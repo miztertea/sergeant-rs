@@ -44,8 +44,20 @@ CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX �
    Residual confirmed-but-deferred findings go to the ledger backlog — never
    silently dropped. (Diminishing returns: iterations 1–2 find architecture,
    3–4 find calibration, 5+ hit bedrock.)
-7. **MARK & LOG.** Commit + push; append a ledger entry to `GAUNTLET.md` with two
+7. **MARK & LOG.** Commit; append a ledger entry to `GAUNTLET.md` with two
    scorecards (see below); update `LESSONS.md`.
+8. **SHIPPING GATE** (adopted 2026-08-08, R5 — installed dependency supplies
+   independent final validation; method + lineage diverse from the critic panel:
+   own pipeline, own agent invocation, fresh disposable worktree). After the
+   milestone commit: `no-mistakes axi run --intent "<contract outcome>" --skip
+   push,pr,ci` — push/PR/CI stay ours. Never `--yes` (upstream Sergeant doctrine):
+   the orchestrator inspects each gate finding and responds selectively via
+   `axi respond` — `fix` for confirmed actionable findings, relay for ask-user,
+   approve for no-op. Pipeline fix commits stay on the branch; never
+   abort-and-restart to escape a gate. It is a final shipping gate, not an
+   implementation loop — if per-milestone runtime proves too heavy, reduce
+   cadence and log the change. Tool: no-mistakes v1.47.0 built from source
+   (SHA recorded in the M1 ledger entry), gate agent: local claude CLI.
 
 ## Model assignment
 
