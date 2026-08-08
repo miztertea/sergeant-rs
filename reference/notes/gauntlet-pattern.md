@@ -14,7 +14,7 @@ outcome prompts, not step-walking), and the IdeaOS operating contract
 ## The loop
 
 ```
-CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX → (re-gauntlet ≤4) → MARK & LOG
+CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX → (round 1) → CHECKPOINT GATE → (round 2, lean) → ADJUDICATE → MARK & LOG
 ```
 
 1. **CONTRACT** (Plan). The orchestrator writes `docs/gauntlet/contracts/M<N>.md`:
