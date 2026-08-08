@@ -33,7 +33,9 @@ CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX �
    - **invariants** — the proposal §40 principles: one owner, work state ≠ process
      state, durable trajectory, disposable projections, idempotency, fail-closed
      ambiguity.
-   - **simplicity** — minimum machinery (Ponytail); no premature abstraction.
+   - **simplicity** — the Ponytail Minimality Ladder is the grading rubric
+     (`ideaos-agent-contract.md`): every addition should sit on its lowest
+     viable rung; unjustified R7s and skipped rungs are findings.
    - **test-honesty** — do the tests verify the claims made, or mirror the
      implementation? Evidence-only.
 5. **ADVERSARIAL VERIFY.** Each finding gets an independent refuter prompted to
@@ -65,6 +67,9 @@ Capability goes where judgment lives; diversity goes where independence matters.
 - One responsibility per context surface: the proposal is the spec, contracts cite
   it, the ledger records what happened, LESSONS.md records what was learned.
   Refer, don't copy.
+- Builders and fixers return `design_decisions` with a Ponytail rung per entry
+  (`R3: seq gap detection via iterator adapter, stdlib only`); the ledger
+  preserves them. An R7 names the lower rungs that failed.
 - The ledger records **mission outcome** (contract met, gates green) and
   **environmental behavior** (iterations used, findings by axis and disposition,
   escalations, evidence completeness) separately.

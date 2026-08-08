@@ -27,10 +27,31 @@ milestones.
   systems own detailed work state; Notion/IdeaOS owns meaning and continuity.
   This repo never writes to the owner's Notion; world-delta candidates accumulate
   in `LESSONS.md` for the owner to promote explicitly.
-- **Ponytail minimality** — add structure only for demonstrated need: identify the
-  concrete failure, search for existing capability, prefer no change / reuse /
-  configuration, add the minimum machinery only when simpler options demonstrably
-  fail. Minimality constrains the path, not the outcome.
+- **Ponytail Minimality Ladder** — a strict preference order for every addition
+  (source: "Ponytail Minimality Ladder", owner's Knowledge base; upstream
+  https://github.com/DietrichGebert/ponytail):
+
+  | Rung | Question | Resolution |
+  |---|---|---|
+  | R1 | Does this need to exist? | No → skip it (YAGNI) |
+  | R2 | Already in this codebase? | Reuse it, don't rewrite |
+  | R3 | Stdlib does it? | Use it |
+  | R4 | Native platform feature? | Use it |
+  | R5 | Installed dependency? | Use it |
+  | R6 | One line? | One line |
+  | R7 | Only then | The minimum that works |
+
+  The ordering is the point: it blocks the jump from "I understand the
+  requirement" to "I should create a new abstraction." Minimality does not mean
+  skipping tests, recovery, or necessary architecture — those are part of
+  correctness ("correctness constrains the destination; expertise constrains
+  the path").
+
+  **Rung logging convention (this repo):** every design decision in a ledger
+  entry, every deviation-register row, and every new dependency, file, trait,
+  or store records the rung it resolved at (`R1`–`R7`). An `R7` entry must name
+  which lower rungs were checked and why they failed. Critics on the simplicity
+  axis grade rung-skipping as a finding.
 
 ## Lineage and boundary
 

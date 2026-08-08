@@ -11,6 +11,10 @@ Each milestone entry carries two scorecards:
 - **Environmental behavior** — iterations used, findings by axis and disposition,
   escalations, evidence completeness.
 
+Design decisions and deviations log their **Ponytail rung** (`R1`–`R7`; ladder in
+`reference/notes/ideaos-agent-contract.md`): the rung the decision resolved at.
+`R7` (new machinery) entries name which lower rungs failed and why.
+
 ## Deviation register
 
 Deviations from `reference/proposal-depot-rust-execution-surface.md`, with
@@ -20,7 +24,7 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 |---|---|---|---|
 | D1 | Product named Depot; `depot.toml`; `depot` CLI | Product **sergeant-rs**; `sergeant.toml`; binary `sgt` | Owner decision 2026-08-08 |
 | D2 | Claude adapter drives a held `attach` (per Sergeant's tmux design) | Daemon has no TTY/pane; turn delivery mechanism selected by measurement in M4 (candidates: SessionStart-hook injection, stop→resume, newer CLI affordances) | Measured spike facts + no tmux in scope; see M4 contract Unknowns |
-| D3 | §35 lists `backend/{claude,codex,opencode,prime}.rs` | Scaffold has `backend/{claude,codex,fake}.rs` | §38 defers OpenCode/Prime past the P0 contract proof; §37's deterministic core tests require a fake backend. Modules are added when their milestone arrives, not pre-declared. Raised by the M0 critic panel. |
+| D3 | §35 lists `backend/{claude,codex,opencode,prime}.rs` | Scaffold has `backend/{claude,codex,fake}.rs` | §38 defers OpenCode/Prime past the P0 contract proof (R1: doesn't need to exist yet); §37's deterministic core tests require a fake backend (R7: no lower rung supplies a deterministic in-process backend). Modules are added when their milestone arrives, not pre-declared. Raised by the M0 critic panel. |
 
 ## Backlog (confirmed-but-deferred findings)
 
