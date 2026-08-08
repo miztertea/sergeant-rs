@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::event::Event;
+use crate::domain::work::{
+    KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_CANCELED, KIND_WORK_SUBMITTED, Work,
+    WorkState,
+};
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::journal::JournalError;
 
@@ -221,4 +225,93 @@ pub fn core_stats_reducer(state: &mut CoreStats, event: &Event) {
 /// An empty [`CoreStats`] projection ready to fold the journal.
 pub fn core_stats_projection() -> Projection<CoreStats> {
     Projection::new(CoreStats::default(), core_stats_reducer)
+}
+
+/// Recorded outcome of an accepted or rejected mutation command (§26).
+///
+/// The daemon journals every command's result; a repeated `command_id`
+/// replays this record verbatim instead of re-executing — including across a
+/// daemon restart, because the registry is rebuilt from the journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOutcome {
+    /// HTTP status the original execution answered with.
+    pub status: u16,
+    /// The exact JSON body the original execution answered with. Replaying a
+    /// duplicate serializes this same value, so the response is
+    /// byte-identical (serde_json maps are order-stable `BTreeMap`s).
+    pub result: Value,
+}
+
+/// The real Work registry (M2): the M1 `CoreStats` demo projection evolved
+/// into domain state, as contracted. Current work records plus the command
+/// idempotency ledger, all folded purely from the journal.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkRegistry {
+    /// Every work record, keyed by work id (ULID keys sort chronologically).
+    pub works: std::collections::BTreeMap<String, Work>,
+    /// Outcome of every accepted/rejected command, keyed by `command_id`.
+    pub commands: std::collections::BTreeMap<String, CommandOutcome>,
+    /// Work id created by each submit command, keyed by `command_id` (from
+    /// the correlation id the mutation event itself carries).
+    ///
+    /// This is the crash-window index. A submit is two fsynced appends —
+    /// `work.submitted`, then the `command.accepted` record — and a daemon
+    /// that dies between them leaves a durable Work record that `commands`
+    /// knows nothing about. Without this index a client retry of the same
+    /// `command_id` would look brand new and create a *second* Work record,
+    /// breaking exact-once for the one case §26 exists to serve: retry after
+    /// an uncertain outcome.
+    pub command_works: std::collections::BTreeMap<String, String>,
+}
+
+/// Reducer for [`WorkRegistry`]. Pure fold; no I/O.
+///
+/// Events are facts: legality was enforced by the writer before the event was
+/// appended (transitions only happen via journal events, and only the daemon
+/// writes them), so the reducer applies what the journal says. Kinds and
+/// payload shapes this reducer does not understand are ignored, never an
+/// error — a newer writer's events must not brick an older reader's replay
+/// (§20's forward-compatibility stance).
+pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
+    match event.kind.as_str() {
+        KIND_WORK_SUBMITTED => {
+            if let Ok(work) = serde_json::from_value::<Work>(event.payload["work"].clone()) {
+                if let Some(command_id) = &event.correlation_id {
+                    state
+                        .command_works
+                        .insert(command_id.clone(), work.id.clone());
+                }
+                state.works.insert(work.id.clone(), work);
+            }
+        }
+        KIND_WORK_CANCELED => {
+            if let Some(work) = event
+                .work_id
+                .as_ref()
+                .and_then(|id| state.works.get_mut(id))
+            {
+                work.state = WorkState::Canceled;
+            }
+        }
+        KIND_COMMAND_ACCEPTED | KIND_COMMAND_REJECTED => {
+            if let (Some(command_id), Some(status)) = (
+                event.payload["command_id"].as_str(),
+                event.payload["status"].as_u64(),
+            ) {
+                state.commands.insert(
+                    command_id.to_string(),
+                    CommandOutcome {
+                        status: u16::try_from(status).unwrap_or(500),
+                        result: event.payload["result"].clone(),
+                    },
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An empty [`WorkRegistry`] projection ready to fold the journal.
+pub fn work_registry_projection() -> Projection<WorkRegistry> {
+    Projection::new(WorkRegistry::default(), work_registry_reducer)
 }

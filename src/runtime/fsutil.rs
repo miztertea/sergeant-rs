@@ -50,6 +50,31 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// [`write_atomic`], but the file is born owner-only (mode `0600` on Unix):
+/// the tmp file is created with the restrictive mode *before* any bytes are
+/// written, so no reader ever observes the content under wider permissions —
+/// not even between write and a later chmod. Used for the runtime descriptor,
+/// which carries the bearer token.
+pub(crate) fn write_atomic_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", ulid::Ulid::generate()));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_data()?;
+    drop(file);
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
