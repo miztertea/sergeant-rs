@@ -79,7 +79,11 @@ uses — medium effort bounds reasoning, not exploration; noted for M3 prompts).
    test, not a defect. All seven produced real tests; C12's constant-token
    mutant and C10's deleted-replay mutant now die.
 4. Contract defects recorded: dependency list over-specified in both
-   directions (D5); "seven acceptance tests" miscounted its own list of eight.
+   directions (D5). The "seven acceptance tests" miscount was initially
+   attributed here to the contract — the final gate's document step caught
+   that the contract correctly lists eight and the miscount was in the
+   orchestrator's builder prompt. Corrected 2026-08-08; the error was the
+   orchestrator's.
 5. B1 revisited per checkpoint-gate finding — see backlog.
 
 **Design decisions (selected, rung-tagged).** Shutdown signal via
@@ -95,7 +99,11 @@ and fixer reported 10 contract ambiguities with interpretations, retained in
 the workflow record.
 
 **Shipping gates.** Checkpoint gate 01KZGVV42FJMY749V1YTBVWVDX: passed.
-Final gate: recorded below after the run.
+Final gate: **passed** — review/test/document/lint clean, no pipeline
+commits; one ask-user info finding (the ruling-#4 misattribution above,
+corrected). Gate agent verified running `--model sonnet`. One environmental
+note: the no-mistakes daemon died between runs and required a restart with
+`IS_SANDBOX=1` re-applied — worth a wrapper if it recurs.
 
 ---
 
