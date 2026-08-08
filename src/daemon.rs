@@ -17,7 +17,7 @@
 //! crash leaves a stale descriptor, which clients detect (dead PID + refused
 //! endpoint) and replace.
 
-use std::fs::{OpenOptions, TryLockError};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ use crate::backend::BackendRegistry;
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::domain::event::{EventDraft, EventSource};
 use crate::runtime::engine::{Engine, EngineError};
-use crate::runtime::fsutil::{create_dir_all_durable, write_atomic_secret};
+use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{ProjectionError, work_registry_projection};
 use crate::runtime::recovery;
@@ -166,16 +166,19 @@ pub async fn start_with(
 
     // 1. Exclusive daemon lock: a second daemon on the same data dir fails
     // closed here, before touching journal or descriptor. The OS releases
-    // the advisory lock on process death, so it can never go stale.
+    // the advisory lock on process death, so it can never go stale. A second
+    // daemon *process* is refused immediately; only a lock this same process
+    // has held before is waited out, because only then can one of our own
+    // forked git children still be holding a duplicate of it (see
+    // `take_exclusive_lock`).
+    let lock_path = data_dir.join(DAEMON_LOCK_FILE);
     let lock = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(data_dir.join(DAEMON_LOCK_FILE))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Err(DaemonError::Locked),
-        Err(TryLockError::Error(e)) => return Err(e.into()),
+        .open(&lock_path)?;
+    if !take_exclusive_lock(&lock_path, &lock)? {
+        return Err(DaemonError::Locked);
     }
 
     // 2. Own the journal and rebuild current state by full replay (§24;

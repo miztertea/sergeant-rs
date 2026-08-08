@@ -1197,3 +1197,71 @@ fn handle_of(execution: &ExecutionRecord) -> ExecutionHandle {
         native_id: execution.native_id.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::fake::{FAKE_BACKEND_NAME, FakeBackend};
+    use crate::runtime::testing;
+
+    fn engine(data_dir: &Path) -> Engine {
+        let backends = BackendRegistry::new().with(Arc::new(FakeBackend::new(FAKE_BACKEND_NAME)));
+        Engine::new(
+            Arc::new(backends),
+            Some(FAKE_BACKEND_NAME.to_string()),
+            data_dir,
+        )
+    }
+
+    /// Blocking is how every fail-closed path records *why* it gave up, and a
+    /// work can be blocked twice for different reasons — recovery blocking a
+    /// work an earlier failure already left blocked, say. `transition`'s
+    /// ordinary same-state short-circuit would drop the second reason on the
+    /// floor, which is exactly the evidence an operator needs. So `block`
+    /// journals it anyway, without pretending a transition happened.
+    #[test]
+    fn blocking_an_already_blocked_work_records_the_new_reason() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let engine = engine(dir.path());
+        let work_id = "01BLOCKTWICE";
+        testing::submit(&mut core, work_id, "block me twice");
+
+        engine
+            .block(&mut core, work_id, "first reason", None)
+            .expect("first block");
+        engine
+            .block(
+                &mut core,
+                work_id,
+                "second reason",
+                Some("what went wrong the second time".to_string()),
+            )
+            .expect("second block");
+
+        let blocked: Vec<Value> = core
+            .journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .filter(|e| e.kind == KIND_WORK_BLOCKED)
+            .map(|e| e.payload)
+            .collect();
+        assert_eq!(
+            blocked.len(),
+            2,
+            "the second reason must not be silently discarded, got {blocked:?}"
+        );
+        assert_eq!(blocked[0]["reason"], "first reason");
+        assert_eq!(blocked[1]["reason"], "second reason");
+        assert_eq!(
+            blocked[1]["evidence"], "what went wrong the second time",
+            "the evidence travels with the reason"
+        );
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Blocked,
+            "and the work is still exactly where it was"
+        );
+    }
+}

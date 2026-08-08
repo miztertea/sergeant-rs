@@ -17,11 +17,12 @@
 //! from the event envelope (§20), which preserves unknown fields — history
 //! must survive readers that do not understand it, instructions must not.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::is_plain_name;
 use crate::domain::profile::Profile;
 use crate::runtime::git::{GitError, git};
 
@@ -112,6 +113,22 @@ pub enum WorkspaceError {
         file: String,
         /// The repeated name.
         name: String,
+    },
+    /// Two differently-named repositories resolve to the same checkout. Both
+    /// would be materialized onto the same `sergeant/<work-id>` branch of the
+    /// same repository, and the second `git worktree add -b` fails *after*
+    /// the first has already created a branch and a worktree in the user's
+    /// checkout. Refused while it still costs nothing.
+    #[error("{file} declares repositories {first:?} and {second:?}, which are both {path}")]
+    DuplicateRepositoryPath {
+        /// Config file that declared them.
+        file: String,
+        /// Name declared first for this path.
+        first: String,
+        /// The later name for the same path.
+        second: String,
+        /// The shared repository top level.
+        path: String,
     },
     /// A declared repository name is not usable as a plain path component.
     /// Surface paths are built by joining it directly onto the surface root
@@ -222,6 +239,10 @@ impl Workspace {
             return Err(WorkspaceError::NoRepositories { file });
         }
         let mut seen = BTreeSet::new();
+        // Identity of a repository is its resolved top level, not the name
+        // the file chose for it: `path = "."` and `path = "./"` are one
+        // checkout under two names, and only git can say so.
+        let mut seen_paths: BTreeMap<PathBuf, String> = BTreeMap::new();
         let mut repositories = Vec::with_capacity(parsed.repository.len());
         for entry in parsed.repository {
             if !is_plain_name(&entry.name) {
@@ -246,9 +267,19 @@ impl Workspace {
                     path: joined.display().to_string(),
                 }
             })?;
+            let resolved = PathBuf::from(resolved);
+            if let Some(first) = seen_paths.get(&resolved) {
+                return Err(WorkspaceError::DuplicateRepositoryPath {
+                    file,
+                    first: first.clone(),
+                    second: entry.name,
+                    path: resolved.display().to_string(),
+                });
+            }
+            seen_paths.insert(resolved.clone(), entry.name.clone());
             repositories.push(RepositorySpec {
                 name: entry.name,
-                path: PathBuf::from(resolved),
+                path: resolved,
             });
         }
 
@@ -323,16 +354,172 @@ fn repo_name(root: &Path) -> String {
         .unwrap_or_else(|| "workspace".to_string())
 }
 
-/// Whether `name` is safe to join directly onto a filesystem path: a single,
-/// non-empty path component with no separators and no `.`/`..` — the same
-/// guard `check_stage_ids` applies to workflow stage ids, applied here to
-/// repository names, which `surface::materialize` joins onto the surface root
-/// the same way.
-fn is_plain_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains('/')
-        && !name.contains('\\')
-        && name != "."
-        && name != ".."
-        && Path::new(name).components().count() == 1
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// A temp git repository with one commit.
+    fn init_repo(path: &Path) {
+        std::fs::create_dir_all(path).expect("repo dir");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["commit", "--allow-empty", "-m", "initial"],
+        ] {
+            let output = Command::new("git")
+                .args(&args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+    }
+
+    /// Write a `sergeant.toml` into `root` and parse it.
+    fn parse(root: &Path, body: &str) -> Result<Workspace, WorkspaceError> {
+        let config = root.join(WORKSPACE_FILE);
+        std::fs::write(&config, body).expect("sergeant.toml");
+        Workspace::from_config(&config)
+    }
+
+    /// A repository name is joined straight onto
+    /// `<data-dir>/surfaces/<work-id>/`, so a name that is not a plain
+    /// directory component could put a worktree anywhere on the filesystem.
+    /// Refused at parse time, before anything is materialized.
+    #[test]
+    fn a_repository_name_may_not_escape_the_surface_root() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        for name in ["../escape", "..", "/etc", "nested/name", ""] {
+            let err = parse(
+                root,
+                &format!(
+                    "[workspace]\nname = \"w\"\n\n[[repository]]\nname = \"{name}\"\npath = \".\"\n"
+                ),
+            )
+            .expect_err("a traversing repository name must be refused");
+            assert!(
+                matches!(err, WorkspaceError::InvalidRepositoryName { .. }),
+                "{name:?} must be refused as a name, got {err}"
+            );
+        }
+
+        // And the ordinary case still parses, so the guard is not refusing
+        // everything.
+        let workspace = parse(
+            root,
+            "[workspace]\nname = \"w\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n",
+        )
+        .expect("a plain name parses");
+        assert_eq!(workspace.repositories[0].name, "solo");
+    }
+
+    /// Two names for one checkout would both materialize onto the same
+    /// `sergeant/<work-id>` branch of the same repository: the second
+    /// `git worktree add -b` fails only *after* the first has created a
+    /// branch and a worktree in the user's own checkout. Rejecting it here
+    /// costs nothing; rejecting it there leaves a branch behind.
+    #[test]
+    fn two_names_for_one_repository_are_refused_before_anything_is_created() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let nested = root.join("sub");
+        std::fs::create_dir_all(&nested).expect("sub dir");
+
+        // Distinct names, distinct spellings, one repository: `.`, `./` and a
+        // subdirectory of the same checkout all resolve to one top level.
+        for path in [".", "./", "sub"] {
+            let err = parse(
+                root,
+                &format!(
+                    "[workspace]\nname = \"w\"\n\n\
+                     [[repository]]\nname = \"a\"\npath = \".\"\n\n\
+                     [[repository]]\nname = \"b\"\npath = \"{path}\"\n"
+                ),
+            )
+            .expect_err("one repository under two names must be refused");
+            match err {
+                WorkspaceError::DuplicateRepositoryPath { first, second, .. } => {
+                    assert_eq!((first.as_str(), second.as_str()), ("a", "b"));
+                }
+                other => panic!("expected a same-path refusal for {path:?}, got {other}"),
+            }
+        }
+    }
+
+    /// Two entries with the same *name* collapse two worktrees into one
+    /// surface path, which is the same hazard read from the other side.
+    #[test]
+    fn two_repositories_may_not_share_a_name() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let other = root.join("other");
+        init_repo(&other);
+
+        let err = parse(
+            root,
+            "[workspace]\nname = \"w\"\n\n\
+             [[repository]]\nname = \"same\"\npath = \".\"\n\n\
+             [[repository]]\nname = \"same\"\npath = \"other\"\n",
+        )
+        .expect_err("a repeated name must be refused");
+        assert!(
+            matches!(&err, WorkspaceError::DuplicateRepository { name, .. } if name == "same"),
+            "got {err}"
+        );
+    }
+
+    /// The submit request's `repositories` selection is user input too, and a
+    /// name repeated there produces two identical bindings — the same
+    /// same-path collision, arriving through the API instead of the file.
+    #[test]
+    fn a_repository_named_twice_in_one_selection_is_refused() {
+        let workspace = Workspace {
+            name: "payments".to_string(),
+            root: PathBuf::from("/nowhere"),
+            repositories: vec![
+                RepositorySpec {
+                    name: "api".to_string(),
+                    path: PathBuf::from("/nowhere/api"),
+                },
+                RepositorySpec {
+                    name: "web".to_string(),
+                    path: PathBuf::from("/nowhere/web"),
+                },
+            ],
+            default_backend: None,
+            default_workflow: None,
+            profiles: Vec::new(),
+            config_path: None,
+        };
+
+        let selected = workspace
+            .select(&["web".to_string(), "api".to_string()])
+            .expect("distinct names select");
+        assert_eq!(
+            selected.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["web", "api"]
+        );
+
+        let err = workspace
+            .select(&["api".to_string(), "api".to_string()])
+            .expect_err("a repeated selection must be refused");
+        assert!(err.contains("twice"), "got {err}");
+
+        // An unknown name still names what does exist.
+        let err = workspace
+            .select(&["ghost".to_string()])
+            .expect_err("unknown repository");
+        assert!(err.contains("api, web"), "got {err}");
+    }
 }

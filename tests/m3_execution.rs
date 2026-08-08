@@ -37,7 +37,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
-use sergeant_rs::backend::{BackendRegistry, NativeState};
+use sergeant_rs::backend::{
+    Backend, BackendError, BackendRegistry, BackendSignal, Capabilities, ExecutionHandle,
+    NativeState, Observation, ProbeReport, StartRequest,
+};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
 use sergeant_rs::domain::execution::KIND_EXECUTION_RECONCILED;
@@ -234,6 +237,81 @@ fn events_of(data_dir: &Path, work_id: &str, kind: &str) -> Vec<Event> {
 /// Whether a branch exists in a repository.
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     !git(repo, &["branch", "--list", branch]).is_empty()
+}
+
+/// Name [`OpaqueBackend`] registers under.
+const OPAQUE_BACKEND: &str = "opaque";
+
+/// A backend that starts an execution and then cannot usefully say what it is
+/// doing. §25 has two shapes of that, and this is an adapter for both.
+///
+/// The scriptable fake always has a usable answer, which is what makes it a
+/// good instrument everywhere else — but "the adapter cannot classify its own
+/// context" is a case in its own right, and it needs an adapter that really
+/// cannot, not a script reporting that it cannot.
+#[derive(Debug, Clone, Copy)]
+enum OpaqueBackend {
+    /// OBSERVE fails outright: the harness stopped answering.
+    ObserveFails,
+    /// OBSERVE answers, but with a native state the adapter cannot classify —
+    /// while *also* signalling that the stage completed. The signal is the
+    /// point: §15 says native evidence and explicit signal are separate, and
+    /// §25 says ambiguity fails closed, so unknown liveness must win over a
+    /// signal that would otherwise have advanced the run.
+    ObserveUnknown,
+}
+
+impl OpaqueBackend {
+    /// The evidence [`OpaqueBackend::ObserveUnknown`] reports.
+    const UNKNOWN_EVIDENCE: &'static str = "the pid is gone but the socket is still open";
+}
+
+impl Backend for OpaqueBackend {
+    fn name(&self) -> &str {
+        OPAQUE_BACKEND
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+
+    fn probe(&self) -> ProbeReport {
+        ProbeReport {
+            available: true,
+            detail: Some("always available, never informative".to_string()),
+        }
+    }
+
+    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
+        Ok(ExecutionHandle {
+            execution_id: request.execution_id.clone(),
+            native_id: Some(format!("opaque-{}", request.execution_id)),
+        })
+    }
+
+    fn send(&self, _handle: &ExecutionHandle, _input: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn observe(&self, _handle: &ExecutionHandle) -> Result<Observation, BackendError> {
+        match self {
+            Self::ObserveFails => Err(BackendError::Failed {
+                backend: OPAQUE_BACKEND.to_string(),
+                detail: "the harness stopped answering".to_string(),
+            }),
+            Self::ObserveUnknown => Ok(Observation {
+                native: NativeState::Unknown,
+                signal: BackendSignal::StageCompleted {
+                    summary: Some("all done".to_string()),
+                },
+                evidence: Some(Self::UNKNOWN_EVIDENCE.to_string()),
+            }),
+        }
+    }
+
+    fn stop(&self, _handle: &ExecutionHandle) -> Result<(), BackendError> {
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------ tests
@@ -1011,6 +1089,42 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
         blocked[0].payload
     );
 
+    // The ambiguity is recorded at *stage* level too, not only against the
+    // work: a work-level block that leaves the stage reading `active` leaves
+    // a stage coordinate nothing will ever move again.
+    let stage_blocked = events_of(data.path(), &orphan, "stage.blocked");
+    assert_eq!(
+        stage_blocked.len(),
+        1,
+        "the stage the work was parked in must be marked too"
+    );
+    assert_eq!(stage_blocked[0].payload["stage_id"], "00-first");
+    assert_eq!(
+        stage_blocked[0].payload["detail"].as_str(),
+        Some(evidence),
+        "the stage carries the same adapter evidence as the work"
+    );
+
+    // Reconciliation asked the surviving session what it was doing exactly
+    // once, and the resumed run acted on *that* answer rather than asking a
+    // second time — two OBSERVEs are not guaranteed to agree, and the run
+    // would then be driven from an answer no decision was made on. The
+    // survivor's first execution was observed once while it was running,
+    // before the restart, and once by reconciliation: a third would be the
+    // duplicate this pins against.
+    let first_execution = durable.starts()[0].execution_id.clone();
+    let observes = durable
+        .observations()
+        .iter()
+        .filter(|id| **id == first_execution)
+        .count();
+    assert_eq!(
+        observes,
+        2,
+        "one OBSERVE before the restart, one to reconcile: got {:?}",
+        durable.observations()
+    );
+
     // Recovery never invents a second execution for work it could not
     // reconcile (§25: "no new worker is created until prior ownership is
     // reconciled"). Asserted on the *restarted* instance: the pre-restart
@@ -1248,6 +1362,474 @@ async fn a_dirty_worktree_is_retained_and_recorded_at_teardown() {
         worktree.join("half-done.rs").is_file(),
         "a dirty worktree must survive teardown"
     );
+
+    handle.shutdown().await;
+}
+
+/// A multi-repository submission where a later repository cannot be
+/// materialized: the earlier ones already have a real branch and worktree in
+/// the user's own checkouts. Those are rolled back and the report is
+/// journaled, so the failure never leaves git state nobody recorded.
+#[tokio::test]
+async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let api = repos.path().join("payments-api");
+    init_repo(&api);
+    // A repository with no commits at all: a real repository (so the
+    // workspace resolves it) with no HEAD to cut a surface from.
+    let web = repos.path().join("payments-web");
+    std::fs::create_dir_all(&web).expect("repo dir");
+    git(&web, &["init", "-b", "main"]);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[workspace]\nname = \"payments\"\n\n\
+         [[repository]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repository]]\nname = \"web\"\npath = \"../payments-web\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &api, "half a surface", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "a surface that cannot be built fails the work closed: {body}"
+    );
+    assert!(body["surface"].is_null(), "no surface was recorded");
+    assert!(
+        fake.starts().is_empty(),
+        "nothing reaches a backend without a surface"
+    );
+
+    // What *was* created is torn down, and the teardown is journaled — this
+    // is the only record that a branch and a worktree briefly existed in the
+    // user's repository.
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1, "the rollback must be recorded, never silent");
+    let report = &torn[0].payload["report"];
+    assert_eq!(report["bindings"].as_array().expect("bindings").len(), 1);
+    assert_eq!(report["bindings"][0]["repository"], "api");
+    assert_eq!(report["bindings"][0]["disposition"], "removed");
+    let rolled_back = PathBuf::from(
+        report["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    assert!(
+        !rolled_back.exists(),
+        "the rolled-back worktree must be gone: {}",
+        rolled_back.display()
+    );
+
+    // The evidence on the block carries the same inventory, so an operator
+    // reading the work sees what happened without replaying the journal.
+    let blocked = events_of(data.path(), &work_id, KIND_WORK_BLOCKED);
+    assert_eq!(blocked.len(), 1);
+    assert!(
+        blocked[0].payload["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("cannot materialize work surface")),
+        "the reason must name the failure: {}",
+        blocked[0].payload
+    );
+    assert!(
+        blocked[0].payload["evidence"]
+            .as_str()
+            .is_some_and(|e| e.contains("\"repository\":\"api\"")),
+        "the evidence must name what was rolled back: {}",
+        blocked[0].payload
+    );
+    // Teardown retains branches by contract, and the report above names it —
+    // recorded, not orphaned. The repository that never got that far has
+    // nothing at all.
+    assert!(branch_exists(&api, &format!("sergeant/{work_id}")));
+    assert!(!branch_exists(&web, &format!("sergeant/{work_id}")));
+
+    handle.shutdown().await;
+}
+
+/// Cancelling a work parked in `blocked` retires the stage it was parked in.
+/// The stage coordinate is orthogonal to work state (§10), which is exactly
+/// why it has to be retired explicitly: a canceled work whose stage still
+/// reads `blocked` is a stage nothing will ever move again.
+#[tokio::test]
+async fn cancelling_a_blocked_work_retires_the_stage_it_was_parked_in() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([FakeStep::blocked("needs an architecture decision")]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "block then cancel",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "blocked");
+    assert_eq!(body["stage"]["status"], "blocked");
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "cancel failed: {body}");
+    assert_eq!(body["work"]["state"], "canceled");
+    assert_eq!(
+        body["stage"]["status"], "canceled",
+        "a parked stage is abandoned with the work, not left parked: {body}"
+    );
+    let canceled = events_of(data.path(), &work_id, "stage.canceled");
+    assert_eq!(canceled.len(), 1);
+    assert_eq!(canceled[0].payload["stage_id"], "00-first");
+    assert_eq!(canceled[0].payload["detail"], "work canceled");
+    // And the surface is retired on the way out, as for any terminal state.
+    assert_eq!(
+        events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN).len(),
+        1
+    );
+
+    handle.shutdown().await;
+}
+
+/// A backend that cannot START the next stage blocks the work with the stage
+/// named. The stage-level record matters as much as the work-level one: it
+/// says *which* stage could not be entered, which the work state cannot.
+#[tokio::test]
+async fn a_backend_that_cannot_start_the_next_stage_blocks_with_the_stage_named() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, fake) = one_fake([
+        FakeStep::needs_input("which database?"),
+        FakeStep::complete(),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "lose the backend mid run",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "needs_input");
+
+    // The harness goes away while the run is parked. Answering completes the
+    // first stage; entering the second cannot start anything.
+    fake.set_available(false, "the harness is gone");
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "postgres"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "a stage that cannot be started fails closed: {body}"
+    );
+
+    let stage_blocked = events_of(data.path(), &work_id, "stage.blocked");
+    assert_eq!(stage_blocked.len(), 1);
+    assert_eq!(
+        stage_blocked[0].payload["stage_id"], "10-second",
+        "the record must name the stage that could not be entered"
+    );
+    assert!(
+        stage_blocked[0].payload["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("the harness is gone")),
+        "the backend's own diagnostic is the evidence: {}",
+        stage_blocked[0].payload
+    );
+    let blocked = events_of(data.path(), &work_id, KIND_WORK_BLOCKED);
+    assert_eq!(
+        blocked[0].payload["reason"],
+        "backend could not start an execution"
+    );
+    // The first stage still reads as completed: it did complete.
+    assert_eq!(
+        events_of(data.path(), &work_id, KIND_STAGE_COMPLETED)[0].payload["stage_id"],
+        "00-first"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Input for an execution the backend no longer recognises: the answer cannot
+/// be delivered, so the work fails closed with the stage named rather than
+/// silently swallowing the input.
+#[tokio::test]
+async fn input_for_a_forgotten_execution_blocks_with_the_stage_named() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([FakeStep::needs_input("which database?")]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "answer a session that did not survive",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "needs_input");
+    handle.shutdown().await;
+
+    // A brand-new backend instance: the native context did not survive the
+    // restart. `needs_input` is a decision, not uncertainty, so recovery
+    // leaves the work exactly where it is — the failure surfaces when the
+    // answer is actually delivered.
+    let (registry, restarted) = one_fake([]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(shown["work"]["state"], "needs_input");
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "postgres"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "undeliverable input must fail closed, not vanish: {body}"
+    );
+    assert!(
+        restarted.starts().is_empty(),
+        "and nothing is speculatively restarted to receive it"
+    );
+
+    let stage_blocked = events_of(data.path(), &work_id, "stage.blocked");
+    assert_eq!(stage_blocked.len(), 1);
+    assert_eq!(stage_blocked[0].payload["stage_id"], "00-first");
+    assert!(
+        stage_blocked[0].payload["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("does not recognise")),
+        "the backend's own diagnostic is the evidence: {}",
+        stage_blocked[0].payload
+    );
+    let blocked = events_of(data.path(), &work_id, KIND_WORK_BLOCKED);
+    assert!(
+        blocked[0].payload["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("cannot deliver input")),
+        "got {}",
+        blocked[0].payload
+    );
+
+    handle.shutdown().await;
+}
+
+/// A backend that starts an execution and then cannot say anything about it.
+/// §25: an adapter that cannot classify its own context is ambiguity, and
+/// ambiguity fails closed with the evidence — never a guess in either
+/// direction.
+#[tokio::test]
+async fn a_backend_that_cannot_observe_its_execution_fails_the_work_closed() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let registry = BackendRegistry::new().with(Arc::new(OpaqueBackend::ObserveFails));
+    let handle = start_with(data.path(), registry, Some(OPAQUE_BACKEND)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "observe me if you can",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "an unobservable execution must not be guessed at: {body}"
+    );
+
+    let stage_blocked = events_of(data.path(), &work_id, "stage.blocked");
+    assert_eq!(stage_blocked.len(), 1);
+    assert_eq!(stage_blocked[0].payload["stage_id"], "00-first");
+    assert!(
+        stage_blocked[0].payload["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("stopped answering")),
+        "got {}",
+        stage_blocked[0].payload
+    );
+    let blocked = events_of(data.path(), &work_id, KIND_WORK_BLOCKED);
+    assert_eq!(
+        blocked[0].payload["reason"],
+        "backend could not observe the execution"
+    );
+    assert!(
+        blocked[0].payload["evidence"]
+            .as_str()
+            .is_some_and(|e| e.contains("stopped answering")),
+        "got {}",
+        blocked[0].payload
+    );
+
+    handle.shutdown().await;
+}
+
+/// An adapter that *can* answer OBSERVE but reports a native state it cannot
+/// classify. §25 makes that ambiguity, and ambiguity fails closed — even when
+/// the very same answer also carries an explicit "stage completed" signal.
+/// Native liveness gets exactly one say in the engine, and this is it: it can
+/// stop a run, and it can never advance one. A completion the engine cannot
+/// trust the context of is not a completion.
+#[tokio::test]
+async fn an_unknown_native_state_blocks_even_when_the_signal_says_completed() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let registry = BackendRegistry::new().with(Arc::new(OpaqueBackend::ObserveUnknown));
+    let handle = start_with(data.path(), registry, Some(OPAQUE_BACKEND)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "complete me from an unknown context",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "an unknown native state must beat the completion signal beside it: {body}"
+    );
+    assert_eq!(body["stage"]["status"], "blocked");
+
+    // Nothing advanced: the stage was never completed and the second stage
+    // was never entered.
+    assert!(
+        events_of(data.path(), &work_id, KIND_STAGE_COMPLETED).is_empty(),
+        "a completion signal from an unclassifiable context must not complete a stage"
+    );
+    assert_eq!(
+        events_of(data.path(), &work_id, KIND_STAGE_ENTERED).len(),
+        1,
+        "and must not enter the next stage"
+    );
+
+    let stage_blocked = events_of(data.path(), &work_id, "stage.blocked");
+    assert_eq!(stage_blocked.len(), 1);
+    assert_eq!(stage_blocked[0].payload["stage_id"], "00-first");
+    assert!(
+        stage_blocked[0].payload["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("socket is still open")),
+        "the adapter's own evidence is what is recorded: {}",
+        stage_blocked[0].payload
+    );
+    let blocked = events_of(data.path(), &work_id, KIND_WORK_BLOCKED);
+    assert_eq!(
+        blocked[0].payload["reason"],
+        "backend reports an unknown native state"
+    );
+    assert!(
+        blocked[0].payload["evidence"]
+            .as_str()
+            .is_some_and(|e| e.contains("socket is still open")),
+        "got {}",
+        blocked[0].payload
+    );
+
+    handle.shutdown().await;
+}
+
+/// The workflow name is client input (`POST /v1/work`'s `workflow` field) and
+/// is joined straight onto `.sergeant/workflows/`. A name that walks out of
+/// that directory is refused before anything runs — not resolved against
+/// whatever `workflow.toml` happens to sit there.
+#[tokio::test]
+async fn a_workflow_name_that_escapes_the_workflows_directory_is_refused_at_submit() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    // A perfectly loadable workflow that simply is not in the workflows
+    // directory, so only the guard can be what refuses the submission.
+    write_workflow(
+        &repo.join("elsewhere"),
+        "outside",
+        &[("00-only", "context")],
+    );
+    std::fs::create_dir_all(repo.join(".sergeant/workflows")).expect("workflows root");
+
+    let (registry, fake) = one_fake([]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "read someone else's workflow",
+        json!({"workflow": "../../elsewhere/.sergeant/workflows/outside"}),
+    )
+    .await;
+    assert_eq!(
+        status, 422,
+        "a traversing workflow name must be refused: {body}"
+    );
+    assert_eq!(body["error"]["code"], "workflow_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("not a plain directory name"),
+        "the diagnostic must say why: {body}"
+    );
+    // Refused before anything was created.
+    let list = get(&client, &handle, "/v1/work").await;
+    assert!(list["works"].as_array().expect("works").is_empty());
+    assert!(fake.starts().is_empty());
 
     handle.shutdown().await;
 }
@@ -1506,6 +2088,33 @@ async fn a_malformed_workspace_file_fails_closed() {
             .as_str()
             .expect("message")
             .contains("ghost")
+    );
+
+    // Two names for one checkout is refused too, and — this is the point —
+    // refused *before* anything is materialized. Both entries would be cut
+    // onto the same `sergeant/<work-id>` branch of the same repository, and
+    // the failure would otherwise land on the second `git worktree add`,
+    // after the first had already put a branch in the user's checkout.
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[workspace]\nname = \"solo\"\n\n\
+         [[repository]]\nname = \"here\"\npath = \".\"\n\n\
+         [[repository]]\nname = \"also-here\"\npath = \"./\"\n",
+    )
+    .expect("sergeant.toml");
+    let (status, body) = submit(&http(), &handle, &repo, "one repo, two names", json!({})).await;
+    assert_eq!(status, 422, "a same-path duplicate must be refused: {body}");
+    assert_eq!(body["error"]["code"], "workspace_error");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("here") && message.contains("also-here"),
+        "the diagnostic must name both entries: {body}"
+    );
+    // Nothing was created behind the refusal: no surface, no branch.
+    assert_eq!(
+        git(&repo, &["branch", "--list", "sergeant/*"]),
+        "",
+        "a statically rejectable submission must not touch the repository"
     );
 
     handle.shutdown().await;

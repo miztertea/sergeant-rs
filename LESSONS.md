@@ -6,6 +6,26 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L7 — A fix without its pinning test is prose: revert-probe every fix commit **[world-delta]**
+
+M3 round 2's headline: the checkpoint gate's 11-fix commit — including two
+path-traversal guards — reverted cleanly with every test still green. The
+fixes were real; their permanence was fiction. Rule now enforced: every fix
+ships with the test that would catch its regression, and the cheap audit is
+`git revert --no-commit <fix-commit> && cargo test` in a disposable copy —
+if the suite stays green, the fix isn't pinned. Corollary from the same
+round: single-run green is not a gate — the M3 suite passed while failing
+~5% of parallel runs; repeated-run checks are part of gate verification.
+
+## L6 — Adjacent-append crash windows are this architecture's recurring hazard
+
+M2: exact-once broke in the window between submit's two journal appends.
+M3: a daemon crash in the same window stranded work in a state nothing would
+pick up. Any code path appending two causally-linked events must either be
+tolerant of the second append missing (recovery re-derives it) or write one
+compound event. Check for this class explicitly in every milestone that adds
+a multi-append sequence.
+
 ## L5 — Verifiers can capture the verification: enforce probe hygiene structurally **[world-delta]**
 
 M2 follow-up round: a refuter tasked with refuting test-coverage findings

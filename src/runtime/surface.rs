@@ -331,6 +331,13 @@ pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError>
     let mut bindings = Vec::with_capacity(surface.bindings.len());
     for binding in &surface.bindings {
         if !binding.worktree_path.exists() {
+            // Whatever removed the directory may not have unregistered it —
+            // teardown only prunes on the paths it walks, and a worktree can
+            // vanish long after that (a retained-dirty one deleted by hand, a
+            // wiped `surfaces/` tree). A stale registration makes every
+            // `git worktree add` at that path fail forever, which would shut
+            // §12's one door back out of failed/blocked/waiting.
+            prune_stale_worktrees(&binding.source_path);
             // The branch was retained by teardown; check it out again there.
             let branch_exists = git_succeeds(
                 &binding.source_path,
@@ -393,15 +400,26 @@ pub fn teardown(surface: &WorkSurface) -> TeardownReport {
     }
 }
 
+/// Drop registrations for worktrees whose directories no longer exist.
+///
+/// A vanished worktree directory leaves the source repository still listing
+/// it administratively, and git then refuses every `worktree add` at that
+/// path — "is a missing but already registered worktree" — with no product
+/// path that recovers. `git worktree prune` is git's own answer, and it only
+/// ever removes records for directories that are already gone, so it can
+/// never destroy anything a run still has. Best-effort: a repository that
+/// refuses to prune fails at the operation that needed it, with git's own
+/// diagnostic, rather than here.
+fn prune_stale_worktrees(source: &Path) {
+    let _ = git(source, &["worktree", "prune"]);
+}
+
 fn teardown_binding(binding: &RepositoryBinding) -> BindingDisposition {
     if !binding.worktree_path.exists() {
-        // The directory is gone, but the source repository's administrative
-        // records still list it as a registered worktree; left alone, a
-        // later `rematerialize` at the same path fails with "is a missing
-        // but already registered worktree". Pruning is git's own recovery
-        // for exactly this — best-effort, since it does not change the
-        // disposition below either way.
-        let _ = git(&binding.source_path, &["worktree", "prune"]);
+        // The directory is gone, but the source repository still lists it;
+        // unregister it now so a later rematerialize at the same path is
+        // possible. This does not change the disposition below either way.
+        prune_stale_worktrees(&binding.source_path);
         return BindingDisposition::Missing;
     }
     match git(&binding.worktree_path, &["status", "--porcelain"]) {
@@ -523,20 +541,167 @@ mod tests {
 
     /// A worktree that has vanished under us is recorded as missing rather
     /// than reported as a clean removal — teardown never claims to have
-    /// removed something it did not find.
+    /// removed something it did not find. And having recorded it, teardown
+    /// leaves the repository in a state a retry can actually use: the stale
+    /// registration is gone, so the surface can be rebuilt at the same path.
     #[test]
-    fn a_vanished_worktree_is_recorded_not_reported_clean() {
+    fn a_vanished_worktree_is_recorded_and_leaves_the_path_reusable() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
         let surface =
             materialize(data.path(), "01GONE", std::slice::from_ref(&spec)).expect("materialize");
 
+        let worktree = surface.bindings[0].worktree_path.display().to_string();
         std::fs::remove_dir_all(&surface.bindings[0].worktree_path).expect("remove worktree");
+        assert!(
+            git(&spec.path, &["worktree", "list"])
+                .expect("list")
+                .contains(&worktree),
+            "git still lists the vanished worktree until something unregisters it"
+        );
+
         let report = teardown(&surface);
         assert!(!report.clean, "a missing worktree is not a clean teardown");
         assert_eq!(report.bindings[0].disposition, BindingDisposition::Missing);
         assert_eq!(report.bindings[0].work_branch, work_branch("01GONE"));
+
+        // Recording it is not enough: the registration git still holds would
+        // make every later `worktree add` at that path fail. Teardown leaves
+        // the repository in a state a retry can actually use.
+        assert!(
+            !git(&spec.path, &["worktree", "list"])
+                .expect("list")
+                .contains(&worktree),
+            "teardown must unregister the worktree it recorded as missing"
+        );
+        let rebuilt = rematerialize(&surface)
+            .expect("a recorded-missing worktree must not wedge the path forever");
+        assert!(rebuilt.bindings[0].worktree_path.is_dir());
+    }
+
+    /// §12 makes retry the one door back out of failed, blocked and waiting,
+    /// and retry re-attaches the worktrees teardown removed. A worktree that
+    /// teardown *retained* (dirty, so fail-closed left it alone) and that
+    /// was then deleted out of band is the case nothing else prunes: git
+    /// still has it registered, and without a prune every `worktree add` at
+    /// that path fails for good, wedging retry permanently.
+    #[test]
+    fn a_worktree_deleted_after_a_dirty_teardown_can_still_be_rematerialized() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01STALE", std::slice::from_ref(&spec)).expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        // Uncommitted work: teardown retains it, and therefore never prunes.
+        std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty");
+        let report = teardown(&surface);
+        assert!(matches!(
+            report.bindings[0].disposition,
+            BindingDisposition::RetainedDirty { .. }
+        ));
+
+        // ...and then it is deleted by something that is not sergeant.
+        std::fs::remove_dir_all(&worktree).expect("delete out of band");
+
+        let rebuilt = rematerialize(&surface).expect("retry must still be able to rebuild");
+        assert!(rebuilt.bindings[0].worktree_path.is_dir());
+        assert_eq!(
+            git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("head"),
+            work_branch("01STALE"),
+            "the rebuilt worktree is back on the retained branch"
+        );
+        // And it is repeatable: a second rebuild after a second deletion
+        // works too, so nothing accumulates that eventually wedges it.
+        std::fs::remove_dir_all(&worktree).expect("delete again");
+        rematerialize(&surface).expect("still rebuildable");
+    }
+
+    /// A later repository failing must not leave the earlier ones' branches
+    /// and worktrees in the user's checkouts unrecorded: what was created is
+    /// torn down, and the report travels with the error.
+    #[test]
+    fn a_later_repository_failing_rolls_back_the_earlier_ones() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mut first = repo(&dir.path().join("first"));
+        first.name = "first".to_string();
+        let mut second = repo(&dir.path().join("second"));
+        second.name = "second".to_string();
+
+        // The second repository already has the branch this work would cut,
+        // so its `git worktree add -b` fails — after the first succeeded.
+        let branch = work_branch("01PARTIAL");
+        git(&second.path, &["branch", &branch]).expect("pre-create the colliding branch");
+
+        let err = materialize(data.path(), "01PARTIAL", &[first.clone(), second])
+            .expect_err("the second repository must fail");
+        let SurfaceError::PartialFailure { source, teardown } = err else {
+            panic!("expected a partial failure, got {err}");
+        };
+        assert!(
+            source.to_string().contains(&branch),
+            "the original git diagnostic must survive: {source}"
+        );
+
+        // Everything the request did create is torn down and named.
+        assert_eq!(teardown.bindings.len(), 1, "only the first got that far");
+        assert_eq!(teardown.bindings[0].repository, "first");
+        assert_eq!(
+            teardown.bindings[0].disposition,
+            BindingDisposition::Removed
+        );
+        assert!(teardown.clean);
+        assert!(
+            !teardown.bindings[0].worktree_path.exists(),
+            "the rolled-back worktree must be gone"
+        );
+        // The branch is retained, as teardown always retains branches — but
+        // the report names it, so it is recorded rather than a mystery.
+        assert_eq!(teardown.bindings[0].work_branch, branch);
+        assert!(
+            git_succeeds(
+                &first.path,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}")
+                ]
+            ),
+            "teardown retains branches by contract"
+        );
+    }
+
+    /// §11's "outside every checkout" is a statement about directories, not
+    /// about how a path happens to be spelled. A data dir reached through a
+    /// symlink into the repository is the same directory, and must be
+    /// refused the same way.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_cannot_smuggle_a_surface_into_the_checkout() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let source = dir.path().join("solo");
+        let mut spec = repo(&source);
+        spec.path = std::fs::canonicalize(&source).expect("canonical repo");
+
+        // A second route to the very same directory.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&source, &link).expect("symlink");
+        let data_dir_via_link = link.join(".sergeant-data");
+
+        let err = materialize(&data_dir_via_link, "01LINK", std::slice::from_ref(&spec))
+            .expect_err("the symlinked route is still inside the checkout");
+        assert!(
+            matches!(err, SurfaceError::InsideSourceCheckout { .. }),
+            "expected a refusal, got {err}"
+        );
+        assert!(
+            !source.join(".sergeant-data/01LINK/solo").exists(),
+            "a refused surface must leave no worktree"
+        );
     }
 
     /// A surface with no repositories could never execute anything.

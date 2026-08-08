@@ -38,6 +38,59 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### M3 — Work Surfaces, Workflow Engine, Routing, Fake Backend (2026-08-08)
+
+**Mission outcome: contract met, gates green.** Shipped: zero-config and
+multi-repo workspace discovery; git-worktree work surfaces with full binding
+records, fail-closed teardown, partial-failure rollback, and stale-registration
+pruning; the §12 staged workflow engine (versioned filesystem workflows, run
+pins its resolved definition in the journal, stage state structurally separate
+from Work state); the §15 backend trait (M3 subset) with the §37 scriptable
+fake backend; §13 routing precedence with origin affinity and
+fail-with-options; §14 profiles with a credential boundary; §25 restart
+reconciliation with per-work fail-closed isolation; traversal-guarded workflow
+and repository names. Evidence: fmt/clippy -D/test green, **96 tests** (41 lib
++ 10 M1 + 21 M2 + 24 M3), all eight contract acceptance tests real, M3 suite
+0 failures across 10 consecutive runs (flake check), verified by the
+orchestrator.
+
+**Environmental behavior.** Economy cadence, ~38 agents total across two
+workflows + pipeline. Round 1 (in-workflow): 12 findings, 9 confirmed — incl.
+a submit crash-window strand (same adjacent-append class as M2's exact-once
+window) and a vacuous recovery test (test-honesty's third error in three
+milestones). Checkpoint gate: **11 findings, 2 errors, zero overlap with the
+panel's 12** — client-supplied workflow-name path traversal and duplicate-repo
+worktree poisoning; all 11 authorized in one respond with the F8 ruling
+(fail closed per-work, never per-daemon) and R2 guard-pattern instructions;
+pipeline applied them (5a60f49) but its test-step agent died (infra, not
+code — verified green locally). Round 2 (lean): 28 findings, **20 confirmed**,
+headline: the entire gate-fix commit reverted with all 75 tests green — two
+traversal guards and a recovery-semantics change carried by prose alone; plus
+~5% parallel-run flake in the M3 suite, two real gaps in the F1/F3 fixes, and
+Ponytail findings on the gate commit's own machinery. Fixer (interrupted once
+by the session limit, resumed from cache) closed all 20: 13 pinning tests, 19
+mutation probes all killed, traversal predicate unified into one
+`is_plain_name`, same-path duplicate detection via already-computed rev-parse,
+prune-on-rematerialize, flake eliminated. Two session-limit interruptions and
+one pipeline infra failure this milestone; cache-resume recovered all three
+with zero rework.
+
+**Adjudication rulings.**
+1. F8 (gate ask-user): reconcile isolates failures per work — a failing work
+   blocks itself with evidence; the fleet and the daemon start regardless.
+2. Round-2 C-findings on the gate commit accepted wholesale — the
+   unpinned-fix discovery is a method lesson (LESSONS L7), not a shortcut.
+3. Pipeline test-step death ruled infrastructure after local verification;
+   no rerun — the lean round and final gate both still stood between the
+   fixes and the close.
+
+**Shipping gates.** Checkpoint gate 01KZHCBRH365H8X4TPNVC5P2P8: review found
+11 (all fixed), then its test step's agent died — outcome failed on infra,
+fixes recovered via `axi sync --recover`, verified green locally. Final gate:
+recorded below after the run.
+
+---
+
 ### M2 — Daemon, API, CLI, Idempotency (2026-08-08)
 
 **Mission outcome: contract met, gates green.** Shipped: §10 Work state machine

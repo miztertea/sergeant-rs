@@ -127,6 +127,7 @@ struct FakeState {
     executions: BTreeMap<String, FakeExecution>,
     starts: Vec<StartRequest>,
     stop_requests: Vec<String>,
+    observations: Vec<String>,
     available: bool,
     detail: Option<String>,
 }
@@ -167,6 +168,7 @@ impl FakeBackend {
                 executions: BTreeMap::new(),
                 starts: Vec::new(),
                 stop_requests: Vec::new(),
+                observations: Vec::new(),
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
             })),
@@ -188,6 +190,16 @@ impl FakeBackend {
     /// Execution ids STOP was requested for, in order.
     pub fn stop_requests(&self) -> Vec<String> {
         self.lock().stop_requests.clone()
+    }
+
+    /// Execution ids OBSERVE was called for, in order.
+    ///
+    /// OBSERVE is the one backend call the engine could plausibly make twice
+    /// for one decision, and the two answers are not guaranteed to agree — so
+    /// how many times it was asked is a property tests need to assert, not an
+    /// implementation detail.
+    pub fn observations(&self) -> Vec<String> {
+        self.lock().observations.clone()
     }
 
     /// Inputs delivered to one execution, in order.
@@ -329,7 +341,8 @@ impl Backend for FakeBackend {
     }
 
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.observations.push(handle.execution_id.clone());
         let execution = self.resolve(&state, handle)?;
         Ok(Observation {
             native: execution.step.native,
@@ -345,21 +358,14 @@ impl Backend for FakeBackend {
     fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
         let mut state = self.lock();
         state.stop_requests.push(handle.execution_id.clone());
-        let name = self.name.clone();
-        let unknown = || BackendError::UnknownExecution {
-            backend: name.clone(),
-            execution_id: handle.execution_id.clone(),
-        };
+        // One identity rule, checked in one place: a handle that has lost its
+        // native id, or carries one from another context, must not be able to
+        // stop an execution it does not actually name.
+        self.resolve(&state, handle)?;
         let execution = state
             .executions
             .get_mut(&handle.execution_id)
-            .ok_or_else(unknown)?;
-        // Same identity check as `resolve`: a handle that has lost its
-        // native id, or carries one from another context, must not be able
-        // to stop an execution it does not actually name.
-        if handle.native_id.as_deref() != Some(execution.native_id.as_str()) {
-            return Err(unknown());
-        }
+            .expect("presence checked above");
         execution.stopped = true;
         if !execution.step.ignores_stop {
             // A compliant context exits and stops signalling about the stage.
@@ -457,6 +463,10 @@ mod tests {
     /// for sergeant's own id. A handle that lost the native id, or carries
     /// another context's, is unrecognised — so the id sergeant journals at
     /// START has to be the id it presents at OBSERVE.
+    ///
+    /// The rule holds for every call that names an execution, not just
+    /// OBSERVE: a forged handle must not be able to read one, feed one, or
+    /// kill one. STOP is the one where getting it wrong is destructive.
     #[test]
     fn a_handle_must_carry_the_native_identity_the_backend_issued() {
         let fake = FakeBackend::new("fake");
@@ -470,14 +480,31 @@ mod tests {
                 execution_id: handle.execution_id.clone(),
                 native_id: wrong,
             };
-            assert!(
-                matches!(
-                    fake.observe(&forged),
-                    Err(BackendError::UnknownExecution { .. })
-                ),
-                "a handle without this context's native identity must not resolve"
-            );
+            for outcome in [
+                fake.observe(&forged).map(|_| ()),
+                fake.send(&forged, "hello"),
+                fake.stop(&forged),
+            ] {
+                assert!(
+                    matches!(outcome, Err(BackendError::UnknownExecution { .. })),
+                    "a handle without this context's native identity must not resolve"
+                );
+            }
         }
+
+        // And none of those refusals touched the execution they named: it is
+        // still live, still unstopped, and still holding its own script.
+        let observed = fake.observe(&handle).expect("still known");
+        assert_eq!(observed.native, NativeState::Running);
+        assert_eq!(
+            observed.evidence.as_deref(),
+            Some("fake backend: native=running, stopped=false"),
+            "a forged STOP must not have retired the execution"
+        );
+        assert!(
+            fake.inputs("e1").is_empty(),
+            "a forged SEND delivered nothing"
+        );
     }
 
     /// §15's capability flags are advertised, and an unsupported capability is

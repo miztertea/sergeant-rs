@@ -17,12 +17,12 @@
 //! Replay yields all events in seq order across segments and fails closed on
 //! a gap or duplicate seq.
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::domain::event::{Event, EventDraft};
-use crate::runtime::fsutil::create_dir_all_durable;
+use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock};
 
 /// Default segment rotation threshold.
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -147,15 +147,14 @@ impl Journal {
         // (tail recovery below mutates files and must run under it). A second
         // live writer on the same dir is refused instead of both handles
         // fsync-acknowledging appends with colliding seqs.
+        let lock_path = journal_dir.join(LOCK_FILE_NAME);
         let lock = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(journal_dir.join(LOCK_FILE_NAME))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(JournalError::Locked),
-            Err(TryLockError::Error(e)) => return Err(e.into()),
+            .open(&lock_path)?;
+        if !take_exclusive_lock(&lock_path, &lock)? {
+            return Err(JournalError::Locked);
         }
 
         let mut segments = list_segments(&journal_dir)?;

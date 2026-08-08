@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::is_plain_name;
+
 /// Workflow directory inside a repository (D1: `.depot/` upstream).
 pub const WORKFLOW_ROOT: &str = ".sergeant/workflows";
 /// Machine-readable workflow descriptor inside a workflow directory.
@@ -368,17 +370,6 @@ fn parse_descriptor(text: &str, path: &str) -> Result<WorkflowFile, WorkflowErro
     })
 }
 
-/// Whether `name` is safe to join directly onto a filesystem path: a single,
-/// non-empty path component with no separators and no `.`/`..`.
-fn is_plain_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains('/')
-        && !name.contains('\\')
-        && name != "."
-        && name != ".."
-        && Path::new(name).components().count() == 1
-}
-
 /// Validate the declared stage order: non-empty, unique, and every id a plain
 /// directory name. The last check is a path-traversal guard — a stage id is
 /// joined onto the workflow directory, and `../../etc` must not read files
@@ -448,6 +439,43 @@ mod tests {
         assert_ne!(workflow.source, SOURCE_EMBEDDED);
     }
 
+    /// The workflow name arrives from the API (`POST /v1/work`'s `workflow`
+    /// field) and is joined straight onto `.sergeant/workflows/`. Without the
+    /// guard, a traversing name reads and parses a `workflow.toml` from
+    /// anywhere on the filesystem — so this test builds exactly that file and
+    /// proves the refusal comes from the *name*, not from the file's absence.
+    #[test]
+    fn a_workflow_name_may_not_escape_the_workflows_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(WORKFLOW_ROOT)).expect("workflows root");
+
+        // A perfectly loadable workflow, outside `.sergeant/workflows/`.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("00-only")).expect("stage dir");
+        std::fs::write(
+            outside.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"outside\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+        )
+        .expect("descriptor");
+        std::fs::write(outside.join("00-only").join(CONTEXT_FILE), "secrets")
+            .expect("stage context");
+        WorkflowDefinition::load_dir(&outside)
+            .expect("the outside workflow really is loadable, so only the guard can refuse it");
+
+        // `.sergeant/workflows/` + `../../outside` is exactly that directory.
+        let escape = "../../outside";
+        assert_eq!(
+            workflow_dir(root, escape),
+            root.join(WORKFLOW_ROOT).join(escape)
+        );
+        let err = WorkflowDefinition::resolve(root, escape).expect_err("must refuse");
+        assert!(
+            matches!(&err, WorkflowError::InvalidName { name } if name == escape),
+            "expected a refusal naming the escape, got {err}"
+        );
+    }
+
     #[test]
     fn malformed_workflows_fail_closed() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -483,6 +511,12 @@ mod tests {
         assert!(matches!(
             WorkflowDefinition::resolve(root, "escape"),
             Err(WorkflowError::InvalidStageId { .. })
+        ));
+
+        // A workflow name may not escape `.sergeant/workflows/` either.
+        assert!(matches!(
+            WorkflowDefinition::resolve(root, "../../etc"),
+            Err(WorkflowError::InvalidName { .. })
         ));
 
         // A typo'd key is refused rather than silently ignored.
