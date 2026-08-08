@@ -1,16 +1,7 @@
 //! Entry point for the `sgt` binary.
 
-mod api;
-mod backend;
-mod cli;
-mod daemon;
-mod domain;
-mod runtime;
-mod telemetry;
-mod tui;
-mod web;
-
 use clap::Parser;
+use sergeant_rs::cli;
 
 /// `sgt` — sergeant-rs command-line entry point.
 #[derive(Parser, Debug)]
