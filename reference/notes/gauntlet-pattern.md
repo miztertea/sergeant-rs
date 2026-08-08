@@ -57,7 +57,9 @@ CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX �
    abort-and-restart to escape a gate. It is a final shipping gate, not an
    implementation loop — if per-milestone runtime proves too heavy, reduce
    cadence and log the change. Tool: no-mistakes v1.47.0 built from source
-   (SHA recorded in the M1 ledger entry), gate agent: local claude CLI.
+   (SHA recorded in the M1 ledger entry), gate agent: local claude CLI pinned
+   to Sonnet via `agent_args_override` (owner decision 2026-08-08 — validation
+   work, not judgment-dense; consistent with the model-assignment table above).
 
 ## Model assignment
 
