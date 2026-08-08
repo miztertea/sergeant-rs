@@ -87,7 +87,10 @@ with zero rework.
 **Shipping gates.** Checkpoint gate 01KZHCBRH365H8X4TPNVC5P2P8: review found
 11 (all fixed), then its test step's agent died — outcome failed on infra,
 fixes recovered via `axi sync --recover`, verified green locally. Final gate:
-recorded below after the run.
+**passed**, zero findings, no pipeline commits. (Two environmental notes: the
+no-mistakes daemon died a second time → `scripts/gate.sh` self-healing runner
+adopted, failure-triggered R7; the pipeline also fails closed on an unclean
+tree — the wrapper gains a status pre-flight at the next natural commit.)
 
 ---
 

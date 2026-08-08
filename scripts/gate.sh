@@ -5,6 +5,7 @@
 # Usage: scripts/gate.sh "<intent>" [extra axi run flags...]
 set -euo pipefail
 intent="$1"; shift
+[ -z "$(git -C /home/user/sergeant-rs status --porcelain)" ] || { echo "gate.sh: tree not clean - commit first" >&2; exit 1; }
 no-mistakes daemon status >/dev/null 2>&1 || IS_SANDBOX=1 no-mistakes daemon start
 pid=$(grep -oE '"pid":[0-9]+' /root/.no-mistakes/daemon.pid | cut -d: -f2)
 grep -qz IS_SANDBOX "/proc/$pid/environ" || { no-mistakes daemon stop; IS_SANDBOX=1 no-mistakes daemon start; }
