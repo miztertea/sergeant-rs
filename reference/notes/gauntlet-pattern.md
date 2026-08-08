@@ -46,6 +46,18 @@ CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX �
    3–4 find calibration, 5+ hit bedrock.)
 7. **MARK & LOG.** Commit; append a ledger entry to `GAUNTLET.md` with two
    scorecards (see below); update `LESSONS.md`.
+7a. **CHECKPOINT GATE** (adopted 2026-08-08, owner-directed; effective from M3).
+   After round 1's fixes leave gates green: checkpoint commit, then a
+   no-mistakes run (`--skip push,pr,ci`). Its confirmed findings join panel
+   round 2's fix input; pipeline fix commits are adopted via `axi sync
+   --recover`. Rationale: M1 showed the pipeline catches what the panel
+   misses (independent method), and the independent signal is worth more
+   while the fixer is still engaged than after MARK & LOG. This deliberately
+   relaxes upstream Sergeant's "final gate, not an implementation loop"
+   doctrine: that rule's cost case (human-driven, repeated restarts) does not
+   apply to a bounded two-passes-per-milestone autonomous cadence. Not a
+   per-round interleave — the pipeline validates committed branch state, and
+   more than two passes re-validates barely-changed code.
 8. **SHIPPING GATE** (adopted 2026-08-08, R5 — installed dependency supplies
    independent final validation; method + lineage diverse from the critic panel:
    own pipeline, own agent invocation, fresh disposable worktree). After the
