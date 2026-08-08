@@ -15,19 +15,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router, body::Bytes};
+use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
-use tower::ServiceBuilder;
 
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::work::{
@@ -101,6 +100,10 @@ pub struct ApiState {
     pub token: String,
     /// Data dir this daemon owns (reported by `/v1/system`).
     pub data_dir: PathBuf,
+    /// Flipped to `true` when the daemon starts shutting down. Endpoints
+    /// whose response body never ends on its own — the SSE tail — watch this
+    /// and finish, because graceful shutdown waits for in-flight responses.
+    pub closing: watch::Receiver<bool>,
 }
 
 /// Build the axum router for the full v1 surface.
@@ -112,12 +115,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/events", get(event_history))
         .route("/events/stream", get(event_stream))
         .route("/system", get(system_info))
-        // Composed as a tower stack so the layer order reads top-down
-        // (outermost first) as the surface grows.
-        .layer(ServiceBuilder::new().layer(middleware::from_fn_with_state(
+        .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
-        )));
+        ));
     Router::new()
         .route("/healthz", get(healthz))
         .nest("/v1", v1)
@@ -190,17 +191,19 @@ fn api_source() -> EventSource {
     EventSource::new("daemon", "api")
 }
 
-/// Parse a request body strictly, answering a structured 400 on failure
+/// Unwrap a JSON body extraction, answering a structured error on failure
 /// (axum's stock `Json` rejection is plain text; errors here are contracted
-/// to be structured JSON).
-fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {
-    serde_json::from_slice(body).map_err(|e| {
-        Box::new(error_response(
-            StatusCode::BAD_REQUEST,
+/// to be structured JSON). The rejection's own status is kept, so a
+/// wrong content type stays a 415 and a bad shape a 422.
+fn parse_body<T>(body: Result<Json<T>, JsonRejection>) -> Result<T, Box<Response>> {
+    match body {
+        Ok(Json(value)) => Ok(value),
+        Err(rejection) => Err(Box::new(error_response(
+            rejection.status(),
             "invalid_request",
-            format!("invalid JSON body: {e}"),
-        ))
-    })
+            format!("invalid JSON body: {}", rejection.body_text()),
+        ))),
+    }
 }
 
 /// Unwrap a query-string extraction, answering a structured 400 on failure
@@ -303,8 +306,11 @@ struct SubmitRequest {
 /// result forever (§26). Only the two failures that leave no usable command
 /// identity — an unparseable body, and a `command_id` that is not a ULID —
 /// answer without a journal record: there is no key to record them under.
-async fn submit_work(State(state): State<ApiState>, body: Bytes) -> Response {
-    let req: SubmitRequest = match parse_body(&body) {
+async fn submit_work(
+    State(state): State<ApiState>,
+    body: Result<Json<SubmitRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
         Ok(r) => r,
         Err(resp) => return *resp,
     };
@@ -416,9 +422,9 @@ struct CancelRequest {
 async fn cancel_work(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-    body: Bytes,
+    body: Result<Json<CancelRequest>, JsonRejection>,
 ) -> Response {
-    let req: CancelRequest = match parse_body(&body) {
+    let req = match parse_body(body) {
         Ok(r) => r,
         Err(resp) => return *resp,
     };
@@ -539,10 +545,42 @@ async fn event_stream(
         None => query.from,
     };
     let (tx, rx) = mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
-    tokio::spawn(forward_events(state, from, tx));
+    tokio::spawn(pump_until_closing(state, from, tx));
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
         .into_response()
+}
+
+/// Run one subscriber's pump, but never past the daemon's shutdown.
+///
+/// Graceful shutdown waits for in-flight responses, and an SSE body is
+/// in-flight until its stream ends — which a live tail never does on its own.
+/// Without this, one attached tail pins the daemon alive forever: no
+/// `daemon.stopped`, no descriptor removal, every later client stuck in the
+/// ambiguous "PID alive but endpoint unresponsive" branch. Cancelling the
+/// pump drops its channel, which ends the stream and completes the response
+/// wherever the pump happened to be.
+async fn pump_until_closing(
+    state: ApiState,
+    from: u64,
+    tx: mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
+) {
+    let mut closing = state.closing.clone();
+    tokio::select! {
+        () = forward_events(state, from, tx) => {}
+        () = daemon_closing(&mut closing) => {}
+    }
+}
+
+/// Resolve once the daemon is shutting down — immediately if it already is,
+/// so a stream opened during shutdown cannot miss the signal and hang.
+async fn daemon_closing(closing: &mut watch::Receiver<bool>) {
+    let already = *closing.borrow();
+    if already {
+        return;
+    }
+    // A dropped sender means the daemon is gone too: either way, stop.
+    let _ = closing.changed().await;
 }
 
 /// Pump for one SSE subscriber: history after `from`, then the live tail,

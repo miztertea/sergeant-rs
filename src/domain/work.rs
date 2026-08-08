@@ -23,7 +23,10 @@ pub const KIND_COMMAND_REJECTED: &str = "command.rejected";
 
 /// The §10 work states. Workflow stage is orthogonal and deliberately not a
 /// state here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+// No `PartialOrd`/`Ord`: states are a set with a transition table, not a
+// scale, and a derived ordering would silently bless declaration order as
+// meaning something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkState {
     /// Accepted, not yet picked up by an execution.

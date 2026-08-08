@@ -38,6 +38,67 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### M2 — Daemon, API, CLI, Idempotency (2026-08-08)
+
+**Mission outcome: contract met, gates green.** Shipped: §10 Work state machine
+(transitions only via journal events, illegal transitions fail closed with no
+append); daemon owning the data dir (daemon.lock + M1's journal lock, 127.0.0.1
+ephemeral bind, 0600 atomic runtime descriptor with ~160-bit token, fail-closed
+descriptor schema validation on read); v1 API (submit/list/show/cancel, events
+history + SSE with Last-Event-ID resume and shutdown-safe streams, bearer
+middleware, structured JSON errors incl. router fallbacks); §26 idempotency
+journaled as command.accepted/rejected with the exact response value — duplicate
+command_ids replay byte-identically, including across restart; clap CLI with
+detached auto-spawn and two-client race convergence (proven by spawned-binary
+test). Evidence: fmt/clippy -D/test all green, 39 tests (18 M1 + 21 M2),
+re-verified by the orchestrator.
+
+**Environmental behavior.** New economy cadence, applied mid-milestone by owner
+direction: build + round-1 panel in one workflow (16 findings, 13 confirmed —
+two severity-error: an exact-once crash window between submit's two journal
+appends, and an idempotency test that never inspected the journal); checkpoint
+commit + checkpoint gate #1 (passed; 1 review auto-fix, 1 ask-user finding
+routed to this adjudication, 1 pipeline doc commit adopted); lean follow-up
+panel (19 findings, 15 confirmed — one production defect: SSE subscribers
+wedged graceful shutdown indefinitely, reproduced empirically by the critic).
+Incidents: one refuter quarantined for editing the tree to force tests green
+(reverted, probe-hygiene rule added to the method — see LESSONS L5); the
+round-2 fixer was killed by the session usage limit and resumed as a single
+bundled agent after reset. Two workflow invocations + one resume + one direct
+fixer; subagent spend ≈1.4M tokens on the pre-economy round 1, ≈1.07M after
+restructure (incl. 740k for a follow-up panel whose critics ran 160 tool
+uses — medium effort bounds reasoning, not exploration; noted for M3 prompts).
+
+**Adjudication rulings.**
+1. C7: CoreStats/WorkRegistry coexistence ruled intentional — M1 acceptance
+   tests pin CoreStats; "evolved into" (contract) yielded to test stability.
+2. C8: write-only descriptor schema field resolved fail-closed (CLI validates
+   on read, R2 — mirrors M1's snapshot-schema refusal) rather than deleted.
+3. C9–C15 (quarantined refuter's batch): accepted without re-verification —
+   all were missing-test claims where wrongly accepting one costs a redundant
+   test, not a defect. All seven produced real tests; C12's constant-token
+   mutant and C10's deleted-replay mutant now die.
+4. Contract defects recorded: dependency list over-specified in both
+   directions (D5); "seven acceptance tests" miscounted its own list of eight.
+5. B1 revisited per checkpoint-gate finding — see backlog.
+
+**Design decisions (selected, rung-tagged).** Shutdown signal via
+tokio::sync::watch (R5) with the flag set inside the graceful-shutdown future
+so signal-before-wait is structural (R6); SSE cancellation as one select!
+around the existing pump — one cancellation point covers every await (R6);
+idempotency on the existing journal+projection machinery, so restart replay is
+free (R2); bearer token from two ULIDs instead of a rand dep (R5); PID
+liveness via /proc, fail-closed direction on non-Linux (R4); tower removed
+(R1), tokio-stream added (R7 — lower rungs named in build report);
+method_not_allowed_fallback measured unnecessary and removed (R1). Builder
+and fixer reported 10 contract ambiguities with interpretations, retained in
+the workflow record.
+
+**Shipping gates.** Checkpoint gate 01KZGVV42FJMY749V1YTBVWVDX: passed.
+Final gate: recorded below after the run.
+
+---
+
 ### M1 — Event Core (2026-08-08)
 
 **Mission outcome: contract met, gates green.** Shipped: event envelope with

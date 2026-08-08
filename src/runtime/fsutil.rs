@@ -38,16 +38,7 @@ pub(crate) fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
 /// mix. Replacement arrives as a new inode (rename), never as an in-place
 /// truncate of the destination.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp-{}", ulid::Ulid::generate()));
-    let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_data()?;
-    drop(file);
-    fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    write_atomic_mode(path, bytes, None)
 }
 
 /// [`write_atomic`], but the file is born owner-only (mode `0600` on Unix):
@@ -56,14 +47,24 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// not even between write and a later chmod. Used for the runtime descriptor,
 /// which carries the bearer token.
 pub(crate) fn write_atomic_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode(path, bytes, Some(0o600))
+}
+
+/// The one crash-consistency recipe both public writers use, so a future fix
+/// to the durability sequence lands in one place: write a uniquely-named tmp
+/// file next to `path` (created with `mode`, when given, before any bytes
+/// exist), fsync it, rename it over `path`, fsync the directory.
+fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", ulid::Ulid::generate()));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
-    {
+    if let Some(mode) = mode {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode; // No file modes to honour off Unix.
     let mut file = options.open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_data()?;

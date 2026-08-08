@@ -18,9 +18,11 @@
 //!
 //! Plus, beyond the numbered list: stale/ambiguous descriptor handling per
 //! the contract's auto-spawn clause (including two clients replacing the same
-//! stale descriptor), the crash image between a mutation append and its
-//! command record, journaled rejections, the daemon's own use of the
-//! transition table, and structured errors on malformed query strings.
+//! stale descriptor), an unknown descriptor schema, the crash image between a
+//! mutation append and its command record, journaled rejections, the daemon's
+//! own use of the transition table, structured errors on malformed queries,
+//! bodies, command ids and resume headers, the router's own 404/405, and
+//! shutdown with a live SSE tail attached.
 
 use std::path::Path;
 use std::process::Output;
@@ -72,6 +74,52 @@ async fn submit(
     let bytes = resp.bytes().await.expect("submit body").to_vec();
     let value: Value = serde_json::from_slice(&bytes).expect("submit json");
     (status, bytes, value)
+}
+
+/// Cancel `work_id`; returns (status, exact response bytes).
+async fn cancel(
+    http: &reqwest::Client,
+    handle: &DaemonHandle,
+    work_id: &str,
+    command_id: &str,
+) -> (reqwest::StatusCode, Vec<u8>) {
+    let resp = http
+        .post(format!("{}/v1/work/{work_id}/cancel", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": command_id}))
+        .send()
+        .await
+        .expect("cancel request");
+    let status = resp.status();
+    let bytes = resp.bytes().await.expect("cancel body").to_vec();
+    (status, bytes)
+}
+
+/// Seqs returned by `GET /v1/events`, optionally with `?from=`.
+async fn history_seqs(
+    http: &reqwest::Client,
+    handle: &DaemonHandle,
+    from: Option<u64>,
+) -> Vec<u64> {
+    let url = match from {
+        Some(seq) => format!("{}/v1/events?from={seq}", handle.endpoint),
+        None => format!("{}/v1/events", handle.endpoint),
+    };
+    let body: Value = http
+        .get(url)
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("history")
+        .json()
+        .await
+        .expect("history json");
+    body["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .map(|e| e["seq"].as_u64().expect("seq"))
+        .collect()
 }
 
 /// Every event in a data dir's journal, in seq order.
@@ -167,7 +215,8 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     );
     assert_eq!(descriptor.pid, std::process::id());
     assert_eq!(descriptor.api_revision, "v1");
-    assert!(!descriptor.token.is_empty());
+    assert_eq!(descriptor.token, handle.token);
+    assert_token_plausible(&descriptor.token);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -187,10 +236,41 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     assert_eq!(resp.status(), 200);
 
     // Clean shutdown removes the descriptor.
+    let first_token = descriptor.token.clone();
     handle.shutdown().await;
     assert!(
         !path.exists(),
         "descriptor must be removed on clean shutdown"
+    );
+
+    // The token is fresh randomness per daemon, not a build-time constant:
+    // a successor on the same data dir publishes a different one. This is
+    // not only auth strength — the client's stale-descriptor identity check
+    // (`is_stale_descriptor`: endpoint + pid + token) is only sound because
+    // a successor's descriptor can never compare equal to the stale one.
+    let successor = start(dir.path()).await;
+    let second_token = successor.token.clone();
+    assert_token_plausible(&second_token);
+    assert_ne!(
+        first_token, second_token,
+        "each daemon must publish a fresh random token"
+    );
+    successor.shutdown().await;
+}
+
+/// A bearer token must be long, high-entropy-looking, and safe to put in a
+/// header: two Crockford-base32 ULIDs' worth of uppercase alphanumerics.
+fn assert_token_plausible(token: &str) {
+    assert!(
+        token.len() >= 32,
+        "token is too short to be random ({} chars): {token}",
+        token.len()
+    );
+    assert!(
+        token
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+        "token must be uppercase base32 alphanumerics: {token}"
     );
 }
 
@@ -551,6 +631,196 @@ async fn malformed_query_string_is_a_structured_error() {
     handle.shutdown().await;
 }
 
+/// `GET /v1/events` is contracted as "history, from a given seq". Every
+/// cut point must yield exactly the tail after it — an implementation that
+/// ignored `from` and always replayed everything would still satisfy a test
+/// that only ever calls the route bare.
+#[tokio::test]
+async fn event_history_from_seq_returns_exactly_the_tail() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+    submit(&http, &handle, &ulid(), "first").await;
+    let (_, _, body) = submit(&http, &handle, &ulid(), "second").await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    cancel(&http, &handle, &work_id, &ulid()).await;
+
+    // daemon.started + 2×(work.submitted, command.accepted) + work.canceled
+    // + command.accepted.
+    let all = history_seqs(&http, &handle, None).await;
+    assert_eq!(all.len(), 7, "unexpected history: {all:?}");
+    assert_eq!(all, (1..=7).collect::<Vec<u64>>(), "seqs are 1..n in order");
+
+    // from=N ⇒ exactly the events after N, for every N in the history.
+    for (cut, from) in all.iter().copied().enumerate() {
+        assert_eq!(
+            history_seqs(&http, &handle, Some(from)).await,
+            all[cut + 1..].to_vec(),
+            "?from={from} must return exactly the events after it"
+        );
+    }
+    // from=0 is the whole history; past the end is empty, not an error.
+    assert_eq!(history_seqs(&http, &handle, Some(0)).await, all);
+    assert!(
+        history_seqs(&http, &handle, Some(all.len() as u64 + 1))
+            .await
+            .is_empty(),
+        "a from beyond the last seq yields nothing"
+    );
+    handle.shutdown().await;
+}
+
+/// The router's own errors are part of "errors are structured JSON": an
+/// unknown route and a known route hit with the wrong method must answer
+/// with the same `{"error": {...}}` shape as any handler, not axum's stock
+/// empty body.
+#[tokio::test]
+async fn unknown_route_and_wrong_method_answer_structured_json() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+    let work_id = "01AN4Z07BY79KA1307SR9X4MV3";
+
+    for path in ["/nope", "/v1/nope", &format!("/v1/work/{work_id}/nope")] {
+        let resp = http
+            .get(format!("{}{path}", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .expect("unknown route request");
+        assert_eq!(resp.status(), 404, "expected 404 for {path}");
+        assert_json_error(resp, "not_found").await;
+    }
+
+    // Wrong method on a known route, at both router levels: `/healthz` on the
+    // outer router, the cancel and show routes inside the nested `/v1`.
+    let resp = http
+        .post(format!("{}/healthz", handle.endpoint))
+        .send()
+        .await
+        .expect("wrong method on healthz");
+    assert_eq!(resp.status(), 405);
+    assert_json_error(resp, "method_not_allowed").await;
+
+    for (method, path) in [
+        ("GET", format!("/v1/work/{work_id}/cancel")),
+        ("POST", format!("/v1/work/{work_id}")),
+    ] {
+        let url = format!("{}{path}", handle.endpoint);
+        let request = match method {
+            "GET" => http.get(url),
+            _ => http.post(url),
+        };
+        let resp = request
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .expect("wrong method request");
+        assert_eq!(resp.status(), 405, "expected 405 for {method} {path}");
+        assert_json_error(resp, "method_not_allowed").await;
+    }
+    handle.shutdown().await;
+}
+
+/// Requests the daemon cannot even key by command id — an unparseable body,
+/// a `command_id` that is not a ULID — and a malformed resume header must
+/// answer structured 4xx errors, and must leave nothing in the journal:
+/// there is no command identity to record them under.
+#[tokio::test]
+async fn malformed_bodies_command_ids_and_resume_headers_are_structured_errors() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+    let work_id = "01AN4Z07BY79KA1307SR9X4MV3";
+    let before = event_count(&http, &handle).await;
+
+    // Not a ULID → 400 invalid_command_id, on every mutation route.
+    for (path, body) in [
+        ("/v1/work", json!({"command_id": "nope", "intent": "hi"})),
+        (
+            "/v1/work/01AN4Z07BY79KA1307SR9X4MV3/cancel",
+            json!({"command_id": "nope"}),
+        ),
+    ] {
+        let resp = http
+            .post(format!("{}{path}", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&body)
+            .send()
+            .await
+            .expect("bad command_id request");
+        assert_eq!(resp.status(), 400, "expected 400 for {path}");
+        assert_json_error(resp, "invalid_command_id").await;
+    }
+
+    // Unparseable and mis-shaped bodies → structured 4xx invalid_request.
+    for (path, body) in [
+        ("/v1/work", "{ not json"),
+        ("/v1/work", r#"{"intent": "no command id"}"#),
+        (&format!("/v1/work/{work_id}/cancel"), "]"),
+    ] {
+        let resp = http
+            .post(format!("{}{path}", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("bad body request");
+        assert!(
+            resp.status().is_client_error(),
+            "expected a 4xx for body {body:?} on {path}, got {}",
+            resp.status()
+        );
+        assert_json_error(resp, "invalid_request").await;
+    }
+
+    // A resume header that is not a decimal seq → 400, not a silent restart
+    // of the stream from the beginning.
+    let resp = http
+        .get(format!("{}/v1/events/stream", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .header("Last-Event-ID", "not-a-seq")
+        .send()
+        .await
+        .expect("bad resume header request");
+    assert_eq!(resp.status(), 400);
+    assert_json_error(resp, "invalid_request").await;
+
+    // None of it was journaled: these fail before any command identity exists.
+    assert_eq!(
+        event_count(&http, &handle).await,
+        before,
+        "unkeyable requests must append no events"
+    );
+    handle.shutdown().await;
+}
+
+/// Assert a response is a structured JSON error with `code`.
+async fn assert_json_error(resp: reqwest::Response, code: &str) {
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(
+        content_type
+            .as_deref()
+            .map(|v| v.starts_with("application/json")),
+        Some(true),
+        "errors are structured JSON, got content-type {content_type:?} with {status}",
+    );
+    let body: Value = resp.json().await.expect("error body json");
+    assert_eq!(body["error"]["code"], code, "error body was {body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
+        "an error must carry a message: {body}"
+    );
+}
+
 #[tokio::test]
 async fn t5_cancel_semantics_and_state_machine() {
     let dir = TempDir::new().expect("tempdir");
@@ -683,6 +953,73 @@ async fn t5b_daemon_refuses_an_illegal_transition_and_appends_no_state_event() {
     );
 }
 
+/// §26 binds *every* mutation, not just submit: a repeated `command_id` on
+/// the cancel route must replay the recorded outcome without re-executing.
+/// A fresh command_id hits the already-canceled branch instead, so only a
+/// resend of the same id exercises the replay guard — and only the journal
+/// can tell the two apart.
+#[tokio::test]
+async fn duplicate_cancel_command_id_replays_the_recorded_outcome() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+    let (_, _, body) = submit(&http, &handle, &ulid(), "cancel me twice").await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+
+    let command_id = ulid();
+    let (s1, b1) = cancel(&http, &handle, &work_id, &command_id).await;
+    assert_eq!(s1, 200);
+    let before = event_count(&http, &handle).await;
+    let (s2, b2) = cancel(&http, &handle, &work_id, &command_id).await;
+    assert_eq!(s2, s1, "the duplicate must replay the recorded status");
+    assert_eq!(b1, b2, "the duplicate must be byte-identical");
+    assert_eq!(
+        event_count(&http, &handle).await,
+        before,
+        "a replayed cancel must append no events"
+    );
+
+    // The same holds for a *rejected* cancel: one command_id, one recorded
+    // 404, no second rejection appended.
+    let missing_id = ulid();
+    let (s3, b3) = cancel(&http, &handle, "01AN4Z07BY79KA1307SR9X4MV3", &missing_id).await;
+    assert_eq!(s3, 404);
+    let before = event_count(&http, &handle).await;
+    let (s4, b4) = cancel(&http, &handle, "01AN4Z07BY79KA1307SR9X4MV3", &missing_id).await;
+    assert_eq!((s4, &b4), (s3, &b3));
+    assert_eq!(event_count(&http, &handle).await, before);
+
+    handle.shutdown().await;
+
+    // And across a restart, from the journal rather than from memory.
+    let handle = start(dir.path()).await;
+    let http = client();
+    let (s5, b5) = cancel(&http, &handle, &work_id, &command_id).await;
+    assert_eq!(s5, s1);
+    assert_eq!(b5, b1, "post-restart duplicate must be byte-identical");
+    handle.shutdown().await;
+
+    let events = journal_events(dir.path());
+    for id in [&command_id, &missing_id] {
+        let recorded: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                (e.kind == KIND_COMMAND_ACCEPTED || e.kind == KIND_COMMAND_REJECTED)
+                    && e.payload["command_id"] == id.as_str()
+            })
+            .collect();
+        assert_eq!(recorded.len(), 1, "exactly one command record for {id}");
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.kind == KIND_WORK_CANCELED)
+            .count(),
+        1,
+        "three cancels under one command_id must transition once"
+    );
+}
+
 /// Read SSE frames from a live response until `count` events (or timeout).
 /// Returns (seq, kind, data-json) triples.
 async fn read_sse_events(resp: &mut reqwest::Response, count: usize) -> Vec<(u64, String, Value)> {
@@ -769,7 +1106,11 @@ async fn t6_sse_live_tail_and_resume_from_seq() {
     assert_eq!(events[1].1, "command.accepted");
     drop(stream);
 
-    // Resume from seq N: exactly the events after N, in order.
+    // Resume from seq N: exactly the events after N, in order. Reading only
+    // as far as the expected frames would not see a duplicate or spurious
+    // frame arriving behind them, so append two more events after resuming
+    // and assert the *whole* tail — replayed history and live continuation —
+    // matches frame for frame.
     let mut resumed = http
         .get(format!("{}/v1/events/stream", handle.endpoint))
         .header("Last-Event-ID", last_seq.to_string())
@@ -777,16 +1118,88 @@ async fn t6_sse_live_tail_and_resume_from_seq() {
         .send()
         .await
         .expect("sse resume");
-    let events = read_sse_events(&mut resumed, 2).await;
-    let seqs: Vec<u64> = events.iter().map(|(seq, _, _)| *seq).collect();
+    let (_, _, body) = submit(&http, &handle, &ulid(), "sse resume event").await;
+    let second_work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let events = read_sse_events(&mut resumed, 4).await;
+    let tail: Vec<(u64, &str)> = events
+        .iter()
+        .map(|(seq, kind, _)| (*seq, kind.as_str()))
+        .collect();
     assert_eq!(
-        seqs,
-        vec![last_seq + 1, last_seq + 2],
-        "resume must yield exactly the events after N"
+        tail,
+        vec![
+            (last_seq + 1, "work.submitted"),
+            (last_seq + 2, "command.accepted"),
+            (last_seq + 3, "work.submitted"),
+            (last_seq + 4, "command.accepted"),
+        ],
+        "resume must yield exactly the events after N — no gaps, repeats, \
+         or replays from the start"
     );
+    assert_eq!(events[0].2["work_id"], work_id.as_str());
+    assert_eq!(events[2].2["work_id"], second_work_id.as_str());
     drop(resumed);
 
     handle.shutdown().await;
+}
+
+/// Graceful shutdown must not wait on a body that never ends. A live SSE tail
+/// is the steady state for any monitoring client, and axum's graceful
+/// shutdown waits for in-flight responses — so unless the daemon force-closes
+/// its streams, one attached tail means `daemon.stopped` is never journaled,
+/// the descriptor is never removed, and every later client lands in the
+/// ambiguous "PID alive but endpoint unresponsive" fail-closed branch.
+#[tokio::test]
+async fn shutdown_completes_with_a_live_sse_client_attached() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+    let path = daemon::descriptor_path(dir.path());
+
+    let mut stream = http
+        .get(format!("{}/v1/events/stream", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("sse connect");
+    assert_eq!(stream.status(), 200);
+    // Read the replayed daemon.started frame: the pump is genuinely attached
+    // and streaming, not merely requested.
+    assert_eq!(
+        read_sse_events(&mut stream, 1).await.len(),
+        1,
+        "the SSE client must be attached before shutdown"
+    );
+
+    tokio::time::timeout(Duration::from_secs(15), handle.shutdown())
+        .await
+        .expect("shutdown must not block on a live SSE tail");
+
+    assert!(
+        !path.exists(),
+        "descriptor must be removed even with an SSE client attached"
+    );
+    let kinds: Vec<String> = journal_events(dir.path())
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(
+        kinds.contains(&daemon::KIND_DAEMON_STOPPED.to_string()),
+        "daemon.stopped must be journaled even with an SSE client attached, got {kinds:?}"
+    );
+
+    // The stream itself ends rather than dangling on a dead daemon.
+    let closed = tokio::time::timeout(Duration::from_secs(5), stream.chunk())
+        .await
+        .expect("the SSE stream must be closed by shutdown, not left open");
+    assert!(
+        matches!(closed, Ok(None) | Err(_)),
+        "the stream must end, not deliver more frames: {closed:?}"
+    );
+
+    // And the data dir is reusable immediately: the lock went with the daemon.
+    let successor = start(dir.path()).await;
+    successor.shutdown().await;
 }
 
 /// Run the sgt binary with args against a data dir; capture output.
@@ -854,6 +1267,94 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     assert!(
         stderr.contains("another daemon"),
         "second daemon should explain the lock, got: {stderr}"
+    );
+
+    stop_daemon(dir.path());
+}
+
+/// The rest of the contracted CLI surface through the spawned binary:
+/// `sgt status`, `sgt work show <id>`, `sgt cancel <id>`, in both human and
+/// `--json` form. Everything here talks to a real daemon over the loopback
+/// API — no in-process shortcuts.
+#[test]
+fn t7b_cli_status_show_and_cancel_through_the_binary() {
+    let dir = TempDir::new().expect("tempdir");
+
+    // Auto-spawn + submit, reading the id straight out of --json.
+    let output = sgt(dir.path(), &["--json", "run", "inspect me"]);
+    assert!(
+        output.status.success(),
+        "sgt run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let submitted: Value = serde_json::from_slice(&output.stdout).expect("run --json prints JSON");
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("submitted work id")
+        .to_string();
+
+    // `sgt status`, human: daemon health plus the counts.
+    let output = sgt(dir.path(), &["status"]);
+    assert!(
+        output.status.success(),
+        "sgt status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("daemon ok"), "status said: {stdout}");
+    assert!(stdout.contains("work: 1 total"), "status said: {stdout}");
+    assert!(stdout.contains("pending: 1"), "status said: {stdout}");
+
+    // `sgt status --json`: the same facts, machine-shaped.
+    let output = sgt(dir.path(), &["status", "--json"]);
+    assert!(output.status.success());
+    let status: Value = serde_json::from_slice(&output.stdout).expect("status --json prints JSON");
+    assert_eq!(status["work_total"], 1);
+    assert_eq!(status["work_by_state"]["pending"], 1);
+    assert_eq!(status["system"]["api_revision"], "v1");
+    assert_eq!(
+        status["system"]["data_dir"].as_str(),
+        Some(dir.path().to_string_lossy().as_ref())
+    );
+
+    // `sgt work show <id>`: human and --json, both naming the work.
+    let output = sgt(dir.path(), &["work", "show", &work_id]);
+    assert!(output.status.success());
+    let shown: Value =
+        serde_json::from_slice(&output.stdout).expect("work show prints the record as JSON");
+    assert_eq!(shown["id"].as_str(), Some(work_id.as_str()));
+    assert_eq!(shown["state"], "pending");
+    assert_eq!(shown["intent"], "inspect me");
+
+    let output = sgt(dir.path(), &["work", "show", &work_id, "--json"]);
+    assert!(output.status.success());
+    let shown: Value = serde_json::from_slice(&output.stdout).expect("show --json prints JSON");
+    assert_eq!(shown["work"]["id"].as_str(), Some(work_id.as_str()));
+
+    // `sgt cancel <id>`: reports the new state, and it sticks.
+    let output = sgt(dir.path(), &["cancel", &work_id]);
+    assert!(
+        output.status.success(),
+        "sgt cancel failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("canceled") && stdout.contains(&work_id),
+        "cancel said: {stdout}"
+    );
+    let output = sgt(dir.path(), &["work", "show", &work_id, "--json"]);
+    let shown: Value = serde_json::from_slice(&output.stdout).expect("show --json");
+    assert_eq!(shown["work"]["state"], "canceled");
+
+    // A server-side error reaches the user as a nonzero exit and the
+    // daemon's own structured message, not a panic or a silent success.
+    let output = sgt(dir.path(), &["work", "show", "01AN4Z07BY79KA1307SR9X4MV3"]);
+    assert!(!output.status.success(), "unknown id must exit nonzero");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no work with id"),
+        "the daemon's diagnostic must reach the user, got: {stderr}"
     );
 
     stop_daemon(dir.path());
@@ -981,6 +1482,49 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
     // And it must not have spawned anything: descriptor unchanged.
     let descriptor = descriptor_of(dir.path()).expect("descriptor still there");
     assert_eq!(descriptor.token, "ambiguous");
+}
+
+/// The descriptor's `schema` field is a promise, not a decoration: a
+/// descriptor written by a build this one does not understand must stop the
+/// client dead — the same fail-closed rule an unknown snapshot schema gets.
+/// Half-interpreting it could mean talking to the wrong process, or spawning
+/// a second daemon on a data dir that already has an owner.
+#[test]
+fn descriptor_with_an_unknown_schema_fails_closed() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(dir.path()).expect("data dir");
+    let from_the_future = json!({
+        "schema": "sergeant.runtime/v2",
+        "endpoint": "http://127.0.0.1:1",
+        "pid": std::process::id(),
+        "api_revision": "v2",
+        "token": "from-the-future",
+    });
+    let path = daemon::descriptor_path(dir.path());
+    std::fs::write(&path, serde_json::to_vec(&from_the_future).expect("json"))
+        .expect("write future descriptor");
+
+    let output = sgt(dir.path(), &["work", "list"]);
+    assert!(
+        !output.status.success(),
+        "an unknown descriptor schema must fail closed, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown schema") && stderr.contains("sergeant.runtime/v2"),
+        "the diagnostic must name the schema it refused, got: {stderr}"
+    );
+    // It refused *before* acting: no daemon was spawned (spawning is what
+    // creates daemon.log) and the descriptor is untouched.
+    assert!(
+        !dir.path().join("daemon.log").exists(),
+        "a refused descriptor must not spawn a daemon"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("descriptor still there"),
+        serde_json::to_vec(&from_the_future).expect("json"),
+    );
 }
 
 /// Two clients replacing the *same* stale descriptor must not leave the

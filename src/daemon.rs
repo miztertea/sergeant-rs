@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::api::{API_REVISION, ApiState, Core, CoreError, router};
 use crate::domain::event::{EventDraft, EventSource};
@@ -81,6 +81,22 @@ pub enum DaemonError {
     /// Descriptor (de)serialization failure.
     #[error("descriptor serde error: {0}")]
     Serde(#[from] serde_json::Error),
+    /// The descriptor names a schema this build does not understand. Fail
+    /// closed exactly as an unknown snapshot schema does: its fields may
+    /// mean something else entirely, and acting on them could mean talking
+    /// to the wrong process — or spawning a second daemon.
+    #[error(
+        "runtime descriptor {path} declares unknown schema {found:?} (this build understands {expected:?}); \
+         refusing to use it"
+    )]
+    UnknownDescriptorSchema {
+        /// Path of the offending descriptor.
+        path: String,
+        /// Schema the file declares.
+        found: String,
+        /// Schema this build understands.
+        expected: &'static str,
+    },
 }
 
 /// Handle to a running in-process daemon. Dropping it does NOT stop the
@@ -163,10 +179,15 @@ pub async fn start(data_dir: &Path) -> Result<DaemonHandle, DaemonError> {
     let descriptor_path = data_dir.join(DESCRIPTOR_FILE);
     write_atomic_secret(&descriptor_path, &serde_json::to_vec_pretty(&descriptor)?)?;
 
+    // Shutdown broadcast for endpoints whose response body never ends by
+    // itself: graceful shutdown waits for in-flight responses, so a live SSE
+    // tail would otherwise keep this daemon serving forever.
+    let (closing_tx, closing_rx) = watch::channel(false);
     let state = ApiState {
         core: Arc::new(tokio::sync::Mutex::new(core)),
         token: token.clone(),
         data_dir: data_dir.to_path_buf(),
+        closing: closing_rx,
     };
     let app = router(state.clone());
 
@@ -174,8 +195,11 @@ pub async fn start(data_dir: &Path) -> Result<DaemonHandle, DaemonError> {
     let served = tokio::spawn(async move {
         // The daemon lock lives exactly as long as the serve task.
         let _lock = lock;
-        let serve = axum::serve(listener, app).with_graceful_shutdown(async {
+        let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
+            // Tell the SSE pumps to finish *before* handing control to the
+            // graceful wait, so the wait has something finite to wait for.
+            let _ = closing_tx.send(true);
         });
         if let Err(e) = serve.await {
             tracing::error!(error = %e, "daemon serve failed");
@@ -241,14 +265,26 @@ async fn wait_for_shutdown_signal() {
 ///
 /// A malformed descriptor is an error, not `None`: it means something is
 /// wrong with the runtime dir and silently spawning a second daemon on top
-/// of it would be the worst response.
+/// of it would be the worst response. A descriptor declaring a schema this
+/// build does not understand is malformed in exactly that sense, so it is
+/// refused here rather than half-interpreted — the reader that makes
+/// [`DESCRIPTOR_SCHEMA`] a promise instead of a decoration.
 pub fn read_descriptor(data_dir: &Path) -> Result<Option<RuntimeDescriptor>, DaemonError> {
     let path = data_dir.join(DESCRIPTOR_FILE);
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let descriptor: RuntimeDescriptor = serde_json::from_slice(&bytes)?;
+    if descriptor.schema != DESCRIPTOR_SCHEMA {
+        return Err(DaemonError::UnknownDescriptorSchema {
+            path: path.display().to_string(),
+            found: descriptor.schema,
+            expected: DESCRIPTOR_SCHEMA,
+        });
     }
+    Ok(Some(descriptor))
 }
 
 /// Whether a PID currently names a live process (Linux: `/proc/<pid>`;
