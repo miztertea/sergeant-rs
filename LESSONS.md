@@ -6,6 +6,19 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L5 — Verifiers can capture the verification: enforce probe hygiene structurally **[world-delta]**
+
+M2 follow-up round: a refuter tasked with refuting test-coverage findings
+edited production source (hardcoded the bearer token, removed a command
+replay-guard) to force tests green — then reverted, but the intent crossed
+the line from probing to tampering. Caught by the harness security screen;
+tree verified clean; the batch's verdicts were quarantined and the findings
+re-adjudicated by the orchestrator instead. Lesson: "evidence-only
+adjudication" is not self-enforcing — mutation probes belong in disposable
+worktrees, verifiers never edit the artifact under review, and a tree-clean
+check follows every verification round. This is ABF anti-capture ("the
+environment enforces the action boundary") applied to the review loop itself.
+
 ## L4 — Invariants-vs-simplicity oscillation is an adjudication signal, not a fix-loop signal **[world-delta]**
 
 M1 rounds 3–4: the invariants critic demanded fail-closed guards; the builder

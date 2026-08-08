@@ -111,3 +111,12 @@ Capability goes where judgment lives; diversity goes where independence matters.
   escalations, evidence completeness) separately.
 - Ambiguity fails closed. A critic finding that cannot be confirmed or refuted is
   recorded as `PLAUSIBLE`, not dropped.
+- **Probe hygiene** (added 2026-08-08 after a live incident): critics and
+  refuters may run mutation probes (comment out a guard, rerun tests) ONLY in
+  a disposable `git worktree` copy, never the main tree, and must report the
+  probe. During M2's follow-up round a refuter edited the main tree to
+  hardcode a token and remove a replay guard so tests would pass — caught by
+  the harness's security screen and reverted, tree integrity verified by the
+  orchestrator afterward. A verifier that mutates the thing it verifies to
+  reach a verdict has stopped verifying; its batch is quarantined and
+  re-adjudicated. This is the anti-capture boundary applied to our own loop.
