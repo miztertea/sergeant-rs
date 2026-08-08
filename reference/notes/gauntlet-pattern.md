@@ -38,12 +38,22 @@ CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX �
      viable rung; unjustified R7s and skipped rungs are findings.
    - **test-honesty** — do the tests verify the claims made, or mirror the
      implementation? Evidence-only.
-5. **ADVERSARIAL VERIFY.** Each finding gets an independent refuter prompted to
-   kill it. Confirmed findings are ranked; the builder fixes the largest gaps.
-6. **RE-GAUNTLET** with fresh critics, capped at 4 iterations per milestone.
-   Residual confirmed-but-deferred findings go to the ledger backlog — never
-   silently dropped. (Diminishing returns: iterations 1–2 find architecture,
-   3–4 find calibration, 5+ hit bedrock.)
+5. **ADVERSARIAL VERIFY.** Findings are refuted adversarially — batched **per
+   axis** (one refuter agent verifies all of an axis's findings; economy
+   revision 2026-08-08, replacing per-finding refuters: M1 spent ~68 refuter
+   agents and the per-axis batch preserves independence — the refuter still
+   never wrote the code — at a quarter of the agent count).
+6. **RE-GAUNTLET, capped at 2 panel rounds total** (economy revision
+   2026-08-08, was 4: M1's data showed later rounds produce axis-tension
+   oscillation that only orchestrator adjudication resolves, and the token
+   cost was an order of magnitude beyond a prototype's needs). Round 1: full
+   panel inside the build workflow, then round-1 fixes. Then the CHECKPOINT
+   GATE (7a). Then ONE lean follow-up round under orchestrator control:
+   fresh critics on only the axes that had confirmed findings (plus anything
+   the checkpoint gate raised), medium effort, batched refuters. Everything
+   still open after that is adjudicated, not re-looped. Residual
+   confirmed-but-deferred findings go to the ledger backlog — never silently
+   dropped.
 7. **MARK & LOG.** Commit; append a ledger entry to `GAUNTLET.md` with two
    scorecards (see below); update `LESSONS.md`.
 7a. **CHECKPOINT GATE** (adopted 2026-08-08, owner-directed; effective from M3).
@@ -80,7 +90,7 @@ Capability goes where judgment lives; diversity goes where independence matters.
 | Role | Model | Rationale |
 |---|---|---|
 | Orchestrator (contracts, adjudication, integration, ledger) | Fable 5 (the session) | Judgment-dense; delegation is a named Fable 5 strength |
-| Builders — thesis-bearing core (journal/recovery, workflow engine, adapters) | Fable (inherit) | First-shot correctness on complex well-specified work; a re-gauntlet round costs more than the model delta |
+| Builders — thesis-bearing core (journal/recovery, workflow engine, adapters) | Opus by default; Fable reserved for M4's adapter/recovery core (economy revision 2026-08-08 — session-window pressure; Opus-high is sufficient for well-contracted server code, and the panel catches the delta) | First-shot correctness on complex well-specified work; a re-gauntlet round costs more than the model delta |
 | Builders — mechanical work (scaffold, vendoring, CI, plumbing, UI polish) | Sonnet, low/medium effort | Well-defined execution |
 | Critics — spec-fidelity, invariants | Fable or Opus, high effort | Verification rigor scales with effort |
 | Critics — simplicity, test-honesty; refuters | Opus | Strong enough to refute; **a different model grading Fable-built code is an independence measure, not a cost measure** — same-lineage reviewers share blind spots ("multiplicity is not institutional independence") |
