@@ -205,6 +205,14 @@ pub enum WorkflowError {
         /// Path of the descriptor.
         path: String,
     },
+    /// The requested workflow name is not a plain directory name. It is
+    /// joined directly onto `.sergeant/workflows/`, so anything else could
+    /// read a `workflow.toml` outside that directory.
+    #[error("workflow name {name:?} is not a plain directory name")]
+    InvalidName {
+        /// The offending name.
+        name: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,6 +261,11 @@ impl WorkflowDefinition {
     /// built-in `software-change` is the fallback when the repository ships
     /// no workflow of that name.
     pub fn resolve(root: &Path, name: &str) -> Result<Self, WorkflowError> {
+        if !is_plain_name(name) {
+            return Err(WorkflowError::InvalidName {
+                name: name.to_string(),
+            });
+        }
         let dir = workflow_dir(root, name);
         if dir.join(WORKFLOW_FILE).is_file() {
             return Self::load_dir(&dir);
@@ -355,6 +368,17 @@ fn parse_descriptor(text: &str, path: &str) -> Result<WorkflowFile, WorkflowErro
     })
 }
 
+/// Whether `name` is safe to join directly onto a filesystem path: a single,
+/// non-empty path component with no separators and no `.`/`..`.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != ".."
+        && Path::new(name).components().count() == 1
+}
+
 /// Validate the declared stage order: non-empty, unique, and every id a plain
 /// directory name. The last check is a path-traversal guard — a stage id is
 /// joined onto the workflow directory, and `../../etc` must not read files
@@ -367,13 +391,7 @@ fn check_stage_ids(ids: &[String], path: &str) -> Result<Vec<String>, WorkflowEr
     }
     let mut seen = std::collections::BTreeSet::new();
     for id in ids {
-        if id.is_empty()
-            || id.contains('/')
-            || id.contains('\\')
-            || id == "."
-            || id == ".."
-            || Path::new(id).components().count() != 1
-        {
+        if !is_plain_name(id) {
             return Err(WorkflowError::InvalidStageId {
                 path: path.to_string(),
                 stage: id.clone(),

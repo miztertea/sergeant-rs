@@ -384,6 +384,25 @@ impl Engine {
         )?;
         let surface = match materialize(&self.data_dir, &work.id, &plan.repositories) {
             Ok(surface) => surface,
+            Err(SurfaceError::PartialFailure { source, teardown }) => {
+                // Earlier repositories in this request got a real worktree
+                // and branch before a later one failed; materialize() has
+                // already torn those down. Journal the report so it is not a
+                // mystery, and put it in the evidence too.
+                self.commit(
+                    core,
+                    &work.id,
+                    KIND_SURFACE_TORN_DOWN,
+                    json!({"report": teardown}),
+                )?;
+                self.block(
+                    core,
+                    &work.id,
+                    &format!("cannot materialize work surface: {source}"),
+                    Some(serde_json::to_string(&teardown).unwrap_or_default()),
+                )?;
+                return Ok(());
+            }
             Err(e) => {
                 self.block(
                     core,
@@ -463,6 +482,12 @@ impl Engine {
             json!({"reason": "input_received"}),
         )?;
         if let Err(e) = backend.send(&handle_of(&execution), input) {
+            self.commit(
+                core,
+                work_id,
+                KIND_STAGE_BLOCKED,
+                json!({"stage_id": stage_id, "detail": e.to_string()}),
+            )?;
             self.block(core, work_id, &format!("cannot deliver input: {e}"), None)?;
             return Ok(());
         }
@@ -554,7 +579,10 @@ impl Engine {
         if let Some(stage) = run.current_stage()
             && matches!(
                 stage.status,
-                StageStatus::Active | StageStatus::Waiting | StageStatus::NeedsInput
+                StageStatus::Active
+                    | StageStatus::Waiting
+                    | StageStatus::NeedsInput
+                    | StageStatus::Blocked
             )
         {
             self.commit(
@@ -576,6 +604,26 @@ impl Engine {
     /// say; every iteration either returns or advances to a later stage, so
     /// the loop is bounded by the workflow's stage count.
     pub fn resume(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
+        self.drive(core, work_id, None)
+    }
+
+    /// [`Engine::resume`]'s implementation, with an optional pre-fetched
+    /// `Observation` for the first loop iteration.
+    ///
+    /// Restart reconciliation ([`Engine::reconcile_work`]) already calls
+    /// `backend.observe()` once to decide whether the run resumes at all; a
+    /// second OBSERVE right after to actually drive it would double the call
+    /// for no reason, and the two calls are not guaranteed to agree. `initial`
+    /// lets reconciliation hand the answer it already has to the first
+    /// iteration; every later iteration (a fresh stage after this one
+    /// completes) always observes fresh, because nothing has asked yet.
+    fn drive(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        initial: Option<Observation>,
+    ) -> Result<(), EngineError> {
+        let mut pending = initial;
         loop {
             let run = self.run(core, work_id)?;
             let Some(execution) = run.execution.clone() else {
@@ -589,21 +637,42 @@ impl Engine {
             })?;
             let backend = self.backend_for(work_id, &execution.backend)?;
 
-            let observation = match backend.observe(&handle_of(&execution)) {
-                Ok(observation) => observation,
-                Err(e) => {
-                    // §25: the adapter cannot classify the native context.
-                    // Ambiguity fails closed, with the evidence recorded.
-                    self.block(
-                        core,
-                        work_id,
-                        "backend could not observe the execution",
-                        Some(e.to_string()),
-                    )?;
-                    return Ok(());
-                }
+            let observation = match pending.take() {
+                Some(observation) => observation,
+                None => match backend.observe(&handle_of(&execution)) {
+                    Ok(observation) => observation,
+                    Err(e) => {
+                        // §25: the adapter cannot classify the native context.
+                        // Ambiguity fails closed, with the evidence recorded.
+                        self.commit(
+                            core,
+                            work_id,
+                            KIND_STAGE_BLOCKED,
+                            json!({"stage_id": stage.stage_id, "detail": e.to_string()}),
+                        )?;
+                        self.block(
+                            core,
+                            work_id,
+                            "backend could not observe the execution",
+                            Some(e.to_string()),
+                        )?;
+                        return Ok(());
+                    }
+                },
             };
             if observation.native == NativeState::Unknown {
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_BLOCKED,
+                    json!({
+                        "stage_id": stage.stage_id,
+                        "detail": observation
+                            .evidence
+                            .clone()
+                            .unwrap_or_else(|| "backend reports an unknown native state".to_string()),
+                    }),
+                )?;
                 self.block(
                     core,
                     work_id,
@@ -727,12 +796,25 @@ impl Engine {
                 ReconcileDisposition::Ambiguous,
                 "work was active with no recorded execution",
             )?;
+            if let Some(stage) = run.current_stage() {
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_BLOCKED,
+                    json!({"stage_id": stage.stage_id, "detail": "no execution to reconcile"}),
+                )?;
+            }
             self.block(core, work_id, "no execution to reconcile", None)?;
             return Ok(ReconcileDisposition::Ambiguous);
         };
         let ambiguous = |detail: String| -> (ReconcileDisposition, String) {
             (ReconcileDisposition::Ambiguous, detail)
         };
+        // Kept only on the `Resumed` path, so `drive` can act on the exact
+        // Observation this decision was made from instead of asking the
+        // backend a second time (which is not guaranteed to answer the same
+        // way twice).
+        let mut resumed_from: Option<Observation> = None;
         let (disposition, evidence) = match self.backends.get(&execution.backend) {
             None => ambiguous(format!(
                 "backend {:?} is not registered in this daemon",
@@ -747,22 +829,31 @@ impl Engine {
                 }) => ambiguous(
                     evidence.unwrap_or_else(|| "backend reports unknown native state".to_string()),
                 ),
-                Ok(observation) => (
-                    ReconcileDisposition::Resumed,
-                    format!(
+                Ok(observation) => {
+                    let evidence = format!(
                         "native={}, signal={}",
                         observation.native.as_str(),
                         observation.signal.as_str()
-                    ),
-                ),
+                    );
+                    resumed_from = Some(observation);
+                    (ReconcileDisposition::Resumed, evidence)
+                }
             },
         };
         self.record_reconcile(core, work_id, Some(&execution), disposition, &evidence)?;
         match disposition {
             ReconcileDisposition::Resumed => {
-                self.resume(core, work_id)?;
+                self.drive(core, work_id, resumed_from)?;
             }
             ReconcileDisposition::Ambiguous => {
+                if let Some(stage) = run.current_stage() {
+                    self.commit(
+                        core,
+                        work_id,
+                        KIND_STAGE_BLOCKED,
+                        json!({"stage_id": stage.stage_id, "detail": evidence.clone()}),
+                    )?;
+                }
                 self.block(
                     core,
                     work_id,
@@ -1001,7 +1092,13 @@ impl Engine {
 
     /// Move a work to `blocked` with a reason and, where there is one, the
     /// evidence that produced the decision.
-    fn block(
+    ///
+    /// A work that is already `blocked` still gets this journaled: a caller
+    /// can re-block an already-`blocked` work with a new reason and evidence
+    /// (e.g. restart reconciliation, after an earlier block left it there),
+    /// and `transition`'s ordinary same-state short-circuit would otherwise
+    /// discard it.
+    pub(crate) fn block(
         &self,
         core: &mut Core,
         work_id: &str,
@@ -1011,6 +1108,9 @@ impl Engine {
         let mut payload = json!({"reason": reason});
         if let Some(evidence) = evidence {
             payload["evidence"] = Value::String(evidence);
+        }
+        if self.work_state(core, work_id)? == WorkState::Blocked {
+            return self.commit(core, work_id, KIND_WORK_BLOCKED, payload);
         }
         self.transition(core, work_id, KIND_WORK_BLOCKED, payload)
     }

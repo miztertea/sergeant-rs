@@ -346,12 +346,20 @@ impl Backend for FakeBackend {
         let mut state = self.lock();
         state.stop_requests.push(handle.execution_id.clone());
         let name = self.name.clone();
-        let execution = state.executions.get_mut(&handle.execution_id).ok_or(
-            BackendError::UnknownExecution {
-                backend: name,
-                execution_id: handle.execution_id.clone(),
-            },
-        )?;
+        let unknown = || BackendError::UnknownExecution {
+            backend: name.clone(),
+            execution_id: handle.execution_id.clone(),
+        };
+        let execution = state
+            .executions
+            .get_mut(&handle.execution_id)
+            .ok_or_else(unknown)?;
+        // Same identity check as `resolve`: a handle that has lost its
+        // native id, or carries one from another context, must not be able
+        // to stop an execution it does not actually name.
+        if handle.native_id.as_deref() != Some(execution.native_id.as_str()) {
+            return Err(unknown());
+        }
         execution.stopped = true;
         if !execution.step.ignores_stop {
             // A compliant context exits and stops signalling about the stage.

@@ -194,6 +194,20 @@ pub enum SurfaceError {
     /// execute anything.
     #[error("cannot materialize a work surface with no repositories")]
     NoRepositories,
+    /// A repository failed to materialize after earlier repositories in the
+    /// same request already succeeded. Whatever those earlier repositories
+    /// created has been torn down before this is returned, so the caller
+    /// never has to reason about a worktree or branch it cannot see: `source`
+    /// is what went wrong, `teardown` is what was done about the rest.
+    #[error("cannot materialize work surface: {source}")]
+    PartialFailure {
+        /// The failure that stopped materialization.
+        #[source]
+        source: Box<SurfaceError>,
+        /// What happened to the bindings already created for earlier
+        /// repositories in this request.
+        teardown: TeardownReport,
+    },
 }
 
 /// Root directory for a work's surface.
@@ -203,6 +217,14 @@ pub fn surface_root(data_dir: &Path, work_id: &str) -> PathBuf {
 
 /// Materialize a work surface: one worktree per repository, each on a fresh
 /// work branch cut from that repository's current HEAD (§11).
+///
+/// A later repository can fail after earlier ones already got a real
+/// worktree and branch in the user's checkout. Rather than return with those
+/// left behind and unrecorded, every binding created so far is torn down
+/// (§11: teardown fails closed, so this can never silently destroy anything)
+/// and the report travels with the error, so the caller can journal exactly
+/// what happened instead of leaving a `sergeant/<work-id>` branch nobody
+/// knows about.
 pub fn materialize(
     data_dir: &Path,
     work_id: &str,
@@ -217,42 +239,79 @@ pub fn materialize(
         source,
     })?;
     let branch = work_branch(work_id);
+    // Symlinks put the same directory on more than one path; canonicalize
+    // both sides of the source-checkout check so a data dir reaching a repo
+    // through a different route cannot bypass it.
+    let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
 
-    let mut bindings = Vec::with_capacity(repositories.len());
+    let mut bindings: Vec<RepositoryBinding> = Vec::with_capacity(repositories.len());
     for repository in repositories {
-        let worktree_path = root.join(&repository.name);
-        if worktree_path.starts_with(&repository.path) {
-            return Err(SurfaceError::InsideSourceCheckout {
-                worktree: worktree_path.display().to_string(),
-                source_repo: repository.path.display().to_string(),
-            });
+        match materialize_one(&root, &canonical_root, &branch, repository) {
+            Ok(binding) => bindings.push(binding),
+            Err(err) => {
+                // Nothing to roll back if this is the first repository in
+                // the request: surface the original error as-is.
+                if bindings.is_empty() {
+                    return Err(err);
+                }
+                let partial = WorkSurface {
+                    work_id: work_id.to_string(),
+                    root,
+                    bindings,
+                };
+                let report = teardown(&partial);
+                return Err(SurfaceError::PartialFailure {
+                    source: Box::new(err),
+                    teardown: report,
+                });
+            }
         }
-        let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
-        // A detached HEAD has no branch name; record the fact rather than
-        // inventing one.
-        let base_branch = git(
-            &repository.path,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        )
-        .unwrap_or_else(|_| "(detached)".to_string());
-
-        add_worktree(&repository.path, &worktree_path, &branch, &base_sha)?;
-        let head_sha = git(&worktree_path, &["rev-parse", "HEAD"])?;
-
-        bindings.push(RepositoryBinding {
-            repository: repository.name.clone(),
-            source_path: repository.path.clone(),
-            base_branch,
-            base_sha,
-            worktree_path,
-            work_branch: branch.clone(),
-            head_sha,
-        });
     }
     Ok(WorkSurface {
         work_id: work_id.to_string(),
         root,
         bindings,
+    })
+}
+
+fn materialize_one(
+    root: &Path,
+    canonical_root: &Path,
+    branch: &str,
+    repository: &RepositorySpec,
+) -> Result<RepositoryBinding, SurfaceError> {
+    let worktree_path = root.join(&repository.name);
+    let canonical_repo_path =
+        std::fs::canonicalize(&repository.path).unwrap_or_else(|_| repository.path.clone());
+    if canonical_root
+        .join(&repository.name)
+        .starts_with(&canonical_repo_path)
+    {
+        return Err(SurfaceError::InsideSourceCheckout {
+            worktree: worktree_path.display().to_string(),
+            source_repo: repository.path.display().to_string(),
+        });
+    }
+    let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
+    // A detached HEAD has no branch name; record the fact rather than
+    // inventing one.
+    let base_branch = git(
+        &repository.path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .unwrap_or_else(|_| "(detached)".to_string());
+
+    add_worktree(&repository.path, &worktree_path, branch, &base_sha)?;
+    let head_sha = git(&worktree_path, &["rev-parse", "HEAD"])?;
+
+    Ok(RepositoryBinding {
+        repository: repository.name.clone(),
+        source_path: repository.path.clone(),
+        base_branch,
+        base_sha,
+        worktree_path,
+        work_branch: branch.to_string(),
+        head_sha,
     })
 }
 
@@ -336,6 +395,13 @@ pub fn teardown(surface: &WorkSurface) -> TeardownReport {
 
 fn teardown_binding(binding: &RepositoryBinding) -> BindingDisposition {
     if !binding.worktree_path.exists() {
+        // The directory is gone, but the source repository's administrative
+        // records still list it as a registered worktree; left alone, a
+        // later `rematerialize` at the same path fails with "is a missing
+        // but already registered worktree". Pruning is git's own recovery
+        // for exactly this — best-effort, since it does not change the
+        // disposition below either way.
+        let _ = git(&binding.source_path, &["worktree", "prune"]);
         return BindingDisposition::Missing;
     }
     match git(&binding.worktree_path, &["status", "--porcelain"]) {

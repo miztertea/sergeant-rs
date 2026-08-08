@@ -51,6 +51,14 @@ pub struct ReconcileReport {
 }
 
 /// Reconcile every in-flight work against its backend (§25).
+///
+/// Each work's reconciliation is isolated: an `EngineError` from one work
+/// (e.g. a journal I/O failure appending its `execution.reconciled`) fails
+/// *that work* closed to `blocked` with the error as evidence, but does not
+/// stop the works after it from reconciling, and does not stop the daemon
+/// from starting. §25's fail-closed contract is stated per-work — "ambiguous
+/// states fail closed to blocked with evidence" — not "one bad journal entry
+/// makes the whole daemon unavailable".
 pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, EngineError> {
     let in_flight: Vec<String> = core
         .registry
@@ -79,14 +87,35 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
 
     let mut report = ReconcileReport::default();
     for work_id in in_flight {
-        match engine.reconcile_work(core, &work_id)? {
-            ReconcileDisposition::Resumed => report.resumed.push(work_id),
-            ReconcileDisposition::Ambiguous => report.blocked.push(work_id),
+        match engine.reconcile_work(core, &work_id) {
+            Ok(ReconcileDisposition::Resumed) => report.resumed.push(work_id),
+            Ok(ReconcileDisposition::Ambiguous) => report.blocked.push(work_id),
+            Err(e) => {
+                block_on_reconcile_error(engine, core, &work_id, &e);
+                report.blocked.push(work_id);
+            }
         }
     }
     for work_id in crashed_starts {
-        engine.reconcile_crashed_start(core, &work_id)?;
+        if let Err(e) = engine.reconcile_crashed_start(core, &work_id) {
+            block_on_reconcile_error(engine, core, &work_id, &e);
+        }
         report.blocked.push(work_id);
     }
     Ok(report)
+}
+
+/// Fail one work closed after its own reconciliation errored, without
+/// letting that error propagate to the works still waiting to reconcile.
+/// Best-effort: if the work's own state cannot be read or written either
+/// (the same underlying failure, e.g. a wedged journal), there is nothing
+/// further to do for it here — the next restart's reconciliation, or an
+/// operator, is the recourse, not aborting every other work's recovery.
+fn block_on_reconcile_error(engine: &Engine, core: &mut Core, work_id: &str, error: &EngineError) {
+    let _ = engine.block(
+        core,
+        work_id,
+        "reconciliation failed",
+        Some(error.to_string()),
+    );
 }

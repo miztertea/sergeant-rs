@@ -113,6 +113,17 @@ pub enum WorkspaceError {
         /// The repeated name.
         name: String,
     },
+    /// A declared repository name is not usable as a plain path component.
+    /// Surface paths are built by joining it directly onto the surface root
+    /// (`<data-dir>/surfaces/<work-id>/<name>`), so anything but a plain name
+    /// could land the worktree outside the data dir entirely.
+    #[error("{file} declares repository name {name:?}, which is not a plain directory name")]
+    InvalidRepositoryName {
+        /// Config file that declared it.
+        file: String,
+        /// The offending name.
+        name: String,
+    },
     /// Two profiles share a name.
     #[error("{file} declares profile name {name:?} twice")]
     DuplicateProfile {
@@ -213,6 +224,12 @@ impl Workspace {
         let mut seen = BTreeSet::new();
         let mut repositories = Vec::with_capacity(parsed.repository.len());
         for entry in parsed.repository {
+            if !is_plain_name(&entry.name) {
+                return Err(WorkspaceError::InvalidRepositoryName {
+                    file,
+                    name: entry.name,
+                });
+            }
             if !seen.insert(entry.name.clone()) {
                 return Err(WorkspaceError::DuplicateRepository {
                     file,
@@ -263,13 +280,23 @@ impl Workspace {
 
     /// Restrict the workspace to the named repositories (the submit request's
     /// `repositories` selection). An unknown name is an error rather than a
-    /// silently empty surface.
+    /// silently empty surface, and a name repeated in the selection is an
+    /// error too — two identical bindings would send `materialize` at the
+    /// same worktree path and branch twice, the second `git worktree add`
+    /// failing after the first has already touched the user's repository.
     pub fn select(&self, names: &[String]) -> Result<Vec<RepositorySpec>, String> {
         if names.is_empty() {
             return Ok(self.repositories.clone());
         }
+        let mut seen = BTreeSet::new();
         let mut selected = Vec::with_capacity(names.len());
         for name in names {
+            if !seen.insert(name.clone()) {
+                return Err(format!(
+                    "repository selection lists {name:?} twice for workspace {:?}",
+                    self.name
+                ));
+            }
             match self.repositories.iter().find(|r| &r.name == name) {
                 Some(repo) => selected.push(repo.clone()),
                 None => {
@@ -294,4 +321,18 @@ fn repo_name(root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".to_string())
+}
+
+/// Whether `name` is safe to join directly onto a filesystem path: a single,
+/// non-empty path component with no separators and no `.`/`..` — the same
+/// guard `check_stage_ids` applies to workflow stage ids, applied here to
+/// repository names, which `surface::materialize` joins onto the surface root
+/// the same way.
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != ".."
+        && Path::new(name).components().count() == 1
 }
