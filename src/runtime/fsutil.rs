@@ -4,12 +4,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-/// Write `bytes` to `path` atomically and durably: a fresh uniquely-named
-/// tmp file next to `path` is written and fsynced, renamed over `path`, and
-/// the containing directory is fsynced. A reader never observes a partial
-/// file, and a crash leaves either the old content or the new — never a torn
-/// mix. Replacement arrives as a new inode (rename), never as an in-place
-/// truncate of the destination.
 /// Create `dir` and any missing ancestors, then fsync the parent of every
 /// directory actually created, so the new dirents survive a crash — the same
 /// crash-consistency recipe [`write_atomic`] applies to files, carried up the
@@ -37,6 +31,12 @@ pub(crate) fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Write `bytes` to `path` atomically and durably: a fresh uniquely-named
+/// tmp file next to `path` is written and fsynced, renamed over `path`, and
+/// the containing directory is fsynced. A reader never observes a partial
+/// file, and a crash leaves either the old content or the new — never a torn
+/// mix. Replacement arrives as a new inode (rename), never as an in-place
+/// truncate of the destination.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", ulid::Ulid::generate()));
     let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
