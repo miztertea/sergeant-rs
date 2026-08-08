@@ -26,10 +26,14 @@ use serde_json::json;
 use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::api::{API_REVISION, ApiState, Core, CoreError, router};
+use crate::backend::BackendRegistry;
+use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::domain::event::{EventDraft, EventSource};
+use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic_secret};
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{ProjectionError, work_registry_projection};
+use crate::runtime::recovery;
 
 /// Runtime descriptor file name inside the data dir.
 pub const DESCRIPTOR_FILE: &str = "runtime.json";
@@ -81,6 +85,9 @@ pub enum DaemonError {
     /// Descriptor (de)serialization failure.
     #[error("descriptor serde error: {0}")]
     Serde(#[from] serde_json::Error),
+    /// Startup reconciliation of in-flight work failed (§25).
+    #[error(transparent)]
+    Engine(#[from] EngineError),
     /// The descriptor names a schema this build does not understand. Fail
     /// closed exactly as an unknown snapshot schema does: its fields may
     /// mean something else entirely, and acting on them could mean talking
@@ -122,9 +129,39 @@ impl DaemonHandle {
     }
 }
 
+/// How a daemon instance is configured beyond its data dir.
+///
+/// This exists so tests can hand the daemon a scripted backend registry (§37's
+/// deterministic core) without a configuration file format that M3 has no
+/// second consumer for. The default is the compiled-in registry.
+#[derive(Debug, Clone)]
+pub struct DaemonConfig {
+    /// Backends this daemon can route to (§13, §15).
+    pub backends: Arc<BackendRegistry>,
+    /// §13's global default tier.
+    pub default_backend: Option<String>,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            backends: Arc::new(BackendRegistry::default_registry()),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+        }
+    }
+}
+
+/// Start the daemon on `data_dir` with the default backend registry.
+pub async fn start(data_dir: &Path) -> Result<DaemonHandle, DaemonError> {
+    start_with(data_dir, DaemonConfig::default()).await
+}
+
 /// Start the daemon on `data_dir`. Returns once it is serving and the
 /// runtime descriptor is published.
-pub async fn start(data_dir: &Path) -> Result<DaemonHandle, DaemonError> {
+pub async fn start_with(
+    data_dir: &Path,
+    config: DaemonConfig,
+) -> Result<DaemonHandle, DaemonError> {
     create_dir_all_durable(data_dir)?;
 
     // 1. Exclusive daemon lock: a second daemon on the same data dir fails
@@ -165,6 +202,23 @@ pub async fn start(data_dir: &Path) -> Result<DaemonHandle, DaemonError> {
         json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "endpoint": endpoint}),
     ))?;
 
+    // 4b. Reconcile work believed in flight *before* serving (§25): no
+    // request may observe — or act on — a work whose prior ownership has not
+    // yet been settled.
+    let engine = Arc::new(Engine::new(
+        config.backends.clone(),
+        config.default_backend.clone(),
+        data_dir,
+    ));
+    let reconciled = recovery::reconcile(&engine, &mut core)?;
+    if !reconciled.resumed.is_empty() || !reconciled.blocked.is_empty() {
+        tracing::info!(
+            resumed = ?reconciled.resumed,
+            blocked = ?reconciled.blocked,
+            "reconciled in-flight work after restart"
+        );
+    }
+
     // 5. Publish the descriptor: atomic rename, owner-only permissions,
     // written only now that the listener is live — a descriptor never
     // points at a daemon that is not yet serving.
@@ -188,6 +242,7 @@ pub async fn start(data_dir: &Path) -> Result<DaemonHandle, DaemonError> {
         token: token.clone(),
         data_dir: data_dir.to_path_buf(),
         closing: closing_rx,
+        engine,
     };
     let app = router(state.clone());
 

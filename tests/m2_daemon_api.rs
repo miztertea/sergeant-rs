@@ -888,11 +888,17 @@ async fn t5_cancel_semantics_and_state_machine() {
 /// appending, not merely that the table is correct in isolation: a work in a
 /// state cancel cannot leave is rejected with 409 and no `work.canceled` is
 /// ever written.
+///
+/// The seeded state is `completed`: M2 wrote this test with `active`, which
+/// M3's engine makes cancellable (cancelling a running work is the whole
+/// point of §12's cancellation verb). `completed` is absorbing in every
+/// milestone, so the property this test exists to pin — the daemon consults
+/// the table before appending — is unchanged.
 #[tokio::test]
 async fn t5b_daemon_refuses_an_illegal_transition_and_appends_no_state_event() {
     let dir = TempDir::new().expect("tempdir");
     let work_id = ulid();
-    seed_work_in_state(dir.path(), &work_id, "active");
+    seed_work_in_state(dir.path(), &work_id, "completed");
     let handle = start(dir.path()).await;
     let http = client();
 
@@ -906,8 +912,8 @@ async fn t5b_daemon_refuses_an_illegal_transition_and_appends_no_state_event() {
         .json()
         .await
         .expect("show json");
-    assert_eq!(show["work"]["state"], "active");
-    assert!(!WorkState::Active.can_transition(WorkState::Canceled));
+    assert_eq!(show["work"]["state"], "completed");
+    assert!(!WorkState::Completed.can_transition(WorkState::Canceled));
 
     let command_id = ulid();
     let resp = http
@@ -931,7 +937,7 @@ async fn t5b_daemon_refuses_an_illegal_transition_and_appends_no_state_event() {
         .json()
         .await
         .expect("show json");
-    assert_eq!(show["work"]["state"], "active");
+    assert_eq!(show["work"]["state"], "completed");
     handle.shutdown().await;
 
     let events = journal_events(dir.path());
@@ -1203,8 +1209,19 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
 }
 
 /// Run the sgt binary with args against a data dir; capture output.
+///
+/// The child runs in the data dir, not in whatever directory `cargo test` was
+/// invoked from. From M3 on, `sgt run` sends its working directory as §13
+/// origin metadata and the daemon discovers a workspace from it — so a test
+/// that inherited the crate's own checkout would materialize real git
+/// worktrees off this repository. These M2 tests are about the daemon, the
+/// API and the CLI transport; the data dir is a plain temp dir with no
+/// repository, so `sgt run` submits work that stays `pending`, exactly as it
+/// did when no engine existed. Work surfaces get their own tests in
+/// `m3_execution.rs`, in temp repositories built for the purpose.
 fn sgt(data_dir: &Path, args: &[&str]) -> Output {
     std::process::Command::new(SGT)
+        .current_dir(data_dir)
         .arg("--data-dir")
         .arg(data_dir)
         .args(args)

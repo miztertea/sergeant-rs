@@ -1,0 +1,10 @@
+# The built-in default workflow (proposal §12's ICM stage model).
+#
+# This file is embedded in the binary and used when a workspace has no
+# `.sergeant/workflows/software-change/` of its own. Copy this directory into
+# a repository to version the procedure with the code it operates on.
+
+[workflow]
+name = "software-change"
+version = "1"
+stages = ["00-prepare", "10-implement", "20-review", "30-close"]

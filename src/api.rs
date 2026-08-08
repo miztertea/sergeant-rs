@@ -33,8 +33,9 @@ use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_CANCELED, KIND_WORK_SUBMITTED, Work,
     WorkState,
 };
+use crate::runtime::engine::{Engine, EngineError, SubmitContext};
 use crate::runtime::journal::{Journal, JournalError};
-use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry};
+use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry, WorkRun};
 
 /// API revision served by this build (`GET /v1/system`, runtime descriptor).
 pub const API_REVISION: &str = "v1";
@@ -104,6 +105,8 @@ pub struct ApiState {
     /// whose response body never ends on its own — the SSE tail — watch this
     /// and finish, because graceful shutdown waits for in-flight responses.
     pub closing: watch::Receiver<bool>,
+    /// The workflow engine: backends, routing defaults, and the surfaces dir.
+    pub engine: Arc<Engine>,
 }
 
 /// Build the axum router for the full v1 surface.
@@ -112,6 +115,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/work", post(submit_work).get(list_work))
         .route("/work/{id}", get(show_work))
         .route("/work/{id}/cancel", post(cancel_work))
+        .route("/work/{id}/input", post(work_input))
+        .route("/work/{id}/retry", post(work_retry))
         .route("/events", get(event_history))
         .route("/events/stream", get(event_stream))
         .route("/system", get(system_info))
@@ -152,6 +157,32 @@ fn error_response(status: StatusCode, code: &str, message: impl Into<String>) ->
 /// The `{"error": {...}}` body alone (also journaled in `command.rejected`).
 fn error_body(code: &str, message: impl Into<String>) -> Value {
     json!({"error": {"code": code, "message": message.into()}})
+}
+
+/// The error body an [`EngineError`] answers with.
+///
+/// A routing failure carries its available options as data, not only prose:
+/// §13's terminal state is "fail with available options", and a client that
+/// has to regex an error message to learn them has not been told them.
+fn engine_error_body(e: &EngineError) -> Value {
+    let mut body = error_body(e.code(), e.to_string());
+    if let Some(available) = e.available_backends() {
+        body["error"]["available_backends"] = json!(available);
+    }
+    body
+}
+
+/// HTTP status for an engine failure: 4xx where the client can fix it, 500
+/// only where sergeant itself broke.
+fn engine_error_status(e: &EngineError) -> StatusCode {
+    match e {
+        EngineError::Core(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        EngineError::NotAwaitingInput { .. }
+        | EngineError::NotRetryable { .. }
+        | EngineError::IllegalTransition { .. } => StatusCode::CONFLICT,
+        EngineError::NoRun { .. } => StatusCode::NOT_FOUND,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    }
 }
 
 /// Bearer-token gate for `/v1/*`. `/healthz` is mounted outside this layer.
@@ -296,7 +327,24 @@ struct SubmitRequest {
     #[serde(default)]
     backend: Option<String>,
     #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
     created_by: Option<String>,
+    #[serde(default)]
+    origin: Option<Origin>,
+}
+
+/// §13's origin metadata: who is asking, and from where.
+#[derive(Debug, Default, Deserialize)]
+struct Origin {
+    /// Front-end harness name, e.g. `claude`. Drives origin affinity.
+    #[serde(default)]
+    client: Option<String>,
+    /// The client's working directory. Workspace discovery (§9) starts here;
+    /// a daemon has no cwd of its own, so this is the only honest source for
+    /// "which repository is this work about".
+    #[serde(default)]
+    cwd: Option<PathBuf>,
 }
 
 /// `POST /v1/work` — submit work; it enters `pending`.
@@ -334,7 +382,7 @@ async fn submit_work(
         .get(&req.command_id)
         .cloned()
     {
-        let result = json!({"work": core.registry.state().works.get(&work_id)});
+        let result = work_view(&core, &work_id);
         return record_and_respond(
             &mut core,
             &req.command_id,
@@ -358,13 +406,48 @@ async fn submit_work(
             result,
         );
     }
+
+    // Plan before creating anything. Workspace topology, workflow content,
+    // routing and profile are all decided here, with no side effects — so a
+    // submission that cannot be routed is rejected with §13's available
+    // options instead of creating work that immediately dies. `Ok(None)`
+    // means the client offered no repository context; the work is accepted
+    // and stays `pending`, exactly as it did before there was an engine.
+    let origin = req.origin.unwrap_or_default();
+    let plan = match state.engine.plan(&SubmitContext {
+        cwd: origin.cwd.as_deref(),
+        origin_client: origin.client.as_deref(),
+        backend: req.backend.as_deref(),
+        workflow: req.workflow.as_deref(),
+        profile: req.profile.as_deref(),
+        repositories: &req.repositories,
+    }) {
+        Ok(plan) => plan,
+        Err(e) => {
+            let status = engine_error_status(&e);
+            let result = engine_error_body(&e);
+            return record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.submit",
+                None,
+                status,
+                result,
+            );
+        }
+    };
+
     let work = Work {
         id: ulid::Ulid::generate().to_string(),
-        workspace: req.workspace,
+        workspace: req
+            .workspace
+            .or_else(|| plan.as_ref().map(|p| p.workspace.name.clone())),
         intent: req.intent,
         repositories: req.repositories,
         workflow: req.workflow,
         backend: req.backend,
+        origin_client: origin.client,
+        profile: req.profile,
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),
@@ -376,8 +459,28 @@ async fn submit_work(
     if let Err(e) = core.commit(draft) {
         return internal_error(e);
     }
+
+    if let Some(plan) = plan {
+        // The Work is durable now. A start failure cannot un-accept it, so
+        // the engine fails it closed to `blocked` with the reason recorded;
+        // only an internal failure escapes as an error here.
+        if let Err(e) = state.engine.start(&mut core, &work, &plan) {
+            tracing::error!(work_id = %work_id, error = %e, "starting the run failed");
+            let status = engine_error_status(&e);
+            let result = engine_error_body(&e);
+            return record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.submit",
+                Some(&work_id),
+                status,
+                result,
+            );
+        }
+    }
+
     // Answer from the projection, not the request: proves the read path.
-    let result = json!({"work": core.registry.state().works.get(&work_id)});
+    let result = work_view(&core, &work_id);
     record_and_respond(
         &mut core,
         &req.command_id,
@@ -388,6 +491,46 @@ async fn submit_work(
     )
 }
 
+/// The full view of a work: the §10 record, plus the orthogonal run
+/// coordinates the M3 contract asks `work show` to include — current stage,
+/// surface, and execution state. They are siblings of `work`, not fields
+/// inside it: §10 keeps stage orthogonal to work state, and flattening them
+/// into one record is how "in review" becomes a state-machine value.
+fn work_view(core: &Core, work_id: &str) -> Value {
+    let registry = core.registry.state();
+    let work = registry.works.get(work_id);
+    let run = registry.runs.get(work_id);
+    json!({
+        "work": work,
+        "stage": run.and_then(run_stage_view),
+        "surface": run.and_then(|r| r.surface.clone()),
+        "execution": run.and_then(|r| r.execution.clone()),
+        "workflow": run.and_then(|r| r.workflow.as_ref().map(|w| json!({
+            "name": w.name,
+            "version": w.version,
+            "source": w.source,
+            "stages": w.stages.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+        }))),
+        "backend": run.and_then(|r| r.backend.clone()),
+        "route_source": run.and_then(|r| r.route_source.clone()),
+        "teardown": run.and_then(|r| r.teardown.clone()),
+    })
+}
+
+/// The current stage coordinate: which stage, where in the order, which
+/// attempt, and what it is doing.
+fn run_stage_view(run: &WorkRun) -> Option<Value> {
+    let stage = run.current_stage()?;
+    Some(json!({
+        "stage_id": stage.stage_id,
+        "index": stage.index,
+        "attempt": stage.attempt,
+        "status": stage.status.as_str(),
+        "detail": stage.detail,
+        "of": run.workflow.as_ref().map(|w| w.stages.len()),
+    }))
+}
+
 /// `GET /v1/work` — list all work (ULID key order = submission order).
 async fn list_work(State(state): State<ApiState>) -> Response {
     let core = state.core.lock().await;
@@ -395,11 +538,12 @@ async fn list_work(State(state): State<ApiState>) -> Response {
     Json(json!({"works": works})).into_response()
 }
 
-/// `GET /v1/work/{id}` — one work record.
+/// `GET /v1/work/{id}` — one work record, with its stage, surface and
+/// execution state (the M3 contract's `work show` surface).
 async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = state.core.lock().await;
     match core.registry.state().works.get(&id) {
-        Some(work) => Json(json!({"work": work})).into_response(),
+        Some(_) => Json(work_view(&core, &id)).into_response(),
         None => error_response(
             StatusCode::NOT_FOUND,
             "work_not_found",
@@ -482,7 +626,13 @@ async fn cancel_work(
     if let Err(e) = core.commit(draft) {
         return internal_error(e);
     }
-    let result = json!({"work": core.registry.state().works.get(&id)});
+    // Work state changes first, then the run is retired: the cancellation is
+    // a fact about the Work, not a request to the backend, and it does not
+    // wait for — or depend on — the native context actually dying (§25).
+    if let Err(e) = state.engine.retire_run(&mut core, &id, "work canceled") {
+        tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed");
+    }
+    let result = work_view(&core, &id);
     record_and_respond(
         &mut core,
         &req.command_id,
@@ -491,6 +641,130 @@ async fn cancel_work(
         StatusCode::OK,
         result,
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct InputRequest {
+    command_id: String,
+    input: String,
+}
+
+/// `POST /v1/work/{id}/input` — answer a work that asked for input (§12's
+/// needs-input verb; `work.respond` in §26's command vocabulary).
+async fn work_input(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Result<Json<InputRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = state.core.lock().await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if !core.registry.state().works.contains_key(&id) {
+        let result = error_body("work_not_found", format!("no work with id {id}"));
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.respond",
+            None,
+            StatusCode::NOT_FOUND,
+            result,
+        );
+    }
+    let engine = state.engine.clone();
+    match engine.provide_input(&mut core, &id, &req.input) {
+        Ok(()) => {
+            let result = work_view(&core, &id);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.respond",
+                Some(&id),
+                StatusCode::OK,
+                result,
+            )
+        }
+        Err(e) => {
+            let status = engine_error_status(&e);
+            let result = engine_error_body(&e);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.respond",
+                Some(&id),
+                status,
+                result,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RetryRequest {
+    command_id: String,
+}
+
+/// `POST /v1/work/{id}/retry` — re-enter the current stage (§12's retry verb).
+async fn work_retry(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Result<Json<RetryRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = state.core.lock().await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if !core.registry.state().works.contains_key(&id) {
+        let result = error_body("work_not_found", format!("no work with id {id}"));
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.retry",
+            None,
+            StatusCode::NOT_FOUND,
+            result,
+        );
+    }
+    let engine = state.engine.clone();
+    match engine.retry(&mut core, &id) {
+        Ok(()) => {
+            let result = work_view(&core, &id);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.retry",
+                Some(&id),
+                StatusCode::OK,
+                result,
+            )
+        }
+        Err(e) => {
+            let status = engine_error_status(&e);
+            let result = engine_error_body(&e);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.retry",
+                Some(&id),
+                status,
+                result,
+            )
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -62,12 +62,15 @@ enum Command {
     Run {
         /// The intent to submit.
         intent: String,
-        /// Workflow to record (executed from M3 on).
+        /// Workflow to run (default: the workspace's, else `software-change`).
         #[arg(long)]
         workflow: Option<String>,
-        /// Backend to record (executed from M4 on).
+        /// Backend to run on (§13's explicit tier).
         #[arg(long)]
         backend: Option<String>,
+        /// Launch profile (§14).
+        #[arg(long)]
+        profile: Option<String>,
         /// Targeted repository (repeatable).
         #[arg(long = "repo")]
         repositories: Vec<String>,
@@ -80,6 +83,18 @@ enum Command {
         /// What to do with work items.
         #[command(subcommand)]
         command: WorkCommand,
+    },
+    /// Answer a work item that is waiting for input.
+    Respond {
+        /// Work id to answer.
+        id: String,
+        /// The answer.
+        input: String,
+    },
+    /// Retry the current stage of a failed, blocked or waiting work item.
+    Retry {
+        /// Work id to retry.
+        id: String,
     },
     /// Cancel a work item.
     Cancel {
@@ -215,6 +230,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             intent,
             workflow,
             backend,
+            profile,
             repositories,
             workspace,
         } => {
@@ -224,19 +240,42 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 "intent": intent,
                 "workflow": workflow,
                 "backend": backend,
+                "profile": profile,
                 "repositories": repositories,
                 "workspace": workspace,
                 "created_by": "cli",
+                "origin": origin(),
             });
             let result = client.post("/v1/work", &body).await?;
             if sgt.json {
                 print_json(&result);
             } else {
-                println!(
-                    "submitted {} ({})",
-                    result["work"]["id"].as_str().unwrap_or("?"),
-                    result["work"]["state"].as_str().unwrap_or("?"),
-                );
+                print_work_line("submitted", &result);
+            }
+            Ok(())
+        }
+        Command::Respond { id, input } => {
+            let client = Client::ensure_daemon(&data_dir).await?;
+            let body = json!({
+                "command_id": ulid::Ulid::generate().to_string(),
+                "input": input,
+            });
+            let result = client.post(&format!("/v1/work/{id}/input"), &body).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_work_line("answered", &result);
+            }
+            Ok(())
+        }
+        Command::Retry { id } => {
+            let client = Client::ensure_daemon(&data_dir).await?;
+            let body = json!({"command_id": ulid::Ulid::generate().to_string()});
+            let result = client.post(&format!("/v1/work/{id}/retry"), &body).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_work_line("retried", &result);
             }
             Ok(())
         }
@@ -269,7 +308,19 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     if sgt.json {
                         print_json(&result);
                     } else {
-                        print_json(&result["work"]);
+                        // Human form is one record: the §10 work fields plus
+                        // the run coordinates the M3 contract asks show to
+                        // include. They stay named keys rather than being
+                        // folded into `state` — stage is orthogonal (§10).
+                        let mut work = result["work"].clone();
+                        if let Some(object) = work.as_object_mut() {
+                            for key in ["stage", "surface", "execution", "workflow", "backend"] {
+                                if !result[key].is_null() {
+                                    object.insert(key.to_string(), result[key].clone());
+                                }
+                            }
+                        }
+                        print_json(&work);
                     }
                     Ok(())
                 }
@@ -298,6 +349,34 @@ fn print_json(value: &Value) {
         Ok(s) => println!("{s}"),
         Err(_) => println!("{value}"),
     }
+}
+
+/// One human line about a work: id, §10 state, and — because the stage is a
+/// separate coordinate, not a state — the stage it is on when there is one.
+fn print_work_line(verb: &str, result: &Value) {
+    let stage = result["stage"]["stage_id"]
+        .as_str()
+        .map(|id| format!(" [{id}]"))
+        .unwrap_or_default();
+    println!(
+        "{verb} {} ({}){stage}",
+        result["work"]["id"].as_str().unwrap_or("?"),
+        result["work"]["state"].as_str().unwrap_or("?"),
+    );
+}
+
+/// §13's origin metadata for this invocation: which front end is asking, and
+/// the directory workspace discovery should start from. The client owns the
+/// cwd — the daemon has none — so discovery input has to travel with the
+/// request. `SGT_ORIGIN_CLIENT` lets a front-end harness declare itself; a
+/// bare terminal is just `cli`, which names no backend and therefore falls
+/// through origin affinity to the configured default (§13's own table).
+fn origin() -> Value {
+    let client = std::env::var("SGT_ORIGIN_CLIENT").unwrap_or_else(|_| "cli".to_string());
+    json!({
+        "client": client,
+        "cwd": std::env::current_dir().ok(),
+    })
 }
 
 /// Thin authenticated HTTP client over the daemon's v1 API.

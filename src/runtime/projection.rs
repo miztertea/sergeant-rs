@@ -14,12 +14,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::event::Event;
+use crate::domain::execution::{ExecutionRecord, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED};
+use crate::domain::profile::Profile;
 use crate::domain::work::{
-    KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_CANCELED, KIND_WORK_SUBMITTED, Work,
-    WorkState,
+    KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_SUBMITTED, Work, WorkState,
+};
+use crate::domain::workflow::{
+    KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
+    KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
+    StageRecord, StageStatus, WorkflowDefinition,
 };
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::journal::JournalError;
+use crate::runtime::surface::{
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfacePlan,
+    TeardownReport, WorkSurface,
+};
 
 /// Snapshot schema identifier written by this version.
 pub const SNAPSHOT_SCHEMA: &str = "sergeant.snapshot/v1";
@@ -262,6 +272,78 @@ pub struct WorkRegistry {
     /// breaking exact-once for the one case §26 exists to serve: retry after
     /// an uncertain outcome.
     pub command_works: std::collections::BTreeMap<String, String>,
+    /// Execution state for every work that has one, keyed by work id. This is
+    /// the coordinate §10 calls "orthogonal": `works[id].state` is the §10
+    /// work state, `runs[id]` is where the run currently *is*.
+    #[serde(default)]
+    pub runs: std::collections::BTreeMap<String, WorkRun>,
+}
+
+/// Everything the journal says about one work's run: the workflow it pinned,
+/// the stages it has attempted, the surface it materialized, and the
+/// execution it last started.
+///
+/// Deliberately separate from [`Work`]: §10 keeps workflow stage orthogonal to
+/// work state so that "in review" can never become a top-level state-machine
+/// value. Keeping them in different structs is that rule made structural.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkRun {
+    /// The workflow definition this run pinned at bind time. Editing the
+    /// workflow files afterwards cannot change a run in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowDefinition>,
+    /// What the engine was *about* to materialize, journaled before the first
+    /// worktree is created. It is the only record of git side effects that a
+    /// crash mid-materialization can leave in the user's repositories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface_plan: Option<SurfacePlan>,
+    /// The work surface, if one was materialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<WorkSurface>,
+    /// Teardown report, once the surface has been torn down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown: Option<TeardownReport>,
+    /// Every stage attempt, in the order they were entered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<StageRecord>,
+    /// The execution last started for this work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionRecord>,
+    /// Backend the run routed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Which §13 tier decided that backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_source: Option<String>,
+    /// Launch profile pinned at bind time (§14 — launch configuration only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Profile>,
+}
+
+impl WorkRun {
+    /// The current (most recent) stage attempt, if any.
+    pub fn current_stage(&self) -> Option<&StageRecord> {
+        self.stages.last()
+    }
+
+    /// Whether the journal shows a start that got part-way and stopped: the
+    /// run has a record of *something* the engine did, but the work never
+    /// reached `active`. Recovery uses this to find works stranded in the
+    /// submit crash window (§25 fails those closed rather than leaving them
+    /// pending forever).
+    pub fn is_started(&self) -> bool {
+        self.surface_plan.is_some()
+            || self.surface.is_some()
+            || self.workflow.is_some()
+            || self.execution.is_some()
+    }
+
+    fn last_stage_mut(&mut self, stage_id: &str) -> Option<&mut StageRecord> {
+        self.stages
+            .iter_mut()
+            .rev()
+            .find(|s| s.stage_id == stage_id)
+    }
 }
 
 /// Reducer for [`WorkRegistry`]. Pure fold; no I/O.
@@ -273,6 +355,19 @@ pub struct WorkRegistry {
 /// error — a newer writer's events must not brick an older reader's replay
 /// (§20's forward-compatibility stance).
 pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
+    // Work-state transitions: one mapping, shared with the writer
+    // (`WorkState::for_event_kind`), so a kind cannot mean one state when
+    // appended and another when replayed.
+    if let Some(new_state) = WorkState::for_event_kind(&event.kind) {
+        if let Some(work) = event
+            .work_id
+            .as_ref()
+            .and_then(|id| state.works.get_mut(id))
+        {
+            work.state = new_state;
+        }
+        return;
+    }
     match event.kind.as_str() {
         KIND_WORK_SUBMITTED => {
             if let Ok(work) = serde_json::from_value::<Work>(event.payload["work"].clone()) {
@@ -284,13 +379,105 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
                 state.works.insert(work.id.clone(), work);
             }
         }
-        KIND_WORK_CANCELED => {
-            if let Some(work) = event
+        KIND_WORKFLOW_BOUND => {
+            if let (Some(work_id), Ok(workflow)) = (
+                event.work_id.as_ref(),
+                serde_json::from_value::<WorkflowDefinition>(event.payload["workflow"].clone()),
+            ) {
+                let run = state.runs.entry(work_id.clone()).or_default();
+                run.workflow = Some(workflow);
+                run.backend = event.payload["backend"].as_str().map(str::to_string);
+                run.route_source = event.payload["route_source"].as_str().map(str::to_string);
+                run.profile = serde_json::from_value(event.payload["profile"].clone()).ok();
+            }
+        }
+        KIND_SURFACE_MATERIALIZING => {
+            if let (Some(work_id), Ok(plan)) = (
+                event.work_id.as_ref(),
+                serde_json::from_value::<SurfacePlan>(event.payload["plan"].clone()),
+            ) {
+                state.runs.entry(work_id.clone()).or_default().surface_plan = Some(plan);
+            }
+        }
+        KIND_SURFACE_MATERIALIZED => {
+            if let (Some(work_id), Ok(surface)) = (
+                event.work_id.as_ref(),
+                serde_json::from_value::<WorkSurface>(event.payload["surface"].clone()),
+            ) {
+                let run = state.runs.entry(work_id.clone()).or_default();
+                run.surface = Some(surface);
+                run.teardown = None;
+            }
+        }
+        KIND_SURFACE_TORN_DOWN => {
+            if let (Some(work_id), Ok(report)) = (
+                event.work_id.as_ref(),
+                serde_json::from_value::<TeardownReport>(event.payload["report"].clone()),
+            ) {
+                state.runs.entry(work_id.clone()).or_default().teardown = Some(report);
+            }
+        }
+        KIND_STAGE_ENTERED => {
+            if let (Some(work_id), Some(stage_id), Some(index)) = (
+                event.work_id.as_ref(),
+                event.payload["stage_id"].as_str(),
+                event.payload["index"].as_u64(),
+            ) {
+                let run = state.runs.entry(work_id.clone()).or_default();
+                run.stages.push(StageRecord {
+                    stage_id: stage_id.to_string(),
+                    index: index as usize,
+                    attempt: event.payload["attempt"].as_u64().unwrap_or(1) as u32,
+                    status: StageStatus::Active,
+                    detail: None,
+                });
+            }
+        }
+        KIND_STAGE_COMPLETED
+        | KIND_STAGE_WAITING
+        | KIND_STAGE_NEEDS_INPUT
+        | KIND_STAGE_BLOCKED
+        | KIND_STAGE_FAILED
+        | KIND_STAGE_CANCELED => {
+            if let (Some(work_id), Some(stage_id)) =
+                (event.work_id.as_ref(), event.payload["stage_id"].as_str())
+            {
+                let status = match event.kind.as_str() {
+                    KIND_STAGE_COMPLETED => StageStatus::Completed,
+                    KIND_STAGE_WAITING => StageStatus::Waiting,
+                    KIND_STAGE_NEEDS_INPUT => StageStatus::NeedsInput,
+                    KIND_STAGE_BLOCKED => StageStatus::Blocked,
+                    KIND_STAGE_FAILED => StageStatus::Failed,
+                    _ => StageStatus::Canceled,
+                };
+                let detail = event.payload["detail"].as_str().map(str::to_string);
+                if let Some(stage) = state
+                    .runs
+                    .entry(work_id.clone())
+                    .or_default()
+                    .last_stage_mut(stage_id)
+                {
+                    stage.status = status;
+                    stage.detail = detail;
+                }
+            }
+        }
+        KIND_EXECUTION_STARTED => {
+            if let (Some(work_id), Ok(execution)) = (
+                event.work_id.as_ref(),
+                serde_json::from_value::<ExecutionRecord>(event.payload["execution"].clone()),
+            ) {
+                state.runs.entry(work_id.clone()).or_default().execution = Some(execution);
+            }
+        }
+        KIND_EXECUTION_STOPPED => {
+            if let Some(execution) = event
                 .work_id
                 .as_ref()
-                .and_then(|id| state.works.get_mut(id))
+                .and_then(|id| state.runs.get_mut(id))
+                .and_then(|run| run.execution.as_mut())
             {
-                work.state = WorkState::Canceled;
+                execution.stop_requested = true;
             }
         }
         KIND_COMMAND_ACCEPTED | KIND_COMMAND_REJECTED => {
