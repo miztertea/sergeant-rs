@@ -1,0 +1,1 @@
+//! Tracing/telemetry setup (stub).

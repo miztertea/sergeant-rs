@@ -1,0 +1,1 @@
+//! Event domain type (stub).

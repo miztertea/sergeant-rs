@@ -1,0 +1,1 @@
+//! Workflow domain type (stub).

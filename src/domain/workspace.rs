@@ -1,0 +1,1 @@
+//! Workspace domain type (stub).
