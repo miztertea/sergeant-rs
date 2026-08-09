@@ -1412,6 +1412,17 @@ impl Backend for ClaudeBackend {
     /// the event sink never blocks on its caller (see
     /// [`crate::daemon::journaling_sink`]) and the adapter lock is released
     /// before the join — the reader takes that same lock on its way out.
+    ///
+    /// This is called from [`crate::runtime::engine::Engine::stop_execution`]
+    /// while the daemon's `Core` mutex is held, and `Engine` is deliberately
+    /// synchronous and lock-agnostic (§25/§37 — it only ever sees `&mut
+    /// Core`, never the guard), so the join cannot release that lock without
+    /// giving `Engine` a way to drop and re-validate against concurrent
+    /// mutation mid-transition. `block_in_place` below only keeps the join
+    /// from starving the executor's other tasks; the `Core` lock stays held
+    /// for the join's duration, so a concurrent request that needs it waits
+    /// out the archive write. That is the accepted trade-off until `Engine`
+    /// grows a way to suspend and safely resume across a stop boundary.
     fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
         self.interrupt(handle)?;
         let reader = {
