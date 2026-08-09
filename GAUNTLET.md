@@ -96,12 +96,20 @@ wrong behavior for an export projection.
 
 **Shipping gates.** Checkpoint gate 01KZJQW-series: passed (test/lint steps
 approved on static review + orchestrator local runtime verification — the
-duckdb cold-build wall; measured and recorded). Final gate: review found 1
-(analytics catch-up TOCTOU — a concurrent `catch_up` failure landing in
-`with_analytics`'s lock-release window could fold a stale journal tail);
-fixed with retry-on-mismatch plus a regression test, pipeline-applied
-(eaa6845); test/lint clean on the checkpoint gate's static-review-plus-
-orchestrator-verification basis.
+duckdb cold-build wall; measured and recorded). Final gate: **passed** —
+review found 2: (1) analytics catch-up TOCTOU — a concurrent `catch_up`
+failure landing in `with_analytics`'s lock-release window could fold a stale
+journal tail — fixed with retry-on-mismatch plus a provoking regression
+test, pipeline-applied (eaa6845, the 178th test, orchestrator-verified
+green post-recovery); (2) source-scan tests flagged as anti-pattern —
+**declined by orchestrator ruling**: third pass at the same axis tension,
+and the round-2 adjudication stands on mutation-probe evidence the finding
+did not engage (L4: rule, don't re-loop). Test/lint approved on the
+checkpoint gate's static-review-plus-orchestrator-verification basis.
+Environmental note: in the gate's post-outcome window, t2/t5 transiently
+failed directory walks with NotFound and self-cleared once pipeline
+activity stopped (17/17 serial, 178/178 parallel afterward) — recorded as
+an unexplained shared-environment interaction, watched for recurrence.
 
 ---
 
