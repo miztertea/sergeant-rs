@@ -40,6 +40,34 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### PAUSE MARKER — 2026-08-09, M6 mid-gauntlet (planned, owner-directed)
+
+State at pause: M6 build + round-1 panel complete (14 findings, 13 confirmed,
+all fixed; 195 tests green, verified post-everything); checkpoint commit
+69cb52e + checkpoint gate **passed** (doc commit e972e64 adopted). The M5/M6
+"transient" test failures are SOLVED and were not transient: the ENOSPC-era
+shared CARGO_TARGET_DIR let pipeline worktree builds write test binaries
+(with worktree paths baked into `env!(CARGO_MANIFEST_DIR)`) into the cache
+our runs then reused — failures appeared after gate runs and "self-cleared"
+whenever an edit forced local recompilation. Fixed: gate.sh now gives the
+pipeline a private persistent cache (/root/.no-mistakes/cargo-target — warm
+across its runs, isolated from ours); forced local rebuild verified 195/0.
+
+**Resume checklist (M6 lean round 2 + P0 close-out):**
+1. Lean round-2 panel over the M6 layer (adapt m5-round2-lean.js; diff base
+   3a70148). Seed one hygiene finding: repeated suite runs leaked ~89
+   spawned `sgt` daemons — tests that auto-spawn must reap their children
+   (kill-on-drop guard or teardown sweep); also note the first pipeline run
+   under the new private cache pays one cold duckdb build (~10 min) — gate
+   step budgets should expect it once.
+2. Adjudication + M6 MARK & LOG.
+3. P0 close-out: cross-milestone ledger entry (totals M0–M6, D1–D7 summary,
+   backlog disposition, LESSONS index), README update to real usage, PR #1
+   body refresh as the deliverable's front door.
+4. Final shipping gate, push, done.
+
+---
+
 ### M5 — DuckDB Projection, Graph, OTel (2026-08-09)
 
 **Mission outcome: contract met, gates green.** Shipped: the §21–22 DuckDB
