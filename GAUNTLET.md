@@ -96,8 +96,12 @@ wrong behavior for an export projection.
 
 **Shipping gates.** Checkpoint gate 01KZJQW-series: passed (test/lint steps
 approved on static review + orchestrator local runtime verification — the
-duckdb cold-build wall; measured and recorded). Final gate: recorded below
-after the run.
+duckdb cold-build wall; measured and recorded). Final gate: review found 1
+(analytics catch-up TOCTOU — a concurrent `catch_up` failure landing in
+`with_analytics`'s lock-release window could fold a stale journal tail);
+fixed with retry-on-mismatch plus a regression test, pipeline-applied
+(eaa6845); test/lint clean on the checkpoint gate's static-review-plus-
+orchestrator-verification basis.
 
 ---
 

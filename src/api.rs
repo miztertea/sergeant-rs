@@ -1120,7 +1120,11 @@ mod tests {
             token: "test-token".to_string(),
             data_dir: data_dir.to_path_buf(),
             closing: closing_rx,
-            engine: Arc::new(Engine::new(Arc::new(BackendRegistry::new()), None, data_dir)),
+            engine: Arc::new(Engine::new(
+                Arc::new(BackendRegistry::new()),
+                None,
+                data_dir,
+            )),
             analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
         }
     }
@@ -1186,7 +1190,8 @@ mod tests {
         let core_guard = state.core.lock().await;
 
         let state_a = state.clone();
-        let task_a = tokio::spawn(async move { with_analytics(&state_a, Analytics::table_counts).await });
+        let task_a =
+            tokio::spawn(async move { with_analytics(&state_a, Analytics::table_counts).await });
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
@@ -1202,11 +1207,7 @@ mod tests {
                 analytics.catch_up(failing).is_err(),
                 "the injected failure must surface"
             );
-            assert_eq!(
-                analytics.last_seq(),
-                0,
-                "a failed fold must fail closed"
-            );
+            assert_eq!(analytics.last_seq(), 0, "a failed fold must fail closed");
         }
 
         drop(core_guard);
@@ -1225,6 +1226,9 @@ mod tests {
             events_count, 5,
             "catch-up raced by a concurrent failure must fold the whole journal, not just the stale tail it fetched before the reset"
         );
-        assert_eq!(seq, 5, "the projection must report itself caught up to the real journal head");
+        assert_eq!(
+            seq, 5,
+            "the projection must report itself caught up to the real journal head"
+        );
     }
 }
