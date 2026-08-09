@@ -487,6 +487,8 @@ impl BackendRegistry {
     /// because they need the data dir and an event sink that only exist
     /// there.
     pub fn default_registry() -> Self {
-        Self::new().with(Arc::new(fake::FakeBackend::new(fake::FAKE_BACKEND_NAME)))
+        Self::new().with(Arc::new(fake::FakeBackend::from_env(
+            fake::FAKE_BACKEND_NAME,
+        )))
     }
 }

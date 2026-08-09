@@ -1,0 +1,83 @@
+/* sergeant-rs embedded dashboard (proposal §29).
+   Shipped inside the binary via include_str!; no CDN, no build step. */
+
+:root {
+  --bg: #12141a;
+  --panel: #1a1d26;
+  --line: #2b3040;
+  --text: #dfe3ee;
+  --muted: #8b93a8;
+  --accent: #7aa2f7;
+  --ok: #79d68a;
+  --warn: #e0c56a;
+  --bad: #e07a7a;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+header.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: baseline;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+header.topbar h1 { font-size: 1rem; margin: 0; letter-spacing: 0.08em; }
+header.topbar .meta { color: var(--muted); font-size: 0.8rem; }
+header.topbar .live { margin-left: auto; color: var(--muted); font-size: 0.8rem; }
+header.topbar .live[data-state="open"] { color: var(--ok); }
+header.topbar .live[data-state="closed"] { color: var(--bad); }
+
+main { padding: 1.25rem; max-width: 78rem; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h2 {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  margin: 1.75rem 0 0.5rem;
+}
+
+table { border-collapse: collapse; width: 100%; }
+th, td {
+  text-align: left;
+  padding: 0.35rem 0.75rem 0.35rem 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+th { color: var(--muted); font-weight: normal; font-size: 0.75rem; text-transform: uppercase; }
+td.wrap { white-space: pre-wrap; word-break: break-word; }
+
+.state { font-weight: bold; }
+.state-completed { color: var(--ok); }
+.state-running, .state-pending { color: var(--accent); }
+.state-needs_input, .state-waiting { color: var(--warn); }
+.state-failed, .state-blocked, .state-canceled { color: var(--bad); }
+
+dl.fields { display: grid; grid-template-columns: 12rem 1fr; gap: 0.15rem 1rem; margin: 0; }
+dl.fields dt { color: var(--muted); }
+dl.fields dd { margin: 0; word-break: break-word; }
+
+.empty { color: var(--muted); font-style: italic; }
+.pointer { color: var(--muted); font-size: 0.8rem; }
+
+ul.ticker { list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y: auto; }
+ul.ticker li { border-bottom: 1px solid var(--line); padding: 0.2rem 0; }
+ul.ticker .seq { color: var(--muted); margin-right: 0.75rem; }
+ul.ticker .kind { color: var(--accent); margin-right: 0.75rem; }

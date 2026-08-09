@@ -113,6 +113,9 @@ pub const REQUIRED_FLAGS: &[&str] = &[
     "--dangerously-skip-permissions",
 ];
 
+/// Environment variable naming the `claude` executable to use.
+pub const CLAUDE_BIN_ENV: &str = "SGT_CLAUDE_BIN";
+
 /// Launch configuration for the adapter.
 #[derive(Debug, Clone)]
 pub struct ClaudeConfig {
@@ -132,9 +135,18 @@ pub struct ClaudeConfig {
 
 impl ClaudeConfig {
     /// Config for a daemon owning `data_dir`, with the system `claude`.
+    ///
+    /// `SGT_CLAUDE_BIN` overrides which binary that is. It exists because
+    /// "which `claude` is on the daemon's PATH" is an operator fact, not a
+    /// compile-time one — a daemon started from a login shell, a service
+    /// manager and a test harness can each see a different one, and `sgt
+    /// doctor` has to be able to report on the same binary the daemon would
+    /// actually run.
     pub fn new(data_dir: &Path) -> Self {
         Self {
-            executable: PathBuf::from("claude"),
+            executable: std::env::var_os(CLAUDE_BIN_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("claude")),
             data_dir: data_dir.to_path_buf(),
             claude_home: None,
             env: BTreeMap::new(),

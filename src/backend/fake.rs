@@ -33,6 +33,35 @@ use crate::backend::BackendSignal;
 /// Name the default registry registers the fake under.
 pub const FAKE_BACKEND_NAME: &str = "fake";
 
+/// Environment variable holding a script for the compiled-in fake backend.
+/// See [`FakeBackend::from_env`] for the grammar.
+pub const FAKE_SCRIPT_ENV: &str = "SGT_FAKE_SCRIPT";
+
+/// Parse [`FAKE_SCRIPT_ENV`]'s grammar into steps.
+pub fn parse_script(script: &str) -> Vec<FakeStep> {
+    script
+        .split(';')
+        .map(str::trim)
+        .filter(|step| !step.is_empty())
+        .filter_map(|step| {
+            let (verb, detail) = match step.split_once(':') {
+                Some((verb, detail)) => (verb.trim(), detail.trim()),
+                None => (step, ""),
+            };
+            match verb {
+                "complete" if detail.is_empty() => Some(FakeStep::complete()),
+                "complete" => Some(FakeStep::complete_with(detail)),
+                "needs_input" => Some(FakeStep::needs_input(detail)),
+                "waiting" => Some(FakeStep::waiting(detail)),
+                "blocked" => Some(FakeStep::blocked(detail)),
+                "fail" => Some(FakeStep::fail(detail)),
+                "hang" => Some(FakeStep::hang()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// One scripted execution's programmed behaviour.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakeStep {
@@ -183,6 +212,30 @@ impl FakeBackend {
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
             })),
+        }
+    }
+
+    /// A fake scripted from the environment (`SGT_FAKE_SCRIPT`).
+    ///
+    /// The script mechanism already exists; this is its front door for a fake
+    /// running inside a *spawned* daemon, where no test can hand it a
+    /// `Vec<FakeStep>` in process. The §39 walkthrough needs exactly that: a
+    /// real `sgt daemon`, driven by real CLI commands, that reaches
+    /// `needs_input` on cue instead of completing everything instantly.
+    ///
+    /// Grammar — steps separated by `;`, each `verb` or `verb:detail`:
+    ///
+    /// ```text
+    /// SGT_FAKE_SCRIPT="needs_input:confirm the retry policy;complete:done"
+    /// ```
+    ///
+    /// Verbs: `complete`, `needs_input`, `waiting`, `blocked`, `fail`, `hang`.
+    /// An unknown verb is ignored rather than silently mistaken for another —
+    /// a typo must not quietly change what the demo demonstrates.
+    pub fn from_env(name: &str) -> Self {
+        match std::env::var(FAKE_SCRIPT_ENV) {
+            Ok(script) => Self::scripted(name, parse_script(&script)),
+            Err(_) => Self::new(name),
         }
     }
 

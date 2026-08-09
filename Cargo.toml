@@ -15,6 +15,16 @@ duckdb = { version = "1", features = ["bundled"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+# §34's TUI stack. The M6 budget names "ratatui + crossterm"; crossterm is
+# deliberately *not* a second direct entry. ratatui 0.30 selects and re-exports
+# its own crossterm (`ratatui::crossterm`), and a separate `crossterm = "0.29"`
+# line here would be a second copy of the same crate that Cargo is free to
+# resolve to a different version — at which point a `KeyEvent` from our
+# crossterm is a different type from the one ratatui's backend produces, and
+# the failure is a type error at best and a silently ignored key at worst.
+# Naming it through ratatui makes agreement structural (R1: the lower rung —
+# do not add a dependency edge whose only effect is a way to be wrong).
+ratatui = "0.30.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

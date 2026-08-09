@@ -28,15 +28,32 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::daemon::{KIND_BACKEND_PROBED, KIND_DAEMON_STARTED, KIND_DAEMON_STOPPED};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
+use crate::domain::execution::{
+    KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
+};
 use crate::domain::work::{
-    KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_CANCELED, KIND_WORK_SUBMITTED, Work,
-    WorkState,
+    KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
+    KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED,
+    KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
+};
+use crate::domain::workflow::{
+    KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
+    KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING,
+    KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{Engine, EngineError, SubmitContext};
+use crate::runtime::graph::{
+    KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED, KIND_CONVERSATION_USER,
+    KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
+};
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry, WorkRun};
+use crate::runtime::surface::{
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
+};
 
 /// API revision served by this build (`GET /v1/system`, runtime descriptor).
 pub const API_REVISION: &str = "v1";
@@ -130,7 +147,12 @@ pub struct ApiState {
     pub analytics: Arc<tokio::sync::Mutex<Analytics>>,
 }
 
-/// Build the axum router for the full v1 surface.
+/// Build the axum router for the full v1 surface plus the embedded dashboard.
+///
+/// The dashboard is mounted here, but it is not part of `/v1`: it is a
+/// *client* of it, and it is handed [`ApiViews`] — the same response bodies
+/// the endpoints below return and nothing else (§29's "the dashboard is not a
+/// second backend; it is an API projection", made structural).
 pub fn router(state: ApiState) -> Router {
     let v1 = Router::new()
         .route("/work", post(submit_work).get(list_work))
@@ -156,7 +178,8 @@ pub fn router(state: ApiState) -> Router {
         // with axum's stock empty bodies.
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::web::routes(ApiViews::new(state)))
 }
 
 /// Structured 404 for routes the router does not know.
@@ -209,14 +232,66 @@ fn engine_error_status(e: &EngineError) -> StatusCode {
     }
 }
 
-/// Bearer-token gate for `/v1/*`. `/healthz` is mounted outside this layer.
-async fn require_bearer(State(state): State<ApiState>, req: Request, next: Next) -> Response {
-    let presented = req
+/// Name of the query parameter that may carry the token on safe requests.
+pub const TOKEN_QUERY_PARAM: &str = "token";
+
+/// The bearer token presented by a request, if any.
+///
+/// Two carriers, deliberately unequal:
+///
+/// - `Authorization: Bearer <token>` — always accepted;
+/// - `?token=<token>` — accepted on **GET and HEAD only**.
+///
+/// The query form exists because the browser is a client too and cannot set a
+/// header on a `<link>`, an `<img>`, or an `EventSource` (§29 requires the
+/// dashboard to live-update over the existing SSE endpoint, and `EventSource`
+/// has no header API at all). The tradeoff is real — a URL-borne secret lands
+/// in shell history, in the terminal scrollback `sgt web` printed it to, and
+/// in any log that records request lines — and it is accepted for P0 on the
+/// grounds that the listener is loopback-only, the token is regenerated on
+/// every daemon start, and the descriptor holding it is already 0600. Post-P0
+/// alternative recorded in the ledger: exchange the URL token once for a
+/// `HttpOnly; SameSite=Strict` cookie and drop the query form.
+///
+/// Restricting it to safe methods is the part that costs nothing: a page that
+/// learns the token can already read everything, but a *mutating* request
+/// authorized by a URL alone is the shape a cross-site form post can forge
+/// without ever reading a response. Mutations therefore keep requiring a
+/// header, which no cross-origin form can set.
+fn presented_token(req: &Request) -> Option<String> {
+    if let Some(header) = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if presented == Some(state.token.as_str()) {
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return Some(header.to_string());
+    }
+    if !matches!(
+        *req.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD
+    ) {
+        return None;
+    }
+    query_token(req.uri().query()?)
+}
+
+/// Pull `token=<value>` out of a raw query string.
+///
+/// The token alphabet is Crockford base32 (two ULIDs), so no percent-decoding
+/// is needed and none is done: a value that had to be decoded to match was
+/// not the token this daemon published.
+fn query_token(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        pair.strip_prefix(TOKEN_QUERY_PARAM)
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(str::to_string)
+    })
+}
+
+/// Bearer-token gate for `/v1/*`. `/healthz` is mounted outside this layer.
+async fn require_bearer(State(state): State<ApiState>, req: Request, next: Next) -> Response {
+    if presented_token(&req).as_deref() == Some(state.token.as_str()) {
         next.run(req).await
     } else {
         error_response(
@@ -232,13 +307,25 @@ async fn healthz() -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
-/// `GET /v1/system` — version, API revision, data dir.
-async fn system_info(State(state): State<ApiState>) -> Json<Value> {
-    Json(json!({
+/// The `GET /v1/system` body.
+///
+/// `journal_head` is the seq of the last committed event. It is here because
+/// every live client needs it and none of them may read the journal to find
+/// it: it is the resume point an SSE subscriber passes as `from` so that
+/// attaching to the tail does not replay all of history first.
+fn system_body(state: &ApiState, journal_head: u64) -> Value {
+    json!({
         "version": env!("CARGO_PKG_VERSION"),
         "api_revision": API_REVISION,
         "data_dir": state.data_dir,
-    }))
+        "journal_head": journal_head,
+    })
+}
+
+/// `GET /v1/system` — version, API revision, data dir, journal head.
+async fn system_info(State(state): State<ApiState>) -> Json<Value> {
+    let head = state.core.lock().await.registry.last_seq();
+    Json(system_body(&state, head))
 }
 
 /// The event source all API-origin events carry.
@@ -555,11 +642,41 @@ fn run_stage_view(run: &WorkRun) -> Option<Value> {
     }))
 }
 
+/// The `GET /v1/work` body: every work, plus each one's stage coordinate.
+///
+/// The stage rides alongside the §10 record rather than inside it — flattening
+/// them is exactly how "in review" becomes a state-machine value — but a fleet
+/// view that cannot say which stage a running work is on is not a fleet view,
+/// so `stage` is a sibling key of `work` here as it is in `work_view`.
+fn fleet_body(core: &Core) -> Value {
+    let registry = core.registry.state();
+    let works: Vec<Value> = registry
+        .works
+        .values()
+        .map(|work| {
+            let run = registry.runs.get(&work.id);
+            let mut row = serde_json::to_value(work).unwrap_or(Value::Null);
+            if let Some(object) = row.as_object_mut() {
+                object.insert(
+                    "stage".to_string(),
+                    run.and_then(run_stage_view).unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "resolved_backend".to_string(),
+                    run.and_then(|r| r.backend.clone())
+                        .map_or(Value::Null, Value::String),
+                );
+            }
+            row
+        })
+        .collect();
+    json!({"works": works})
+}
+
 /// `GET /v1/work` — list all work (ULID key order = submission order).
 async fn list_work(State(state): State<ApiState>) -> Response {
     let core = state.core.lock().await;
-    let works: Vec<&Work> = core.registry.state().works.values().collect();
-    Json(json!({"works": works})).into_response()
+    Json(fleet_body(&core)).into_response()
 }
 
 /// `GET /v1/work/{id}` — one work record, with its stage, surface and
@@ -922,14 +1039,43 @@ async fn analytics_query(State(state): State<ApiState>, Path(name): Path<String>
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct EventsQuery {
     /// Return events with seq strictly greater than this (default 0 = all).
     #[serde(default)]
     from: u64,
+    /// Restrict to one work's events (the detail screens' "recent events
+    /// tail"). Absent = the whole stream.
+    #[serde(default)]
+    work_id: Option<String>,
+    /// Keep only the newest `limit` matching events. Absent = all of them.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
-/// `GET /v1/events?from=N` — journaled history after seq N.
+/// The `GET /v1/events` body for a already-fetched slice.
+fn events_body(events: Vec<Event>, query: &EventsQuery) -> Value {
+    let mut events: Vec<Event> = match &query.work_id {
+        Some(work_id) => events
+            .into_iter()
+            .filter(|e| e.work_id.as_deref() == Some(work_id.as_str()))
+            .collect(),
+        None => events,
+    };
+    if let Some(limit) = query.limit
+        && events.len() > limit
+    {
+        events.drain(..events.len() - limit);
+    }
+    json!({"events": events})
+}
+
+/// `GET /v1/events?from=N&work_id=X&limit=K` — journaled history after seq N.
+///
+/// `from` is the only bound on how much journal is read; `work_id` and `limit`
+/// shape the answer, not the scan. A client that wants a cheap tail should
+/// carry the `from` it already knows (the TUI and the dashboard both do, from
+/// the SSE stream's last id) rather than re-asking from 0.
 async fn event_history(
     State(state): State<ApiState>,
     query: Result<Query<EventsQuery>, QueryRejection>,
@@ -940,7 +1086,7 @@ async fn event_history(
     };
     let core = state.core.lock().await;
     match core.events_after(query.from) {
-        Ok(events) => Json(json!({"events": events})).into_response(),
+        Ok(events) => Json(events_body(events, &query)).into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -1081,6 +1227,55 @@ async fn forward_events(
     }
 }
 
+/// Every event kind [`send_sse`] can name a frame with — the SSE stream's
+/// published vocabulary.
+///
+/// `EventSource` has no way to subscribe to "every named frame": a client that
+/// wants all of them must name each one. Rather than let each client keep its
+/// own copy of the list (the dashboard did, and it was already five kinds out
+/// of date), the vocabulary is stated once, here, next to the function that
+/// writes the frame names — and assembled from the journal's own `KIND_*`
+/// constants so it cannot say a kind the journal does not have. `t6` in the M6
+/// suite is the other half: it fails if a `KIND_*` constant is added to the
+/// crate and not to this list.
+pub const SSE_EVENT_KINDS: &[&str] = &[
+    KIND_WORK_SUBMITTED,
+    KIND_WORK_STARTED,
+    KIND_WORK_RESUMED,
+    KIND_WORK_WAITING,
+    KIND_WORK_NEEDS_INPUT,
+    KIND_WORK_BLOCKED,
+    KIND_WORK_COMPLETED,
+    KIND_WORK_FAILED,
+    KIND_WORK_CANCELED,
+    KIND_WORKFLOW_BOUND,
+    KIND_STAGE_ENTERED,
+    KIND_STAGE_COMPLETED,
+    KIND_STAGE_WAITING,
+    KIND_STAGE_NEEDS_INPUT,
+    KIND_STAGE_INPUT_RECEIVED,
+    KIND_STAGE_BLOCKED,
+    KIND_STAGE_FAILED,
+    KIND_STAGE_CANCELED,
+    KIND_EXECUTION_STARTED,
+    KIND_EXECUTION_STOPPED,
+    KIND_EXECUTION_RECONCILED,
+    KIND_SURFACE_MATERIALIZING,
+    KIND_SURFACE_MATERIALIZED,
+    KIND_SURFACE_TORN_DOWN,
+    KIND_CONVERSATION_USER,
+    KIND_CONVERSATION_ASSISTANT_COMPLETED,
+    KIND_CONVERSATION_TURN_ENDED,
+    KIND_TOOL_REQUESTED,
+    KIND_TOOL_COMPLETED,
+    KIND_USAGE_UPDATED,
+    KIND_COMMAND_ACCEPTED,
+    KIND_COMMAND_REJECTED,
+    KIND_DAEMON_STARTED,
+    KIND_DAEMON_STOPPED,
+    KIND_BACKEND_PROBED,
+];
+
 /// Encode one journal event as an SSE frame (`id` = seq for resume).
 async fn send_sse(
     tx: &mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
@@ -1092,6 +1287,399 @@ async fn send_sse(
         .event(event.kind.clone())
         .data(data);
     tx.send(Ok(frame)).await.map_err(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// The two client halves of this contract
+// ---------------------------------------------------------------------------
+
+/// The read surface the embedded dashboard is allowed to use.
+///
+/// §30's architectural test — "if the TUI needs a private shortcut, the API is
+/// incomplete" — applies to the dashboard too, but the dashboard is served
+/// *by* the daemon, so it cannot be held to it by "it only has a socket". This
+/// type is how it is held to it anyway: the [`ApiState`] inside is **private**,
+/// and every method returns exactly the body a `/v1` endpoint returns, built
+/// by the same function the endpoint uses. `web.rs` cannot reach the core, the
+/// engine, the journal or the projection — not by convention, but because
+/// there is no path to them from here that the compiler will accept.
+///
+/// Extending the dashboard therefore means extending the API first, which is
+/// the rule §7 states and this milestone is meant to prove.
+#[derive(Clone)]
+pub struct ApiViews(ApiState);
+
+impl ApiViews {
+    /// Wrap a daemon's state as the dashboard's read surface.
+    pub fn new(state: ApiState) -> Self {
+        Self(state)
+    }
+
+    /// Whether a presented token authorizes a dashboard request. The token
+    /// itself never leaves this type by this route — a caller can ask, not
+    /// read.
+    pub fn authorized(&self, presented: Option<&str>) -> bool {
+        presented == Some(self.0.token.as_str())
+    }
+
+    /// The `GET /v1/system` body.
+    pub async fn system(&self) -> Value {
+        let head = self.0.core.lock().await.registry.last_seq();
+        system_body(&self.0, head)
+    }
+
+    /// The `GET /v1/work` body.
+    pub async fn fleet(&self) -> Value {
+        let core = self.0.core.lock().await;
+        fleet_body(&core)
+    }
+
+    /// The `GET /v1/work/{id}` body, or `None` for an unknown work (the 404
+    /// the endpoint would answer with).
+    pub async fn work(&self, id: &str) -> Option<Value> {
+        let core = self.0.core.lock().await;
+        core.registry
+            .state()
+            .works
+            .contains_key(id)
+            .then(|| work_view(&core, id))
+    }
+
+    /// The `GET /v1/events?work_id=…&limit=…` body, or the structured error
+    /// body the endpoint would answer `500` with.
+    ///
+    /// The `Result` is the point. A journal that cannot be read is not an
+    /// empty journal, and a client that cannot tell those apart renders
+    /// "nothing happened" over a fault. The HTTP endpoint answers 500 here;
+    /// so must the dashboard, or the two clients are not equal (§7).
+    pub async fn work_events(&self, work_id: &str, limit: usize) -> Result<Value, Value> {
+        let query = EventsQuery {
+            from: 0,
+            work_id: Some(work_id.to_string()),
+            limit: Some(limit),
+        };
+        let core = self.0.core.lock().await;
+        match core.events_after(0) {
+            Ok(events) => Ok(events_body(events, &query)),
+            Err(e) => Err(error_body("internal", e.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared view helpers
+// ---------------------------------------------------------------------------
+//
+// Both clients project the same `/v1` bodies onto a screen, so the small rules
+// for *how a JSON field reads as text* belong to the API surface they share
+// rather than to either screen. Two copies of "a missing value is `-`" is two
+// chances for the TUI and the dashboard to tell a different story about the
+// same work.
+
+/// A JSON value as human text: `-` when it is absent or an empty string, the
+/// string itself when it is one, its JSON form otherwise.
+pub fn field_text(value: &Value) -> String {
+    match value {
+        Value::Null => "-".to_string(),
+        Value::String(s) if s.is_empty() => "-".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// A stage coordinate as `10-implement 2/4 · running`, or `-` when there is
+/// no run. `index` is zero-based on the wire and one-based on a screen.
+pub fn stage_label(stage: &Value) -> String {
+    if stage.is_null() {
+        return "-".to_string();
+    }
+    let position = match (stage["index"].as_u64(), stage["of"].as_u64()) {
+        (Some(i), Some(of)) => format!(" {}/{of}", i + 1),
+        (Some(i), None) => format!(" {}", i + 1),
+        _ => String::new(),
+    };
+    format!(
+        "{}{position} · {}",
+        field_text(&stage["stage_id"]),
+        field_text(&stage["status"])
+    )
+}
+
+/// Default per-request timeout for the API client. Not applied to the SSE
+/// stream, whose whole job is to stay open.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Environment override for [`CLIENT_TIMEOUT`], in whole seconds.
+///
+/// `POST /v1/work` and `POST /v1/work/{id}/input` drive the stage *inside* the
+/// request — the engine is synchronous in P0 — so a call that lands on a real
+/// model backend can outlast any fixed default (M4's ledger records a
+/// six-turn Claude pair at 33 s). Raising the default instead would be worse:
+/// a long default turns an unreachable daemon into a long hang for every
+/// client. So the default stays short and the callers that knowingly wait on a
+/// model — `scripts/demo.sh --real-claude` is the one in this repo — say so.
+pub const CLIENT_TIMEOUT_ENV: &str = "SGT_CLIENT_TIMEOUT_SECS";
+
+/// The per-request timeout this process's API clients use: [`CLIENT_TIMEOUT`]
+/// unless [`CLIENT_TIMEOUT_ENV`] names a larger, positive number of seconds.
+pub fn client_timeout() -> Duration {
+    std::env::var(CLIENT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or(CLIENT_TIMEOUT, Duration::from_secs)
+}
+
+/// A failure talking to the daemon's v1 API.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// The request never produced a response (connect, timeout, body).
+    #[error("{0}")]
+    Transport(String),
+    /// The daemon answered with a non-2xx status and a structured error.
+    #[error("{status}: {message}")]
+    Api {
+        /// HTTP status the daemon answered with.
+        status: u16,
+        /// Machine-readable error code from the structured body.
+        code: String,
+        /// Human-readable message from the structured body.
+        message: String,
+    },
+}
+
+impl From<reqwest::Error> for ClientError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Transport(e.to_string())
+    }
+}
+
+/// A client of the v1 API.
+///
+/// This is the *whole* surface a non-daemon client has: the CLI, the TUI and
+/// anything else in-process reach state through this type and nothing else.
+/// It lives beside the router on purpose — a request shape and its response
+/// shape are one contract, and keeping the two halves in one file is what
+/// makes "the client is a projection of the API" checkable by reading.
+#[derive(Clone, Debug)]
+pub struct ApiClient {
+    http: reqwest::Client,
+    endpoint: String,
+    token: String,
+}
+
+impl ApiClient {
+    /// Build a client for a daemon endpoint and its bearer token.
+    pub fn new(endpoint: &str, token: &str) -> Result<Self, ClientError> {
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .timeout(client_timeout())
+                .build()?,
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+        })
+    }
+
+    /// The daemon endpoint this client talks to.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The dashboard URL, token included (§29's `sgt web` handoff).
+    pub fn dashboard_url(&self) -> String {
+        format!(
+            "{}/ui?{TOKEN_QUERY_PARAM}={}",
+            self.endpoint,
+            urlencode(&self.token)
+        )
+    }
+
+    /// Authenticated GET returning the parsed body.
+    pub async fn get(&self, path: &str) -> Result<Value, ClientError> {
+        let response = self
+            .http
+            .get(format!("{}{path}", self.endpoint))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        Self::into_value(response).await
+    }
+
+    /// Authenticated POST with a JSON body, returning the parsed body.
+    pub async fn post(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.endpoint))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await?;
+        Self::into_value(response).await
+    }
+
+    /// `GET /v1/system`.
+    pub async fn system(&self) -> Result<Value, ClientError> {
+        self.get("/v1/system").await
+    }
+
+    /// `GET /v1/work`.
+    pub async fn fleet(&self) -> Result<Value, ClientError> {
+        self.get("/v1/work").await
+    }
+
+    /// `GET /v1/work/{id}`.
+    pub async fn work(&self, id: &str) -> Result<Value, ClientError> {
+        self.get(&format!("/v1/work/{id}")).await
+    }
+
+    /// `GET /v1/events` for one work's newest `limit` events.
+    pub async fn work_events(&self, id: &str, limit: usize) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/events?work_id={}&limit={limit}",
+            urlencode(id)
+        ))
+        .await
+    }
+
+    /// `POST /v1/work/{id}/cancel` with a fresh command id (§26).
+    pub async fn cancel(&self, id: &str) -> Result<Value, ClientError> {
+        self.post(
+            &format!("/v1/work/{id}/cancel"),
+            &json!({"command_id": ulid::Ulid::generate().to_string()}),
+        )
+        .await
+    }
+
+    /// `POST /v1/work/{id}/input` with a fresh command id (§26).
+    pub async fn respond(&self, id: &str, input: &str) -> Result<Value, ClientError> {
+        self.post(
+            &format!("/v1/work/{id}/input"),
+            &json!({
+                "command_id": ulid::Ulid::generate().to_string(),
+                "input": input,
+            }),
+        )
+        .await
+    }
+
+    /// Open the SSE live tail at `GET /v1/events/stream?from=N`.
+    ///
+    /// A separate reqwest client is built with no total timeout: the response
+    /// body of a live tail is *supposed* to stay open, and the per-request
+    /// timeout that keeps a stuck command honest would kill it on schedule.
+    pub async fn stream_events(&self, from: u64) -> Result<EventStream, ClientError> {
+        let http = reqwest::Client::builder().build()?;
+        let response = http
+            .get(format!("{}/v1/events/stream?from={from}", self.endpoint))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body: Value = response.json().await.unwrap_or(Value::Null);
+            return Err(Self::api_error(status.as_u16(), &body));
+        }
+        Ok(EventStream {
+            response,
+            pending: String::new(),
+        })
+    }
+
+    async fn into_value(response: reqwest::Response) -> Result<Value, ClientError> {
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            Ok(body)
+        } else {
+            Err(Self::api_error(status.as_u16(), &body))
+        }
+    }
+
+    fn api_error(status: u16, body: &Value) -> ClientError {
+        ClientError::Api {
+            status,
+            code: body["error"]["code"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string(),
+            message: body["error"]["message"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("HTTP {status}")),
+        }
+    }
+}
+
+/// Minimal percent-encoding for the few values this crate puts in a URL
+/// (work ids and the bearer token, both Crockford base32 today). Anything
+/// outside the unreserved set is escaped rather than trusted.
+///
+/// Public because the dashboard builds URLs into this same API and must
+/// escape them by the same rule; a second copy of an escaping rule is a
+/// second rule.
+pub fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// A live SSE tail of the journal, as [`Event`]s.
+///
+/// Frames are accumulated across chunk boundaries (a chunk is a transport
+/// artifact, not a message) and decoded one blank-line-separated frame at a
+/// time. Comment lines — which is what axum's keep-alive sends — carry no
+/// `data:` and are skipped without ending the stream.
+#[derive(Debug)]
+pub struct EventStream {
+    response: reqwest::Response,
+    pending: String,
+}
+
+impl EventStream {
+    /// The next journal event, or `None` once the stream ends.
+    pub async fn next_event(&mut self) -> Option<Event> {
+        loop {
+            while let Some(frame) = take_frame(&mut self.pending) {
+                if let Some(event) = decode_frame(&frame) {
+                    return Some(event);
+                }
+            }
+            let chunk = self.response.chunk().await.ok()??;
+            self.pending.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+}
+
+/// Split off the first complete SSE frame (terminated by a blank line).
+fn take_frame(pending: &mut String) -> Option<String> {
+    let end = pending.find("\n\n")?;
+    let frame = pending[..end].to_string();
+    pending.drain(..end + 2);
+    Some(frame)
+}
+
+/// Decode one SSE frame's `data:` lines into an [`Event`].
+fn decode_frame(frame: &str) -> Option<Event> {
+    let mut data = String::new();
+    for line in frame.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str(&data).ok()
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 
+use crate::api::{ApiClient, ClientError};
 use crate::daemon::{self, RuntimeDescriptor};
 
 /// How long the client waits for a spawned daemon to publish a healthy
@@ -46,9 +47,9 @@ struct Sgt {
     /// Emit machine-readable JSON instead of human text.
     #[arg(long, global = true)]
     json: bool,
-    /// Subcommand to run.
+    /// Subcommand to run. Omitted, `sgt` opens the TUI (§30).
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// Top-level `sgt` subcommands (§31 subset).
@@ -111,6 +112,15 @@ enum Command {
         /// Query name (omit to list what is available).
         name: Option<String>,
     },
+    /// Print the embedded dashboard's URL, token included (§29).
+    Web {
+        /// Also open it in a browser (`$BROWSER`, else `xdg-open`/`open`).
+        #[arg(long)]
+        open: bool,
+    },
+    /// Diagnose this installation (§31): tools, data dir, journal, projection,
+    /// daemon. Every failing check names the remedy.
+    Doctor,
 }
 
 /// `sgt work ...` subcommands.
@@ -136,6 +146,25 @@ struct CliError(String);
 impl CliError {
     fn new(msg: impl Into<String>) -> Self {
         Self(msg.into())
+    }
+
+    /// A nonzero exit with nothing to say: the command already printed its
+    /// own report (`sgt doctor`), and repeating it on stderr adds noise, not
+    /// information.
+    fn silent() -> Self {
+        Self(String::new())
+    }
+}
+
+impl From<ClientError> for CliError {
+    fn from(e: ClientError) -> Self {
+        Self(e.to_string())
+    }
+}
+
+impl From<crate::tui::TuiError> for CliError {
+    fn from(e: crate::tui::TuiError) -> Self {
+        Self(e.to_string())
     }
 }
 
@@ -172,6 +201,7 @@ pub fn main() -> ExitCode {
     };
     match runtime.block_on(dispatch(sgt)) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(CliError(message)) if message.is_empty() => ExitCode::FAILURE,
         Err(e) => {
             eprintln!("sgt: {e}");
             ExitCode::FAILURE
@@ -201,14 +231,20 @@ fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
 
 async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(sgt.data_dir)?;
-    match sgt.command {
+    let Some(command) = sgt.command else {
+        // §30: bare `sgt` is the TUI. It is a client like any other, so it
+        // gets the same auto-spawn path the CLI commands get.
+        let client = ensure_daemon(&data_dir).await?;
+        return crate::tui::run(client).await.map_err(CliError::from);
+    };
+    match command {
         Command::Daemon => {
             tracing_subscriber::fmt().init();
             daemon::run_until_signal(&data_dir).await?;
             Ok(())
         }
         Command::Status => {
-            let client = Client::ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir).await?;
             let system = client.get("/v1/system").await?;
             let works = client.get("/v1/work").await?;
             let mut counts = std::collections::BTreeMap::<String, u64>::new();
@@ -247,7 +283,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             repositories,
             workspace,
         } => {
-            let client = Client::ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "intent": intent,
@@ -268,7 +304,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Respond { id, input } => {
-            let client = Client::ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "input": input,
@@ -282,7 +318,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Retry { id } => {
-            let client = Client::ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/retry"), &body).await?;
             if sgt.json {
@@ -293,7 +329,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Work { command } => {
-            let client = Client::ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir).await?;
             match command {
                 WorkCommand::List => {
                     let result = client.get("/v1/work").await?;
@@ -349,7 +385,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Analytics { name } => {
-            let client = Client::ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir).await?;
             let result = match &name {
                 Some(name) => client.get(&format!("/v1/analytics/{name}")).await?,
                 None => client.get("/v1/analytics").await?,
@@ -364,7 +400,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Cancel { id } => {
-            let client = Client::ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/cancel"), &body).await?;
             if sgt.json {
@@ -378,6 +414,64 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Web { open } => {
+            // §29's handoff. `sgt web` is a client command like any other, so
+            // it auto-spawns the daemon: asking for the dashboard of a daemon
+            // that is not running should start it, not lecture about it.
+            let client = ensure_daemon(&data_dir).await?;
+            let url = client.dashboard_url();
+            if sgt.json {
+                print_json(&json!({"url": url, "endpoint": client.endpoint()}));
+            } else {
+                println!("{url}");
+                println!(
+                    "the token is in that URL — it is a secret; loopback only, \
+                     and it changes every time the daemon restarts"
+                );
+            }
+            if open {
+                open_in_browser(&url)?;
+            }
+            Ok(())
+        }
+        Command::Doctor => {
+            let report = doctor::run(&data_dir).await;
+            if sgt.json {
+                print_json(&report.to_json());
+            } else {
+                report.print();
+            }
+            if report.healthy() {
+                Ok(())
+            } else {
+                // The report has already said what is wrong and what to do
+                // about it on stdout; a second summary on stderr would be
+                // noise. The nonzero exit is the machine-readable half.
+                Err(CliError::silent())
+            }
+        }
+    }
+}
+
+/// Hand a URL to the user's browser: `$BROWSER` if set, else the platform
+/// opener. A failure here is reported, never silent — the URL has already
+/// been printed, so the user still has it.
+fn open_in_browser(url: &str) -> Result<(), CliError> {
+    let opener = std::env::var("BROWSER").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            "open".to_string()
+        } else {
+            "xdg-open".to_string()
+        }
+    });
+    let status = std::process::Command::new(&opener)
+        .arg(url)
+        .status()
+        .map_err(|e| CliError::new(format!("cannot run {opener}: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::new(format!("{opener} exited with {status}")))
     }
 }
 
@@ -503,122 +597,76 @@ fn origin() -> Value {
     })
 }
 
-/// Thin authenticated HTTP client over the daemon's v1 API.
-struct Client {
-    http: reqwest::Client,
-    endpoint: String,
-    token: String,
+/// Connect to the daemon for `data_dir`, auto-spawning one if needed.
+///
+/// This is the CLI's half of the client contract — descriptor discovery,
+/// staleness judgement, detached spawn — and it hands back the crate's one
+/// API client ([`ApiClient`], defined next to the router it speaks to). Every
+/// front end in this binary, TUI included, comes through here.
+async fn ensure_daemon(data_dir: &Path) -> Result<ApiClient, CliError> {
+    let http = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()?;
+
+    let stale = if let Some(descriptor) = daemon::read_descriptor(data_dir)? {
+        if healthz_ok(&http, &descriptor.endpoint).await {
+            return client_for(&descriptor);
+        }
+        if daemon::pid_alive(descriptor.pid) {
+            // Ambiguous: something with that PID is alive but the endpoint
+            // does not answer. Spawning a second daemon here could race a
+            // slow-but-live one; fail closed instead.
+            return Err(CliError::new(format!(
+                "daemon descriptor at {} names PID {} (alive) but {} does not answer /healthz; \
+                 refusing to spawn a second daemon. If the daemon is truly gone, remove the \
+                 descriptor file and retry.",
+                daemon::descriptor_path(data_dir).display(),
+                descriptor.pid,
+                descriptor.endpoint,
+            )));
+        }
+        // Stale: endpoint dead and PID dead. Replacement is the spawned
+        // daemon's atomic descriptor write below, *not* an unlink here:
+        // between judging the file stale and removing it, a daemon another
+        // client just spawned can publish its fresh descriptor at the same
+        // path, and unlinking that would leave a healthy, lock-holding daemon
+        // permanently undiscoverable (it only writes the descriptor at
+        // startup). Leaving the stale bytes in place costs nothing — the wait
+        // loop below never accepts a descriptor that does not answer
+        // `/healthz`.
+        Some(descriptor)
+    } else {
+        None
+    };
+
+    spawn_daemon(data_dir)?;
+
+    // Wait for a healthy descriptor. It may be written by our child or by a
+    // concurrently racing client's child — either is fine; the daemon lock
+    // guarantees at most one winner. The descriptor already judged stale is
+    // skipped by identity rather than re-probed, so a stale endpoint that
+    // hangs instead of refusing cannot eat the wait budget one health timeout
+    // at a time.
+    let deadline = Instant::now() + SPAWN_WAIT;
+    while Instant::now() < deadline {
+        if let Ok(Some(descriptor)) = daemon::read_descriptor(data_dir)
+            && !is_stale_descriptor(stale.as_ref(), &descriptor)
+            && healthz_ok(&http, &descriptor.endpoint).await
+        {
+            return client_for(&descriptor);
+        }
+        tokio::time::sleep(SPAWN_POLL).await;
+    }
+    Err(CliError::new(format!(
+        "spawned a daemon for {} but it did not become healthy within {:?} \
+         (see daemon.log in the data dir)",
+        data_dir.display(),
+        SPAWN_WAIT,
+    )))
 }
 
-impl Client {
-    /// Connect to the daemon for `data_dir`, auto-spawning one if needed.
-    async fn ensure_daemon(data_dir: &Path) -> Result<Self, CliError> {
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()?;
-
-        let stale = if let Some(descriptor) = daemon::read_descriptor(data_dir)? {
-            if healthz_ok(&http, &descriptor.endpoint).await {
-                return Ok(Self::from_descriptor(http, descriptor));
-            }
-            if daemon::pid_alive(descriptor.pid) {
-                // Ambiguous: something with that PID is alive but the
-                // endpoint does not answer. Spawning a second daemon here
-                // could race a slow-but-live one; fail closed instead.
-                return Err(CliError::new(format!(
-                    "daemon descriptor at {} names PID {} (alive) but {} does not answer /healthz; \
-                     refusing to spawn a second daemon. If the daemon is truly gone, remove the \
-                     descriptor file and retry.",
-                    daemon::descriptor_path(data_dir).display(),
-                    descriptor.pid,
-                    descriptor.endpoint,
-                )));
-            }
-            // Stale: endpoint dead and PID dead. Replacement is the spawned
-            // daemon's atomic descriptor write below, *not* an unlink here:
-            // between judging the file stale and removing it, a daemon
-            // another client just spawned can publish its fresh descriptor at
-            // the same path, and unlinking that would leave a healthy,
-            // lock-holding daemon permanently undiscoverable (it only writes
-            // the descriptor at startup). Leaving the stale bytes in place
-            // costs nothing — the wait loop below never accepts a descriptor
-            // that does not answer `/healthz`.
-            Some(descriptor)
-        } else {
-            None
-        };
-
-        spawn_daemon(data_dir)?;
-
-        // Wait for a healthy descriptor. It may be written by our child or
-        // by a concurrently racing client's child — either is fine; the
-        // daemon lock guarantees at most one winner. The descriptor already
-        // judged stale is skipped by identity rather than re-probed, so a
-        // stale endpoint that hangs instead of refusing cannot eat the wait
-        // budget one health timeout at a time.
-        let deadline = Instant::now() + SPAWN_WAIT;
-        while Instant::now() < deadline {
-            if let Ok(Some(descriptor)) = daemon::read_descriptor(data_dir)
-                && !is_stale_descriptor(stale.as_ref(), &descriptor)
-                && healthz_ok(&http, &descriptor.endpoint).await
-            {
-                return Ok(Self::from_descriptor(http, descriptor));
-            }
-            tokio::time::sleep(SPAWN_POLL).await;
-        }
-        Err(CliError::new(format!(
-            "spawned a daemon for {} but it did not become healthy within {:?} \
-             (see daemon.log in the data dir)",
-            data_dir.display(),
-            SPAWN_WAIT,
-        )))
-    }
-
-    fn from_descriptor(http: reqwest::Client, descriptor: RuntimeDescriptor) -> Self {
-        Self {
-            http,
-            endpoint: descriptor.endpoint,
-            token: descriptor.token,
-        }
-    }
-
-    /// Authenticated GET; non-2xx becomes a [`CliError`] carrying the
-    /// server's structured error message.
-    async fn get(&self, path: &str) -> Result<Value, CliError> {
-        let response = self
-            .http
-            .get(format!("{}{path}", self.endpoint))
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
-        Self::into_value(response).await
-    }
-
-    /// Authenticated POST with a JSON body.
-    async fn post(&self, path: &str, body: &Value) -> Result<Value, CliError> {
-        let response = self
-            .http
-            .post(format!("{}{path}", self.endpoint))
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await?;
-        Self::into_value(response).await
-    }
-
-    async fn into_value(response: reqwest::Response) -> Result<Value, CliError> {
-        let status = response.status();
-        let body: Value = response.json().await.unwrap_or(Value::Null);
-        if status.is_success() {
-            Ok(body)
-        } else {
-            let message = body["error"]["message"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("HTTP {status}"));
-            Err(CliError::new(format!("{status}: {message}")))
-        }
-    }
+fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
+    ApiClient::new(&descriptor.endpoint, &descriptor.token).map_err(CliError::from)
 }
 
 /// Whether `candidate` is still the exact descriptor already judged stale.
@@ -671,4 +719,448 @@ fn spawn_daemon(data_dir: &Path) -> Result<(), CliError> {
     }
     command.spawn()?;
     Ok(())
+}
+
+/// `sgt doctor` (proposal §31): diagnose one installation.
+///
+/// The rule every check here obeys: **a failing check names its remedy.** A
+/// diagnostic that reports a fault without saying what to do about it has
+/// moved the problem, not diagnosed it. The checks run in a fixed order and
+/// the `--json` shape is stable — one object per check, always the same keys,
+/// always the same names — because the first consumer of a doctor is a bug
+/// report and the second is a script.
+///
+/// Doctor deliberately does **not** auto-spawn a daemon. Every other client
+/// command starts one on demand; this one is asking whether the installation
+/// is sound, and starting the thing under examination would answer a
+/// different question.
+mod doctor {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use serde_json::{Value, json};
+
+    use crate::backend::Backend;
+    use crate::backend::claude::{
+        CLAUDE_BIN_ENV, ClaudeBackend, ClaudeConfig, MIN_TRUSTED_VERSION,
+    };
+    use crate::daemon;
+    use crate::runtime::analytics::Analytics;
+    use crate::runtime::journal::Journal;
+
+    /// A check's verdict.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Status {
+        /// Working as it should.
+        Ok,
+        /// Usable, but something is off and will bite later.
+        Warn,
+        /// Broken: this installation cannot do its job.
+        Fail,
+    }
+
+    impl Status {
+        fn as_str(self) -> &'static str {
+            match self {
+                Status::Ok => "ok",
+                Status::Warn => "warn",
+                Status::Fail => "fail",
+            }
+        }
+
+        fn marker(self) -> &'static str {
+            match self {
+                Status::Ok => "ok  ",
+                Status::Warn => "warn",
+                Status::Fail => "FAIL",
+            }
+        }
+    }
+
+    /// One diagnostic.
+    #[derive(Debug, Clone)]
+    pub struct Check {
+        /// Stable machine name.
+        pub name: &'static str,
+        /// Verdict.
+        pub status: Status,
+        /// What was measured.
+        pub detail: String,
+        /// What to do about it — present whenever the status is not `Ok`.
+        pub remedy: Option<String>,
+    }
+
+    impl Check {
+        fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+            Self {
+                name,
+                status: Status::Ok,
+                detail: detail.into(),
+                remedy: None,
+            }
+        }
+
+        fn warn(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>) -> Self {
+            Self {
+                name,
+                status: Status::Warn,
+                detail: detail.into(),
+                remedy: Some(remedy.into()),
+            }
+        }
+
+        fn fail(name: &'static str, detail: impl Into<String>, remedy: impl Into<String>) -> Self {
+            Self {
+                name,
+                status: Status::Fail,
+                detail: detail.into(),
+                remedy: Some(remedy.into()),
+            }
+        }
+    }
+
+    /// The full diagnosis.
+    #[derive(Debug, Clone)]
+    pub struct Report {
+        /// Data dir the report is about.
+        pub data_dir: PathBuf,
+        /// Checks, in a fixed order.
+        pub checks: Vec<Check>,
+    }
+
+    impl Report {
+        /// Whether the installation can do its job. Warnings do not make an
+        /// installation unhealthy — they make it worth reading about.
+        pub fn healthy(&self) -> bool {
+            self.checks.iter().all(|c| c.status != Status::Fail)
+        }
+
+        /// The stable `--json` shape.
+        pub fn to_json(&self) -> Value {
+            json!({
+                "healthy": self.healthy(),
+                "data_dir": self.data_dir,
+                "checks": self.checks.iter().map(|c| json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "detail": c.detail,
+                    "remedy": c.remedy,
+                })).collect::<Vec<_>>(),
+            })
+        }
+
+        /// The human report: one line per check, remedy indented under any
+        /// check that is not `Ok`.
+        pub fn print(&self) {
+            println!("sergeant doctor — {}", self.data_dir.display());
+            for check in &self.checks {
+                println!(
+                    "  [{}] {:<12} {}",
+                    check.status.marker(),
+                    check.name,
+                    check.detail
+                );
+                if let Some(remedy) = &check.remedy {
+                    println!("         remedy: {remedy}");
+                }
+            }
+            println!(
+                "{}",
+                if self.healthy() {
+                    "healthy"
+                } else {
+                    "unhealthy — see the remedies above"
+                }
+            );
+        }
+    }
+
+    /// Run every check against `data_dir`.
+    pub async fn run(data_dir: &Path) -> Report {
+        let mut checks = vec![
+            git_check(),
+            claude_check(data_dir),
+            data_dir_check(data_dir),
+        ];
+        // The journal is the only durable fact in the installation, so it is
+        // checked before anything derived from it; a projection rebuild over
+        // an unreadable journal would report the journal's fault under the
+        // projection's name.
+        let (journal_check, journal_ok) = journal_check(data_dir);
+        checks.push(journal_check);
+        checks.push(projection_check(data_dir, journal_ok));
+        checks.push(daemon_check(data_dir).await);
+        Report {
+            data_dir: data_dir.to_path_buf(),
+            checks,
+        }
+    }
+
+    /// Where the journal's segments live inside a data dir.
+    fn journal_dir(data_dir: &Path) -> PathBuf {
+        data_dir.join("journal")
+    }
+
+    /// §31: git presence and version. Sergeant shells out to the installed
+    /// git for every work surface (§34), so an absent git is a hard failure.
+    fn git_check() -> Check {
+        match Command::new("git").arg("--version").output() {
+            Ok(output) if output.status.success() => Check::ok(
+                "git",
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            ),
+            Ok(output) => Check::fail(
+                "git",
+                format!("`git --version` exited with {}", output.status),
+                "install a working git; sergeant materializes every work surface with `git worktree`",
+            ),
+            Err(e) => Check::fail(
+                "git",
+                format!("cannot run `git --version`: {e}"),
+                "install git and make sure it is on the daemon's PATH",
+            ),
+        }
+    }
+
+    /// §31: the claude CLI's presence *and* the adapter's own version gate.
+    ///
+    /// This runs the adapter's probe rather than a second copy of the rule:
+    /// a doctor that says "fine" while the daemon refuses the same binary is
+    /// worse than no doctor at all.
+    fn claude_check(data_dir: &Path) -> Check {
+        let config = ClaudeConfig::new(data_dir);
+        let executable = config.executable.display().to_string();
+        let report = ClaudeBackend::new(config).probe();
+        let detail = report
+            .detail
+            .unwrap_or_else(|| "no detail reported".to_string());
+        if report.available {
+            Check::ok("claude", format!("{executable}: {detail}"))
+        } else {
+            Check::fail(
+                "claude",
+                format!("{executable}: {detail}"),
+                format!(
+                    "install the Claude CLI at >= {}.{}.{} (or point {CLAUDE_BIN_ENV} at one); \
+                     until then only the `fake` backend can run work",
+                    MIN_TRUSTED_VERSION.0, MIN_TRUSTED_VERSION.1, MIN_TRUSTED_VERSION.2
+                ),
+            )
+        }
+    }
+
+    /// §31: the data dir exists and this user can write it.
+    ///
+    /// Probed by actually creating and removing a file. Permission *bits* are
+    /// not the question — read-only mounts, full disks and SELinux all answer
+    /// "writable" by inspection and "no" in practice.
+    fn data_dir_check(data_dir: &Path) -> Check {
+        let remedy = format!(
+            "create {} and make it writable by this user (or point --data-dir / SGT_DATA_DIR \
+             somewhere that is)",
+            data_dir.display()
+        );
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            return Check::fail(
+                "data_dir",
+                format!("cannot create {}: {e}", data_dir.display()),
+                remedy,
+            );
+        }
+        let probe = data_dir.join(".doctor-write-probe");
+        match std::fs::write(&probe, b"doctor") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                Check::ok("data_dir", format!("{} is writable", data_dir.display()))
+            }
+            Err(e) => Check::fail(
+                "data_dir",
+                format!("cannot write inside {}: {e}", data_dir.display()),
+                remedy,
+            ),
+        }
+    }
+
+    /// §31: the journal opens and validates.
+    ///
+    /// Read-only, by full validating replay across segments — the same walk
+    /// the daemon does at startup, which is what makes a green check mean
+    /// "the daemon will start". It never takes the journal's writer lock, so
+    /// running this against a live daemon is safe.
+    ///
+    /// Returns the check and whether the replay succeeded, so the projection
+    /// check below can say "not attempted" instead of blaming itself.
+    fn journal_check(data_dir: &Path) -> (Check, bool) {
+        let remedy = "the journal is the durable record — do not delete it. Inspect the \
+                      reported segment by hand; a torn tail from a crash is quarantined \
+                      automatically the next time the daemon opens it";
+        if !journal_dir(data_dir).exists() {
+            // A data dir nothing has ever run in is healthy, not broken. The
+            // daemon creates the journal on its first start; reporting a
+            // fresh install as a fault would train operators to ignore this
+            // check, which is worse than not having it.
+            return (
+                Check::ok(
+                    "journal",
+                    "no journal yet — nothing has run in this data dir",
+                ),
+                true,
+            );
+        }
+        let replay = match Journal::replay_data_dir(data_dir) {
+            Ok(replay) => replay,
+            Err(e) => {
+                return (
+                    Check::fail("journal", format!("cannot open the journal: {e}"), remedy),
+                    false,
+                );
+            }
+        };
+        let mut count = 0u64;
+        let mut last_seq = 0u64;
+        for event in replay {
+            match event {
+                Ok(event) => {
+                    count += 1;
+                    last_seq = event.seq;
+                }
+                Err(e) => {
+                    return (
+                        Check::fail(
+                            "journal",
+                            format!("replay failed after {count} events: {e}"),
+                            remedy,
+                        ),
+                        false,
+                    );
+                }
+            }
+        }
+        (
+            Check::ok(
+                "journal",
+                format!("{count} events replay cleanly (head seq {last_seq})"),
+            ),
+            true,
+        )
+    }
+
+    /// §31: the disposable projection can be rebuilt from the journal.
+    ///
+    /// Built into a scratch directory, not the data dir: a live daemon owns
+    /// the real DuckDB file, and a diagnostic must not touch state it does
+    /// not own. What this proves is the property that matters — the fold from
+    /// journal to projection completes — which is exactly what the daemon
+    /// does on every start (§40: projections are disposable).
+    fn projection_check(data_dir: &Path, journal_ok: bool) -> Check {
+        if !journal_ok {
+            return Check::warn(
+                "projection",
+                "not attempted: the journal did not replay",
+                "fix the journal check above first",
+            );
+        }
+        let scratch = std::env::temp_dir().join(format!("sgt-doctor-{}", ulid::Ulid::generate()));
+        let outcome = if journal_dir(data_dir).exists() {
+            Journal::replay_data_dir(data_dir)
+                .map_err(|e| e.to_string())
+                .and_then(|replay| {
+                    Analytics::rebuild(&scratch, replay)
+                        .map(|analytics| analytics.last_seq())
+                        .map_err(|e| e.to_string())
+                })
+        } else {
+            // No journal yet: the fold has nothing to read, but the store
+            // itself must still open — which is the half of this check that
+            // a fresh install can actually be wrong about.
+            Analytics::rebuild(&scratch, std::iter::empty())
+                .map(|analytics| analytics.last_seq())
+                .map_err(|e| e.to_string())
+        };
+        let _ = std::fs::remove_dir_all(&scratch);
+        match outcome {
+            Ok(last_seq) => Check::ok(
+                "projection",
+                format!("rebuilds from the journal to seq {last_seq}"),
+            ),
+            Err(e) => Check::fail(
+                "projection",
+                format!("rebuild failed: {e}"),
+                "the analytical projection is disposable: stop the daemon, delete \
+                 `projections/` in the data dir, and start it again. If it still fails, the \
+                 journal is the source of truth and nothing has been lost",
+            ),
+        }
+    }
+
+    /// §31: the runtime descriptor and whether a daemon is actually behind it.
+    ///
+    /// The three states mirror the client's own stale-descriptor policy: no
+    /// descriptor is fine (clients spawn on demand); descriptor plus a
+    /// healthy endpoint is fine; a descriptor whose PID is alive while the
+    /// endpoint refuses is the ambiguous case a client cannot resolve on its
+    /// own, so it is the one the doctor calls a failure.
+    async fn daemon_check(data_dir: &Path) -> Check {
+        let path = daemon::descriptor_path(data_dir);
+        let descriptor = match daemon::read_descriptor(data_dir) {
+            Ok(Some(descriptor)) => descriptor,
+            Ok(None) => {
+                return Check::ok(
+                    "daemon",
+                    "no daemon running; the next client command starts one",
+                );
+            }
+            Err(e) => {
+                return Check::fail(
+                    "daemon",
+                    format!("{} is unreadable: {e}", path.display()),
+                    format!(
+                        "stop any running daemon and remove {} — it is republished at startup",
+                        path.display()
+                    ),
+                );
+            }
+        };
+        let healthy = match reqwest::Client::builder()
+            .timeout(super::HEALTH_TIMEOUT)
+            .build()
+        {
+            Ok(http) => super::healthz_ok(&http, &descriptor.endpoint).await,
+            Err(_) => false,
+        };
+        if healthy {
+            return Check::ok(
+                "daemon",
+                format!(
+                    "serving {} (pid {}, api {})",
+                    descriptor.endpoint, descriptor.pid, descriptor.api_revision
+                ),
+            );
+        }
+        if daemon::pid_alive(descriptor.pid) {
+            Check::fail(
+                "daemon",
+                format!(
+                    "pid {} is alive but {} does not answer /healthz",
+                    descriptor.pid, descriptor.endpoint
+                ),
+                format!(
+                    "a client will refuse to start a second daemon in this state. Check what \
+                     pid {} is; if it is not sergeant, remove {}",
+                    descriptor.pid,
+                    path.display()
+                ),
+            )
+        } else {
+            Check::warn(
+                "daemon",
+                format!(
+                    "descriptor at {} is stale (pid {} is gone)",
+                    path.display(),
+                    descriptor.pid
+                ),
+                "harmless: the next client command spawns a daemon, which republishes it",
+            )
+        }
+    }
 }
