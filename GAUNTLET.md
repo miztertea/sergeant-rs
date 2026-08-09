@@ -39,6 +39,28 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### PAUSE MARKER — 2026-08-09, M4 mid-gauntlet (planned, owner-directed)
+
+State at pause: M4 build + round-1 panel complete (24 findings, 22 confirmed,
+all fixed with 17 revert-probed pinning tests; 132 tests, 5 clean runs);
+checkpoint commit c89e1c0 + checkpoint gate **passed** (pipeline doc commit
+bc52c00 adopted). The builder's 15 verbatim CLI measurements are in the M4
+workflow record (wf_e6b3fd7f-95b), including two new-beyond-the-spike
+hazards: nested CLAUDE_CODE_SESSION_ID capture (closed structurally via
+pre-launch --session-id + env scrub) and print-mode's lying result subtype
+(is_error/modelUsage are load-bearing).
+
+**Resume point:** M4 lean round 2. First input, from the checkpoint gate's
+parked ask-user finding: `Backend::resume()` is implemented and tested on
+both adapters but has NO production caller — reconcile only observes and
+blocks; the resume verb must be wired into the engine (and CLI/API per §8)
+or its absence ruled and recorded. Then: adjudication, MARK & LOG, final
+gate, M5 (DuckDB/graph/OTel), M6 (TUI/HTML/doctor/§39 demo). Method:
+`reference/notes/gauntlet-pattern.md`; script pattern:
+`workflows/scripts/m3-round2-lean.js` (adapt for M4).
+
+---
+
 ### M3 — Work Surfaces, Workflow Engine, Routing, Fake Backend (2026-08-08)
 
 **Mission outcome: contract met, gates green.** Shipped: zero-config and
