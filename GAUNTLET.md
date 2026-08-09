@@ -37,6 +37,7 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 |---|---|---|---|
 | B1 | M1 adjudication | A foreign snapshot whose `last_seq` is within the journal's range loads undetected (identity binding was removed as beyond-contract machinery) | Snapshots live in the daemon-owned data dir; the threat is operator error, not adversarial. **Revisited at M2 (per checkpoint-gate finding document-1):** the daemon now owns the data dir exclusively (daemon.lock) AND uses full journal replay — no snapshot loading exists in the daemon path at all (builder ruling, R1). B1 is unreachable in production flow; trigger narrowed to "if/when the daemon adopts snapshot loading (likely M5 perf)". **Revisited at M5 (checkpoint round 1):** rebuild-from-journal measured well within budget (bulk-appender fold, ~580x a row-wise-SQL baseline — see `Analytics`'s doc comment in `src/runtime/analytics.rs` and the rebuild bench in `tests/m5_projections.rs`), so rebuild-on-start remains the only population path with no perf case for snapshot loading. B1's trigger still does not fire; still dormant. |
 | B2 | M6 adjudication | Dashboard auth delivers the bearer token in the `sgt web` URL query string (shoulder-surf/history exposure on a shared machine) | Accepted at R1 for the P0: the listener is loopback-only and the token already travels in the printed URL by design; the API refuses query tokens on non-GET/HEAD (CSRF bound), and `/ui` sits behind the same `require_bearer` gate as `/v1`. Post-P0 alternative recorded per the M6 contract: exchange the URL token once for an `HttpOnly; SameSite=Strict` cookie handoff. Trigger: any non-loopback binding or multi-user host. |
+| B3 | P0 final gate | `ClaudeBackend::stop` joins the turn's evidence-archive thread while API handlers hold the core lock, so a concurrent request waits out one transcript flush during a cancel/retry of an in-flight Claude turn | Orchestrator ruling at the final gate (three review rounds converged here): STOP's evidence promise (round-2 fix — the archive is durable before STOP returns) is kept; the lock-hold is rare-path and bounded by one local-disk write; the real fix is a §15 trait-shape change (`stop` returning a join token the caller awaits after releasing the core guard) — R7 machinery, not invented at gate-time without panel coverage. `block_in_place` (d82a6e2) keeps the executor healthy meanwhile; trade-off documented on `stop` itself (d20554d). Trigger: any measured multi-client stall, or the first §15 trait revision for other reasons. |
 
 ---
 
@@ -151,7 +152,18 @@ of the reader thread ran on the async caller's tokio worker, so the archive
 wait could starve that worker's other tasks; fixed with `block_in_place` on
 a multi-thread runtime, pipeline-applied (d82a6e2), with the accepted
 Core-lock-held-during-join trade-off documented on `stop` itself (d20554d).
-Test/lint clean.
+Test/lint clean. Post-gate addendum (orchestrator): the lock-hold ruling is
+registered as backlog B3 with its trigger — the review's three rounds
+(blocking join → `block_in_place` → doc-only concession) were an L4 axis
+tension between STOP's evidence promise and core-lock responsiveness, and
+the fixer's "accepted trade-off" comment was ratified as a ruling, not
+accepted as one. A second parked finding — `source-content-only-tests`,
+against the crossterm-narrowing and timeout-knob-name pins — was declined
+on the M5 final-gate precedent (L4: third pass at the axis): both
+properties are inherently structural (a dependency-manifest shape; a
+cross-file env-name agreement), and their runtime observables live behind
+the opt-in real-Claude path. Orchestrator post-gate verification: 203/203,
+zero leaked daemons, zero /tmp residue.
 
 ---
 
