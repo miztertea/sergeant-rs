@@ -6,6 +6,18 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L10 — A squashed milestone commit defeats the revert-probe audit
+
+M6 round 2: checkpoint commit 69cb52e folded the entire build plus all 13
+round-1 fixes into one commit, so L7's cheap audit (`git revert --no-commit
+<fix-commit> && cargo test`) had nothing to revert — reverting the commit
+removes the milestone, not a fix. Mutation probes substituted (and found two
+real gaps), but they cost a specialist round; the revert-probe is supposed to
+be cheap. Rule: keep fix commits separable from build commits — a checkpoint
+may bundle *fixes* together, but never fixes with the build they fix. Where
+history is already squashed, mutation probing is the honest substitute and
+its probe-found gaps must land as pinning tests.
+
 ## L9 — The orchestrator's rulings are findings too **[world-delta]**
 
 M5: the orchestrator instructed a test rewrite ("assert a collector receives

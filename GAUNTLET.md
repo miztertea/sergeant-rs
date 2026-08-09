@@ -24,6 +24,7 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 |---|---|---|---|
 | D1 | Product named Depot; `depot.toml`; `depot` CLI | Product **sergeant-rs**; `sergeant.toml`; binary `sgt` | Owner decision 2026-08-08 |
 | D2 | Claude adapter drives a held `attach` (per Sergeant's tmux design) | Daemon has no TTY/pane. Leading M4 candidate (2026-08-08): headless turn sequence — `claude -p --output-format stream-json` with prompt on stdin, `--resume <session_id>` per later turn; session identity is durable, process exists per turn. Proven in production by no-mistakes (`internal/agent/claude.go`, vendored knowledge in LESSONS L2). The spike's rejection of `-p --resume` was Sergeant-specific (live-`--bg` refusal + persistent-TTY doctrine), neither applies here. To be confirmed by M4 contract tests (R5: installed harness capability; interrupt/restart/concurrency semantics still unmeasured). Fallbacks: SessionStart-hook injection, `--bg` + stop→resume. **Confirmed at M4** (see the M4 ledger entry below): headless print-mode turns proved adequate; fallbacks unused. | Measured spike facts + no tmux in scope; see M4 contract Unknowns and the M4 ledger entry |
+| D8 | M6 contract budgets "ratatui + crossterm (§34-named, R5)" | `ratatui` only; crossterm is reached exclusively through `ratatui::crossterm` re-exports | Builder narrowing, registered at M6 adjudication (D5 precedent): declaring crossterm separately could resolve a second version whose `KeyEvent` differs from ratatui's backend type — one declaration means one resolution (R1). Rung-noted in Cargo.toml; pinned by `the_tui_stack_is_ratatui_with_crossterm_reached_through_it`. |
 | D7 | M5 contract budgets `tracing-opentelemetry` (§28-named) | `opentelemetry` + `opentelemetry_sdk` + `opentelemetry-otlp` directly; no tracing bridge | Builder measurement-adjacent ruling, registered at M5 adjudication (flagged by the checkpoint gate): the tracing-bridge cannot represent the §28 work→stage→execution span tree — spans there follow tokio task structure, not the engine's domain structure; building spans directly from journal/engine events preserves the §28 shape (R5: the named OTel crates themselves; the bridge dropped as R1 — machinery that cannot express the requirement). Rationale in `src/telemetry.rs` module docs. |
 | D6 | §38 P0 includes "native Codex execution"; owner's original scope decision was full P0 | Claude is the only native adapter in this prototype; Codex (and the M0-era `backend/codex.rs` stub) deferred until an environment exists where Codex can actually be measured | Owner decision 2026-08-08. Measure-first doctrine (L1) + the L7 lesson: adapter code that cannot be validated against the real harness is prose with a compiler. The §15 trait remains backend-neutral, so a future Codex adapter is additive. |
 | D5 | M2 contract enumerates dependencies "axum, tower, reqwest (client, rustls)" | Actual: axum; reqwest without TLS (loopback plain HTTP — R1); tower first wrapped in a no-op layer then removed entirely at round 2 (R1: axum's own middleware suffices); plus `tokio-stream` (R7: sole Stream adapter for SSE, lower rungs named in build report) and `tracing-subscriber` (R5-adjacent: the tracing facade M0 pinned needs one subscriber to emit anything) | Contract over-specified; builder narrowed with rung-logged justifications, round-2 panel flagged the unregistered delta (M0's D3 precedent), registered at M2 adjudication. |
@@ -35,10 +36,121 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 | # | From | Finding | Why deferred |
 |---|---|---|---|
 | B1 | M1 adjudication | A foreign snapshot whose `last_seq` is within the journal's range loads undetected (identity binding was removed as beyond-contract machinery) | Snapshots live in the daemon-owned data dir; the threat is operator error, not adversarial. **Revisited at M2 (per checkpoint-gate finding document-1):** the daemon now owns the data dir exclusively (daemon.lock) AND uses full journal replay — no snapshot loading exists in the daemon path at all (builder ruling, R1). B1 is unreachable in production flow; trigger narrowed to "if/when the daemon adopts snapshot loading (likely M5 perf)". **Revisited at M5 (checkpoint round 1):** rebuild-from-journal measured well within budget (bulk-appender fold, ~580x a row-wise-SQL baseline — see `Analytics`'s doc comment in `src/runtime/analytics.rs` and the rebuild bench in `tests/m5_projections.rs`), so rebuild-on-start remains the only population path with no perf case for snapshot loading. B1's trigger still does not fire; still dormant. |
+| B2 | M6 adjudication | Dashboard auth delivers the bearer token in the `sgt web` URL query string (shoulder-surf/history exposure on a shared machine) | Accepted at R1 for the P0: the listener is loopback-only and the token already travels in the printed URL by design; the API refuses query tokens on non-GET/HEAD (CSRF bound), and `/ui` sits behind the same `require_bearer` gate as `/v1`. Post-P0 alternative recorded per the M6 contract: exchange the URL token once for an `HttpOnly; SameSite=Strict` cookie handoff. Trigger: any non-loopback binding or multi-user host. |
 
 ---
 
 ## Ledger entries
+
+### P0 CLOSE-OUT — 2026-08-09, prototype complete
+
+The §38 P0 vertical slice is done: seven gauntlet units (M0–M6), one crate,
+one binary. `sgt run "<intent>"` drives durable Work through worktree
+surfaces, a staged workflow engine, and the measured Claude adapter, with
+the complete trajectory in an append-only journal that every projection —
+in-memory, DuckDB analytics, graph, TUI, dashboard — rebuilds from. The §39
+walkthrough runs end-to-end as `scripts/demo.sh` (exit 0, evidence pointers
+verified by test t4).
+
+**Totals.** 203 tests + 2 opt-in live-Claude (suite: 78 unit, m1 10, m2 22,
+m3 24, m4 40, m5 17, m6 12); gates `fmt --check` / `clippy --all-targets
+-D warnings` / `test` green at every milestone close; release binary 58.8MB
+(47.3MB stripped) with embedded DuckDB, owner-accepted. Confirmed-finding
+series across milestones: 13 → 15/19 → 22/19 → 7/12 → 13 (round-1/round-2
+where two rounds ran) — panels kept finding real defects to the end (M6
+round 2: two errors post-checkpoint), which is the argument for the loop.
+
+**Deviations D1–D8, disposition.** All registered with rungs, none silent:
+D1 naming (owner), D2 headless print-mode turns over held-attach (measured,
+confirmed at M4), D3 backend stubs deferred to their milestones, D4 lib+bin
+layout for testability, D5 M2 dependency narrowing, D6 Codex descoped to a
+doc-stub until measurable (owner), D7 direct OTel crates over the tracing
+bridge, D8 crossterm via ratatui's re-export. The register did its job
+twice over: critics caught unregistered deltas (D5, D8) and the
+contract-amendment trap (D6) proved critics grade the amended contract.
+
+**Backlog.** B1 (snapshot identity binding) — dormant, trigger never fired,
+rebuild-on-start measured fast enough that snapshot loading never entered
+the daemon path. B2 (dashboard cookie handoff) — post-P0, trigger is any
+non-loopback binding.
+
+**LESSONS index (L1–L10).** L1 measure the Claude CLI, never trust docs;
+L2 headless driving is proven production practice; L3 point fresh critics
+at the register; L4 axis-tension means adjudicate, not loop; L5 enforce
+probe hygiene structurally; L6 adjacent-append crash windows recur; L7
+fixes need pinning tests (revert-probe); L8 capability flags need contract
+tests; L9 orchestrator rulings are findings too; L10 milestone-squashed
+commits defeat the revert-probe audit.
+
+**What P0 does not do** (deferred by contract, not omitted silently):
+Codex/OpenCode/Prime adapters (D6/D3), MCP, non-loopback auth, graph
+rendering (JSON endpoint only), charts. The §15 trait, §8 API, and journal
+schema are the extension points the proposal intends.
+
+---
+
+### M6 — TUI, Dashboard, Doctor, §39 Demo (2026-08-09)
+
+**Mission outcome: contract met, gates green.** Shipped: the ratatui TUI
+(bare `sgt` opens fleet + work detail, SSE-live with a durable liveness
+indicator — `live` / `TAIL CLOSED (r reconnects)` — that command outcomes
+cannot overwrite; SIGTERM/SIGHUP restore the terminal; cancel/respond
+keybinds); the embedded server-rendered dashboard (`include_str!` assets,
+EventSource live updates, `/ui` behind the same `require_bearer` middleware
+as `/v1` with one token-extraction rule and one 401/405 vocabulary; `sgt
+web` prints/opens the tokenized URL); `sgt doctor` (git, claude CLI +
+version-gate verdict, data dir + journal validation, projection rebuild
+health, daemon liveness/descriptor; human + stable `--json`, every check
+names its remedy, exit code reflects health); and `scripts/demo.sh` — the
+§39 walkthrough in a temp repo, fake-backend deterministic, narrating both
+stages including the second (review) execution, exiting 0 with evidence
+pointers t4 re-resolves against the kept journal. Clients-are-equal is
+enforced structurally: tui.rs/web.rs reach state only via `ApiClient`/
+`ApiViews`, and t5 pins the `ApiViews` public-method set so widening the
+surface fails the test. Evidence: 203 tests + 2 opt-in, zero leaked
+daemons and zero /tmp residue after a full suite run (orchestrator-
+verified with non-self-matching patterns).
+
+**Environmental behavior.** Build + round 1 in one workflow: 14 findings,
+13 confirmed, fixed at checkpoint 69cb52e; checkpoint gate passed (doc
+commit e972e64 adopted). Round 2 (lean, 11 agents): 17 panel findings + 1
+orchestrator-seeded, refuters killed 4, **13 confirmed — 2 errors after a
+passed checkpoint**: (1) t5 was defeatable by widening `ApiViews` with a
+non-endpoint method — the guard pinned "whatever methods exist", weaker
+than the doc's compile-error claim; probe-proven, now pinned by a
+self-tested scanner; (2) the seeded cross-suite daemon leak (measured ~89
+accumulated, then 1 per clean run). Round 2 also found by forensics what
+no axis was assigned: 243 leaked /tmp dirs traced to `ClaudeBackend::stop`
+returning before the turn's evidence archive landed — an M4 latent defect
+surfaced by an M6 hygiene sweep. The checkpoint-adopted doc commit e972e64
+itself contained false specifics (test-inventory claims), confirmed and
+corrected by closing the gaps it papered over, not rewording. Fixer: one
+iteration, all 13 closed, every new instrument itself tested (reaper,
+surface scanner, stop-join pin all probe-verified to fail when their
+subject regresses).
+
+**Adjudication rulings.** (1) D8 registered (crossterm narrowing, D5
+precedent). (2) Token-in-URL accepted at R1 for loopback P0; recorded as
+backlog B2 with the cookie-handoff alternative — this is the record the
+contract's Unknown pointed at; api.rs's premature "recorded in the ledger"
+claim was made honest in round 2 and is true as of this entry. (3) A doc
+adopted by a checkpoint gate is a claim like any other — e972e64's false
+inventory confirmed as a finding; the correction closes gaps rather than
+rewording (fleet-row projection now unit-tested field by field). (4) L7's
+revert-probe was unperformable on the squashed 69cb52e — mutation probes
+accepted as this round's substitute, and the process defect is now LESSONS
+L10. (5) `POST /ui` unauthenticated now 401 (was 405): gate-before-router
+chosen to match `/v1`; uncontracted behavior change made visible in t2's
+assertions. (6) Daemon-leak and temp-dir-leak fixes are structural (the
+`DataDir` guard's `&DataDir`-typed helpers make an unreaped spawn a type
+error), per L5's "the environment enforces the boundary".
+
+**Shipping gates.** Checkpoint gate (pre-round-2): passed, e972e64
+adopted. Final shipping gate: run at P0 close-out over the round-2 fix
+commit 2383863 and this documentation — result recorded by the gate's own
+document step in the commit trail.
+
+---
 
 ### PAUSE MARKER — 2026-08-09, M6 mid-gauntlet (planned, owner-directed)
 
