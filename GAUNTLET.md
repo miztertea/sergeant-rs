@@ -88,7 +88,9 @@ server-model backend).
 
 **Shipping gates.** Checkpoint gate: **passed** (doc commit bc52c00 adopted;
 review parked resume-unwired to adjudication; test step approved without
-re-spending the live pair). Final gate: recorded below after the run.
+re-spending the live pair). Final gate: **passed** — one doc commit adopted
+(2d8bfdc: the pipeline confirmed D2's register row against the M4
+measurements; the register now records its own resolution).
 
 ---
 
