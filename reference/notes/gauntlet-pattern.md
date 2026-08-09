@@ -120,3 +120,13 @@ Capability goes where judgment lives; diversity goes where independence matters.
   orchestrator afterward. A verifier that mutates the thing it verifies to
   reach a verdict has stopped verifying; its batch is quarantined and
   re-adjudicated. This is the anti-capture boundary applied to our own loop.
+
+## The scripts as run
+
+`reference/gauntlet-workflows.zip` holds all twelve orchestration scripts
+exactly as executed, one per workflow invocation: the seven milestone
+gauntlets (`m0-bootstrap` … `m6-clients`) and the five lean follow-up
+rounds (`m2`–`m6-round2-lean`). They are the concrete instantiation of
+this pattern — schemas, axis briefs, hygiene preambles, model/effort
+assignments, and the economy revisions are all visible in the diffs
+between successive milestones' scripts.
