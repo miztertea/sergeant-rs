@@ -1425,7 +1425,16 @@ impl Backend for ClaudeBackend {
             execution.reader.take()
         };
         if let Some(reader) = reader {
-            let _ = reader.join();
+            let use_block_in_place = tokio::runtime::Handle::try_current()
+                .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+                .unwrap_or(false);
+            if use_block_in_place {
+                tokio::task::block_in_place(|| {
+                    let _ = reader.join();
+                });
+            } else {
+                let _ = reader.join();
+            }
         }
         Ok(())
     }
