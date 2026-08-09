@@ -1,0 +1,49 @@
+# Recorded fixtures
+
+`claude-2.1.226-turn.jsonl` — four verbatim stream-json lines from one real
+print-mode turn, recorded 2026-08-09 in this container against Claude Code
+2.1.226:
+
+```
+IS_SANDBOX=1 claude -p --verbose --output-format stream-json \
+  --setting-sources user --session-id 3f2a9c14-... --model haiku \
+  --dangerously-skip-permissions
+prompt: "Run the bash command: echo hello-fixture. Then reply with exactly: OK"
+```
+
+The turn's other 22 lines (`system:thinking_tokens`, `system:init`,
+`rate_limit_event`, thinking blocks, `post_turn_summary`) are omitted; the
+four kept lines — assistant `tool_use`, user `tool_result`, assistant `text`,
+and the `result` envelope — are byte-for-byte as the CLI emitted them.
+Nothing here is authored: this is a recording, and it is what the
+deterministic §20/§27 tests replay.
+
+## `claude-2.1.226-substitution-envelope.derived.json` — derived, not recorded
+
+**This file is not a recording, and the name says so.** The M4 contract's
+acceptance 2 asks for the substitution path to be "unit-tested against a
+recorded fixture of the substitution envelope", and no such recording can
+exist here: print-mode substitution cannot be provoked on this account (it is
+entitled to every model the pin would ask for), and the spike's actual
+substitution evidence is a *TUI transcript warning line*, not a print-mode
+result envelope (`reference/sergeant-upstream/docs/research/
+claude-background-harness-spike.md`, "the warning"). Recording it would
+require an unentitled account, which is an environment, not a test.
+
+So this fixture is *derived* from the recorded envelope above by exactly
+three edits, and nothing else:
+
+1. the `modelUsage` key `claude-haiku-4-5-20251001` → `claude-sonnet-5-20260101`
+2. its `canonicalModel` `claude-haiku-4-5` → `claude-sonnet-5`
+3. `result` → `"mission accomplished"` (the spike's point: the mission
+   succeeded while the pin did not hold)
+
+Every other byte — `is_error: false`, `subtype: "success"`,
+`api_error_status: null`, the usage block, the cost — is the measured 2.1.226
+shape. What the substitution test therefore pins is the adapter's fail-closed
+*rule* (an envelope whose model fields do not match the pin is substitution,
+whatever the mission said), against a measured envelope shape, with a
+scenario taken from the spike. It does not pin a measurement of print mode's
+substitution surface, and the test says so in its own doc comment. Keeping
+the derivation on disk, rather than as a `json!` literal inside the test,
+is what makes the difference between "recorded" and "derived" reviewable.

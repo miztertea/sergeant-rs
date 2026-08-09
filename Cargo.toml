@@ -1,0 +1,63 @@
+[package]
+name = "sergeant-rs"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sgt"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+blake3 = "1.8.6"
+clap = { version = "4.6.6", features = ["derive"] }
+duckdb = { version = "1", features = ["bundled"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+# §34's TUI stack. The M6 budget names "ratatui + crossterm"; crossterm is
+# deliberately *not* a second direct entry. ratatui 0.30 selects and re-exports
+# its own crossterm (`ratatui::crossterm`), and a separate `crossterm = "0.29"`
+# line here would be a second copy of the same crate that Cargo is free to
+# resolve to a different version — at which point a `KeyEvent` from our
+# crossterm is a different type from the one ratatui's backend produces, and
+# the failure is a type error at best and a silently ignored key at worst.
+# Naming it through ratatui makes agreement structural (R1: the lower rung —
+# do not add a dependency edge whose only effect is a way to be wrong).
+# This narrows a contract-enumerated list ("ratatui + crossterm"), which is the
+# same shape as the registered deviation D5; the delta is not yet in the
+# deviation register because M6's MARK & LOG has not run. Pinned as a test —
+# `the_tui_stack_is_ratatui_with_crossterm_reached_through_it` in
+# tests/m6_surfaces.rs — so the omission stays deliberate rather than becoming
+# a fact nobody re-decided.
+ratatui = "0.30.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = "0.3"
+ulid = "3.0.0"
+
+# M5 Unknown #1 — "the duckdb crate's bundled-build cost in this container
+# (compile time and disk) — measure first". Measured here, dev profile, before
+# this override: libduckdb.a 2.08 GB, liblibduckdb_sys.rlib 2.0 GB, and every
+# integration-test binary that links it ~770 MB, for 15 GB of `target/` on a
+# disk with ~16 GB free. That is survivable for `cargo test` alone but not for
+# `cargo clippy --all-targets`, which needs its own check-profile copy of the
+# same C build and died in `ar` with ENOSPC — i.e. a project gate was silently
+# unrunnable. Nearly all of that bulk is DWARF: cc-rs passes `-g` to the ~500
+# bundled C++ translation units whenever the profile asks for debug info.
+# Fallback taken instead of a feature gate or a leaner store (both of which
+# would change what M5 ships): keep the proposal-named crate (R5) and drop
+# debug info from that one package's artifacts. Rust-side debug info is
+# untouched, and nobody in this project steps through DuckDB's C++.
+[profile.dev.package.libduckdb-sys]
+debug = false
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
+tempfile = "3"
