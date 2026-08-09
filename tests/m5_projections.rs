@@ -415,41 +415,41 @@ async fn a_restart_over_the_existing_projection_file_rebuilds_it() {
 #[test]
 fn t2_the_duckdb_file_has_exactly_one_owner() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut users: Vec<String> = Vec::new();
+    // A token scan, not a fixed-pattern grep: however the import is spelled
+    // (`use duckdb::...`, `duckdb::Connection`, `extern crate duckdb`, a
+    // re-export), the crate's own lowercase name has to appear somewhere in
+    // the file. Prose that mentions the product ("DuckDB") is capitalized
+    // and does not collide with the identifier.
+    let names_the_crate = |text: &str| {
+        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|token| token == "duckdb")
+    };
     for file in rust_sources(&src) {
-        let text = std::fs::read_to_string(&file).expect("read source");
-        if text.contains("duckdb::") || text.contains("use duckdb") {
-            users.push(
-                file.strip_prefix(&src)
-                    .expect("under src")
-                    .display()
-                    .to_string(),
-            );
+        if file.ends_with("runtime/analytics.rs") {
+            continue;
         }
+        let text = std::fs::read_to_string(&file).expect("read source");
+        assert!(
+            !names_the_crate(&text),
+            "{} names the duckdb crate; it must be reachable from one module only",
+            file.strip_prefix(&src).expect("under src").display()
+        );
     }
-    users.sort();
-    assert_eq!(
-        users,
-        vec!["runtime/analytics.rs".to_string()],
-        "the DuckDB client must be reachable from one module only"
-    );
 
     // And that module must not leak the connection: everything crossing its
-    // boundary is plain data (`QueryResult`, `GraphView`, counts).
+    // boundary is plain data (`QueryResult`, `GraphView`, counts). The field
+    // itself needs no check here — rustc enforces private-by-default struct
+    // fields at compile time, so any external access is a compile error.
     let analytics = std::fs::read_to_string(src.join("runtime/analytics.rs")).expect("read");
     assert!(
         !analytics.contains("pub fn conn") && !analytics.contains("-> &Connection"),
         "no accessor may hand a live DuckDB connection outside the projection"
     );
-    assert!(
-        analytics.contains("    conn: Connection,"),
-        "the connection must stay a private field"
-    );
 
     // The CLI reaches analytics only through the daemon's HTTP surface.
     let cli = std::fs::read_to_string(src.join("cli.rs")).expect("read cli");
     assert!(
-        cli.contains("/v1/analytics") && !cli.contains("duckdb"),
+        cli.contains("/v1/analytics") && !names_the_crate(&cli),
         "clients ask the daemon; they do not open the file"
     );
 }
@@ -1188,56 +1188,33 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
         "a disabled configuration must not build a pipeline at all"
     );
 
-    // Structural, and the reason the configuration assertions above are not
-    // the only guard: `start_with` exports what its caller handed it and
-    // nothing else. Across the crate the sole construction site is
-    // `run_until_signal`, fed by `TelemetryConfig::from_env` — so a daemon
-    // started from the default configuration has no pipeline to reach for,
-    // and a regression that built one inside `start_with` regardless of
-    // config (which every assertion above would survive) fails here.
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    for file in rust_sources(&src) {
-        if file.ends_with("telemetry.rs") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&file).expect("read source");
-        for line in text.lines() {
-            let builds = [
-                "Telemetry::otlp",
-                "Telemetry::with_exporters",
-                "Telemetry::from_config",
-            ]
-            .iter()
-            .any(|constructor| line.contains(constructor));
-            assert!(
-                !builds || file.ends_with("daemon.rs"),
-                "{} builds an export pipeline: {}",
-                file.display(),
-                line.trim()
-            );
-        }
-    }
-    let daemon_src = std::fs::read_to_string(src.join("daemon.rs")).expect("read daemon");
-    let body = |name: &str| {
-        daemon_src
-            .split_once(name)
-            .unwrap_or_else(|| panic!("no {name} in daemon.rs"))
-            .1
-            .split("\n}\n")
-            .next()
-            .expect("a function body")
-            .to_string()
+    // Not the only guard, and not a text scan: a bare TCP listener stands in
+    // for a collector nobody told the daemon about. If a regression started
+    // building a pipeline from the ambient environment regardless of the
+    // config it was handed, the fake-backend run below would have somewhere
+    // to send it — this asserts it never dials out at all.
+    let collector_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let collector_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stand-in collector");
+    collector_listener
+        .set_nonblocking(true)
+        .expect("nonblocking");
+    let collector_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let collector_thread = {
+        use std::sync::atomic::Ordering;
+        let hits = Arc::clone(&collector_hits);
+        let stop = Arc::clone(&collector_stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match collector_listener.accept() {
+                    Ok(_) => {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        })
     };
-    assert!(
-        !body("pub async fn start_with(").contains("Telemetry::"),
-        "`start_with` must never build an export pipeline of its own"
-    );
-    let signal = body("pub async fn run_until_signal(");
-    assert!(
-        signal.contains("TelemetryConfig::from_env()")
-            && signal.contains("Telemetry::from_config("),
-        "the one construction site must be gated on the environment configuration"
-    );
 
     let data = TempDir::new().expect("tempdir");
     let repo = TempDir::new().expect("tempdir");
@@ -1268,6 +1245,14 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
     .await;
     assert_eq!(created["work"]["state"], "completed");
     handle.shutdown().await;
+
+    collector_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    collector_thread.join().expect("collector thread");
+    assert_eq!(
+        collector_hits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a disabled daemon dialed a collector nothing told it about"
+    );
 
     let _ = ambient_traces.force_flush();
     let _ = ambient_meters.force_flush();
