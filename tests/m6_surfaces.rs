@@ -34,10 +34,22 @@
 //! `TestBackend` buffer proved workable and are used as the primary
 //! instrument: the buffer is flattened to text lines and searched for the
 //! contracted fields. Exact-frame snapshots were rejected — they break on
-//! every layout tweak and assert mostly about box-drawing — and the
-//! view-model layer (`fleet_rows`, `stage_label`, `App::on_key`) is unit
-//! tested inside `src/tui.rs` as the fallback the contract names, so both
-//! halves exist rather than one standing in for the other.
+//! every layout tweak and assert mostly about box-drawing.
+//!
+//! The view-model layer is unit tested as well, not merely as a fallback, and
+//! here is exactly where, because a claim about where tests live is itself a
+//! test claim:
+//!
+//! - `src/tui.rs`'s own `#[cfg(test)] mod tests` covers the projection field
+//!   by field (`fleet_rows` → `WorkRow`, including the `-`-for-missing rule
+//!   and the one-based stage position), the keymap (`App::on_key`: bounded
+//!   navigation, the two-keystroke write keys), `App::observe`'s
+//!   refresh-worthy set, and the durable liveness indicator in the header;
+//! - `stage_label` and `field_text` are *not* the TUI's — they live in
+//!   `src/api.rs` because both clients share them, and they are unit tested
+//!   next to the dashboard's renderers in `src/web.rs`. The point of the
+//!   sharing is that the two screens cannot tell different stories about the
+//!   same field, so one unit test for the rule is the right number.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -57,6 +69,9 @@ use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::tui::{self, App, Screen};
 use sergeant_rs::web::{DASHBOARD_CSS, DASHBOARD_JS};
+
+mod support;
+use support::DataDir;
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
@@ -383,7 +398,7 @@ fn t1_the_tui_has_no_private_shortcut() {
 /// a daemon or not fail here.
 #[test]
 fn t1_bare_sgt_opens_the_tui_as_a_client() {
-    let data = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
     let output = Command::new(SGT)
         .arg("--data-dir")
         .arg(data.path())
@@ -397,9 +412,13 @@ fn t1_bare_sgt_opens_the_tui_as_a_client() {
     let descriptor = daemon::read_descriptor(data.path())
         .expect("descriptor readable")
         .expect("bare `sgt` must auto-spawn a daemon like every other client");
-    let _ = Command::new("kill")
-        .arg(descriptor.pid.to_string())
-        .status();
+    // Reaped through the guard rather than by an unwaited `kill` of the pid
+    // in the descriptor: the guard waits for the process to actually be gone,
+    // and it runs even if the assertion below fails first.
+    assert!(
+        dir_reap_contains(&data, descriptor.pid),
+        "the daemon the descriptor names must be the one on this data dir"
+    );
 
     assert!(
         !output.status.success() && stderr.contains("terminal"),
@@ -626,6 +645,38 @@ async fn t2_the_dashboard_serves_real_data_and_is_embedded() {
         "a POST must not be authorized by a query-string token"
     );
 
+    // …and the dashboard is behind the *same* gate, not a copy of it. The
+    // rule the copy used to omit was exactly this safe-method bound, so it is
+    // checked here on a `/ui` route as well as on `/v1`.
+    let response = http()
+        .post(format!("{}/ui?token={}", handle.endpoint, handle.token))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        response.status(),
+        401,
+        "a query token must not authorize a POST to the dashboard either"
+    );
+
+    // A wrong-method request that *is* authorized gets the router's own
+    // structured 405 — the same error vocabulary /v1 answers with. A `/ui`
+    // mounted outside the shared layers answered these with an empty body.
+    for path in ["/ui", "/v1/system"] {
+        let response = http()
+            .post(format!("{}{path}", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(response.status(), 405, "POST {path} is not a route");
+        let body: Value = response.json().await.expect("structured error body");
+        assert_eq!(
+            body["error"]["code"], "method_not_allowed",
+            "every route on this listener answers with one error vocabulary: {body}"
+        );
+    }
+
     handle.shutdown().await;
 
     // --- the assets are in the binary ---------------------------------------
@@ -659,9 +710,9 @@ async fn t2_the_dashboard_serves_real_data_and_is_embedded() {
         );
     }
 
-    let data = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
     let empty = TempDir::new().expect("tempdir");
-    let daemon = SpawnedDaemon::start(data.path(), empty.path(), &[]);
+    let daemon = SpawnedDaemon::start(&data, empty.path(), &[]);
     let css = get_text(
         &format!(
             "{}/ui/assets/dashboard.css?token={}",
@@ -930,10 +981,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // pass (probed: replacing its body with that one literal left the whole
     // suite green). Its other three branches are where an operator actually
     // needs it, so they are exercised here.
-    let live_data = TempDir::new().expect("tempdir");
+    let live_data = DataDir::new();
     let live_cwd = TempDir::new().expect("tempdir");
     {
-        let running = SpawnedDaemon::start(live_data.path(), live_cwd.path(), &[]);
+        let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
         let (code, stdout, _) = doctor(live_data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
         assert_eq!(
             code,
@@ -1212,6 +1263,11 @@ fn t4_the_section_39_demo_runs_and_its_evidence_resolves() {
         "sergeant routed it, cut a work surface",
         "the first stage runs and stops to ask a question",
         "the developer answers",
+        // §39's arc is "stages", plural, and this is the element that makes
+        // it so: the review is dispatched as another execution. It always
+        // ran; until this marker existed the walkthrough never said so, and
+        // nothing would have noticed it going quiet again.
+        "the review ran as a second, independent execution",
         "the surface was retired",
         "where the evidence lives",
         "the walkthrough held",
@@ -1279,6 +1335,37 @@ fn t4_the_section_39_demo_runs_and_its_evidence_resolves() {
         assert!(
             seqs.contains(&seq),
             "edge {edge} cites journal seq {seq}, which is not in the journal the run kept"
+        );
+    }
+
+    // The stage narration, resolved the same way: every line the step printed
+    // names an execution and a journal seq, and both must be real. A run that
+    // printed one stage, or printed the same execution twice, would be
+    // describing a single prompt while calling it a workflow.
+    let narrated: Vec<(String, u64)> = stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("stage "))
+        .filter_map(|line| {
+            let execution = line.split(" — execution ").nth(1)?;
+            let (execution, rest) = execution.split_once(" on ")?;
+            let seq = rest.split("journal seq ").nth(1)?.trim_end_matches(')');
+            Some((execution.to_string(), seq.parse::<u64>().ok()?))
+        })
+        .collect();
+    assert_eq!(
+        narrated.len(),
+        2,
+        "the walkthrough must narrate both stages of the two-stage workflow:\n{stdout}"
+    );
+    assert_ne!(
+        narrated[0].0, narrated[1].0,
+        "§39's review is *another execution*, not a later turn of the first one"
+    );
+    for (execution, seq) in &narrated {
+        assert!(
+            seqs.contains(seq),
+            "the narration cites journal seq {seq} for execution {execution}, which is \
+             not in the journal the run kept"
         );
     }
 
@@ -1379,6 +1466,72 @@ fn t4_the_section_39_demo_runs_and_its_evidence_resolves() {
     );
 }
 
+/// The §34 TUI stack, as the milestone actually spends it.
+///
+/// The contract's dependency budget names "ratatui + crossterm". Only
+/// `ratatui` is declared: a second `crossterm` entry is a second copy of the
+/// same crate that Cargo may resolve to a different version, at which point
+/// the `KeyEvent` this code matches on is not the one ratatui's backend
+/// produces. The narrowing is deliberate and rung-logged in `Cargo.toml`;
+/// this is what keeps it that way — adding the direct dependency, or reaching
+/// for crossterm by any path other than ratatui's re-export, fails here and
+/// has to be argued for.
+#[test]
+fn the_tui_stack_is_ratatui_with_crossterm_reached_through_it() {
+    let manifest =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .expect("read Cargo.toml");
+    let declared: Vec<&str> = manifest
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("crossterm"))
+        .collect();
+    assert!(
+        declared.is_empty(),
+        "crossterm must not be a direct dependency — it is ratatui's, and one \
+         resolution of it is the whole point: {declared:?}"
+    );
+    assert!(
+        manifest.contains("\nratatui = "),
+        "ratatui is the §34-named TUI dependency and must stay declared"
+    );
+
+    let tui = code_only(&read_source("tui.rs"));
+    assert!(
+        tui.contains("ratatui::crossterm::"),
+        "the TUI must reach crossterm through ratatui's re-export"
+    );
+    for line in tui.lines().map(str::trim) {
+        assert!(
+            !line.starts_with("use crossterm"),
+            "a bare `crossterm` path would compile only against a second, separately \
+             resolved copy of the crate: {line}"
+        );
+    }
+}
+
+/// The one client knob the walkthrough sets, checked by name.
+///
+/// `SGT_CLIENT_TIMEOUT_SECS` is read in exactly one place (`api::client_timeout`)
+/// and written in exactly one place (`scripts/demo.sh`, inside the
+/// `--real-claude` branch this suite deliberately does not run). Nothing else
+/// would notice the two spellings drifting apart, and the failure mode is
+/// silent: the demo exports a variable nobody reads and the run dies on the
+/// ten-second default instead. The parse itself is unit tested in `src/api.rs`;
+/// this is the other half — that the two ends still name the same knob.
+#[test]
+fn t4_the_demo_and_the_client_name_the_same_timeout_knob() {
+    let script =
+        std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/demo.sh"))
+            .expect("read scripts/demo.sh");
+    let knob = sergeant_rs::api::CLIENT_TIMEOUT_ENV;
+    assert!(
+        script.contains(&format!("export {knob}=")),
+        "scripts/demo.sh must export {knob} — the variable the client actually \
+         reads — for the path that waits on a real model"
+    );
+}
+
 // -------------------------------------------------------- 5. clients equal
 
 /// Acceptance 5. §7/§30's clients-are-equal rule, enforced on both surfaces:
@@ -1458,6 +1611,76 @@ fn t5_the_tui_and_the_dashboard_are_clients_like_any_other() {
             "the dashboard's read surface must stay plain API bodies: {signature} is gone"
         );
     }
+    // …and there must be no *others*. Requiring four signatures to still exist
+    // says nothing about a fifth, and the fifth is where the rule actually
+    // breaks: a `pub async fn raw_journal_tail(&self, n: usize) -> Vec<String>`
+    // added to this impl and called from `web.rs` is an ordinary-looking
+    // feature addition that hands the dashboard the journal, and it left the
+    // path scan, this test and t5b all green (measured, in a disposable copy).
+    // The private field forecloses reaching *around* `ApiViews`; only this
+    // pins the surface `ApiViews` itself offers.
+    assert_eq!(
+        public_methods_of(&code_only(&api), "impl ApiViews {"),
+        vec![
+            "fleet".to_string(),
+            "new".to_string(),
+            "system".to_string(),
+            "work".to_string(),
+            "work_events".to_string(),
+        ],
+        "the dashboard's read surface is exactly these methods. Adding one is \
+         adding a client capability that no `/v1` endpoint has to justify — if \
+         the new method returns a body an endpoint already returns, say so here; \
+         if it does not, §30 says the API is what is incomplete."
+    );
+}
+
+/// The `pub fn`/`pub async fn` names declared directly inside an `impl` block,
+/// sorted.
+///
+/// Brace-counted from the header so it stops at the end of *that* block, and
+/// depth-checked so a `pub fn` nested inside a method body (a closure's
+/// module, a helper `impl`) is not counted as part of the surface. Fed
+/// comment-stripped source, because a doc comment is free to contain a lone
+/// brace and the count is what decides where the block ends.
+fn public_methods_of(source: &str, header: &str) -> Vec<String> {
+    let start = source
+        .find(header)
+        .unwrap_or_else(|| panic!("no {header:?} in the source to scan"))
+        + header.len();
+    let mut depth = 1usize;
+    let mut names = Vec::new();
+    for line in source[start..].lines() {
+        if depth == 1
+            && let Some(rest) = line.trim().strip_prefix("pub ")
+        {
+            let rest = rest.strip_prefix("async ").unwrap_or(rest);
+            if let Some(rest) = rest.strip_prefix("fn ") {
+                names.push(
+                    rest.split(['(', '<', ' '])
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        for c in line.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                break;
+            }
+        }
+        if depth == 0 {
+            break;
+        }
+    }
+    assert_eq!(depth, 0, "the {header:?} block is never closed");
+    names.sort();
+    names
 }
 
 /// The guard above, guarded. An instrument nobody has tried to fool is a
@@ -1499,6 +1722,33 @@ fn t5b_the_structural_scan_sees_every_spelling_of_a_path() {
     assert!(
         crate_paths("mod tests { use super::*; use super::field; }").is_empty(),
         "`super::` inside a module's own tests names that module, not the crate"
+    );
+
+    // The surface scan, tried on the shape it exists to catch: a method added
+    // to the dashboard's read surface that is not a `/v1` body. It must see
+    // the addition, and it must not see either a `pub fn` from a later impl
+    // block or one nested inside a method body.
+    let widened = "\
+impl ApiViews {
+    pub fn new(state: ApiState) -> Self { Self(state) }
+    pub async fn system(&self) -> Value { json!({}) }
+    pub async fn raw_journal_tail(&self, n: usize) -> Vec<String> {
+        pub fn helper() {}
+        vec![]
+    }
+}
+impl Other {
+    pub fn not_part_of_the_surface(&self) {}
+}
+";
+    assert_eq!(
+        public_methods_of(widened, "impl ApiViews {"),
+        vec![
+            "new".to_string(),
+            "raw_journal_tail".to_string(),
+            "system".to_string()
+        ],
+        "the surface scan must see a widened surface, and stop at the block it was asked about"
     );
 }
 
@@ -1737,11 +1987,23 @@ struct SpawnedDaemon {
 }
 
 impl SpawnedDaemon {
+    /// Start a daemon on a guarded data dir.
+    ///
+    /// The [`DataDir`] is what makes the process accounting complete: this
+    /// type reaps the child it owns, but a client command run against the
+    /// same data dir can spawn a *second*, detached daemon that no `Child`
+    /// handle points at, and that is the shape the leak measurement found.
+    fn start(data_dir: &DataDir, cwd: &Path, env: &[(&str, &str)]) -> Self {
+        Self::start_at(data_dir.path(), cwd, env)
+    }
+}
+
+impl SpawnedDaemon {
     // The child is reaped by this type's `Drop`, which kills and waits. The
     // lint cannot see across that boundary; the timeout path below reaps
     // explicitly because it never constructs the value that owns the Drop.
     #[allow(clippy::zombie_processes)]
-    fn start(data_dir: &Path, cwd: &Path, env: &[(&str, &str)]) -> Self {
+    fn start_at(data_dir: &Path, cwd: &Path, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(SGT);
         command
             .arg("--data-dir")
@@ -1795,6 +2057,11 @@ impl Drop for SpawnedDaemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Reap a guarded data dir's daemons, reporting whether `pid` was among them.
+fn dir_reap_contains(data_dir: &DataDir, pid: u32) -> bool {
+    data_dir.reap().contains(&pid)
 }
 
 /// The slice of a page between two markers, so an assertion about one section

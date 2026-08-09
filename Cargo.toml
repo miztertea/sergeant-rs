@@ -24,6 +24,12 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 # the failure is a type error at best and a silently ignored key at worst.
 # Naming it through ratatui makes agreement structural (R1: the lower rung —
 # do not add a dependency edge whose only effect is a way to be wrong).
+# This narrows a contract-enumerated list ("ratatui + crossterm"), which is the
+# same shape as the registered deviation D5; the delta is not yet in the
+# deviation register because M6's MARK & LOG has not run. Pinned as a test —
+# `the_tui_stack_is_ratatui_with_crossterm_reached_through_it` in
+# tests/m6_surfaces.rs — so the omission stays deliberate rather than becoming
+# a fact nobody re-decided.
 ratatui = "0.30.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }

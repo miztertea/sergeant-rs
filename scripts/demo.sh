@@ -226,6 +226,59 @@ say "state $STATE"
 [ "$STATE" = "completed" ] || fail "expected completed, got $STATE"
 
 # ---------------------------------------------------------------------------
+# §39's arc is "stages", plural, and the second one is the part that makes it
+# so: the review is dispatched as *another execution*, not as a later phase of
+# the same agent's turn. It ran in every version of this walkthrough and was
+# never printed, so the one element that distinguishes a workflow from a single
+# prompt was invisible in the walkthrough that narrates it.
+step "the review ran as a second, independent execution"
+
+STAGE_RUNS="$(python3 - "$DATA_DIR/journal" "$WORK_ID" <<'PY'
+import glob, json, os, sys
+
+journal, work_id = sys.argv[1], sys.argv[2]
+stages = []
+for path in sorted(glob.glob(os.path.join(journal, "*.ndjson"))):
+    with open(path) as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            event = json.loads(line)
+            if event.get("work_id") != work_id:
+                continue
+            payload = event.get("payload") or {}
+            if event["kind"] == "stage.entered":
+                stages.append([payload.get("stage_id", "?"), "-", "-", event["seq"]])
+            elif event["kind"] == "execution.started" and stages:
+                execution = payload.get("execution") or {}
+                stages[-1][1] = execution.get("execution_id", "?")
+                stages[-1][2] = execution.get("backend", "?")
+                stages[-1][3] = event["seq"]
+for stage in stages:
+    print("\t".join(str(field) for field in stage))
+PY
+)"
+[ -n "$STAGE_RUNS" ] || fail "the journal records no stages for $WORK_ID"
+
+STAGE_COUNT=0
+EXECUTIONS=""
+while IFS=$'\t' read -r stage execution backend seq; do
+  [ -n "$stage" ] || continue
+  STAGE_COUNT=$((STAGE_COUNT + 1))
+  say "stage $STAGE_COUNT: $stage — execution $execution on $backend (journal seq $seq)"
+  EXECUTIONS="$EXECUTIONS $execution"
+done <<< "$STAGE_RUNS"
+
+[ "$STAGE_COUNT" -ge 2 ] || fail "the workflow has two stages but only $STAGE_COUNT ran"
+DISTINCT="$(printf '%s' "$EXECUTIONS" | tr ' ' '\n' | grep -c '[^[:space:]-]' || true)"
+UNIQUE="$(printf '%s' "$EXECUTIONS" | tr ' ' '\n' | grep '[^[:space:]-]' | sort -u | wc -l | tr -d ' ')"
+[ "$UNIQUE" = "$DISTINCT" ] \
+  || fail "the stages reused an execution — the review must be its own ($EXECUTIONS)"
+say "different execution ids: the review is independent work, not a later turn of the first agent"
+evidence "journal: stage.entered + execution.started per stage, at the seqs above"
+
+# ---------------------------------------------------------------------------
 step "the surface was retired"
 
 TEARDOWN="$(printf '%s' "$FINAL" | json teardown.reason)"

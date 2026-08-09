@@ -55,6 +55,9 @@ use sergeant_rs::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
 };
 
+mod support;
+use support::DataDir;
+
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 // ---------------------------------------------------------------- helpers
@@ -2165,14 +2168,14 @@ async fn a_malformed_workspace_file_fails_closed() {
 #[test]
 fn cli_respond_and_retry_through_the_binary() {
     let repos = TempDir::new().expect("tempdir");
-    let data = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
     let repo = repos.path().join("solo");
     init_repo(&repo);
     write_two_stage_workflow(&repo);
 
     // The default daemon registry's fake completes every stage, so this run
     // goes end to end without a scripted backend.
-    let output = sgt(&repo, data.path(), &["--json", "run", "ship it"]);
+    let output = sgt(&repo, &data, &["--json", "run", "ship it"]);
     assert!(
         output.status.success(),
         "sgt run failed: {}",
@@ -2188,7 +2191,7 @@ fn cli_respond_and_retry_through_the_binary() {
     assert_eq!(submitted["route_source"], "global_default");
 
     // `sgt work show` (human form) carries the stage and surface coordinates.
-    let output = sgt(&repo, data.path(), &["work", "show", &work_id]);
+    let output = sgt(&repo, &data, &["work", "show", &work_id]);
     assert!(output.status.success());
     let shown: Value = serde_json::from_slice(&output.stdout).expect("work show");
     assert_eq!(shown["id"].as_str(), Some(work_id.as_str()));
@@ -2200,13 +2203,13 @@ fn cli_respond_and_retry_through_the_binary() {
 
     // Responding to work that is not waiting exits nonzero with the daemon's
     // own diagnostic (the CLI never invents success).
-    let output = sgt(&repo, data.path(), &["respond", &work_id, "hello"]);
+    let output = sgt(&repo, &data, &["respond", &work_id, "hello"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not needs_input"), "respond said: {stderr}");
 
     // Same for retry on a completed work.
-    let output = sgt(&repo, data.path(), &["retry", &work_id]);
+    let output = sgt(&repo, &data, &["retry", &work_id]);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("only failed, blocked or waiting"),
@@ -2218,11 +2221,15 @@ fn cli_respond_and_retry_through_the_binary() {
 }
 
 /// Run the sgt binary from `cwd` against `data_dir`.
-fn sgt(cwd: &Path, data_dir: &Path, args: &[&str]) -> std::process::Output {
+///
+/// `data_dir` is a [`DataDir`] rather than a path because any client command
+/// may auto-spawn a detached daemon; the guard is what reaps it, including on
+/// the path where an assertion above the cleanup fails.
+fn sgt(cwd: &Path, data_dir: &DataDir, args: &[&str]) -> std::process::Output {
     Command::new(SGT)
         .current_dir(cwd)
         .arg("--data-dir")
-        .arg(data_dir)
+        .arg(data_dir.path())
         .args(args)
         .output()
         .expect("run sgt")

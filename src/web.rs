@@ -18,25 +18,32 @@
 //! Auth is the same bearer token as everything else, presented either as a
 //! header or — because a browser navigating to a URL can set no headers — as
 //! `?token=`. The tradeoff and its bound (safe methods only) are documented on
-//! [`crate::api::TOKEN_QUERY_PARAM`]'s reader.
+//! [`crate::api::TOKEN_QUERY_PARAM`]'s reader, and **this module decides no
+//! part of it**: the daemon layers [`crate::api`]'s own bearer gate over these
+//! routes, exactly as it does over `/v1`, so an unauthorized request never
+//! reaches a handler here. What the pages still need is the token's *value*,
+//! to put it back on the links and asset URLs a browser will follow — and
+//! they read it with the API's extractor, not a second copy of the rule.
 
 use std::fmt::Write as _;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::Router;
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 // The view helpers below are the API's, not this module's: `text` is the
 // shared `-`-for-missing rule and `stage_label` the shared stage coordinate,
 // so the dashboard and the TUI cannot tell different stories about the same
-// field, and `urlencode` is the client's own escaping rule rather than a
-// second copy of it.
+// field, `urlencode` is the client's own escaping rule rather than a second
+// copy of it, and `presented_token` is the one bearer-extraction rule this
+// listener has.
 use crate::api::{
-    ApiViews, SSE_EVENT_KINDS, TOKEN_QUERY_PARAM, field_text as text, stage_label, urlencode,
+    ApiViews, SSE_EVENT_KINDS, TOKEN_QUERY_PARAM, field_text as text, presented_token, stage_label,
+    urlencode,
 };
 
 /// Dashboard stylesheet, compiled into the binary (§29: no CDN).
@@ -60,49 +67,33 @@ pub fn routes(views: ApiViews) -> Router {
         .with_state(views)
 }
 
-/// Query parameters every dashboard page accepts.
-#[derive(Debug, Default, Deserialize)]
-struct PageQuery {
-    /// The bearer token, for a browser that cannot send a header.
-    #[serde(default)]
-    token: Option<String>,
-}
+/// The token this request presented — the *value*, not a verdict.
+///
+/// Authorization is already settled by the time a handler here runs: the
+/// daemon layers [`crate::api`]'s bearer gate over these routes. What the
+/// pages need is the token itself, because every link, asset URL and
+/// `EventSource` the browser follows next has to carry it. Reading it with
+/// [`presented_token`] rather than a local copy is the point: the copy this
+/// module used to keep accepted a query token on any method, so the listener
+/// had two extraction rules that disagreed about the safe-method bound.
+///
+/// The rejection is unreachable behind the gate — it exists because an
+/// extractor must return something, and it returns the one 401 this daemon
+/// has rather than inventing a second.
+struct PageToken(String);
 
-/// The token a request presents, header first.
-fn presented(headers: &HeaderMap, query: &PageQuery) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_string)
-        .or_else(|| query.token.clone())
-}
+impl<S: Send + Sync> FromRequestParts<S> for PageToken {
+    type Rejection = Response;
 
-/// The same structured 401 the API answers with — one error vocabulary for
-/// every client, including this one.
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": {
-            "code": "unauthorized",
-            "message": "missing or invalid bearer token",
-        }})),
-    )
-        .into_response()
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        presented_token(&parts.method, &parts.headers, parts.uri.query())
+            .map(PageToken)
+            .ok_or_else(crate::api::unauthorized_response)
+    }
 }
 
 /// `GET /ui` — the Fleet screen.
-async fn fleet_page(
-    State(views): State<ApiViews>,
-    headers: HeaderMap,
-    Query(query): Query<PageQuery>,
-) -> Response {
-    let Some(token) = presented(&headers, &query) else {
-        return unauthorized();
-    };
-    if !views.authorized(Some(&token)) {
-        return unauthorized();
-    }
+async fn fleet_page(State(views): State<ApiViews>, PageToken(token): PageToken) -> Response {
     let system = views.system().await;
     let fleet = views.fleet().await;
     Html(render_fleet(&system, &fleet, &token)).into_response()
@@ -112,15 +103,8 @@ async fn fleet_page(
 async fn work_page(
     State(views): State<ApiViews>,
     Path(id): Path<String>,
-    headers: HeaderMap,
-    Query(query): Query<PageQuery>,
+    PageToken(token): PageToken,
 ) -> Response {
-    let Some(token) = presented(&headers, &query) else {
-        return unauthorized();
-    };
-    if !views.authorized(Some(&token)) {
-        return unauthorized();
-    }
     let system = views.system().await;
     let Some(detail) = views.work(&id).await else {
         return (
@@ -152,48 +136,17 @@ async fn work_page(
 /// Assets are authenticated like the pages that reference them: the token
 /// travels on the `<link>`/`<script>` URL, so a stylesheet is not a hole in
 /// the same listener's auth.
-async fn stylesheet(
-    State(views): State<ApiViews>,
-    headers: HeaderMap,
-    Query(query): Query<PageQuery>,
-) -> Response {
-    asset(
-        &views,
-        &headers,
-        &query,
-        "text/css; charset=utf-8",
-        DASHBOARD_CSS,
-    )
+async fn stylesheet() -> Response {
+    asset("text/css; charset=utf-8", DASHBOARD_CSS)
 }
 
 /// `GET /ui/assets/dashboard.js`.
-async fn script(
-    State(views): State<ApiViews>,
-    headers: HeaderMap,
-    Query(query): Query<PageQuery>,
-) -> Response {
-    asset(
-        &views,
-        &headers,
-        &query,
-        "text/javascript; charset=utf-8",
-        DASHBOARD_JS,
-    )
+async fn script() -> Response {
+    asset("text/javascript; charset=utf-8", DASHBOARD_JS)
 }
 
-fn asset(
-    views: &ApiViews,
-    headers: &HeaderMap,
-    query: &PageQuery,
-    content_type: &'static str,
-    body: &'static str,
-) -> Response {
-    match presented(headers, query) {
-        Some(token) if views.authorized(Some(&token)) => {
-            ([(header::CONTENT_TYPE, content_type)], body).into_response()
-        }
-        _ => unauthorized(),
-    }
+fn asset(content_type: &'static str, body: &'static str) -> Response {
+    ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
 // ---------------------------------------------------------------- rendering
@@ -579,6 +532,7 @@ fn fields(pairs: &[(&str, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn text_nodes_and_attributes_are_escaped() {
@@ -627,6 +581,20 @@ mod tests {
                 "a read failure must never be dressed as an empty section: {green:?}"
             );
         }
+    }
+
+    /// The `-`-for-missing rule, where it is defined for both clients.
+    ///
+    /// It lives in `api.rs` because the TUI and the dashboard must not tell
+    /// different stories about the same absent field; it is tested here,
+    /// beside the renderers that lean on it hardest.
+    #[test]
+    fn an_absent_field_reads_as_a_dash_and_a_present_one_as_itself() {
+        assert_eq!(text(&Value::Null), "-");
+        assert_eq!(text(&json!("")), "-", "an empty string is absence too");
+        assert_eq!(text(&json!("fake")), "fake");
+        assert_eq!(text(&json!(3)), "3", "a number reads as its JSON form");
+        assert_eq!(text(&json!(false)), "false");
     }
 
     #[test]

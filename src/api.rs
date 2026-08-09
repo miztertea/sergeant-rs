@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -170,6 +170,20 @@ pub fn router(state: ApiState) -> Router {
             state.clone(),
             require_bearer,
         ));
+    // The dashboard goes behind the *same* gate, rather than carrying a
+    // second one: `web.rs` renders pages, it does not decide authorization
+    // (R2 — the middleware is already here; reuse it). Its own
+    // `method_not_allowed_fallback` is set here because the outer one below
+    // only rewrites the routes the router already holds, and a merge brings
+    // these in afterwards: without this line `POST /ui` answered with axum's
+    // stock empty body while every other route on the listener answered
+    // structured JSON.
+    let ui = crate::web::routes(ApiViews::new(state.clone()))
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
     Router::new()
         .route("/healthz", get(healthz))
         .nest("/v1", v1)
@@ -178,8 +192,8 @@ pub fn router(state: ApiState) -> Router {
         // with axum's stock empty bodies.
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
-        .with_state(state.clone())
-        .merge(crate::web::routes(ApiViews::new(state)))
+        .with_state(state)
+        .merge(ui)
 }
 
 /// Structured 404 for routes the router does not know.
@@ -193,6 +207,19 @@ async fn method_not_allowed() -> Response {
         StatusCode::METHOD_NOT_ALLOWED,
         "method_not_allowed",
         "method not allowed on this route",
+    )
+}
+
+/// The 401 this listener answers with, wherever it is answered.
+///
+/// One constructor, so a client cannot learn a different error vocabulary
+/// depending on which route it knocked on. The dashboard's extractor needs it
+/// for a rejection the gate makes unreachable; the gate itself uses it below.
+pub fn unauthorized_response() -> Response {
+    error_response(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or invalid bearer token",
     )
 }
 
@@ -249,31 +276,40 @@ pub const TOKEN_QUERY_PARAM: &str = "token";
 /// in shell history, in the terminal scrollback `sgt web` printed it to, and
 /// in any log that records request lines — and it is accepted for P0 on the
 /// grounds that the listener is loopback-only, the token is regenerated on
-/// every daemon start, and the descriptor holding it is already 0600. Post-P0
-/// alternative recorded in the ledger: exchange the URL token once for a
-/// `HttpOnly; SameSite=Strict` cookie and drop the query form.
+/// every daemon start, and the descriptor holding it is already 0600. The
+/// post-P0 alternative, for the ledger entry this milestone's MARK & LOG
+/// still owes (R1 — ship the cheapest thing that closes the P0 and name the
+/// better shape rather than build it): exchange the URL token once for a
+/// `HttpOnly; SameSite=Strict` cookie and drop the query form. That entry is
+/// not written yet, and this comment does not claim it is.
 ///
 /// Restricting it to safe methods is the part that costs nothing: a page that
 /// learns the token can already read everything, but a *mutating* request
 /// authorized by a URL alone is the shape a cross-site form post can forge
 /// without ever reading a response. Mutations therefore keep requiring a
 /// header, which no cross-origin form can set.
-fn presented_token(req: &Request) -> Option<String> {
-    if let Some(header) = req
-        .headers()
+///
+/// **This is the only copy of the rule.** The dashboard needs the same
+/// extraction — its pages have to put the token back on every link they
+/// render — and the second copy it used to keep had already drifted from this
+/// one: it took a query token on any method and percent-decoded it. Both
+/// clients call this function now.
+pub fn presented_token(
+    method: &Method,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Option<String> {
+    if let Some(header) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     {
         return Some(header.to_string());
     }
-    if !matches!(
-        *req.method(),
-        axum::http::Method::GET | axum::http::Method::HEAD
-    ) {
+    if !matches!(*method, Method::GET | Method::HEAD) {
         return None;
     }
-    query_token(req.uri().query()?)
+    query_token(query?)
 }
 
 /// Pull `token=<value>` out of a raw query string.
@@ -289,16 +325,20 @@ fn query_token(query: &str) -> Option<String> {
     })
 }
 
-/// Bearer-token gate for `/v1/*`. `/healthz` is mounted outside this layer.
+/// Bearer-token gate for `/v1/*` **and for the dashboard**. `/healthz` is the
+/// only route mounted outside this layer.
+///
+/// The dashboard used to re-implement this: its own extraction, its own
+/// comparison, and its own hand-written copy of the 401 body below. One gate
+/// decides for every route on this listener now — a second implementation of
+/// an authorization rule is a second rule, and it had already diverged on the
+/// safe-method bound.
 async fn require_bearer(State(state): State<ApiState>, req: Request, next: Next) -> Response {
-    if presented_token(&req).as_deref() == Some(state.token.as_str()) {
+    let presented = presented_token(req.method(), req.headers(), req.uri().query());
+    if presented.as_deref() == Some(state.token.as_str()) {
         next.run(req).await
     } else {
-        error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "missing or invalid bearer token",
-        )
+        unauthorized_response()
     }
 }
 
@@ -1299,10 +1339,21 @@ async fn send_sse(
 /// incomplete" — applies to the dashboard too, but the dashboard is served
 /// *by* the daemon, so it cannot be held to it by "it only has a socket". This
 /// type is how it is held to it anyway: the [`ApiState`] inside is **private**,
-/// and every method returns exactly the body a `/v1` endpoint returns, built
-/// by the same function the endpoint uses. `web.rs` cannot reach the core, the
-/// engine, the journal or the projection — not by convention, but because
-/// there is no path to them from here that the compiler will accept.
+/// and every method below returns exactly the body a `/v1` endpoint returns,
+/// built by the same function the endpoint uses. `web.rs` therefore cannot
+/// reach the core, the engine, the journal or the projection *directly* — not
+/// by convention, but because there is no path to them from `web.rs` that the
+/// compiler will accept.
+///
+/// **What the compiler does not decide is this list.** The private field
+/// forecloses reaching *around* this type; it says nothing about a method
+/// added *to* it, and a `raw_journal_tail` here would hand `web.rs` the
+/// journal with every structural test still green (measured — that probe is
+/// why this paragraph exists). The list is therefore pinned as data by
+/// `t5_the_tui_and_the_dashboard_are_clients_like_any_other`, which reads the
+/// `pub fn`s of this block and requires them to be exactly the set below.
+/// Adding a method means changing that test, which is where a reviewer is
+/// asked whether the new method is a `/v1` body or a shortcut.
 ///
 /// Extending the dashboard therefore means extending the API first, which is
 /// the rule §7 states and this milestone is meant to prove.
@@ -1313,13 +1364,6 @@ impl ApiViews {
     /// Wrap a daemon's state as the dashboard's read surface.
     pub fn new(state: ApiState) -> Self {
         Self(state)
-    }
-
-    /// Whether a presented token authorizes a dashboard request. The token
-    /// itself never leaves this type by this route — a caller can ask, not
-    /// read.
-    pub fn authorized(&self, presented: Option<&str>) -> bool {
-        presented == Some(self.0.token.as_str())
     }
 
     /// The `GET /v1/system` body.
@@ -1423,11 +1467,25 @@ pub const CLIENT_TIMEOUT_ENV: &str = "SGT_CLIENT_TIMEOUT_SECS";
 /// The per-request timeout this process's API clients use: [`CLIENT_TIMEOUT`]
 /// unless [`CLIENT_TIMEOUT_ENV`] names a larger, positive number of seconds.
 pub fn client_timeout() -> Duration {
-    std::env::var(CLIENT_TIMEOUT_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map_or(CLIENT_TIMEOUT, Duration::from_secs)
+    timeout_from(std::env::var(CLIENT_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// [`client_timeout`]'s rule, as a function of the raw setting.
+///
+/// Separated from the `std::env` read so it can be tested: the whole knob is
+/// five lines of parsing whose only production caller is an opt-in
+/// `--real-claude` path, i.e. exactly the shape that rots unobserved. It had
+/// already drifted from the sentence above it — the filter admitted *any*
+/// positive value, so `SGT_CLIENT_TIMEOUT_SECS=1` silently shortened every
+/// client's timeout below the default. The knob exists to let a caller that
+/// knowingly waits on a model wait longer; it is not a way to make the daemon
+/// look unreachable, so the raise is one-directional and the tests below say
+/// so.
+fn timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .filter(|requested| *requested > CLIENT_TIMEOUT)
+        .unwrap_or(CLIENT_TIMEOUT)
 }
 
 /// A failure talking to the daemon's v1 API.
@@ -1687,6 +1745,41 @@ mod tests {
     use super::*;
     use crate::backend::BackendRegistry;
     use crate::runtime::projection::work_registry_projection;
+
+    /// The one knob on the client, exercised. Its only production caller is
+    /// `scripts/demo.sh --real-claude`, which the suite deliberately does not
+    /// run, so without this the parse is unobserved code — and it had already
+    /// drifted from its own doc comment (any positive value was accepted,
+    /// including ones *below* the default).
+    #[test]
+    fn the_client_timeout_override_only_ever_raises_the_default() {
+        assert_eq!(timeout_from(None), CLIENT_TIMEOUT, "unset: the default");
+        assert_eq!(
+            timeout_from(Some("300")),
+            Duration::from_secs(300),
+            "a larger value is what the knob is for"
+        );
+        assert_eq!(
+            timeout_from(Some("  300\n")),
+            Duration::from_secs(300),
+            "an exported value carrying whitespace still parses"
+        );
+        for lowering in ["1", "0", "10"] {
+            assert_eq!(
+                timeout_from(Some(lowering)),
+                CLIENT_TIMEOUT,
+                "{lowering}s must not shorten the default: a short timeout makes a \
+                 working daemon look unreachable to every client in the process"
+            );
+        }
+        for nonsense in ["", "abc", "-5", "2.5", "9999999999999999999999"] {
+            assert_eq!(
+                timeout_from(Some(nonsense)),
+                CLIENT_TIMEOUT,
+                "an unparseable {nonsense:?} falls back rather than failing the client"
+            );
+        }
+    }
 
     async fn test_state(data_dir: &std::path::Path) -> ApiState {
         let journal = Journal::open(data_dir).expect("open journal");

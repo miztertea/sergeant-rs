@@ -22,8 +22,10 @@
 //! of state, no client-side reducer to drift.
 //!
 //! The terminal is restored on every exit path: [`ratatui::try_init`]
-//! installs a panic hook that restores before printing, and [`run`] restores
-//! in one place on the way out regardless of how the loop ended.
+//! installs a panic hook that restores before printing, [`run`] restores in
+//! one place on the way out regardless of how the loop ended, and SIGTERM /
+//! SIGHUP end the loop through that same exit instead of killing the process
+//! with the screen still in raw mode (see `TerminationSignals`).
 
 use std::time::Duration;
 
@@ -54,6 +56,36 @@ pub enum TuiError {
     /// session: a daemon restart should not take the TUI down with it.
     #[error("{0}")]
     Api(#[from] ClientError),
+}
+
+/// Whether the live tail is attached.
+///
+/// This is *screen state*, not a transient message, and it is rendered in the
+/// header next to the seq counter for exactly that reason. The one-line status
+/// at the bottom is overwritten by the next command outcome ("canceled …"),
+/// so a tail that died two keystrokes ago would leave a screen that looks
+/// live and never reconnects — fixed data presented as live truth, which is
+/// the failure mode §7 cares about. The dashboard keeps a dedicated live
+/// indicator for the same reason (`#live` in `web/dashboard.js`); this is the
+/// TUI's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Live {
+    /// Attached: the daemon's SSE tail is feeding this screen.
+    #[default]
+    Attached,
+    /// Detached: the tail ended or could not be opened. The data on screen is
+    /// as of the last read, and `r` re-reads *and* re-attaches.
+    Detached,
+}
+
+impl Live {
+    /// How the header says it, in the one place that decides.
+    fn label(self) -> &'static str {
+        match self {
+            Live::Attached => "live",
+            Live::Detached => "TAIL CLOSED (r reconnects)",
+        }
+    }
 }
 
 /// Which screen is in front.
@@ -116,6 +148,8 @@ pub struct App {
     pub detail_id: Option<String>,
     /// Highest journal seq this client has seen (the SSE resume point).
     pub last_seq: u64,
+    /// Whether the live tail is attached — durable, unlike [`App::status`].
+    pub live: Live,
     /// One line of feedback: last command outcome, or the last error.
     pub status: String,
     /// `Some(buffer)` while the respond prompt is open.
@@ -389,11 +423,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn header_line(app: &App) -> Paragraph<'_> {
     let text = format!(
-        "sergeant {} · api {} · {} · seq {}",
+        "sergeant {} · api {} · {} · seq {} · {}",
         app.system["version"].as_str().unwrap_or("?"),
         app.system["api_revision"].as_str().unwrap_or("?"),
         app.system["data_dir"].as_str().unwrap_or("?"),
         app.last_seq,
+        app.live.label(),
     );
     Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED))
 }
@@ -597,13 +632,8 @@ async fn event_loop(
         }
     });
 
-    let mut stream = match client.stream_events(app.last_seq).await {
-        Ok(stream) => Some(stream),
-        Err(e) => {
-            app.status = format!("live tail unavailable: {e}");
-            None
-        }
-    };
+    let mut stream = attach(client, app).await;
+    let mut signals = TerminationSignals::install();
 
     terminal.draw(|frame| draw(frame, app))?;
     loop {
@@ -614,7 +644,17 @@ async fn event_loop(
                 let action = app.on_key(key);
                 match app.execute(client, action).await {
                     Action::Quit => break,
-                    Action::Refresh => needs_refresh = true,
+                    Action::Refresh => {
+                        needs_refresh = true;
+                        // A refresh is the user asking for the truth, so it
+                        // re-attaches the tail as well as re-reading: an `r`
+                        // that repainted stale data and left the screen
+                        // permanently detached would answer the wrong
+                        // question.
+                        if stream.is_none() {
+                            stream = attach(client, app).await;
+                        }
+                    }
                     _ => {}
                 }
                 if app.quit {
@@ -625,12 +665,25 @@ async fn event_loop(
                 match event {
                     Some(event) => needs_refresh = app.observe(&event),
                     None => {
-                        // The tail ended (daemon restart, or shutdown). Keep
-                        // the UI alive and say so; `r` still works.
+                        // The tail ended (daemon restart or shutdown, a lagged
+                        // subscriber the server dropped, a broken chunk). Keep
+                        // the UI alive and say so — durably, in the header, not
+                        // only in a status line the next command overwrites.
                         stream = None;
+                        app.live = Live::Detached;
                         app.status = "live tail closed — press r to refresh".to_string();
                     }
                 }
+            }
+            // A terminal left in raw mode + alternate screen is the one
+            // failure this module's contract names by hand, and default
+            // signal disposition is the path that produces it: SIGTERM from a
+            // process manager, SIGHUP from a closing terminal emulator. Both
+            // end the loop through the same exit as `q`, so `run`'s single
+            // restore runs. (SIGINT is not here: raw mode delivers Ctrl-C as a
+            // key event, which the keymap already handles.)
+            _ = signals.terminated() => {
+                break;
             }
         }
         if needs_refresh && let Err(e) = app.refresh(client).await {
@@ -643,6 +696,83 @@ async fn event_loop(
     drop(keys);
     let _ = reader.join();
     Ok(())
+}
+
+/// Open the live tail and record the outcome where the screen can show it.
+///
+/// Used for the first attach and for every reconnect, so "attached" is
+/// decided in one place and cannot drift from what the header says.
+async fn attach(client: &ApiClient, app: &mut App) -> Option<crate::api::EventStream> {
+    match client.stream_events(app.last_seq).await {
+        Ok(stream) => {
+            app.live = Live::Attached;
+            Some(stream)
+        }
+        Err(e) => {
+            app.live = Live::Detached;
+            app.status = format!("live tail unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// The termination signals the TUI must not die under without restoring the
+/// terminal.
+///
+/// **Rung note (R1).** The loop *returns* on one of these rather than
+/// restoring and re-raising the signal with its default disposition. Re-raising
+/// is the more correct shell citizenship — it makes `$?` report `143` and lets
+/// a parent see "killed by SIGTERM" — but it needs `libc` (or `signal-hook`),
+/// a dependency the M6 budget does not name, to buy an exit code. Restoring
+/// the terminal is the contracted property, and this gets it with what is
+/// already here.
+struct TerminationSignals {
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+}
+
+impl TerminationSignals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            // A handler that cannot be installed is not fatal: the TUI still
+            // works, it just loses this protection, and taking the session
+            // down over it would be the worse trade.
+            Self {
+                term: signal(SignalKind::terminate()).ok(),
+                hangup: signal(SignalKind::hangup()).ok(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    /// Resolve when a termination signal arrives; park forever where there
+    /// are none to listen for, so the `select!` arm is simply never taken.
+    async fn terminated(&mut self) {
+        #[cfg(unix)]
+        {
+            match (self.term.as_mut(), self.hangup.as_mut()) {
+                (Some(term), Some(hangup)) => {
+                    tokio::select! {
+                        _ = term.recv() => {}
+                        _ = hangup.recv() => {}
+                    }
+                }
+                (Some(one), None) | (None, Some(one)) => {
+                    one.recv().await;
+                }
+                (None, None) => std::future::pending().await,
+            }
+        }
+        #[cfg(not(unix))]
+        std::future::pending().await
+    }
 }
 
 /// Await the next SSE event, or park forever when there is no stream — so
@@ -726,5 +856,132 @@ mod tests {
         assert!(app.observe(&json!({"seq": 7, "kind": "work.completed"})));
         assert!(!app.observe(&json!({"seq": 8, "kind": "daemon.started"})));
         assert_eq!(app.last_seq, 8, "the resume point tracks every event");
+    }
+
+    /// The projection itself, field by field.
+    ///
+    /// The other unit tests here use `fleet_rows` as a fixture builder and
+    /// then assert about keys and navigation, which never looks at what it
+    /// put in the row: before this test, only the `TestBackend` render in the
+    /// acceptance suite could catch a `state`/`backend` swap, and nothing at
+    /// all pinned the `-`-for-missing rule or the one-based stage position.
+    #[test]
+    fn a_fleet_row_is_the_api_body_projected_field_by_field() {
+        let rows = fleet_rows(&fleet_of(&[("a", "needs_input")]));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            WorkRow {
+                id: "a".to_string(),
+                state: "needs_input".to_string(),
+                // Zero-based on the wire, one-based on a screen.
+                stage: "10-implement 2/2 · running".to_string(),
+                backend: "fake".to_string(),
+                intent: "intent for a".to_string(),
+            },
+            "every column of the fleet screen comes from a named field of the \
+             `/v1/work` body — this is the mapping, stated"
+        );
+
+        // A work the daemon has not routed or staged yet is the common case
+        // on the fleet screen's first paint, and it must read as absence
+        // rather than as `null`.
+        let unrouted = fleet_rows(&json!({"works": [{"id": "b", "state": "pending"}]}));
+        assert_eq!(
+            unrouted[0],
+            WorkRow {
+                id: "b".to_string(),
+                state: "pending".to_string(),
+                stage: "-".to_string(),
+                backend: "-".to_string(),
+                intent: "-".to_string(),
+            },
+            "missing fields read as `-`, the rule shared with the dashboard"
+        );
+
+        // A body with no `works` array at all is an empty fleet, not a panic.
+        assert!(fleet_rows(&json!({})).is_empty());
+    }
+
+    /// Liveness is durable state, not a message.
+    ///
+    /// The regression: the only sign that the SSE tail had died was
+    /// `App::status`, which `execute` overwrites with the next command's
+    /// outcome — leaving a screen that looks live, is not, and never
+    /// reconnects.
+    #[tokio::test]
+    async fn a_dead_tail_stays_visible_after_the_next_command() {
+        let mut app = App::new();
+        app.system = json!({"version": "0.1.0", "api_revision": "v1", "data_dir": "/tmp/d"});
+        assert_eq!(app.live, Live::Attached, "a fresh app assumes the tail");
+        assert!(
+            header_text(&app).contains("live"),
+            "the header states liveness: {}",
+            header_text(&app)
+        );
+
+        app.live = Live::Detached;
+        app.status = "live tail closed — press r to refresh".to_string();
+        assert!(
+            header_text(&app).contains("TAIL CLOSED"),
+            "a detached tail is named in the header: {}",
+            header_text(&app)
+        );
+
+        // Any later command outcome replaces the status line…
+        let client = ApiClient::new("http://127.0.0.1:1", "t").expect("client");
+        let action = app.execute(&client, Action::Cancel("a".to_string())).await;
+        assert_eq!(action, Action::Refresh);
+        assert!(
+            !app.status.contains("live tail closed"),
+            "the status line is the command's now: {}",
+            app.status
+        );
+        // …and the header still says the screen is not live.
+        assert_eq!(app.live, Live::Detached);
+        assert!(
+            header_text(&app).contains("TAIL CLOSED"),
+            "the indicator must outlive the status line: {}",
+            header_text(&app)
+        );
+    }
+
+    /// The signal arm, exercised for real: install the handlers, send this
+    /// process a SIGTERM, and require the future to resolve.
+    ///
+    /// Not a name-based check — the point is that the handler is *installed*,
+    /// because the default disposition for SIGTERM terminates the process,
+    /// and a TUI terminated that way leaves the terminal in raw mode on the
+    /// alternate screen (the one failure the contract names by hand). If the
+    /// install silently stopped happening, this test would not merely fail:
+    /// the signal would kill the test binary, which is the same evidence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_termination_signal_is_caught_so_the_terminal_can_be_restored() {
+        let mut signals = TerminationSignals::install();
+        let status = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(std::process::id().to_string())
+            .status()
+            .expect("send SIGTERM to this process");
+        assert!(status.success(), "the test could not signal itself");
+        tokio::time::timeout(Duration::from_secs(10), signals.terminated())
+            .await
+            .expect("SIGTERM must end the TUI's loop, not the process");
+    }
+
+    /// The header line as the text a terminal would show — rendered into a
+    /// buffer, not `Debug`-printed, so the assertion is about the screen.
+    fn header_text(app: &App) -> String {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        let area = Rect::new(0, 0, 160, 1);
+        let mut buffer = Buffer::empty(area);
+        header_line(app).render(area, &mut buffer);
+        (0..area.width)
+            .map(|x| buffer.cell((x, 0)).map_or(" ", |cell| cell.symbol()))
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 }

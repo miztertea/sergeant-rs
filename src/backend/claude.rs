@@ -444,6 +444,17 @@ struct ClaudeExecution {
     /// Interrupt was requested while a turn was in flight; consumed by the
     /// reader thread into `TurnOutcome::interrupted`.
     interrupt_requested: bool,
+    /// The most recent turn's stdout reader thread.
+    ///
+    /// Kept so that STOP can *wait* for it (see [`ClaudeBackend::stop`]).
+    /// Killing the child closes stdout, but the reader's remaining work —
+    /// the §20 raw-transcript archive write and the `conversation.turn.ended`
+    /// event that publishes its blob ref — happens after that, on this
+    /// thread. Without a handle, "the turn is stopped" would be a claim about
+    /// the process only, and the evidence would land at an unpredictable
+    /// later moment (measured: a test's data dir was recreated by that write
+    /// after the directory had been removed).
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -829,7 +840,15 @@ impl ClaudeBackend {
             child,
             stderr_buf,
         };
-        std::thread::spawn(move || reader.run(stdout));
+        let reader = std::thread::spawn(move || reader.run(stdout));
+        // Recorded after the spawn, and deliberately not fatal if the
+        // execution has gone away in the meantime: the handle exists so STOP
+        // can wait for the archive write, not so anything can depend on the
+        // thread's identity. A previous turn's handle is replaced here —
+        // that turn is `Finished`, its evidence already written.
+        if let Some(execution) = self.lock().executions.get_mut(execution_id) {
+            execution.reader = Some(reader);
+        }
         Ok(())
     }
 }
@@ -1123,6 +1142,7 @@ impl Backend for ClaudeBackend {
                     turn: TurnState::Unlaunched,
                     stopped: false,
                     interrupt_requested: false,
+                    reader: None,
                 },
             );
         }
@@ -1344,6 +1364,7 @@ impl Backend for ClaudeBackend {
                 turn: TurnState::Adopted,
                 stopped: false,
                 interrupt_requested: false,
+                reader: None,
             },
         );
         Ok(())
@@ -1379,15 +1400,33 @@ impl Backend for ClaudeBackend {
     /// Retire: kill any in-flight turn and refuse further input. The
     /// durable transcript is untouched — recoverable state survives STOP by
     /// construction.
+    ///
+    /// STOP also *waits for the turn's evidence*. Killing the child closes
+    /// stdout, but the reader thread then archives the raw stream-json
+    /// transcript (§20) and emits `conversation.turn.ended` carrying its blob
+    /// ref — work that happens after `interrupt` returns. Returning before it
+    /// lands would make STOP a claim about the process only: the caller is
+    /// told the execution is retired while a write to its data dir is still
+    /// in flight (measured in the M4 suite, where the write recreated a data
+    /// directory the test had already removed). Joining is safe here because
+    /// the event sink never blocks on its caller (see
+    /// [`crate::daemon::journaling_sink`]) and the adapter lock is released
+    /// before the join — the reader takes that same lock on its way out.
     fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
         self.interrupt(handle)?;
-        let mut state = self.lock();
-        self.check_identity(&state, handle)?;
-        let execution = state
-            .executions
-            .get_mut(&handle.execution_id)
-            .expect("presence checked above");
-        execution.stopped = true;
+        let reader = {
+            let mut state = self.lock();
+            self.check_identity(&state, handle)?;
+            let execution = state
+                .executions
+                .get_mut(&handle.execution_id)
+                .expect("presence checked above");
+            execution.stopped = true;
+            execution.reader.take()
+        };
+        if let Some(reader) = reader {
+            let _ = reader.join();
+        }
         Ok(())
     }
 }
@@ -2091,6 +2130,7 @@ mod tests {
             }),
             stopped: false,
             interrupt_requested: false,
+            reader: None,
         }
     }
 }

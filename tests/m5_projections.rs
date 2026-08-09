@@ -50,6 +50,9 @@ use sergeant_rs::runtime::graph::{GraphContext, GraphEdge};
 use sergeant_rs::runtime::journal::{Journal, JournalError};
 use sergeant_rs::telemetry::{DEFAULT_OTLP_ENDPOINT, Telemetry, TelemetryConfig};
 
+mod support;
+use support::DataDir;
+
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 // ---------------------------------------------------------------- helpers
@@ -1615,7 +1618,7 @@ fn item_source<'a>(source: &'a str, signature: &str) -> &'a str {
 /// daemon — over the API and over the CLI, which is the surface a human has.
 #[tokio::test]
 async fn t6_the_daemon_answers_three_section_22_questions() {
-    let data = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
     let repo = TempDir::new().expect("tempdir");
     init_repo(repo.path());
     write_two_stage_workflow(repo.path());
@@ -1700,7 +1703,7 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
     let _ = endpoint;
 
     // The same answers through the CLI, over a daemon it spawns itself.
-    let listed = sgt(data.path(), &["analytics"]);
+    let listed = sgt(&data, &["analytics"]);
     for canned in CANNED_QUERIES {
         assert!(
             listed.contains(canned.name),
@@ -1712,7 +1715,7 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
         listed.contains("graph_edges"),
         "the projection's tables are reported: {listed}"
     );
-    let answered = sgt(data.path(), &["analytics", "backend_retries"]);
+    let answered = sgt(&data, &["analytics", "backend_retries"]);
     assert!(
         answered.contains("Which backend produces the most retries?")
             && answered.contains(FAKE_BACKEND_NAME),
@@ -1720,13 +1723,13 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
     );
 
     // And §23's minimal CLI rendering, which must show provenance.
-    let rendered = sgt(data.path(), &["work", "show", &work_id, "--graph"]);
+    let rendered = sgt(&data, &["work", "show", &work_id, "--graph"]);
     assert!(
         rendered.contains("--executes-->") && rendered.contains("seq "),
         "`sgt work show --graph` renders edges with their source seq: {rendered}"
     );
     let as_json: Value = serde_json::from_str(&sgt(
-        data.path(),
+        &data,
         &["--json", "work", "show", &work_id, "--graph"],
     ))
     .expect("json graph");
@@ -1742,10 +1745,10 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
 
 /// Run `sgt` against a data dir, returning stdout (the CLI spawns and reuses
 /// its own daemon, so this exercises the client path a human has).
-fn sgt(data_dir: &Path, args: &[&str]) -> String {
+fn sgt(data_dir: &DataDir, args: &[&str]) -> String {
     let output = Command::new(SGT)
         .arg("--data-dir")
-        .arg(data_dir)
+        .arg(data_dir.path())
         .args(args)
         .output()
         .expect("run sgt");

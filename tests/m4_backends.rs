@@ -1686,7 +1686,49 @@ fn an_in_flight_turn_is_killed_by_interrupt_and_reported_as_resumable() {
     backend.send(&handle, "carry on").expect("send after kill");
     let launches = stub.wait_for_launches(2);
     assert_eq!(launches[1].value_of("--resume"), Some(session_id.as_str()));
+
+    // STOP is where this test used to leak. The second turn is still in
+    // flight; `stop` kills it, and the reader thread then archives whatever
+    // it streamed — a write to this data dir. When `stop` returned before
+    // that write, the archive landed *after* `TempDir::drop` had removed the
+    // directory, recreating `/tmp/.tmpXXXXXX/blobs/b3/…` (243 such
+    // directories had accumulated on one container). So: STOP must leave
+    // nothing in flight.
+    let before = dir_entries(data.path());
     backend.stop(&handle).expect("stop");
+    let settled = backend.observe(&handle).expect("observe after stop");
+    assert_eq!(
+        settled.native,
+        NativeState::Exited,
+        "stop must leave no turn running: {settled:?}"
+    );
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        dir_entries(data.path()),
+        before,
+        "a write landed after `stop` returned — the turn's evidence is still being \
+         written when the caller has been told the execution is retired"
+    );
+}
+
+/// Every path under a directory, sorted: a cheap "did anything get written?".
+fn dir_entries(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            }
+            out.push(path);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out.sort();
+    out
 }
 
 /// A print-mode conversation runs one turn at a time, and SEND refuses to

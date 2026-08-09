@@ -39,6 +39,9 @@ use sergeant_rs::domain::work::{
 };
 use sergeant_rs::runtime::journal::Journal;
 
+mod support;
+use support::DataDir;
+
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 fn ulid() -> String {
@@ -1224,11 +1227,15 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
 /// repository, so `sgt run` submits work that stays `pending`, exactly as it
 /// did when no engine existed. Work surfaces get their own tests in
 /// `m3_execution.rs`, in temp repositories built for the purpose.
-fn sgt(data_dir: &Path, args: &[&str]) -> Output {
+/// The parameter is a [`DataDir`], not a `&Path`, on purpose: running the
+/// binary against a data dir may auto-spawn a detached daemon, and the guard
+/// is the thing that reaps it. Taking a bare path here is how a future test
+/// would leak one without noticing.
+fn sgt(data_dir: &DataDir, args: &[&str]) -> Output {
     std::process::Command::new(SGT)
-        .current_dir(data_dir)
+        .current_dir(data_dir.path())
         .arg("--data-dir")
-        .arg(data_dir)
+        .arg(data_dir.path())
         .args(args)
         .output()
         .expect("run sgt")
@@ -1251,12 +1258,51 @@ fn stop_daemon(dir: &Path) {
     }
 }
 
+/// The reaper, measured rather than assumed.
+///
+/// An instrument nobody has tried is a claim: this runs the auto-spawn path
+/// the leak came from, checks that a daemon really is there, and then checks
+/// that the guard's own reap removes it. If `DataDir` ever stops finding the
+/// daemons it is supposed to kill — a changed command line, a `/proc` that is
+/// not there — this fails here instead of quietly resuming the accumulation
+/// (89 live daemons on one container, measured, before the guard existed).
+#[test]
+fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
+    let dir = DataDir::new();
+    let output = sgt(&dir, &["run", "auto-spawn a daemon to reap"]);
+    assert!(
+        output.status.success(),
+        "sgt run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let spawned = dir.daemon_pids();
+    assert_eq!(
+        spawned.len(),
+        1,
+        "the client command must have auto-spawned exactly one daemon on this data          dir (found {spawned:?}) — if it spawned none, the rest of this test proves          nothing"
+    );
+    assert!(
+        daemon::pid_alive(spawned[0]),
+        "the scan must report a live pid, not a leftover /proc entry"
+    );
+
+    let reaped = dir.reap();
+    assert_eq!(reaped, spawned, "the guard must reap what it found");
+    assert!(
+        dir.daemon_pids().is_empty(),
+        "after the reap nothing may still be running on this data dir"
+    );
+    // …and the guard's `Drop` then finds nothing to complain about, which is
+    // the assertion every other test in this file gets for free.
+}
+
 #[test]
 fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = DataDir::new();
 
     // No daemon running: `sgt run` auto-spawns one and submits.
-    let output = sgt(dir.path(), &["run", "ship the M2 milestone"]);
+    let output = sgt(&dir, &["run", "ship the M2 milestone"]);
     assert!(
         output.status.success(),
         "sgt run failed: {}",
@@ -1264,7 +1310,7 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     );
 
     // `sgt work list --json` shows it.
-    let output = sgt(dir.path(), &["work", "list", "--json"]);
+    let output = sgt(&dir, &["work", "list", "--json"]);
     assert!(
         output.status.success(),
         "sgt work list failed: {}",
@@ -1279,7 +1325,7 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     assert_eq!(works[0]["created_by"], "cli");
 
     // A second daemon on the same data dir fails closed.
-    let output = sgt(dir.path(), &["daemon"]);
+    let output = sgt(&dir, &["daemon"]);
     assert!(
         !output.status.success(),
         "second daemon must fail closed, got: {}",
@@ -1300,10 +1346,10 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
 /// API — no in-process shortcuts.
 #[test]
 fn t7b_cli_status_show_and_cancel_through_the_binary() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = DataDir::new();
 
     // Auto-spawn + submit, reading the id straight out of --json.
-    let output = sgt(dir.path(), &["--json", "run", "inspect me"]);
+    let output = sgt(&dir, &["--json", "run", "inspect me"]);
     assert!(
         output.status.success(),
         "sgt run failed: {}",
@@ -1316,7 +1362,7 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
         .to_string();
 
     // `sgt status`, human: daemon health plus the counts.
-    let output = sgt(dir.path(), &["status"]);
+    let output = sgt(&dir, &["status"]);
     assert!(
         output.status.success(),
         "sgt status failed: {}",
@@ -1328,7 +1374,7 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
     assert!(stdout.contains("pending: 1"), "status said: {stdout}");
 
     // `sgt status --json`: the same facts, machine-shaped.
-    let output = sgt(dir.path(), &["status", "--json"]);
+    let output = sgt(&dir, &["status", "--json"]);
     assert!(output.status.success());
     let status: Value = serde_json::from_slice(&output.stdout).expect("status --json prints JSON");
     assert_eq!(status["work_total"], 1);
@@ -1340,7 +1386,7 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
     );
 
     // `sgt work show <id>`: human and --json, both naming the work.
-    let output = sgt(dir.path(), &["work", "show", &work_id]);
+    let output = sgt(&dir, &["work", "show", &work_id]);
     assert!(output.status.success());
     let shown: Value =
         serde_json::from_slice(&output.stdout).expect("work show prints the record as JSON");
@@ -1348,13 +1394,13 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
     assert_eq!(shown["state"], "pending");
     assert_eq!(shown["intent"], "inspect me");
 
-    let output = sgt(dir.path(), &["work", "show", &work_id, "--json"]);
+    let output = sgt(&dir, &["work", "show", &work_id, "--json"]);
     assert!(output.status.success());
     let shown: Value = serde_json::from_slice(&output.stdout).expect("show --json prints JSON");
     assert_eq!(shown["work"]["id"].as_str(), Some(work_id.as_str()));
 
     // `sgt cancel <id>`: reports the new state, and it sticks.
-    let output = sgt(dir.path(), &["cancel", &work_id]);
+    let output = sgt(&dir, &["cancel", &work_id]);
     assert!(
         output.status.success(),
         "sgt cancel failed: {}",
@@ -1365,13 +1411,13 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
         stdout.contains("canceled") && stdout.contains(&work_id),
         "cancel said: {stdout}"
     );
-    let output = sgt(dir.path(), &["work", "show", &work_id, "--json"]);
+    let output = sgt(&dir, &["work", "show", &work_id, "--json"]);
     let shown: Value = serde_json::from_slice(&output.stdout).expect("show --json");
     assert_eq!(shown["work"]["state"], "canceled");
 
     // A server-side error reaches the user as a nonzero exit and the
     // daemon's own structured message, not a panic or a silent success.
-    let output = sgt(dir.path(), &["work", "show", "01AN4Z07BY79KA1307SR9X4MV3"]);
+    let output = sgt(&dir, &["work", "show", "01AN4Z07BY79KA1307SR9X4MV3"]);
     assert!(!output.status.success(), "unknown id must exit nonzero");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1384,14 +1430,15 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
 
 #[test]
 fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
-    let dir = TempDir::new().expect("tempdir");
-    let path_a = dir.path().to_path_buf();
-    let path_b = dir.path().to_path_buf();
-
-    let a = std::thread::spawn(move || sgt(&path_a, &["run", "racer A"]));
-    let b = std::thread::spawn(move || sgt(&path_b, &["run", "racer B"]));
-    let out_a = a.join().expect("thread A");
-    let out_b = b.join().expect("thread B");
+    let dir = DataDir::new();
+    // Scoped threads so both racers share the one guarded data dir rather
+    // than a copy of its path: whichever daemon survives the race, the guard
+    // that reaps it is the same object.
+    let (out_a, out_b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| sgt(&dir, &["run", "racer A"]));
+        let b = scope.spawn(|| sgt(&dir, &["run", "racer B"]));
+        (a.join().expect("thread A"), b.join().expect("thread B"))
+    });
     assert!(
         out_a.status.success(),
         "client A failed: {}",
@@ -1404,7 +1451,7 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
     );
 
     // Both commands completed: two works listed.
-    let output = sgt(dir.path(), &["work", "list", "--json"]);
+    let output = sgt(&dir, &["work", "list", "--json"]);
     assert!(output.status.success());
     let listed: Value = serde_json::from_slice(&output.stdout).expect("list json");
     let intents: Vec<&str> = listed["works"]
@@ -1451,7 +1498,7 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
 #[test]
 fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
     // Stale: dead PID, refused endpoint → the client replaces it and spawns.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = DataDir::new();
     std::fs::create_dir_all(dir.path()).expect("data dir");
     let stale = json!({
         "schema": "sergeant.runtime/v1",
@@ -1465,7 +1512,7 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
         serde_json::to_vec(&stale).expect("stale json"),
     )
     .expect("write stale descriptor");
-    let output = sgt(dir.path(), &["run", "after stale descriptor"]);
+    let output = sgt(&dir, &["run", "after stale descriptor"]);
     assert!(
         output.status.success(),
         "stale descriptor must be replaced: {}",
@@ -1477,7 +1524,7 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
 
     // Ambiguous: alive PID (this test process), unresponsive endpoint →
     // fail closed with a diagnostic, never a second daemon.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = DataDir::new();
     std::fs::create_dir_all(dir.path()).expect("data dir");
     let ambiguous = json!({
         "schema": "sergeant.runtime/v1",
@@ -1491,7 +1538,7 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
         serde_json::to_vec(&ambiguous).expect("ambiguous json"),
     )
     .expect("write ambiguous descriptor");
-    let output = sgt(dir.path(), &["run", "must fail closed"]);
+    let output = sgt(&dir, &["run", "must fail closed"]);
     assert!(
         !output.status.success(),
         "ambiguous descriptor must fail closed"
@@ -1513,7 +1560,7 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
 /// a second daemon on a data dir that already has an owner.
 #[test]
 fn descriptor_with_an_unknown_schema_fails_closed() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = DataDir::new();
     std::fs::create_dir_all(dir.path()).expect("data dir");
     let from_the_future = json!({
         "schema": "sergeant.runtime/v2",
@@ -1526,7 +1573,7 @@ fn descriptor_with_an_unknown_schema_fails_closed() {
     std::fs::write(&path, serde_json::to_vec(&from_the_future).expect("json"))
         .expect("write future descriptor");
 
-    let output = sgt(dir.path(), &["work", "list"]);
+    let output = sgt(&dir, &["work", "list"]);
     assert!(
         !output.status.success(),
         "an unknown descriptor schema must fail closed, got: {}",
@@ -1557,7 +1604,7 @@ fn descriptor_with_an_unknown_schema_fails_closed() {
 /// successor's record and wedges the data dir for good.
 #[test]
 fn concurrent_stale_replacement_leaves_the_surviving_daemon_discoverable() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = DataDir::new();
     std::fs::create_dir_all(dir.path()).expect("data dir");
     let blackhole = std::net::TcpListener::bind("127.0.0.1:0").expect("blackhole listener");
     let port = blackhole.local_addr().expect("blackhole addr").port();
@@ -1574,13 +1621,12 @@ fn concurrent_stale_replacement_leaves_the_surviving_daemon_discoverable() {
     )
     .expect("write stale descriptor");
 
-    let path_a = dir.path().to_path_buf();
-    let path_b = dir.path().to_path_buf();
-    let a = std::thread::spawn(move || sgt(&path_a, &["run", "stale racer A"]));
-    std::thread::sleep(Duration::from_millis(300));
-    let b = std::thread::spawn(move || sgt(&path_b, &["run", "stale racer B"]));
-    let out_a = a.join().expect("thread A");
-    let out_b = b.join().expect("thread B");
+    let (out_a, out_b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| sgt(&dir, &["run", "stale racer A"]));
+        std::thread::sleep(Duration::from_millis(300));
+        let b = scope.spawn(|| sgt(&dir, &["run", "stale racer B"]));
+        (a.join().expect("thread A"), b.join().expect("thread B"))
+    });
     assert!(
         out_a.status.success(),
         "client A failed: {}",
@@ -1599,7 +1645,7 @@ fn concurrent_stale_replacement_leaves_the_surviving_daemon_discoverable() {
         daemon::pid_alive(descriptor.pid),
         "the descriptor must name the live daemon"
     );
-    let output = sgt(dir.path(), &["work", "list", "--json"]);
+    let output = sgt(&dir, &["work", "list", "--json"]);
     assert!(
         output.status.success(),
         "a later client must still find the daemon: {}",
