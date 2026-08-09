@@ -188,6 +188,46 @@ pub fn rfc3339_utc(t: SystemTime) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
+/// Parse an event timestamp back to Unix milliseconds — the exact inverse of
+/// [`rfc3339_utc`] over the fixed-width form this crate writes.
+///
+/// Analytical projections and the OTel export both need a *numeric* instant:
+/// a duration cannot be computed from two strings. Only the shape written
+/// here is accepted (`YYYY-MM-DDTHH:MM:SS.mmmZ`); anything else — including a
+/// legitimately different RFC3339 rendering from a future writer — returns
+/// `None` rather than a guess. Projections are disposable, so a timestamp a
+/// projection cannot read is a missing cell in a derived table, never a
+/// failure of the journal.
+pub fn unix_millis(timestamp: &str) -> Option<i64> {
+    let bytes = timestamp.as_bytes();
+    if bytes.len() != 24 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' || bytes[19] != b'.' || bytes[23] != b'Z' {
+        return None;
+    }
+    let field = |from: usize, to: usize| timestamp[from..to].parse::<i64>().ok();
+    let (year, month, day) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
+    let (hour, minute, second) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
+    let millis = field(20, 23)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Howard Hinnant's days_from_civil — the inverse of the civil_from_days
+    // above, so the pair round-trips by construction.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000) + millis)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +243,28 @@ mod tests {
         // Leap-year day.
         let t = UNIX_EPOCH + Duration::from_secs(1_709_164_800);
         assert_eq!(rfc3339_utc(t), "2024-02-29T00:00:00.000Z");
+    }
+
+    #[test]
+    fn unix_millis_inverts_the_formatter_and_refuses_other_shapes() {
+        // Round-trip over the whole range the formatter is pinned to above,
+        // including the leap day: every instant the journal can write reads
+        // back to exactly the milliseconds it was written from.
+        for ms in [
+            0i64,
+            1_786_153_332_437,
+            1_709_164_800_000,
+            4_102_444_800_123,
+        ] {
+            let text = rfc3339_utc(UNIX_EPOCH + Duration::from_millis(ms as u64));
+            assert_eq!(unix_millis(&text), Some(ms), "round trip {text}");
+        }
+        // Shapes this crate never writes are refused, not guessed at: an
+        // offset form, a second-precision form, and outright garbage.
+        assert_eq!(unix_millis("2026-08-08T01:42:12.437+00:00"), None);
+        assert_eq!(unix_millis("2026-08-08T01:42:12Z"), None);
+        assert_eq!(unix_millis("2026-13-08T01:42:12.000Z"), None);
+        assert_eq!(unix_millis("not a timestamp at all!!"), None);
     }
 
     #[test]

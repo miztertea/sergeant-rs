@@ -31,11 +31,13 @@ use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
 use crate::domain::event::{EventDraft, EventSource};
+use crate::runtime::analytics::{Analytics, AnalyticsError};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{ProjectionError, work_registry_projection};
 use crate::runtime::recovery;
+use crate::telemetry::{Telemetry, TelemetryConfig, TelemetryError};
 
 /// Runtime descriptor file name inside the data dir.
 pub const DESCRIPTOR_FILE: &str = "runtime.json";
@@ -93,6 +95,12 @@ pub enum DaemonError {
     /// Startup reconciliation of in-flight work failed (§25).
     #[error(transparent)]
     Engine(#[from] EngineError),
+    /// The disposable analytical projection could not be rebuilt.
+    #[error(transparent)]
+    Analytics(#[from] AnalyticsError),
+    /// The §28 export pipeline could not be built from its configuration.
+    #[error(transparent)]
+    Telemetry(#[from] TelemetryError),
     /// The descriptor names a schema this build does not understand. Fail
     /// closed exactly as an unknown snapshot schema does: its fields may
     /// mean something else entirely, and acting on them could mean talking
@@ -150,6 +158,10 @@ pub struct DaemonConfig {
     /// it at a stub binary so the *real* adapter — not a fake wearing its
     /// name — can be driven through the daemon's own request path.
     pub claude: Option<ClaudeConfig>,
+    /// §28 OpenTelemetry export. `None` is **off**, and off is the default:
+    /// with no pipeline here the daemon builds no provider, spawns no
+    /// exporter task, and subscribes nothing to the event stream.
+    pub telemetry: Option<Arc<Telemetry>>,
 }
 
 impl Default for DaemonConfig {
@@ -158,6 +170,7 @@ impl Default for DaemonConfig {
             backends: Arc::new(BackendRegistry::default_registry()),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
+            telemetry: None,
         }
     }
 }
@@ -194,9 +207,25 @@ pub async fn start_with(
 
     // 2. Own the journal and rebuild current state by full replay (§24;
     // snapshots are an optimization the M2 daemon does not need yet).
-    let journal = Journal::open(data_dir)?;
+    let mut journal = Journal::open(data_dir)?;
     let mut registry = work_registry_projection();
     registry.catch_up(journal.replay()?)?;
+
+    // 2b. The disposable projections (§21–§23, §40). The DuckDB file is
+    // rebuilt from the journal on **every** start, so deleting it and
+    // restarting is indistinguishable from restarting: no code path can come
+    // to depend on state that only lives in there.
+    let analytics = Analytics::rebuild(data_dir, journal.replay()?)?;
+
+    // 2c. §28 export, when it is switched on. The journal's append timing is
+    // the one metric whose input exists nowhere else, so the observer is
+    // installed here — and only here, when export is on.
+    if let Some(telemetry) = &config.telemetry {
+        let telemetry = telemetry.clone();
+        journal.set_append_observer(Arc::new(move |elapsed| {
+            telemetry.record_journal_append(elapsed);
+        }));
+    }
 
     let (events_tx, _) = broadcast::channel(1024);
     let mut core = Core {
@@ -307,7 +336,14 @@ pub async fn start_with(
         data_dir: data_dir.to_path_buf(),
         closing: closing_rx,
         engine,
+        analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
     };
+    // §28's export is a fold over the event stream, subscribed here and
+    // nowhere else. With export off this task does not exist.
+    if let Some(telemetry) = config.telemetry.clone() {
+        let events = state.core.lock().await.events_tx.subscribe();
+        tokio::spawn(export_events(telemetry, events));
+    }
     // The Claude adapter's normalized events (§27) flow into the journal
     // through the core; the sink can only exist now that the core is shared.
     if let Some(claude) = claude {
@@ -466,14 +502,58 @@ fn commit_normalized_events(
     }
 }
 
+/// Feed the §28 export the committed event stream.
+///
+/// Lagging behind the broadcast buffer drops spans, and that is the correct
+/// failure for an export projection: the journal still has everything, and a
+/// telemetry backlog must never apply backpressure to execution.
+async fn export_events(
+    telemetry: Arc<Telemetry>,
+    mut events: broadcast::Receiver<crate::domain::event::Event>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(event) => telemetry.record(&event),
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "otel export fell behind the event stream");
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                telemetry.force_flush();
+                return;
+            }
+        }
+    }
+}
+
 /// Run the daemon in the foreground until SIGINT/SIGTERM, then shut down
 /// cleanly. This is what `sgt daemon` (and therefore auto-spawn) executes.
+///
+/// This is the one place §28 export is configured from the environment, and
+/// [`TelemetryConfig::from_env`] answers "off" unless explicitly switched on.
 pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
-    let handle = start(data_dir).await?;
+    let telemetry_config = TelemetryConfig::from_env();
+    let telemetry = Telemetry::from_config(&telemetry_config)?.map(Arc::new);
+    if telemetry.is_some() {
+        tracing::info!(
+            endpoint = telemetry_config.endpoint(),
+            "otel export enabled"
+        );
+    }
+    let handle = start_with(
+        data_dir,
+        DaemonConfig {
+            telemetry: telemetry.clone(),
+            ..DaemonConfig::default()
+        },
+    )
+    .await?;
     tracing::info!(endpoint = %handle.endpoint, data_dir = %data_dir.display(), "daemon serving");
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received");
     handle.shutdown().await;
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown();
+    }
     Ok(())
 }
 

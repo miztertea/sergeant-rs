@@ -33,6 +33,7 @@ use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_CANCELED, KIND_WORK_SUBMITTED, Work,
     WorkState,
 };
+use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{Engine, EngineError, SubmitContext};
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry, WorkRun};
@@ -107,6 +108,13 @@ pub struct ApiState {
     pub closing: watch::Receiver<bool>,
     /// The workflow engine: backends, routing defaults, and the surfaces dir.
     pub engine: Arc<Engine>,
+    /// The disposable DuckDB analytical + graph projection (§21–§23).
+    ///
+    /// Behind its own lock, not the core's: an analytics query is a read of a
+    /// derived file and must never be able to stall a mutation. It is caught
+    /// up from the journal at query time (see [`with_analytics`]), so a
+    /// failure anywhere in here costs an answer, never a fact.
+    pub analytics: Arc<tokio::sync::Mutex<Analytics>>,
 }
 
 /// Build the axum router for the full v1 surface.
@@ -117,6 +125,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/work/{id}/cancel", post(cancel_work))
         .route("/work/{id}/input", post(work_input))
         .route("/work/{id}/retry", post(work_retry))
+        .route("/graph/work/{id}", get(work_graph))
+        .route("/analytics", get(analytics_index))
+        .route("/analytics/{name}", get(analytics_query))
         .route("/events", get(event_history))
         .route("/events/stream", get(event_stream))
         .route("/system", get(system_info))
@@ -764,6 +775,121 @@ async fn work_retry(
                 result,
             )
         }
+    }
+}
+
+/// Catch the analytical projection up to the journal, then hand it to `f`.
+///
+/// The projection is folded lazily, at read time, rather than on every
+/// commit. Three things follow, and all three are the point:
+///
+/// - the mutation path never waits on DuckDB, and a DuckDB failure can never
+///   fail a journal append — §40's "projections are disposable" made
+///   structural rather than promised;
+/// - an answer is always as fresh as the journal, because the catch-up runs
+///   *before* the query, not on a timer;
+/// - rebuild and catch-up run the identical fold, so "delete the file and
+///   restart" and "keep it current" cannot produce different tables.
+///
+/// A catch-up failure is answered as a 503 against the projection, never as a
+/// failure of the work it describes: the journal is untouched and a restart
+/// rebuilds.
+async fn with_analytics<T>(
+    state: &ApiState,
+    f: impl FnOnce(&mut Analytics) -> Result<T, AnalyticsError>,
+) -> Result<(T, u64), Response> {
+    // Never hold both locks: the core's lock is the daemon's mutation path,
+    // and a read of a derived file has no business being in the way of it.
+    // Reading `last_seq` outside the catch-up is safe because `catch_up`
+    // skips anything already folded — a concurrent reader that got there
+    // first costs this one a re-read of nothing.
+    let from = state.analytics.lock().await.last_seq();
+    let pending = match state.core.lock().await.events_after(from) {
+        Ok(events) => events,
+        Err(e) => return Err(projection_unavailable(e)),
+    };
+    let mut analytics = state.analytics.lock().await;
+    if let Err(e) = analytics.catch_up(pending.into_iter().map(Ok)) {
+        return Err(projection_unavailable(e));
+    }
+    match f(&mut analytics) {
+        Ok(value) => Ok((value, analytics.last_seq())),
+        Err(AnalyticsError::UnknownQuery { name }) => Err(error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_query",
+            format!("no analytics query named {name:?}"),
+        )),
+        Err(e) => Err(projection_unavailable(e)),
+    }
+}
+
+/// A projection failure: the derived read model is unavailable, and that is
+/// all it is. 503 rather than 500 — the journal is fine and a rebuild fixes
+/// it — with the code naming the projection so no client mistakes this for a
+/// failure of the work itself.
+fn projection_unavailable(e: impl std::fmt::Display) -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "projection_unavailable",
+        format!("the analytical projection could not answer: {e}"),
+    )
+}
+
+/// `GET /v1/graph/work/{id}` — the work's §23 graph neighborhood (§8).
+///
+/// Every edge carries the `source_seq` of the journal event that justifies
+/// it: the graph is inspectable back to the chronology, which is what makes
+/// it a derivation rather than an opinion.
+async fn work_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    {
+        let core = state.core.lock().await;
+        if !core.registry.state().works.contains_key(&id) {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "work_not_found",
+                format!("no work with id {id}"),
+            );
+        }
+    }
+    match with_analytics(&state, |analytics| analytics.graph_neighborhood(&id)).await {
+        Ok((view, last_seq)) => Json(json!({
+            "work_id": id,
+            "nodes": view.nodes,
+            "edges": view.edges,
+            "projection": {"last_seq": last_seq},
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// `GET /v1/analytics` — the canned §22 questions this daemon can answer.
+async fn analytics_index(State(state): State<ApiState>) -> Response {
+    match with_analytics(&state, |analytics| analytics.table_counts()).await {
+        Ok((counts, last_seq)) => Json(json!({
+            "queries": CANNED_QUERIES.iter().map(|q| json!({
+                "name": q.name,
+                "question": q.question,
+            })).collect::<Vec<_>>(),
+            "tables": counts.into_iter()
+                .map(|(name, rows)| json!({"table": name, "rows": rows}))
+                .collect::<Vec<_>>(),
+            "projection": {"last_seq": last_seq},
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
+}
+
+/// `GET /v1/analytics/{name}` — run one canned §22 query.
+async fn analytics_query(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
+    match with_analytics(&state, |analytics| analytics.query(&name)).await {
+        Ok((result, last_seq)) => {
+            let mut body = result.to_json();
+            body["projection"] = json!({"last_seq": last_seq});
+            Json(body).into_response()
+        }
+        Err(response) => response,
     }
 }
 

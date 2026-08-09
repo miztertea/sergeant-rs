@@ -897,6 +897,7 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
             backends: Arc::new(BackendRegistry::new()),
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
+            ..DaemonConfig::default()
         },
     )
     .await
@@ -1020,6 +1021,7 @@ async fn the_capability_probe_is_journaled_at_registration() {
             backends: Arc::new(BackendRegistry::new()),
             default_backend: None,
             claude: Some(claude),
+            ..DaemonConfig::default()
         },
     )
     .await
@@ -3109,6 +3111,7 @@ async fn r6_client_disconnect_mid_run_has_no_consequence() {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
+            ..DaemonConfig::default()
         },
     )
     .await

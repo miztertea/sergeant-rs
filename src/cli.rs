@@ -101,6 +101,16 @@ enum Command {
         /// Work id to cancel.
         id: String,
     },
+    /// Ask the daemon one of the canned §22 analytical questions.
+    ///
+    /// With no name, list the questions this daemon can answer and the row
+    /// counts of the disposable DuckDB projection behind them. Clients never
+    /// open that file — they ask the daemon, which is what keeps the
+    /// one-owner architecture true (§22).
+    Analytics {
+        /// Query name (omit to list what is available).
+        name: Option<String>,
+    },
 }
 
 /// `sgt work ...` subcommands.
@@ -112,6 +122,9 @@ enum WorkCommand {
     Show {
         /// Work id to show.
         id: String,
+        /// Render the work's §23 graph neighborhood instead of its record.
+        #[arg(long)]
+        graph: bool,
     },
 }
 
@@ -303,7 +316,16 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     }
                     Ok(())
                 }
-                WorkCommand::Show { id } => {
+                WorkCommand::Show { id, graph: true } => {
+                    let result = client.get(&format!("/v1/graph/work/{id}")).await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_graph(&result);
+                    }
+                    Ok(())
+                }
+                WorkCommand::Show { id, graph: false } => {
                     let result = client.get(&format!("/v1/work/{id}")).await?;
                     if sgt.json {
                         print_json(&result);
@@ -326,6 +348,21 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
             }
         }
+        Command::Analytics { name } => {
+            let client = Client::ensure_daemon(&data_dir).await?;
+            let result = match &name {
+                Some(name) => client.get(&format!("/v1/analytics/{name}")).await?,
+                None => client.get("/v1/analytics").await?,
+            };
+            if sgt.json {
+                print_json(&result);
+            } else if name.is_some() {
+                print_table(&result);
+            } else {
+                print_analytics_index(&result);
+            }
+            Ok(())
+        }
         Command::Cancel { id } => {
             let client = Client::ensure_daemon(&data_dir).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
@@ -341,6 +378,93 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+    }
+}
+
+/// One line per edge: the relation, its endpoints, and — the point of §23 —
+/// the journal seq that justifies it, so a reader can go and check.
+fn print_graph(result: &Value) {
+    let labels: std::collections::BTreeMap<&str, &str> = result["nodes"]
+        .as_array()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| Some((n["node_id"].as_str()?, n["label"].as_str().unwrap_or(""))))
+                .collect()
+        })
+        .unwrap_or_default();
+    let empty = Vec::new();
+    let edges = result["edges"].as_array().unwrap_or(&empty);
+    println!(
+        "{} — {} nodes, {} edges",
+        result["work_id"].as_str().unwrap_or("?"),
+        result["nodes"].as_array().map_or(0, Vec::len),
+        edges.len(),
+    );
+    for edge in edges {
+        let from = edge["from_node"].as_str().unwrap_or("?");
+        let to = edge["to_node"].as_str().unwrap_or("?");
+        println!(
+            "  seq {:>5}  {} --{}--> {}   ({} → {})",
+            edge["source_seq"],
+            from,
+            edge["relation"].as_str().unwrap_or("?"),
+            to,
+            labels.get(from).copied().unwrap_or(""),
+            labels.get(to).copied().unwrap_or(""),
+        );
+    }
+}
+
+/// A canned query's answer as a plain aligned table (M6 owns presentation).
+fn print_table(result: &Value) {
+    let empty = Vec::new();
+    let columns = result["columns"].as_array().unwrap_or(&empty);
+    if let Some(question) = result["question"].as_str() {
+        println!("{question}");
+    }
+    let header: Vec<String> = columns
+        .iter()
+        .map(|c| c.as_str().unwrap_or("?").to_string())
+        .collect();
+    println!("{}", header.join("\t"));
+    for row in result["rows"].as_array().unwrap_or(&empty) {
+        let cells: Vec<String> = row
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .map(cell_text)
+            .collect();
+        println!("{}", cells.join("\t"));
+    }
+}
+
+/// The questions this daemon answers, and how populated the projection is.
+fn print_analytics_index(result: &Value) {
+    let empty = Vec::new();
+    println!("queries:");
+    for query in result["queries"].as_array().unwrap_or(&empty) {
+        println!(
+            "  {:<26} {}",
+            query["name"].as_str().unwrap_or("?"),
+            query["question"].as_str().unwrap_or(""),
+        );
+    }
+    println!("projection (rebuilt from the journal, disposable):");
+    for table in result["tables"].as_array().unwrap_or(&empty) {
+        println!(
+            "  {:<26} {} rows",
+            table["table"].as_str().unwrap_or("?"),
+            table["rows"],
+        );
+    }
+}
+
+fn cell_text(value: &Value) -> String {
+    match value {
+        Value::Null => "-".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 

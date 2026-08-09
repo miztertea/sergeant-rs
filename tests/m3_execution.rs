@@ -146,6 +146,7 @@ async fn start_with(
             backends: Arc::new(registry),
             default_backend: default.map(str::to_string),
             claude: None,
+            ..DaemonConfig::default()
         },
     )
     .await

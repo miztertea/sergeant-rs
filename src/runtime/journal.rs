@@ -20,12 +20,20 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::domain::event::{Event, EventDraft};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock};
 
 /// Default segment rotation threshold.
 pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Observer of per-append latency, installed by the daemon when §28 export is
+/// on. Called after each acknowledged append with the time the write plus its
+/// fsync took. Nothing in the journal reads it back — it is a one-way seam
+/// for the one §28 metric whose input exists only inside this module.
+pub type AppendObserver = Arc<dyn Fn(Duration) + Send + Sync>;
 
 /// Advisory write-lock file inside the journal dir (never a segment name).
 const LOCK_FILE_NAME: &str = ".lock";
@@ -103,7 +111,6 @@ pub enum JournalError {
 }
 
 /// Single-writer handle to the segmented journal.
-#[derive(Debug)]
 pub struct Journal {
     journal_dir: PathBuf,
     segment_max_bytes: u64,
@@ -113,10 +120,34 @@ pub struct Journal {
     next_seq: u64,
     fsync_count: u64,
     poisoned: bool,
+    /// Optional observer of append latency (§28's
+    /// `sergeant_journal_append_seconds`). `None` by default and in every
+    /// path but a daemon with export switched on: the journal must not gain
+    /// a dependency on the telemetry module, and the only place this timing
+    /// exists is here.
+    append_observer: Option<AppendObserver>,
     /// Exclusive advisory lock on the journal dir, held for the lifetime of
     /// the handle. The OS releases it when the handle drops — including on
     /// crash — so a stale lock can never wedge reopen.
     _lock: File,
+}
+
+// Hand-written because the append observer is a closure, which has no
+// `Debug`. Everything a reader of a `{:?}` journal actually wants — where it
+// is, how far it has got, whether it is usable — is here.
+impl std::fmt::Debug for Journal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Journal")
+            .field("journal_dir", &self.journal_dir)
+            .field("segment_max_bytes", &self.segment_max_bytes)
+            .field("segment_index", &self.segment_index)
+            .field("segment_len", &self.segment_len)
+            .field("next_seq", &self.next_seq)
+            .field("fsync_count", &self.fsync_count)
+            .field("poisoned", &self.poisoned)
+            .field("append_observer", &self.append_observer.is_some())
+            .finish()
+    }
 }
 
 impl Journal {
@@ -183,6 +214,7 @@ impl Journal {
             next_seq,
             fsync_count: 0,
             poisoned: false,
+            append_observer: None,
             _lock: lock,
         })
     }
@@ -226,6 +258,7 @@ impl Journal {
         self.rotate_if_needed()?;
         let mut line = serde_json::to_vec(event).map_err(JournalError::Serialize)?;
         line.push(b'\n');
+        let started = self.append_observer.as_ref().map(|_| Instant::now());
         if let Err(err) = self.write_and_sync(&line) {
             // A failed write_all/sync_data can leave torn, un-terminated bytes
             // in the segment while the handle stays otherwise usable; a later
@@ -243,7 +276,19 @@ impl Journal {
         }
         self.segment_len += line.len() as u64;
         self.next_seq += 1;
+        if let (Some(observer), Some(started)) = (&self.append_observer, started) {
+            observer(started.elapsed());
+        }
         Ok(())
+    }
+
+    /// Observe how long each successful append takes.
+    ///
+    /// Set by the daemon only when §28 export is on. An observer that panics
+    /// or blocks would do so inside the single-writer path, so the contract
+    /// on it is the same as any metric callback: cheap and infallible.
+    pub fn set_append_observer(&mut self, observer: AppendObserver) {
+        self.append_observer = Some(observer);
     }
 
     /// Write one line and fsync it. The fsync counter is derived from the
