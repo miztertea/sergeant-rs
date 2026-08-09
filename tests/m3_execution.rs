@@ -145,6 +145,7 @@ async fn start_with(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: default.map(str::to_string),
+            claude: None,
         },
     )
     .await
@@ -307,6 +308,25 @@ impl Backend for OpaqueBackend {
                 evidence: Some(Self::UNKNOWN_EVIDENCE.to_string()),
             }),
         }
+    }
+
+    fn interrupt(&self, _handle: &ExecutionHandle) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn resume(
+        &self,
+        _handle: &ExecutionHandle,
+        _request: &sergeant_rs::backend::ResumeRequest,
+    ) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn history(
+        &self,
+        _handle: &ExecutionHandle,
+    ) -> Result<Vec<sergeant_rs::backend::NativeEvent>, BackendError> {
+        Ok(Vec::new())
     }
 
     fn stop(&self, _handle: &ExecutionHandle) -> Result<(), BackendError> {
@@ -965,6 +985,9 @@ async fn t7_routing_precedence_and_structured_failure() {
     let (status, body) = submit(&http(), &handle, &plain, "nothing selected", json!({})).await;
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
+    // The scripted fake occupies the "claude" slot, so the daemon adds
+    // nothing: Codex is descoped (D6) and never registered, and a backend
+    // that is not registered is not offered.
     assert_eq!(body["error"]["available_backends"], json!(["claude"]));
     assert!(
         body["error"]["message"]
@@ -1941,9 +1964,11 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
         "an unhonourable selection must not be recorded as pending work: {body}"
     );
     assert_eq!(body["error"]["code"], "backend_not_found");
+    // Since M4 the daemon registers the real claude adapter alongside the
+    // scripted fake. Codex is descoped (D6): not registered, not offered.
     assert_eq!(
         body["error"]["available_backends"],
-        json!([FAKE_BACKEND_NAME])
+        json!(["claude", FAKE_BACKEND_NAME])
     );
 
     // Only two works exist: the refusal created none.

@@ -1,13 +1,13 @@
 //! The backend contract (proposal §15): sergeant's one extension boundary.
 //!
 //! §15 is deliberately not a plugin framework — it is a small native-runtime
-//! contract. This is the **M3 subset** of it: `probe`, `start`, `send`,
-//! `observe`, `stop`, plus advertised capabilities. `subscribe`, `history`,
-//! `interrupt` and `resume` arrive in M4 with the first real backends, when
-//! there is an implementation to measure them against; declaring them now
-//! would mean four methods every backend implements by returning
-//! "unsupported", which teaches the trait nothing and locks in signatures
-//! chosen without evidence.
+//! contract. M3 shipped `probe`, `start`, `send`, `observe`, `stop`; M4's
+//! real adapters demanded `interrupt`, `resume` and `history` and they
+//! arrived here with their first implementations. `subscribe` is still
+//! absent (R1): the Claude adapter ingests each turn's stdout as it streams
+//! and pushes normalized events through an [`EventSink`], so nothing needs a
+//! pull-based push surface on the trait — measured, not assumed (the M4
+//! spike drove real turns through per-turn stdout ingestion alone).
 //!
 //! The contract's load-bearing shape is [`Observation`]: a backend reports
 //! *native evidence* ([`NativeState`]) and, separately, any *explicit signal*
@@ -16,6 +16,7 @@
 //! backend cannot complete a stage by exiting, and cannot fail one by dying.
 
 pub mod claude;
+/// Descoped per deviation D6 — see the module's own doc comment.
 pub mod codex;
 pub mod fake;
 
@@ -24,8 +25,33 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::domain::event::EventDraft;
 use crate::domain::profile::Profile;
+
+/// One normalized native event (§20/§27): an adapter's translation of a raw
+/// vendor record into sergeant's `conversation.*`/`tool.*`/`usage.*`
+/// vocabulary. The raw record itself is archived separately (blob store) so
+/// vendor fidelity is never lost to this normalization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeEvent {
+    /// Dotted normalized kind (`conversation.assistant.completed`, ...).
+    pub kind: String,
+    /// Kind-specific payload, straight from the adapter's normalization.
+    pub payload: Value,
+}
+
+/// Where an adapter pushes normalized events as they stream (§27).
+///
+/// Adapters cannot journal directly — the journal is single-owner behind the
+/// daemon's core lock — so the daemon hands them a sink that commits on their
+/// behalf. Delivery is asynchronous and a sink must never block or fail its
+/// caller: adapters emit from wherever their work happens, including the
+/// request path that already holds that lock (see `daemon::journaling_sink`).
+/// A backend with no sink installed still accumulates its events for
+/// [`Backend::history`]; the sink is delivery, not the source of truth.
+pub type EventSink = Arc<dyn Fn(EventDraft) + Send + Sync>;
 
 /// What a backend can do (§15's capability list). Absent means `unsupported`,
 /// never emulated.
@@ -99,6 +125,48 @@ pub struct StartRequest {
     /// Launch profile to apply (§14: launch configuration, never credentials).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+}
+
+/// Everything a backend needs to RESUME an execution it no longer remembers
+/// (§15 RESUME after a daemon restart).
+///
+/// A restarted adapter has lost the launch configuration it pinned at START
+/// along with the process that held it, and nothing durable in the *native*
+/// harness records it. So the caller re-supplies it from what sergeant
+/// journaled, and an adapter must use exactly this and invent nothing: a
+/// fabricated permission mode or a dropped model pin would be the adapter
+/// making a decision — about security, about cost — that belongs to the
+/// human who configured the work.
+///
+/// The corollary for callers: a model pin that is not re-supplied here is
+/// *not enforced* on later turns, and the adapter will report those turns as
+/// unpinned rather than pretend otherwise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeRequest {
+    /// Work the execution serves — normalized events carry it (§27).
+    pub work_id: String,
+    /// The work surface later turns run in.
+    pub cwd: PathBuf,
+    /// The model pin the work requested, re-supplied from the journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The launch profile the execution started under (§14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Profile>,
+}
+
+impl ResumeRequest {
+    /// A resume request carrying only the two things every caller has: the
+    /// work and its surface. Model and profile default to "not re-supplied",
+    /// which adapters must treat as absent, never as a default.
+    pub fn new(work_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            work_id: work_id.into(),
+            cwd: cwd.into(),
+            model: None,
+            profile: None,
+        }
+    }
 }
 
 /// Handle to a started execution, as the backend names it.
@@ -255,6 +323,28 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// OBSERVE: report current native evidence and any explicit signal.
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError>;
 
+    /// INTERRUPT: stop the current turn/action without retiring the
+    /// execution. For a print-mode adapter this kills the per-turn process;
+    /// the durable conversation survives and RESUME/SEND continue it
+    /// (measured against Claude Code 2.1.226: a SIGKILLed turn leaves the
+    /// session resumable with full recall). Interrupting an execution with
+    /// no turn in flight is a no-op, not an error: the goal state — no turn
+    /// running — already holds.
+    fn interrupt(&self, handle: &ExecutionHandle) -> Result<(), BackendError>;
+
+    /// RESUME: re-adopt an existing native context, e.g. after a daemon
+    /// restart, so later SENDs continue the same conversation. The
+    /// [`ResumeRequest`] carries the launch configuration the adapter lost
+    /// with the old daemon; an adapter uses that and fabricates nothing.
+    /// Fails closed when the native context cannot be evidenced.
+    fn resume(&self, handle: &ExecutionHandle, request: &ResumeRequest)
+    -> Result<(), BackendError>;
+
+    /// HISTORY: the normalized native events this adapter has accumulated
+    /// for an execution (§27), in order. This is retrieval, not delivery —
+    /// events pushed through an [`EventSink`] appear here too.
+    fn history(&self, handle: &ExecutionHandle) -> Result<Vec<NativeEvent>, BackendError>;
+
     /// STOP: retire the execution without corrupting recoverable state. A
     /// backend reports that it *asked*; whether the native context complied is
     /// only knowable through OBSERVE.
@@ -293,8 +383,10 @@ impl BackendRegistry {
         self.backends.keys().cloned().collect()
     }
 
-    /// The default registry for a daemon: the deterministic fake, which is the
-    /// only backend that exists before M4.
+    /// The default registry for a daemon: the deterministic fake. The daemon
+    /// adds the real adapters itself at startup (`daemon::start_with`),
+    /// because they need the data dir and an event sink that only exist
+    /// there.
     pub fn default_registry() -> Self {
         Self::new().with(Arc::new(fake::FakeBackend::new(fake::FAKE_BACKEND_NAME)))
     }

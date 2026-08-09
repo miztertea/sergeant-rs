@@ -22,9 +22,11 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use serde_json::json;
+
 use super::{
-    Backend, BackendError, Capabilities, ExecutionHandle, NativeState, Observation, ProbeReport,
-    StartRequest,
+    Backend, BackendError, Capabilities, ExecutionHandle, NativeEvent, NativeState, Observation,
+    ProbeReport, ResumeRequest, StartRequest,
 };
 use crate::backend::BackendSignal;
 
@@ -127,6 +129,7 @@ struct FakeState {
     executions: BTreeMap<String, FakeExecution>,
     starts: Vec<StartRequest>,
     stop_requests: Vec<String>,
+    interrupt_requests: Vec<String>,
     observations: Vec<String>,
     available: bool,
     detail: Option<String>,
@@ -168,6 +171,7 @@ impl FakeBackend {
                 executions: BTreeMap::new(),
                 starts: Vec::new(),
                 stop_requests: Vec::new(),
+                interrupt_requests: Vec::new(),
                 observations: Vec::new(),
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
@@ -190,6 +194,11 @@ impl FakeBackend {
     /// Execution ids STOP was requested for, in order.
     pub fn stop_requests(&self) -> Vec<String> {
         self.lock().stop_requests.clone()
+    }
+
+    /// Execution ids INTERRUPT was requested for, in order.
+    pub fn interrupt_requests(&self) -> Vec<String> {
+        self.lock().interrupt_requests.clone()
     }
 
     /// Execution ids OBSERVE was called for, in order.
@@ -355,6 +364,53 @@ impl Backend for FakeBackend {
         })
     }
 
+    /// INTERRUPT stops the current turn but never retires the conversation:
+    /// the execution stays known, its signal survives, and — like the real
+    /// adapters — a compliant native context reports its turn process gone
+    /// while a hang keeps running.
+    fn interrupt(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
+        let mut state = self.lock();
+        state.interrupt_requests.push(handle.execution_id.clone());
+        self.resolve(&state, handle)?;
+        let execution = state
+            .executions
+            .get_mut(&handle.execution_id)
+            .expect("presence checked above");
+        if !execution.step.ignores_stop {
+            execution.step.native = NativeState::Exited;
+        }
+        Ok(())
+    }
+
+    /// RESUME re-adopts a known execution; §25's identity rule applies the
+    /// same as everywhere else — a handle without this context's native
+    /// identity is not recognised, it is refused.
+    fn resume(
+        &self,
+        handle: &ExecutionHandle,
+        _request: &ResumeRequest,
+    ) -> Result<(), BackendError> {
+        let state = self.lock();
+        self.resolve(&state, handle)?;
+        Ok(())
+    }
+
+    /// HISTORY reports the inputs this execution received as
+    /// `conversation.user` events — the minimal honest §27 surface for a
+    /// backend with no native transcript.
+    fn history(&self, handle: &ExecutionHandle) -> Result<Vec<NativeEvent>, BackendError> {
+        let state = self.lock();
+        let execution = self.resolve(&state, handle)?;
+        Ok(execution
+            .inputs
+            .iter()
+            .map(|input| NativeEvent {
+                kind: "conversation.user".to_string(),
+                payload: json!({"text": input}),
+            })
+            .collect())
+    }
+
     fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
         let mut state = self.lock();
         state.stop_requests.push(handle.execution_id.clone());
@@ -483,6 +539,9 @@ mod tests {
             for outcome in [
                 fake.observe(&forged).map(|_| ()),
                 fake.send(&forged, "hello"),
+                fake.interrupt(&forged),
+                fake.resume(&forged, &ResumeRequest::new("w", PathBuf::from("/tmp"))),
+                fake.history(&forged).map(|_| ()),
                 fake.stop(&forged),
             ] {
                 assert!(
@@ -504,6 +563,46 @@ mod tests {
         assert!(
             fake.inputs("e1").is_empty(),
             "a forged SEND delivered nothing"
+        );
+    }
+
+    /// The M4 trait surface on the fake: INTERRUPT stops a compliant turn
+    /// (native exits, signal survives) but not a hang; RESUME re-adopts a
+    /// known handle; HISTORY reports delivered inputs as
+    /// `conversation.user` events.
+    #[test]
+    fn interrupt_resume_and_history_behave_like_the_real_adapters() {
+        let fake = FakeBackend::scripted("fake", [FakeStep::needs_input("who?"), FakeStep::hang()]);
+        let compliant = fake.start(&request("c")).expect("start");
+        let hanging = fake.start(&request("h")).expect("start");
+
+        fake.interrupt(&compliant).expect("interrupt");
+        fake.interrupt(&hanging).expect("interrupt");
+        assert_eq!(fake.interrupt_requests(), vec!["c", "h"]);
+        let observed = fake.observe(&compliant).expect("observe");
+        assert_eq!(observed.native, NativeState::Exited, "the turn died");
+        assert_eq!(
+            observed.signal,
+            BackendSignal::NeedsInput {
+                prompt: "who?".to_string()
+            },
+            "the conversation's signal survives the interrupt"
+        );
+        assert_eq!(
+            fake.observe(&hanging).expect("observe").native,
+            NativeState::Running,
+            "a hang ignores interrupt like it ignores stop"
+        );
+
+        fake.resume(&compliant, &ResumeRequest::new("w", "/anywhere"))
+            .expect("a known handle re-adopts");
+        fake.send(&compliant, "it was Mallory").expect("send");
+        assert_eq!(
+            fake.history(&compliant).expect("history"),
+            vec![NativeEvent {
+                kind: "conversation.user".to_string(),
+                payload: serde_json::json!({"text": "it was Mallory"}),
+            }]
         );
     }
 

@@ -854,6 +854,14 @@ impl Engine {
                         json!({"stage_id": stage.stage_id, "detail": evidence.clone()}),
                     )?;
                 }
+                // Retire the unreconcilable execution explicitly: a stale
+                // identity must never be reachable for SEND again (§25;
+                // Sergeant's stale-pane-identity class). Ordered before the
+                // work-level block, and idempotent via `stop_requested`, so
+                // a crash anywhere in this append sequence re-derives on
+                // the next restart (L6: the work is still `active` until
+                // the final append, and reconcile re-runs on `active`).
+                self.stop_execution(core, work_id, "retired at reconcile: unrecognized")?;
                 self.block(
                     core,
                     work_id,

@@ -301,6 +301,7 @@ async fn t2_bearer_token_gates_v1_routes() {
 
     // The mutation routes are gated too, not just the reads: an unauthenticated
     // POST must never reach a handler that appends to the journal.
+    let before = event_count(&http, &handle).await;
     for path in ["/v1/work", "/v1/work/01AN4Z07BY79KA1307SR9X4MV3/cancel"] {
         let resp = http
             .post(format!("{}{path}", handle.endpoint))
@@ -321,9 +322,10 @@ async fn t2_bearer_token_gates_v1_routes() {
             .expect("wrong-token POST");
         assert_eq!(resp.status(), 401, "expected 401 for POST {path}");
     }
-    // And nothing they sent was journaled: only daemon.started exists.
+    // And nothing they sent was journaled: the journal is exactly where the
+    // daemon's own startup left it.
     let events = event_count(&http, &handle).await;
-    assert_eq!(events, 1, "rejected requests must not append events");
+    assert_eq!(events, before, "rejected requests must not append events");
 
     // Correct token → 200 on several /v1 routes.
     for path in ["/v1/work", "/v1/events", "/v1/system"] {
@@ -645,11 +647,12 @@ async fn event_history_from_seq_returns_exactly_the_tail() {
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     cancel(&http, &handle, &work_id, &ulid()).await;
 
-    // daemon.started + 2×(work.submitted, command.accepted) + work.canceled
+    // daemon.started + backend.probed (one per registered backend, M4)
+    // + 2×(work.submitted, command.accepted) + work.canceled
     // + command.accepted.
     let all = history_seqs(&http, &handle, None).await;
-    assert_eq!(all.len(), 7, "unexpected history: {all:?}");
-    assert_eq!(all, (1..=7).collect::<Vec<u64>>(), "seqs are 1..n in order");
+    assert_eq!(all.len(), 9, "unexpected history: {all:?}");
+    assert_eq!(all, (1..=9).collect::<Vec<u64>>(), "seqs are 1..n in order");
 
     // from=N ⇒ exactly the events after N, for every N in the history.
     for (cut, from) in all.iter().copied().enumerate() {
@@ -1169,11 +1172,13 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
         .await
         .expect("sse connect");
     assert_eq!(stream.status(), 200);
-    // Read the replayed daemon.started frame: the pump is genuinely attached
+    // Read the replayed startup frames (daemon.started, then one
+    // backend.probed per registered backend): the pump is genuinely attached
     // and streaming, not merely requested.
+    let startup = journal_events(dir.path()).len();
     assert_eq!(
-        read_sse_events(&mut stream, 1).await.len(),
-        1,
+        read_sse_events(&mut stream, startup).await.len(),
+        startup,
         "the SSE client must be attached before shutdown"
     );
 

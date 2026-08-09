@@ -17,6 +17,7 @@
 //! crash leaves a stale descriptor, which clients detect (dead PID + refused
 //! endpoint) and replace.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,8 +27,9 @@ use serde_json::json;
 use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::api::{API_REVISION, ApiState, Core, CoreError, router};
-use crate::backend::BackendRegistry;
+use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
+use crate::backend::{BackendRegistry, EventSink};
 use crate::domain::event::{EventDraft, EventSource};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
@@ -46,6 +48,9 @@ pub const DESCRIPTOR_SCHEMA: &str = "sergeant.runtime/v1";
 pub const KIND_DAEMON_STARTED: &str = "daemon.started";
 /// Event kind: the daemon shut down cleanly.
 pub const KIND_DAEMON_STOPPED: &str = "daemon.stopped";
+/// Event kind: a backend was registered and probed (§15 PROBE, recorded at
+/// registration as the M4 contract requires).
+pub const KIND_BACKEND_PROBED: &str = "backend.probed";
 
 /// The runtime descriptor published for clients (proposal §6): endpoint,
 /// PID, API revision, and the bearer token, protected by owner-only file
@@ -140,6 +145,11 @@ pub struct DaemonConfig {
     pub backends: Arc<BackendRegistry>,
     /// §13's global default tier.
     pub default_backend: Option<String>,
+    /// Launch configuration for the Claude adapter this daemon registers
+    /// itself. `None` is the system `claude` over this data dir. Tests point
+    /// it at a stub binary so the *real* adapter — not a fake wearing its
+    /// name — can be driven through the daemon's own request path.
+    pub claude: Option<ClaudeConfig>,
 }
 
 impl Default for DaemonConfig {
@@ -147,6 +157,7 @@ impl Default for DaemonConfig {
         Self {
             backends: Arc::new(BackendRegistry::default_registry()),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            claude: None,
         }
     }
 }
@@ -205,11 +216,57 @@ pub async fn start_with(
         json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "endpoint": endpoint}),
     ))?;
 
-    // 4b. Reconcile work believed in flight *before* serving (§25): no
+    // 4b. Register the real adapter alongside whatever the config supplied
+    // (tests hand in scripted fakes; they keep them). It is added here, not
+    // in `default_registry`, because the Claude adapter needs this data dir
+    // for its raw-transcript archive and an event sink that only exists once
+    // the core does. A config that already registered the name wins — that
+    // is how tests substitute stubs. Codex is not registered at all: it is
+    // descoped by deviation D6, and a backend nothing has measured must not
+    // appear in routing output as something a user could ask for.
+    let mut backends = (*config.backends).clone();
+    let claude = if config.backends.get(CLAUDE_BACKEND_NAME).is_none() {
+        let claude_config = config
+            .claude
+            .clone()
+            .unwrap_or_else(|| ClaudeConfig::new(data_dir));
+        let adapter = Arc::new(ClaudeBackend::new(claude_config));
+        backends = backends.with(adapter.clone());
+        Some(adapter)
+    } else {
+        None
+    };
+    let backends = Arc::new(backends);
+
+    // 4b-ii. The capability/version probe, recorded at registration (M4
+    // contract). Probing is offline and token-free (`--version`, `--help`),
+    // and journaling the answer is the point: a version and flag set that
+    // only ever appear inside a later refusal's message are not a record.
+    // An unavailable backend is registered anyway and refuses work with this
+    // same evidence — routing must be able to say *why*, not pretend the
+    // backend does not exist.
+    for name in backends.names() {
+        let Some(backend) = backends.get(&name) else {
+            continue;
+        };
+        let report = backend.probe();
+        core.commit(EventDraft::new(
+            EventSource::new("daemon", "sergeant"),
+            KIND_BACKEND_PROBED,
+            json!({
+                "backend": name,
+                "available": report.available,
+                "detail": report.detail,
+                "capabilities": backend.capabilities(),
+            }),
+        ))?;
+    }
+
+    // 4c. Reconcile work believed in flight *before* serving (§25): no
     // request may observe — or act on — a work whose prior ownership has not
     // yet been settled.
     let engine = Arc::new(Engine::new(
-        config.backends.clone(),
+        backends,
         config.default_backend.clone(),
         data_dir,
     ));
@@ -247,6 +304,11 @@ pub async fn start_with(
         closing: closing_rx,
         engine,
     };
+    // The Claude adapter's normalized events (§27) flow into the journal
+    // through the core; the sink can only exist now that the core is shared.
+    if let Some(claude) = claude {
+        claude.set_event_sink(journaling_sink(state.core.clone()));
+    }
     let app = router(state.clone());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -282,6 +344,87 @@ pub async fn start_with(
         shutdown_tx: Some(shutdown_tx),
         served,
     })
+}
+
+/// Build the [`EventSink`] that journals an adapter's normalized events.
+///
+/// **The sink never blocks and never locks on its caller's thread.** It hands
+/// the draft to a dedicated committer thread and returns. That is not an
+/// optimization; it is what makes the sink safe to call from *any* thread an
+/// adapter has, which is the only assumption an adapter can be held to:
+///
+/// - a real adapter emits from the request path. `Backend::start` is called
+///   by the engine while the API handler holds the core lock on a tokio
+///   worker; `ClaudeBackend::start` spawns the (token-burning) turn and then
+///   emits `conversation.user` on that same thread. A sink that took
+///   `blocking_lock` there would panic inside a runtime — after the child
+///   process exists and before `execution.started` is journaled, i.e. an
+///   orphaned native process with no durable record: an L6 crash window
+///   opened by the logging path;
+/// - a sink that blocked instead of panicking would be no better: the lock it
+///   waits for is the one its own caller is holding.
+///
+/// So the committer thread owns all locking. It is also where causation
+/// chaining belongs: journal-assigned event ids exist only after commit, so
+/// only the committer can thread `causation_id` from one event to the next
+/// within an execution, and being single-threaded it does so in a
+/// deterministic order. Correlation (`correlation_id` = execution id) stays
+/// the adapter's.
+///
+/// Delivery is therefore asynchronous: a caller learns nothing about whether
+/// the event landed, which is correct — the journal is the daemon's
+/// single-owner surface, not the adapter's. The thread lives until every
+/// sink clone is dropped.
+pub fn journaling_sink(core: Arc<tokio::sync::Mutex<Core>>) -> EventSink {
+    let (tx, rx) = std::sync::mpsc::channel::<EventDraft>();
+    // The committer holds the core *weakly*: it must not keep the journal —
+    // and the exclusive lock the journal holds on the data dir — alive past
+    // the daemon that owns it, or a successor daemon would be locked out by
+    // a logging thread. Events still queued when the daemon goes away are
+    // dropped, which is the honest end state: delivery is best-effort, the
+    // journal is the daemon's.
+    let core = Arc::downgrade(&core);
+    std::thread::Builder::new()
+        .name("sergeant-event-sink".to_string())
+        .spawn(move || commit_normalized_events(&core, &rx))
+        .expect("spawn the normalized-event committer thread");
+    let tx = std::sync::Mutex::new(tx);
+    Arc::new(move |draft: EventDraft| {
+        if let Err(e) = tx.lock().expect("sink queue lock").send(draft) {
+            tracing::warn!(error = %e, "normalized backend event dropped: committer is gone");
+        }
+    })
+}
+
+/// The committer thread's loop: drain drafts in order, chain causation,
+/// commit. Runs on a plain std thread, so `blocking_lock` is correct here and
+/// only here.
+fn commit_normalized_events(
+    core: &std::sync::Weak<tokio::sync::Mutex<Core>>,
+    rx: &std::sync::mpsc::Receiver<EventDraft>,
+) {
+    let mut chain: HashMap<String, String> = HashMap::new();
+    while let Ok(mut draft) = rx.recv() {
+        let Some(core) = core.upgrade() else {
+            tracing::debug!("normalized-event committer stopping: the core is gone");
+            return;
+        };
+        let key = draft.execution_id.clone();
+        if draft.causation_id.is_none()
+            && let Some(key) = &key
+        {
+            draft.causation_id = chain.get(key).cloned();
+        }
+        let mut core = core.blocking_lock();
+        match core.commit(draft) {
+            Ok(event) => {
+                if let Some(key) = key {
+                    chain.insert(key, event.id);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to journal normalized backend event"),
+        }
+    }
 }
 
 /// Run the daemon in the foreground until SIGINT/SIGTERM, then shut down
