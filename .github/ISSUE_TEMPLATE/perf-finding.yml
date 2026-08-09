@@ -1,0 +1,53 @@
+name: Performance finding
+description: A measured performance, resource, or scale finding — leak, saturation, degradation, or baseline deviation.
+title: "[perf] "
+labels: ["perf"]
+body:
+  - type: textarea
+    id: finding
+    attributes:
+      label: Finding
+      description: The effect, with its magnitude. "Slow" is not a finding; "p95 latency 340ms at 20-way concurrency vs 12ms at 1-way" is.
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements
+      description: The numbers, with how they were taken (tool, sampling interval, binary profile — debug vs release matters here).
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Ideally a `scripts/perf/` scenario invocation (or the smallest standalone sequence). State the environment — cores, RAM, container limits.
+      render: sh
+    validations:
+      required: true
+  - type: input
+    id: baseline
+    attributes:
+      label: Baseline reference
+      placeholder: docs/perf/baseline-<date>.md section, if this deviates from a recorded baseline
+    validations:
+      required: false
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - critical — crash, loss, or wedge under load
+        - major — leak, or saturation well below intended scale
+        - minor — degradation or limit worth tracking
+        - observation — baseline data point, not wrong
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+      placeholder: git SHA the measurement was taken at
+    validations:
+      required: true

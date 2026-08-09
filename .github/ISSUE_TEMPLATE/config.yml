@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Architecture / proposal discussion
+    url: https://github.com/miztertea/sergeant-rs/blob/main/reference/proposal-depot-rust-execution-surface.md
+    about: The proposal the prototype implements; deviations from it live in GAUNTLET.md's register (D-rows) and are settled by ruling, not by re-noticing them.
