@@ -146,9 +146,12 @@ assertions. (6) Daemon-leak and temp-dir-leak fixes are structural (the
 error), per L5's "the environment enforces the boundary".
 
 **Shipping gates.** Checkpoint gate (pre-round-2): passed, e972e64
-adopted. Final shipping gate: run at P0 close-out over the round-2 fix
-commit 2383863 and this documentation — result recorded by the gate's own
-document step in the commit trail.
+adopted. Final shipping gate: review found 1 — `ClaudeBackend::stop`'s join
+of the reader thread ran on the async caller's tokio worker, so the archive
+wait could starve that worker's other tasks; fixed with `block_in_place` on
+a multi-thread runtime, pipeline-applied (d82a6e2), with the accepted
+Core-lock-held-during-join trade-off documented on `stop` itself (d20554d).
+Test/lint clean.
 
 ---
 
