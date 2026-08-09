@@ -82,8 +82,9 @@ alternatives documented in Cargo.toml); rebuild 16,000 events in 1.08s; all
 canned queries 59–123ms; OTLP smoke measured live against a bound collector;
 pipeline worktrees cannot see the shared build cache (no-mistakes constructs
 agent env), so the standing pattern is pipeline-static-review + orchestrator
-runtime verification, recorded per gate. Release binary size: recorded below
-when the measurement completes.
+runtime verification, recorded per gate. Release binary: 58.8MB (47.3MB
+stripped) — the full daemon with embedded DuckDB; one-binary shipping (§34)
+confirmed viable, owner accepted the size 2026-08-09.
 
 **Adjudication rulings.** (1) D7 registered (opentelemetry_sdk direct; the
 tracing bridge cannot represent the domain span tree). (2) The t5 regression
