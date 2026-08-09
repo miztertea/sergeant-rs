@@ -816,15 +816,31 @@ async fn with_analytics<T>(
     // Reading `last_seq` outside the catch-up is safe because `catch_up`
     // skips anything already folded — a concurrent reader that got there
     // first costs this one a re-read of nothing.
-    let from = state.analytics.lock().await.last_seq();
-    let pending = match state.core.lock().await.events_after(from) {
-        Ok(events) => events,
-        Err(e) => return Err(projection_unavailable(e)),
+    //
+    // But the gap between that read and re-acquiring the analytics lock is
+    // a window: a concurrent `with_analytics` call can run its own
+    // `catch_up` in between — succeeding (advancing `last_seq` past what
+    // `pending` covers) or failing (resetting `last_seq` to 0 behind our
+    // back). Either way, `pending` was computed against a `from` that is no
+    // longer the projection's real position, and folding it as-is would
+    // fold the wrong tail. So the read-fetch-fold cycle is retried, under
+    // the re-acquired lock, until `last_seq` still matches what `pending`
+    // was fetched against.
+    let mut analytics = loop {
+        let from = state.analytics.lock().await.last_seq();
+        let pending = match state.core.lock().await.events_after(from) {
+            Ok(events) => events,
+            Err(e) => return Err(projection_unavailable(e)),
+        };
+        let mut analytics = state.analytics.lock().await;
+        if analytics.last_seq() != from {
+            continue;
+        }
+        if let Err(e) = analytics.catch_up(pending.into_iter().map(Ok)) {
+            return Err(projection_unavailable(e));
+        }
+        break analytics;
     };
-    let mut analytics = state.analytics.lock().await;
-    if let Err(e) = analytics.catch_up(pending.into_iter().map(Ok)) {
-        return Err(projection_unavailable(e));
-    }
     match f(&mut analytics) {
         Ok(value) => Ok((value, analytics.last_seq())),
         Err(AnalyticsError::UnknownQuery { name }) => Err(error_response(
@@ -1076,4 +1092,139 @@ async fn send_sse(
         .event(event.kind.clone())
         .data(data);
     tx.send(Ok(frame)).await.map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendRegistry;
+    use crate::runtime::projection::work_registry_projection;
+
+    async fn test_state(data_dir: &std::path::Path) -> ApiState {
+        let journal = Journal::open(data_dir).expect("open journal");
+        let mut registry = work_registry_projection();
+        registry
+            .catch_up(journal.replay().expect("replay"))
+            .expect("catch up registry");
+        let (events_tx, _) = broadcast::channel(16);
+        let core = Core {
+            journal,
+            registry,
+            events_tx,
+        };
+        let analytics = Analytics::rebuild(data_dir, core.journal.replay().expect("replay"))
+            .expect("rebuild analytics");
+        let (_closing_tx, closing_rx) = watch::channel(false);
+        ApiState {
+            core: Arc::new(tokio::sync::Mutex::new(core)),
+            token: "test-token".to_string(),
+            data_dir: data_dir.to_path_buf(),
+            closing: closing_rx,
+            engine: Arc::new(Engine::new(Arc::new(BackendRegistry::new()), None, data_dir)),
+            analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+        }
+    }
+
+    fn seeded(n: u32) -> EventDraft {
+        EventDraft::new(
+            EventSource::new("test", "harness"),
+            "test.seeded",
+            json!({"n": n}),
+        )
+    }
+
+    /// The TOCTOU this test provokes: `with_analytics` reads `last_seq`,
+    /// releases the analytics lock to fetch the journal tail, then
+    /// re-acquires the lock to fold it. A concurrent request's `catch_up`
+    /// can run to completion — and fail — in that gap, which resets the
+    /// projection to seq 0 behind the first request's back. Folding the
+    /// first request's *stale* tail on top of that reset would silently
+    /// skip the events between 0 and its old `last_seq`, exactly the
+    /// "silently short table" the fail-closed contract forbids. The fix
+    /// must detect the mismatch and re-fetch from the projection's real
+    /// position instead of trusting the stale batch.
+    #[tokio::test]
+    async fn a_concurrent_catch_up_failure_never_folds_a_stale_tail() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        // Seed three events and catch the projection up to them, so
+        // `last_seq` starts at 3.
+        {
+            let mut core = state.core.lock().await;
+            for n in 1..=3u32 {
+                core.commit(seeded(n)).expect("commit");
+            }
+        }
+        let pending = state
+            .core
+            .lock()
+            .await
+            .events_after(0)
+            .expect("events_after");
+        state
+            .analytics
+            .lock()
+            .await
+            .catch_up(pending.into_iter().map(Ok))
+            .expect("seed catch-up");
+
+        // Two more events arrive — the "work submission" racing the
+        // analytics requests below.
+        {
+            let mut core = state.core.lock().await;
+            for n in 4..=5u32 {
+                core.commit(seeded(n)).expect("commit");
+            }
+        }
+
+        // Hold the core lock so the spawned request is guaranteed to be
+        // parked between its `last_seq` read and its `events_after` fetch
+        // (both uncontended locks resolve without yielding, so it reaches
+        // exactly that point on its first poll) when the concurrent
+        // failure below runs.
+        let core_guard = state.core.lock().await;
+
+        let state_a = state.clone();
+        let task_a = tokio::spawn(async move { with_analytics(&state_a, Analytics::table_counts).await });
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // A concurrent request's catch-up fails partway. The fail-closed
+        // contract requires this to leave the projection reporting
+        // `last_seq() == 0` until the next successful catch-up.
+        {
+            let mut analytics = state.analytics.lock().await;
+            let failing = std::iter::once(Err(JournalError::Io(std::io::Error::other(
+                "injected failure",
+            ))));
+            assert!(
+                analytics.catch_up(failing).is_err(),
+                "the injected failure must surface"
+            );
+            assert_eq!(
+                analytics.last_seq(),
+                0,
+                "a failed fold must fail closed"
+            );
+        }
+
+        drop(core_guard);
+
+        let result = task_a.await.expect("task a joined");
+        let (counts, seq) = match result {
+            Ok(v) => v,
+            Err(_) => panic!("a catch-up raced by a concurrent failure must not answer short"),
+        };
+        let events_count = counts
+            .into_iter()
+            .find(|(table, _)| table == "events")
+            .map(|(_, count)| count)
+            .expect("events table present");
+        assert_eq!(
+            events_count, 5,
+            "catch-up raced by a concurrent failure must fold the whole journal, not just the stale tail it fetched before the reset"
+        );
+        assert_eq!(seq, 5, "the projection must report itself caught up to the real journal head");
+    }
 }
