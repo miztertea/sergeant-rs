@@ -26,6 +26,22 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3"
 ulid = "3.0.0"
 
+# M5 Unknown #1 — "the duckdb crate's bundled-build cost in this container
+# (compile time and disk) — measure first". Measured here, dev profile, before
+# this override: libduckdb.a 2.08 GB, liblibduckdb_sys.rlib 2.0 GB, and every
+# integration-test binary that links it ~770 MB, for 15 GB of `target/` on a
+# disk with ~16 GB free. That is survivable for `cargo test` alone but not for
+# `cargo clippy --all-targets`, which needs its own check-profile copy of the
+# same C build and died in `ar` with ENOSPC — i.e. a project gate was silently
+# unrunnable. Nearly all of that bulk is DWARF: cc-rs passes `-g` to the ~500
+# bundled C++ translation units whenever the profile asks for debug info.
+# Fallback taken instead of a feature gate or a leaner store (both of which
+# would change what M5 ships): keep the proposal-named crate (R5) and drop
+# debug info from that one package's artifacts. Rust-side debug info is
+# untouched, and nobody in this project steps through DuckDB's C++.
+[profile.dev.package.libduckdb-sys]
+debug = false
+
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
 tempfile = "3"

@@ -47,8 +47,8 @@ use sergeant_rs::runtime::analytics::{
     Analytics, AnalyticsError, CANNED_QUERIES, DUCKDB_FILE, PROJECTIONS_DIR, duckdb_path,
 };
 use sergeant_rs::runtime::graph::{GraphContext, GraphEdge};
-use sergeant_rs::runtime::journal::Journal;
-use sergeant_rs::telemetry::{Telemetry, TelemetryConfig};
+use sergeant_rs::runtime::journal::{Journal, JournalError};
+use sergeant_rs::telemetry::{DEFAULT_OTLP_ENDPOINT, Telemetry, TelemetryConfig};
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
@@ -404,6 +404,209 @@ async fn a_restart_over_the_existing_projection_file_rebuilds_it() {
     );
 }
 
+// ------------------------------- 1b. the projection fails closed, or not at all
+
+/// A fold that fails part-way must never leave a table silently short.
+///
+/// Acceptance 1 says the kept-current projection equals a from-scratch
+/// rebuild row for row. The dangerous way to break that is not a crash: it is
+/// a fold that dies after `last_seq` has moved past rows that never reached
+/// the tables. The skip in `catch_up` is permanent, so those rows would never
+/// be folded again — `events`, `messages` and `usage` would answer *200 with
+/// missing rows* for the rest of the process's life, while the mutable tables
+/// quietly self-healed around them. One 503 is the correct cost; wrong rows
+/// are not a cost the contract permits at any price.
+#[test]
+fn a_fold_that_fails_part_way_never_answers_out_of_a_short_table() {
+    let good = provenance_fixture();
+    assert!(
+        good.len() > 3,
+        "fixture must have events either side of the failure"
+    );
+
+    // The journal goes unreadable in the middle of a catch-up: real, and the
+    // same early return every write failure (a full disk, say) takes.
+    let torn = || {
+        let mut items: Vec<Result<Event, JournalError>> =
+            good.iter().take(2).cloned().map(Ok).collect();
+        items.push(Err(JournalError::Io(std::io::Error::other(
+            "the journal went away mid-replay",
+        ))));
+        items.extend(good.iter().skip(2).cloned().map(Ok));
+        items
+    };
+
+    let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
+    assert!(
+        analytics.catch_up(torn()).is_err(),
+        "the fold must surface the failure"
+    );
+
+    // It must now claim to have folded nothing, and refuse to answer at all.
+    assert_eq!(
+        analytics.last_seq(),
+        0,
+        "a projection that dropped rows must not claim the seq it dropped them at"
+    );
+    assert!(
+        matches!(analytics.table_counts(), Err(AnalyticsError::NeedsRebuild)),
+        "a projection holding a failed fold must refuse to answer, not answer short"
+    );
+
+    // And it heals by re-folding the journal, which is the only repair the
+    // §40 disposability story allows.
+    let refolded = analytics
+        .catch_up(good.iter().cloned().map(Ok))
+        .expect("re-fold after the journal came back");
+    assert_eq!(
+        refolded,
+        good.len() as u64,
+        "the whole journal must be re-folded"
+    );
+
+    let healed = local_projection(&mut analytics);
+    let rebuilt =
+        local_projection(&mut Analytics::in_memory(good.iter().cloned().map(Ok)).expect("rebuild"));
+    assert_eq!(
+        healed, rebuilt,
+        "after healing, kept-current must equal a from-scratch rebuild row for row"
+    );
+}
+
+/// Acceptance 1's failure semantics over HTTP: a projection that cannot be
+/// caught up answers 503 against the *projection*, and the work it describes
+/// is untouched.
+#[tokio::test]
+async fn a_projection_that_cannot_catch_up_answers_503_and_never_wrong_rows() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+
+    let (handle, _fake) =
+        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let created = submit(
+        &handle,
+        repo.path(),
+        "still answerable",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = created["work"]["id"].as_str().expect("id").to_string();
+
+    // Corrupt the journal *tail* behind the daemon's back. The projection is
+    // folded lazily at read time, so the next analytics request has to read
+    // this and cannot.
+    let segment = journal_segment(data.path());
+    let intact = std::fs::read(&segment).expect("read segment");
+    let mut torn = intact.clone();
+    torn.extend_from_slice(b"{ not an event }\n");
+    std::fs::write(&segment, &torn).expect("tear the journal");
+
+    for path in ["/v1/analytics", "/v1/analytics/blocked_time_per_work"] {
+        let (status, body) = get_status(&handle, path).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{path} must report the projection unavailable, not invent an answer"
+        );
+        assert_eq!(body["error"]["code"], "projection_unavailable");
+    }
+    let (status, _) = get_status(&handle, &format!("/v1/graph/work/{work_id}")).await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+    // The point of 503 rather than 500: the work itself is fine. Its state
+    // lives in the journal-backed registry, not in the derived file.
+    let work = get(&handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(work["work"]["state"], "completed");
+
+    // And the failure is transient by construction — nothing was written, so
+    // repairing the journal restores the answer with no restart.
+    std::fs::write(&segment, &intact).expect("restore the journal");
+    let index = get(&handle, "/v1/analytics").await;
+    assert!(
+        index["tables"]
+            .as_array()
+            .expect("tables")
+            .iter()
+            .any(|t| t["table"] == "work" && t["rows"].as_i64() == Some(1)),
+        "the projection must answer again once the journal is readable"
+    );
+
+    handle.shutdown().await;
+}
+
+/// The analytical projection's read-time catch-up asks the journal for its
+/// tail while holding the daemon's mutation lock, so the tail read must cost
+/// the answer and not the history.
+///
+/// The correctness risk in doing that is segment skipping: it is the one read
+/// path that does not start at seq 1, so it is the one that could silently
+/// return a short or misaligned answer. This pins it across real segment
+/// boundaries, at every offset, including the two that matter most — nothing
+/// pending, and everything pending.
+#[test]
+fn the_journal_tail_read_is_exact_at_every_offset_across_segments() {
+    use sergeant_rs::domain::event::{EventDraft, EventSource};
+
+    let dir = TempDir::new().expect("tempdir");
+    // Small enough to rotate every few events, so the skip logic is exercised
+    // rather than trivially satisfied by a single segment.
+    let mut journal = Journal::open_with(dir.path(), 512).expect("open");
+    for index in 0..40u64 {
+        journal
+            .append(EventDraft::new(
+                EventSource::new("daemon", "test"),
+                "work.submitted",
+                json!({"work": {"id": format!("w{index}"), "state": "pending"}}),
+            ))
+            .expect("append");
+    }
+    let segments = std::fs::read_dir(dir.path().join("journal"))
+        .expect("journal dir")
+        .filter(|e| {
+            e.as_ref()
+                .expect("entry")
+                .path()
+                .extension()
+                .is_some_and(|x| x == "ndjson")
+        })
+        .count();
+    assert!(segments > 1, "the fixture must span multiple segments");
+
+    let all: Vec<u64> = journal
+        .replay()
+        .expect("replay")
+        .map(|e| e.expect("event").seq)
+        .collect();
+    assert_eq!(all, (1..=40).collect::<Vec<u64>>());
+
+    for after in 0..=41u64 {
+        let tail: Vec<u64> = journal
+            .replay_after(after)
+            .expect("replay_after")
+            .map(|e| e.expect("event").seq)
+            .filter(|seq| *seq > after)
+            .collect();
+        let expected: Vec<u64> = ((after + 1)..=40).collect();
+        assert_eq!(tail, expected, "tail after {after} is wrong");
+    }
+}
+
+/// The journal's single segment file for a data dir.
+fn journal_segment(data_dir: &Path) -> PathBuf {
+    let dir = data_dir.join("journal");
+    let mut segments: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("journal dir")
+        .filter_map(|entry| {
+            let path = entry.expect("entry").path();
+            (path.extension().is_some_and(|e| e == "ndjson")).then_some(path)
+        })
+        .collect();
+    segments.sort();
+    segments.pop().expect("at least one segment")
+}
+
 // ------------------------------------------------------ 2. one owner
 
 /// Acceptance 2. Only the daemon's own projection module opens DuckDB.
@@ -436,11 +639,29 @@ fn t2_the_duckdb_file_has_exactly_one_owner() {
         );
     }
 
-    // And that module must not leak the connection: everything crossing its
-    // boundary is plain data (`QueryResult`, `GraphView`, counts). The field
-    // itself needs no check here — rustc enforces private-by-default struct
-    // fields at compile time, so any external access is a compile error.
+    // The positive half of "exactly one owner". Without it the loop above is
+    // satisfied by a build that stopped using the crate altogether — and R5
+    // named the embedded Rust client specifically, so a silent swap for some
+    // other store is exactly the drift this acceptance test exists to catch.
     let analytics = std::fs::read_to_string(src.join("runtime/analytics.rs")).expect("read");
+    assert!(
+        names_the_crate(&analytics),
+        "runtime/analytics.rs must be the one module that uses the duckdb crate"
+    );
+
+    // And that module must not leak the connection: everything crossing its
+    // boundary is plain data (`QueryResult`, `GraphView`, counts).
+    //
+    // Private-by-default does not cover this on its own. `Analytics` is a
+    // public struct in a public module, so `pub conn: Connection` compiles
+    // and is reachable from anywhere in the workspace — and a consumer
+    // written against it (`analytics.conn.execute(..)`) names the lowercase
+    // crate token nowhere, so the scan above would not see it either. The
+    // field declaration is therefore pinned directly.
+    assert!(
+        analytics.contains("\n    conn: Connection,"),
+        "the connection must stay a private field"
+    );
     assert!(
         !analytics.contains("pub fn conn") && !analytics.contains("-> &Connection"),
         "no accessor may hand a live DuckDB connection outside the projection"
@@ -1167,13 +1388,24 @@ fn exported_metric_names(exporter: &InMemoryMetricExporter) -> BTreeSet<String> 
 /// on the daemon's start path can construct one at all, and a running daemon
 /// puts nothing into an ambient pipeline that is sitting right there.
 ///
-/// The third claim needs the pipeline to be genuinely reachable to mean
-/// anything. An earlier shape of this test built a `Telemetry` with in-memory
-/// exporters and asserted they stayed empty — but `Telemetry::with_exporters`
-/// registers its providers nowhere, so no daemon behaviour whatsoever could
-/// have filled them and the assertion was unfalsifiable. The exporters below
-/// are installed as OpenTelemetry's *global* providers instead, and the kill
-/// probe at the end proves it.
+/// Each claim is checked by the probe that can actually see it, because this
+/// test has twice been rewritten into one that could not fail:
+///
+/// - *no pipeline from the default config* is a unit assertion, below;
+/// - *no code on the start path can construct one* is not observable at
+///   runtime at all — `sgt daemon` runs `run_until_signal`, which no test
+///   drives — so it is checked structurally by
+///   [`assert_telemetry_is_built_in_one_gated_place`];
+/// - *nothing reaches a collector* needs a collector at an address a
+///   regression would really dial, which is `DEFAULT_OTLP_ENDPOINT`, not an
+///   ephemeral port nobody is told about;
+/// - *nothing lands in an ambient pipeline* needs that pipeline to be
+///   genuinely reachable. An earlier shape of this test built a `Telemetry`
+///   with in-memory exporters and asserted they stayed empty — but
+///   `Telemetry::with_exporters` registers its providers nowhere, so no
+///   daemon behaviour could ever have filled them. The exporters below are
+///   installed as OpenTelemetry's *global* providers, and the kill probe at
+///   the end proves they are live.
 #[tokio::test]
 async fn t5_disabled_export_runs_no_exporter_machinery() {
     assert!(
@@ -1188,14 +1420,32 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
         "a disabled configuration must not build a pipeline at all"
     );
 
+    // The structural guard, and the only coverage anywhere of the daemon's
+    // real entrypoint. `sgt daemon` runs `run_until_signal`, which no test
+    // drives (every test above hands `start_with` a `DaemonConfig` directly),
+    // so without this a regression that dropped the environment gate — or
+    // that built a pipeline inside `start_with` regardless of the config it
+    // was handed — would ship green.
+    assert_telemetry_is_built_in_one_gated_place();
+
     // Not the only guard, and not a text scan: a bare TCP listener stands in
     // for a collector nobody told the daemon about. If a regression started
     // building a pipeline from the ambient environment regardless of the
     // config it was handed, the fake-backend run below would have somewhere
     // to send it — this asserts it never dials out at all.
+    //
+    // The listener has to sit on `DEFAULT_OTLP_ENDPOINT`, because that is the
+    // address such a regression would actually dial. An ephemeral port whose
+    // number is never handed to anything makes "zero connections" true under
+    // every possible implementation, which is not a test at all.
     let collector_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let collector_listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stand-in collector");
+    let default_port = DEFAULT_OTLP_ENDPOINT
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .expect("the default endpoint names a port");
+    let collector_listener = std::net::TcpListener::bind(("127.0.0.1", default_port))
+        .unwrap_or_else(|e| panic!("bind a stand-in collector on 127.0.0.1:{default_port}: {e}"));
     collector_listener
         .set_nonblocking(true)
         .expect("nonblocking");
@@ -1246,6 +1496,10 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
     assert_eq!(created["work"]["state"], "completed");
     handle.shutdown().await;
 
+    // Shutdown closes the event channel, which is what makes the export task
+    // force-flush; give a regression's flush time to reach the listener
+    // before concluding that nothing dialed it.
+    tokio::time::sleep(Duration::from_millis(750)).await;
     collector_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     collector_thread.join().expect("collector thread");
     assert_eq!(
@@ -1288,6 +1542,71 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
         exported_metric_names(&metrics).contains("m5_probe_total"),
         "the ambient meter must be reachable, or the emptiness above proves nothing"
     );
+}
+
+/// "Off means nothing runs" as a property of the source, not of one run.
+///
+/// The runtime probes in `t5_disabled_export_runs_no_exporter_machinery` can
+/// only observe the daemon they were handed. This covers the shape that no
+/// runtime probe reaches: that a pipeline can be *constructed* in exactly one
+/// place, that the place is gated on the environment, and that the function
+/// every other test drives cannot build one at all.
+fn assert_telemetry_is_built_in_one_gated_place() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    const CONSTRUCTORS: &[&str] = &[
+        "Telemetry::otlp",
+        "Telemetry::with_exporters",
+        "Telemetry::from_config",
+    ];
+    for file in rust_sources(&src) {
+        let relative = file.strip_prefix(&src).expect("under src").to_path_buf();
+        // `telemetry.rs` defines them; `daemon.rs` is the one caller, and is
+        // checked far more precisely just below.
+        if relative == Path::new("telemetry.rs") || relative == Path::new("daemon.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).expect("read source");
+        for constructor in CONSTRUCTORS {
+            assert!(
+                !text.contains(constructor),
+                "{} calls {constructor}; the export pipeline has exactly one construction site",
+                relative.display()
+            );
+        }
+    }
+
+    let daemon = std::fs::read_to_string(src.join("daemon.rs")).expect("read daemon");
+
+    // Every test in this file drives `start_with` with an explicit config. If
+    // it built a pipeline of its own, none of them could tell.
+    let start_with = item_source(&daemon, "pub async fn start_with(");
+    assert!(
+        !start_with.contains("Telemetry::"),
+        "start_with must never construct an export pipeline; it exports only what it is handed"
+    );
+
+    // And the real entrypoint builds one only behind the environment gate.
+    let run_until_signal = item_source(&daemon, "pub async fn run_until_signal(");
+    assert!(
+        run_until_signal.contains("TelemetryConfig::from_env()")
+            && run_until_signal.contains("Telemetry::from_config("),
+        "`sgt daemon` must build its pipeline from the environment config, which defaults to off"
+    );
+}
+
+/// The source text of the top-level item beginning with `signature`.
+///
+/// Ends at the first line consisting of a single `}`, which rustfmt
+/// guarantees is the item's own closing brace and nothing nested.
+fn item_source<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} not found"));
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("no closing brace for {signature}"));
+    &rest[..end]
 }
 
 // -------------------------------------------------- 6. analytics smoke
@@ -1617,11 +1936,13 @@ async fn real_adapter_events_populate_the_conversation_tables_and_tool_spans() {
         "request and result are one row, not two: {calls:?}"
     );
     // The name is *validated*, not merely handed to SQL and allowed to fail
-    // there: the error says "unknown", and a name shaped like an injection is
-    // refused by the same check rather than reaching the parser.
+    // there: the error says "unknown *table*" — the one error this call can
+    // raise, so it must not borrow the name of a different surface — and a
+    // name shaped like an injection is refused by the same check rather than
+    // reaching the parser.
     for name in ["not_a_table", "work\"; DROP TABLE work; --"] {
         match analytics.table_rows(name) {
-            Err(AnalyticsError::UnknownQuery { name: reported }) => {
+            Err(AnalyticsError::UnknownTable { name: reported }) => {
                 assert_eq!(reported, name);
             }
             other => panic!("{name:?} must be refused by name, not by SQL: {other:?}"),

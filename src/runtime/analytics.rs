@@ -87,6 +87,17 @@ pub enum AnalyticsError {
         /// The name that was asked for.
         name: String,
     },
+    /// A raw table dump was asked for by a name that is not a §22 table.
+    #[error("no such analytics table {name:?}")]
+    UnknownTable {
+        /// The name that was asked for.
+        name: String,
+    },
+    /// A write failed part-way through a fold, so the tables no longer match
+    /// the fold state. The projection refuses to answer until a `catch_up`
+    /// from the journal has rebuilt it — see [`Analytics::catch_up`].
+    #[error("the analytical projection dropped rows on a failed write and must be rebuilt")]
+    NeedsRebuild,
 }
 
 /// Prepared statements the fold keeps planned. Comfortably above the number
@@ -390,6 +401,11 @@ pub struct Analytics {
     /// (`events`, `messages`, `usage`) are written as they are folded, so
     /// only the mutable ones can fall behind — and only until the next read.
     materialized_seq: u64,
+    /// Set while a fold is in flight and left set if it fails, because a
+    /// failed fold can have advanced [`Analytics::last_seq`] past rows that
+    /// never reached the tables. While set, every read fails closed and the
+    /// next [`Analytics::catch_up`] rebuilds from seq 0. See that method.
+    needs_reset: bool,
 }
 
 impl std::fmt::Debug for Analytics {
@@ -718,12 +734,19 @@ impl Analytics {
             graph: GraphContext::default(),
             last_seq: 0,
             materialized_seq: 0,
+            needs_reset: false,
         })
     }
 
-    /// Seq of the last event folded in.
+    /// Seq of the last event folded in — `0` when the projection is holding
+    /// a failed fold and needs rebuilding, because then it has folded
+    /// nothing a caller may rely on.
+    ///
+    /// The daemon reads this to decide which journal tail to hand back to
+    /// [`Analytics::catch_up`], so reporting `0` here is what turns a failed
+    /// fold into a full re-fold rather than a permanent hole.
     pub fn last_seq(&self) -> u64 {
-        self.last_seq
+        if self.needs_reset { 0 } else { self.last_seq }
     }
 
     /// Fold every event in `events` with a seq past [`Analytics::last_seq`].
@@ -733,6 +756,32 @@ impl Analytics {
     /// at or below the current seq are skipped, so handing this the whole
     /// journal is always safe.
     pub fn catch_up<I>(&mut self, events: I) -> Result<u64, AnalyticsError>
+    where
+        I: IntoIterator<Item = Result<Event, JournalError>>,
+    {
+        // A fold is not atomic: rows are buffered as events are applied and
+        // written in chunks, and `last_seq` advances per event so the skip
+        // above stays right. If a write then fails, those buffered rows are
+        // gone while `last_seq` says they landed — and because the skip is
+        // permanent, `events`/`messages`/`usage` would answer 200 with rows
+        // missing forever after (the mutable tables self-heal via
+        // `materialize`, the append-only ones cannot). That is precisely the
+        // "kept current == rebuilt from scratch" invariant this method
+        // exists to hold, so the failure is made structural instead: the
+        // flag is set before the attempt and cleared only on success, so no
+        // `?` in the body can escape it, and the next call re-folds from
+        // zero. Cost of a transient write failure is one 503 and one
+        // rebuild; it is never a silently short table.
+        if self.needs_reset {
+            self.reset()?;
+        }
+        self.needs_reset = true;
+        let applied = self.catch_up_folding(events)?;
+        self.needs_reset = false;
+        Ok(applied)
+    }
+
+    fn catch_up_folding<I>(&mut self, events: I) -> Result<u64, AnalyticsError>
     where
         I: IntoIterator<Item = Result<Event, JournalError>>,
     {
@@ -754,6 +803,25 @@ impl Analytics {
         Ok(applied)
     }
 
+    /// Empty every table and the in-memory fold, so the next catch-up is a
+    /// rebuild from seq 0.
+    ///
+    /// The in-memory state is reset only once the SQL has succeeded, so a
+    /// reset that itself fails (the disk is still full) leaves the instance
+    /// marked and is simply retried by the next call.
+    fn reset(&mut self) -> Result<(), AnalyticsError> {
+        for table in TABLES {
+            self.conn
+                .execute_batch(&format!("DELETE FROM \"{table}\""))?;
+        }
+        self.rows = Rows::default();
+        self.graph = GraphContext::default();
+        self.last_seq = 0;
+        self.materialized_seq = 0;
+        self.needs_reset = false;
+        Ok(())
+    }
+
     /// Write the buffered append-only rows.
     fn flush(&self, appended: &mut Appended) -> Result<(), AnalyticsError> {
         append_all(&self.conn, "events", std::mem::take(&mut appended.events))?;
@@ -772,6 +840,13 @@ impl Analytics {
     /// measurement as above, and it makes each materialization a total
     /// function of the fold state — a stale row cannot survive one.
     fn materialize(&mut self) -> Result<(), AnalyticsError> {
+        // Every read goes through here, which makes it the one place that
+        // has to refuse to answer out of a projection whose tables no longer
+        // match its fold state (see `catch_up`). Answering anyway would be
+        // the one thing the projection must never do: quietly wrong rows.
+        if self.needs_reset {
+            return Err(AnalyticsError::NeedsRebuild);
+        }
         if self.materialized_seq == self.last_seq {
             return Ok(());
         }
@@ -1216,14 +1291,24 @@ impl Analytics {
 
     /// Every row of one §22 table.
     ///
-    /// The name is checked against [`TABLES`] rather than interpolated — the
+    /// **No production caller, and deliberately so.** No route reaches this
+    /// and no CLI verb exposes it: the daemon's analytics surface is the
+    /// canned §22 questions plus the graph neighborhood, and a raw table
+    /// dump is not in M5's contract. It is public because it is the
+    /// instrument acceptance 1 needs — "delete the file, rebuild, identical
+    /// results **row for row**" is a claim `table_counts` cannot check, and
+    /// the M5 suite is a separate crate that cannot see `pub(crate)`. If a
+    /// future milestone wants a table dump on the API, this is the function
+    /// to route to; until then it answers only to the tests that justify it.
+    ///
+    /// The name is checked against the table list rather than interpolated — the
     /// projection answers questions it knows, never SQL it was handed, which
     /// is the same rule that keeps [`CANNED_QUERIES`] a fixed list.
     pub fn table_rows(&mut self, table: &str) -> Result<QueryResult, AnalyticsError> {
         let table = TABLES
             .iter()
             .find(|known| **known == table)
-            .ok_or_else(|| AnalyticsError::UnknownQuery {
+            .ok_or_else(|| AnalyticsError::UnknownTable {
                 name: table.to_string(),
             })?;
         self.materialize()?;
@@ -1301,8 +1386,10 @@ impl Analytics {
     }
 }
 
-/// Tables this projection creates, in a stable order.
-pub const TABLES: &[&str] = &[
+/// Tables this projection creates, in a stable order. Crate-internal: the
+/// table list is an implementation detail of the projection, and callers get
+/// it as data from [`Analytics::table_counts`].
+const TABLES: &[&str] = &[
     "events",
     "work",
     "stages",

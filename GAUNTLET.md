@@ -40,6 +40,66 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### M5 — DuckDB Projection, Graph, OTel (2026-08-09)
+
+**Mission outcome: contract met, gates green.** Shipped: the §21–22 DuckDB
+analytical projection as a bulk-appender materialization of a pure journal
+fold — rebuild-on-start is the only population path (measured 14,810 events/s
+after a 580× engineering pass from row-wise SQL; B1's snapshot trigger
+formally does not fire); fail-closed catch-up (`NeedsRebuild`: a transient
+flush failure costs one 503 and a rebuild, never a silently short table); the
+§23 graph projection with per-edge `source_seq` provenance at
+`/v1/graph/work/{id}`; §28 OTel export off-by-default with a live-measured
+OTLP smoke and an honest "what this export loses, on purpose" doc (startup
+events and cross-restart spans — deliberately not re-exported); journal
+`replay_after` seek so read-time catch-up is O(segments + wanted), not
+O(history) under the core lock. Evidence: 177 tests, fmt/clippy -D/test all
+green (clippy re-verified after the profile fix below), orchestrator-run.
+
+**Environmental behavior.** Round 1: 17 findings, only 7 confirmed — all
+test-shape refinements, zero production defects (confirmation counts across
+milestones: 13→15/19→22→7 — the codebase is getting harder to catch).
+Checkpoint gate: passed; two ask-user findings led to an **orchestrator-
+caused regression**: my instructed t5 rewrite replaced falsifiable source-
+scan guards with an unfalsifiable stand-in collector (port never handed to
+anything). Round 2 caught it as an error, alongside three real production
+defects earlier rounds missed (catch_up flush-desync; O(journal) reads under
+the core mutation lock; post-startup export subscription) and the
+still-unrecorded duckdb build-cost Unknown. Fixer closed all 12: the
+falsifiable guards restored AND the collector made real (bound to the
+default endpoint, probed to trip), the desync fixed fail-closed, the seek
+added, and the disk crisis root-caused — cc passes `-g` to DuckDB's ~500 C++
+TUs in dev profile; `[profile.dev.package.libduckdb-sys] debug = false`
+shrank target/ 15GB→5.4GB and made `clippy --all-targets` runnable in this
+container again. One container restart mid-checkpoint recovered from git
+evidence (the exact coordinator-death class this prototype exists to fix —
+the daemon would have journaled it; the orchestrator had to do forensics).
+
+**Measurements of record** (closing the contract's Unknowns): duckdb bundled
+cold build 605s / ~3.9GB per configuration (three configs + copies drove two
+ENOSPC incidents; mitigated by the debug=false profile override, rejected
+alternatives documented in Cargo.toml); rebuild 16,000 events in 1.08s; all
+canned queries 59–123ms; OTLP smoke measured live against a bound collector;
+pipeline worktrees cannot see the shared build cache (no-mistakes constructs
+agent env), so the standing pattern is pipeline-static-review + orchestrator
+runtime verification, recorded per gate. Release binary size: recorded below
+when the measurement completes.
+
+**Adjudication rulings.** (1) D7 registered (opentelemetry_sdk direct; the
+tracing bridge cannot represent the domain span tree). (2) The t5 regression
+is owned by the orchestrator, not the pipeline — the instruction was wrong;
+LESSONS L9. (3) `table_rows` kept as the acceptance-1 instrument with its
+no-production-caller status documented in place. (4) OTel restart loss is a
+documented property, not a defect — re-exporting history on restart is the
+wrong behavior for an export projection.
+
+**Shipping gates.** Checkpoint gate 01KZJQW-series: passed (test/lint steps
+approved on static review + orchestrator local runtime verification — the
+duckdb cold-build wall; measured and recorded). Final gate: recorded below
+after the run.
+
+---
+
 ### M4 — Claude Adapter, Recovery, Regression Catalog (2026-08-09)
 
 **Mission outcome: contract met (as amended by D6), gates green.** Shipped:

@@ -307,6 +307,30 @@ impl Journal {
         Ok(Replay::new(list_segments(&self.journal_dir)?))
     }
 
+    /// Iterate every committed event with `seq > after`, skipping whole
+    /// segments that cannot contain one.
+    ///
+    /// [`Journal::replay`] is the *rebuild* primitive: it starts at seq 1 and
+    /// validates the whole chain, which is exactly what a daemon start and a
+    /// projection rebuild want. It is the wrong primitive for a caller that
+    /// is already caught up to `after`, because it costs O(total journal) to
+    /// discover that the answer is empty — and the callers that ask for the
+    /// tail (the analytical projection's read-time catch-up, `/v1/events`,
+    /// the SSE resume) hold the daemon's single mutation lock while they do
+    /// it, so that cost lands on `submit`/`cancel`/`input`. This reads one
+    /// line per segment to find the first segment that can contain
+    /// `after + 1`, then parses only from there: O(segments) plus O(events
+    /// actually wanted), rather than O(history).
+    ///
+    /// The seq-continuity check still applies to everything it does read —
+    /// it simply starts expecting the first seq of the first kept segment
+    /// rather than 1. Full-chain validation is not weakened where it
+    /// matters: every daemon start replays from 1 through [`Journal::open`]
+    /// and the projection rebuild.
+    pub fn replay_after(&self, after: u64) -> Result<Replay, JournalError> {
+        Replay::after(list_segments(&self.journal_dir)?, after)
+    }
+
     /// Replay a journal directory without opening a writer handle (and
     /// without tail recovery). Useful for read-only inspection and tests.
     pub fn replay_data_dir(data_dir: impl AsRef<Path>) -> Result<Replay, JournalError> {
@@ -349,6 +373,54 @@ impl Replay {
             failed: false,
         }
     }
+
+    /// Drop the leading segments that cannot hold an event past `after`.
+    ///
+    /// Segments are indexed by rotation order, not by seq, so the first seq
+    /// of each is read off its first line. The kept prefix boundary is the
+    /// *last* segment starting at or before `after + 1`: that segment may
+    /// still contain wanted events, everything before it provably cannot.
+    fn after(segments: Vec<(u64, PathBuf)>, after: u64) -> Result<Self, JournalError> {
+        let mut keep = 0usize;
+        let mut expected = 1u64;
+        for (index, (_, path)) in segments.iter().enumerate() {
+            match first_seq(path)? {
+                // A segment created by rotation but not yet appended to has
+                // no first seq to compare; it cannot rule anything out.
+                None => continue,
+                Some(first) if first <= after.saturating_add(1) => {
+                    keep = index;
+                    expected = first;
+                }
+                Some(_) => break,
+            }
+        }
+        let mut segments = segments;
+        let mut replay = Self::new(segments.split_off(keep));
+        replay.expected = expected;
+        Ok(replay)
+    }
+}
+
+/// The seq of a segment's first event, or `None` if it has no events yet.
+///
+/// Reads one line. A malformed first line is reported the same way a replay
+/// would report it rather than being skipped — fail closed.
+fn first_seq(path: &Path) -> Result<Option<u64>, JournalError> {
+    let file = File::open(path)?;
+    let Some(line) = BufReader::new(file).lines().next() else {
+        return Ok(None);
+    };
+    let line = line?;
+    let event: Event = serde_json::from_str(&line).map_err(|source| JournalError::Malformed {
+        segment: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        line: 1,
+        source,
+    })?;
+    Ok(Some(event.seq))
 }
 
 impl Iterator for Replay {

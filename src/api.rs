@@ -81,9 +81,22 @@ impl Core {
     }
 
     /// Every journaled event with `seq > after`, in seq order.
+    ///
+    /// Every caller of this runs while holding the core's lock — the
+    /// daemon's single mutation choke point — so its cost is a cost paid by
+    /// `submit`/`cancel`/`input`. It is therefore bounded by the *answer*
+    /// and not by history: nothing committed past `after` is an in-memory
+    /// comparison against the journal head, and otherwise
+    /// [`Journal::replay_after`] skips whole segments instead of parsing the
+    /// whole chain. The steady state of the analytical projection's
+    /// read-time catch-up — already current, nothing to fold — is the first
+    /// branch, and costs no I/O at all.
     pub fn events_after(&self, after: u64) -> Result<Vec<Event>, JournalError> {
+        if after.saturating_add(1) >= self.journal.next_seq() {
+            return Ok(Vec::new());
+        }
         let mut events = Vec::new();
-        for event in self.journal.replay()? {
+        for event in self.journal.replay_after(after)? {
             let event = event?;
             if event.seq > after {
                 events.push(event);

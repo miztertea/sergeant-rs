@@ -6,6 +6,18 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L9 — The orchestrator's rulings are findings too **[world-delta]**
+
+M5: the orchestrator instructed a test rewrite ("assert a collector receives
+zero bytes") that was unfalsifiable as specified — nothing could ever dial
+the collector's port, so the assertion could not fail, and it replaced
+guards that could. The round-2 panel confirmed it as an error and the fix
+restored both halves (structural guard + a collector bound where a
+regression would actually dial). The loop's protection against a wrong
+ruling is the same as against wrong code: fresh eyes grade the outcome, not
+the authority. Rulings therefore go through the panel like any other change
+— never exempt them, and record whose error it was.
+
 ## L8 — A capability flag is a claim: every advertised verb needs a contract test
 
 M4 round 2: the adapter advertised `history: true` while its restart path

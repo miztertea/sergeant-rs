@@ -2,8 +2,9 @@
 //!
 //! §28's own framing is the design: "internal execution events remain Depot
 //! events; OTel is an export/projection". So this module is a *fold over the
-//! journal*, exactly like the DuckDB and graph projections, and not an
-//! instrumentation layer sprinkled through the engine:
+//! event stream* — the same shape as the DuckDB and graph projections,
+//! though see "What this export loses" below for where the analogy stops —
+//! and not an instrumentation layer sprinkled through the engine:
 //!
 //! - a `work` outlives every request, every stage and (via §25 recovery) every
 //!   daemon process. Request-scoped `tracing` spans bridged through
@@ -30,6 +31,34 @@
 //! disabled [`Telemetry::from_config`] returns `None`, no provider is built,
 //! no exporter task exists, and the daemon never subscribes anything to the
 //! event stream.
+//!
+//! # What this export loses, on purpose
+//!
+//! Unlike the DuckDB and graph projections, this fold is **live-stream only**
+//! and is never seeded from journal replay: `FoldState` starts empty in
+//! every process, and the daemon subscribes it to the event broadcast after
+//! startup has already committed `daemon.started`, `backend.probed` and the
+//! §25 reconcile events. Two loss classes follow, and both are accepted
+//! rather than overlooked:
+//!
+//! - **Startup events are never exported.** A tokio broadcast delivers
+//!   nothing sent before the receiver existed, so the lifecycle events above
+//!   are missing from every run.
+//! - **Work already in flight across a restart exports no span tree.** Its
+//!   `work.submitted` is in the journal, not in this process's stream, so no
+//!   work span is ever opened for it; the stage, execution and tool branches
+//!   then return early on the missing parent for the rest of that work's
+//!   life. Parent-free metrics (usage tokens, `needs_input_total`,
+//!   `backend_failure_total`, journal append timing) still record — it is the
+//!   span tree and the durations derived from it that are lost.
+//!
+//! Seeding the fold from replay would fix both, and is deliberately not done:
+//! it would re-export historical spans with historical timestamps on every
+//! restart, which is worse for a collector than a gap. §28 makes OTel an
+//! export projection over which the journal is the truth, so a lossy export
+//! is the correct failure — the same stance as the broadcast-lag drop
+//! documented on `export_events`. What was missing was saying so; a lossy
+//! projection is only honest if the lossiness is written down.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -55,9 +84,13 @@ use crate::runtime::graph::{
 };
 
 /// Service name reported on every exported span and metric.
-pub const SERVICE_NAME: &str = "sergeant";
+const SERVICE_NAME: &str = "sergeant";
 
 /// §28 export configuration. [`Default`] is **off**.
+///
+/// Read from `SGT_OTEL` (`1`/`true`/`yes`/`on` switches export on) and
+/// `SGT_OTLP_ENDPOINT` (collector base URL, defaulting to
+/// [`DEFAULT_OTLP_ENDPOINT`]) — see [`TelemetryConfig::from_env`].
 ///
 /// Every field here is a claim the daemon makes about its own behaviour, so
 /// each one is read by [`TelemetryConfig::from_env_with`] and asserted in the
@@ -71,9 +104,9 @@ pub struct TelemetryConfig {
 }
 
 /// Environment variable that switches §28 export on (`1`/`true`/`yes`/`on`).
-pub const OTEL_ENABLE_VAR: &str = "SGT_OTEL";
+const OTEL_ENABLE_VAR: &str = "SGT_OTEL";
 /// Environment variable naming the OTLP/HTTP collector base URL.
-pub const OTLP_ENDPOINT_VAR: &str = "SGT_OTLP_ENDPOINT";
+const OTLP_ENDPOINT_VAR: &str = "SGT_OTLP_ENDPOINT";
 /// Collector base URL used when export is on and none was configured.
 pub const DEFAULT_OTLP_ENDPOINT: &str = "http://localhost:4318";
 

@@ -102,18 +102,19 @@ pub struct GraphContext {
     last_message: BTreeMap<String, (String, String)>,
 }
 
-/// Node id for a work.
-pub fn work_node(work_id: &str) -> String {
+/// Node id for a work. Internal: node ids are a derivation detail, and
+/// callers read them off the emitted nodes and edges.
+fn work_node(work_id: &str) -> String {
     format!("work:{work_id}")
 }
 
 /// Node id for one attempt of one stage of one work.
-pub fn stage_node(work_id: &str, stage_id: &str, attempt: u64) -> String {
+fn stage_node(work_id: &str, stage_id: &str, attempt: u64) -> String {
     format!("stage:{work_id}/{stage_id}#{attempt}")
 }
 
 /// Node id for an execution.
-pub fn execution_node(execution_id: &str) -> String {
+fn execution_node(execution_id: &str) -> String {
     format!("execution:{execution_id}")
 }
 
