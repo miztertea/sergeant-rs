@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use crate::api::{Core, CoreError};
 use crate::backend::{
     Backend, BackendError, BackendRegistry, BackendSignal, ExecutionHandle, NativeState,
-    Observation, StartRequest,
+    Observation, ResumeRequest, StartRequest,
 };
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::execution::{
@@ -775,13 +775,34 @@ impl Engine {
         }
     }
 
-    /// Re-observe one in-flight execution after a daemon restart (§25).
+    /// Reattach, resume, classify one in-flight execution after a daemon
+    /// restart (§25's own sequence, in that order).
     ///
     /// Returns the disposition it recorded. Unambiguous evidence resumes the
     /// run from wherever the backend now is; anything the adapter cannot
     /// classify — an unrecognised execution, an unreachable backend, an
     /// unknown native state — lands the work in `blocked` with the evidence,
     /// because §25's rule is that ambiguity fails closed.
+    ///
+    /// **Reattachment happens first, through §15 RESUME** ([`Engine::reattach`]).
+    /// Observing an execution the restarted adapter has not re-adopted can
+    /// only ever produce a classification, never a run that continues: the
+    /// adapter has no owned context to SEND to afterwards, so every such work
+    /// parks in `blocked` and the durable native context it names goes
+    /// unclaimed. RESUME is what turns "the evidence says this is resumable"
+    /// into "this daemon owns it again", and it is the adapter — not the
+    /// engine — that decides whether the evidence supports the claim. An
+    /// adapter that refuses fails the work closed exactly as before; nothing
+    /// here softens ambiguity, and RESUME never starts a turn, so a
+    /// reattached execution is the same execution, never a second one.
+    ///
+    /// L6 audit of the step: it opens no new append window. RESUME is called
+    /// before the first append of this sequence and its only effect is in
+    /// adapter memory — no process is started, nothing on disk changes — so a
+    /// crash between reattaching and `execution.reconciled` loses the
+    /// adoption along with the daemon that made it, leaves the work `active`,
+    /// and the next restart reattaches again (adapters make RESUME
+    /// idempotent for exactly this reason).
     pub fn reconcile_work(
         &self,
         core: &mut Core,
@@ -794,6 +815,7 @@ impl Engine {
                 work_id,
                 None,
                 ReconcileDisposition::Ambiguous,
+                false,
                 "work was active with no recorded execution",
             )?;
             if let Some(stage) = run.current_stage() {
@@ -815,32 +837,47 @@ impl Engine {
         // backend a second time (which is not guaranteed to answer the same
         // way twice).
         let mut resumed_from: Option<Observation> = None;
-        let (disposition, evidence) = match self.backends.get(&execution.backend) {
-            None => ambiguous(format!(
-                "backend {:?} is not registered in this daemon",
-                execution.backend
-            )),
-            Some(backend) => match backend.observe(&handle_of(&execution)) {
-                Err(e) => ambiguous(e.to_string()),
-                Ok(Observation {
-                    native: NativeState::Unknown,
-                    evidence,
-                    ..
-                }) => ambiguous(
-                    evidence.unwrap_or_else(|| "backend reports unknown native state".to_string()),
-                ),
-                Ok(observation) => {
-                    let evidence = format!(
-                        "native={}, signal={}",
-                        observation.native.as_str(),
-                        observation.signal.as_str()
-                    );
-                    resumed_from = Some(observation);
-                    (ReconcileDisposition::Resumed, evidence)
-                }
-            },
-        };
-        self.record_reconcile(core, work_id, Some(&execution), disposition, &evidence)?;
+        let mut reattached = false;
+        let (disposition, evidence) =
+            match self.backends.get(&execution.backend) {
+                None => ambiguous(format!(
+                    "backend {:?} is not registered in this daemon",
+                    execution.backend
+                )),
+                Some(backend) => match self.reattach(backend, &run, work_id, &execution) {
+                    Err(detail) => ambiguous(detail),
+                    Ok(did) => {
+                        reattached = did;
+                        match backend.observe(&handle_of(&execution)) {
+                            Err(e) => ambiguous(e.to_string()),
+                            Ok(Observation {
+                                native: NativeState::Unknown,
+                                evidence,
+                                ..
+                            }) => ambiguous(evidence.unwrap_or_else(|| {
+                                "backend reports unknown native state".to_string()
+                            })),
+                            Ok(observation) => {
+                                let evidence = format!(
+                                    "native={}, signal={}",
+                                    observation.native.as_str(),
+                                    observation.signal.as_str()
+                                );
+                                resumed_from = Some(observation);
+                                (ReconcileDisposition::Resumed, evidence)
+                            }
+                        }
+                    }
+                },
+            };
+        self.record_reconcile(
+            core,
+            work_id,
+            Some(&execution),
+            disposition,
+            reattached,
+            &evidence,
+        )?;
         match disposition {
             ReconcileDisposition::Resumed => {
                 self.drive(core, work_id, resumed_from)?;
@@ -857,10 +894,20 @@ impl Engine {
                 // Retire the unreconcilable execution explicitly: a stale
                 // identity must never be reachable for SEND again (§25;
                 // Sergeant's stale-pane-identity class). Ordered before the
-                // work-level block, and idempotent via `stop_requested`, so
-                // a crash anywhere in this append sequence re-derives on
-                // the next restart (L6: the work is still `active` until
-                // the final append, and reconcile re-runs on `active`).
+                // work-level block, so a crash anywhere in this append
+                // sequence re-derives on the next restart (L6: the work is
+                // still `active` until the final append, and reconcile
+                // re-runs on `active`).
+                //
+                // A retirement the backend *acknowledged* latches
+                // (`stop_requested`) and is not repeated. One it refused, or
+                // that reached no registered backend, deliberately does not
+                // latch: the native context was never asked, so a later stop
+                // — a human's cancel, or the next restart's reconcile — must
+                // still be able to ask. Re-running it appends a second
+                // `execution.stopped` and asks again, which is convergent
+                // (asking a backend that refuses has no effect) and honest
+                // (every attempt is journaled as the attempt it was).
                 self.stop_execution(core, work_id, "retired at reconcile: unrecognized")?;
                 self.block(
                     core,
@@ -871,6 +918,53 @@ impl Engine {
             }
         }
         Ok(disposition)
+    }
+
+    /// §25's reattach step: ask the backend to re-adopt the recorded native
+    /// context before anything is classified from it.
+    ///
+    /// `Ok(true)` — reattached, later SENDs continue the same context.
+    /// `Ok(false)` — no reattachment was attempted, and the run is classified
+    /// from OBSERVE alone exactly as it was before this step existed.
+    /// `Err(detail)` — the adapter refused: the native context could not be
+    /// evidenced, which is ambiguity and fails the work closed.
+    ///
+    /// Two cases decline to attempt it, and both are the absence of a claim
+    /// rather than a softened one. A backend that does not advertise `resume`
+    /// has no such verb to call (§15: unsupported means unsupported). And a
+    /// run whose journal records no work surface has nowhere to reattach
+    /// *into*: the [`ResumeRequest`] carries the directory later turns run
+    /// in, and inventing one is precisely the fabrication `ResumeRequest`'s
+    /// own contract forbids — a surface-less run is a journal prefix, and
+    /// OBSERVE's classification (which fails closed) is the honest handling.
+    /// Every run this engine actually started has a surface: `Engine::start`
+    /// journals `surface.materialized` before the first stage is entered.
+    fn reattach(
+        &self,
+        backend: &Arc<dyn Backend>,
+        run: &WorkRun,
+        work_id: &str,
+        execution: &ExecutionRecord,
+    ) -> Result<bool, String> {
+        if !backend.capabilities().resume {
+            return Ok(false);
+        }
+        let Some(surface) = run.surface.as_ref() else {
+            return Ok(false);
+        };
+        let request = ResumeRequest {
+            work_id: work_id.to_string(),
+            cwd: surface.execution_cwd(),
+            // Re-supplied from what sergeant journaled, never rebuilt from
+            // defaults: the pin and the profile are the human's decisions
+            // about cost and about permissions.
+            model: run.profile.as_ref().and_then(|p| p.default_model.clone()),
+            profile: run.profile.clone(),
+        };
+        backend
+            .resume(&handle_of(execution), &request)
+            .map(|()| true)
+            .map_err(|e| format!("could not reattach to the native context: {e}"))
     }
 
     /// Fail a work whose *start* crashed part-way closed (§25).
@@ -1082,6 +1176,7 @@ impl Engine {
         work_id: &str,
         execution: Option<&ExecutionRecord>,
         disposition: ReconcileDisposition,
+        reattached: bool,
         evidence: &str,
     ) -> Result<(), EngineError> {
         self.commit(
@@ -1092,6 +1187,12 @@ impl Engine {
                 "execution_id": execution.map(|e| e.execution_id.clone()),
                 "backend": execution.map(|e| e.backend.clone()),
                 "disposition": disposition,
+                // Whether §15 RESUME re-adopted the native context before it
+                // was classified. Its own field rather than prose in the
+                // evidence: "sergeant owns this context again" is the fact a
+                // later operator (or M6's UI) needs to read back, and the
+                // evidence string is the adapter's answer, not the engine's.
+                "reattached": reattached,
                 "evidence": evidence,
             }),
         )?;

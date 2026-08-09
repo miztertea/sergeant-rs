@@ -276,6 +276,12 @@ impl Backend for OpaqueBackend {
         Capabilities::default()
     }
 
+    /// §17: an opaque in-process context per execution, and no service
+    /// anyone could start on its behalf.
+    fn runtime_scope(&self) -> sergeant_rs::backend::RuntimeScope {
+        sergeant_rs::backend::RuntimeScope::PerExecution
+    }
+
     fn probe(&self) -> ProbeReport {
         ProbeReport {
             available: true,
@@ -322,11 +328,18 @@ impl Backend for OpaqueBackend {
         Ok(())
     }
 
+    /// `Capabilities::default()` advertises no history, so the honest answer
+    /// is a refusal — an empty `Ok` from a backend that cannot look is the
+    /// shape §15 forbids (see `Backend::history`).
     fn history(
         &self,
         _handle: &ExecutionHandle,
     ) -> Result<Vec<sergeant_rs::backend::NativeEvent>, BackendError> {
-        Ok(Vec::new())
+        Err(BackendError::Unsupported {
+            backend: OPAQUE_BACKEND.to_string(),
+            verb: "history".to_string(),
+            detail: "this backend records nothing".to_string(),
+        })
     }
 
     fn stop(&self, _handle: &ExecutionHandle) -> Result<(), BackendError> {

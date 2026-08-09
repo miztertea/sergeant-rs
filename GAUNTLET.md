@@ -39,6 +39,59 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### M4 — Claude Adapter, Recovery, Regression Catalog (2026-08-09)
+
+**Mission outcome: contract met (as amended by D6), gates green.** Shipped:
+the measured Claude adapter — headless print-mode turns over daemon-chosen
+durable session identity (`--session-id` pre-launch + `CLAUDE_CODE_SESSION_ID`
+scrubbed, closing a measured nested-capture hazard this container itself
+demonstrated), `--setting-sources user` against project-memory capture,
+three-layer model-pin verification keyed to `is_error`/`modelUsage` (print
+mode's `subtype` measured untrustworthy), raw stream-json archived per turn
+with journaled blob refs, EventSink-delivered normalized events with
+committed causation, transcript-existence reconciliation (measured: no free
+liveness probe exists — even `--max-turns 0` bills), **resume wired into
+reconcile per the §25 ruling** (unambiguous evidence resumes, ambiguity still
+blocks, no new public verbs), honest capabilities incl. durable-transcript
+`history` backfill and the §17 `runtime_scope` declaration, version gate at
+2.1.226, and the seven-entry Sergeant regression catalog with provenance.
+Codex: doc-comment stub per D6 (421 speculative lines removed in-loop).
+Evidence: 150 tests + 2 opt-in (live pair passed first try — haiku, 33s, six
+turns incl. one killed mid-generation), 5 clean full runs verified by the
+orchestrator, 14 clean loaded runs by the fixer.
+
+**Environmental behavior.** Round 1: 24 findings, 22 confirmed (8 errors) —
+D6-descope catches (the contract-amendment trap worked: critics graded
+against the amended contract and flagged the builder's pre-descope Codex
+work), recovery identity loss, evidence-archiving gaps, an unmeasured
+capability claim, L6's crash-window class for the third straight milestone.
+Checkpoint gate: passed; parked `resume-unwired` (ask-user) → orchestrator
+ruling seeded into round 2. Round 2: 24 findings, 19 confirmed (18 + seed) —
+headline: `history: true` advertised while the restart path returned
+Ok(empty) despite the durable transcript on disk (fail-open indistinguishable
+from "nothing said"), caught precisely where the live contract tests hadn't
+measured (§37's history/stop gap — the hole and the defect coincided).
+Fixer: all 19 closed, 18/18 revert-probes killed, self-introduced flake
+caught by its own 14-run load check. The builder's 15 verbatim CLI
+measurements (incl. print-mode envelope semantics differing from the spike's
+TUI measurements) live in workflow record wf_e6b3fd7f-95b. One planned pause
+(owner-directed, usage window) executed cleanly mid-milestone.
+
+**Adjudication rulings.** (1) resume wiring per §25 — reconcile auto-resumes
+unambiguous evidence only; no new public verbs (R1). (2) Substitution
+detection remains fixture-derived and fails closed on any model-field
+mismatch — an entitled account cannot be made to substitute on demand;
+recorded as documented-not-measured per spike doctrine. (3) `runtime_scope()`
+added as the minimal §17 rendering (declaration only; ENSURE RUNTIME remains
+unneeded while the only runtime is the CLI itself — R1, revisit with a
+server-model backend).
+
+**Shipping gates.** Checkpoint gate: **passed** (doc commit bc52c00 adopted;
+review parked resume-unwired to adjudication; test step approved without
+re-spending the live pair). Final gate: recorded below after the run.
+
+---
+
 ### PAUSE MARKER — 2026-08-09, M4 mid-gauntlet (planned, owner-directed)
 
 State at pause: M4 build + round-1 panel complete (24 findings, 22 confirmed,

@@ -6,6 +6,15 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L8 — A capability flag is a claim: every advertised verb needs a contract test
+
+M4 round 2: the adapter advertised `history: true` while its restart path
+returned Ok(empty) — and the defect sat exactly in the two §15 verbs
+(history, stop) the live contract tests didn't cover. The capability list
+and the contract-test list must be the same list; an advertised verb without
+a test against the installed harness is an unmeasured claim, and unmeasured
+claims fail closed (L1's corollary at the trait boundary).
+
 ## L7 — A fix without its pinning test is prose: revert-probe every fix commit **[world-delta]**
 
 M3 round 2's headline: the checkpoint gate's 11-fix commit — including two

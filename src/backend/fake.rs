@@ -26,7 +26,7 @@ use serde_json::json;
 
 use super::{
     Backend, BackendError, Capabilities, ExecutionHandle, NativeEvent, NativeState, Observation,
-    ProbeReport, ResumeRequest, StartRequest,
+    ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use crate::backend::BackendSignal;
 
@@ -130,6 +130,7 @@ struct FakeState {
     starts: Vec<StartRequest>,
     stop_requests: Vec<String>,
     interrupt_requests: Vec<String>,
+    resume_requests: Vec<(String, ResumeRequest)>,
     observations: Vec<String>,
     available: bool,
     detail: Option<String>,
@@ -161,6 +162,11 @@ impl FakeBackend {
             name: name.to_string(),
             capabilities: Capabilities {
                 persistent_sessions: true,
+                // Honest: the fake's record of an execution is complete or
+                // the execution is unknown to it — there is no partial answer
+                // it could return, which is exactly what the capability
+                // claims (see `Capabilities::history`).
+                history: true,
                 resume: true,
                 model_selection: true,
                 profiles: true,
@@ -172,6 +178,7 @@ impl FakeBackend {
                 starts: Vec::new(),
                 stop_requests: Vec::new(),
                 interrupt_requests: Vec::new(),
+                resume_requests: Vec::new(),
                 observations: Vec::new(),
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
@@ -199,6 +206,14 @@ impl FakeBackend {
     /// Execution ids INTERRUPT was requested for, in order.
     pub fn interrupt_requests(&self) -> Vec<String> {
         self.lock().interrupt_requests.clone()
+    }
+
+    /// Every RESUME this backend was asked for, in order, with the request
+    /// the caller re-supplied. Restart reconciliation reattaches before it
+    /// classifies (§25), so "was this context re-adopted, and with which
+    /// launch configuration" is a property tests assert directly.
+    pub fn resume_requests(&self) -> Vec<(String, ResumeRequest)> {
+        self.lock().resume_requests.clone()
     }
 
     /// Execution ids OBSERVE was called for, in order.
@@ -297,6 +312,14 @@ impl Backend for FakeBackend {
         self.capabilities
     }
 
+    /// §17: each fake execution is its own in-process context and there is no
+    /// shared service behind them, which is `per_execution` — the same scope
+    /// the print-mode Claude adapter declares, deliberately: the deterministic
+    /// stand-in must not model a runtime model no real adapter here has.
+    fn runtime_scope(&self) -> RuntimeScope {
+        RuntimeScope::PerExecution
+    }
+
     fn probe(&self) -> ProbeReport {
         let state = self.lock();
         ProbeReport {
@@ -388,9 +411,12 @@ impl Backend for FakeBackend {
     fn resume(
         &self,
         handle: &ExecutionHandle,
-        _request: &ResumeRequest,
+        request: &ResumeRequest,
     ) -> Result<(), BackendError> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state
+            .resume_requests
+            .push((handle.execution_id.clone(), request.clone()));
         self.resolve(&state, handle)?;
         Ok(())
     }
@@ -607,13 +633,32 @@ mod tests {
     }
 
     /// §15's capability flags are advertised, and an unsupported capability is
-    /// advertised as `false` rather than emulated.
+    /// advertised as `false` rather than emulated — checked against what the
+    /// verbs actually do, which is the only way a flag can be wrong.
     #[test]
     fn capabilities_are_advertised_and_never_emulated() {
-        let capabilities = FakeBackend::new("fake").capabilities();
+        let fake = FakeBackend::new("fake");
+        let capabilities = fake.capabilities();
         assert!(capabilities.persistent_sessions);
         assert!(capabilities.resume);
-        assert!(!capabilities.history);
         assert!(!capabilities.streaming);
+        // HISTORY is advertised because the fake can honor the claim: it
+        // answers with an execution's whole history or refuses to recognise
+        // it, and never with a prefix that reads like the whole thing.
+        assert!(capabilities.history);
+        let handle = fake.start(&request("e-caps")).expect("start");
+        fake.send(&handle, "one").expect("send");
+        assert_eq!(fake.history(&handle).expect("history").len(), 1);
+        let stranger = ExecutionHandle {
+            execution_id: "never-started".to_string(),
+            native_id: None,
+        };
+        assert!(
+            matches!(
+                fake.history(&stranger),
+                Err(BackendError::UnknownExecution { .. })
+            ),
+            "an execution this backend never had is refused, not reported as an empty history"
+        );
     }
 }

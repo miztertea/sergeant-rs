@@ -258,6 +258,10 @@ pub async fn start_with(
                 "available": report.available,
                 "detail": report.detail,
                 "capabilities": backend.capabilities(),
+                // §17: the adapter's declared runtime scope, recorded with
+                // the probe because it is a claim about the adapter, and the
+                // core is forbidden from assuming one.
+                "runtime_scope": backend.runtime_scope(),
             }),
         ))?;
     }
@@ -371,6 +375,17 @@ pub async fn start_with(
 /// deterministic order. Correlation (`correlation_id` = execution id) stays
 /// the adapter's.
 ///
+/// **Rung note (R2, a std thread where tokio primitives exist).** The
+/// blocking-lock hazard above is real, but it alone does not force an OS
+/// thread: `tokio::sync::mpsc::unbounded_channel` can be sent to from any
+/// thread, and a spawned task would need no `Weak` dance. What forces this
+/// shape is that the deterministic tests construct a sink from synchronous
+/// `#[test]` functions, where there is no runtime for a task to live in and
+/// `tokio::spawn` would panic. That is test ergonomics deciding a production
+/// rung, recorded here rather than left to be rediscovered: the day the
+/// daemon needs backpressure or ordered shutdown of this queue, the tokio
+/// version is the right one and the tests move to `#[tokio::test]`.
+///
 /// Delivery is therefore asynchronous: a caller learns nothing about whether
 /// the event landed, which is correct — the journal is the daemon's
 /// single-owner surface, not the adapter's. The thread lives until every
@@ -396,6 +411,20 @@ pub fn journaling_sink(core: Arc<tokio::sync::Mutex<Core>>) -> EventSink {
     })
 }
 
+/// How many executions the committer keeps a causation chain for.
+///
+/// The chain is one journal-event id per execution, and an execution is never
+/// "finished" from the sink's point of view — a conversation can be sent to
+/// again at any time — so nothing in the event stream says when an entry may
+/// be dropped. Unbounded, that is a map that grows for the daemon's lifetime
+/// with every execution it ever ran. Bounded, the oldest execution's chain is
+/// forgotten and its next event starts a new chain (`causation_id: None`),
+/// which is the same thing that happens across a daemon restart and is
+/// already what the chain means: causation links events the daemon observed
+/// in sequence, and correlation — which is never forgotten — is what groups
+/// an execution's events for all time.
+pub const SINK_CHAIN_CAPACITY: usize = 256;
+
 /// The committer thread's loop: drain drafts in order, chain causation,
 /// commit. Runs on a plain std thread, so `blocking_lock` is correct here and
 /// only here.
@@ -404,6 +433,9 @@ fn commit_normalized_events(
     rx: &std::sync::mpsc::Receiver<EventDraft>,
 ) {
     let mut chain: HashMap<String, String> = HashMap::new();
+    // Insertion order of the keys in `chain`, so the bound evicts the
+    // least-recently-started execution rather than an arbitrary one.
+    let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while let Ok(mut draft) = rx.recv() {
         let Some(core) = core.upgrade() else {
             tracing::debug!("normalized-event committer stopping: the core is gone");
@@ -419,7 +451,14 @@ fn commit_normalized_events(
         match core.commit(draft) {
             Ok(event) => {
                 if let Some(key) = key {
-                    chain.insert(key, event.id);
+                    if chain.insert(key.clone(), event.id).is_none() {
+                        order.push_back(key);
+                    }
+                    while order.len() > SINK_CHAIN_CAPACITY {
+                        if let Some(evicted) = order.pop_front() {
+                            chain.remove(&evicted);
+                        }
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "failed to journal normalized backend event"),

@@ -471,6 +471,21 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
             }
         }
         KIND_EXECUTION_STOPPED => {
+            // The latch records that the *backend was actually asked and did
+            // not refuse* — not merely that sergeant journaled an attempt.
+            // `stop_requested` is what makes STOP idempotent (the engine
+            // skips an execution that carries it), so latching on an attempt
+            // that never reached a native context turns every later stop —
+            // including a human's cancel — into a permanent no-op against a
+            // context nobody ever asked to die. An attempt that names an
+            // error, or that never reached a registered backend, leaves the
+            // latch open so the next caller tries again; the attempt itself
+            // is journaled either way, which is the evidence.
+            let acknowledged = event.payload["outcome"]["requested"] == Value::Bool(true)
+                && event.payload["outcome"]["error"].is_null();
+            if !acknowledged {
+                return;
+            }
             if let Some(execution) = event
                 .work_id
                 .as_ref()

@@ -9,6 +9,23 @@
 //! pull-based push surface on the trait — measured, not assumed (the M4
 //! spike drove real turns through per-turn stdout ingestion alone).
 //!
+//! **§17 runtime scope, and why ENSURE RUNTIME is not a verb here (R1).**
+//! §17 forbids the core from assuming any one daemon model, so every adapter
+//! declares its [`RuntimeScope`] ([`Backend::runtime_scope`]) and the daemon
+//! journals it with the probe. §15's ENSURE RUNTIME — "start or attach to any
+//! backend-level service required" — is deliberately *absent* from this
+//! trait, and this is the rung log for that absence rather than a silence:
+//! both adapters that exist declare `per_execution`, which is precisely the
+//! scope with no backend-level service to start. The Claude adapter's
+//! "runtime" is the installed CLI, and the only thing anyone can ensure about
+//! it — that it is present, recent enough, and speaks the launch grammar this
+//! adapter measured — is what PROBE already does and journals. A verb whose
+//! every implementation would be `Ok(())` would be machinery ahead of its
+//! evidence; it arrives with the first adapter whose scope is `external`,
+//! `per_profile` or `per_workspace` and which therefore has a service to
+//! start (§16's OpenCode server and Prime daemon are the shapes that will
+//! force it), together with the failure modes only such a backend can show.
+//!
 //! The contract's load-bearing shape is [`Observation`]: a backend reports
 //! *native evidence* ([`NativeState`]) and, separately, any *explicit signal*
 //! ([`BackendSignal`]) about the stage. The engine acts only on the signal.
@@ -49,9 +66,49 @@ pub struct NativeEvent {
 /// behalf. Delivery is asynchronous and a sink must never block or fail its
 /// caller: adapters emit from wherever their work happens, including the
 /// request path that already holds that lock (see `daemon::journaling_sink`).
-/// A backend with no sink installed still accumulates its events for
-/// [`Backend::history`]; the sink is delivery, not the source of truth.
+///
+/// The sink is where sergeant's *durable* record of normalized events comes
+/// from: what reaches the journal is what survives a restart. It is not the
+/// same surface as [`Backend::history`], which is the backend's own retrieval
+/// of native history and exists only where an adapter can honestly serve it
+/// (see [`Capabilities::history`]).
 pub type EventSink = Arc<dyn Fn(EventDraft) + Send + Sync>;
+
+/// §17: the runtime model an adapter needs, declared rather than assumed.
+///
+/// §17's rule is that the core "must not assume one backend daemon per worker
+/// or one global daemon per backend"; adapters declare which of these four
+/// shapes they are, and sergeant records the declaration with the probe. It
+/// is evidence about the adapter, not a capability toggle: nothing in the
+/// engine branches on it yet, and the value is journaled precisely so that
+/// the first thing which *does* need to (a supervisor for backend-level
+/// services) is written against recorded declarations instead of guesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeScope {
+    /// The runtime exists outside sergeant's lifecycle entirely; sergeant
+    /// attaches to it and never owns it.
+    External,
+    /// One runtime instance per launch profile (§14).
+    PerProfile,
+    /// One runtime instance per workspace.
+    PerWorkspace,
+    /// Each execution owns its own native runtime; there is no shared
+    /// backend-level service to start or attach to.
+    PerExecution,
+}
+
+impl RuntimeScope {
+    /// The scope's canonical snake_case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeScope::External => "external",
+            RuntimeScope::PerProfile => "per_profile",
+            RuntimeScope::PerWorkspace => "per_workspace",
+            RuntimeScope::PerExecution => "per_execution",
+        }
+    }
+}
 
 /// What a backend can do (§15's capability list). Absent means `unsupported`,
 /// never emulated.
@@ -63,7 +120,12 @@ pub struct Capabilities {
     pub native_background: bool,
     /// Incremental event streaming.
     pub streaming: bool,
-    /// Durable native history retrieval.
+    /// Durable native history retrieval: [`Backend::history`] answers with
+    /// this execution's whole normalized history, or refuses — never with a
+    /// partial list a caller could read as the whole thing. An adapter that
+    /// can only report what its own process happened to see advertises
+    /// `false` here and refuses (§15: unsupported means unsupported, not
+    /// emulation), and [`Backend::history`] enforces exactly that pairing.
     pub history: bool,
     /// Resuming an existing context.
     pub resume: bool,
@@ -280,6 +342,20 @@ pub enum BackendError {
         /// The execution id it did not recognise.
         execution_id: String,
     },
+    /// The backend does not support this verb, and says so instead of
+    /// emulating it (§15: "missing capability means unsupported ... not
+    /// emulation"). A refusal a caller can distinguish from an empty answer
+    /// is the whole point: `Ok(vec![])` from an adapter that simply cannot
+    /// look is indistinguishable from "this conversation produced nothing".
+    #[error("backend {backend:?} does not support {verb}: {detail}")]
+    Unsupported {
+        /// Backend name.
+        backend: String,
+        /// The §15 verb that is unsupported (`history`, ...).
+        verb: String,
+        /// What the caller should use instead, or why it is unsupported.
+        detail: String,
+    },
     /// The backend cannot operate here at all.
     #[error("backend {backend:?} is unavailable: {detail}")]
     Unavailable {
@@ -311,6 +387,11 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// Capabilities this backend advertises (§15).
     fn capabilities(&self) -> Capabilities;
 
+    /// §17: the runtime model this adapter needs. Declared, never assumed by
+    /// the core — see the module docs for why ENSURE RUNTIME is not a verb
+    /// on this trait yet.
+    fn runtime_scope(&self) -> RuntimeScope;
+
     /// PROBE: can this backend operate here, and at what version?
     fn probe(&self) -> ProbeReport;
 
@@ -337,12 +418,30 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// [`ResumeRequest`] carries the launch configuration the adapter lost
     /// with the old daemon; an adapter uses that and fabricates nothing.
     /// Fails closed when the native context cannot be evidenced.
+    ///
+    /// This is §25's "reattach" step, and restart reconciliation calls it
+    /// before it classifies anything (`Engine::reconcile_work`), so `Ok` is a
+    /// load-bearing claim: *this adapter now owns this context and later
+    /// SENDs continue it*. An adapter that cannot evidence that — a turn of
+    /// the conversation still running unowned, liveness it cannot read at
+    /// all, no durable context to adopt — returns an error and lets the
+    /// engine fail the work closed. RESUME never starts a turn: re-adoption
+    /// costs no tokens and creates no second execution.
     fn resume(&self, handle: &ExecutionHandle, request: &ResumeRequest)
     -> Result<(), BackendError>;
 
-    /// HISTORY: the normalized native events this adapter has accumulated
-    /// for an execution (§27), in order. This is retrieval, not delivery —
-    /// events pushed through an [`EventSink`] appear here too.
+    /// HISTORY: this execution's normalized native history (§27), in order.
+    ///
+    /// The answer is the *whole* history or a refusal — never a prefix, and
+    /// never a suffix. An adapter whose only record is what its own process
+    /// happened to observe cannot honor that after a restart, where the
+    /// events exist but this process never saw them; such an adapter
+    /// advertises [`Capabilities::history`] `false` and returns
+    /// [`BackendError::Unsupported`], which a caller can tell apart from "the
+    /// conversation said nothing". `Ok` is therefore only legal from a
+    /// backend advertising the capability (pinned across the registry by
+    /// `tests/m4_backends.rs`), and sergeant's own durable record of these
+    /// events remains the journal, fed by the [`EventSink`].
     fn history(&self, handle: &ExecutionHandle) -> Result<Vec<NativeEvent>, BackendError>;
 
     /// STOP: retire the execution without corrupting recoverable state. A

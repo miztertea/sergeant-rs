@@ -16,10 +16,13 @@
 //!   Claude session silently adopts the parent's session id).
 //! - Every turn carries its session id in its own argv (`--session-id` on the
 //!   first turn, `--resume` after), which is what makes process liveness
-//!   *evidence* rather than inference after a restart: a `/proc` scan for the
-//!   id answers "is a turn of this conversation still running" without any
-//!   pid having been recorded, and without a recycled pid being mistakable
-//!   for ours (see [`session_liveness`]).
+//!   *evidence* rather than inference after a restart: a `/proc` scan for
+//!   that argv shape answers "is a turn of this conversation still running"
+//!   without any pid having been recorded, and without a recycled pid being
+//!   mistakable for ours (see [`session_liveness`]). The scan matches the
+//!   flag-and-value pair, never the id as a substring of a joined command
+//!   line — a process that merely *quotes* the id (an operator reading the
+//!   transcript, a shell wrapper) is not a running turn.
 //! - `--resume <session_id>` continues the same conversation from a
 //!   different process *and* a different cwd (measured: nonce set in turn 1
 //!   recalled after resume from a sibling directory; `result.session_id`
@@ -80,7 +83,7 @@ use serde_json::{Value, json};
 
 use super::{
     Backend, BackendError, BackendSignal, Capabilities, EventSink, ExecutionHandle, NativeEvent,
-    NativeState, Observation, ProbeReport, ResumeRequest, StartRequest,
+    NativeState, Observation, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::profile::Profile;
@@ -267,8 +270,28 @@ impl TurnOutcome {
 /// Turn lifecycle for one execution. At most one turn is in flight per
 /// conversation — `--resume` continues a session, it does not parallelize
 /// one.
+///
+/// The two states that are *not* a turn outcome are separate variants on
+/// purpose. Borrowing `Finished(TurnOutcome { envelope: None, interrupted:
+/// true })` as a placeholder — which this adapter used to do at both START
+/// and RESUME — makes OBSERVE state, in its own evidence string, that a turn
+/// "was interrupted by request" when no interrupt was ever requested, and
+/// report `BackendSignal::Running` for a conversation with no turn running.
+/// That is a fabricated observation, and after a restart it is the
+/// fail-*open* direction: the engine's Running branch makes no transition, so
+/// the work sits `active` with nothing in flight and nothing to move it.
 #[derive(Debug)]
 enum TurnState {
+    /// Registered, no turn launched yet: the window inside START between
+    /// inserting the execution and spawning its first turn. START either
+    /// spawns (replacing this) or removes the execution, so OBSERVE reaching
+    /// it means something went wrong — which is why it is not silently
+    /// mapped onto any turn outcome.
+    Unlaunched,
+    /// Re-adopted after a restart (§15 RESUME): this daemon launched no turn
+    /// on this conversation, and the outcome of the turn that was in flight
+    /// when the previous daemon died is not something it can read.
+    Adopted,
     /// A per-turn process is running; the child handle is shared with
     /// `interrupt` so it can be killed without waiting for the reader.
     InFlight(Arc<Mutex<Child>>),
@@ -298,19 +321,66 @@ pub enum Liveness {
     Unknowable(String),
 }
 
+/// Does this NUL-separated `/proc/<pid>/cmdline` belong to a turn of
+/// `session_id`?
+///
+/// The rule is deliberately narrow: some argv element must be exactly
+/// `--session-id` or `--resume`, and the *next* element must be exactly the
+/// session id. That is the launch grammar this adapter emits, and nothing
+/// else. The wide rule — "the joined cmdline contains the id" — is what this
+/// replaces, and it was a claim stronger than its evidence: an operator's
+/// `less <session>.jsonl`, a `grep` for the id, or any harness that wraps
+/// commands as `bash -c '<command text>'` (this project's own build
+/// environment does) puts the id in *some* process's argv without any turn
+/// running, and the adapter then reported `NativeState::Running` with the
+/// evidence "pid N carries session id in argv". A quoted string is not a
+/// running turn. Tokenizing also makes the false positive structurally
+/// impossible rather than unlikely: a wrapper's whole command line is one
+/// argv element, so it can never *be* the id, only contain it.
+fn cmdline_names_session(cmdline: &[u8], session_id: &str) -> bool {
+    let mut argv = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(String::from_utf8_lossy);
+    while let Some(arg) = argv.next() {
+        if (arg == "--session-id" || arg == "--resume")
+            && argv.next().is_some_and(|value| value == session_id)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Is a per-turn `claude` process for `session_id` still running?
 ///
 /// Every turn this adapter launches names its session in its own argv
 /// (`--session-id <uuid>` first, `--resume <uuid>` after), so scanning
-/// `/proc/<pid>/cmdline` for that id is evidence about *this conversation*
-/// rather than about a pid — which matters precisely in the case that needs
-/// it: after a restart, when no in-memory record survives and a recorded pid
-/// (if anything had recorded one) could since have been recycled.
+/// `/proc/<pid>/cmdline` for *that argv shape* is evidence about **this
+/// conversation** rather than about a pid — which matters precisely in the
+/// case that needs it: after a restart, when no in-memory record survives and
+/// a recorded pid (if anything had recorded one) could since have been
+/// recycled. What is matched is the flag-and-value pair
+/// ([`cmdline_names_session`]), not the id as a substring: the evidence this
+/// function returns is quoted verbatim into an execution-state claim, so it
+/// has to be about an execution.
 ///
 /// Linux-only by construction. Elsewhere the answer is `Unknowable`, not a
 /// guess: an adapter that reported "exited" from the absence of a mechanism
 /// it does not have would be inventing execution state.
 pub fn session_liveness(session_id: &str) -> Liveness {
+    session_liveness_excluding(session_id, std::process::id())
+}
+
+/// [`session_liveness`], with the pid to skip made explicit.
+///
+/// The skip exists because sergeant's own process can carry a session id in
+/// its argv (a `sgt` invocation naming one, a test binary) and must not
+/// report itself as a live turn. It is a parameter so that the skip is
+/// testable: a test can spawn one real stand-in turn and ask both questions
+/// — excluding a bystander pid finds it, excluding the stand-in's own pid
+/// does not — which is the only way to pin a rule about "self" from outside.
+pub fn session_liveness_excluding(session_id: &str, skip_pid: u32) -> Liveness {
     if !cfg!(target_os = "linux") {
         return Liveness::Unknowable(
             "process liveness needs /proc; this platform has none".to_string(),
@@ -320,7 +390,6 @@ pub fn session_liveness(session_id: &str) -> Liveness {
         Ok(entries) => entries,
         Err(e) => return Liveness::Unknowable(format!("/proc is unreadable: {e}")),
     };
-    let own_pid = std::process::id();
     for entry in entries.flatten() {
         let Some(pid) = entry
             .file_name()
@@ -329,7 +398,7 @@ pub fn session_liveness(session_id: &str) -> Liveness {
         else {
             continue;
         };
-        if pid == own_pid {
+        if pid == skip_pid {
             continue;
         }
         // A vanished process between readdir and read is not evidence of
@@ -337,7 +406,7 @@ pub fn session_liveness(session_id: &str) -> Liveness {
         let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
             continue;
         };
-        if String::from_utf8_lossy(&cmdline).contains(session_id) {
+        if cmdline_names_session(&cmdline, session_id) {
             return Liveness::Alive(pid);
         }
     }
@@ -363,9 +432,6 @@ struct ClaudeExecution {
     /// Interrupt was requested while a turn was in flight; consumed by the
     /// reader thread into `TurnOutcome::interrupted`.
     interrupt_requested: bool,
-    /// Normalized events accumulated for HISTORY (§27). Sink delivery is
-    /// separate; this is the retrieval surface.
-    history: Vec<NativeEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -402,8 +468,13 @@ impl ClaudeBackend {
     }
 
     /// Install the event sink normalized events are pushed through (§27).
-    /// Installed by the daemon once its core exists; events emitted before
-    /// installation are still retained for HISTORY.
+    ///
+    /// The daemon installs one as soon as its core exists and before it
+    /// serves any request, which is before anything can start an execution.
+    /// Events emitted with no sink installed are not delivered anywhere and
+    /// are not kept: this adapter serves no HISTORY (see [`Backend::history`]),
+    /// so a second in-memory copy would be an unbounded buffer with no
+    /// reader.
     pub fn set_event_sink(&self, sink: EventSink) {
         *self.sink.lock().expect("claude sink lock") = Some(sink);
     }
@@ -598,19 +669,17 @@ impl ClaudeBackend {
         Ok(())
     }
 
-    /// Record one normalized event: append to HISTORY and push through the
-    /// sink when one is installed.
+    /// Push one normalized event through the sink, when one is installed.
+    ///
+    /// There is deliberately no second copy kept per execution (R1). This
+    /// adapter does not serve HISTORY — see [`Backend::history`] below — so a
+    /// per-execution `Vec<NativeEvent>` would be an unbounded buffer, growing
+    /// for the daemon's lifetime with a duplicate of every event the sink
+    /// already journals durably, for a reader that does not exist. Events
+    /// emitted before the daemon installs a sink are not delivered anywhere;
+    /// the daemon installs one before it serves any request, so nothing that
+    /// can start an execution runs before it.
     fn emit(&self, execution_id: &str, work_id: &str, kind: &str, payload: Value) {
-        let event = NativeEvent {
-            kind: kind.to_string(),
-            payload: payload.clone(),
-        };
-        {
-            let mut state = self.lock();
-            if let Some(execution) = state.executions.get_mut(execution_id) {
-                execution.history.push(event);
-            }
-        }
         let sink = self.sink.lock().expect("claude sink lock").clone();
         if let Some(sink) = sink {
             let draft = EventDraft {
@@ -920,19 +989,6 @@ impl TurnReader {
     }
 
     fn emit(&self, kind: &str, payload: Value) {
-        let event = NativeEvent {
-            kind: kind.to_string(),
-            payload: payload.clone(),
-        };
-        {
-            let mut state = self
-                .backend_state
-                .lock()
-                .expect("claude adapter state lock");
-            if let Some(execution) = state.executions.get_mut(&self.execution_id) {
-                execution.history.push(event);
-            }
-        }
         if let Some(sink) = &self.sink {
             sink(EventDraft {
                 source: EventSource::new("backend", CLAUDE_BACKEND_NAME),
@@ -965,12 +1021,24 @@ impl Backend for ClaudeBackend {
     /// stream-json, and an unmeasured capability is `false` until a
     /// measurement flips it (§15: unsupported means unsupported, and
     /// "documented" is not "supported").
+    ///
+    /// `history` is `false` for that last reason, and the reason is worth
+    /// stating because it used to be `true`: the capability means *durable*
+    /// native history retrieval, and the only durable native history here is
+    /// the CLI's private `<session_id>.jsonl` transcript, whose record format
+    /// this milestone never measured (§16 keeps such layouts adapter details;
+    /// this adapter only ever asks whether the file exists). What the adapter
+    /// could return instead — the events its own process happened to ingest —
+    /// is a partial answer that reads exactly like a complete one, and after
+    /// a RESUME it is empty for a conversation with a full transcript on
+    /// disk: "nothing was said" and "this daemon was not here" would be the
+    /// same value. So the claim is `false` and [`Backend::history`] refuses.
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             persistent_sessions: true,
             native_background: false,
             streaming: true,
-            history: true,
+            history: false,
             resume: true,
             interrupt: true,
             model_selection: true,
@@ -980,6 +1048,17 @@ impl Backend for ClaudeBackend {
             usage: true,
             native_subagents: false,
         }
+    }
+
+    /// §17: print-mode Claude has no backend-level service. An execution is a
+    /// durable conversation and each turn is its own short-lived process, so
+    /// the runtime this adapter needs comes into being per execution and
+    /// leaves with it. (§17's own Claude example — "native supervisor/session
+    /// infrastructure" — describes the `--bg` supervisor model D2 measured
+    /// and did not take; scope follows the design that shipped, not the
+    /// example.)
+    fn runtime_scope(&self) -> RuntimeScope {
+        RuntimeScope::PerExecution
     }
 
     fn probe(&self) -> ProbeReport {
@@ -1029,16 +1108,9 @@ impl Backend for ClaudeBackend {
                     env,
                     permission_args,
                     turns: 0,
-                    turn: TurnState::Finished(TurnOutcome {
-                        envelope: None,
-                        interrupted: true, // placeholder; replaced by spawn
-                        raw_blob: None,
-                        raw_error: None,
-                        stderr: String::new(),
-                    }),
+                    turn: TurnState::Unlaunched,
                     stopped: false,
                     interrupt_requested: false,
-                    history: Vec::new(),
                 },
             );
         }
@@ -1084,6 +1156,20 @@ impl Backend for ClaudeBackend {
         if state.executions.contains_key(&handle.execution_id) {
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
+            // A re-adopted execution has no turn of this daemon's to report,
+            // so it is classified from the same restart evidence an
+            // un-adopted one is — truthfully, as adopted (§15 RESUME).
+            if matches!(execution.turn, TurnState::Adopted) {
+                let session_id = execution.session_id.clone();
+                drop(state);
+                return classify_restart(
+                    &session_id,
+                    session_liveness(&session_id),
+                    self.session_transcript(&session_id),
+                    Adoption::Adopted,
+                )
+                .ok_or_else(|| self.err_unknown(&handle.execution_id));
+            }
             return Ok(observe_in_memory(execution));
         }
         drop(state);
@@ -1105,53 +1191,13 @@ impl Backend for ClaudeBackend {
             .native_id
             .as_deref()
             .ok_or_else(|| self.err_unknown(&handle.execution_id))?;
-        let transcript = self.session_transcript(session_id);
-        match (session_liveness(session_id), transcript) {
-            (Liveness::Alive(pid), _) => Ok(Observation {
-                native: NativeState::Running,
-                signal: BackendSignal::Blocked {
-                    reason: format!(
-                        "daemon restarted while a turn of conversation {session_id} was still \
-                         running (pid {pid}); that turn is unowned — its output is going \
-                         nowhere and sergeant did not adopt it"
-                    ),
-                },
-                evidence: Some(format!(
-                    "live turn: pid {pid} carries session {session_id} in its argv"
-                )),
-            }),
-            (Liveness::Dead, Some(path)) => Ok(Observation {
-                native: NativeState::Exited,
-                signal: BackendSignal::Blocked {
-                    reason: format!(
-                        "daemon restarted mid-execution; conversation {session_id} is \
-                         resumable (durable transcript present) but the in-flight turn's \
-                         outcome is unknown"
-                    ),
-                },
-                evidence: Some(format!(
-                    "no live process carries session {session_id}; session transcript: {}",
-                    path.display()
-                )),
-            }),
-            (Liveness::Unknowable(why), Some(path)) => Ok(Observation {
-                // The transcript proves the conversation; nothing here
-                // proves what its last process is doing. §25: fail closed.
-                native: NativeState::Unknown,
-                signal: BackendSignal::Blocked {
-                    reason: format!(
-                        "daemon restarted mid-execution; conversation {session_id} is \
-                         resumable (durable transcript present) but whether its turn process \
-                         is still running cannot be evidenced here"
-                    ),
-                },
-                evidence: Some(format!(
-                    "session transcript: {}; process liveness unknowable: {why}",
-                    path.display()
-                )),
-            }),
-            (_, None) => Err(self.err_unknown(&handle.execution_id)),
-        }
+        classify_restart(
+            session_id,
+            session_liveness(session_id),
+            self.session_transcript(session_id),
+            Adoption::Unowned,
+        )
+        .ok_or_else(|| self.err_unknown(&handle.execution_id))
     }
 
     /// Kill the per-turn process. The conversation survives (measured); the
@@ -1169,7 +1215,10 @@ impl Backend for ClaudeBackend {
                     execution.interrupt_requested = true;
                     Some(Arc::clone(child))
                 }
-                TurnState::Finished(_) => None, // goal state already holds
+                // No turn in flight: the goal state — no turn running —
+                // already holds, whether this daemon finished one, launched
+                // none, or re-adopted the conversation from a restart.
+                TurnState::Finished(_) | TurnState::Unlaunched | TurnState::Adopted => None,
             }
         };
         if let Some(child) = child {
@@ -1179,9 +1228,19 @@ impl Backend for ClaudeBackend {
         Ok(())
     }
 
-    /// Re-adopt a conversation after a restart: verify the durable
-    /// transcript exists, then register the execution so SEND continues it
-    /// with `--resume`.
+    /// Re-adopt a conversation after a restart: verify that the durable
+    /// transcript exists **and that no turn of it is still running**, then
+    /// register the execution so SEND continues it with `--resume`.
+    ///
+    /// Both halves are the evidence RESUME's `Ok` claims (§15: "fails closed
+    /// when the native context cannot be evidenced"), and restart
+    /// reconciliation reattaches through exactly this call before it
+    /// classifies anything. A conversation whose previous turn is still alive
+    /// cannot be adopted at all: this adapter would have no child handle to
+    /// interrupt, no stdout to ingest, and a later SEND would put a second
+    /// process on a session the first one still holds. Liveness that cannot
+    /// be read (no `/proc`) is refused for the same reason — the difference
+    /// between the two is exactly what could not be established.
     ///
     /// Launch configuration comes from the [`ResumeRequest`] the caller
     /// rebuilt from the journal, through the same resolution START uses —
@@ -1202,14 +1261,45 @@ impl Backend for ClaudeBackend {
             .native_id
             .clone()
             .ok_or_else(|| self.err_unknown(&handle.execution_id))?;
+        // Layer 1 of pin verification applies to a re-supplied pin exactly as
+        // it does at START: a pin that could never be honored is refused
+        // before anything is adopted on the strength of it — including
+        // before the cheap "already adopted" answer, so a caller cannot slip
+        // an impossible pin past the check by asking twice.
+        if let Some(model) = &request.model {
+            preflight_model_pin(model).map_err(|reason| self.err_failed(reason))?;
+        }
+        // Already ours: re-adoption is idempotent (restart reconciliation may
+        // re-run after a crash inside its own append window), and an
+        // execution this daemon already owns is not classified from restart
+        // evidence — its own turn may legitimately be in flight.
+        {
+            let state = self.lock();
+            if let Some(existing) = state.executions.get(&handle.execution_id) {
+                if existing.session_id != session_id {
+                    return Err(self.err_unknown(&handle.execution_id));
+                }
+                return Ok(());
+            }
+        }
         if self.session_transcript(&session_id).is_none() {
             return Err(self.err_unknown(&handle.execution_id));
         }
-        // Layer 1 of pin verification applies to a re-supplied pin exactly as
-        // it does at START: a pin that could never be honored is refused
-        // before anything is adopted on the strength of it.
-        if let Some(model) = &request.model {
-            preflight_model_pin(model).map_err(|reason| self.err_failed(reason))?;
+        match session_liveness(&session_id) {
+            Liveness::Dead => {}
+            Liveness::Alive(pid) => {
+                return Err(self.err_failed(format!(
+                    "cannot re-adopt conversation {session_id}: a turn of it is still running \
+                     (pid {pid}) and this adapter does not own that process — adopting it \
+                     would claim ownership of a turn whose output nothing is reading"
+                )));
+            }
+            Liveness::Unknowable(why) => {
+                return Err(self.err_failed(format!(
+                    "cannot re-adopt conversation {session_id}: whether a turn of it is still \
+                     running cannot be evidenced here ({why})"
+                )));
+            }
         }
         let LaunchConfig {
             executable,
@@ -1218,10 +1308,11 @@ impl Backend for ClaudeBackend {
         } = self.launch_config(request.profile.as_ref());
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
+            // Another thread adopted it while this one gathered evidence.
             if existing.session_id != session_id {
                 return Err(self.err_unknown(&handle.execution_id));
             }
-            return Ok(()); // already adopted
+            return Ok(());
         }
         state.executions.insert(
             handle.execution_id.clone(),
@@ -1234,25 +1325,43 @@ impl Backend for ClaudeBackend {
                 env,
                 permission_args,
                 turns: 1, // there was at least the turn that created it
-                turn: TurnState::Finished(TurnOutcome {
-                    envelope: None,
-                    interrupted: true, // deliberate: adoption draws no conclusion
-                    raw_blob: None,
-                    raw_error: None,
-                    stderr: String::new(),
-                }),
+                // Adoption draws no conclusion — and says so. (It used to
+                // borrow an interrupted turn's shape here, which made OBSERVE
+                // report "turn interrupted by request" for an interrupt
+                // nobody requested.)
+                turn: TurnState::Adopted,
                 stopped: false,
                 interrupt_requested: false,
-                history: Vec::new(),
             },
         );
         Ok(())
     }
 
+    /// HISTORY is unsupported here, and says so (§15: unsupported means
+    /// unsupported, not emulation). See [`ClaudeBackend::capabilities`] for
+    /// why the capability is `false`; the refusal names where the record
+    /// actually is, because a caller that wanted history still needs an
+    /// answer: sergeant's own journal holds every normalized event this
+    /// adapter ever emitted, and the vendor's own durable transcript holds
+    /// the native one.
     fn history(&self, handle: &ExecutionHandle) -> Result<Vec<NativeEvent>, BackendError> {
+        // Identity is still checked first: an unrecognised execution is
+        // unrecognised whatever the verb, and the caller learns that before
+        // it learns anything about capabilities.
         let state = self.lock();
         self.check_identity(&state, handle)?;
-        Ok(state.executions[&handle.execution_id].history.clone())
+        drop(state);
+        Err(BackendError::Unsupported {
+            backend: CLAUDE_BACKEND_NAME.to_string(),
+            verb: "history".to_string(),
+            detail: "this adapter cannot retrieve durable native history: the CLI's session \
+                     transcript format is not measured, and reporting only the events this \
+                     process happened to ingest would be a partial answer indistinguishable \
+                     from a complete one (empty, in particular, after a restart). The \
+                     normalized events are journaled through the event sink (§27); the native \
+                     record is the CLI's own <session_id>.jsonl transcript"
+                .to_string(),
+        })
     }
 
     /// Retire: kill any in-flight turn and refuse further input. The
@@ -1271,10 +1380,117 @@ impl Backend for ClaudeBackend {
     }
 }
 
+/// Whether this daemon has re-adopted the conversation being classified.
+///
+/// It changes nothing about the *evidence* — the same `/proc` scan and the
+/// same transcript answer either way — and everything about what the reason
+/// says, which is the part a human reads: "sergeant did not adopt it" and
+/// "sergeant re-adopted it, and the pre-restart turn's outcome is still
+/// unknown" are different situations with the same liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Adoption {
+    /// No RESUME has been performed: the context is unowned by this daemon.
+    Unowned,
+    /// RESUME succeeded; later SENDs continue this conversation.
+    Adopted,
+}
+
+/// Classify a conversation this daemon did not run a turn on, from the two
+/// independent pieces of restart evidence (§25's still-alive / resumable /
+/// ambiguous). `None` means there is no durable conversation to classify —
+/// the caller turns that into `UnknownExecution`.
+///
+/// Every branch fails the *work* closed. That is not redundancy with the
+/// engine: the adapter is the only thing that knows which of these three
+/// situations it is in, and the difference between them is the whole content
+/// of the evidence an operator acts on.
+fn classify_restart(
+    session_id: &str,
+    liveness: Liveness,
+    transcript: Option<PathBuf>,
+    adoption: Adoption,
+) -> Option<Observation> {
+    match (liveness, transcript) {
+        (Liveness::Alive(pid), _) => Some(Observation {
+            native: NativeState::Running,
+            signal: BackendSignal::Blocked {
+                reason: format!(
+                    "daemon restarted while a turn of conversation {session_id} was still \
+                     running (pid {pid}); that turn is unowned — its output is going \
+                     nowhere and sergeant did not adopt it"
+                ),
+            },
+            evidence: Some(format!(
+                "live turn: pid {pid} runs with --resume/--session-id {session_id} in its argv"
+            )),
+        }),
+        (Liveness::Dead, Some(path)) => Some(Observation {
+            native: NativeState::Exited,
+            signal: BackendSignal::Blocked {
+                reason: match adoption {
+                    Adoption::Unowned => format!(
+                        "daemon restarted mid-execution; conversation {session_id} is \
+                         resumable (durable transcript present) but the in-flight turn's \
+                         outcome is unknown"
+                    ),
+                    Adoption::Adopted => format!(
+                        "conversation {session_id} was re-adopted after a daemon restart and is \
+                         resumable (durable transcript present, no turn running), but the turn \
+                         that was in flight when the daemon died left no outcome this daemon \
+                         can read — the stage's result is unknown, not absent"
+                    ),
+                },
+            },
+            evidence: Some(format!(
+                "no live process carries session {session_id}; session transcript: {}; \
+                 adopted={}",
+                path.display(),
+                adoption == Adoption::Adopted
+            )),
+        }),
+        (Liveness::Unknowable(why), Some(path)) => Some(Observation {
+            // The transcript proves the conversation; nothing here
+            // proves what its last process is doing. §25: fail closed.
+            native: NativeState::Unknown,
+            signal: BackendSignal::Blocked {
+                reason: format!(
+                    "daemon restarted mid-execution; conversation {session_id} is \
+                     resumable (durable transcript present) but whether its turn process \
+                     is still running cannot be evidenced here"
+                ),
+            },
+            evidence: Some(format!(
+                "session transcript: {}; process liveness unknowable: {why}",
+                path.display()
+            )),
+        }),
+        (_, None) => None,
+    }
+}
+
 /// Map an in-memory execution's turn state to an Observation.
 fn observe_in_memory(execution: &ClaudeExecution) -> Observation {
     let session = &execution.session_id;
     match &execution.turn {
+        // START inserts this and then either spawns (replacing it) or removes
+        // the execution, so reaching it means the adapter's own invariant
+        // broke. §25: report the ambiguity, invent nothing.
+        TurnState::Unlaunched => Observation {
+            native: NativeState::Unknown,
+            signal: BackendSignal::Running,
+            evidence: Some(format!(
+                "execution registered for conversation {session} but no turn was ever launched"
+            )),
+        },
+        // Handled by `observe` against restart evidence before it gets here.
+        TurnState::Adopted => Observation {
+            native: NativeState::Unknown,
+            signal: BackendSignal::Running,
+            evidence: Some(format!(
+                "conversation {session} was re-adopted after a restart; no turn of this \
+                 daemon's has run on it"
+            )),
+        },
         TurnState::InFlight(_) => Observation {
             native: NativeState::Running,
             signal: BackendSignal::Running,
@@ -1659,6 +1875,191 @@ mod tests {
         );
     }
 
+    /// An envelope that does not say `is_error: false` is an error — the
+    /// `.unwrap_or(true)` default, which is the only thing standing between a
+    /// malformed or truncated envelope and a stage reported complete. The
+    /// error-path test above supplies `is_error: true` explicitly, so it
+    /// never reaches this default; flipping the default to `false` used to
+    /// leave the whole suite green.
+    #[test]
+    fn an_envelope_that_cannot_say_no_error_is_an_error() {
+        let execution = test_execution(None);
+        let envelope = json!({
+            "type": "result", "subtype": "success", "result": "looks fine to me"
+        });
+        let outcome = TurnOutcome {
+            envelope: Some(envelope.clone()),
+            interrupted: false,
+            raw_blob: None,
+            raw_error: None,
+            stderr: String::new(),
+        };
+        match observe_envelope(&execution, &envelope, &outcome).signal {
+            BackendSignal::Failed { reason } => assert!(reason.contains("turn failed"), "{reason}"),
+            other => panic!("a missing is_error must not read as success, got {other:?}"),
+        }
+    }
+
+    /// The restart classifier's three branches, including the one no
+    /// environment here can produce: liveness that cannot be read at all
+    /// (`/proc` absent or unreadable). Its `NativeState::Unknown` is what
+    /// makes the engine fail the work closed, and nothing else in the suite
+    /// can reach it — `session_liveness` only returns `Unknowable` off Linux
+    /// or on an unreadable `/proc`.
+    #[test]
+    fn restart_classification_fails_closed_on_unreadable_liveness() {
+        let transcript = Some(PathBuf::from("/claude/projects/x/s.jsonl"));
+        let unknowable = classify_restart(
+            "s",
+            Liveness::Unknowable("no /proc here".to_string()),
+            transcript.clone(),
+            Adoption::Unowned,
+        )
+        .expect("a transcript means there is something to classify");
+        assert_eq!(unknowable.native, NativeState::Unknown);
+        assert!(
+            unknowable
+                .evidence
+                .as_deref()
+                .unwrap_or("")
+                .contains("no /proc here"),
+            "{unknowable:?}"
+        );
+
+        let alive = classify_restart(
+            "s",
+            Liveness::Alive(4242),
+            transcript.clone(),
+            Adoption::Unowned,
+        )
+        .expect("a live turn is classifiable with or without a transcript");
+        assert_eq!(alive.native, NativeState::Running);
+        assert!(alive.evidence.as_deref().unwrap_or("").contains("4242"));
+
+        let dead = classify_restart("s", Liveness::Dead, transcript, Adoption::Unowned)
+            .expect("dead + transcript is the resumable case");
+        assert_eq!(dead.native, NativeState::Exited);
+
+        assert!(
+            classify_restart("s", Liveness::Dead, None, Adoption::Unowned).is_none(),
+            "no durable conversation: there is nothing to classify, and the caller \
+             turns that into UnknownExecution"
+        );
+    }
+
+    /// A re-adopted conversation reports adoption, and never claims an
+    /// interrupt nobody requested.
+    ///
+    /// The fabricated shape this replaces (`Finished { envelope: None,
+    /// interrupted: true }`) rendered as `signal=Running` with the evidence
+    /// "turn interrupted by request" — an affirmatively false statement, and
+    /// the fail-*open* direction: the engine's Running branch makes no
+    /// transition, so a reattached work would sit `active` with no turn in
+    /// flight and nothing to move it.
+    #[test]
+    fn an_adopted_conversation_claims_no_interrupt_and_no_verdict() {
+        let mut execution = test_execution(None);
+        execution.turn = TurnState::Adopted;
+        let observation = observe_in_memory(&execution);
+        let evidence = observation.evidence.clone().unwrap_or_default();
+        assert!(
+            !evidence.contains("interrupted"),
+            "adoption must not borrow the interrupted-turn shape: {observation:?}"
+        );
+        assert!(evidence.contains("re-adopted"), "{observation:?}");
+        assert_eq!(
+            observation.native,
+            NativeState::Unknown,
+            "no turn of this daemon's has run: {observation:?}"
+        );
+
+        // And the adopted classification an OBSERVE actually returns says the
+        // same thing against real restart evidence.
+        let adopted = classify_restart(
+            "s",
+            Liveness::Dead,
+            Some(PathBuf::from("/claude/projects/x/s.jsonl")),
+            Adoption::Adopted,
+        )
+        .expect("classifiable");
+        let BackendSignal::Blocked { reason } = &adopted.signal else {
+            panic!("an adopted conversation with an unknown turn outcome blocks: {adopted:?}");
+        };
+        assert!(reason.contains("re-adopted"), "{reason}");
+        assert!(reason.contains("resumable"), "{reason}");
+        assert!(!reason.contains("interrupt"), "{reason}");
+    }
+
+    /// Liveness is evidence about a *turn*, so the argv match is the launch
+    /// grammar's flag-and-value pair — never the id as a substring of a
+    /// joined command line. Everything in the second group puts the id in
+    /// some process's argv without any turn running, and each one used to
+    /// report `NativeState::Running` with "pid N carries session id in argv".
+    #[test]
+    fn liveness_matches_turn_argv_and_not_a_quoted_session_id() {
+        let session = "11111111-2222-4333-8444-555555555555";
+        let argv = |args: &[&str]| args.join("\0").into_bytes();
+
+        for turn in [
+            argv(&[
+                "claude",
+                "-p",
+                "--verbose",
+                "--session-id",
+                session,
+                "--dangerously-skip-permissions",
+            ]),
+            argv(&["claude", "-p", "--resume", session]),
+            // A profile may name a different executable; the flag pair is
+            // what identifies the turn, not the program's name.
+            argv(&["/opt/harness/claude-wrapper", "-p", "--resume", session]),
+        ] {
+            assert!(
+                cmdline_names_session(&turn, session),
+                "a real turn's argv must match: {:?}",
+                String::from_utf8_lossy(&turn)
+            );
+        }
+
+        for bystander in [
+            // The harness this project is built in wraps commands like this.
+            argv(&["bash", "-c", &format!("eval 'grep {session} log.txt'")]),
+            argv(&["less", &format!("/root/.claude/projects/p/{session}.jsonl")]),
+            argv(&["vim", &format!("{session}.jsonl")]),
+            // The id is present as its own argument, but no flag claims it.
+            argv(&["echo", session]),
+            // The flag is present, but names a different conversation.
+            argv(&[
+                "claude",
+                "-p",
+                "--resume",
+                "99999999-8888-4777-8666-555555555555",
+            ]),
+            // A flag with nothing after it.
+            argv(&["claude", "-p", "--resume"]),
+        ] {
+            assert!(
+                !cmdline_names_session(&bystander, session),
+                "a quoted id is not a running turn: {:?}",
+                String::from_utf8_lossy(&bystander)
+            );
+        }
+    }
+
+    /// `truncate` cuts on character boundaries. The inputs are CLI stderr and
+    /// the model's own `result` text, both of which routinely carry
+    /// multibyte characters; byte slicing here is a panic in the adapter's
+    /// evidence path, which is exactly where a panic destroys the evidence.
+    #[test]
+    fn truncate_cuts_on_character_boundaries() {
+        let text = "航海日誌: ✅ done";
+        assert_eq!(truncate(text, 0), "");
+        assert_eq!(truncate(text, 2), "航海");
+        assert_eq!(truncate(text, 4), "航海日誌");
+        assert_eq!(truncate(text, 1000), text, "shorter than the limit");
+        assert_eq!(truncate("", 4), "");
+    }
+
     fn test_execution(model: Option<&str>) -> ClaudeExecution {
         ClaudeExecution {
             session_id: "s".to_string(),
@@ -1678,7 +2079,6 @@ mod tests {
             }),
             stopped: false,
             interrupt_requested: false,
-            history: Vec::new(),
         }
     }
 }
