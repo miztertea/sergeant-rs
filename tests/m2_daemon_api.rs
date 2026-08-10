@@ -2402,28 +2402,68 @@ async fn t11c_a_stalled_observation_after_a_send_does_not_hold_the_core_lock() {
 // by hand. Nothing in m1..m6 asserted a throughput floor at all, so a further
 // regression below the amended floor shipped silently.
 
-/// Submission throughput has an automated floor.
+/// Submission throughput has an automated floor, **on the path the budget was
+/// measured on**.
 ///
-/// **What this is and is not.** It is *not* the A-N3-1 budget: 24 works/s at
-/// burst 50 is measured by `scripts/perf/s1-burst.sh` on a quiet machine, and
-/// asserting it here — inside a suite that runs in parallel with seven others
-/// on shared cores — would be a coin flip, which is worse than no guard
-/// because a flaky floor gets deleted. It is the guard the budget lacked: an
-/// order-of-magnitude floor that cannot flake and that a real regression
-/// cannot slip under. Putting an fsync back per event, or a `git` call back
-/// under the submit guard, lands well below it.
+/// Round-2 finding N3R2-04: the first version of this posted
+/// `{command_id, intent}` with no `origin.cwd`, which `Engine::plan` answers
+/// with `Ok(None)` — no workspace discovery, no workflow resolution, no
+/// `git worktree add`, no reservation, no launch. It measured 1200 works/s
+/// against a floor of 4 and called that a 6× margin on a 24 works/s budget
+/// measured over the whole submit path. An 86 ms external effect put back
+/// under the submit guard — the measured cost of one `git worktree add` on a
+/// 3.4 MB `.git`, i.e. exactly the regression the failure message named —
+/// dropped the real path to 11.4 works/s and this test still passed.
 ///
-/// The number: the amended budget is 24 works/s; this asserts 4, a 6× margin
-/// for a contended test host. When the group-commit fix (#44) lands, this
-/// floor rises with the measurement rather than being left behind.
+/// So it submits what `scripts/perf/s1-burst.sh` submits: `origin.cwd` in a
+/// seeded repository carrying a two-stage workflow, so every accepted call
+/// discovers a workspace, resolves and binds a workflow, materializes a
+/// worktree, reserves an execution and runs the stages. A call's latency is a
+/// work's end-to-end latency, which is what the A-N3-1 number means.
+///
+/// **The floor, and how it is scaled.** A-N3-1's amended budget is ≥24
+/// works/s at burst 50 on a quiet machine. This runs at burst 25 inside a
+/// suite that shares its cores with seven others, so the floor takes a 2×
+/// contention allowance: **12 works/s**. Two measurements make that the
+/// honest number rather than a round one:
+///
+/// - the healthy path here runs 38 works/s idle and 33 works/s with the whole
+///   suite in flight — 2.8× the floor on a loaded host, which is margin
+///   against a scheduler hiccup and not against a regression;
+/// - and the floor is still above the ceiling that the regression class this
+///   exists to catch imposes. Any effect of duration *d* serialized under the
+///   submit guard caps throughput at `1/d` regardless of burst size or host
+///   speed: at the measured 86 ms of a `git worktree add`, that ceiling is
+///   11.6 works/s — below this floor by construction rather than by luck, and
+///   measured at 10.2 works/s when that sleep is actually put back.
+///
+/// The burst is 25 rather than 50 because the guard is bounded by the ceiling
+/// above, not by the burst, and 50 concurrent worktrees on a shared test host
+/// is a lot of disk for no extra signal. When the group-commit fix (#44) lands
+/// and the measurement rises, this floor rises with it.
+///
+/// **What it does not catch, and what does.** A second fsync per journal
+/// append — A-N3-1's own cost story, and #44's target — is ~5% of a submit on
+/// this container's filesystem (38.2 → 36.8 works/s measured), which is inside
+/// the noise of any floor that does not flake. Timing is the wrong instrument
+/// for it and the previous version of this comment claimed otherwise; m6's
+/// `t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for` counts it
+/// instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t12_submission_throughput_has_an_automated_floor() {
-    /// Works per second the daemon must sustain on a burst, on any host a
-    /// test suite runs on.
-    const THROUGHPUT_FLOOR: f64 = 4.0;
+    /// A-N3-1's amended budget, on a quiet machine at burst 50.
+    const BUDGET: f64 = 24.0;
+    /// How much slower a suite sharing its cores with seven others may be.
+    const CONTENTION_ALLOWANCE: f64 = 2.0;
+    /// Works per second the daemon must sustain, whole submit path.
+    const THROUGHPUT_FLOOR: f64 = BUDGET / CONTENTION_ALLOWANCE;
     const BURST: usize = 25;
 
     let dir = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    seed_workflow_repo(&repo);
+
     let fake = FakeBackend::new(FAKE_BACKEND_NAME);
     let handle = start_with_fake(dir.path(), &fake).await;
     let http = client();
@@ -2434,34 +2474,100 @@ async fn t12_submission_throughput_has_an_automated_floor() {
         let http = http.clone();
         let endpoint = handle.endpoint.clone();
         let token = handle.token.clone();
+        let repo = repo.clone();
         inflight.push(tokio::spawn(async move {
-            http.post(format!("{endpoint}/v1/work"))
+            let response = http
+                .post(format!("{endpoint}/v1/work"))
                 .bearer_auth(token)
-                .json(&json!({"command_id": ulid(), "intent": "throughput floor"}))
+                .json(&json!({
+                    "command_id": ulid(),
+                    "intent": "throughput floor",
+                    "backend": FAKE_BACKEND_NAME,
+                    "origin": {"client": "cli", "cwd": repo},
+                }))
                 .send()
                 .await
-                .expect("submit")
-                .status()
+                .expect("submit");
+            let status = response.status();
+            let body: Value = response.json().await.expect("submit json");
+            (status, body)
         }));
     }
+    let mut completed = 0usize;
     let mut created = 0usize;
     for task in inflight {
-        if task.await.expect("submit task").is_success() {
+        let (status, body) = task.await.expect("submit task");
+        if status.is_success() {
             created += 1;
+            if body["work"]["state"] == "completed" {
+                completed += 1;
+            }
         }
     }
     let elapsed = started.elapsed();
     handle.shutdown().await;
 
     assert_eq!(created, BURST, "every submission must be accepted");
+    // The whole point is that the measured operation is the whole operation: a
+    // burst that parked in `pending` would be timing the HTTP surface again.
+    assert_eq!(
+        completed, BURST,
+        "every submission must have run its workflow to completion — otherwise \
+         this is not measuring the submit path the budget was measured on"
+    );
     let rate = BURST as f64 / elapsed.as_secs_f64();
-    eprintln!("burst {BURST}: {rate:.1} works/s in {elapsed:?}");
+    eprintln!("burst {BURST} (full submit path): {rate:.1} works/s in {elapsed:?}");
     assert!(
         rate >= THROUGHPUT_FLOOR,
         "submission throughput fell to {rate:.1} works/s at burst {BURST}, below the \
-         {THROUGHPUT_FLOOR} works/s floor. The A-N3-1 budget is 24 works/s at burst 50 \
-         (docs/perf/n3-two-phase-boundary-2026-08-10.md); this floor is six times looser \
-         and is only tripped by a structural regression — an extra fsync per event, or an \
-         external effect back under the core lock."
+         {THROUGHPUT_FLOOR} works/s floor — A-N3-1's amended budget of {BUDGET} works/s \
+         at burst 50 (docs/perf/n3-two-phase-boundary-2026-08-10.md) divided by a \
+         {CONTENTION_ALLOWANCE}× allowance for a shared test host. This is the whole \
+         submit path — workspace discovery, workflow bind, `git worktree add`, \
+         reservation, launch — so any external effect of ~80 ms or more put back under \
+         the core lock lands below it, whatever the host speed."
     );
+}
+
+/// A repository the submit path can actually run in: one commit, and a
+/// two-stage workflow under `.sergeant/workflows/`.
+///
+/// The same shape `scripts/perf/s1-burst.sh` seeds, because a throughput floor
+/// asserted here is only comparable to the budget if it submits the same work.
+fn seed_workflow_repo(repo: &Path) {
+    let workflow = repo.join(".sergeant/workflows/software-change");
+    for stage in ["10-implement", "20-review"] {
+        std::fs::create_dir_all(workflow.join(stage)).expect("stage dir");
+        std::fs::write(
+            workflow.join(stage).join("CONTEXT.md"),
+            format!("Stage {stage} of the throughput fixture.\n"),
+        )
+        .expect("CONTEXT.md");
+    }
+    std::fs::write(
+        workflow.join("workflow.toml"),
+        "[workflow]\nname = \"software-change\"\nversion = \"1\"\n\
+         stages = [\"10-implement\", \"20-review\"]\n",
+    )
+    .expect("workflow.toml");
+    std::fs::write(repo.join("payments.py"), "def settle(payment):\n    pass\n")
+        .expect("source file");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "throughput fixture"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "sergeant tests")
+            .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+            .env("GIT_COMMITTER_NAME", "sergeant tests")
+            .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
 }

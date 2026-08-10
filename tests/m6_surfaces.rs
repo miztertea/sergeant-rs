@@ -2182,6 +2182,82 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
     }
 }
 
+/// The journal's append path issues exactly the one fsync it accounts for.
+///
+/// A-N3-1's whole cost story is per-event fsyncs — the two-phase boundary
+/// added two per work, that is the 25% the budget was amended over, and #44's
+/// fix is one fsync per lock hold instead of one per event. So "an extra fsync
+/// per append" is *the* named throughput regression, and round-2 finding
+/// N3R2-04 showed the throughput guard could not see it: on this container an
+/// fsync costs ~0.08 ms, so a second one per append is ~5% of a submit —
+/// inside the noise of any floor that does not flake (measured: 38.2 → 36.8
+/// works/s at burst 25).
+///
+/// Timing is the wrong instrument for it; counting is the right one, and
+/// `Journal::fsync_count` already exists for that. But the counter is derived
+/// from *one* `sync_data` call, so a second durability syscall beside it is
+/// invisible to the counter as well — which is exactly the mutation the
+/// finding used. This closes both: every `sync_data`/`sync_all` in the module
+/// must live in a named block, and `write_and_sync` — the only one on the
+/// acknowledged-append path — must contain exactly one, the accounted one.
+///
+/// m1's `crash_tail…` tests assert the counter's value per append; this
+/// asserts the counter is the whole truth about what the append path syncs.
+#[test]
+fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
+    let source = code_only(&read_source("runtime/journal.rs"));
+    // Where a durability syscall may appear, and why.
+    let allowed = [
+        // The accounted per-append sync.
+        "fn write_and_sync",
+        // The rollback after a failed append: re-syncs a truncated segment so
+        // a torn tail cannot be concatenated onto. Not an acknowledged append.
+        "pub fn append_event",
+        // Startup quarantine of a torn tail, and the dirent sync that makes a
+        // new segment survive its own creation. Neither is on the hot path.
+        "fn recover_tail",
+        "fn sync_dir",
+    ];
+    let ranges: Vec<(usize, usize)> = allowed
+        .iter()
+        .map(|block| {
+            let start = source
+                .find(block)
+                .unwrap_or_else(|| panic!("journal.rs must declare `{block}`"));
+            (start, block_end(&source, start))
+        })
+        .collect();
+
+    for effect in [".sync_data(", ".sync_all("] {
+        for (index, _) in source.match_indices(effect) {
+            assert!(
+                ranges
+                    .iter()
+                    .any(|(start, end)| index > *start && index < *end),
+                "src/runtime/journal.rs calls `{effect}` outside every accounted \
+                 durability site, near: {:?}",
+                &source[index.saturating_sub(120)..(index + 60).min(source.len())]
+            );
+        }
+    }
+
+    // And the append path syncs once, through the expression that counts it.
+    let (start, end) = ranges[0];
+    let body = &source[start..end];
+    let syncs = body.matches(".sync_data(").count() + body.matches(".sync_all(").count();
+    assert_eq!(
+        syncs, 1,
+        "`write_and_sync` must issue exactly one durability syscall — a second \
+         one is an fsync per append that `fsync_count` cannot see and no \
+         throughput floor on a fast filesystem can feel: {body}"
+    );
+    assert!(
+        body.contains("self.fsync_count += self.segment_file.sync_data()"),
+        "the one sync must be the counted one, so the counter cannot drift \
+         from the syscall: {body}"
+    );
+}
+
 /// The end of the `{ … }` block that starts at or after `from`.
 fn block_end(source: &str, from: usize) -> usize {
     let open = source[from..].find('{').expect("a block") + from;
