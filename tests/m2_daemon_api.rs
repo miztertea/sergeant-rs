@@ -2071,6 +2071,147 @@ async fn t11_a_stalled_send_does_not_hold_the_core_lock() {
     );
 }
 
+/// §14.5 for **SEND**: an answer whose delivery lands after a cancel is
+/// recorded as late evidence and moves nothing.
+///
+/// Opening the guard around SEND (t11) opened the window §14.5 exists for:
+/// between `stage.input_received` going durable and the delivery reporting
+/// back, a cancel can retire the run underneath it. The LAUNCH side of that
+/// rule is pinned three times (m4's n3, n23, n24); the SEND side was pinned by
+/// nothing — making `delivery_is_stale` return `None` unconditionally left all
+/// 269 tests green (round-2 finding N3R2-02). Unwired, the late delivery
+/// falls straight into `drive` on a canceled work, which is §22.5's first
+/// prohibition: no terminal Work revived.
+///
+/// Driven through the daemon rather than the engine, because the window only
+/// exists on the path where the guard is actually dropped between the phases:
+/// an inline `provide_input` never lets anyone else in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11b_a_delivery_that_lands_after_a_cancel_does_not_revive_the_work() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LATESEND";
+    seed_blocked_run(dir.path(), work_id);
+
+    // The actor asks; the answer would complete the stage — so if the late
+    // delivery were allowed to drive, it would try to complete a canceled
+    // work, and the journal would say so.
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::ask("postgres or sqlite?"), FakeStep::complete()],
+    );
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+
+    fake.hold_sends();
+    let respond = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/input"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid(), "input": "postgres"}))
+                .send()
+                .await
+                .expect("input request")
+                .status()
+        })
+    };
+
+    // Rendezvous: the delivery is provably in flight, its two appends already
+    // durable, and the guard is open.
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_sends(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake send never reached its gate");
+
+    let canceled = http
+        .post(format!("{}/v1/work/{work_id}/cancel", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("cancel request")
+        .status();
+    assert!(canceled.is_success(), "the cancel answered {canceled}");
+
+    fake.release_sends();
+    let responded = respond.await.expect("respond task");
+    assert!(responded.is_success(), "the respond answered {responded}");
+    let execution_id = fake.starts()[0].execution_id.clone();
+    let delivered = fake.inputs(&execution_id);
+    let view: Value = http
+        .get(format!("{}/v1/work/{work_id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show request")
+        .json()
+        .await
+        .expect("show json");
+    handle.shutdown().await;
+
+    assert_eq!(
+        view["work"]["state"], "canceled",
+        "a late answer must not revive terminal work: {view}"
+    );
+    assert_eq!(
+        delivered,
+        vec!["postgres".to_string()],
+        "the harness did take the words — that is what makes this late, not lost"
+    );
+
+    let events: Vec<(String, Value)> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.work_id.as_deref() == Some(work_id))
+        .map(|e| (e.kind, e.payload))
+        .collect();
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+
+    // It moved nothing. The last word on this work's state is the cancel, and
+    // the stage the answer would have completed stays where the cancel left
+    // it.
+    assert!(
+        !kinds.contains(&"stage.completed"),
+        "the late delivery must not complete the stage: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().rfind(|k| k.starts_with("work.")).copied(),
+        Some("work.canceled"),
+        "no work-state event may follow the cancel: {kinds:?}"
+    );
+
+    // And it is recorded as what it was, not silently dropped: a human's words
+    // reaching a context whose work had already moved on.
+    let abandoned: Vec<&Value> = events
+        .iter()
+        .filter(|(k, _)| k == "execution.abandoned")
+        .map(|(_, p)| p)
+        .collect();
+    let late = abandoned
+        .iter()
+        .find(|p| p["verb"] == "send")
+        .unwrap_or_else(|| panic!("no send abandonment among {abandoned:?}"));
+    assert_eq!(late["reason"], "superseded");
+    assert_eq!(late["delivered"], true);
+    assert_eq!(late["execution_id"], execution_id);
+}
+
 // ------------------------------------- the throughput floor, as a guard
 //
 // N3-10: adjudication A-N3-1 amended the burst-50 floor to ">=24 works/s with
