@@ -553,6 +553,11 @@ mod tests {
         );
         assert!(html.contains("&lt;script&gt;alert"), "escaped form missing");
         assert!(
+            html.contains("alert(&#39;x&#39;)") && !html.contains("alert('x')"),
+            "an apostrophe is escaped too — the page must not depend on \
+             which quote character its attributes happen to use: {html}"
+        );
+        assert!(
             !html.contains("data-token=\"tok\"en\""),
             "an attribute value must not be able to close its own quote"
         );
@@ -757,10 +762,10 @@ mod tests {
     #[test]
     fn a_missing_work_is_a_dashboard_page_with_its_id_escaped() {
         let system = json!({"version": "0.1.0", "api_revision": "v1", "data_dir": "/tmp/d"});
-        let html = render_missing_work(&system, "01A&B<script>", "tok");
+        let html = render_missing_work(&system, "01A&B'<script>", "tok");
         assert!(
-            html.contains("no work with id 01A&amp;B&lt;script&gt;"),
-            "the id is echoed, escaped — ampersand included: {html}"
+            html.contains("no work with id 01A&amp;B&#39;&lt;script&gt;"),
+            "the id is echoed, escaped — ampersand and apostrophe included: {html}"
         );
         assert!(
             !html.contains("<script>"),

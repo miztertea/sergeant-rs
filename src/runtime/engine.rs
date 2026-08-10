@@ -1455,6 +1455,29 @@ mod tests {
                 .into(),
                 "no_backend_selected",
             ),
+            // All three routing failures, not one of them: `Route` is the
+            // only arm that delegates instead of naming a constant, so a
+            // single row would let the delegation be replaced by whichever
+            // code that row happens to want.
+            (
+                RouteError::NotFound {
+                    requested: "ghost".to_string(),
+                    tier: crate::runtime::router::RouteSource::Explicit,
+                    available: vec!["fake".to_string()],
+                }
+                .into(),
+                "backend_not_found",
+            ),
+            (
+                RouteError::Unavailable {
+                    requested: "claude".to_string(),
+                    tier: crate::runtime::router::RouteSource::GlobalDefault,
+                    detail: "no CLI on PATH".to_string(),
+                    available: vec!["fake".to_string()],
+                }
+                .into(),
+                "backend_unavailable",
+            ),
             (SurfaceError::NoRepositories.into(), "surface_error"),
             (
                 BackendError::Unavailable {

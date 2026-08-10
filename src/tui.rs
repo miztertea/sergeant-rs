@@ -1293,6 +1293,13 @@ mod tests {
         assert_eq!(app.on_key(KeyCode::Esc), Action::None);
         assert_eq!(app.screen, Screen::Fleet, "Esc backs out of a detail too");
         assert_eq!(app.on_key(KeyCode::Char('r')), Action::Refresh);
+        assert_eq!(
+            app.on_key(KeyCode::Char('q')),
+            Action::Quit,
+            "`q` from the fleet is the exit the footer advertises"
+        );
+        assert!(app.quit);
+        app.quit = false;
         assert_eq!(app.on_key(KeyCode::Esc), Action::Quit);
         assert!(app.quit);
 
