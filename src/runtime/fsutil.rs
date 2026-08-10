@@ -240,6 +240,28 @@ mod tests {
     /// *would* hit the same fallback arm via `Some(parent)` where `parent`
     /// is empty, but would then actually `mkdir` in the process's CWD — a
     /// real repo-tree side effect this suite must never risk).
+    ///
+    /// **What this does not pin**, stated so the coverage it produces is not
+    /// mistaken for a guard (S2 wave-2 finding, escalated rather than
+    /// papered over):
+    ///
+    /// - *That the walk is how the function terminates.* Inverting the loop
+    ///   condition to `while cur.exists()` skips the walk entirely and this
+    ///   test still passes, because `fs::create_dir_all("")` is `Ok` either
+    ///   way. The `_ => break` arm is pinned against being **changed** (a
+    ///   `panic!` there is caught) but not against being **bypassed**.
+    /// - *The `created`-ancestor fsync walk at all* — the durability half of
+    ///   this function, and the only reason it is not just
+    ///   `fs::create_dir_all`. Its whole observable effect is `fsync` calls
+    ///   on directories that always exist and always sync successfully; no
+    ///   in-process assertion can distinguish "synced" from "not synced"
+    ///   without a seam (an injectable sync hook) that the S2 contract's
+    ///   test-only rule forbids a builder from adding. Both sibling tests
+    ///   survive deleting the walk. Filed for adjudication; a crash-injection
+    ///   harness, not another unit test, is what would close it.
+    /// - *The `Some(parent) if !parent.as_os_str().is_empty()` guard's false
+    ///   branch* (`Some("")`, from a relative single-component path), which
+    ///   is unreachable without the CWD `mkdir` this test exists to avoid.
     #[test]
     fn create_dir_all_durable_takes_the_no_parent_fallback_without_touching_disk() {
         let empty = Path::new("");
