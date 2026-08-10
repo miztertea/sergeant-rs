@@ -44,6 +44,44 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### N1 — 2026-08-10, ICM convention + adjudicated Sergeant reference decomposition
+
+**Mission outcome: contract met; corpus frozen at version 1** (`reference-corpus/FROZEN.md`).
+Convention docs (`docs/icm/`) carry the D9 four-layer ICM model (owner-directed
+mid-milestone: L1 orientation / L2 stage contract with Inputs table / L3
+stable references / L4 per-run outputs with declared promote|evidence
+disposition + deterministic finalize). Corpus: 979 behavior units (966
+extracted from 139 decompose-files + 13 adjudication additions/splits), every
+quote script-verified against its source span, 4 citations honestly marked
+disputed; 34 draft workflow packages / 116 stages; 20 conflicts ADJUDICATED;
+4 surviving engine-pressure claims. Gate items all evidenced: per-file
+dispositions (source-inventory), two independent reviewers (boundary-honesty
++ completeness lenses, Opus), disagreements preserved (classification-ledger
++ adjudication-round1.md), structural lint committed and green (`lint.py`,
+orchestrator-re-run at freeze).
+
+**Environmental behavior.** Three workflows, 37 agents, ~8.4M subagent
+tokens, ~7h wall (2-wide concurrency ceiling): decomposition (17 agents —
+Sonnet extraction/drafting, Opus synthesis + 2 blind reviewers), fixer (15 —
+Sonnet fixers, Opus verifier), closure (5 Sonnet). The panel structure paid
+for itself twice: round-1 refute returned 21 findings (5 error) including
+44% of stages being machinery promoted via a future-engine justification
+(A4 demoted 71; N2's measurement would have been graded against over-staged
+gold) and the unenforceable-hash finding that became L11; the fixer round's
+Opus verifier then caught 13 closure gaps including a skipped package and a
+ruling written up but never applied to the record (V2) — fixed and re-linted.
+Orchestrator errors recorded: the parallel convention-doc agent's enum
+contradicted the extraction vocabulary (A1 — spec doc amended, corpus stood);
+adjudication A12 said "route the new units into provenance" without naming an
+owner, and no fixer owned it (V3). Scripts archived in
+`reference/gauntlet-workflows.zip` (n1-decomposition, n1-fixer, n1-closure).
+Unknowns resolved: U1 966 base units (vs 150–400 scoping estimate); U2
+no-mistakes decomposed without composition machinery (validate-and-ship, 9
+stages post-A5); U3 sergeant-setup's interactivity fit needs_input — its
+engine-gap claim (G5) was *rejected*: the lower rung already shipped.
+
+---
+
 ### N0 — 2026-08-10, Next Iteration kickoff: proposal accepted, remediation adjudicated
 
 **Mission outcome: contract met — adjudication-only, zero code delta.** The
