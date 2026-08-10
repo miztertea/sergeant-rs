@@ -16,3 +16,8 @@ commits, never rewrites — the file is the record of what ran.
   analysis and the batched reproduce-or-refute pass over candidate
   findings. Phase 2's stage execution itself is orchestrator-run from
   `scripts/coverage/` (R-S0-4 sequencing), not agent-run.
+- `s2-wave1-gauntlet.js` — S2 wave 1 (contract:
+  `docs/gauntlet/contracts/S2-STABILIZE.md`): four Sonnet builders on
+  disjoint surfaces (fixtures + in-module pokes for #30/#32/#33/#34/#37/
+  #39/#41), then the full loop — two-critic panel, batched refuters,
+  fixer (R-S0-12: code is code, waves included).
