@@ -4546,3 +4546,494 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
         ),
     }
 }
+
+// ------------------------- §22.5. the crash-injection matrix (issue #20)
+//
+// "For every external lifecycle, inject process death or simulated append
+// failure at least at" eight points. Each test below is one of them: it builds
+// the journal prefix a daemon death at that instant would leave, restarts
+// recovery over it, and checks §22.5's six convergence rules —
+//
+//   no external effect started twice / no owned external identity lost /
+//   no unrelated external identity adopted / no wrong attempt advanced /
+//   no terminal work revived / no unproven state deleted
+//
+// — as they apply to that window. Windows 3 and 4 deserve their emphasis: they
+// share window 2's journal prefix exactly, and differ only in what exists out
+// in the world. The engine must answer them identically, because the journal
+// is the only thing it may read. That equality *is* the fail-closed rule.
+
+/// Journal a two-stage run up to `stage.entered` on stage 0, with a surface
+/// rooted at `root`. Every §22.5 window below extends this prefix.
+fn journal_two_stage_prefix(core: &mut Core, work_id: &str, root: &Path) {
+    submit_work(core, work_id, "crash me somewhere");
+    commit(
+        core,
+        work_id,
+        KIND_WORKFLOW_BOUND,
+        json!({
+            "workflow": {"name": "two", "version": "1", "source": "test",
+                         "stages": [{"id": "00-first", "context": "c"},
+                                    {"id": "10-second", "context": "c"}]},
+            "backend": FAKE_BACKEND_NAME,
+        }),
+    );
+    let worktree = root.join("wt");
+    commit(
+        core,
+        work_id,
+        KIND_SURFACE_MATERIALIZED,
+        json!({"surface": {
+            "work_id": work_id,
+            "root": root,
+            "bindings": [{
+                "repository": "solo",
+                "source_path": root,
+                "base_branch": "main",
+                "base_sha": "0".repeat(40),
+                "worktree_path": worktree,
+                "work_branch": format!("sergeant/{work_id}"),
+                "head_sha": "0".repeat(40),
+            }],
+        }}),
+    );
+    commit(
+        core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-first", "index": 0, "attempt": 1}),
+    );
+    commit(core, work_id, KIND_WORK_STARTED, json!({}));
+}
+
+/// The `execution.reserved` payload a crash-window prefix carries.
+fn reservation_payload(execution_id: &str) -> Value {
+    json!({"reservation": {
+        "execution_id": execution_id,
+        "backend": FAKE_BACKEND_NAME,
+        "native_id": format!("fake-session-{execution_id}"),
+        "stage_id": "00-first",
+        "index": 0,
+        "attempt": 1,
+        "stage_kind": "actor",
+    }})
+}
+
+/// The `execution.started` payload for the same execution.
+fn started_payload(execution_id: &str) -> Value {
+    json!({"execution": {
+        "execution_id": execution_id,
+        "backend": FAKE_BACKEND_NAME,
+        "native_id": format!("fake-session-{execution_id}"),
+        "stage_id": "00-first",
+        "attempt": 1,
+        "stop_requested": false,
+    }})
+}
+
+/// The current stage's (id, attempt), for the "no wrong attempt advanced" rule.
+fn stage_coordinate(core: &Core, work_id: &str) -> (String, u32) {
+    let stage = core.registry.state().runs[work_id]
+        .current_stage()
+        .expect("a stage");
+    (stage.stage_id.clone(), stage.attempt)
+}
+
+/// §22.5 window 1 — **before the reservation append**. Nothing was decided,
+/// so there is nothing to be ambiguous about and nothing in the world: the
+/// stage is entered and no execution exists. Fails closed, starts nothing.
+#[test]
+fn n10_window1_before_the_reservation_append() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W1";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_WORK_BLOCKED)[0]["reason"],
+        "no execution to reconcile"
+    );
+    assert!(fake.starts().is_empty(), "nothing may be started");
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-first".to_string(), 1)
+    );
+}
+
+/// §22.5 window 2 — **immediately after the reservation append**. Sergeant
+/// committed to an execution identity; whether anything external exists is
+/// unknowable. Fails closed with the identity in the evidence, launches
+/// nothing, deletes nothing, and closes the window so a retry starts clean.
+#[test]
+fn n11_window2_after_the_reservation_append() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W2";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W2EXEC"),
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains("fake-session-01N3W2EXEC"),
+        "the owned identity must not be lost: {evidence}"
+    );
+    assert!(fake.starts().is_empty(), "no second start");
+    assert!(
+        fake.stop_requests().is_empty(),
+        "nothing unproven is killed"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_ABANDONED)[0]["reason"],
+        "unsettled_at_restart"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-first".to_string(), 1)
+    );
+}
+
+/// §22.5 window 3 — **external identity created, before the started append**,
+/// and window 4 — **the process was running**. One test, because the point is
+/// that they are one situation from the journal's side.
+///
+/// The prefix is byte-for-byte window 2's. What differs is the world: in one
+/// run the adapter holds a context under the reserved identity that has since
+/// exited, in the other it is still live. Recovery must produce the *same*
+/// outcome in all three, because reading the world to tell them apart is
+/// exactly the guess §25 forbids — and the two worlds are indistinguishable
+/// to a restarted daemon anyway, whose adapter has no memory of either.
+#[test]
+fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
+    let mut outcomes = Vec::new();
+    for (label, native) in [
+        ("identity created, turn exited", NativeState::Exited),
+        ("process started and still live", NativeState::Running),
+    ] {
+        let data = TempDir::new().expect("tempdir");
+        let fake = FakeBackend::scripted(
+            FAKE_BACKEND_NAME,
+            [FakeStep::complete().with_native(native)],
+        );
+        let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+        let engine = Engine::new(Arc::new(registry), None, data.path());
+        let mut core = core(data.path());
+        let work_id = "01N3W34";
+        journal_two_stage_prefix(&mut core, work_id, data.path());
+        commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_RESERVED,
+            reservation_payload("01N3W34EXEC"),
+        );
+        // The world the crash left behind: a native context under the
+        // reserved identity that the journal never learned about.
+        let prepared = fake
+            .prepare(&StartRequest {
+                work_id: work_id.to_string(),
+                execution_id: "01N3W34EXEC".to_string(),
+                stage_id: "00-first".to_string(),
+                attempt: 1,
+                cwd: data.path().to_path_buf(),
+                intent: "i".to_string(),
+                context: "c".to_string(),
+                model: None,
+                profile: None,
+            })
+            .expect("prepare");
+        fake.launch(&prepared).expect("launch");
+        let launched_before = fake.starts().len();
+
+        let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+        assert_eq!(report.blocked, vec![work_id.to_string()], "{label}");
+        assert_eq!(
+            fake.starts().len(),
+            launched_before,
+            "{label}: the external effect must not be started twice"
+        );
+        assert!(
+            fake.stop_requests().is_empty(),
+            "{label}: recovery deletes nothing it cannot prove it owns"
+        );
+        assert!(
+            events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+            "{label}: an unrecorded context is never adopted as this run's execution"
+        );
+        assert_eq!(
+            stage_coordinate(&core, work_id),
+            ("00-first".to_string(), 1),
+            "{label}: no attempt advanced"
+        );
+        outcomes.push((
+            core.registry.state().works[work_id].state,
+            events_of(&core, work_id, KIND_EXECUTION_ABANDONED)[0]["reason"].clone(),
+        ));
+    }
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "the same journal prefix must converge the same way whatever the world holds"
+    );
+}
+
+/// §22.5 window 5 — **result observed, before the result append**. The
+/// execution is durable and the backend still has the answer, so this is the
+/// one window that resumes rather than blocking: recovery reattaches, reads
+/// the signal it never got to journal, and finishes the stage — once.
+#[test]
+fn n13_window5_result_observed_before_the_result_append() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete().with_native(NativeState::Exited)],
+    );
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W5";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W5EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STARTED,
+        started_payload("01N3W5EXEC"),
+    );
+    // The pre-crash daemon's context, which this one re-adopts.
+    let prepared = fake
+        .prepare(&StartRequest {
+            work_id: work_id.to_string(),
+            execution_id: "01N3W5EXEC".to_string(),
+            stage_id: "00-first".to_string(),
+            attempt: 1,
+            cwd: data.path().to_path_buf(),
+            intent: "i".to_string(),
+            context: "c".to_string(),
+            model: None,
+            profile: None,
+        })
+        .expect("prepare");
+    fake.launch(&prepared).expect("launch");
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.resumed, vec![work_id.to_string()]);
+    let completed: Vec<Value> = events_of(&core, work_id, "stage.completed")
+        .into_iter()
+        .filter(|e| e["stage_id"] == "00-first")
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly once: the observed result is journaled one time"
+    );
+    // Forward progress: stage 1 was entered, and only stage 1 was launched.
+    assert_eq!(
+        core.registry.state().runs[work_id]
+            .stages
+            .iter()
+            .filter(|s| s.stage_id == "10-second")
+            .count(),
+        1,
+        "the next stage was entered exactly once"
+    );
+    let launched_stages: Vec<String> = fake
+        .starts()
+        .iter()
+        .skip(1) // the pre-crash context this test planted
+        .map(|s| s.stage_id.clone())
+        .collect();
+    assert_eq!(
+        launched_stages,
+        vec!["10-second".to_string()],
+        "stage 0 is never launched a second time"
+    );
+}
+
+/// §22.5 window 6 — **result appended, before the stage transition append**.
+/// `stage.completed` is durable and nothing followed it. Recovery converges
+/// forward — the next stage is entered — without re-running stage 0's
+/// execution and without advancing the wrong attempt.
+#[test]
+fn n14_window6_result_appended_before_the_transition() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete().with_native(NativeState::Exited)],
+    );
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W6";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W6EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STARTED,
+        started_payload("01N3W6EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        "stage.completed",
+        json!({"stage_id": "00-first", "index": 0}),
+    );
+    let prepared = fake
+        .prepare(&StartRequest {
+            work_id: work_id.to_string(),
+            execution_id: "01N3W6EXEC".to_string(),
+            stage_id: "00-first".to_string(),
+            attempt: 1,
+            cwd: data.path().to_path_buf(),
+            intent: "i".to_string(),
+            context: "c".to_string(),
+            model: None,
+            profile: None,
+        })
+        .expect("prepare");
+    fake.launch(&prepared).expect("launch");
+
+    recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("10-second".to_string(), 1),
+        "the transition the crash swallowed is re-derived, at attempt 1"
+    );
+    let relaunched: Vec<String> = fake
+        .starts()
+        .iter()
+        .skip(1)
+        .map(|s| format!("{}#{}", s.stage_id, s.attempt))
+        .collect();
+    assert_eq!(
+        relaunched,
+        vec!["10-second#1".to_string()],
+        "stage 0 attempt 1 is not re-run: {relaunched:?}"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_WORK_BLOCKED).is_empty(),
+        "a recoverable window must not park the work"
+    );
+}
+
+/// §22.5 window 7 — **stage terminal, before the stop/cleanup request**. The
+/// work reached its conclusion and the surface teardown never ran. Recovery
+/// finishes the teardown and journals it; the conclusion is not rewritten and
+/// no execution is revived.
+#[test]
+fn n15_window7_terminal_before_the_cleanup_request() {
+    let data = TempDir::new().expect("tempdir");
+    let surfaces = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(surfaces.path().join("wt")).expect("worktree dir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W7";
+    journal_two_stage_prefix(&mut core, work_id, surfaces.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W7EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STARTED,
+        started_payload("01N3W7EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_COMPLETED,
+        json!({"stages": 2}),
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed,
+        "terminal work is never revived or reclassified"
+    );
+    assert_eq!(events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(), 1);
+    assert!(fake.starts().is_empty(), "nothing is restarted");
+
+    // Idempotent: a second restart finds the teardown recorded and does
+    // nothing at all.
+    let again = recovery::reconcile(&engine, &mut core).expect("reconcile again");
+    assert!(again.surfaces_retired.is_empty());
+    assert_eq!(events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(), 1);
+}
+
+/// §22.5 window 8 — **cleanup complete, before the cleanup append**. The
+/// worktree is already gone; only the record is missing. Recovery re-inspects
+/// (it does not assume), records what the disk actually holds, and marks the
+/// event as recovered so the trail does not pretend it landed on time.
+#[test]
+fn n16_window8_cleanup_done_before_the_cleanup_append() {
+    let data = TempDir::new().expect("tempdir");
+    let surfaces = TempDir::new().expect("tempdir");
+    // No `wt` directory: the crash landed *after* teardown removed it.
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W8";
+    journal_two_stage_prefix(&mut core, work_id, surfaces.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_COMPLETED,
+        json!({"stages": 2}),
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
+    let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    assert_eq!(
+        torn[0]["recovered"], true,
+        "the record says when it was written, not that it was on time"
+    );
+    assert_eq!(
+        torn[0]["report"]["bindings"][0]["disposition"], "missing",
+        "evidence from the disk, not an assumption about which side of the window the crash fell on"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed
+    );
+}
