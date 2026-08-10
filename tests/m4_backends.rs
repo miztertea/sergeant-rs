@@ -64,8 +64,8 @@ use sergeant_rs::backend::claude::{
 };
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
-    AskAuthor, Backend, BackendError, BackendRegistry, BackendSignal, ExecutionHandle, NativeState,
-    ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
+    AskAuthor, Backend, BackendError, BackendRegistry, BackendSignal, Completion, Deferred,
+    ExecutionHandle, NativeState, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, journaling_sink};
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
@@ -5960,4 +5960,49 @@ fn keys_of(value: &Value) -> Vec<String> {
         .unwrap_or_default();
     keys.sort();
     keys
+}
+
+/// A `Deferred` dropped on an early-return path (a `?` between `push` and
+/// `.wait()`) must not silently discard the tail work it was holding — this
+/// is the issue #14/B3 leak class reopened at the engine's internal
+/// error-propagation boundary and closed by `Deferred`'s `Drop` impl
+/// (src/backend/mod.rs). Proven by execution, not by reading the impl: push
+/// a completion whose tail work signals a channel, drop the bag without
+/// calling `.wait()`, and require the signal to arrive within a bounded
+/// wait. Reverting the `Drop` impl leaves the tail closure captured inside
+/// the dropped `Vec<Completion>` and this recv times out.
+#[test]
+fn n27_a_deferred_dropped_with_pending_completions_still_runs_their_tail_work() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+    let mut deferred = Deferred::new();
+    deferred.push(Completion::deferred(move || {
+        tx.send(()).expect("send completion signal");
+    }));
+    assert!(deferred.is_pending());
+    drop(deferred);
+
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("dropping a Deferred with pending completions must still run their tail work");
+}
+
+/// A `Deferred` drained normally through `.wait()` must not have its
+/// completions re-run by the `Drop` impl afterward — `wait`/`absorb` take
+/// the completions out via `mem::take` precisely so the empty bag's `Drop`
+/// is a no-op. Proven by counting actual invocations of the tail closure.
+#[test]
+fn n27b_waiting_a_deferred_runs_each_completion_exactly_once() {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&count);
+
+    let mut deferred = Deferred::new();
+    deferred.push(Completion::deferred(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    deferred.wait();
+
+    // Give a wrongly-still-spawned background thread a chance to run before
+    // asserting, so a regression that double-fires is actually caught.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
