@@ -1,0 +1,62 @@
+
+[1m== stage c2-m4_backends — 2026-08-10T16:34:04Z[0m
+   disk: 18 GB free (floor 10 GB)
+   toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
+   profraw before: 2
+   $ cargo llvm-cov --no-report --test m4_backends
+info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
+   Compiling sergeant-rs v0.1.0 (/home/user/sergeant-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.36s
+     Running tests/m4_backends.rs (target/llvm-cov-target/debug/deps/m4_backends-b388c1e5312edfdc)
+
+running 44 tests
+test a1_real_claude_session_identity_survives_turns_and_restart ... ignored, opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored
+test a3_real_claude_interrupt_leaves_the_conversation_resumable ... ignored, opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored
+test a2_substitution_is_detected_from_the_recorded_envelope ... ok
+test a4_a_crash_between_spawn_and_execution_started_blocks_the_work ... ok
+test a2_provider_qualified_pin_is_rejected_preflight ... ok
+test a4_a_crash_inside_the_reconcile_append_window_rederives_on_restart ... ok
+test a4_reconcile_does_not_ask_a_backend_that_cannot_resume ... ok
+test a4_reconcile_reattaches_a_resumable_execution_before_it_classifies ... ok
+test a4_reconcile_that_cannot_reattach_stays_fail_closed ... ok
+test a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence ... ok
+test a4_restart_reports_a_still_running_turn_as_running_not_exited ... ok
+test a4_restart_with_vanished_session_retires_the_execution_and_blocks ... ok
+test a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept ... ok
+test a7_version_gate_fails_closed_naming_the_probe ... ok
+test a4_a_crash_between_completion_and_teardown_is_swept_on_restart ... ok
+test a4_a_turn_that_dies_without_an_envelope_is_ambiguous_not_a_verdict ... ok
+test a_failed_raw_archive_is_reported_with_its_reason ... ok
+test a_start_that_cannot_spawn_leaves_no_phantom_execution ... ok
+test a_stop_attempt_that_never_reached_the_backend_does_not_disable_the_next_one ... ok
+test a_profile_is_launch_configuration_carried_to_the_claude_adapter ... ok
+test a_recorded_turn_is_normalized_and_archived_verbatim ... ok
+test a_forged_handle_never_resolves_against_the_claude_adapter ... ok
+test an_envelope_less_turn_still_surfaces_its_raw_capture ... ok
+test liveness_reads_turn_argv_and_ignores_processes_that_merely_quote_the_id ... ok
+test r1_worker_reports_done_but_native_session_stays_alive ... ok
+test r2_daemon_dies_during_delivery_fails_closed_with_the_input_preserved ... ok
+test r3_native_dies_after_work_preserved_is_not_a_failure ... ok
+test capabilities_match_behaviour_for_every_backend ... ok
+test r5_stale_execution_identity_is_refused_not_adopted ... ok
+test an_in_flight_turn_is_killed_by_interrupt_and_reported_as_resumable ... ok
+test r7_work_waiting_for_input_is_never_timed_out_or_reclassified ... ok
+test d2_the_launch_grammar_is_session_pinned_then_resumed ... ok
+test resume_refuses_a_pin_that_could_never_be_honored ... ok
+test r4_duplicate_command_delivery_replays_instead_of_re_executing ... ok
+test resume_launches_later_turns_under_the_re_supplied_configuration ... ok
+test stop_kills_a_turn_that_is_still_running ... ok
+test r6_client_disconnect_mid_run_has_no_consequence ... ok
+test the_journaling_sink_chains_causation_within_an_execution ... ok
+test the_live_gate_skips_on_both_of_the_contracts_conditions ... ok
+test the_capability_probe_is_journaled_at_registration ... ok
+test send_refuses_a_second_turn_while_one_is_in_flight ... ok
+test the_real_adapter_journals_from_the_daemon_request_path ... ok
+test the_sinks_causation_chain_is_bounded ... ok
+test stop_latches_and_a_stopped_execution_refuses_input ... ok
+
+test result: ok. 42 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.41s
+
+   profraw produced=1 mergeable=1 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 0
+   stage c2-m4_backends ok
