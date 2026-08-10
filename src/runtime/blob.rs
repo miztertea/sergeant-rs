@@ -127,3 +127,44 @@ impl BlobStore {
         Ok(bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #31 item 1: `BlobStore::get`'s generic io-error branch. The
+    /// existing coverage only ever exercises the happy path and the
+    /// `NotFound` branch; this is a non-`NotFound` failure where the content
+    /// address exists but isn't a regular file. A dir-as-file trick (rather
+    /// than a permission trick) is used deliberately: this suite can run as
+    /// root, where directory-permission bits are not enforced, but "the path
+    /// is a directory, not a file" is a type mismatch `read()` refuses
+    /// unconditionally — verified empirically (`fs::read` on a directory
+    /// fails with `ErrorKind::IsADirectory`) — so it stays a reliable probe
+    /// regardless of the runner's privileges.
+    #[test]
+    fn get_surfaces_a_non_not_found_io_error_when_the_blob_path_is_a_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+
+        let hex = "a".repeat(64);
+        let blob_ref: BlobRef = format!("b3:{hex}").parse().expect("valid ref");
+        // Put a directory where the blob's content-addressed file would be,
+        // instead of ever calling `put` — this is deliberately not the
+        // NotFound case (something exists at the path) and not a hash
+        // mismatch (nothing was ever readable as bytes).
+        fs::create_dir_all(store.root.join(&hex)).expect("place a directory at the blob path");
+
+        let err = store
+            .get(&blob_ref)
+            .expect_err("a directory is not a readable blob");
+        assert!(
+            !matches!(err, BlobError::NotFound(_)),
+            "a path that exists (as a directory) must not be reported as missing: {err:?}"
+        );
+        assert!(
+            matches!(err, BlobError::Io(_)),
+            "expected the generic io-error branch, got {err:?}"
+        );
+    }
+}

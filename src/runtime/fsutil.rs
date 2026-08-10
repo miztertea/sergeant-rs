@@ -228,6 +228,27 @@ mod tests {
         releaser.join().expect("releaser");
     }
 
+    /// Issue #31 item 3: `create_dir_all_durable`'s ancestor-walk fallback
+    /// (`_ => break` when a path has no usable parent to climb to). The path
+    /// `""` hits it on the very first iteration — `Path::new("").exists()`
+    /// is `false` and `Path::new("").parent()` is `None` (both verified
+    /// empirically on this toolchain) — without ever touching the
+    /// filesystem: `fs::create_dir_all("")` is a documented-by-behavior
+    /// no-op `Ok(())` rather than a real syscall, so this cannot leave
+    /// stray directories in whatever the test binary's CWD happens to be
+    /// (unlike a relative single-component path such as `"foo"`, which
+    /// *would* hit the same fallback arm via `Some(parent)` where `parent`
+    /// is empty, but would then actually `mkdir` in the process's CWD — a
+    /// real repo-tree side effect this suite must never risk).
+    #[test]
+    fn create_dir_all_durable_takes_the_no_parent_fallback_without_touching_disk() {
+        let empty = Path::new("");
+        assert!(!empty.exists());
+        assert_eq!(empty.parent(), None);
+
+        create_dir_all_durable(empty).expect("the None-parent fallback must not error");
+    }
+
     #[test]
     fn create_dir_all_durable_creates_nested_dirs_and_is_idempotent() {
         let dir = tempfile::TempDir::new().expect("tempdir");

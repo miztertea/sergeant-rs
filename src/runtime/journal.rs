@@ -570,6 +570,94 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::event::EventSource;
+
+    fn draft(n: u64) -> EventDraft {
+        EventDraft::new(
+            EventSource::new("daemon", "sergeant"),
+            "tool.completed",
+            serde_json::json!({"n": n}),
+        )
+    }
+
+    /// Issue #30 items 1-2, in-module (no production seam): swap the private
+    /// `segment_file` for a read-only handle on the same path, so the next
+    /// append's `write_all` fails at the OS level (EBADF — the fd was never
+    /// opened for writing) regardless of the test process's own privileges.
+    ///
+    /// Item 2 (the torn-append rollback-then-poison handler, lines ~270-274):
+    /// the same read-only handle also can't be `set_len`-truncated (EINVAL),
+    /// so the failed write's rollback attempt itself fails — and `poisoned`
+    /// is set. Grep-verified: `self.poisoned = true` appears exactly once in
+    /// this whole module, on that rollback-failure arm, so observing
+    /// `journal.poisoned` after the failed append is direct evidence that
+    /// arm ran (not merely that the write failed). The rollback also leaves
+    /// no torn bytes here, because the write's own permission failure occurs
+    /// before any byte reaches the OS buffer — asserted below by comparing
+    /// the segment's raw bytes before and after.
+    ///
+    /// Item 1 (the poisoned-handle short-circuit, line ~249): a second
+    /// append after poisoning must be refused immediately with
+    /// `JournalError::Poisoned`, not re-attempt the write.
+    #[test]
+    fn append_event_poisons_the_handle_when_a_failed_writes_rollback_also_fails() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open(dir.path()).expect("open");
+
+        // A real committed line first, so there is a known-good on-disk
+        // state and segment_len to check the "no torn bytes" claim against.
+        journal.append(draft(1)).expect("first append must succeed");
+        let segment_path = dir
+            .path()
+            .join("journal")
+            .join(segment_file_name(journal.segment_index));
+        let bytes_before_failure =
+            fs::read(&segment_path).expect("read segment after the healthy append");
+        let next_before_failure = journal.next_seq();
+
+        journal.segment_file = OpenOptions::new()
+            .read(true)
+            .open(&segment_path)
+            .expect("reopen the segment read-only");
+
+        let err = journal
+            .append(draft(2))
+            .expect_err("write_all must fail on a read-only handle");
+        assert!(
+            matches!(err, JournalError::Io(_)),
+            "expected an io error surfaced from the failed write, got {err:?}"
+        );
+        assert!(
+            journal.poisoned,
+            "a failed write whose rollback (set_len) also fails must poison the handle"
+        );
+        assert_eq!(
+            journal.next_seq(),
+            next_before_failure,
+            "a failed append must not advance next_seq"
+        );
+        let bytes_after_failure =
+            fs::read(&segment_path).expect("read segment after the failed append");
+        assert_eq!(
+            bytes_after_failure, bytes_before_failure,
+            "a failed append must never leave torn bytes behind, rollback or not"
+        );
+
+        // Item 1: the poison latch holds on every further call, refusing
+        // before ever touching the (still) unusable handle.
+        let err2 = journal
+            .append(draft(3))
+            .expect_err("a poisoned handle must refuse further appends");
+        assert!(
+            matches!(err2, JournalError::Poisoned),
+            "expected the poisoned-handle short-circuit, got {err2:?}"
+        );
+        assert_eq!(
+            journal.next_seq(),
+            next_before_failure,
+            "a refused append must not advance next_seq either"
+        );
+    }
 
     #[test]
     fn segment_creation_past_the_8_digit_namespace_fails_closed() {

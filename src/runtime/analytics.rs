@@ -1719,4 +1719,30 @@ mod tests {
         assert!(debug.contains("path: \":memory:\""), "{debug}");
         assert!(debug.contains("last_seq: 1"), "{debug}");
     }
+
+    /// Issue #31 item 4: `remove_if_present`'s `Err(e)` pass-through for a
+    /// non-`NotFound` removal failure. This suite can run as root, where a
+    /// read-only-parent-dir trick is not enforced (verified empirically:
+    /// `chmod 555` on a directory does not stop root from unlinking inside
+    /// it), so the probe uses a type mismatch `unlink` refuses
+    /// unconditionally instead: passing a *directory* fails with
+    /// `ErrorKind::IsADirectory`, not `NotFound`, regardless of privilege.
+    #[test]
+    fn remove_if_present_surfaces_a_non_not_found_removal_failure() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let victim = dir.path().join("not-actually-a-file.duckdb.wal");
+        std::fs::create_dir_all(&victim).expect("place a directory at the removal target");
+
+        let err =
+            remove_if_present(&victim).expect_err("removing a directory via remove_file must fail");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "a path that exists (as a directory) must not be reported as missing: {err}"
+        );
+        assert!(
+            victim.is_dir(),
+            "the non-NotFound failure must leave it untouched"
+        );
+    }
 }
