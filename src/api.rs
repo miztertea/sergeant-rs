@@ -197,6 +197,29 @@ pub fn router(state: ApiState) -> Router {
         .merge(ui)
 }
 
+/// Run one blocking closure without occupying an async worker.
+///
+/// `block_in_place` rather than `spawn_blocking` (R1: the cheaper primitive
+/// that already does the job). Both keep the effect off the async worker;
+/// `spawn_blocking` additionally moves the value to another thread and back,
+/// which costs two task hops per launch — measured at burst 50, that showed up
+/// as a throughput regression against R-N0-4's floor. `block_in_place` hands
+/// the current worker's other tasks to a replacement thread and runs the
+/// closure right here, so the launch costs no migration at all.
+///
+/// It requires a multi-thread runtime; the single-thread fallback runs the
+/// closure inline, which is what a current-thread runtime can do anyway.
+async fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 /// Turn the engine's crank to a park, **holding no core lock across any
 /// external effect** (§14.2's middle phase, §22.6's budget).
 ///
@@ -213,46 +236,49 @@ pub fn router(state: ApiState) -> Router {
 /// succeeded: the reservation is durable and, if the launch got that far, the
 /// journal says so. Recovery re-derives from that record; inventing a failure
 /// response for a command that was accepted would be worse than the log line.
-async fn crank(state: &ApiState, step: Step) {
+///
+/// It **returns the guard it is still holding** when the crank ends with the
+/// lock in hand and nothing outstanding, so the caller can render its response
+/// without queueing for the mutex a fourth time. That is not a shortcut around
+/// the boundary: the guard is dropped before every launch and before every
+/// completion wait, which are the only places §22.6 cares about.
+async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'_, Core>> {
     let mut step = step;
+    let mut held: Option<tokio::sync::MutexGuard<'_, Core>> = None;
     loop {
         let Step { next, deferred } = step;
-        if deferred.is_pending()
-            && let Err(e) = tokio::task::spawn_blocking(move || deferred.wait()).await
-        {
-            tracing::warn!(error = %e, "an adapter completion task failed to join");
+        if deferred.is_pending() {
+            drop(held.take()); // never wait on an adapter under the guard
+            blocking(move || deferred.wait()).await;
         }
         let EngineNext::Launch(pending) = next else {
-            return;
+            return held;
         };
-        let launched = tokio::task::spawn_blocking(move || {
-            let outcome = pending.launch();
-            (pending, outcome)
-        })
-        .await;
-        let (pending, outcome) = match launched {
-            Ok(launched) => launched,
-            Err(e) => {
-                // The launch task itself died (panic or runtime shutdown).
-                // The reservation stays unsettled in the journal, which is
-                // exactly the state a crash here leaves and is handled the
-                // same way at the next restart: fail closed, never guess.
-                tracing::error!(error = %e, "the launch task did not complete");
-                return;
-            }
-        };
+        drop(held.take()); // never launch under the guard
+        let outcome = blocking(|| pending.launch()).await;
         let work_id = pending.work_id().to_string();
         let mut core = state.core.lock().await;
         match state.engine.settle_launch(&mut core, pending, outcome) {
             Ok(next_step) => {
-                drop(core);
+                held = Some(core);
                 step = next_step;
             }
             Err(e) => {
                 tracing::error!(work_id = %work_id, error = %e, "settling a launch failed");
-                return;
+                return Some(core);
             }
         }
+    }
+}
+
+/// Take the guard [`crank`] handed back, or acquire one if it kept none.
+async fn relock<'a>(
+    state: &'a ApiState,
+    held: Option<tokio::sync::MutexGuard<'a, Core>>,
+) -> tokio::sync::MutexGuard<'a, Core> {
+    match held {
+        Some(guard) => guard,
+        None => state.core.lock().await,
     }
 }
 
@@ -696,8 +722,7 @@ async fn submit_work(
             }
         };
         drop(core);
-        crank(&state, step).await;
-        core = state.core.lock().await;
+        core = relock(&state, crank(&state, step).await).await;
     }
 
     // Answer from the projection, not the request: proves the read path.
@@ -948,8 +973,7 @@ async fn work_input(
     match engine.begin_input(&mut core, &id, &req.input) {
         Ok(step) => {
             drop(core);
-            crank(&state, step).await;
-            let mut core = state.core.lock().await;
+            let mut core = relock(&state, crank(&state, step).await).await;
             let result = work_view(&core, &id);
             record_and_respond(
                 &mut core,
@@ -1012,8 +1036,7 @@ async fn work_retry(
     match engine.begin_retry(&mut core, &id) {
         Ok(step) => {
             drop(core);
-            crank(&state, step).await;
-            let mut core = state.core.lock().await;
+            let mut core = relock(&state, crank(&state, step).await).await;
             let result = work_view(&core, &id);
             record_and_respond(
                 &mut core,
