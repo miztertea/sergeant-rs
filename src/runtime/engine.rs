@@ -1757,15 +1757,28 @@ impl Engine {
     /// closed with the reserved identity in the evidence, which is the thing
     /// an operator needs to go and look for.
     ///
+    /// **It does ask the adapter what the reserved identity looks like now.**
+    /// The disposition does not depend on the answer — it is ambiguous either
+    /// way, because "a live turn under this session id" and "sergeant owns
+    /// this execution" are different claims — but the answer is *evidence*,
+    /// and for the only real adapter it is available: the reservation
+    /// journaled the session UUID, and `ClaudeBackend::observe` answers
+    /// exactly this question for a handle it has no memory of, by finding the
+    /// session id in a live turn's argv. Declining to look meant a live orphan
+    /// writing into the work's worktree was neither reported nor visible to
+    /// the human who then hits `retry` and puts a second harness beside it.
+    /// An adapter that cannot answer says so, and "no evidence" is recorded as
+    /// no evidence — never as proof of absence.
+    ///
     /// Three things this deliberately does **not** do:
     ///
-    /// - it does not ask the adapter to observe or resume the identity. The
-    ///   adapter has no record of it (the reservation predates its state), so
-    ///   the question would return `UnknownExecution` and that refusal would
-    ///   read like evidence the context does not exist. It is not.
+    /// - it does not RESUME. Observing is a question; re-adopting is a claim
+    ///   of ownership over a context this daemon never launched.
     /// - it does not stop or delete anything. §22.5's rule for every crash
     ///   window is that recovery must not delete unproven state, and a
-    ///   possibly-nonexistent native context is the purest case of it.
+    ///   possibly-nonexistent native context is the purest case of it. A turn
+    ///   the adapter reports as *live* is named in the block reason instead,
+    ///   which is what an operator can act on.
     /// - it does not retry. Re-launching would be the "start the external
     ///   effect twice" failure the same rule forbids.
     ///
@@ -1783,10 +1796,24 @@ impl Engine {
             Some(native_id) => format!("reserved native identity {native_id}"),
             None => "no native identity had been reserved yet".to_string(),
         };
+        let native = self.reserved_identity_liveness(reservation);
+        let liveness = match native {
+            Some(NativeState::Running) => format!(
+                "the adapter reports a LIVE native context under {identity} — it may still be \
+                 writing into this work's surface; stop it before retrying"
+            ),
+            Some(NativeState::Exited) => {
+                "the adapter reports the reserved native context has exited".to_string()
+            }
+            Some(NativeState::Unknown) | None => format!(
+                "the adapter could not say whether anything exists under {identity}, which is \
+                 not evidence that nothing does"
+            ),
+        };
         let evidence = format!(
             "execution {} was reserved on backend {:?} for stage {} attempt {}, and the journal \
-             never recorded whether its launch happened ({identity}); sergeant will not guess, \
-             start it a second time, or remove anything it cannot prove it owns",
+             never recorded whether its launch happened ({identity}); {liveness}; sergeant will \
+             not guess, start it a second time, or remove anything it cannot prove it owns",
             reservation.execution_id,
             reservation.backend,
             reservation.stage_id,
@@ -1813,6 +1840,10 @@ impl Engine {
                 "reason": "unsettled_at_restart",
                 "detail": evidence,
                 "launched": Value::Null,
+                // Evidence, not state (§15's own distinction): what the
+                // adapter could see of the reserved identity at this restart.
+                // `null` is "could not look", which is not "nothing there".
+                "native": native.map(NativeState::as_str),
             }),
         )?;
         if let Some(stage) = run.current_stage() {
@@ -1823,13 +1854,35 @@ impl Engine {
                 json!({"stage_id": stage.stage_id, "detail": evidence.clone()}),
             )?;
         }
-        self.block(
-            core,
-            work_id,
-            "an execution was reserved but its launch was never recorded",
-            Some(evidence),
-        )?;
+        let reason = if native == Some(NativeState::Running) {
+            "an execution was reserved, its launch was never recorded, and a native context \
+             under the reserved identity is still running"
+        } else {
+            "an execution was reserved but its launch was never recorded"
+        };
+        self.block(core, work_id, reason, Some(evidence))?;
         Ok(ReconcileDisposition::Ambiguous)
+    }
+
+    /// What the adapter can see of a reserved-but-unsettled native identity.
+    ///
+    /// `None` means the question could not be asked or the adapter refused —
+    /// an unregistered backend, a reservation with no native id yet, an
+    /// `UnknownExecution` from an adapter with no way to look. All of those
+    /// are "no evidence", which the caller must not read as "nothing exists".
+    fn reserved_identity_liveness(
+        &self,
+        reservation: &ExecutionReservation,
+    ) -> Option<NativeState> {
+        let native_id = reservation.native_id.clone()?;
+        let backend = self.backends.get(&reservation.backend)?;
+        backend
+            .observe(&ExecutionHandle {
+                execution_id: reservation.execution_id.clone(),
+                native_id: Some(native_id),
+            })
+            .ok()
+            .map(|observation| observation.native)
     }
 
     /// §25's reattach step: ask the backend to re-adopt the recorded native

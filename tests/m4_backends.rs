@@ -5134,18 +5134,27 @@ fn n11_window2_after_the_reservation_append() {
 }
 
 /// §22.5 window 3 — **external identity created, before the started append**,
-/// and window 4 — **the process was running**. One test, because the point is
-/// that they are one situation from the journal's side.
+/// and window 4 — **the process was running**.
 ///
 /// The prefix is byte-for-byte window 2's. What differs is the world: in one
 /// run the adapter holds a context under the reserved identity that has since
-/// exited, in the other it is still live. Recovery must produce the *same*
-/// outcome in all three, because reading the world to tell them apart is
-/// exactly the guess §25 forbids — and the two worlds are indistinguishable
-/// to a restarted daemon anyway, whose adapter has no memory of either.
+/// exited, in the other it is still live. Two things must both hold, and they
+/// are not the same thing:
+///
+/// - the **disposition** converges. Both windows fail closed, abandon the
+///   reservation for the same reason, start nothing, kill nothing and advance
+///   no attempt. Deciding differently would be reading the world to move state,
+///   which is exactly the guess §25 forbids.
+/// - the **evidence** differs. Recovery asks the adapter what it can see of the
+///   reserved identity, because for the real adapter that question is
+///   answerable from `/proc` and a live orphan writing into this work's
+///   surface is the single most important thing to put in front of the human
+///   who is about to hit `retry`. Before, the variant knob in this test was
+///   unread and the equality below was a tautology.
 #[test]
 fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
     let mut outcomes = Vec::new();
+    let mut evidence = Vec::new();
     for (label, native) in [
         ("identity created, turn exited", NativeState::Exited),
         ("process started and still live", NativeState::Running),
@@ -5204,14 +5213,33 @@ fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
             ("00-first".to_string(), 1),
             "{label}: no attempt advanced"
         );
+        let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED)[0].clone();
+        assert_eq!(
+            abandoned["native"],
+            native.as_str(),
+            "{label}: the adapter's answer about the reserved identity is recorded"
+        );
+        let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
         outcomes.push((
             core.registry.state().works[work_id].state,
-            events_of(&core, work_id, KIND_EXECUTION_ABANDONED)[0]["reason"].clone(),
+            abandoned["reason"].clone(),
         ));
+        evidence.push(blocked.last().expect("a block").clone());
     }
     assert_eq!(
         outcomes[0], outcomes[1],
         "the same journal prefix must converge the same way whatever the world holds"
+    );
+    assert_ne!(
+        evidence[0]["reason"], evidence[1]["reason"],
+        "…and must still say which world it found: {evidence:?}"
+    );
+    assert!(
+        evidence[1]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("still running")),
+        "a live orphan must be named where a human will read it: {}",
+        evidence[1]
     );
 }
 
