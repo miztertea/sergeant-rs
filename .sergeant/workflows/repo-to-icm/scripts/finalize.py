@@ -61,12 +61,20 @@ is removed exactly as `evidence` is — declaring nothing promotes nothing.
 
 USAGE
 -----
-    python3 finalize.py [WORKFLOW_ROOT]
+    python3 finalize.py [--dry-run] [WORKFLOW_ROOT]
 
 WORKFLOW_ROOT defaults to this script's own workflow directory (the parent
 of `scripts/`) — the ordinary case when invoked by `90-reconcile` in the
 materialized run worktree. An explicit argument is accepted for review or
 testing against a copy.
+
+`--dry-run` computes and prints the exact same keep/remove plan (including
+any REFUSED ambiguity) but performs no filesystem or git mutation — no
+`git rm`, no `git commit`, no `os.remove`. Its exit code matches what a real
+run would return (0 clean-apply-or-nothing-to-do, 1 refused-ambiguous, 2
+usage/environment error), so it is safe to sanity-check the disposition
+plan against a real or scratch worktree before the closing stage actually
+applies it.
 
 Exits 0 on a clean apply (including "nothing to do"), 1 if any stage's
 output could not be resolved unambiguously (nothing is modified in that
@@ -215,12 +223,16 @@ def git(*args, cwd):
 
 
 def main():
-    if len(sys.argv) > 2:
-        print("usage: finalize.py [WORKFLOW_ROOT]", file=sys.stderr)
+    args = sys.argv[1:]
+    dry_run = "--dry-run" in args
+    positional = [a for a in args if a != "--dry-run"]
+
+    if len(positional) > 1:
+        print("usage: finalize.py [--dry-run] [WORKFLOW_ROOT]", file=sys.stderr)
         return 2
 
-    if len(sys.argv) == 2:
-        root = os.path.abspath(sys.argv[1])
+    if len(positional) == 1:
+        root = os.path.abspath(positional[0])
     else:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -243,11 +255,16 @@ def main():
         for fname in p.keep:
             print(f"keep    {p.stage_id}/output/{fname}  (promote)")
         for fname in p.remove:
-            print(f"remove  {p.stage_id}/output/{fname}")
+            verb = "would remove" if dry_run else "remove"
+            print(f"{verb}  {p.stage_id}/output/{fname}")
             to_remove.append(os.path.join(p.stage_id, "output", fname))
 
     if not to_remove:
         print("\nnothing to finalize (no evidence-class or undeclared files present)")
+        return 0
+
+    if dry_run:
+        print(f"\ndry-run: would finalize {len(to_remove)} file(s); nothing modified.")
         return 0
 
     in_git = git("rev-parse", "--is-inside-work-tree", cwd=root)
