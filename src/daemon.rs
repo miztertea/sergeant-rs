@@ -641,8 +641,8 @@ mod tests {
     use super::*;
     use crate::domain::event::Event;
     use crate::domain::work::{KIND_WORK_COMPLETED, KIND_WORK_NEEDS_INPUT, KIND_WORK_SUBMITTED};
+    use crate::telemetry::test_support::counter_total;
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use std::time::Duration;
 
@@ -740,34 +740,6 @@ mod tests {
         .into_event(seq)
     }
 
-    /// The largest value a `u64` counter reports across every export batch.
-    ///
-    /// Not a sum: this is driven from inside a live tokio runtime (the
-    /// `#[tokio::test]` executor), so the SDK's `PeriodicReader` can fire its
-    /// own background collect in addition to the test's explicit
-    /// `force_flush` — telemetry.rs's own equivalent helper never sees this,
-    /// since its tests are plain `#[test]`s with no runtime to drive that
-    /// background task at all. Every collect of a cumulative counter reports
-    /// the *total so far*, so summing batches double-counts; the largest
-    /// value is the true total regardless of how many times collection ran.
-    fn counter_total(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
-        exporter
-            .get_finished_metrics()
-            .expect("metrics")
-            .iter()
-            .flat_map(|resource| resource.scope_metrics())
-            .flat_map(|scope| scope.metrics())
-            .filter(|metric| metric.name() == name)
-            .map(|metric| match metric.data() {
-                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
-                    sum.data_points().map(|dp| dp.value()).sum::<u64>()
-                }
-                _ => 0,
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
     /// `commit_normalized_events` commits while its `Weak<Core>` still
     /// upgrades, and stops committing — without panicking or hanging — the
     /// moment the daemon's last strong reference is gone. This is the exact
@@ -804,9 +776,17 @@ mod tests {
             json!({}),
         ))
         .expect("queue after drop");
-        drop(tx);
 
+        // `tx` is deliberately still alive here. Stopping is the guard, not
+        // discarding: a committer that merely skipped the draft and kept
+        // draining would satisfy every assertion below, and would also keep
+        // the journal's exclusive lock on the data dir alive for as long as
+        // any sink handle exists — the successor-daemon lockout
+        // `journaling_sink`'s doc comment exists to prevent. With the
+        // sending half held open the *only* thing that can end this thread
+        // is the failed `Weak::upgrade` returning.
         join_with_deadline(handle, Duration::from_secs(5));
+        drop(tx);
 
         let kinds: Vec<String> = Journal::replay_data_dir(data.path())
             .expect("replay")
@@ -823,6 +803,54 @@ mod tests {
         );
     }
 
+    /// How many live threads carry the name `journaling_sink` gives its
+    /// committer. Linux truncates thread names to 15 bytes
+    /// (`TASK_COMM_LEN - 1`), so `"sergeant-event-sink"` is published under
+    /// `/proc/self/task/*/comm` as `"sergeant-event-"`.
+    ///
+    /// This is positive evidence that a committer has really exited, which
+    /// the send-after-gone test needs and cannot get any other way: the sink
+    /// swallows the delivery failure by design, and nothing else it can
+    /// observe distinguishes "the send failed" from "the send succeeded and
+    /// the draft was discarded". Nothing else in this test binary spawns
+    /// that thread — `journaling_sink`'s only other caller is `start_with`,
+    /// which no unit test in this crate runs — so a non-zero count here is
+    /// this test's own committer.
+    #[cfg(target_os = "linux")]
+    fn committer_threads_alive() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("read /proc/self/task")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                std::fs::read_to_string(entry.path().join("comm"))
+                    .is_ok_and(|name| name.trim_end() == "sergeant-event-")
+            })
+            .count()
+    }
+
+    /// Block until [`committer_threads_alive`] reads `expected`, bounded so a
+    /// committer that never stops fails the test instead of hanging it. A
+    /// wait rather than a bare read in both directions: `Builder::spawn`
+    /// returns before the new thread has published its own name, and exit is
+    /// asynchronous by nature. Off Linux there is no `/proc` to read, so this
+    /// degrades to a fixed pause — the weaker pre-existing shape, kept only
+    /// so the test still compiles and runs there.
+    fn wait_for_committer_threads(expected: usize, why: &str) {
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while committer_threads_alive() != expected {
+                assert!(std::time::Instant::now() < deadline, "{why}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, why);
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
     /// The sink `journaling_sink` returns is a plain closure over a channel
     /// `Sender`; once the committer thread has actually exited (its
     /// receiver goes with it), every further call must be swallowed as a
@@ -833,6 +861,11 @@ mod tests {
         let data = tempfile::TempDir::new().expect("tempdir");
         let core = Arc::new(tokio::sync::Mutex::new(test_core(data.path())));
         let sink = journaling_sink(core.clone());
+        wait_for_committer_threads(
+            1,
+            "the sink must have spawned exactly the committer this test then \
+             waits out",
+        );
 
         // Drop the only strong reference the committer could ever upgrade
         // to, then wake it: the next draft it dequeues finds the core
@@ -845,19 +878,22 @@ mod tests {
             json!({}),
         ));
 
-        // Keep calling the sink across a generous window. The committer's
-        // per-message work is a couple of microseconds (no I/O — just a
-        // failed `Weak::upgrade`), so well before this loop ends the
-        // channel's receiving half is gone and every remaining call here
-        // exercises exactly the branch under test. If it panicked instead
-        // of logging, this loop would abort right there.
-        for i in 0..200 {
+        // Not "wait a while and assume": wait until the receiving half is
+        // provably gone, so every call below really is a failed send hitting
+        // the swallow branch. If it panicked instead of logging, this would
+        // abort right here.
+        wait_for_committer_threads(
+            0,
+            "the committer must exit once the core is gone; while it is still \
+             running the sink's send cannot fail and the branch under test is \
+             never reached",
+        );
+        for i in 0..3 {
             sink(EventDraft::new(
                 EventSource::new("test", "t"),
                 format!("test.after_gone.{i}"),
                 json!({}),
             ));
-            std::thread::sleep(Duration::from_millis(1));
         }
 
         let kinds: Vec<String> = Journal::replay_data_dir(data.path())
@@ -948,5 +984,43 @@ mod tests {
             1,
             "Closed must force_flush before returning"
         );
+    }
+
+    /// …and that flush covers *both* pipelines, not just the meter half the
+    /// counter above can see.
+    ///
+    /// `Telemetry::with_exporters` wires a *simple* span processor, which
+    /// exports at span end and whose `force_flush` is therefore a no-op: on
+    /// that pipeline the spans are already out before anything flushes, so
+    /// `Telemetry::force_flush`'s `tracer_provider.force_flush()` line could
+    /// be deleted with every other daemon test green. A **batched** processor
+    /// holds finished spans in its own queue on a five-second timer, so the
+    /// span is exported here if and only if `export_events` really flushed
+    /// the tracer pipeline before returning.
+    #[tokio::test]
+    async fn export_events_force_flushes_the_span_pipeline_too_when_the_channel_closes() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Arc::new(Telemetry::with_batch_span_exporter(spans.clone(), metrics));
+
+        let (tx, rx) = broadcast::channel::<Event>(4);
+        tx.send(work_submitted_event(1, "flushed")).expect("open");
+        tx.send(work_completed_event(2, "flushed")).expect("close");
+        drop(tx);
+
+        // A clone, not a move, for the same reason as the two tests above.
+        tokio::time::timeout(Duration::from_secs(5), export_events(telemetry.clone(), rx))
+            .await
+            .expect("export_events must return once the sender side is gone");
+
+        let finished = spans.get_finished_spans().expect("spans");
+        assert_eq!(
+            finished.len(),
+            1,
+            "Closed must force_flush the span pipeline before returning: an \
+             unflushed batch processor is still holding this span in its own \
+             queue, and the export never happened: {finished:?}"
+        );
+        assert_eq!(finished[0].name, "work");
     }
 }

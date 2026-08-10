@@ -675,8 +675,72 @@ fn resource() -> Resource {
         .build()
 }
 
+/// Pipeline shapes and metric readers that exist only for tests, here rather
+/// than in a test module because `daemon.rs`'s own `#[cfg(test)]` module
+/// needs them too and `from_providers` is private to this module. Compiled
+/// out of the daemon entirely.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::trace::BatchSpanProcessor;
+
+    impl Telemetry {
+        /// [`Telemetry::with_exporters`]'s batched twin: finished spans wait
+        /// in the processor's own queue until something flushes it.
+        ///
+        /// The simple processor `with_exporters` builds exports at span end,
+        /// so its `force_flush` is a no-op and a test built on it cannot tell
+        /// whether [`Telemetry::force_flush`] flushed the tracer pipeline at
+        /// all. This one can: unflushed means unexported.
+        pub(crate) fn with_batch_span_exporter(
+            spans: impl SpanExporter + 'static,
+            metrics: impl PushMetricExporter + 'static,
+        ) -> Self {
+            let tracer_provider = SdkTracerProvider::builder()
+                .with_resource(resource())
+                .with_span_processor(BatchSpanProcessor::builder(spans).build())
+                .build();
+            Self::from_providers(tracer_provider, metrics)
+        }
+    }
+
+    /// The largest value a `u64` counter reports across every export batch,
+    /// 0 if the instrument never exported. Reading the actual value (not just
+    /// the instrument's name) is what proves the fold recorded the right
+    /// *count*, not merely that the instrument exists.
+    ///
+    /// The largest, not the sum: a caller driving this from inside a live
+    /// tokio runtime (`#[tokio::test]`) lets the SDK's `PeriodicReader` fire
+    /// its own background collect alongside the test's explicit
+    /// `force_flush`, and every collect of a *cumulative* counter reports the
+    /// total so far — so summing batches double-counts while the maximum is
+    /// the true total however many times collection ran. With a single batch
+    /// the two agree, which is why this one function serves both this
+    /// module's plain `#[test]`s and `daemon.rs`'s `#[tokio::test]`s.
+    pub(crate) fn counter_total(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+        exporter
+            .get_finished_metrics()
+            .expect("metrics")
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .filter(|metric| metric.name() == name)
+            .map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    sum.data_points().map(|dp| dp.value()).sum::<u64>()
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::counter_total;
     use super::*;
     use crate::domain::event::{EventDraft, EventSource};
     use crate::domain::work::{
@@ -684,7 +748,6 @@ mod tests {
         KIND_WORK_WAITING,
     };
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use serde_json::json;
 
@@ -714,27 +777,6 @@ mod tests {
             .flat_map(|scope| scope.metrics())
             .map(|metric| metric.name().to_string())
             .collect()
-    }
-
-    /// Sum of a `u64` counter's data points across every export batch, 0 if
-    /// the instrument never exported. Reading the actual value (not just the
-    /// instrument's name) is what proves the fold recorded the right
-    /// *count*, not merely that the instrument exists.
-    fn counter_total(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
-        exporter
-            .get_finished_metrics()
-            .expect("metrics")
-            .iter()
-            .flat_map(|resource| resource.scope_metrics())
-            .flat_map(|scope| scope.metrics())
-            .filter(|metric| metric.name() == name)
-            .map(|metric| match metric.data() {
-                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
-                    sum.data_points().map(|dp| dp.value()).sum::<u64>()
-                }
-                _ => 0,
-            })
-            .sum()
     }
 
     /// Issue #34 item 1: `from_config` with an **enabled** config must
