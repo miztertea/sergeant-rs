@@ -1,0 +1,46 @@
+S1 phase 1 measurements — 2026-08-10, uninstrumented, this container (4 cores / 15 GiB)
+Cited by scripts/coverage/README.md's wall-clock deadline ranking.
+
+== suite wall times (cargo test --test <suite>, warm build, box otherwise idle) ==
+   m1_event_core    1s   (10 tests, 1.05s harness-reported)
+   m4_backends      4s   (42 tests + 2 ignored, 3.13s)
+   m2_daemon_api    7s   (22 tests, 6.58s)
+   m3_execution     7s   (24 tests, 6.39s)
+   m6_surfaces      9s   (16 tests, 8.82s)
+   m5_projections  10s   (17 tests, 9.54s)
+   --lib            2s   (88 tests, 1.48s)
+   total          219 tests + 2 opt-in, never run (#[ignore], real Claude)
+
+== daemon boot -> runtime.json published (the m6:2341 / 30s deadline) ==
+   5 samples, target/debug/sgt --data-dir <fresh> daemon, polled every 10ms:
+   1845 ms (first, cold page cache), 790, 762, 769, 738 ms
+   -> 16-40x headroom against the 30s bound, idle and uninstrumented.
+
+== journal rebuild (the m5:2344 / 30s asserted bound) ==
+   rebuild: 16000 events -> 1.171158377s (13661.7 events/s); 5 canned queries: 128.127461ms
+   -> 25.6x headroom. (S0's static estimate was ~27x; consistent.)
+
+== #[cfg(test)] volume in src/ (counted as covered by the report — see P5) ==
+   src/runtime/mod.rs             70 lines     50 under #[cfg(test)]    71%
+   src/runtime/fsutil.rs         278 lines    135 under #[cfg(test)]    49%
+   src/runtime/recovery.rs       368 lines    174 under #[cfg(test)]    47%
+   src/tui.rs                   1718 lines    709 under #[cfg(test)]    41%
+   src/runtime/router.rs         351 lines    144 under #[cfg(test)]    41%
+   src/domain/profile.rs          83 lines     32 under #[cfg(test)]    39%
+   src/runtime/surface.rs        831 lines    320 under #[cfg(test)]    39%
+   src/domain/mod.rs              48 lines     18 under #[cfg(test)]    38%
+   src/domain/work.rs            307 lines    114 under #[cfg(test)]    37%
+   src/domain/workspace.rs       525 lines    169 under #[cfg(test)]    32%
+   src/domain/event.rs           327 lines     97 under #[cfg(test)]    30%
+   src/backend/fake.rs           717 lines    204 under #[cfg(test)]    28%
+   src/domain/workflow.rs        535 lines    135 under #[cfg(test)]    25%
+   src/runtime/graph.rs          503 lines    125 under #[cfg(test)]    25%
+   src/backend/claude.rs        2156 lines    435 under #[cfg(test)]    20%
+   src/runtime/git.rs            107 lines     16 under #[cfg(test)]    15%
+   src/web.rs                    606 lines     75 under #[cfg(test)]    12%
+   src/api.rs                   1992 lines    215 under #[cfg(test)]    11%
+   src/telemetry.rs              727 lines     50 under #[cfg(test)]     7%
+   src/runtime/analytics.rs     1557 lines     83 under #[cfg(test)]     5%
+   src/runtime/journal.rs        598 lines     29 under #[cfg(test)]     5%
+   src/runtime/engine.rs        1424 lines     67 under #[cfg(test)]     5%
+   TOTAL src                   18861 lines   3396 under #[cfg(test)]  18.0%
