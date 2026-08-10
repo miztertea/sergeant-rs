@@ -157,6 +157,21 @@ Rules:
    conversation state — is how context flows between stages; the engine's
    fresh-execution-per-stage model (§7.1) depends on it.
 
+Open questions (recorded, not resolved — N2's runs are the measurement):
+
+- **Merge-back semantics for Layer 4.** ICM assumes a static workspace
+  whose outputs accumulate; Sergeant's Work branches are meant to merge.
+  Working rule until measured: per-run `output/` artifacts are Work-branch
+  evidence, and the workflow's closing stage explicitly decides what is
+  promoted into the merge and what is dropped — silence promotes nothing.
+  Whether that rule survives real runs (or needs `.gitignore`d outputs, a
+  strip step, or an engine-owned artifact home) is an N2 observation.
+- **Inputs-table enforceability.** Lint can verify that listed paths
+  resolve and that L4 inputs come from earlier stages (machine-checkable).
+  *Completeness* — no contract-bearing dependency omitted — is
+  review-enforced only. Rule 1's "violation" is a review verdict, not a
+  lint result, and the convention claims no more than that.
+
 ## 2. The draft publication boundary
 
 ```text
