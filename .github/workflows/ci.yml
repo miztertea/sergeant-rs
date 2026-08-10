@@ -1,7 +1,11 @@
 name: CI
 
 on:
+  # `on: [push, pull_request]` ran this battery twice for every push to a PR
+  # branch — same commit, same result, twice the wait. Pushes are checked on
+  # `main` only; every other branch is checked through its pull request.
   push:
+    branches: [main]
   pull_request:
 
 env:
