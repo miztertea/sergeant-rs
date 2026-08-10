@@ -16,7 +16,7 @@ scripts/demo.sh                                      # §39 end-to-end walkthrou
 scripts/gate.sh "<intent>"                           # shipping gate via the no-mistakes pipeline (see below)
 ```
 
-First build is slow: bundled DuckDB compiles ~500 C++ translation units (~10 min cold). `Cargo.toml` pins `[profile.dev.package.libduckdb-sys] debug = false` — removing it balloons `target/` from ~5 GB to ~15 GB. Never point an external pipeline's builds at this checkout's `CARGO_TARGET_DIR`: shared caches bake foreign `env!(CARGO_MANIFEST_DIR)` paths into reused test binaries (diagnosed 2026-08-09, see the ledger's M6 pause marker).
+First build is slow: bundled DuckDB compiles ~500 C++ translation units (~10 min cold). `Cargo.toml` pins `[profile.dev.package.libduckdb-sys] debug = false` — removing it balloons `target/` from ~5 GB to ~15 GB. Never point an external pipeline's builds at this checkout's `CARGO_TARGET_DIR`: shared caches bake foreign `env!(CARGO_MANIFEST_DIR)` paths into reused test binaries (diagnosed 2026-08-09, see the ledger's M6 pause marker). The same hazard's other face: a disposable probe copy that shares this checkout's cache overwrites its binary slots — after any probe-copy build, rebuild the main checkout before measuring `target/debug/sgt` (bit twice, 2026-08-10, Bug Sprint 1 entry).
 
 ## What this is
 
@@ -34,7 +34,7 @@ Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integ
 
 ## Testing rules specific to this repo
 
-- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m6_surfaces.rs` (203 total + 2 opt-in). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
+- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m6_surfaces.rs` (218 total + 2 opt-in, per GAUNTLET.md's Bug Sprint 1 entry). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
 - A fix without a test that fails when the fix is reverted is not done (LESSONS L7). Every advertised backend capability flag needs a contract test against the installed harness (L8).
 - The Claude adapter's behavior is *measured*, never assumed from docs — exit codes lie, `subtype` lies, model aliases silently substitute (L1). The version gate is pinned in `src/backend/claude.rs`; re-measure on any CLI version bump.
 - After running suites, `pgrep -f "debug/sgt --data-dir"` should find nothing (note: quoting matters — an unquoted pattern matches your own shell).

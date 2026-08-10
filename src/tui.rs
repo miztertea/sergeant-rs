@@ -26,6 +26,21 @@
 //! one place on the way out regardless of how the loop ended, and SIGTERM /
 //! SIGHUP end the loop through that same exit instead of killing the process
 //! with the screen still in raw mode (see `TerminationSignals`).
+//!
+//! The terminal can also *disappear* — the emulator dies, the ssh session
+//! drops — and a TUI whose pty is gone can never render again, so it leaves
+//! rather than lingering: the loop watches for the hangup (`TtyWatch`), the
+//! key reader treats the end of input as the end of its job (`read_keys`),
+//! and shutdown never waits on that reader indefinitely
+//! (`KeyReader::shutdown`). Each of those three is load-bearing on its own;
+//! together they are why an orphaned session exits instead of spinning at
+//! ~80% of a core until somebody finds it with SIGKILL.
+//!
+//! Those three are *composed* in `TerminalProbes` and driven by the loop, and
+//! the composition is where the bug actually lived — a guard that exists but
+//! is not the tick the reader was handed protects nothing — so the wiring is
+//! tested rather than the pieces alone, and the whole of it once more end to
+//! end against a real pty in `tests/m6_surfaces.rs`.
 
 use std::time::Duration;
 
@@ -44,6 +59,13 @@ pub const DETAIL_EVENT_TAIL: usize = 40;
 
 /// How long the key reader waits between polls before checking for shutdown.
 const KEY_POLL: Duration = Duration::from_millis(200);
+
+/// How often the loop checks that the terminal it is drawing on still exists.
+/// One `open`/`close` of `/dev/tty` per interval (see [`TtyWatch`]).
+const TTY_WATCH: Duration = Duration::from_millis(500);
+
+/// How long shutdown waits for the key reader before leaving it behind.
+const READER_JOIN_GRACE: Duration = Duration::from_secs(1);
 
 /// A TUI failure that reaches the caller.
 #[derive(Debug, thiserror::Error)]
@@ -596,106 +618,451 @@ pub async fn run(client: ApiClient) -> Result<(), TuiError> {
     app.status = String::new();
 
     let mut terminal = ratatui::try_init()?;
-    let result = event_loop(&mut terminal, &mut app, &client).await;
-    ratatui::try_restore()?;
-    result
+    let result = event_loop(
+        &mut terminal,
+        &mut app,
+        &client,
+        TerminalProbes::production(),
+    )
+    .await;
+    // Restore is attempted on every path, including the hung-up one — the
+    // ioctl half (raw mode) can still land even when the write half cannot.
+    let restored = ratatui::try_restore();
+    finish(result, restored)
 }
 
-async fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+/// What the process answers, given how the loop ended and whether the
+/// terminal could be restored.
+///
+/// A function rather than a `match` inside [`run`] because the interesting
+/// rule — a hung-up terminal is *not* an error — is otherwise reachable only
+/// through a real terminal, i.e. by nothing the suite can run.
+fn finish(result: Result<Exit, TuiError>, restored: std::io::Result<()>) -> Result<(), TuiError> {
+    match result {
+        // The terminal is gone: there is nothing left to restore it *for*,
+        // and nothing to report the failure *to* — both halves of the exit
+        // are writes to a descriptor that now answers EIO. Leaving quietly is
+        // the whole remedy; the alternative is a process that outlives its
+        // screen (issue #3), and an error printed to a descriptor nobody can
+        // read is not a report.
+        Ok(Exit::TerminalGone) => Ok(()),
+        Ok(Exit::Requested) => restored.map_err(TuiError::from),
+        Err(e) => Err(e),
+    }
+}
+
+/// Why the session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// The user left, or a termination signal asked for the same thing.
+    Requested,
+    /// The terminal itself went away (see [`TtyWatch`]).
+    TerminalGone,
+}
+
+/// The session loop.
+///
+/// Generic over the backend, and handed its terminal probes rather than
+/// building them, so the whole loop — including the exit paths a hangup
+/// takes — runs under a `TestBackend` with a scripted terminal. Production
+/// passes [`TerminalProbes::production`]; that composition is itself tested
+/// (see `TerminalProbes::over`).
+async fn event_loop<B>(
+    terminal: &mut ratatui::Terminal<B>,
     app: &mut App,
     client: &ApiClient,
-) -> Result<(), TuiError> {
+    probes: TerminalProbes,
+) -> Result<Exit, TuiError>
+where
+    B: ratatui::backend::Backend,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let TerminalProbes { watch: tty, tick } = probes;
     // crossterm's reader is blocking, so it lives on its own OS thread and
     // posts keystrokes into the async loop. It polls rather than blocking
-    // forever so it notices the loop going away.
-    let reader = std::thread::spawn(move || {
-        loop {
-            if stop_rx.try_recv().is_ok() {
-                return;
-            }
-            match event::poll(KEY_POLL) {
-                Ok(true) => match event::read() {
-                    Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                        if keys_tx.send(key.code).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => return,
-                },
-                Ok(false) => {}
-                Err(_) => return,
-            }
-        }
-    });
+    // forever so it notices the loop going away, and its tick checks the
+    // terminal is still there before every poll so it never hands a hung-up
+    // pty to a library that would spin on it.
+    let reader = KeyReader::spawn(tick, keys_tx);
 
     let mut stream = attach(client, app).await;
     let mut signals = TerminationSignals::install();
+    let mut watch = tokio::time::interval(TTY_WATCH);
 
-    terminal.draw(|frame| draw(frame, app))?;
-    loop {
-        let mut needs_refresh = false;
-        tokio::select! {
-            key = keys.recv() => {
-                let Some(key) = key else { break };
-                let action = app.on_key(key);
-                match app.execute(client, action).await {
-                    Action::Quit => break,
-                    Action::Refresh => {
-                        needs_refresh = true;
-                        // A refresh is the user asking for the truth, so it
-                        // re-attaches the tail as well as re-reading: an `r`
-                        // that repainted stale data and left the screen
-                        // permanently detached would answer the wrong
-                        // question.
-                        if stream.is_none() {
-                            stream = attach(client, app).await;
+    let mut outcome: Result<Exit, TuiError> = Ok(Exit::Requested);
+    'session: {
+        if let Err(e) = terminal.draw(|frame| draw(frame, app)) {
+            outcome = Err(terminal_error(e));
+            break 'session;
+        }
+        loop {
+            let mut needs_refresh = false;
+            tokio::select! {
+                key = keys.recv() => {
+                    let Some(key) = key else { break 'session };
+                    let action = app.on_key(key);
+                    match app.execute(client, action).await {
+                        Action::Quit => break 'session,
+                        Action::Refresh => {
+                            needs_refresh = true;
+                            // A refresh is the user asking for the truth, so it
+                            // re-attaches the tail as well as re-reading: an `r`
+                            // that repainted stale data and left the screen
+                            // permanently detached would answer the wrong
+                            // question.
+                            if stream.is_none() {
+                                stream = attach(client, app).await;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if app.quit {
+                        break 'session;
+                    }
+                }
+                event = next_event(&mut stream) => {
+                    match event {
+                        Some(event) => needs_refresh = app.observe(&event),
+                        None => {
+                            // The tail ended (daemon restart or shutdown, a lagged
+                            // subscriber the server dropped, a broken chunk). Keep
+                            // the UI alive and say so — durably, in the header, not
+                            // only in a status line the next command overwrites.
+                            stream = None;
+                            app.live = Live::Detached;
+                            app.status = "live tail closed — press r to refresh".to_string();
                         }
                     }
-                    _ => {}
                 }
-                if app.quit {
-                    break;
+                // A terminal left in raw mode + alternate screen is the one
+                // failure this module's contract names by hand, and default
+                // signal disposition is the path that produces it: SIGTERM from a
+                // process manager, SIGHUP from a closing terminal emulator. Both
+                // end the loop through the same exit as `q`, so `run`'s single
+                // restore runs. (SIGINT is not here: raw mode delivers Ctrl-C as a
+                // key event, which the keymap already handles.)
+                _ = signals.terminated() => {
+                    break 'session;
                 }
-            }
-            event = next_event(&mut stream) => {
-                match event {
-                    Some(event) => needs_refresh = app.observe(&event),
-                    None => {
-                        // The tail ended (daemon restart or shutdown, a lagged
-                        // subscriber the server dropped, a broken chunk). Keep
-                        // the UI alive and say so — durably, in the header, not
-                        // only in a status line the next command overwrites.
-                        stream = None;
-                        app.live = Live::Detached;
-                        app.status = "live tail closed — press r to refresh".to_string();
+                // The terminal can also leave without saying anything this
+                // loop would otherwise notice: a screen nobody can see is a
+                // session that must end, not one that idles forever holding a
+                // spinning reader thread.
+                _ = watch.tick() => {
+                    if tty.hung_up() {
+                        outcome = Ok(Exit::TerminalGone);
+                        break 'session;
                     }
                 }
             }
-            // A terminal left in raw mode + alternate screen is the one
-            // failure this module's contract names by hand, and default
-            // signal disposition is the path that produces it: SIGTERM from a
-            // process manager, SIGHUP from a closing terminal emulator. Both
-            // end the loop through the same exit as `q`, so `run`'s single
-            // restore runs. (SIGINT is not here: raw mode delivers Ctrl-C as a
-            // key event, which the keymap already handles.)
-            _ = signals.terminated() => {
-                break;
+            if needs_refresh && let Err(e) = app.refresh(client).await {
+                app.status = format!("refresh failed: {e}");
+            }
+            if let Err(e) = terminal.draw(|frame| draw(frame, app)) {
+                // A write that fails because the pty hung up is that same
+                // exit, discovered by the drawing half instead of the watch.
+                outcome = if tty.hung_up() {
+                    Ok(Exit::TerminalGone)
+                } else {
+                    Err(terminal_error(e))
+                };
+                break 'session;
             }
         }
-        if needs_refresh && let Err(e) = app.refresh(client).await {
-            app.status = format!("refresh failed: {e}");
-        }
-        terminal.draw(|frame| draw(frame, app))?;
     }
 
-    let _ = stop_tx.send(());
+    // The receiver goes first: a reader parked on a send ends on the closed
+    // channel even before it is asked to stop.
     drop(keys);
-    let _ = reader.join();
-    Ok(())
+    let _ = reader.shutdown();
+    outcome
+}
+
+/// A backend's own draw failure, as this module's error.
+///
+/// Every ratatui backend names its own error type — crossterm's is
+/// `io::Error`, the test backend's cannot be constructed at all — so the loop
+/// converts instead of assuming one.
+fn terminal_error<E: std::error::Error + Send + Sync + 'static>(e: E) -> TuiError {
+    TuiError::Terminal(std::io::Error::other(e))
+}
+
+/// The key reader thread, and the only two things the loop does with it:
+/// start it, and stop waiting for it.
+///
+/// It is a type rather than four locals in [`event_loop`] because the
+/// *shutdown* is the part that has to stay bounded (issue #3), and a bound
+/// spelled out inline is a bound no test can hold on to: `shutdown` is both
+/// what the loop calls and what `shutdown_leaves_a_wedged_reader_behind`
+/// drives.
+struct KeyReader {
+    /// Asks the reader to stop at its next turn.
+    stop: std::sync::mpsc::Sender<()>,
+    /// Disconnects when the thread ends, however it ends.
+    done: std::sync::mpsc::Receiver<()>,
+    /// Joined only once `done` says joining cannot block.
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl KeyReader {
+    /// Start reading keys off `tick` into `keys`.
+    fn spawn(
+        mut tick: impl FnMut() -> ReaderTick + Send + 'static,
+        keys: tokio::sync::mpsc::UnboundedSender<KeyCode>,
+    ) -> Self {
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // Dropped when the thread ends, however it ends: that drop — not
+            // a line the thread has to reach — is what `join_reader` waits on.
+            let _done = done_tx;
+            read_keys(&mut tick, &stop_rx, &keys);
+        });
+        Self {
+            stop: stop_tx,
+            done: done_rx,
+            thread,
+        }
+    }
+
+    /// Ask the reader to stop and wait only as long as [`READER_JOIN_GRACE`].
+    fn shutdown(self) -> ReaderExit {
+        let _ = self.stop.send(());
+        let exit = join_reader(&self.done, READER_JOIN_GRACE);
+        if exit == ReaderExit::Finished {
+            let _ = self.thread.join();
+        }
+        exit
+    }
+}
+
+/// One turn of the key reader: what the terminal produced, or that it is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderTick {
+    /// A key was pressed.
+    Key(KeyCode),
+    /// Nothing happened within the poll window.
+    Idle,
+    /// The terminal ended — end of input, or a read that failed. Terminal in
+    /// both senses: there is no later tick worth asking for.
+    Ended,
+}
+
+/// The key reader's loop, over any source of ticks.
+///
+/// Written against a tick function rather than against crossterm directly so
+/// the one property that matters here is testable without a terminal:
+/// `Ended` **returns**. A reader that treats a dead input as "nothing yet"
+/// and asks again is the shape that burned ~80% of a core in an orphaned TUI
+/// (issue #3), and it is a shape a `continue` reintroduces in one character.
+fn read_keys(
+    mut tick: impl FnMut() -> ReaderTick,
+    stop: &std::sync::mpsc::Receiver<()>,
+    keys: &tokio::sync::mpsc::UnboundedSender<KeyCode>,
+) {
+    loop {
+        // Asked to stop, or the loop that asked is gone: either way, done.
+        if !matches!(stop.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+            return;
+        }
+        match tick() {
+            ReaderTick::Key(key) => {
+                if keys.send(key).is_err() {
+                    return;
+                }
+            }
+            ReaderTick::Idle => {}
+            ReaderTick::Ended => return,
+        }
+    }
+}
+
+/// What the session touches the terminal *with*: the loop's own hangup check
+/// and the key reader's tick, built together so they cannot disagree.
+///
+/// The two production leaves — the `/dev/tty` probe and crossterm's poll —
+/// are the only parts of the hangup path a test cannot drive, and they are
+/// the only parts this type does not settle. Everything above them (the guard
+/// runs *before* the poll; the loop's watch and the reader's guard read the
+/// same probe) is [`TerminalProbes::over`], which the suite drives with a
+/// scripted probe and a poll that fails the test if it is ever reached. That
+/// wiring is what issue #3 turned on: the spin was a reader handed an
+/// *unguarded* tick, which is not a property of the guard function — it is a
+/// property of what the reader is handed.
+struct TerminalProbes {
+    /// The loop's periodic check that the terminal is still there.
+    watch: TtyWatch,
+    /// The reader thread's tick: that same check, then a poll.
+    tick: Box<dyn FnMut() -> ReaderTick + Send>,
+}
+
+impl TerminalProbes {
+    /// The real terminal: `/dev/tty` and crossterm.
+    fn production() -> Self {
+        Self::over(controlling_terminal_present, crossterm_poll)
+    }
+
+    /// The composition, over any probe and any poll.
+    fn over(probe: fn() -> bool, poll: fn() -> ReaderTick) -> Self {
+        let watch = TtyWatch::watching(probe);
+        Self {
+            watch,
+            tick: Box::new(move || guarded_tick(&watch, poll)),
+        }
+    }
+}
+
+/// [`read_keys`]'s tick: one poll, guarded by the terminal probe.
+///
+/// The guard is not belt-and-braces. crossterm's own reader cannot report the
+/// hangup — it takes the endless zero-length read a dead pty produces as "no
+/// data yet" and polls again, inside `event::poll`, which therefore never
+/// returns (see [`TtyWatch`] for the measurement). So the check has to happen
+/// *before* the call, on this side of the library.
+fn guarded_tick(tty: &TtyWatch, poll: fn() -> ReaderTick) -> ReaderTick {
+    if tty.hung_up() {
+        return ReaderTick::Ended;
+    }
+    poll()
+}
+
+/// The production poll: one crossterm turn, unguarded.
+fn crossterm_poll() -> ReaderTick {
+    match event::poll(KEY_POLL) {
+        Ok(true) => match event::read() {
+            Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => ReaderTick::Key(key.code),
+            Ok(_) => ReaderTick::Idle,
+            Err(_) => ReaderTick::Ended,
+        },
+        Ok(false) => ReaderTick::Idle,
+        Err(_) => ReaderTick::Ended,
+    }
+}
+
+/// What waiting for the key reader found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderExit {
+    /// The thread returned; its handle can be joined immediately.
+    Finished,
+    /// It did not return in time and is left to die with the process.
+    Abandoned,
+}
+
+/// Wait for the key reader to finish — but only for `grace`.
+///
+/// **Rung note (R1).** The signal is the *drop* of the sender the reader
+/// thread owns, so this resolves the moment the thread returns, however it
+/// returns, and never depends on it reaching a particular line. A bare
+/// `join()` cannot be bounded, and an unbounded join is how an orphaned TUI
+/// came to ignore SIGTERM: the shutdown path parked in `reader.join()` behind
+/// a thread spinning inside crossterm, and only SIGKILL ended it (issue #3).
+/// Leaving a doomed thread behind at exit costs nothing — the process is on
+/// its way out and the thread holds nothing but its own stack — while waiting
+/// for it costs a core, indefinitely. The bound belongs here even once the
+/// spin itself is fixed: it is what keeps the *next* reader bug from becoming
+/// an unkillable process.
+fn join_reader(done: &std::sync::mpsc::Receiver<()>, grace: Duration) -> ReaderExit {
+    match done.recv_timeout(grace) {
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ReaderExit::Finished,
+        _ => ReaderExit::Abandoned,
+    }
+}
+
+/// Whether this process still has the terminal it started with.
+///
+/// **Measured, not assumed (L1).** When the terminal emulator goes away —
+/// `tmux kill-server`, a dropped ssh session — the pty *master* closes while
+/// the slave this process holds stays open, and on Linux that combination
+/// reads as end-of-file forever rather than as an error: `read()` returns 0
+/// every time (measured in this container, alongside `write()` → `EIO` and
+/// `open("/dev/tty")` → `ENXIO`). crossterm reads a zero-length read as "no
+/// data yet" and immediately polls again, so `event::poll`/`event::read` never
+/// return and the reader thread spins at ~80% of a core from the moment the
+/// pty dies — before any signal is involved (P1-PERF S7, issue #3).
+///
+/// The `ENXIO` half of that measurement is the probe: opening the controlling
+/// terminal is cheap, needs no dependency this crate does not already have,
+/// and — unlike reading — consumes nothing the key reader is waiting for.
+///
+/// Only a *transition* counts. A process that never had a controlling
+/// terminal must not be told that its terminal vanished, so the state
+/// recorded at install is half of every later answer.
+#[derive(Debug, Clone, Copy)]
+struct TtyWatch {
+    had_tty: bool,
+    /// How "is the terminal there?" is answered. A field rather than a direct
+    /// call so the whole hangup path can be driven by a scripted terminal;
+    /// production always passes [`controlling_terminal_present`].
+    probe: fn() -> bool,
+}
+
+impl TtyWatch {
+    /// Record the starting state, as `probe` sees it.
+    fn watching(probe: fn() -> bool) -> Self {
+        Self {
+            had_tty: probe(),
+            probe,
+        }
+    }
+
+    /// The starting state, stated outright — the truth table's fixture.
+    #[cfg(test)]
+    fn from_probe(had_tty: bool) -> Self {
+        Self {
+            had_tty,
+            probe: controlling_terminal_present,
+        }
+    }
+
+    /// Whether the terminal this session started with has hung up.
+    fn hung_up(&self) -> bool {
+        self.decide((self.probe)())
+    }
+
+    /// [`TtyWatch::hung_up`]'s rule as a function of the probe — the half
+    /// that can be tested without arranging a dying pty.
+    fn decide(&self, present_now: bool) -> bool {
+        self.had_tty && !present_now
+    }
+}
+
+/// `ENXIO` — the errno the hangup measurement produced, and the only one that
+/// means the terminal went away.
+///
+/// Spelled as its number because this crate has no libc dependency and is not
+/// buying one for a constant: 6 on Linux and on every BSD including macOS.
+#[cfg(unix)]
+const ENXIO: i32 = 6;
+
+/// Whether `/dev/tty` — this process's controlling terminal — can be opened.
+#[cfg(unix)]
+fn controlling_terminal_present() -> bool {
+    terminal_present_at("/dev/tty")
+}
+
+/// The probe over an explicit path, so the rule below is measurable against a
+/// failure a test can arrange.
+///
+/// **Only `ENXIO` counts** (L1: the discriminator is the measured one, not
+/// "the open failed"). A live terminal can refuse to open for reasons that
+/// are about this process rather than about the terminal — `EMFILE`/`ENFILE`
+/// from a full descriptor table, `ENOMEM` — and reading those as a hangup
+/// would end a perfectly good session silently, with exit 0 and nothing said,
+/// which is the failure this whole path exists to prevent rather than to
+/// cause.
+#[cfg(unix)]
+fn terminal_present_at(path: &str) -> bool {
+    match std::fs::File::open(path) {
+        Ok(_) => true,
+        Err(e) => e.raw_os_error() != Some(ENXIO),
+    }
+}
+
+/// No equivalent probe off Unix; the watch simply never fires there.
+#[cfg(not(unix))]
+fn controlling_terminal_present() -> bool {
+    true
 }
 
 /// Open the live tail and record the outcome where the screen can show it.
@@ -955,9 +1322,19 @@ mod tests {
     /// alternate screen (the one failure the contract names by hand). If the
     /// install silently stopped happening, this test would not merely fail:
     /// the signal would kill the test binary, which is the same evidence.
+    /// Serializes the tests that involve process-wide signals.
+    ///
+    /// A SIGTERM sent to this process reaches *every* handler installed in
+    /// it, so the test below and any test running a session loop (which
+    /// installs its own) cannot overlap: the stray signal would end the other
+    /// test's loop through the wrong arm. Cheaper and more honest than
+    /// tolerating either outcome in the assertion.
+    static SIGNALS_QUIET: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_termination_signal_is_caught_so_the_terminal_can_be_restored() {
+        let _quiet = SIGNALS_QUIET.lock().await;
         let mut signals = TerminationSignals::install();
         let status = std::process::Command::new("kill")
             .arg("-TERM")
@@ -968,6 +1345,360 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), signals.terminated())
             .await
             .expect("SIGTERM must end the TUI's loop, not the process");
+    }
+
+    /// The end of the terminal ends the reader thread — it never asks again.
+    ///
+    /// The regression this pins is issue #3's first half. An orphaned TUI's
+    /// reader sat on a pty whose master had closed, where every read returns
+    /// end-of-file immediately and forever; treating that as "nothing yet"
+    /// and looping is what turned an idle TUI (0.03% CPU, measured) into one
+    /// burning ~80% of a core, from the instant the pty died and regardless of
+    /// any signal. The scripted tick panics if it is called after saying
+    /// `Ended`, so a regression fails the test instead of hanging it.
+    #[test]
+    fn the_key_reader_stops_when_the_terminal_ends() {
+        let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+        // Kept alive: a dropped sender is itself a stop, and this test is
+        // about the *tick* ending the loop.
+        let (_stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+
+        let script = [
+            ReaderTick::Idle,
+            ReaderTick::Key(KeyCode::Char('j')),
+            ReaderTick::Ended,
+        ];
+        let mut calls = 0usize;
+        read_keys(
+            || {
+                assert!(
+                    calls < script.len(),
+                    "the reader polled a terminal that had already ended ({} calls)",
+                    calls + 1
+                );
+                let tick = script[calls];
+                calls += 1;
+                tick
+            },
+            &stop_rx,
+            &keys_tx,
+        );
+        assert_eq!(calls, script.len(), "every tick was consumed, and no more");
+        assert_eq!(keys.try_recv().ok(), Some(KeyCode::Char('j')));
+        assert!(keys.try_recv().is_err(), "only the key was forwarded");
+
+        // The other two ways the loop is over, for completeness: a stop
+        // request, and an event loop that has dropped its receiver.
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        stop_tx.send(()).expect("request stop");
+        read_keys(
+            || panic!("a stopped reader must not poll at all"),
+            &stop_rx,
+            &keys_tx,
+        );
+        drop(keys);
+        let (_stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let mut sends = 0usize;
+        read_keys(
+            || {
+                sends += 1;
+                assert!(sends < 3, "a closed key channel must end the reader");
+                ReaderTick::Key(KeyCode::Char('k'))
+            },
+            &stop_rx,
+            &keys_tx,
+        );
+        assert_eq!(sends, 1, "the first failed send is the end");
+    }
+
+    /// Shutdown is bounded even when the reader will not come back.
+    ///
+    /// Issue #3's second half: the loop ended on SIGTERM exactly as designed,
+    /// and then parked forever in `reader.join()` behind a thread spinning
+    /// inside crossterm, so the orphan ignored SIGTERM and needed SIGKILL.
+    /// The bound is what makes a *future* reader bug a slow exit instead of an
+    /// unkillable process, so it is pinned separately from the spin itself.
+    #[test]
+    fn shutdown_does_not_park_on_a_reader_that_will_not_finish() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        // A reader that returns: the wait ends as soon as it does, and its
+        // handle can then be joined for real.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let finished = std::thread::spawn(move || {
+            let _done = done_tx;
+        });
+        assert_eq!(
+            join_reader(&done_rx, Duration::from_secs(10)),
+            ReaderExit::Finished,
+            "a reader that ends is waited for, not abandoned"
+        );
+        finished.join().expect("the finished reader joins at once");
+
+        // A reader that does not: the wait is over within the grace period,
+        // and the caller is free to exit.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let wedged = Arc::new(AtomicBool::new(true));
+        let held = Arc::clone(&wedged);
+        let spinner = std::thread::spawn(move || {
+            let _done = done_tx;
+            while held.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let grace = Duration::from_millis(200);
+        let started = Instant::now();
+        assert_eq!(
+            join_reader(&done_rx, grace),
+            ReaderExit::Abandoned,
+            "a wedged reader is left behind"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited < grace * 10,
+            "shutdown waited {waited:?} on a reader that never finishes — \
+             an unbounded join here is what needed SIGKILL"
+        );
+        wedged.store(false, Ordering::Relaxed);
+        spinner.join().expect("release the helper thread");
+    }
+
+    /// The hangup rule: only a terminal that *was* there can go away.
+    ///
+    /// Both halves matter. Missing the transition leaves the orphan spinning;
+    /// firing on a process that never had a controlling terminal would end a
+    /// session that is working perfectly well.
+    #[test]
+    fn only_a_terminal_that_was_there_can_hang_up() {
+        assert!(
+            TtyWatch::from_probe(true).decide(false),
+            "a terminal that was there and is not is a hangup — the session must end"
+        );
+        assert!(
+            !TtyWatch::from_probe(true).decide(true),
+            "a live terminal is not a hangup"
+        );
+        assert!(
+            !TtyWatch::from_probe(false).decide(false),
+            "a session that never had a controlling terminal must not be ended by \
+             the absence of one"
+        );
+        assert!(!TtyWatch::from_probe(false).decide(true));
+    }
+
+    /// The probe answers "gone" for the *measured* errno and nothing else.
+    ///
+    /// `open("/dev/tty")` → `ENXIO` is what the hangup was measured to produce
+    /// (L1). Treating any failed open as a hangup adds failure modes the
+    /// measurement never showed — a full descriptor table (`EMFILE`/`ENFILE`)
+    /// or `ENOMEM` on a terminal that is perfectly alive — and each of them
+    /// would end the session the quiet way, exit 0 with nothing said.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_measured_hangup_errno_says_the_terminal_is_gone() {
+        assert!(
+            terminal_present_at("/dev/null"),
+            "a path that opens is present"
+        );
+        assert!(
+            terminal_present_at("/proc/self/no-such-terminal-here"),
+            "an open that failed for a reason other than the hangup errno is this \
+             process's problem, not evidence that the terminal went away"
+        );
+        // And where this suite runs without a controlling terminal — the usual
+        // case under `cargo test` — the real probe re-measures L1's claim end
+        // to end rather than trusting the constant above.
+        if let Err(e) = std::fs::File::open("/dev/tty") {
+            assert_eq!(
+                e.raw_os_error(),
+                Some(ENXIO),
+                "the absent controlling terminal must fail with the measured errno"
+            );
+            assert!(
+                !controlling_terminal_present(),
+                "and that errno must read as absent"
+            );
+        }
+    }
+
+    /// The reader is handed a tick that checks the terminal *before* polling.
+    ///
+    /// This is the wiring, not the guard: issue #3's spin was crossterm being
+    /// asked to poll a pty whose master had closed, where `event::poll` never
+    /// returns, so what matters is that the tick the reader thread actually
+    /// receives refuses to make that call. The poll here fails the test if it
+    /// is ever reached on a hung-up terminal, and is counted on a live one so
+    /// the guard cannot pass by simply never polling at all.
+    #[test]
+    fn the_reader_is_handed_a_tick_that_never_polls_a_hung_up_terminal() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        static PRESENT: AtomicBool = AtomicBool::new(true);
+        static POLLS: AtomicUsize = AtomicUsize::new(0);
+        fn probe() -> bool {
+            PRESENT.load(Ordering::SeqCst)
+        }
+        fn poll() -> ReaderTick {
+            POLLS.fetch_add(1, Ordering::SeqCst);
+            ReaderTick::Idle
+        }
+
+        PRESENT.store(true, Ordering::SeqCst);
+        POLLS.store(0, Ordering::SeqCst);
+        let mut probes = TerminalProbes::over(probe, poll);
+
+        assert_eq!(
+            (probes.tick)(),
+            ReaderTick::Idle,
+            "a live terminal is polled as usual"
+        );
+        assert_eq!(POLLS.load(Ordering::SeqCst), 1, "…and the poll ran");
+
+        PRESENT.store(false, Ordering::SeqCst);
+        assert!(
+            probes.watch.hung_up(),
+            "the loop's own watch and the reader's guard read the same probe"
+        );
+        assert_eq!(
+            (probes.tick)(),
+            ReaderTick::Ended,
+            "a hung-up terminal ends the reader"
+        );
+        assert_eq!(
+            POLLS.load(Ordering::SeqCst),
+            1,
+            "the tick handed to the reader must not poll a terminal that hung up — \
+             that call is the one that never returns, and the spin is what it costs"
+        );
+    }
+
+    /// Shutdown does not wait on a reader that will not come back — as the
+    /// loop calls it, not as a helper called nowhere.
+    ///
+    /// Issue #3's second half was exactly this wiring: `join_reader` can be
+    /// perfectly bounded and the session still hang, because what shutdown
+    /// ran was a bare `reader.join()`. So the assertion is on elapsed time
+    /// through [`KeyReader::shutdown`], which is what `event_loop` calls: a
+    /// reader wedged for five seconds must not hold the exit for five seconds.
+    #[test]
+    fn shutdown_leaves_a_wedged_reader_behind() {
+        use std::time::Instant;
+
+        // A reader that returns promptly is waited for and joined.
+        let (keys_tx, _keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+        let reader = KeyReader::spawn(|| ReaderTick::Ended, keys_tx);
+        assert_eq!(
+            reader.shutdown(),
+            ReaderExit::Finished,
+            "a reader that ends is joined, not abandoned"
+        );
+
+        // A reader stuck inside its tick — crossterm's poll on a dead pty is
+        // the real one — is left to die with the process.
+        const WEDGE: Duration = Duration::from_secs(5);
+        let (keys_tx, _keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let reader = KeyReader::spawn(
+            move || {
+                let _ = entered_tx.send(());
+                std::thread::sleep(WEDGE);
+                ReaderTick::Ended
+            },
+            keys_tx,
+        );
+        // Shut down while the reader is *inside* its tick: a reader that has
+        // not started yet stops on the request itself, which is not the case
+        // this is about.
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reader reached its tick");
+        let started = Instant::now();
+        let exit = reader.shutdown();
+        let waited = started.elapsed();
+        assert_eq!(exit, ReaderExit::Abandoned);
+        assert!(
+            waited < WEDGE / 2,
+            "shutdown waited {waited:?} on a wedged reader (grace is \
+             {READER_JOIN_GRACE:?}) — an unbounded join here is what made the \
+             orphaned TUI ignore SIGTERM"
+        );
+    }
+
+    /// The loop ends when the terminal goes away, without needing the reader
+    /// to notice — driven through `event_loop` itself.
+    ///
+    /// The reader cannot be relied on for this: crossterm's poll on a dead pty
+    /// does not return, so the tick here keeps saying "nothing yet" exactly as
+    /// a wedged one would. The watch arm is the half that has to fire, and
+    /// `TerminalGone` is the exit it must produce — an ordinary `Requested`
+    /// would send `run` down the restore-and-report path, into writes to a
+    /// descriptor that answers EIO.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hangup_ends_the_session_through_the_watch() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _quiet = SIGNALS_QUIET.lock().await;
+        static PRESENT: AtomicBool = AtomicBool::new(true);
+        fn probe() -> bool {
+            PRESENT.load(Ordering::SeqCst)
+        }
+
+        PRESENT.store(true, Ordering::SeqCst);
+        let watch = TtyWatch::watching(probe);
+        PRESENT.store(false, Ordering::SeqCst);
+        let probes = TerminalProbes {
+            watch,
+            tick: Box::new(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                ReaderTick::Idle
+            }),
+        };
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("a test terminal");
+        let mut app = App::new();
+        // Nothing is listening there: the tail simply fails to attach, which
+        // is a state the screen already knows how to be in.
+        let client = ApiClient::new("http://127.0.0.1:1", "token").expect("client");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(20),
+            event_loop(&mut terminal, &mut app, &client, probes),
+        )
+        .await
+        .expect("a session whose terminal is gone must end, not idle on forever");
+        assert_eq!(
+            exit.expect("a hangup is not a failure"),
+            Exit::TerminalGone,
+            "the loop must name the hangup, so `run` knows there is nobody to \
+             report to"
+        );
+    }
+
+    /// A terminal that is gone is not an error, and a live one's failed
+    /// restore still is.
+    #[test]
+    fn a_gone_terminal_is_not_reported_as_a_failure() {
+        let broken = || std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(
+            finish(Ok(Exit::TerminalGone), Err(broken())).is_ok(),
+            "the restore of a terminal that no longer exists cannot fail *at* \
+             anyone: reporting it writes an error to a descriptor answering EIO \
+             and exits nonzero for a session that ended correctly"
+        );
+        assert!(
+            finish(Ok(Exit::Requested), Err(broken())).is_err(),
+            "a restore that fails on a terminal that is still there is a real \
+             failure — the user is left in raw mode and must be told"
+        );
+        assert!(finish(Ok(Exit::Requested), Ok(())).is_ok());
+        assert!(
+            finish(Err(TuiError::Terminal(broken())), Ok(())).is_err(),
+            "a loop that failed reports its own failure"
+        );
     }
 
     /// The header line as the text a terminal would show — rendered into a

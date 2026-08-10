@@ -43,6 +43,119 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### BUG SPRINT 1 — 2026-08-10, issues #3 #5 #9 #24
+
+**Mission outcome: all four fixed, pinned, landed as four separable commits
+(L10)** — 6167f4c (#5 surface-root removal, the syscall as the guard),
+f91d95c (#9 terminal-surface sweep on restart, re-derivation over compound
+per L6, `recovered: true` provenance), dc157e5 (#24 warn-once on an
+unapplied timeout override), de193a2 (#3 pty-death exit + bounded reader
+join). Gates 218/0 orchestrator-verified, zero leaked daemons, zero /tmp
+residue. Issues auto-close on merge via Fixes-tags.
+
+**The measurement that shaped #3 (L1 vindicated again):** the ~80% spin
+lives *inside* crossterm 0.29 — its unix event source treats a
+zero-length pty read as "no data yet" and loops, so `event::poll` never
+returns after hangup and no caller-side error handling can see it. The
+fix therefore guards *before* handing the fd to the reader (open
+/dev/tty, ENXIO discriminates hangup from transient errors — measured),
+adds a 500 ms watch arm that ends the session (orphan now self-exits in
+~1 s, was SIGKILL-only), and bounds the join so the *class* — not just
+the instance — can never wedge the process again.
+
+**Environmental behavior.** Lean gauntlet, 5 agents (~764k tokens, ~109
+min): Opus fixer, Fable invariants + Opus test-honesty critics, batched
+refuter, Opus round-2 fixer. Panel earned its keep: 6 findings, all 6
+confirmed, headlined by a test-honesty **error** — round 1 pinned #3's
+*parts* but not their *composition* (a two-line mutation removing the
+guard's wiring and the bounded join reproduced the wedge with every test
+green). Round 2 pinned composition (the tick the reader actually
+receives, the watch arm ending the loop, run() mapping TerminalGone to
+exit 0, the unbounded join failing the suite), ENXIO discrimination, the
+printed (not merely computed) #24 warning, and the canceled-work sweep
+case. One residual startup-window hangup edge → issue #26, not silence.
+Ruling: pre-fix leaked surface roots stay (GC belongs to #17) — the
+sweep is journal-keyed and does not delete directories no event points
+at; correctly declined by the fixer.
+
+**Method note (shared-cache hazard, third bite):** probe copies sharing
+the main checkout's CARGO_TARGET_DIR overwrite its binary slots — three
+early "fixed binary" pty measurements were silently measuring a probe
+build until the fixer caught it and rebuilt. Standing rule for probe
+prompts: after any probe-copy build, rebuild the main checkout before
+measuring its binary.
+
+---
+
+### BACKLOG CONSOLIDATION — 2026-08-10
+
+Everything outstanding from the build cycle now lives in one place: the
+GitHub issue tracker (#3–#25). P1-PERF filed #3–#13 (measured findings);
+this sweep added #14–#25 from the development record — the registered
+backlog rows (B3→#14, B2→#15), the accepted-with-ruling M6 warts (TUI
+reconnect #16, timeout-knob silence #24), the structural debts named at
+P0 close-out (retention/GC #17, /proc portability #18, doctor disk check
+#23), the coverage gaps (real-Claude soak #19, crash-point injection #20,
+dashboard JS #21, workspace edge cases #22), and the D6 Codex descope
+(#25, blocked on a measurable environment). Deliberately NOT filed: B1
+(snapshot identity binding — dormant by design, its trigger is itself a
+design guard; it stays a ledger row), the L10 commit-hygiene rule
+(process, binding via LESSONS, not work), and §38's OpenCode/Prime/MCP
+deferrals (roadmap without current intent — the proposal already records
+them). The backlog rows in this file now carry their issue numbers as the
+live tracking surface; the ledger remains the record of *why*.
+
+---
+
+### P1-PERF — 2026-08-10, load/stress baseline + issue backlog
+
+**Mission outcome: contract met.** The full S1–S7 matrix ran at contract
+scale against the release binary at 499c061; every cell filled, every
+scenario's hygiene sweep clean. Deliverables: the rerunnable harness
+(`scripts/perf/`, commit 348623b — including the measured SGT_FAKE_SCRIPT
+semantics: one global FIFO of steps, popped per execution-start and per
+input-send), the baseline document (`docs/perf/baseline-2026-08-10.md`),
+and **eleven GitHub issues (#3–#13)** — the phase's stated product. Nothing
+was fixed, per contract. Headline numbers: idle 28.6 MB / 15 fds / 9
+threads; submission plateau 28–39 works/s independent of concurrency
+(daemon saturates first — Unknown #2 resolved); churn cost ~25 kB RSS per
+work, never reclaimed (#4); graph reads 9.7 ms p50 at 1k-event depth;
+rebuild holds the §21 budget with growing margin (14.6k–29.2k events/s at
+10k–50k); kill -9 ×3 recovery: zero lost/illegal/duplicated/orphaned, and
+the command-ID crash-window index positively confirmed under ambiguous
+client retry. The seeded TUI orphan repro upgraded on measurement from
+"needs SIGKILL" to "wedges spinning ~80% CPU" — critical, #3.
+
+**Environmental behavior.** One workflow: Opus harness builder (smoke-
+tested all seven scenarios before handoff), seven Sonnet runners strictly
+sequential to keep measurement windows unshared, two batched Opus
+verifiers; 10 agents, 1.30M tokens, ~108 min. 22 findings → 21 confirmed
+on independent reproduction, 1 refuted (S4's claimed 35% submit-latency
+rise under SSE subscribers — run-to-run noise). Runners honestly filed
+harness defects against their own instrument (#13) and flagged the
+workflow brief's script-name drift (s3-graph/s5-scale vs the committed
+s3-deep/s5-journal) instead of papering over it — they followed the
+committed harness, correctly. The verification pass measured one finding
+as WORSE than claimed (TUI orphan: pre-signal CPU spin) and corrected one
+severity down (S1 surface-dir leak major→minor per-instance).
+
+**Adjudication rulings.** (1) The empty `surfaces/<work-id>/` leak
+recurred in all seven scenarios — deduplicated to one issue (#5), minor
+per-instance, unbounded in aggregate; its connection to the S6
+completion-tail crash window (#9: a torn-down surface whose teardown
+event is lost) is noted in both issues. (2) The S4 refutation stands;
+recorded in the baseline doc. (3) The throughput plateau (#6) is ruled an
+observation, not a defect — the single-writer journal invariant predicts
+it — and is linked to B3 as the second measured symptom of core-lock
+serialization. (4) The TUI column collision (#11) and doctor floor (#12)
+are intake for the planned usability phase, not P1 work. (5) The no-fix
+rule held: zero product or harness lines changed after the contract
+commit; harness gaps went to #13. (6) Positive results are recorded with
+the same weight as defects: crash idempotency, §21 rebuild margin, SSE
+fd-per-subscriber exactness, TUI 0.03% idle CPU.
+
+---
+
 ### P0 CLOSE-OUT — 2026-08-09, prototype complete
 
 The §38 P0 vertical slice is done: seven gauntlet units (M0–M6), one crate,

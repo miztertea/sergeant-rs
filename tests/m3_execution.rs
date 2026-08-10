@@ -595,6 +595,22 @@ async fn t3_full_run_completes_every_stage_and_retires_the_surface() {
         !worktree.exists(),
         "a clean worktree must be removed at teardown"
     );
+    // Including the scaffolding one level up. `git worktree remove` deletes
+    // the worktree, not the per-work root that materialize created around it,
+    // so for the whole P0 every completed work left an empty
+    // `surfaces/<work-id>/` behind — minor once, unbounded over a data dir's
+    // life (P1-PERF measured it in all seven scenarios).
+    let surface_root = data.path().join("surfaces").join(&work_id);
+    assert_eq!(surface_root, worktree.parent().expect("root").to_path_buf());
+    assert!(
+        !surface_root.exists(),
+        "the emptied surface root must go with the worktree: {}",
+        surface_root.display()
+    );
+    assert!(
+        data.path().join("surfaces").is_dir(),
+        "only the per-work root is removed, not the surfaces directory"
+    );
     let branch = format!("sergeant/{work_id}");
     assert!(
         branch_exists(&repo, &branch),

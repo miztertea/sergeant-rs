@@ -1,0 +1,68 @@
+name: Bug report
+description: Something behaves wrongly — a crash, wrong state, leaked resource, or broken invariant.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The wrong behavior, stated as what you observed — not what you suspect the cause is.
+      placeholder: e.g. After a full `cargo test` run, one `sgt … daemon` process is still alive.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Smallest reproduction
+      description: The smallest sequence of commands that shows it. A bug without a reproduction is a hypothesis.
+      render: sh
+      placeholder: |
+        cargo build
+        target/debug/sgt --data-dir "$(mktemp -d)" run "…" --backend fake
+        pgrep -fa "debug/sgt"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should have happened instead — cite the invariant, proposal section, or contract clause if one applies.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Output, journal excerpts, measurements. Journal event seq numbers are the best pointers — the journal is the only truth.
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Commit / version
+      placeholder: git SHA (and `claude --version` if the Claude adapter is involved)
+    validations:
+      required: true
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Suspected subsystem
+      options:
+        - journal / blob store
+        - projections (in-memory / DuckDB / graph)
+        - engine / workflow / routing
+        - surfaces / worktrees
+        - Claude adapter
+        - fake backend
+        - daemon / recovery
+        - HTTP API / SSE
+        - CLI
+        - TUI
+        - dashboard (web)
+        - doctor
+        - telemetry / OTel
+        - tests / harness
+        - unknown
+    validations:
+      required: false

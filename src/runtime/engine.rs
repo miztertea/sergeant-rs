@@ -1151,23 +1151,71 @@ impl Engine {
 
     /// Tear the surface down and journal the report (never silently).
     fn tear_down_surface(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
+        self.tear_down_surface_marked(core, work_id, false)
+            .map(|_| ())
+    }
+
+    /// Finish a teardown a crash swallowed, on a work that is already
+    /// terminal (§25 applied to the completion tail; issue #9).
+    ///
+    /// **Rung note (R2).** `work.completed` and its trailing
+    /// `surface.torn_down` are two adjacent appends, and a kill in between
+    /// leaves a work whose state is legal but whose audit trail is not 1:1 —
+    /// and, when the crash landed *before* `teardown()` ran, a worktree and a
+    /// surface root nothing will ever remove, because reconciliation only ever
+    /// looked at work believed in flight. L6 offers two answers: one compound
+    /// event, or a tolerant reader that re-derives. Compounding would put a
+    /// filesystem operation's report inside the state transition that must
+    /// land first — the completion would then wait on git, and a teardown
+    /// failure would take the completion with it. So this is the re-derivation
+    /// (R2: the existing teardown, re-run, rather than new machinery).
+    ///
+    /// It is evidence, not a guess: [`teardown`] *inspects* — a worktree that
+    /// is gone is recorded `Missing`, one that is still there is removed only
+    /// if git says it is clean, and a dirty or unremovable one is retained and
+    /// named in the report exactly as it would have been at completion time.
+    /// Nothing is assumed about which side of the window the crash fell on;
+    /// the report says what the disk actually holds now. The event carries
+    /// `recovered: true` so the trail shows *when* the teardown was recorded,
+    /// rather than pretending it landed with the completion.
+    ///
+    /// Returns whether an event was appended.
+    pub fn reconcile_terminal_surface(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+    ) -> Result<bool, EngineError> {
+        self.tear_down_surface_marked(core, work_id, true)
+    }
+
+    /// The one teardown path: both callers above are this, differing only in
+    /// whether the record says a restart is what wrote it.
+    ///
+    /// Idempotent through the projection: a run that already has a teardown
+    /// report is left alone, so re-running teardown (the crash window, a
+    /// second restart) appends nothing and touches no repository.
+    fn tear_down_surface_marked(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        recovered: bool,
+    ) -> Result<bool, EngineError> {
         let Ok(run) = self.run(core, work_id) else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(surface) = run.surface.clone() else {
-            return Ok(());
+            return Ok(false);
         };
         if run.teardown.is_some() {
-            return Ok(()); // already retired
+            return Ok(false); // already retired
         }
         let report = teardown(&surface);
-        self.commit(
-            core,
-            work_id,
-            KIND_SURFACE_TORN_DOWN,
-            json!({"report": report}),
-        )?;
-        Ok(())
+        let mut payload = json!({"report": report});
+        if recovered {
+            payload["recovered"] = Value::Bool(true);
+        }
+        self.commit(core, work_id, KIND_SURFACE_TORN_DOWN, payload)?;
+        Ok(true)
     }
 
     fn record_reconcile(

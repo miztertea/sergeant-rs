@@ -1466,26 +1466,61 @@ pub const CLIENT_TIMEOUT_ENV: &str = "SGT_CLIENT_TIMEOUT_SECS";
 
 /// The per-request timeout this process's API clients use: [`CLIENT_TIMEOUT`]
 /// unless [`CLIENT_TIMEOUT_ENV`] names a larger, positive number of seconds.
+///
+/// An override that is *present but not applied* is said out loud, once, on
+/// stderr. Raise-only is the right rule (see [`timeout_from`]), but silently
+/// ignoring the value someone exported is how an operator concludes the knob
+/// is broken: `SGT_CLIENT_TIMEOUT_SECS=5` and `SGT_CLIENT_TIMEOUT_SECS=abc`
+/// both behaved exactly like not setting it at all, with nothing anywhere
+/// naming the timeout actually in force. One line, once per process (the
+/// warning is about this process's configuration, not about each client
+/// constructed from it), on stderr rather than through `tracing` — the
+/// clients that read this knob are CLI processes with no subscriber
+/// installed, so a `warn!` would go nowhere.
 pub fn client_timeout() -> Duration {
-    timeout_from(std::env::var(CLIENT_TIMEOUT_ENV).ok().as_deref())
+    static SAID: std::sync::Once = std::sync::Once::new();
+    let (timeout, warning) = timeout_from(std::env::var(CLIENT_TIMEOUT_ENV).ok().as_deref());
+    if let Some(warning) = warning {
+        SAID.call_once(|| eprintln!("warning: {warning}"));
+    }
+    timeout
 }
 
-/// [`client_timeout`]'s rule, as a function of the raw setting.
+/// [`client_timeout`]'s rule, as a function of the raw setting: the timeout to
+/// use, and the warning to print when the setting was present and did not
+/// produce it.
 ///
-/// Separated from the `std::env` read so it can be tested: the whole knob is
-/// five lines of parsing whose only production caller is an opt-in
-/// `--real-claude` path, i.e. exactly the shape that rots unobserved. It had
-/// already drifted from the sentence above it — the filter admitted *any*
-/// positive value, so `SGT_CLIENT_TIMEOUT_SECS=1` silently shortened every
-/// client's timeout below the default. The knob exists to let a caller that
-/// knowingly waits on a model wait longer; it is not a way to make the daemon
-/// look unreachable, so the raise is one-directional and the tests below say
-/// so.
-fn timeout_from(raw: Option<&str>) -> Duration {
-    raw.and_then(|value| value.trim().parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .filter(|requested| *requested > CLIENT_TIMEOUT)
-        .unwrap_or(CLIENT_TIMEOUT)
+/// Separated from the `std::env` read — and from the printing — so both halves
+/// can be tested: the whole knob is a few lines of parsing whose only
+/// production caller is an opt-in `--real-claude` path, i.e. exactly the shape
+/// that rots unobserved. It had already drifted from the sentence above it
+/// twice: the filter once admitted *any* positive value, so
+/// `SGT_CLIENT_TIMEOUT_SECS=1` silently shortened every client's timeout below
+/// the default; and the fix for that swallowed the setting without a word. The
+/// knob exists to let a caller that knowingly waits on a model wait longer; it
+/// is not a way to make the daemon look unreachable, so the raise is
+/// one-directional — and now audible when it declines.
+fn timeout_from(raw: Option<&str>) -> (Duration, Option<String>) {
+    let Some(raw) = raw else {
+        return (CLIENT_TIMEOUT, None);
+    };
+    let default_secs = CLIENT_TIMEOUT.as_secs();
+    // Every warning names the knob, the value that was ignored, and the
+    // timeout actually in force — the three facts an operator needs to stop
+    // guessing.
+    let declined = |why: &str| {
+        (
+            CLIENT_TIMEOUT,
+            Some(format!(
+                "{CLIENT_TIMEOUT_ENV}={raw:?} {why}; using the {default_secs}s default"
+            )),
+        )
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(seconds) if seconds > default_secs => (Duration::from_secs(seconds), None),
+        Ok(_) => declined("does not raise the timeout, and the knob only raises it"),
+        Err(_) => declined("is not a whole number of seconds"),
+    }
 }
 
 /// A failure talking to the daemon's v1 API.
@@ -1753,20 +1788,20 @@ mod tests {
     /// including ones *below* the default).
     #[test]
     fn the_client_timeout_override_only_ever_raises_the_default() {
-        assert_eq!(timeout_from(None), CLIENT_TIMEOUT, "unset: the default");
+        assert_eq!(timeout_from(None).0, CLIENT_TIMEOUT, "unset: the default");
         assert_eq!(
-            timeout_from(Some("300")),
+            timeout_from(Some("300")).0,
             Duration::from_secs(300),
             "a larger value is what the knob is for"
         );
         assert_eq!(
-            timeout_from(Some("  300\n")),
+            timeout_from(Some("  300\n")).0,
             Duration::from_secs(300),
             "an exported value carrying whitespace still parses"
         );
         for lowering in ["1", "0", "10"] {
             assert_eq!(
-                timeout_from(Some(lowering)),
+                timeout_from(Some(lowering)).0,
                 CLIENT_TIMEOUT,
                 "{lowering}s must not shorten the default: a short timeout makes a \
                  working daemon look unreachable to every client in the process"
@@ -1774,10 +1809,52 @@ mod tests {
         }
         for nonsense in ["", "abc", "-5", "2.5", "9999999999999999999999"] {
             assert_eq!(
-                timeout_from(Some(nonsense)),
+                timeout_from(Some(nonsense)).0,
                 CLIENT_TIMEOUT,
                 "an unparseable {nonsense:?} falls back rather than failing the client"
             );
+        }
+    }
+
+    /// An override that is present and not applied is *said*, and the setting
+    /// that is applied is not.
+    ///
+    /// The regression this pins: raise-only semantics silently swallowed
+    /// every below-default, zero and unparseable value, so an operator who
+    /// exported `SGT_CLIENT_TIMEOUT_SECS=5` (or typo'd it) got the 10s default
+    /// with nothing anywhere saying so — the knob looked broken, and the next
+    /// person's diagnosis was a code read. The decision is returned rather
+    /// than printed inside `timeout_from` precisely so this test can make it.
+    #[test]
+    fn an_override_that_is_not_applied_says_so() {
+        assert_eq!(timeout_from(None).1, None, "unset is not a complaint");
+        assert_eq!(
+            timeout_from(Some("300")).1,
+            None,
+            "an applied raise is silent: nothing was ignored"
+        );
+
+        for ignored in ["1", "0", "10", "", "abc", "-5", "2.5"] {
+            let (timeout, warning) = timeout_from(Some(ignored));
+            assert_eq!(
+                timeout, CLIENT_TIMEOUT,
+                "raise-only semantics are unchanged"
+            );
+            let warning =
+                warning.unwrap_or_else(|| panic!("{ignored:?} was ignored without a word"));
+            assert!(
+                warning.contains(CLIENT_TIMEOUT_ENV),
+                "the warning names the knob: {warning}"
+            );
+            assert!(
+                warning.contains(&format!("{ignored:?}")),
+                "the warning names the value it ignored: {warning}"
+            );
+            assert!(
+                warning.contains(&format!("{}s", CLIENT_TIMEOUT.as_secs())),
+                "the warning names the effective value: {warning}"
+            );
+            assert_eq!(warning.lines().count(), 1, "one line: {warning}");
         }
     }
 

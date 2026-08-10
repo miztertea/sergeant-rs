@@ -304,10 +304,14 @@ pub async fn start_with(
         data_dir,
     ));
     let reconciled = recovery::reconcile(&engine, &mut core)?;
-    if !reconciled.resumed.is_empty() || !reconciled.blocked.is_empty() {
+    if !reconciled.resumed.is_empty()
+        || !reconciled.blocked.is_empty()
+        || !reconciled.surfaces_retired.is_empty()
+    {
         tracing::info!(
             resumed = ?reconciled.resumed,
             blocked = ?reconciled.blocked,
+            surfaces_retired = ?reconciled.surfaces_retired,
             "reconciled in-flight work after restart"
         );
     }
