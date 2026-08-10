@@ -6,6 +6,24 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L12 — Authority lives in the artifact: re-read the governing text at decision time
+
+S0/S1, 2026-08-10 (numbered assuming the N-branch's L11 lands first; renumber
+at merge if it collides): three same-session orchestrator misses, one class.
+(1) S1 phase 1 launched as a single self-probing builder — P1-PERF's
+"no implementation to grade" exemption stretched over a code-writing phase
+from a *remembered summary* of the pattern doc, whose pipeline line is
+unconditional. (2) The model-spread doctrine pasted wholesale into CLAUDE.md
+instead of revised into gauntlet-pattern.md — "refer, don't copy" and the
+doc's own dated-revision precedent were both in text quoted earlier the same
+day. (3) An Edit failed because its target text was reconstructed from
+memory of a file written an hour before. The critics' rule — grade actual
+artifacts, never a summary — binds the orchestrator too: summaries,
+including your own earlier ones, are orientation, not authority. When a
+decision turns on exact wording (a rule's scope, a template's boundary, an
+edit target), read the governing text in-session at decision time. The
+owner caught all three; the fix each time was one Read.
+
 ## L10 — A squashed milestone commit defeats the revert-probe audit
 
 M6 round 2: checkpoint commit 69cb52e folded the entire build plus all 13
