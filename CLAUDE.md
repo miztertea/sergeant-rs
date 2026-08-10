@@ -39,6 +39,29 @@ Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integ
 - The Claude adapter's behavior is *measured*, never assumed from docs — exit codes lie, `subtype` lies, model aliases silently substitute (L1). The version gate is pinned in `src/backend/claude.rs`; re-measure on any CLI version bump.
 - After running suites, `pgrep -f "debug/sgt --data-dir"` should find nothing (note: quoting matters — an unquoted pattern matches your own shell).
 
+## Model spread (binding, owner direction 2026-08-10)
+
+Sonnet by default, escalation by earned need. Full ruling: R-S0-13 in
+`docs/gauntlet/contracts/S0.md` — supersedes the model table in
+`reference/notes/gauntlet-pattern.md` (which stays unedited as evidence).
+
+- **Sonnet executes contracts**: clear contract, grounded inputs, checkable
+  output — extraction, drafting, mechanical fixes, scripted verification,
+  stage acting, running measurements, applying enumerated rulings. Most
+  gauntlet seats are this shape.
+- **Opus judges outcomes**: judgment under breadth with no mechanical check
+  to lean on — cross-partition synthesis, blind adversarial review,
+  independent verification of a fixer's claims, fixes whose correctness
+  turns on architectural understanding. The tell: a wrong answer would look
+  plausible and nothing downstream would mechanically catch it.
+- **Fable is one seat, not a tier**: the orchestrator, holding the whole
+  program — contracts, rulings, the ledger, adjudication, L4
+  stop-the-loop calls, and catching when the process itself is wrong.
+  Fable never fans out; it is never a worker; there are no Fable subagents.
+
+Cost follows accountability — the expensive contexts are the ones whose
+mistakes the system can't catch mechanically.
+
 ## The development record (read before changing method or scope)
 
 - **GAUNTLET.md** — append-only ledger: deviation register D1–D8, backlog B1–B3 (deferred findings with named triggers), per-milestone scorecards and adjudication rulings. Append; never rewrite history.
