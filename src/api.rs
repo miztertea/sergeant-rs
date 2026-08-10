@@ -31,7 +31,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::daemon::{KIND_BACKEND_PROBED, KIND_DAEMON_STARTED, KIND_DAEMON_STOPPED};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::execution::{
-    KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
+    KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
+    KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
@@ -44,7 +45,7 @@ use crate::domain::workflow::{
     KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
-use crate::runtime::engine::{Engine, EngineError, SubmitContext};
+use crate::runtime::engine::{Engine, EngineError, Next as EngineNext, Step, SubmitContext};
 use crate::runtime::graph::{
     KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED, KIND_CONVERSATION_USER,
     KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
@@ -194,6 +195,65 @@ pub fn router(state: ApiState) -> Router {
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .merge(ui)
+}
+
+/// Turn the engine's crank to a park, **holding no core lock across any
+/// external effect** (§14.2's middle phase, §22.6's budget).
+///
+/// The handler commits its authoritative half under the guard, drops it, and
+/// hands the resulting [`Step`] here. Everything this function blocks on —
+/// the launch itself, and any adapter tail work an earlier crank collected
+/// (issue #14/B3) — happens with the guard released and on a blocking thread,
+/// so another request can take the lock while a harness is spawning or a
+/// transcript is flushing. Each settle re-acquires the lock, re-validates the
+/// reservation against durable state (§14.5), and releases it again.
+///
+/// A `settle_launch` failure is logged and the crank stops. It cannot be
+/// returned to the client, because the client's own command already
+/// succeeded: the reservation is durable and, if the launch got that far, the
+/// journal says so. Recovery re-derives from that record; inventing a failure
+/// response for a command that was accepted would be worse than the log line.
+async fn crank(state: &ApiState, step: Step) {
+    let mut step = step;
+    loop {
+        let Step { next, deferred } = step;
+        if deferred.is_pending()
+            && let Err(e) = tokio::task::spawn_blocking(move || deferred.wait()).await
+        {
+            tracing::warn!(error = %e, "an adapter completion task failed to join");
+        }
+        let EngineNext::Launch(pending) = next else {
+            return;
+        };
+        let launched = tokio::task::spawn_blocking(move || {
+            let outcome = pending.launch();
+            (pending, outcome)
+        })
+        .await;
+        let (pending, outcome) = match launched {
+            Ok(launched) => launched,
+            Err(e) => {
+                // The launch task itself died (panic or runtime shutdown).
+                // The reservation stays unsettled in the journal, which is
+                // exactly the state a crash here leaves and is handled the
+                // same way at the next restart: fail closed, never guess.
+                tracing::error!(error = %e, "the launch task did not complete");
+                return;
+            }
+        };
+        let work_id = pending.work_id().to_string();
+        let mut core = state.core.lock().await;
+        match state.engine.settle_launch(&mut core, pending, outcome) {
+            Ok(next_step) => {
+                drop(core);
+                step = next_step;
+            }
+            Err(e) => {
+                tracing::error!(work_id = %work_id, error = %e, "settling a launch failed");
+                return;
+            }
+        }
+    }
 }
 
 /// Structured 404 for routes the router does not know.
@@ -615,19 +675,29 @@ async fn submit_work(
         // The Work is durable now. A start failure cannot un-accept it, so
         // the engine fails it closed to `blocked` with the reason recorded;
         // only an internal failure escapes as an error here.
-        if let Err(e) = state.engine.start(&mut core, &work, &plan) {
-            tracing::error!(work_id = %work_id, error = %e, "starting the run failed");
-            let status = engine_error_status(&e);
-            let result = engine_error_body(&e);
-            return record_and_respond(
-                &mut core,
-                &req.command_id,
-                "work.submit",
-                Some(&work_id),
-                status,
-                result,
-            );
-        }
+        //
+        // Two-phase (§14.2): everything authoritative — surface, binding,
+        // `work.started`, the first stage's `execution.reserved` — lands
+        // under this guard; the harness launch happens after it is dropped.
+        let step = match state.engine.begin_start(&mut core, &work, &plan) {
+            Ok(step) => step,
+            Err(e) => {
+                tracing::error!(work_id = %work_id, error = %e, "starting the run failed");
+                let status = engine_error_status(&e);
+                let result = engine_error_body(&e);
+                return record_and_respond(
+                    &mut core,
+                    &req.command_id,
+                    "work.submit",
+                    Some(&work_id),
+                    status,
+                    result,
+                );
+            }
+        };
+        drop(core);
+        crank(&state, step).await;
+        core = state.core.lock().await;
     }
 
     // Answer from the projection, not the request: proves the read path.
@@ -656,6 +726,10 @@ fn work_view(core: &Core, work_id: &str) -> Value {
         "stage": run.and_then(run_stage_view),
         "surface": run.and_then(|r| r.surface.clone()),
         "execution": run.and_then(|r| r.execution.clone()),
+        // Additive (§20.5): a run whose launch phase is in flight, or whose
+        // launch phase a crash left unaccounted for, is a state a client can
+        // now see rather than infer from a gap between events.
+        "reservation": run.and_then(|r| r.reservation.clone()),
         "workflow": run.and_then(|r| r.workflow.as_ref().map(|w| json!({
             "name": w.name,
             "version": w.version,
@@ -810,8 +884,19 @@ async fn cancel_work(
     // Work state changes first, then the run is retired: the cancellation is
     // a fact about the Work, not a request to the backend, and it does not
     // wait for — or depend on — the native context actually dying (§25).
-    if let Err(e) = state.engine.retire_run(&mut core, &id, "work canceled") {
-        tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed");
+    //
+    // The STOP request and the teardown land under this guard; the adapter's
+    // evidence tail (issue #14/B3) is awaited by `crank` after it is dropped.
+    match state
+        .engine
+        .begin_retire_run(&mut core, &id, "work canceled")
+    {
+        Ok(step) => {
+            drop(core);
+            crank(&state, step).await;
+            core = state.core.lock().await;
+        }
+        Err(e) => tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed"),
     }
     let result = work_view(&core, &id);
     record_and_respond(
@@ -860,8 +945,11 @@ async fn work_input(
         );
     }
     let engine = state.engine.clone();
-    match engine.provide_input(&mut core, &id, &req.input) {
-        Ok(()) => {
+    match engine.begin_input(&mut core, &id, &req.input) {
+        Ok(step) => {
+            drop(core);
+            crank(&state, step).await;
+            let mut core = state.core.lock().await;
             let result = work_view(&core, &id);
             record_and_respond(
                 &mut core,
@@ -921,8 +1009,11 @@ async fn work_retry(
         );
     }
     let engine = state.engine.clone();
-    match engine.retry(&mut core, &id) {
-        Ok(()) => {
+    match engine.begin_retry(&mut core, &id) {
+        Ok(step) => {
+            drop(core);
+            crank(&state, step).await;
+            let mut core = state.core.lock().await;
             let result = work_view(&core, &id);
             record_and_respond(
                 &mut core,
@@ -1297,8 +1388,10 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_STAGE_BLOCKED,
     KIND_STAGE_FAILED,
     KIND_STAGE_CANCELED,
+    KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED,
     KIND_EXECUTION_STOPPED,
+    KIND_EXECUTION_ABANDONED,
     KIND_EXECUTION_RECONCILED,
     KIND_SURFACE_MATERIALIZING,
     KIND_SURFACE_MATERIALIZED,

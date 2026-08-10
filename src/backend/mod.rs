@@ -143,6 +143,20 @@ pub struct Capabilities {
     pub usage: bool,
     /// The harness spawns its own subagents.
     pub native_subagents: bool,
+    /// **The actor can author a question that parks its own stage**
+    /// (proposal §11.1's "observe explicit semantic signals", sharpened by
+    /// N2's GP-2 finding). `true` claims something narrow and checkable: this
+    /// adapter can tell, from the harness's own output, that the *actor* — not
+    /// the adapter, not a policy gate — asked the human a question and is
+    /// waiting for the answer, and it reports that as
+    /// [`BackendSignal::NeedsInput`] with [`AskAuthor::Actor`].
+    ///
+    /// An adapter whose harness offers no such record advertises `false` and
+    /// never guesses one from prose: "the last thing it said ended in a
+    /// question mark" is a heuristic, and a heuristic that parks a stage is an
+    /// adapter inventing a checkpoint. L8 binds the flag to a contract test
+    /// against the installed harness.
+    pub ask: bool,
 }
 
 /// Answer to §15's PROBE: can this backend operate here, and why not?
@@ -231,6 +245,186 @@ impl ResumeRequest {
     }
 }
 
+/// Who authored a [`BackendSignal::NeedsInput`] question.
+///
+/// The distinction is the whole content of GP-2: an adapter asking (a
+/// permission gate, a policy stop, a harness that needs a credential) and the
+/// *actor* asking (the reasoning agent decided it cannot proceed without a
+/// human decision) park the same stage in the same state, but they are
+/// different facts about the run, and only the second one is the checkpoint a
+/// workflow author is designing for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskAuthor {
+    /// The adapter or the harness itself is asking. The default, because it
+    /// is what a journaled payload written before this field existed meant:
+    /// nothing had measured actor authorship, so nothing may be claimed.
+    #[default]
+    Adapter,
+    /// The running actor authored the question (§11.1's explicit semantic
+    /// signal). Only an adapter advertising [`Capabilities::ask`] may report
+    /// this, and only from a structured record of the harness's, never from
+    /// prose.
+    Actor,
+}
+
+impl AskAuthor {
+    /// The author's canonical snake_case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskAuthor::Adapter => "adapter",
+            AskAuthor::Actor => "actor",
+        }
+    }
+}
+
+/// Work an adapter must finish *after* a verb returns, handed to the caller
+/// so it can be awaited somewhere the caller chooses (§14.3, issue #14/B3).
+///
+/// STOP has to keep two promises that pull against each other: the execution's
+/// evidence is durable before the operation is over, and the daemon's core
+/// lock is not held while a thread is joined (§22.6). A verb that joins
+/// internally can only keep the first. So the verb does its authoritative part
+/// — kill the process, latch the refusal — and hands back the tail as a
+/// value; the engine collects those into a [`Deferred`] and the daemon waits
+/// on it after releasing the core guard.
+///
+/// Dropping one detaches the tail rather than waiting for it, which is why the
+/// type is `#[must_use]`: an ignored completion is precisely the bug B3
+/// records, wearing a different hat.
+#[must_use = "an unawaited Completion detaches the adapter's tail work (issue #14/B3): \
+              collect it into a Deferred and wait outside the core lock"]
+#[derive(Default)]
+pub struct Completion {
+    wait: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl std::fmt::Debug for Completion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Completion")
+            .field("pending", &self.wait.is_some())
+            .finish()
+    }
+}
+
+impl Completion {
+    /// Nothing left to wait for: the verb finished everything it promised.
+    pub fn immediate() -> Self {
+        Self { wait: None }
+    }
+
+    /// Tail work the caller must run to make the verb's promise true.
+    pub fn deferred(wait: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            wait: Some(Box::new(wait)),
+        }
+    }
+
+    /// Whether anything is still outstanding.
+    pub fn is_pending(&self) -> bool {
+        self.wait.is_some()
+    }
+
+    /// Run the tail work, blocking until it is done. Never call this while
+    /// holding the core lock — that is the whole point of the type.
+    pub fn wait(self) {
+        if let Some(wait) = self.wait {
+            wait();
+        }
+    }
+}
+
+/// Every [`Completion`] one engine call accumulated, awaited together.
+///
+/// The engine never waits on a completion itself: a single API request can
+/// stop several executions (a cancel that retires a run, a stage failure that
+/// stops one execution and blocks the work), and each one's tail belongs
+/// outside the same guard. So they collect here and the caller drains the bag
+/// once, in whatever place it is safe to block.
+#[must_use = "an undrained Deferred detaches every completion it holds (issue #14/B3)"]
+#[derive(Debug, Default)]
+pub struct Deferred {
+    completions: Vec<Completion>,
+}
+
+impl Deferred {
+    /// An empty bag.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take ownership of one adapter completion.
+    pub fn push(&mut self, completion: Completion) {
+        if completion.is_pending() {
+            self.completions.push(completion);
+        }
+    }
+
+    /// Absorb another bag (an inner engine step's).
+    pub fn absorb(&mut self, other: Deferred) {
+        self.completions.extend(other.completions);
+    }
+
+    /// Whether anything is outstanding.
+    pub fn is_pending(&self) -> bool {
+        !self.completions.is_empty()
+    }
+
+    /// How many completions are outstanding.
+    pub fn len(&self) -> usize {
+        self.completions.len()
+    }
+
+    /// Whether the bag holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.completions.is_empty()
+    }
+
+    /// Wait for every completion, in the order they were collected.
+    pub fn wait(self) {
+        for completion in self.completions {
+            completion.wait();
+        }
+    }
+}
+
+/// A reserved-but-not-yet-launched execution (§14.2's first phase, §14.3's
+/// `prepare(request) → PreparedHarnessExecution`).
+///
+/// PREPARE allocates whatever identity the adapter can allocate *before* an
+/// external effect exists — for the Claude adapter, the session UUID it used
+/// to mint one line before spawning — and performs no external effect of its
+/// own. That restriction is what lets the engine journal the reservation
+/// under the core lock (§22.6 forbids external I/O there) and still have the
+/// native identity in the record before anything can create it: a daemon that
+/// dies between the reservation and the launch leaves a journal entry naming
+/// exactly the identity that might, or might not, exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedExecution {
+    /// Sergeant's id for the execution being prepared.
+    pub execution_id: String,
+    /// The native identity reserved for it, when the adapter can name one
+    /// before launching. `None` is honest, not a failure: an adapter whose
+    /// identity is minted by the external system (a container id) has nothing
+    /// to reserve here, and §14.4's deterministic-name answer for that case
+    /// arrives with the executor that needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_id: Option<String>,
+    /// The request this reservation pinned, carried to LAUNCH so the adapter
+    /// cannot resolve its configuration twice and get two answers.
+    pub request: StartRequest,
+}
+
+impl PreparedExecution {
+    /// The handle this reservation will name once it is launched.
+    pub fn handle(&self) -> ExecutionHandle {
+        ExecutionHandle {
+            execution_id: self.execution_id.clone(),
+            native_id: self.native_id.clone(),
+        }
+    }
+}
+
 /// Handle to a started execution, as the backend names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionHandle {
@@ -286,6 +480,11 @@ pub enum BackendSignal {
     NeedsInput {
         /// What the actor is asking.
         prompt: String,
+        /// Who authored the question (GP-2). `#[serde(default)]` because
+        /// payloads journaled before the field existed carry no claim about
+        /// authorship, and [`AskAuthor::Adapter`] is exactly "no claim".
+        #[serde(default)]
+        asked_by: AskAuthor,
     },
     /// The stage is waiting on an external condition.
     Waiting {
@@ -305,6 +504,31 @@ pub enum BackendSignal {
 }
 
 impl BackendSignal {
+    /// The stage needs input, asked for by the adapter or the harness itself.
+    pub fn needs_input(prompt: impl Into<String>) -> Self {
+        BackendSignal::NeedsInput {
+            prompt: prompt.into(),
+            asked_by: AskAuthor::Adapter,
+        }
+    }
+
+    /// GP-2's ask: the *actor* authored this question and is waiting.
+    /// Only an adapter advertising [`Capabilities::ask`] may build one.
+    pub fn ask(prompt: impl Into<String>) -> Self {
+        BackendSignal::NeedsInput {
+            prompt: prompt.into(),
+            asked_by: AskAuthor::Actor,
+        }
+    }
+
+    /// Who authored this signal's question, when it is one.
+    pub fn asked_by(&self) -> Option<AskAuthor> {
+        match self {
+            BackendSignal::NeedsInput { asked_by, .. } => Some(*asked_by),
+            _ => None,
+        }
+    }
+
     /// Short name for journaling and diagnostics.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -395,8 +619,46 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// PROBE: can this backend operate here, and at what version?
     fn probe(&self) -> ProbeReport;
 
-    /// START: create one native execution context.
-    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError>;
+    /// PREPARE: reserve one execution's identity, without creating anything
+    /// external (§14.3's `prepare(request) → PreparedHarnessExecution`).
+    ///
+    /// Two rules bind every implementation, and both are what makes the
+    /// engine's two-phase boundary honest rather than decorative:
+    ///
+    /// - **no external effect.** No process, no container, no network, no
+    ///   blocking wait. The engine calls this while holding the core lock,
+    ///   which §22.6 forbids doing any of those under. What PREPARE may do is
+    ///   resolve configuration and allocate identity in adapter memory.
+    /// - **the identity is final.** Whatever [`PreparedExecution::native_id`]
+    ///   names is what LAUNCH must use. The engine journals the reservation
+    ///   *before* calling LAUNCH, precisely so that a crash in between leaves
+    ///   a record naming the identity that may now exist unowned.
+    ///
+    /// A prepared execution that is never launched leaves adapter memory with
+    /// the daemon; the journaled reservation is what recovery reads.
+    fn prepare(&self, request: &StartRequest) -> Result<PreparedExecution, BackendError>;
+
+    /// LAUNCH: create the native execution context a [`PreparedExecution`]
+    /// reserved. This is the external effect, and the engine runs it with the
+    /// core lock released.
+    ///
+    /// A failed launch must leave no phantom behind: the adapter drops
+    /// whatever PREPARE registered, so a later OBSERVE of the reserved id is
+    /// an honest "unknown execution" rather than a context in a state nothing
+    /// created.
+    fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError>;
+
+    /// START: create one native execution context — PREPARE then LAUNCH, with
+    /// no journal record in between.
+    ///
+    /// Kept as a verb (§15 names it) and as the single-owner convenience for
+    /// callers holding no shared lock. The daemon deliberately does *not* use
+    /// it: it journals `execution.reserved` between the two halves, which is
+    /// the whole point of the split.
+    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
+        let prepared = self.prepare(request)?;
+        self.launch(&prepared)
+    }
 
     /// SEND: deliver input to an execution context.
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError>;
@@ -411,7 +673,11 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// session resumable with full recall). Interrupting an execution with
     /// no turn in flight is a no-op, not an error: the goal state — no turn
     /// running — already holds.
-    fn interrupt(&self, handle: &ExecutionHandle) -> Result<(), BackendError>;
+    ///
+    /// Returns a [`Completion`] for whatever the adapter must still finish
+    /// before the interrupt's promise is true (a killed turn's transcript
+    /// archive, say). The engine never waits on it under the core lock.
+    fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError>;
 
     /// RESUME: re-adopt an existing native context, e.g. after a daemon
     /// restart, so later SENDs continue the same conversation. The
@@ -447,7 +713,13 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// STOP: retire the execution without corrupting recoverable state. A
     /// backend reports that it *asked*; whether the native context complied is
     /// only knowable through OBSERVE.
-    fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError>;
+    ///
+    /// The returned [`Completion`] carries the adapter's tail work — the
+    /// evidence promise STOP used to keep by joining internally, which put a
+    /// thread join under the daemon's core lock (issue #14/B3). The engine
+    /// collects it and the daemon waits after releasing the guard, so the
+    /// promise survives and the lock does not.
+    fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError>;
 }
 
 /// The set of backends this daemon can route to.

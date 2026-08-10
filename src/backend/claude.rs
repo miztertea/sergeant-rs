@@ -82,8 +82,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde_json::{Value, json};
 
 use super::{
-    Backend, BackendError, BackendSignal, Capabilities, EventSink, ExecutionHandle, NativeEvent,
-    NativeState, Observation, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
+    Backend, BackendError, BackendSignal, Capabilities, Completion, EventSink, ExecutionHandle,
+    NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport, ResumeRequest,
+    RuntimeScope, StartRequest,
 };
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::profile::Profile;
@@ -1078,6 +1079,9 @@ impl Backend for ClaudeBackend {
             human_attach: false,
             usage: true,
             native_subagents: false,
+            // Nothing measured yet about whether 2.1.226 can report an
+            // actor-authored question; unmeasured is `false` (L8).
+            ask: false,
         }
     }
 
@@ -1100,9 +1104,25 @@ impl Backend for ClaudeBackend {
         }
     }
 
-    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
+    /// PREPARE: mint the conversation's session id and refuse anything that
+    /// could never launch — with **no process, no adapter state, and no
+    /// blocking call** (§14.3).
+    ///
+    /// This is where the "spawned before `execution.started`" window finally
+    /// closes. The adapter has always chosen the session id before spawning;
+    /// what was missing was a moment at which sergeant could *journal* that
+    /// choice while it was still only a choice. PREPARE is that moment, and it
+    /// is deliberately empty of side effects so the engine can run it under
+    /// the core lock (§22.6) and append `execution.reserved` before anything
+    /// exists to be orphaned.
+    ///
+    /// The probe and the pin pre-flight run here rather than at LAUNCH so a
+    /// refusal happens before the reservation is journaled at all: a work that
+    /// cannot start should not first acquire an execution identity.
+    fn prepare(&self, request: &StartRequest) -> Result<PreparedExecution, BackendError> {
         // Version/capability gate: an unmeasured CLI is refused with the
-        // probe's own evidence (fail closed, structured, actionable).
+        // probe's own evidence (fail closed, structured, actionable). The
+        // probe is cached after the first call and is offline either way.
         let probe = self.probe_outcome();
         if !probe.available {
             return Err(BackendError::Unavailable {
@@ -1114,18 +1134,33 @@ impl Backend for ClaudeBackend {
         if let Some(model) = &request.model {
             preflight_model_pin(model).map_err(|reason| self.err_failed(reason))?;
         }
+        // The session identity exists before the process does — and now,
+        // before the *record* of the process does too.
+        Ok(PreparedExecution {
+            execution_id: request.execution_id.clone(),
+            native_id: Some(new_session_uuid()),
+            request: request.clone(),
+        })
+    }
 
-        // Launch details pinned now, from profile + config (§14: launch
-        // configuration only — credentials stay with the native harness).
+    /// LAUNCH: register the reserved conversation and spawn its first turn.
+    ///
+    /// Everything external lives here, which is why the engine calls it with
+    /// the core lock released. The launch configuration is resolved from the
+    /// same profile PREPARE saw, through the same function START always used
+    /// (§14) — a pure function of the request, so the two phases cannot
+    /// disagree about permission mode or executable.
+    fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let session_id = prepared
+            .native_id
+            .clone()
+            .ok_or_else(|| self.err_failed("prepared execution carries no session id"))?;
         let LaunchConfig {
             executable,
             env,
             permission_args,
         } = self.launch_config(request.profile.as_ref());
-
-        // The session identity exists before the process does (see module
-        // docs: this is both the nested-env hazard fix and the L6 fix).
-        let session_id = new_session_uuid();
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -1234,7 +1269,7 @@ impl Backend for ClaudeBackend {
 
     /// Kill the per-turn process. The conversation survives (measured); the
     /// reader thread archives whatever the turn streamed before dying.
-    fn interrupt(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
+    fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let child = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
@@ -1257,7 +1292,10 @@ impl Backend for ClaudeBackend {
             let mut child = child.lock().expect("turn child lock");
             let _ = child.kill();
         }
-        Ok(())
+        // Killing the child is the whole of INTERRUPT's promise: the turn's
+        // evidence is STOP's promise, not this one, and the conversation
+        // stays live and observable either way.
+        Ok(Completion::immediate())
     }
 
     /// Re-adopt a conversation after a restart: verify that the durable
@@ -1401,30 +1439,32 @@ impl Backend for ClaudeBackend {
     /// durable transcript is untouched — recoverable state survives STOP by
     /// construction.
     ///
-    /// STOP also *waits for the turn's evidence*. Killing the child closes
+    /// STOP still *promises the turn's evidence*. Killing the child closes
     /// stdout, but the reader thread then archives the raw stream-json
     /// transcript (§20) and emits `conversation.turn.ended` carrying its blob
-    /// ref — work that happens after `interrupt` returns. Returning before it
-    /// lands would make STOP a claim about the process only: the caller is
-    /// told the execution is retired while a write to its data dir is still
-    /// in flight (measured in the M4 suite, where the write recreated a data
-    /// directory the test had already removed). Joining is safe here because
-    /// the event sink never blocks on its caller (see
-    /// [`crate::daemon::journaling_sink`]) and the adapter lock is released
-    /// before the join — the reader takes that same lock on its way out.
+    /// ref — work that happens after `interrupt` returns. Declaring the
+    /// execution retired while a write to its data dir is still in flight
+    /// would make STOP a claim about the process only (measured in the M4
+    /// suite, where that write recreated a data directory the test had
+    /// already removed).
     ///
-    /// This is called from [`crate::runtime::engine::Engine::stop_execution`]
-    /// while the daemon's `Core` mutex is held, and `Engine` is deliberately
-    /// synchronous and lock-agnostic (§25/§37 — it only ever sees `&mut
-    /// Core`, never the guard), so the join cannot release that lock without
-    /// giving `Engine` a way to drop and re-validate against concurrent
-    /// mutation mid-transition. `block_in_place` below only keeps the join
-    /// from starving the executor's other tasks; the `Core` lock stays held
-    /// for the join's duration, so a concurrent request that needs it waits
-    /// out the archive write. That is the accepted trade-off until `Engine`
-    /// grows a way to suspend and safely resume across a stop boundary.
-    fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
-        self.interrupt(handle)?;
+    /// **Issue #14 / backlog B3, resolved here.** The promise used to be kept
+    /// by joining the reader inside this method — and this method is called
+    /// from the engine while the daemon's `Core` mutex is held, so a
+    /// concurrent request waited out one transcript flush. B3's registered
+    /// trigger was "the first §15 trait revision", and this is it: the join
+    /// is handed back as a [`Completion`] instead. The engine collects it
+    /// ([`crate::backend::Deferred`]) and the daemon awaits it after
+    /// releasing the core guard, so the evidence is still durable before the
+    /// operation is over and nothing waits on a thread under the lock
+    /// (§22.6). `block_in_place` is gone with the inline join.
+    ///
+    /// The join is safe wherever it eventually runs because the event sink
+    /// never blocks on its caller (see [`crate::daemon::journaling_sink`])
+    /// and the adapter lock is released before the completion is handed over
+    /// — the reader takes that same lock on its way out.
+    fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
+        self.interrupt(handle)?.wait();
         let reader = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
@@ -1435,19 +1475,12 @@ impl Backend for ClaudeBackend {
             execution.stopped = true;
             execution.reader.take()
         };
-        if let Some(reader) = reader {
-            let use_block_in_place = tokio::runtime::Handle::try_current()
-                .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-                .unwrap_or(false);
-            if use_block_in_place {
-                tokio::task::block_in_place(|| {
-                    let _ = reader.join();
-                });
-            } else {
+        match reader {
+            None => Ok(Completion::immediate()),
+            Some(reader) => Ok(Completion::deferred(move || {
                 let _ = reader.join();
-            }
+            })),
         }
-        Ok(())
     }
 }
 

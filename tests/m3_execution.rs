@@ -300,11 +300,22 @@ impl Backend for OpaqueBackend {
         }
     }
 
-    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
-        Ok(ExecutionHandle {
+    fn prepare(
+        &self,
+        request: &StartRequest,
+    ) -> Result<sergeant_rs::backend::PreparedExecution, BackendError> {
+        Ok(sergeant_rs::backend::PreparedExecution {
             execution_id: request.execution_id.clone(),
             native_id: Some(format!("opaque-{}", request.execution_id)),
+            request: request.clone(),
         })
+    }
+
+    fn launch(
+        &self,
+        prepared: &sergeant_rs::backend::PreparedExecution,
+    ) -> Result<ExecutionHandle, BackendError> {
+        Ok(prepared.handle())
     }
 
     fn send(&self, _handle: &ExecutionHandle, _input: &str) -> Result<(), BackendError> {
@@ -327,8 +338,11 @@ impl Backend for OpaqueBackend {
         }
     }
 
-    fn interrupt(&self, _handle: &ExecutionHandle) -> Result<(), BackendError> {
-        Ok(())
+    fn interrupt(
+        &self,
+        _handle: &ExecutionHandle,
+    ) -> Result<sergeant_rs::backend::Completion, BackendError> {
+        Ok(sergeant_rs::backend::Completion::immediate())
     }
 
     fn resume(
@@ -353,8 +367,11 @@ impl Backend for OpaqueBackend {
         })
     }
 
-    fn stop(&self, _handle: &ExecutionHandle) -> Result<(), BackendError> {
-        Ok(())
+    fn stop(
+        &self,
+        _handle: &ExecutionHandle,
+    ) -> Result<sergeant_rs::backend::Completion, BackendError> {
+        Ok(sergeant_rs::backend::Completion::immediate())
     }
 }
 

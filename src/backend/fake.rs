@@ -20,13 +20,14 @@
 //!   is reproducible without a real process.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use super::{
-    Backend, BackendError, Capabilities, ExecutionHandle, NativeEvent, NativeState, Observation,
-    ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
+    Backend, BackendError, Capabilities, Completion, ExecutionHandle, NativeEvent, NativeState,
+    Observation, PreparedExecution, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use crate::backend::BackendSignal;
 
@@ -86,11 +87,9 @@ impl FakeStep {
         })
     }
 
-    /// Asks for human input.
+    /// Asks for human input — the *adapter* asking (a gate, a policy stop).
     pub fn needs_input(prompt: &str) -> Self {
-        Self::running(BackendSignal::NeedsInput {
-            prompt: prompt.to_string(),
-        })
+        Self::running(BackendSignal::needs_input(prompt))
     }
 
     /// Waits on an external condition.
@@ -141,6 +140,73 @@ impl FakeStep {
     }
 }
 
+/// A place a scripted execution can be made to stall on purpose.
+///
+/// §22.6 asks for instrumentation proving the core lock is not held across an
+/// external effect, and the only way to prove a negative about a lock is to
+/// make the effect take arbitrarily long and watch an *independent* request go
+/// through anyway. A sleep would make the test a race against a clock; a gate
+/// makes it a rendezvous: the test waits until the executor is provably parked
+/// inside the effect, does its independent work, and only then releases.
+#[derive(Debug, Default)]
+struct Gate {
+    inner: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    held: bool,
+    /// How many callers are parked inside the gate right now.
+    waiting: usize,
+}
+
+impl Gate {
+    /// Close the gate: every later [`Gate::pass`] parks until released.
+    fn hold(&self) {
+        self.inner.lock().expect("gate lock").held = true;
+    }
+
+    /// Open the gate and wake everyone parked in it.
+    fn release(&self) {
+        self.inner.lock().expect("gate lock").held = false;
+        self.changed.notify_all();
+    }
+
+    /// Go through, parking while the gate is closed.
+    fn pass(&self) {
+        let mut state = self.inner.lock().expect("gate lock");
+        state.waiting += 1;
+        self.changed.notify_all();
+        while state.held {
+            state = self.changed.wait(state).expect("gate wait");
+        }
+        state.waiting -= 1;
+        self.changed.notify_all();
+    }
+
+    /// Block until at least `n` callers are parked inside, or the deadline
+    /// passes. Returns whether the rendezvous happened.
+    fn wait_for_waiting(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inner.lock().expect("gate lock");
+        while state.waiting < n {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("gate wait");
+            state = next;
+            if timed_out.timed_out() && state.waiting < n {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug)]
 struct FakeExecution {
     /// The backend's own name for the native context. §25's restart sequence
@@ -176,6 +242,16 @@ pub struct FakeBackend {
     name: String,
     capabilities: Capabilities,
     state: Arc<Mutex<FakeState>>,
+    /// Where LAUNCH can be made to stall (§22.6's "deliberately stalled fake
+    /// executor"). Deliberately *not* inside `state`: a caller parked in the
+    /// gate must not be holding the backend's own lock, or the instrument
+    /// would measure the fake's contention instead of the daemon's.
+    launch_gate: Arc<Gate>,
+    /// Where a STOP [`Completion`] can be made to stall — the fake's stand-in
+    /// for the Claude adapter's transcript-archive join (issue #14/B3).
+    archive_gate: Arc<Gate>,
+    /// Whether STOP/INTERRUPT hand back a deferred completion at all.
+    archive_armed: Arc<Mutex<bool>>,
 }
 
 impl FakeBackend {
@@ -212,6 +288,9 @@ impl FakeBackend {
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
             })),
+            launch_gate: Arc::new(Gate::default()),
+            archive_gate: Arc::new(Gate::default()),
+            archive_armed: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -237,6 +316,45 @@ impl FakeBackend {
             Ok(script) => Self::scripted(name, parse_script(&script)),
             Err(_) => Self::new(name),
         }
+    }
+
+    /// Stall every later LAUNCH until [`FakeBackend::release_launches`].
+    ///
+    /// The §22.6 instrument. A launch parked here is an external effect in
+    /// flight; anything the daemon can still answer while it is parked is
+    /// something the core lock was demonstrably not held across.
+    pub fn hold_launches(&self) {
+        self.launch_gate.hold();
+    }
+
+    /// Let stalled launches through.
+    pub fn release_launches(&self) {
+        self.launch_gate.release();
+    }
+
+    /// Block until `n` launches are parked in the gate, or the timeout
+    /// expires. Returns whether the rendezvous happened — a test asserts on
+    /// it rather than sleeping and hoping.
+    pub fn await_stalled_launches(&self, n: usize, timeout: Duration) -> bool {
+        self.launch_gate.wait_for_waiting(n, timeout)
+    }
+
+    /// Make STOP/INTERRUPT hand back a *deferred* [`Completion`] — the fake's
+    /// stand-in for the Claude adapter's transcript archive — and stall it
+    /// until [`FakeBackend::release_archives`].
+    pub fn hold_archives(&self) {
+        *self.archive_armed.lock().expect("archive arm lock") = true;
+        self.archive_gate.hold();
+    }
+
+    /// Let stalled stop/interrupt completions finish.
+    pub fn release_archives(&self) {
+        self.archive_gate.release();
+    }
+
+    /// Block until `n` stop/interrupt completions are parked, or time out.
+    pub fn await_stalled_archives(&self, n: usize, timeout: Duration) -> bool {
+        self.archive_gate.wait_for_waiting(n, timeout)
     }
 
     /// Make PROBE report unavailable (routing must then fail closed).
@@ -319,6 +437,16 @@ impl FakeBackend {
         }
     }
 
+    /// The [`Completion`] STOP/INTERRUPT hand back: nothing to wait for by
+    /// default, and a gated wait once a test has armed the archive stall.
+    fn completion(&self) -> Completion {
+        if !*self.archive_armed.lock().expect("archive arm lock") {
+            return Completion::immediate();
+        }
+        let gate = Arc::clone(&self.archive_gate);
+        Completion::deferred(move || gate.pass())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
         // A poisoned lock means a test thread panicked mid-mutation; there is
         // no recovery to attempt in a test instrument, so surface it.
@@ -381,7 +509,36 @@ impl Backend for FakeBackend {
         }
     }
 
-    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
+    /// PREPARE allocates this execution's native identity and nothing else:
+    /// no script step is consumed, no execution table entry appears, and the
+    /// gate is not touched. That is what makes it safe to call under the core
+    /// lock — and what makes the reservation the engine journals a claim
+    /// about an identity that does not exist yet.
+    fn prepare(&self, request: &StartRequest) -> Result<PreparedExecution, BackendError> {
+        let state = self.lock();
+        if !state.available {
+            return Err(BackendError::Unavailable {
+                backend: self.name.clone(),
+                detail: state
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "scripted unavailable".to_string()),
+            });
+        }
+        Ok(PreparedExecution {
+            execution_id: request.execution_id.clone(),
+            native_id: Some(format!("fake-session-{}", request.execution_id)),
+            request: request.clone(),
+        })
+    }
+
+    /// LAUNCH is the external effect — and therefore the one place a test can
+    /// stall this backend (see [`FakeBackend::hold_launches`]). The gate is
+    /// passed *before* the state lock is taken, so a parked launch holds
+    /// nothing at all: it is a stand-in for a process spawn, not for
+    /// contention inside the adapter.
+    fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        self.launch_gate.pass();
         let mut state = self.lock();
         if !state.available {
             return Err(BackendError::Unavailable {
@@ -393,10 +550,13 @@ impl Backend for FakeBackend {
             });
         }
         let step = Self::next_step(&mut state);
-        state.starts.push(request.clone());
-        let native_id = format!("fake-session-{}", request.execution_id);
+        state.starts.push(prepared.request.clone());
+        let native_id = prepared
+            .native_id
+            .clone()
+            .unwrap_or_else(|| format!("fake-session-{}", prepared.execution_id));
         state.executions.insert(
-            request.execution_id.clone(),
+            prepared.execution_id.clone(),
             FakeExecution {
                 native_id: native_id.clone(),
                 step,
@@ -405,7 +565,7 @@ impl Backend for FakeBackend {
             },
         );
         Ok(ExecutionHandle {
-            execution_id: request.execution_id.clone(),
+            execution_id: prepared.execution_id.clone(),
             native_id: Some(native_id),
         })
     }
@@ -444,7 +604,7 @@ impl Backend for FakeBackend {
     /// the execution stays known, its signal survives, and — like the real
     /// adapters — a compliant native context reports its turn process gone
     /// while a hang keeps running.
-    fn interrupt(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
+    fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let mut state = self.lock();
         state.interrupt_requests.push(handle.execution_id.clone());
         self.resolve(&state, handle)?;
@@ -455,7 +615,8 @@ impl Backend for FakeBackend {
         if !execution.step.ignores_stop {
             execution.step.native = NativeState::Exited;
         }
-        Ok(())
+        drop(state);
+        Ok(self.completion())
     }
 
     /// RESUME re-adopts a known execution; §25's identity rule applies the
@@ -490,7 +651,7 @@ impl Backend for FakeBackend {
             .collect())
     }
 
-    fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
+    fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let mut state = self.lock();
         state.stop_requests.push(handle.execution_id.clone());
         // One identity rule, checked in one place: a handle that has lost its
@@ -507,7 +668,8 @@ impl Backend for FakeBackend {
             execution.step.native = NativeState::Exited;
             execution.step.signal = BackendSignal::Running;
         }
-        Ok(())
+        drop(state);
+        Ok(self.completion())
     }
 }
 
@@ -547,9 +709,7 @@ mod tests {
         );
         assert_eq!(
             fake.observe(&second).expect("observe").signal,
-            BackendSignal::NeedsInput {
-                prompt: "who?".to_string()
-            }
+            BackendSignal::needs_input("who?")
         );
         assert_eq!(
             fake.observe(&third).expect("observe").signal,
@@ -563,8 +723,8 @@ mod tests {
         let hanging = fake.start(&request("hang")).expect("start");
         let compliant = fake.start(&request("ok")).expect("start");
 
-        fake.stop(&hanging).expect("stop");
-        fake.stop(&compliant).expect("stop");
+        fake.stop(&hanging).expect("stop").wait();
+        fake.stop(&compliant).expect("stop").wait();
         assert_eq!(fake.stop_requests(), vec!["hang", "ok"]);
         assert_eq!(
             fake.observe(&hanging).expect("observe").native,
@@ -618,10 +778,10 @@ mod tests {
             for outcome in [
                 fake.observe(&forged).map(|_| ()),
                 fake.send(&forged, "hello"),
-                fake.interrupt(&forged),
+                fake.interrupt(&forged).map(|c| c.wait()),
                 fake.resume(&forged, &ResumeRequest::new("w", PathBuf::from("/tmp"))),
                 fake.history(&forged).map(|_| ()),
-                fake.stop(&forged),
+                fake.stop(&forged).map(|c| c.wait()),
             ] {
                 assert!(
                     matches!(outcome, Err(BackendError::UnknownExecution { .. })),
@@ -655,16 +815,14 @@ mod tests {
         let compliant = fake.start(&request("c")).expect("start");
         let hanging = fake.start(&request("h")).expect("start");
 
-        fake.interrupt(&compliant).expect("interrupt");
-        fake.interrupt(&hanging).expect("interrupt");
+        fake.interrupt(&compliant).expect("interrupt").wait();
+        fake.interrupt(&hanging).expect("interrupt").wait();
         assert_eq!(fake.interrupt_requests(), vec!["c", "h"]);
         let observed = fake.observe(&compliant).expect("observe");
         assert_eq!(observed.native, NativeState::Exited, "the turn died");
         assert_eq!(
             observed.signal,
-            BackendSignal::NeedsInput {
-                prompt: "who?".to_string()
-            },
+            BackendSignal::needs_input("who?"),
             "the conversation's signal survives the interrupt"
         );
         assert_eq!(

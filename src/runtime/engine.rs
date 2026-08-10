@@ -27,13 +27,13 @@ use serde_json::{Value, json};
 
 use crate::api::{Core, CoreError};
 use crate::backend::{
-    Backend, BackendError, BackendRegistry, BackendSignal, ExecutionHandle, NativeState,
-    Observation, ResumeRequest, StartRequest,
+    Backend, BackendError, BackendRegistry, BackendSignal, Deferred, ExecutionHandle, NativeState,
+    Observation, PreparedExecution, ResumeRequest, StartRequest,
 };
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::execution::{
-    ExecutionRecord, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
-    ReconcileDisposition,
+    ExecutionRecord, ExecutionReservation, KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED,
+    KIND_EXECUTION_RESERVED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED, ReconcileDisposition,
 };
 use crate::domain::profile::Profile;
 use crate::domain::work::{
@@ -91,6 +91,97 @@ pub struct StartPlan {
     pub route: Route,
     /// The launch profile, if one was selected.
     pub profile: Option<Profile>,
+}
+
+/// An external effect the engine has committed to and must now perform
+/// **with the core lock released** (§14.2's middle phase).
+///
+/// It carries everything the launch needs and nothing the journal owns: the
+/// reservation is already durable, so this value is pure intent. A caller that
+/// drops one without launching leaves an unsettled reservation in the journal,
+/// which is the same state a crash leaves and is handled the same way — fail
+/// closed at the next restart, never guessed at.
+pub struct PendingLaunch {
+    work_id: String,
+    reservation: ExecutionReservation,
+    backend: Arc<dyn Backend>,
+    prepared: PreparedExecution,
+}
+
+impl std::fmt::Debug for PendingLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLaunch")
+            .field("work_id", &self.work_id)
+            .field("execution_id", &self.reservation.execution_id)
+            .field("stage_id", &self.reservation.stage_id)
+            .field("attempt", &self.reservation.attempt)
+            .field("backend", &self.reservation.backend)
+            .finish()
+    }
+}
+
+impl PendingLaunch {
+    /// The work this launch serves.
+    pub fn work_id(&self) -> &str {
+        &self.work_id
+    }
+
+    /// The reserved execution id.
+    pub fn execution_id(&self) -> &str {
+        &self.reservation.execution_id
+    }
+
+    /// Perform the external effect.
+    ///
+    /// **Never call this while holding the core lock** — it is the process
+    /// spawn, the container create, the thing §22.6 exists to keep out from
+    /// under the daemon's single writer. The engine cannot enforce that
+    /// (it never sees a guard, only `&mut Core`), so it is stated here and
+    /// instrumented by the §22.6 tests.
+    pub fn launch(&self) -> Result<ExecutionHandle, BackendError> {
+        self.backend.launch(&self.prepared)
+    }
+}
+
+/// What the engine needs before it can crank again.
+#[derive(Debug)]
+pub enum Next {
+    /// Nothing further: the run is where its last explicit signal left it.
+    Parked,
+    /// Perform this outside the lock, then feed the result back through
+    /// [`Engine::settle_launch`].
+    ///
+    /// Boxed because the payload dwarfs `Parked` — and because the common
+    /// case *is* `Parked`: every observation that does not enter a stage
+    /// returns one, so the enum is moved far more often than it is filled.
+    Launch(Box<PendingLaunch>),
+}
+
+/// One crank of the engine: everything it committed under this lock hold,
+/// plus what it needs done outside it.
+#[must_use = "a Step's Deferred must be drained and its Next acted on, or the \
+              adapter's tail work detaches and the run stalls mid-launch"]
+#[derive(Debug)]
+pub struct Step {
+    /// What to do outside the lock.
+    pub next: Next,
+    /// Adapter tail work collected during this crank (issue #14/B3).
+    pub deferred: Deferred,
+}
+
+impl Step {
+    /// A crank that committed nothing outstanding and needs nothing done.
+    pub fn parked() -> Self {
+        Self {
+            next: Next::Parked,
+            deferred: Deferred::new(),
+        }
+    }
+
+    /// Whether this crank asks for an external launch.
+    pub fn needs_launch(&self) -> bool {
+        matches!(self.next, Next::Launch(_))
+    }
 }
 
 /// Failure from an engine operation.
@@ -374,6 +465,21 @@ impl Engine {
     /// [`Engine::reconcile_crashed_start`] turns whatever prefix survives
     /// into a `blocked` work with that evidence.
     pub fn start(&self, core: &mut Core, work: &Work, plan: &StartPlan) -> Result<(), EngineError> {
+        let step = self.begin_start(core, work, plan)?;
+        self.run_inline(core, step)
+    }
+
+    /// [`Engine::start`]'s first phase: everything up to and including the
+    /// first stage's reservation, all of it under the caller's lock.
+    ///
+    /// The daemon calls this, releases the core guard, performs the returned
+    /// [`Next::Launch`], and comes back through [`Engine::settle_launch`].
+    pub fn begin_start(
+        &self,
+        core: &mut Core,
+        work: &Work,
+        plan: &StartPlan,
+    ) -> Result<Step, EngineError> {
         // Recorded first: everything below this line can create a branch and
         // a worktree in a repository sergeant does not own.
         self.commit(
@@ -401,7 +507,7 @@ impl Engine {
                     &format!("cannot materialize work surface: {source}"),
                     Some(serde_json::to_string(&teardown).unwrap_or_default()),
                 )?;
-                return Ok(());
+                return Ok(Step::parked());
             }
             Err(e) => {
                 self.block(
@@ -410,7 +516,7 @@ impl Engine {
                     &format!("cannot materialize work surface: {e}"),
                     None,
                 )?;
-                return Ok(());
+                return Ok(Step::parked());
             }
         };
         self.commit(
@@ -437,10 +543,36 @@ impl Engine {
             KIND_WORK_STARTED,
             json!({"backend": plan.route.backend, "workflow": plan.workflow.name}),
         )?;
-        if self.enter_stage(core, &work.id, 0, 1)? {
-            self.resume(core, &work.id)?;
+        let next = self.reserve_stage(core, &work.id, 0, 1)?;
+        Ok(Step {
+            next,
+            deferred: Deferred::new(),
+        })
+    }
+
+    /// Drive a [`Step`] to a park **inline**, performing every launch and
+    /// waiting for every completion on this thread.
+    ///
+    /// This is the single-owner path: correct wherever the caller is not
+    /// sharing the core with concurrent requests — startup recovery (nothing
+    /// is served yet), the deterministic tests, and the sync wrappers below.
+    /// The daemon's request path uses the same primitives with the guard
+    /// dropped between phases (`api::crank`), so there is one implementation
+    /// of the lifecycle and two lock policies over it, rather than two
+    /// lifecycles that can drift.
+    fn run_inline(&self, core: &mut Core, step: Step) -> Result<(), EngineError> {
+        let mut step = step;
+        loop {
+            let Step { next, deferred } = step;
+            deferred.wait();
+            match next {
+                Next::Parked => return Ok(()),
+                Next::Launch(pending) => {
+                    let outcome = pending.launch();
+                    step = self.settle_launch(core, pending, outcome)?;
+                }
+            }
         }
-        Ok(())
     }
 
     /// Deliver an answer to a work that asked for input (§12's needs-input
@@ -452,6 +584,17 @@ impl Engine {
         work_id: &str,
         input: &str,
     ) -> Result<(), EngineError> {
+        let step = self.begin_input(core, work_id, input)?;
+        self.run_inline(core, step)
+    }
+
+    /// [`Engine::provide_input`]'s first phase (see [`Engine::begin_start`]).
+    pub fn begin_input(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        input: &str,
+    ) -> Result<Step, EngineError> {
         let state = self.work_state(core, work_id)?;
         if state != WorkState::NeedsInput {
             return Err(EngineError::NotAwaitingInput {
@@ -489,9 +632,11 @@ impl Engine {
                 json!({"stage_id": stage_id, "detail": e.to_string()}),
             )?;
             self.block(core, work_id, &format!("cannot deliver input: {e}"), None)?;
-            return Ok(());
+            return Ok(Step::parked());
         }
-        self.resume(core, work_id)
+        let mut deferred = Deferred::new();
+        let next = self.drive(core, work_id, None, &mut deferred)?;
+        Ok(Step { next, deferred })
     }
 
     /// Re-enter the current stage (§12's retry verb).
@@ -501,6 +646,12 @@ impl Engine {
     /// re-attached to the branch teardown retained, so a retry continues on
     /// the work the failed attempt left behind.
     pub fn retry(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
+        let step = self.begin_retry(core, work_id)?;
+        self.run_inline(core, step)
+    }
+
+    /// [`Engine::retry`]'s first phase (see [`Engine::begin_start`]).
+    pub fn begin_retry(&self, core: &mut Core, work_id: &str) -> Result<Step, EngineError> {
         let state = self.work_state(core, work_id)?;
         if !matches!(
             state,
@@ -547,10 +698,11 @@ impl Engine {
             KIND_WORK_RESUMED,
             json!({"reason": "retry", "stage_id": current.stage_id}),
         )?;
-        if self.enter_stage(core, work_id, current.index, current.attempt + 1)? {
-            self.resume(core, work_id)?;
-        }
-        Ok(())
+        let next = self.reserve_stage(core, work_id, current.index, current.attempt + 1)?;
+        Ok(Step {
+            next,
+            deferred: Deferred::new(),
+        })
     }
 
     /// Retire a run whose work has just reached a terminal state.
@@ -570,8 +722,25 @@ impl Engine {
         work_id: &str,
         reason: &str,
     ) -> Result<(), EngineError> {
+        let step = self.begin_retire_run(core, work_id, reason)?;
+        self.run_inline(core, step)
+    }
+
+    /// [`Engine::retire_run`]'s first phase (see [`Engine::begin_start`]).
+    ///
+    /// This is the one that mattered for issue #14: the STOP it issues used
+    /// to join the Claude adapter's transcript-archive thread inline, under
+    /// the daemon's core lock. Now the join rides home in the returned
+    /// [`Step::deferred`] and the caller waits for it after releasing the
+    /// guard — same promise, different place.
+    pub fn begin_retire_run(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        reason: &str,
+    ) -> Result<Step, EngineError> {
         let Ok(run) = self.run(core, work_id) else {
-            return Ok(()); // nothing ever started
+            return Ok(Step::parked()); // nothing ever started
         };
         // A stage that already reached its own conclusion keeps it: cancelling
         // a work that failed must not rewrite the failure as a cancellation.
@@ -592,8 +761,13 @@ impl Engine {
                 json!({"stage_id": stage.stage_id, "detail": reason}),
             )?;
         }
-        self.stop_execution(core, work_id, reason)?;
-        self.tear_down_surface(core, work_id)
+        let mut deferred = Deferred::new();
+        self.stop_execution(core, work_id, reason, &mut deferred)?;
+        self.tear_down_surface(core, work_id)?;
+        Ok(Step {
+            next: Next::Parked,
+            deferred,
+        })
     }
 
     /// Drive a run forward from whatever its backend now says.
@@ -604,7 +778,15 @@ impl Engine {
     /// say; every iteration either returns or advances to a later stage, so
     /// the loop is bounded by the workflow's stage count.
     pub fn resume(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
-        self.drive(core, work_id, None)
+        let step = self.begin_resume(core, work_id)?;
+        self.run_inline(core, step)
+    }
+
+    /// [`Engine::resume`]'s first phase (see [`Engine::begin_start`]).
+    pub fn begin_resume(&self, core: &mut Core, work_id: &str) -> Result<Step, EngineError> {
+        let mut deferred = Deferred::new();
+        let next = self.drive(core, work_id, None, &mut deferred)?;
+        Ok(Step { next, deferred })
     }
 
     /// [`Engine::resume`]'s implementation, with an optional pre-fetched
@@ -622,155 +804,169 @@ impl Engine {
         core: &mut Core,
         work_id: &str,
         initial: Option<Observation>,
-    ) -> Result<(), EngineError> {
-        let mut pending = initial;
-        loop {
-            let run = self.run(core, work_id)?;
-            let Some(execution) = run.execution.clone() else {
-                return Ok(());
-            };
-            let Some(stage) = run.current_stage().cloned() else {
-                return Ok(());
-            };
-            let workflow = run.workflow.clone().ok_or_else(|| EngineError::NoRun {
-                work_id: work_id.to_string(),
-            })?;
-            let backend = self.backend_for(work_id, &execution.backend)?;
+        deferred: &mut Deferred,
+    ) -> Result<Next, EngineError> {
+        let run = self.run(core, work_id)?;
+        let Some(execution) = run.execution.clone() else {
+            return Ok(Next::Parked);
+        };
+        let Some(stage) = run.current_stage().cloned() else {
+            return Ok(Next::Parked);
+        };
+        let workflow = run.workflow.clone().ok_or_else(|| EngineError::NoRun {
+            work_id: work_id.to_string(),
+        })?;
+        let backend = self.backend_for(work_id, &execution.backend)?;
 
-            let observation = match pending.take() {
-                Some(observation) => observation,
-                None => match backend.observe(&handle_of(&execution)) {
-                    Ok(observation) => observation,
-                    Err(e) => {
-                        // §25: the adapter cannot classify the native context.
-                        // Ambiguity fails closed, with the evidence recorded.
-                        self.commit(
-                            core,
-                            work_id,
-                            KIND_STAGE_BLOCKED,
-                            json!({"stage_id": stage.stage_id, "detail": e.to_string()}),
-                        )?;
-                        self.block(
-                            core,
-                            work_id,
-                            "backend could not observe the execution",
-                            Some(e.to_string()),
-                        )?;
-                        return Ok(());
-                    }
-                },
-            };
-            if observation.native == NativeState::Unknown {
-                self.commit(
-                    core,
-                    work_id,
-                    KIND_STAGE_BLOCKED,
-                    json!({
-                        "stage_id": stage.stage_id,
-                        "detail": observation
-                            .evidence
-                            .clone()
-                            .unwrap_or_else(|| "backend reports an unknown native state".to_string()),
-                    }),
-                )?;
-                self.block(
-                    core,
-                    work_id,
-                    "backend reports an unknown native state",
-                    observation.evidence.clone(),
-                )?;
-                return Ok(());
-            }
-
-            // From here on, only `observation.signal` is consulted. Native
-            // liveness has already had its one and only say (Unknown above).
-            match observation.signal {
-                BackendSignal::Running => return Ok(()),
-                BackendSignal::NeedsInput { prompt } => {
-                    self.commit(
-                        core,
-                        work_id,
-                        KIND_STAGE_NEEDS_INPUT,
-                        json!({"stage_id": stage.stage_id, "detail": prompt}),
-                    )?;
-                    self.transition(
-                        core,
-                        work_id,
-                        KIND_WORK_NEEDS_INPUT,
-                        json!({"prompt": prompt, "stage_id": stage.stage_id}),
-                    )?;
-                    return Ok(());
-                }
-                BackendSignal::Waiting { reason } => {
-                    self.commit(
-                        core,
-                        work_id,
-                        KIND_STAGE_WAITING,
-                        json!({"stage_id": stage.stage_id, "detail": reason}),
-                    )?;
-                    self.transition(
-                        core,
-                        work_id,
-                        KIND_WORK_WAITING,
-                        json!({"reason": reason, "stage_id": stage.stage_id}),
-                    )?;
-                    return Ok(());
-                }
-                BackendSignal::Blocked { reason } => {
+        let observation = match initial {
+            Some(observation) => observation,
+            None => match backend.observe(&handle_of(&execution)) {
+                Ok(observation) => observation,
+                Err(e) => {
+                    // §25: the adapter cannot classify the native context.
+                    // Ambiguity fails closed, with the evidence recorded.
                     self.commit(
                         core,
                         work_id,
                         KIND_STAGE_BLOCKED,
-                        json!({"stage_id": stage.stage_id, "detail": reason}),
+                        json!({"stage_id": stage.stage_id, "detail": e.to_string()}),
                     )?;
-                    self.transition(
+                    self.block(
                         core,
                         work_id,
-                        KIND_WORK_BLOCKED,
-                        json!({"reason": reason, "stage_id": stage.stage_id}),
+                        "backend could not observe the execution",
+                        Some(e.to_string()),
                     )?;
-                    return Ok(());
+                    return Ok(Next::Parked);
                 }
-                BackendSignal::Failed { reason } => {
-                    self.commit(
-                        core,
-                        work_id,
-                        KIND_STAGE_FAILED,
-                        json!({"stage_id": stage.stage_id, "detail": reason}),
-                    )?;
-                    self.stop_execution(core, work_id, "stage failed")?;
-                    self.transition(
-                        core,
-                        work_id,
-                        KIND_WORK_FAILED,
-                        json!({"reason": reason, "stage_id": stage.stage_id}),
-                    )?;
-                    self.tear_down_surface(core, work_id)?;
-                    return Ok(());
+            },
+        };
+        if observation.native == NativeState::Unknown {
+            self.commit(
+                core,
+                work_id,
+                KIND_STAGE_BLOCKED,
+                json!({
+                    "stage_id": stage.stage_id,
+                    "detail": observation
+                        .evidence
+                        .clone()
+                        .unwrap_or_else(|| "backend reports an unknown native state".to_string()),
+                }),
+            )?;
+            self.block(
+                core,
+                work_id,
+                "backend reports an unknown native state",
+                observation.evidence.clone(),
+            )?;
+            return Ok(Next::Parked);
+        }
+
+        // From here on, only `observation.signal` is consulted. Native
+        // liveness has already had its one and only say (Unknown above).
+        match observation.signal {
+            BackendSignal::Running => Ok(Next::Parked),
+            BackendSignal::NeedsInput { prompt, asked_by } => {
+                // GP-2: *who asked* travels with the question. The engine's
+                // handling is identical either way — that is the point, the
+                // ask primitive reuses `respond` rather than inventing a
+                // second resume verb — but a trajectory that cannot say
+                // whether a human was consulted because the actor asked or
+                // because a gate fired has lost the fact the workflow author
+                // was designing around.
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_NEEDS_INPUT,
+                    json!({
+                        "stage_id": stage.stage_id,
+                        "detail": prompt,
+                        "asked_by": asked_by.as_str(),
+                    }),
+                )?;
+                self.transition(
+                    core,
+                    work_id,
+                    KIND_WORK_NEEDS_INPUT,
+                    json!({
+                        "prompt": prompt,
+                        "stage_id": stage.stage_id,
+                        "asked_by": asked_by.as_str(),
+                    }),
+                )?;
+                Ok(Next::Parked)
+            }
+            BackendSignal::Waiting { reason } => {
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_WAITING,
+                    json!({"stage_id": stage.stage_id, "detail": reason}),
+                )?;
+                self.transition(
+                    core,
+                    work_id,
+                    KIND_WORK_WAITING,
+                    json!({"reason": reason, "stage_id": stage.stage_id}),
+                )?;
+                Ok(Next::Parked)
+            }
+            BackendSignal::Blocked { reason } => {
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_BLOCKED,
+                    json!({"stage_id": stage.stage_id, "detail": reason}),
+                )?;
+                self.transition(
+                    core,
+                    work_id,
+                    KIND_WORK_BLOCKED,
+                    json!({"reason": reason, "stage_id": stage.stage_id}),
+                )?;
+                Ok(Next::Parked)
+            }
+            BackendSignal::Failed { reason } => {
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_FAILED,
+                    json!({"stage_id": stage.stage_id, "detail": reason}),
+                )?;
+                self.stop_execution(core, work_id, "stage failed", deferred)?;
+                self.transition(
+                    core,
+                    work_id,
+                    KIND_WORK_FAILED,
+                    json!({"reason": reason, "stage_id": stage.stage_id}),
+                )?;
+                self.tear_down_surface(core, work_id)?;
+                Ok(Next::Parked)
+            }
+            BackendSignal::StageCompleted { summary } => {
+                let mut payload = json!({"stage_id": stage.stage_id, "index": stage.index});
+                if let Some(summary) = summary {
+                    payload["detail"] = Value::String(summary);
                 }
-                BackendSignal::StageCompleted { summary } => {
-                    let mut payload = json!({"stage_id": stage.stage_id, "index": stage.index});
-                    if let Some(summary) = summary {
-                        payload["detail"] = Value::String(summary);
-                    }
-                    self.commit(core, work_id, KIND_STAGE_COMPLETED, payload)?;
-                    self.stop_execution(core, work_id, "stage completed")?;
-                    let next = stage.index + 1;
-                    if next < workflow.stages.len() {
-                        if !self.enter_stage(core, work_id, next, 1)? {
-                            return Ok(());
-                        }
-                        continue;
-                    }
-                    self.transition(
-                        core,
-                        work_id,
-                        KIND_WORK_COMPLETED,
-                        json!({"stages": workflow.stages.len()}),
-                    )?;
-                    self.tear_down_surface(core, work_id)?;
-                    return Ok(());
+                self.commit(core, work_id, KIND_STAGE_COMPLETED, payload)?;
+                self.stop_execution(core, work_id, "stage completed", deferred)?;
+                let next = stage.index + 1;
+                if next < workflow.stages.len() {
+                    // The next stage's reservation is committed here, under
+                    // the same lock; its *launch* goes back to the caller.
+                    // That is why this function no longer loops — the loop is
+                    // the caller's, and every turn of it releases the lock.
+                    return self.reserve_stage(core, work_id, next, 1);
                 }
+                self.transition(
+                    core,
+                    work_id,
+                    KIND_WORK_COMPLETED,
+                    json!({"stages": workflow.stages.len()}),
+                )?;
+                self.tear_down_surface(core, work_id)?;
+                Ok(Next::Parked)
             }
         }
     }
@@ -809,6 +1005,14 @@ impl Engine {
         work_id: &str,
     ) -> Result<ReconcileDisposition, EngineError> {
         let run = self.run(core, work_id)?;
+        // §14.2's window, read first because it is the most recent fact the
+        // journal has: an execution whose reservation is durable and whose
+        // launch never reported back. It outranks any *earlier* execution
+        // this run still records — that one belongs to a settled attempt,
+        // and resuming it would be resuming the wrong thing.
+        if let Some(reservation) = run.unsettled_reservation().cloned() {
+            return self.reconcile_unsettled_reservation(core, work_id, &run, &reservation);
+        }
         let Some(execution) = run.execution.clone() else {
             self.record_reconcile(
                 core,
@@ -878,9 +1082,19 @@ impl Engine {
             reattached,
             &evidence,
         )?;
+        let mut deferred = Deferred::new();
         match disposition {
             ReconcileDisposition::Resumed => {
-                self.drive(core, work_id, resumed_from)?;
+                let next = self.drive(core, work_id, resumed_from, &mut deferred)?;
+                // Recovery is the single-owner path: nothing is served yet,
+                // so performing the launch here holds up no request.
+                self.run_inline(
+                    core,
+                    Step {
+                        next,
+                        deferred: std::mem::take(&mut deferred),
+                    },
+                )?;
             }
             ReconcileDisposition::Ambiguous => {
                 if let Some(stage) = run.current_stage() {
@@ -908,7 +1122,12 @@ impl Engine {
                 // `execution.stopped` and asks again, which is convergent
                 // (asking a backend that refuses has no effect) and honest
                 // (every attempt is journaled as the attempt it was).
-                self.stop_execution(core, work_id, "retired at reconcile: unrecognized")?;
+                self.stop_execution(
+                    core,
+                    work_id,
+                    "retired at reconcile: unrecognized",
+                    &mut deferred,
+                )?;
                 self.block(
                     core,
                     work_id,
@@ -917,7 +1136,94 @@ impl Engine {
                 )?;
             }
         }
+        deferred.wait();
         Ok(disposition)
+    }
+
+    /// Fail a work closed over a reservation whose launch never reported back
+    /// (§14.2's crash window, §14.3's Claude start-window).
+    ///
+    /// This is the window the reservation exists to make inspectable, and the
+    /// honest answer to it is short: *sergeant committed to this execution
+    /// identity, and cannot tell whether the external effect happened.* Both
+    /// branches are live — the daemon may have died before the spawn, or
+    /// after it — and no evidence available here separates them. So it fails
+    /// closed with the reserved identity in the evidence, which is the thing
+    /// an operator needs to go and look for.
+    ///
+    /// Three things this deliberately does **not** do:
+    ///
+    /// - it does not ask the adapter to observe or resume the identity. The
+    ///   adapter has no record of it (the reservation predates its state), so
+    ///   the question would return `UnknownExecution` and that refusal would
+    ///   read like evidence the context does not exist. It is not.
+    /// - it does not stop or delete anything. §22.5's rule for every crash
+    ///   window is that recovery must not delete unproven state, and a
+    ///   possibly-nonexistent native context is the purest case of it.
+    /// - it does not retry. Re-launching would be the "start the external
+    ///   effect twice" failure the same rule forbids.
+    ///
+    /// The reservation is journaled as abandoned so the record is closed —
+    /// the identity survives *in that event*, and a later retry starts from a
+    /// clean bookkeeping state rather than tripping this branch forever.
+    fn reconcile_unsettled_reservation(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        reservation: &ExecutionReservation,
+    ) -> Result<ReconcileDisposition, EngineError> {
+        let identity = match &reservation.native_id {
+            Some(native_id) => format!("reserved native identity {native_id}"),
+            None => "no native identity had been reserved yet".to_string(),
+        };
+        let evidence = format!(
+            "execution {} was reserved on backend {:?} for stage {} attempt {}, and the journal \
+             never recorded whether its launch happened ({identity}); sergeant will not guess, \
+             start it a second time, or remove anything it cannot prove it owns",
+            reservation.execution_id,
+            reservation.backend,
+            reservation.stage_id,
+            reservation.attempt,
+        );
+        self.record_reconcile(
+            core,
+            work_id,
+            None,
+            ReconcileDisposition::Ambiguous,
+            false,
+            &evidence,
+        )?;
+        self.commit(
+            core,
+            work_id,
+            KIND_EXECUTION_ABANDONED,
+            json!({
+                "execution_id": reservation.execution_id,
+                "backend": reservation.backend,
+                "native_id": reservation.native_id,
+                "stage_id": reservation.stage_id,
+                "attempt": reservation.attempt,
+                "reason": "unsettled_at_restart",
+                "detail": evidence,
+                "launched": Value::Null,
+            }),
+        )?;
+        if let Some(stage) = run.current_stage() {
+            self.commit(
+                core,
+                work_id,
+                KIND_STAGE_BLOCKED,
+                json!({"stage_id": stage.stage_id, "detail": evidence.clone()}),
+            )?;
+        }
+        self.block(
+            core,
+            work_id,
+            "an execution was reserved but its launch was never recorded",
+            Some(evidence),
+        )?;
+        Ok(ReconcileDisposition::Ambiguous)
     }
 
     /// §25's reattach step: ask the backend to re-adopt the recorded native
@@ -1017,15 +1323,34 @@ impl Engine {
         )
     }
 
-    /// Enter a stage: journal the entry, then START an execution for it.
-    /// Returns whether the run can be driven (a start failure blocks instead).
-    fn enter_stage(
+    /// Enter a stage and reserve its execution — §14.2's first phase, whole.
+    ///
+    /// Everything here is authoritative and cheap: validate the stage exists,
+    /// resolve the executor, allocate the execution id, ask the adapter to
+    /// PREPARE (identity only — no process, no I/O), and append
+    /// `execution.reserved`. What comes back is the launch, for the caller to
+    /// perform outside the lock.
+    ///
+    /// **L6 audit.** This makes `stage.entered` → `execution.reserved` →
+    /// `execution.started` a three-append sequence with two crash windows,
+    /// where before there were two appends and one. That is a deliberate
+    /// trade: the new window is the one that was previously *invisible*. A
+    /// crash between `stage.entered` and the reservation leaves a stage with
+    /// no execution, which recovery already fails closed on. A crash between
+    /// the reservation and `execution.started` leaves an unsettled
+    /// reservation — and that is the window in which a native context may
+    /// exist that sergeant never recorded. Before, that same window existed
+    /// between the adapter's spawn and `execution.started`, with *nothing*
+    /// durable naming the session; now the journal names it, and
+    /// [`crate::runtime::recovery`] can fail the work closed with the
+    /// identity in the evidence instead of with a shrug.
+    fn reserve_stage(
         &self,
         core: &mut Core,
         work_id: &str,
         index: usize,
         attempt: u32,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<Next, EngineError> {
         let run = self.run(core, work_id)?;
         let workflow = run.workflow.clone().ok_or_else(|| EngineError::NoRun {
             work_id: work_id.to_string(),
@@ -1073,9 +1398,11 @@ impl Engine {
             model: run.profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: run.profile.clone(),
         };
-        let handle = match backend.start(&request) {
-            Ok(handle) => handle,
+        let prepared = match backend.prepare(&request) {
+            Ok(prepared) => prepared,
             Err(e) => {
+                // Refused before anything was reserved: no identity was
+                // allocated, so there is nothing for recovery to wonder about.
                 self.commit(
                     core,
                     work_id,
@@ -1088,24 +1415,199 @@ impl Engine {
                     "backend could not start an execution",
                     Some(e.to_string()),
                 )?;
-                return Ok(false);
+                return Ok(Next::Parked);
             }
         };
-        let record = ExecutionRecord {
+        let reservation = ExecutionReservation {
             execution_id,
             backend: backend_name,
-            native_id: handle.native_id.clone(),
+            native_id: prepared.native_id.clone(),
             stage_id: stage.id.clone(),
+            index,
             attempt,
-            stop_requested: false,
+            stage_kind: stage.kind.as_str().to_string(),
+            profile: run.profile.as_ref().map(|p| p.name.clone()),
+            model: request.model.clone(),
         };
         self.commit(
             core,
             work_id,
+            KIND_EXECUTION_RESERVED,
+            json!({"reservation": reservation}),
+        )?;
+        Ok(Next::Launch(Box::new(PendingLaunch {
+            work_id: work_id.to_string(),
+            reservation,
+            backend,
+            prepared,
+        })))
+    }
+
+    /// §14.2's third phase: verify the reservation is still current, record
+    /// what the launch produced, and drive on.
+    ///
+    /// The verification is the whole reason the phase exists. Between the
+    /// reservation and this call the core lock was *open*, so another request
+    /// may have canceled the work, retried the stage, or otherwise moved the
+    /// durable state on. §14.5's rule is that the late result is subordinate:
+    /// it never revives terminal Work, never advances a superseded attempt,
+    /// and never becomes the run's execution behind the newer decision's
+    /// back. It is recorded as what it is — an execution that was reserved,
+    /// possibly launched, and is now retired — and the native context, if one
+    /// exists, is asked to stop.
+    pub fn settle_launch(
+        &self,
+        core: &mut Core,
+        pending: Box<PendingLaunch>,
+        outcome: Result<ExecutionHandle, BackendError>,
+    ) -> Result<Step, EngineError> {
+        let mut deferred = Deferred::new();
+        let work_id = pending.work_id.clone();
+        let reservation = &pending.reservation;
+        if let Some(why) = self.reservation_is_stale(core, &pending) {
+            let stop = match &outcome {
+                Ok(handle) => match pending.backend.stop(handle) {
+                    Ok(completion) => {
+                        deferred.push(completion);
+                        json!({"requested": true})
+                    }
+                    Err(e) => json!({"requested": true, "error": e.to_string()}),
+                },
+                Err(e) => json!({
+                    "requested": false,
+                    "error": format!("nothing was launched: {e}"),
+                }),
+            };
+            self.commit(
+                core,
+                &work_id,
+                KIND_EXECUTION_ABANDONED,
+                json!({
+                    "execution_id": reservation.execution_id,
+                    "backend": reservation.backend,
+                    "native_id": reservation.native_id,
+                    "stage_id": reservation.stage_id,
+                    "attempt": reservation.attempt,
+                    "reason": "superseded",
+                    "detail": why,
+                    "launched": outcome.is_ok(),
+                    "stop": stop,
+                }),
+            )?;
+            return Ok(Step {
+                next: Next::Parked,
+                deferred,
+            });
+        }
+        let handle = match outcome {
+            Ok(handle) => handle,
+            Err(e) => {
+                // The reservation named an identity nothing ever created.
+                // Saying so explicitly is what keeps the window closed:
+                // without this event the journal would show a reservation
+                // that never settled, and the next restart would fail a work
+                // closed over a native context that provably does not exist.
+                self.commit(
+                    core,
+                    &work_id,
+                    KIND_EXECUTION_ABANDONED,
+                    json!({
+                        "execution_id": reservation.execution_id,
+                        "backend": reservation.backend,
+                        "native_id": reservation.native_id,
+                        "stage_id": reservation.stage_id,
+                        "attempt": reservation.attempt,
+                        "reason": "launch_failed",
+                        "detail": e.to_string(),
+                        "launched": false,
+                    }),
+                )?;
+                self.commit(
+                    core,
+                    &work_id,
+                    KIND_STAGE_BLOCKED,
+                    json!({"stage_id": reservation.stage_id, "detail": e.to_string()}),
+                )?;
+                self.block(
+                    core,
+                    &work_id,
+                    "backend could not start an execution",
+                    Some(e.to_string()),
+                )?;
+                return Ok(Step {
+                    next: Next::Parked,
+                    deferred,
+                });
+            }
+        };
+        let record = ExecutionRecord {
+            execution_id: reservation.execution_id.clone(),
+            backend: reservation.backend.clone(),
+            native_id: handle.native_id.clone(),
+            stage_id: reservation.stage_id.clone(),
+            attempt: reservation.attempt,
+            stop_requested: false,
+        };
+        self.commit(
+            core,
+            &work_id,
             KIND_EXECUTION_STARTED,
             json!({"execution": record}),
         )?;
-        Ok(true)
+        let next = self.drive(core, &work_id, None, &mut deferred)?;
+        Ok(Step { next, deferred })
+    }
+
+    /// Why a launch's result may no longer be applied, or `None` if it may.
+    ///
+    /// §14.5's checklist, in order: the Work still exists; it has not gone
+    /// terminal (or otherwise left `active`); the reservation this launch
+    /// belongs to is still the run's outstanding one; and the stage attempt
+    /// it named is still the current one.
+    fn reservation_is_stale(&self, core: &Core, pending: &PendingLaunch) -> Option<String> {
+        let reservation = &pending.reservation;
+        let registry = core.registry.state();
+        let Some(work) = registry.works.get(&pending.work_id) else {
+            return Some("the work no longer exists".to_string());
+        };
+        if work.state != WorkState::Active {
+            return Some(format!(
+                "work is {} — a launch that finished afterwards cannot move it",
+                work.state
+            ));
+        }
+        let Some(run) = registry.runs.get(&pending.work_id) else {
+            return Some("the run record is gone".to_string());
+        };
+        match run.reservation.as_ref() {
+            Some(current) if current.execution_id == reservation.execution_id => {}
+            Some(current) => {
+                return Some(format!(
+                    "reservation {} was superseded by {}",
+                    reservation.execution_id, current.execution_id
+                ));
+            }
+            None => {
+                return Some(format!(
+                    "reservation {} was already settled or abandoned",
+                    reservation.execution_id
+                ));
+            }
+        }
+        match run.current_stage() {
+            Some(stage)
+                if stage.stage_id == reservation.stage_id
+                    && stage.index == reservation.index
+                    && stage.attempt == reservation.attempt => {}
+            Some(stage) => {
+                return Some(format!(
+                    "the run moved on to stage {} attempt {}",
+                    stage.stage_id, stage.attempt
+                ));
+            }
+            None => return Some("the run has no current stage".to_string()),
+        }
+        None
     }
 
     /// Ask the current execution to retire, and journal that we asked.
@@ -1113,11 +1615,17 @@ impl Engine {
     /// A stop *request* is the whole truth available to sergeant: whether the
     /// native context complied is only knowable through OBSERVE, and is never
     /// assumed here.
+    ///
+    /// The adapter's tail work — a transcript archive still being written —
+    /// goes into `deferred` rather than being joined here (issue #14/B3):
+    /// this runs under the daemon's core lock, and §22.6 forbids a thread
+    /// join under it.
     fn stop_execution(
         &self,
         core: &mut Core,
         work_id: &str,
         reason: &str,
+        deferred: &mut Deferred,
     ) -> Result<(), EngineError> {
         let Ok(run) = self.run(core, work_id) else {
             return Ok(());
@@ -1130,7 +1638,10 @@ impl Engine {
         }
         let outcome = match self.backends.get(&execution.backend) {
             Some(backend) => match backend.stop(&handle_of(&execution)) {
-                Ok(()) => json!({"requested": true}),
+                Ok(completion) => {
+                    deferred.push(completion);
+                    json!({"requested": true})
+                }
                 Err(e) => json!({"requested": true, "error": e.to_string()}),
             },
             None => json!({"requested": false, "error": "backend not registered"}),

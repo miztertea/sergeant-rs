@@ -70,7 +70,8 @@ use sergeant_rs::backend::{
 use sergeant_rs::daemon::{self, DaemonConfig, journaling_sink};
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
 use sergeant_rs::domain::execution::{
-    KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
+    KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
+    KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use sergeant_rs::domain::profile::Profile;
 use sergeant_rs::domain::work::{
@@ -78,11 +79,12 @@ use sergeant_rs::domain::work::{
     KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, WorkState,
 };
 use sergeant_rs::domain::workflow::{
-    KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_WORKFLOW_BOUND,
+    KIND_STAGE_BLOCKED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
+    KIND_WORKFLOW_BOUND,
 };
 use sergeant_rs::domain::workspace::RepositorySpec;
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
-use sergeant_rs::runtime::engine::Engine;
+use sergeant_rs::runtime::engine::{Engine, Next};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::work_registry_projection;
 use sergeant_rs::runtime::recovery;
@@ -1599,7 +1601,7 @@ fn stop_latches_and_a_stopped_execution_refuses_input() {
     wait_settled(&backend, &handle, Duration::from_secs(10));
     backend.send(&handle, "still welcome").expect("send");
     wait_settled(&backend, &handle, Duration::from_secs(10));
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let err = backend
         .send(&handle, "no longer welcome")
         .expect_err("a stopped execution accepts nothing");
@@ -1650,7 +1652,7 @@ fn an_in_flight_turn_is_killed_by_interrupt_and_reported_as_resumable() {
         "the hanging stub keeps the turn in flight: {in_flight:?}"
     );
 
-    backend.interrupt(&handle).expect("interrupt");
+    backend.interrupt(&handle).expect("interrupt").wait();
     let after = wait_settled(&backend, &handle, Duration::from_secs(10));
     assert_eq!(
         after.native,
@@ -1698,7 +1700,7 @@ fn an_in_flight_turn_is_killed_by_interrupt_and_reported_as_resumable() {
     // directories had accumulated on one container). So: STOP must leave
     // nothing in flight.
     let before = dir_entries(data.path());
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let settled = backend.observe(&handle).expect("observe after stop");
     assert_eq!(
         settled.native,
@@ -1779,11 +1781,11 @@ fn send_refuses_a_second_turn_while_one_is_in_flight() {
     );
 
     // Once the turn settles, the same SEND is accepted.
-    backend.interrupt(&handle).expect("interrupt");
+    backend.interrupt(&handle).expect("interrupt").wait();
     wait_settled(&backend, &handle, Duration::from_secs(10));
     backend.send(&handle, "and another thing").expect("send");
     assert_eq!(stub.wait_for_launches(2).len(), 2);
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
 }
 
 /// STOP kills the turn in flight, not just the ability to send.
@@ -1814,7 +1816,7 @@ fn stop_kills_a_turn_that_is_still_running() {
         NativeState::Running
     );
 
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let after = wait_settled(&backend, &handle, Duration::from_secs(10));
     assert_eq!(
         after.native,
@@ -1871,10 +1873,10 @@ fn a_forged_handle_never_resolves_against_the_claude_adapter() {
         for outcome in [
             backend.observe(&forged).map(|_| ()),
             backend.send(&forged, "hello"),
-            backend.interrupt(&forged),
+            backend.interrupt(&forged).map(|c| c.wait()),
             backend.resume(&forged, &ResumeRequest::new("w", data.path())),
             backend.history(&forged).map(|_| ()),
-            backend.stop(&forged),
+            backend.stop(&forged).map(|c| c.wait()),
         ] {
             assert!(
                 matches!(outcome, Err(BackendError::UnknownExecution { .. })),
@@ -3726,7 +3728,7 @@ fn a1_real_claude_session_identity_survives_turns_and_restart() {
     // "retired" is sergeant's decision about this execution, never damage to
     // the native context.
     let transcript = live_transcript_path(&session_id).expect("the durable transcript exists");
-    reborn.stop(&handle).expect("stop");
+    reborn.stop(&handle).expect("stop").wait();
     let refused = reborn
         .send(&handle, "anything")
         .expect_err("a stopped execution accepts nothing");
@@ -3812,7 +3814,7 @@ fn a3_real_claude_interrupt_leaves_the_conversation_resumable() {
         NativeState::Running,
         "the long turn should still be generating when we kill it: {in_flight:?}"
     );
-    backend.interrupt(&handle).expect("interrupt");
+    backend.interrupt(&handle).expect("interrupt").wait();
 
     let after = wait_settled(&backend, &handle, Duration::from_secs(30));
     assert_eq!(after.native, NativeState::Exited);
@@ -3846,9 +3848,450 @@ fn a3_real_claude_interrupt_leaves_the_conversation_resumable() {
     // §37 again, on the interrupt path: STOP after an INTERRUPT retires the
     // execution (no turn is in flight to kill, which is a no-op and not an
     // error) and the latch holds against further input.
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let refused = backend
         .send(&handle, "anything")
         .expect_err("a stopped execution accepts nothing");
     assert!(refused.to_string().contains("stopped"), "{refused}");
+}
+
+// ------------------------------- N3. the two-phase external-effect boundary
+//
+// Proposal §14.2's three phases, and §14.5's rule about what a late result may
+// and may not do. The instrument throughout is the fake backend: `prepare` is
+// pure allocation, `launch` is the external effect, and the tests drive the
+// two halves by hand — which is exactly what the daemon does, with the core
+// lock dropped in between (`api::crank`).
+
+/// A run parked in `blocked` on stage `00-only`, ready for `retry` to reserve
+/// a second attempt. Retry is the cheapest door into the reservation path
+/// that does not need a real workspace on disk.
+fn journal_blocked_run(core: &mut Core, work_id: &str, backend: &str, cwd: &Path) {
+    submit_work(core, work_id, "reserve me a stage");
+    commit(
+        core,
+        work_id,
+        KIND_WORKFLOW_BOUND,
+        json!({
+            "workflow": {"name": "tiny", "version": "1", "source": "test",
+                         "stages": [{"id": "00-only", "context": "c"}]},
+            "backend": backend,
+        }),
+    );
+    journal_surface(core, work_id, cwd);
+    commit(
+        core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+    );
+    commit(core, work_id, KIND_WORK_STARTED, json!({}));
+    commit(
+        core,
+        work_id,
+        KIND_STAGE_BLOCKED,
+        json!({"stage_id": "00-only", "detail": "parked for the test"}),
+    );
+    commit(
+        core,
+        work_id,
+        KIND_WORK_BLOCKED,
+        json!({"reason": "parked"}),
+    );
+}
+
+/// The kinds one work journaled, in order — the cheapest way to assert that
+/// a *sequence* holds, which is what a two-phase boundary is.
+fn kinds_of(core: &Core, work_id: &str) -> Vec<String> {
+    core.journal
+        .replay()
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.work_id.as_deref() == Some(work_id))
+        .map(|e| e.kind)
+        .collect()
+}
+
+/// §14.2 phase 1 and 3: `execution.reserved` is durable — with the allocated
+/// id, the reserved native identity and the pinned executor spec — **before**
+/// the backend is asked to launch anything, and `execution.started` only
+/// appears after the launch reported back.
+///
+/// The load-bearing assertion is the negative one in the middle: at the
+/// moment the reservation is journaled, the backend has received no START
+/// request at all. That is what "the external effect happens outside the
+/// authoritative phase" means operationally, and it is what a regression
+/// (folding the launch back into the reservation) would break first.
+#[test]
+fn n1_the_reservation_is_journaled_before_anything_is_launched() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3RESERVE1";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let Next::Launch(pending) = step.next else {
+        panic!("retry must reserve an execution and hand back its launch");
+    };
+    assert!(
+        !step.deferred.is_pending(),
+        "reserving a stage waits on nothing"
+    );
+
+    // Phase 1 is complete and durable; phase 2 has not happened.
+    let reserved = events_of(&core, work_id, KIND_EXECUTION_RESERVED);
+    assert_eq!(reserved.len(), 1, "one reservation for one attempt");
+    let reservation = &reserved[0]["reservation"];
+    assert_eq!(reservation["execution_id"], pending.execution_id());
+    assert_eq!(reservation["backend"], FAKE_BACKEND_NAME);
+    assert_eq!(reservation["stage_id"], "00-only");
+    assert_eq!(reservation["index"], 0);
+    assert_eq!(reservation["attempt"], 2, "retry's fresh attempt");
+    assert_eq!(
+        reservation["stage_kind"], "actor",
+        "the pinned executor spec travels with the reservation (§12/§13.4)"
+    );
+    assert_eq!(
+        reservation["native_id"],
+        format!("fake-session-{}", pending.execution_id()),
+        "the identity the adapter reserved is journaled before it can exist"
+    );
+    assert!(
+        fake.starts().is_empty(),
+        "the backend must not have been launched while the reservation was being committed"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "no execution is started until the launch reports back"
+    );
+    assert_eq!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .map(|r| r.execution_id.clone()),
+        Some(pending.execution_id().to_string()),
+        "between the phases the projection shows an outstanding reservation"
+    );
+
+    // Phase 2, then phase 3.
+    let outcome = pending.launch();
+    let execution_id = pending.execution_id().to_string();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let started = events_of(&core, work_id, KIND_EXECUTION_STARTED);
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["execution"]["execution_id"], execution_id);
+    assert_eq!(
+        started[0]["execution"]["native_id"],
+        format!("fake-session-{execution_id}"),
+        "the launched identity is the reserved identity, not a second one"
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none(),
+        "a settled reservation is no longer an open window"
+    );
+    let kinds = kinds_of(&core, work_id);
+    let reserved_at = kinds
+        .iter()
+        .position(|k| k == KIND_EXECUTION_RESERVED)
+        .expect("reserved");
+    let started_at = kinds
+        .iter()
+        .position(|k| k == KIND_EXECUTION_STARTED)
+        .expect("started");
+    assert!(
+        reserved_at < started_at,
+        "the reservation must precede the start in the journal: {kinds:?}"
+    );
+}
+
+/// A launch that fails leaves no unsettled reservation behind: the journal
+/// says the reserved identity was never created, and the work fails closed.
+///
+/// Without the abandonment record this would be indistinguishable from a
+/// crash between the two phases — and the next restart would block a work
+/// over a native context that provably does not exist.
+#[test]
+fn n2_a_failed_launch_abandons_its_reservation_and_blocks_the_work() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3RESERVE2";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let Next::Launch(pending) = step.next else {
+        panic!("expected a launch");
+    };
+    let execution_id = pending.execution_id().to_string();
+    // The harness goes away between the reservation and the launch — the
+    // window the two-phase boundary opens on purpose.
+    fake.set_available(false, "the harness vanished mid-launch");
+    let outcome = pending.launch();
+    assert!(outcome.is_err(), "the launch must have failed");
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "launch_failed");
+    assert_eq!(abandoned[0]["launched"], false);
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "nothing started"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none(),
+        "the window is closed: a restart must not re-block over this"
+    );
+}
+
+/// §14.5: a launch that finishes after the durable state moved on is *late
+/// evidence*, never an outcome.
+///
+/// The core lock is open between the reservation and the launch — that is the
+/// whole point of the boundary — so a cancel can land in the middle. When it
+/// does, the launched context is asked to stop, the reservation is journaled
+/// as superseded, and the canceled work stays canceled. A regression that
+/// applied the result anyway would revive terminal Work, which is the first
+/// thing §22.5 forbids.
+#[test]
+fn n3_a_late_launch_cannot_revive_work_that_moved_on() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3LATE0001";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let Next::Launch(pending) = step.next else {
+        panic!("expected a launch");
+    };
+    let execution_id = pending.execution_id().to_string();
+
+    // …and while that launch is in flight, the human cancels.
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_CANCELED,
+        json!({"from": "active"}),
+    );
+    engine
+        .retire_run(&mut core, work_id, "work canceled")
+        .expect("retire");
+
+    let outcome = pending.launch();
+    assert!(
+        outcome.is_ok(),
+        "the launch itself succeeded — that is the point"
+    );
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "a late launch must not revive terminal work"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "the superseded execution never becomes the run's execution"
+    );
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "superseded");
+    assert_eq!(abandoned[0]["launched"], true);
+    assert_eq!(
+        abandoned[0]["stop"]["requested"], true,
+        "the orphan the launch created is asked to stop, not left running"
+    );
+    assert!(
+        fake.stop_requests().contains(&execution_id),
+        "the stop reached the backend for exactly that execution: {:?}",
+        fake.stop_requests()
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none()
+    );
+}
+
+/// A crash between the reservation and the launch result fails closed at the
+/// next restart, with the reserved native identity in the evidence — and
+/// removes nothing (§22.5's "does not delete unproven state", §14.3).
+///
+/// This is the Claude start-window, finally inspectable: before the
+/// reservation existed, a daemon that died between `claude --session-id <u>`
+/// being spawned and `execution.started` being appended left no durable trace
+/// of `<u>` at all.
+#[test]
+fn n4_a_reservation_whose_launch_never_reported_fails_closed_at_restart() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3CRASHRES";
+
+    submit_work(&mut core, work_id, "died between the phases");
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORKFLOW_BOUND,
+        json!({
+            "workflow": {"name": "tiny", "version": "1", "source": "test",
+                         "stages": [{"id": "00-only", "context": "c"}]},
+            "backend": FAKE_BACKEND_NAME,
+        }),
+    );
+    journal_surface(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        json!({"reservation": {
+            "execution_id": "01N3EXEC0001",
+            "backend": FAKE_BACKEND_NAME,
+            "native_id": "fake-session-01N3EXEC0001",
+            "stage_id": "00-only",
+            "index": 0,
+            "attempt": 1,
+            "stage_kind": "actor",
+        }}),
+    );
+    commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked
+    );
+    let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
+    let evidence = blocked
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains("fake-session-01N3EXEC0001"),
+        "the reserved native identity is what an operator has to go and look for: {evidence}"
+    );
+    assert!(
+        evidence.contains("01N3EXEC0001"),
+        "and sergeant's own id for it: {evidence}"
+    );
+    // Nothing was started, nothing was re-launched, nothing was removed.
+    assert!(events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty());
+    assert!(
+        fake.starts().is_empty(),
+        "recovery must never start the external effect a second time"
+    );
+    assert!(
+        fake.stop_requests().is_empty(),
+        "and must not try to kill a context it cannot prove exists"
+    );
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0]["reason"], "unsettled_at_restart");
+    assert_eq!(
+        abandoned[0]["native_id"], "fake-session-01N3EXEC0001",
+        "the identity survives in the record that closes the window"
+    );
+
+    // Idempotent: the work is no longer `active`, so a second restart leaves
+    // it exactly where the first one put it.
+    let again = recovery::reconcile(&engine, &mut core).expect("reconcile again");
+    assert!(again.blocked.is_empty() && again.resumed.is_empty());
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_ABANDONED).len(),
+        1,
+        "the window is closed once"
+    );
+}
+
+/// The stop latch belongs to the execution the event *names*.
+///
+/// Before the two-phase boundary every `execution.stopped` was about the run's
+/// current execution and the id in the payload went unread. Now a superseded
+/// launch is stopped while a different execution is current — and latching
+/// *that* one would make every later stop, including a human's cancel, a
+/// permanent no-op against a live native context nobody ever asked to die.
+#[test]
+fn n5_a_stop_naming_another_execution_does_not_latch_the_current_one() {
+    let data = TempDir::new().expect("tempdir");
+    let mut core = core(data.path());
+    let work_id = "01N3LATCH001";
+    journal_active_run(&mut core, work_id, FAKE_BACKEND_NAME, "fake-session-x");
+    let current = format!("exec-{work_id}");
+
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STOPPED,
+        json!({
+            "execution_id": "some-other-execution",
+            "backend": FAKE_BACKEND_NAME,
+            "reason": "superseded",
+            "outcome": {"requested": true},
+        }),
+    );
+    assert!(
+        !core.registry.state().runs[work_id]
+            .execution
+            .as_ref()
+            .expect("execution")
+            .stop_requested,
+        "a stop aimed at another execution must not latch this one"
+    );
+
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STOPPED,
+        json!({
+            "execution_id": current,
+            "backend": FAKE_BACKEND_NAME,
+            "reason": "canceled",
+            "outcome": {"requested": true},
+        }),
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .execution
+            .as_ref()
+            .expect("execution")
+            .stop_requested,
+        "and a stop that names it does"
+    );
 }
