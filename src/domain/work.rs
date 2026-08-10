@@ -293,6 +293,31 @@ mod tests {
         }
     }
 
+    /// `Display` is `as_str` for every variant, not just the ones that
+    /// happen to appear inside another assertion's failure message
+    /// elsewhere in this file (which only formats on a failing path, so
+    /// those calls execute nothing in a green suite). `Pending` and
+    /// `Waiting` in particular are never the state on either side of a
+    /// failing `can_transition` assertion, so nothing else in this module
+    /// exercises their `as_str`/`Display` arms.
+    #[test]
+    fn display_is_the_canonical_name_for_every_state() {
+        use WorkState::*;
+        for (state, expected) in [
+            (Pending, "pending"),
+            (Active, "active"),
+            (Waiting, "waiting"),
+            (NeedsInput, "needs_input"),
+            (Blocked, "blocked"),
+            (Completed, "completed"),
+            (Failed, "failed"),
+            (Canceled, "canceled"),
+        ] {
+            assert_eq!(state.as_str(), expected);
+            assert_eq!(state.to_string(), expected);
+        }
+    }
+
     #[test]
     fn state_serde_is_snake_case() {
         assert_eq!(

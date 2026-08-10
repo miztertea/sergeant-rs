@@ -265,6 +265,20 @@ mod tests {
         assert_eq!(unix_millis("2026-08-08T01:42:12Z"), None);
         assert_eq!(unix_millis("2026-13-08T01:42:12.000Z"), None);
         assert_eq!(unix_millis("not a timestamp at all!!"), None);
+        // Same length (24 bytes) and the same date/time digits as a valid
+        // stamp, but a separator byte the fixed-width shape never uses at
+        // that position: the second structural check (the `HH:MM:SS.mmmZ`
+        // punctuation), not just the first (`YYYY-MM-DDT`), must refuse it.
+        assert_eq!(unix_millis("2026-08-08T01;42:12.437Z"), None); // ':' -> ';' at byte 13
+        assert_eq!(unix_millis("2026-08-08T01:42;12.437Z"), None); // ':' -> ';' at byte 16
+        assert_eq!(unix_millis("2026-08-08T01:42:12,437Z"), None); // '.' -> ',' at byte 19
+        assert_eq!(unix_millis("2026-08-08T01:42:12.437X"), None); // 'Z' -> 'X' at byte 23
+        // Structurally well-formed (right length, right punctuation) but the
+        // clock fields are out of range: refused by the bounds check, not
+        // guessed at via modular arithmetic.
+        assert_eq!(unix_millis("2026-08-08T24:00:00.000Z"), None); // hour > 23
+        assert_eq!(unix_millis("2026-08-08T00:60:00.000Z"), None); // minute > 59
+        assert_eq!(unix_millis("2026-08-08T00:00:61.000Z"), None); // second > 60
     }
 
     #[test]
