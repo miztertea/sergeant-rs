@@ -2216,7 +2216,83 @@ fn names_token(source: &str, token: &str) -> bool {
         .any(|word| word == token)
 }
 
+/// The rig's own teardown, pinned: SIGTERM, and the daemon exits by itself.
+///
+/// An instrument nobody has tried is a claim (the m2 reaper test's rule,
+/// applied to this file's rig). The assertion that matters is not "the daemon
+/// is gone" — SIGKILL achieves that too — but *how*: the daemon must receive
+/// SIGTERM, run `run_until_signal`'s shutdown path, and return from `main`,
+/// which is the only exit that runs anything registered to happen at exit.
+/// A rig that reverted to `child.kill()` would leave every assertion in the
+/// suite green while silently dropping this daemon's coverage profile, so the
+/// exit status is read and checked rather than discarded.
+#[test]
+fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let data = DataDir::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let mut spawned = SpawnedDaemon::start(&data, cwd.path(), &[]);
+    let pid = spawned.child.id();
+    assert!(
+        daemon::pid_alive(pid),
+        "the rig must hand back a live daemon, or this test measures nothing"
+    );
+
+    let stop = spawned.stop();
+
+    assert_eq!(
+        stop.signal,
+        StopSignal::Term,
+        "the rig must stop its daemon with SIGTERM and only escalate if the {}s grace runs \
+         out; a SIGKILL here means the polite path was skipped or the daemon slept through it",
+        DAEMON_TERM_GRACE.as_secs()
+    );
+    let status = stop
+        .status
+        .expect("the rig must wait for the daemon it signalled, not leave a zombie");
+    assert_eq!(
+        status.signal(),
+        None,
+        "the daemon must exit on its own after SIGTERM, not die *of* a signal — killed by \
+         {:?} means nothing it registered at exit ran (a coverage profile among them)",
+        status.signal()
+    );
+    assert!(
+        status.success(),
+        "the daemon's SIGTERM shutdown must return from main cleanly: {status:?}"
+    );
+    assert!(
+        !daemon::pid_alive(pid),
+        "after stop() the daemon pid {pid} must be gone"
+    );
+    assert_eq!(
+        spawned.stop(),
+        stop,
+        "stop() must be idempotent: Drop calls it again on the way out"
+    );
+}
+
 // ------------------------------------------------------- spawned-daemon rig
+
+/// How the rig's own daemon ended, and what the kernel said about it.
+///
+/// Recorded rather than assumed: the whole point of the polite teardown is
+/// that the daemon gets to run its shutdown path, and "it is gone" is not
+/// evidence that it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonStop {
+    /// The strongest signal the rig had to send.
+    signal: StopSignal,
+    /// What `wait(2)` reported. `None` only if the wait itself failed.
+    status: Option<std::process::ExitStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopSignal {
+    Term,
+    Kill,
+}
 
 /// A `sgt daemon` running as a real child process, from a chosen cwd.
 struct SpawnedDaemon {
@@ -2224,6 +2300,9 @@ struct SpawnedDaemon {
     token: String,
     data_dir: PathBuf,
     child: std::process::Child,
+    /// Set by the first `stop()`, so `Drop` neither repeats it nor waits on
+    /// a child that has already been reaped.
+    stopped: Option<DaemonStop>,
 }
 
 impl SpawnedDaemon {
@@ -2239,9 +2318,11 @@ impl SpawnedDaemon {
 }
 
 impl SpawnedDaemon {
-    // The child is reaped by this type's `Drop`, which kills and waits. The
+    // The child is reaped by this type's `Drop`, which stops and waits. The
     // lint cannot see across that boundary; the timeout path below reaps
-    // explicitly because it never constructs the value that owns the Drop.
+    // explicitly because it never constructs the value that owns the Drop —
+    // and it stays a `kill()`, because a daemon that never published a
+    // descriptor has nothing to shut down politely.
     #[allow(clippy::zombie_processes)]
     fn start_at(data_dir: &Path, cwd: &Path, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(SGT);
@@ -2265,6 +2346,7 @@ impl SpawnedDaemon {
                     token: descriptor.token,
                     data_dir: data_dir.to_path_buf(),
                     child,
+                    stopped: None,
                 };
             }
             if Instant::now() >= deadline {
@@ -2290,18 +2372,75 @@ impl SpawnedDaemon {
         );
         String::from_utf8_lossy(&output.stdout).to_string()
     }
+
+    /// Stop the daemon the way an operator stops it — SIGTERM, a bounded
+    /// wait, SIGKILL only if the wait runs out — and report which of the two
+    /// it took. Idempotent; `Drop` calls it for tests that do not.
+    ///
+    /// This rig used to open with `child.kill()`, i.e. SIGKILL. The daemon
+    /// died either way and every test stayed green, so the difference was
+    /// invisible from inside the suite — but SIGKILL runs nothing registered
+    /// at exit. Measured on this container: an instrumented process that
+    /// handles SIGTERM and returns from `main` writes its `.profraw`; the
+    /// same process under SIGKILL writes none at all. Both of this rig's
+    /// daemons were therefore contributing nothing to a coverage run, which
+    /// is what §6.1 of the S-series proposal registered as loss site 1.
+    fn stop(&mut self) -> DaemonStop {
+        if let Some(stop) = self.stopped {
+            return stop;
+        }
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status();
+        let deadline = Instant::now() + DAEMON_TERM_GRACE;
+        let stop = loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                break DaemonStop {
+                    signal: StopSignal::Term,
+                    status: Some(status),
+                };
+            }
+            if Instant::now() >= deadline {
+                // The escalation still exists — a rig that could be outlived
+                // by its own daemon would be a worse bug than a lost profile.
+                let _ = self.child.kill();
+                break DaemonStop {
+                    signal: StopSignal::Kill,
+                    status: self.child.wait().ok(),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        self.stopped = Some(stop);
+        stop
+    }
 }
+
+/// How long the rig's daemon gets to shut down on SIGTERM before SIGKILL.
+///
+/// Deliberately the same ten seconds as `support::TERM_GRACE`: two teardown
+/// paths that disagreed about "too slow" would make a slow shutdown look like
+/// a different failure depending on which one ran first.
+const DAEMON_TERM_GRACE: Duration = Duration::from_secs(10);
 
 impl Drop for SpawnedDaemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let stop = self.stop();
+        if stop.signal == StopSignal::Kill {
+            eprintln!(
+                "SpawnedDaemon: the daemon on {:?} ignored SIGTERM for {}s and needed SIGKILL \
+                 — it flushed nothing at exit (coverage profiles included)",
+                self.data_dir,
+                DAEMON_TERM_GRACE.as_secs()
+            );
+        }
     }
 }
 
 /// Reap a guarded data dir's daemons, reporting whether `pid` was among them.
 fn dir_reap_contains(data_dir: &DataDir, pid: u32) -> bool {
-    data_dir.reap().contains(&pid)
+    data_dir.reap().iter().any(|daemon| daemon.pid == pid)
 }
 
 /// The slice of a page between two markers, so an assertion about one section
