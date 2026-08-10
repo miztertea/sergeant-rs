@@ -5736,3 +5736,140 @@ fn n24_a_launch_for_a_superseded_attempt_does_not_advance_the_current_one() {
         fake.stop_requests()
     );
 }
+
+/// §22.5 window 2 again, over a prefix the **engine actually produced**.
+///
+/// N3-06: the eight window tests build their `execution.reserved` /
+/// `execution.started` payloads by hand, and nothing binds those fixtures to
+/// what `reserve_stage` writes. A payload-shape drift — the mutation probe
+/// dropped `native_id` — was caught by exactly one test outside the matrix
+/// while all eight window tests kept passing on a journal image the daemon can
+/// no longer produce. That is a matrix testing its own fixtures.
+///
+/// Two guards, because they fail differently. This one is the real article: it
+/// drives the engine to a reservation, drops the launch on the floor (which
+/// *is* the crash — the daemon died before the effect reported back), and
+/// reconciles over the journal the engine wrote itself. The second is the
+/// cheap agreement check below, which fails with the offending key named.
+#[test]
+fn n25_window2_over_a_producer_derived_prefix() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W2DERIVED";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+    // The crash: the daemon dies holding the launch. Nothing was launched,
+    // and nothing will ever report back.
+    drop(pending);
+    assert!(fake.starts().is_empty(), "the launch never happened");
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "unsettled_at_restart");
+    assert_eq!(
+        abandoned[0]["native_id"],
+        format!("fake-session-{execution_id}"),
+        "the identity the engine reserved must survive into the closure — \
+         which is the whole reason the reservation is journaled"
+    );
+    let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains(&format!("fake-session-{execution_id}")),
+        "no owned external identity lost: {evidence}"
+    );
+    assert!(fake.starts().is_empty(), "nothing started twice");
+    assert!(fake.stop_requests().is_empty(), "nothing unproven killed");
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-only".to_string(), 2),
+        "no wrong attempt advanced"
+    );
+}
+
+/// The matrix's hand-written prefixes must have the shape the engine produces.
+///
+/// A window test's value is that its journal image is one a daemon can
+/// actually leave behind. This compares the fixture payloads against a live
+/// `execution.reserved`/`execution.started` pair field by field — keys, and
+/// the coordinate values the fixtures hard-code — so a field added to,
+/// removed from or renamed in either record fails here by name instead of
+/// silently retiring eight tests.
+#[test]
+fn n26_the_crash_window_fixtures_match_what_the_engine_writes() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3FIXTURES";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let produced_reservation = events_of(&core, work_id, KIND_EXECUTION_RESERVED)[0].clone();
+    let produced_started = events_of(&core, work_id, KIND_EXECUTION_STARTED)[0].clone();
+
+    for (label, produced, fixture, inner) in [
+        (
+            "execution.reserved",
+            &produced_reservation,
+            reservation_payload(&execution_id),
+            "reservation",
+        ),
+        (
+            "execution.started",
+            &produced_started,
+            started_payload(&execution_id),
+            "execution",
+        ),
+    ] {
+        let produced_keys = keys_of(&produced[inner]);
+        let fixture_keys = keys_of(&fixture[inner]);
+        assert_eq!(
+            produced_keys, fixture_keys,
+            "the {label} fixture the §22.5 matrix builds no longer has the shape \
+             the engine writes — update the fixture *and* re-read the windows it feeds"
+        );
+        // The coordinate fields the fixtures hard-code must also agree, or
+        // the matrix's prefixes describe a run the engine would not produce.
+        for field in ["execution_id", "backend", "native_id", "stage_id"] {
+            if produced[inner].get(field).is_some() {
+                assert_eq!(
+                    produced[inner][field].is_string(),
+                    fixture[inner][field].is_string(),
+                    "{label}.{field} changed type"
+                );
+            }
+        }
+    }
+}
+
+/// The sorted key names of a JSON object (empty for anything else).
+fn keys_of(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
