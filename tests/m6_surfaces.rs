@@ -428,6 +428,180 @@ fn t1_bare_sgt_opens_the_tui_as_a_client() {
     );
 }
 
+/// Issue #3, end to end and on a real terminal: a TUI whose pty hangs up
+/// exits, instead of outliving its screen at ~100% of a core.
+///
+/// **Why a pty and not a unit test.** The spin is crossterm's — its
+/// `event::poll` never returns once the pty master closes — and no in-process
+/// test can produce that, because it is precisely the library call the fix
+/// arranges never to make. `src/tui.rs`'s unit tests pin the composition (the
+/// tick the reader is handed refuses to poll a hung-up terminal; shutdown
+/// leaves a wedged reader behind; the watch arm ends the session). This is
+/// the measurement they stand in for, and it is the shape the bug was
+/// reported in: run the binary under a pty, kill the process holding the
+/// master, require the TUI to be gone.
+///
+/// Measured while this was written: pre-fix, the orphan was still there 15 s
+/// later having burned 614 CPU ticks, and it ignored SIGTERM (the shutdown
+/// path was parked in an unbounded `reader.join()` behind the spinning
+/// thread); fixed, it exits within a few seconds.
+///
+/// `script(1)` is the pty allocator because it is util-linux and already
+/// present wherever these suites run; when it is absent the test says so and
+/// stops rather than inventing a weaker claim.
+#[cfg(unix)]
+#[test]
+fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
+    if Command::new("script").arg("--version").output().is_err() {
+        eprintln!("skipping: script(1) is not installed, so no pty can be allocated");
+        return;
+    }
+    let data = DataDir::new();
+    let typescript_dir = TempDir::new().expect("tempdir");
+    let typescript = typescript_dir.path().join("session");
+
+    // `script` allocates the pty and makes it the child's controlling
+    // terminal; killing `script` closes the master, which is what a terminal
+    // emulator dying does. Wrapped so that an assertion failing before the
+    // planned kill does not leave the pty (and the session on it) running.
+    let mut pty = Reaped(
+        Command::new("script")
+            .arg("-q")
+            .arg("-f")
+            .arg("-c")
+            .arg(format!("{SGT} --data-dir {}", data.display()))
+            .arg(&typescript)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("allocate a pty with script(1)"),
+    );
+
+    // Wait until the session is actually up — the TUI is a client, so it
+    // reads the API and starts a daemon before it ever touches the terminal,
+    // and hanging up before that would test the wrong thing entirely. The
+    // alternate-screen switch in the typescript is the terminal half; the
+    // process itself is found the same way the daemon reaper finds daemons.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut tui = None;
+    while Instant::now() < deadline {
+        let painted = std::fs::read(&typescript)
+            .map(|bytes| String::from_utf8_lossy(&bytes).contains("[?1049h"))
+            .unwrap_or(false);
+        if painted {
+            tui = tui_pid(data.path());
+            if tui.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let tui = tui.expect("the TUI must come up under the pty");
+    // The watch installs itself as the loop starts; hang up after it has.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        pid_alive(tui),
+        "the session must still be running when its terminal dies, or this \
+         measures nothing"
+    );
+
+    pty.reap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && pid_alive(tui) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let survived = pid_alive(tui);
+    if survived {
+        // Killed before the assertion, not after: a failing assert would
+        // otherwise leave the orphan this test is about running on the box.
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(tui.to_string())
+            .status();
+    }
+    assert!(
+        !survived,
+        "the TUI outlived the terminal it was drawing on (pid {tui}) — that is \
+         issue #3: a process nobody can see, spinning, deaf to SIGTERM"
+    );
+}
+
+/// A child process this test must not leave behind, on any path out.
+#[cfg(unix)]
+struct Reaped(std::process::Child);
+
+#[cfg(unix)]
+impl Reaped {
+    /// Kill it now — the hangup itself, when the child is holding a pty
+    /// master. Idempotent with the `Drop` below.
+    fn reap(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        self.reap();
+    }
+}
+
+/// The pid of the `sgt` *client* on this data dir — the TUI — as distinct
+/// from the daemon it spawned. Argv-matched like `support::daemon_pids`,
+/// which this deliberately mirrors rather than extends: the reaper's job is
+/// daemons, and widening it would make every suite's cleanup depend on a
+/// classification only this test needs.
+#[cfg(unix)]
+fn tui_pid(data_dir: &Path) -> Option<u32> {
+    let wanted = data_dir.to_string_lossy().to_string();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let argv: Vec<String> = String::from_utf8_lossy(&raw)
+            .split('\0')
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_string)
+            .collect();
+        let is_sgt = argv
+            .first()
+            .map(PathBuf::from)
+            .and_then(|program| program.file_name().map(|name| name == "sgt"))
+            .unwrap_or(false);
+        let names_dir = argv
+            .windows(2)
+            .any(|pair| pair[0] == "--data-dir" && pair[1] == wanted);
+        if is_sgt && names_dir && !argv.iter().any(|arg| arg == "daemon") {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Whether a pid is still *running* — `/proc`, like everything else in this
+/// rig, so nothing has to be signalled to find out.
+///
+/// A zombie is not alive: once the pty's owner is killed the session is
+/// reparented, and whether its exit status has been collected yet is the
+/// reaper's business, not evidence that the process is still there.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The comm field is parenthesized and may contain spaces; the state
+    // character is the first field after it.
+    stat.rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| state != "Z")
+}
+
 /// The API extension the detail screens needed, tested where it lives: this
 /// milestone added `work_id` and `limit` to `/v1/events` rather than letting
 /// a client read the journal (§30's rule, applied).
@@ -1529,6 +1703,72 @@ fn t4_the_demo_and_the_client_name_the_same_timeout_knob() {
         script.contains(&format!("export {knob}=")),
         "scripts/demo.sh must export {knob} — the variable the client actually \
          reads — for the path that waits on a real model"
+    );
+}
+
+/// …and an operator who sets that knob and does not get it is *told*, on the
+/// stderr of the process they ran (issue #24).
+///
+/// The rule itself (raise-only) and the warning's wording are unit tested in
+/// `src/api.rs`. What only a real client process can show is that the warning
+/// is printed at all: `client_timeout` can compute it and drop it on the
+/// floor, which restores exactly the silence the issue is about — a knob that
+/// behaves identically whether you set it, mistype it, or leave it alone,
+/// with nothing anywhere naming the timeout in force. So this runs a client
+/// with the override set to a value below the default and reads its stderr.
+#[test]
+fn t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob() {
+    let data = DataDir::new();
+    let knob = sergeant_rs::api::CLIENT_TIMEOUT_ENV;
+    let output = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("status")
+        .env(knob, "5")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run a client with the override set");
+    data.reap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let said: Vec<&str> = stderr.lines().filter(|line| line.contains(knob)).collect();
+    assert_eq!(
+        said.len(),
+        1,
+        "a client that ignored {knob} must say so exactly once on stderr — \
+         once, because the warning is about this process's configuration, not \
+         about each client it builds. stderr was: {stderr:?}"
+    );
+    let said = said[0];
+    assert!(
+        said.contains("\"5\"") && said.contains("10s"),
+        "the warning must name the value it ignored and the timeout actually in \
+         force, or the operator is no better off: {said}"
+    );
+}
+
+/// The same client, with nothing to complain about, complains about nothing.
+///
+/// Half of the value of a warning is that it is not always there; a client
+/// that printed this line unconditionally would be noise an operator learns
+/// to skip past, and the assertion above would still pass.
+#[test]
+fn t4_a_client_that_applies_the_knob_is_quiet_about_it() {
+    let data = DataDir::new();
+    let knob = sergeant_rs::api::CLIENT_TIMEOUT_ENV;
+    let output = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("status")
+        .env(knob, "300")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run a client with the override set");
+    data.reap();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !stderr.contains(knob),
+        "an override that *was* applied is not a complaint: {stderr:?}"
     );
 }
 
