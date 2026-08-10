@@ -48,8 +48,8 @@ use sergeant_rs::domain::work::{
     KIND_WORK_BLOCKED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_SUBMITTED,
 };
 use sergeant_rs::domain::workflow::{
-    KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_WORKFLOW_BOUND,
-    WorkflowDefinition,
+    KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
+    KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
 use sergeant_rs::runtime::engine::{Engine, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
@@ -1550,6 +1550,123 @@ async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
     assert_eq!(
         view["stage"]["executor"]["harness"], FAKE_BACKEND_NAME,
         "the restarted daemon exposes the current stage's pinned executor: {view}"
+    );
+    handle.shutdown().await;
+}
+
+/// §12.5's no-substitution rule at **stage entry** — the one place §17.5's
+/// preflight structurally cannot reach.
+///
+/// The preflight refuses an unusable stage harness before the Work exists
+/// (t7c), and every later stage entry replays the pinned decision (t7d). Both
+/// assume the registry is the one the run was admitted against. It need not
+/// be: a daemon restarted without an adapter — dropped from the config, an
+/// harness uninstalled, a build without a feature — meets a `StageBinding`
+/// naming a harness it does not have, and the fallback that reads naturally
+/// there ("use the Work default") is exactly the silent substitution §12.5
+/// forbids. It would also hand that harness `binding.profile`, a profile
+/// belonging to a different harness.
+///
+/// So the run is stopped at the boundary instead, and this is the test that
+/// says so. Stage 00 fails on the default harness so the work parks somewhere
+/// a restart can pick it up; the daemon comes back with `alt-harness` absent;
+/// the retry walks stage 00 to completion and then meets stage 10's pin.
+#[tokio::test]
+async fn t7f_a_bound_stage_whose_harness_left_the_daemon_blocks_rather_than_substituting() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    mixed_harness_repo(
+        &repo,
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
+    );
+
+    // First daemon: both harnesses registered, so the submission is admitted
+    // and stage 10's binding is pinned to `alt-harness`. Stage 00 fails, which
+    // parks the work in `failed` — a state a restart leaves alone and a retry
+    // can walk forward.
+    let alt = FakeBackend::new("alt-harness");
+    let (registry, fake) = one_fake([FakeStep::fail("stage a could not finish")]);
+    let registry = registry.with(Arc::new(alt.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "the harness leaves between the bind and the stage",
+        json!({"workflow": "mixed"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit rejected: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "failed", "{body}");
+    let bound = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
+    assert_eq!(
+        bound[0].payload["stage_bindings"][1]["harness"], "alt-harness",
+        "the pin under test must actually be in the journal"
+    );
+    handle.shutdown().await;
+
+    // Second daemon over the same journal, with `alt-harness` deregistered.
+    // Nothing in the workspace changed; the *daemon* did.
+    let (registry, fake2) = one_fake([FakeStep::complete()]);
+    assert!(
+        !registry.names().iter().any(|n| n == "alt-harness"),
+        "the point of this restart is that the pinned harness is gone"
+    );
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+
+    // Stage 00 completed on the Work default, and then the run stopped.
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "a stage pinned to a missing harness must stop the run: {body}"
+    );
+    let blocked = events_of(data.path(), &work_id, KIND_WORK_BLOCKED);
+    let blocked = blocked.last().expect("work.blocked").payload.clone();
+    assert_eq!(
+        blocked["reason"], "stage harness is unavailable",
+        "the block names why, not just that: {blocked}"
+    );
+    let evidence = blocked["evidence"].as_str().expect("evidence").to_string();
+    for fragment in ["10-b", "alt-harness", "will not substitute"] {
+        assert!(
+            evidence.contains(fragment),
+            "the evidence must name {fragment:?}: {evidence}"
+        );
+    }
+    let stage_blocked = events_of(data.path(), &work_id, KIND_STAGE_BLOCKED);
+    assert_eq!(
+        stage_blocked.last().expect("stage.blocked").payload["stage_id"],
+        "10-b",
+        "the block is attributed to the stage that named the missing harness"
+    );
+
+    // The substitution that would have been silent, denied: the Work default
+    // ran stage 00 and only stage 00, and was never handed stage 10 — nor
+    // stage 10's profile, which belongs to another harness entirely.
+    assert_eq!(
+        fake2
+            .starts()
+            .iter()
+            .map(|s| s.stage_id.clone())
+            .collect::<Vec<_>>(),
+        vec!["00-a".to_string()],
+        "the Work default must not pick up a stage another harness was pinned to"
+    );
+    assert!(
+        !fake.starts().iter().any(|s| s.stage_id == "10-b"),
+        "and neither did the first daemon's instance of it"
     );
     handle.shutdown().await;
 }
