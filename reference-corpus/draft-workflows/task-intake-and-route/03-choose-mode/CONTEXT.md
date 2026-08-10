@@ -4,7 +4,7 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../02-check-queue/output/README.md | L4 | upstream artifact produced by `02-check-queue` |
+| ../01-load-context/output/README.md | L4 | upstream artifact produced by `01-load-context` |
 
 ## Purpose
 
@@ -37,6 +37,13 @@ Direct or dispatch is selected on the four stated criteria.
 ## Judgment required
 
 This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+
+## Helpers (folded per N1 adjudication A4)
+
+`02-check-queue` carried no argument beyond the §6.5 deterministic-machinery boilerplate — no "Additional note" checkpoint argument — so it demotes by default and folds into this stage as a helper invocation performed before the mode decision:
+
+- **Check queue.** Run sgt-td-list and reuse a matching task in direct or dispatch mode; create a task only when no canonical task exists.
+  — `BU-P1-027`, `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L137, step 2)
 
 ## Output
 

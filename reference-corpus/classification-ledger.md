@@ -13,14 +13,18 @@ extracted largely independently before `synthesis.md`'s cross-partition pass
 merged, re-split, and overruled their proposals — the twenty conflicts in §3
 below are exactly the disagreements that independent extraction surfaced, and
 `synthesis.md` §8's refute-stage notes (reproduced in §6 below) are the
-specific challenges the synthesis itself flags as its weakest points. What
-has **not** yet happened is a second, independent round of reviewers
-re-attacking those boundaries and either accepting or overturning
-`synthesis.md`'s rulings. Every resolution in §3 is therefore marked
-**PROPOSED**, not **ADJUDICATED** — it is this milestone's argued position,
-ready for a reviewer to accept, amend, or overturn with evidence, per the
-binding rule that disagreements are "preserved as adjudicated evidence, not
-erased," never silently resolved by a single pass.
+specific challenges the synthesis itself flags as its weakest points. A
+second, independent round of reviewers (boundary-honesty findings N1-BH-*,
+completeness/invention findings N1-R3-*) has now re-attacked those
+boundaries, and the orchestrator's rulings are recorded in
+`adjudication-round1.md`. Per that document's A14: two independent reviewers
+challenged the §3 conflict set and objected only to X1 and X8 (plus X3's
+citation) — every entry below now carries an **ADJUDICATED** status citing
+its ruling, in place of the prior blanket **PROPOSED**. See the "Round-1
+adjudication" section at the end of this document for the full summary; any
+residual disagreement a future reviewer wants to reopen still follows the
+same rule — cite specific units/sections and either accept, amend, or record
+a new conflict, never silently resolve by a single pass.
 
 ---
 
@@ -85,13 +89,23 @@ state and worktrees rather than falling back from atomic rename, vs cleanup
 diagnostic on rollback failure.
 **Citations:** BU-P8-108 (`docs/troubleshooting.md`) vs BU-P7-079
 (`tests/sgt-cleanup-cross-filesystem-test.sh`).
-**PROPOSED:** adopt BU-P8-108's refusal as the durable rule. Tests would
-normally outrank docs (§5 of the extraction method), which favors P7 — but
-P7's unit is itself a rejected engine-gap claim (`engine-pressure.md` G9),
-so its evidentiary weight as a *behavioral requirement* is already spent;
-what remains is P8's invariant. BU-P7-079 is retained only as engine-pressure
-provenance (what the old fallback path *tried* to guarantee), not as a live
-requirement.
+**ADJUDICATED (adjudication-round1.md A13 — overturned):** adopt BU-P7-079's
+copy-based cross-filesystem fallback with a CRITICAL rollback diagnostic as
+the corpus's canonical extracted behavior — tests outrank documentation per
+§5 of the extraction method (the binding rule). The original PROPOSED
+resolution's reason for preferring BU-P8-108 was circular: it discounted
+BU-P7-079's evidentiary weight by citing `engine-pressure.md` G9's rejection
+of BU-P7-079, but that G9 rejection in turn cited this same X1 ruling (P8
+wins) as its own reason to prefer BU-P8-108. A13 severs the circularity and
+lets the test-backed unit win on its own §5 priority, unconditionally. This
+is a ruling about which *behavioral statement the corpus extracted*, not
+about sergeant-rs's engine — `engine-pressure.md` G9 separately re-derives,
+on independent architectural evidence (not on this ledger's citation fight),
+that sergeant-rs's actual data-dir/surface topology makes the cross-
+filesystem split BU-P7-079 describes structurally impossible today; see
+G9's revised entry. BU-P8-108 is retained here as provenance for the
+invariant the shipped architecture happens to satisfy by construction, not
+as the winning citation.
 
 ### X2 — Graph output location (Type S)
 **Conflict:** output is **never** published inside an owning source
@@ -99,7 +113,8 @@ repository, vs the output directory **may** sit inside a source repo with
 Sergeant staging extraction outside it before publish.
 **Citations:** BU-P5-107, BU-P5-100 (`skills/load-project/SKILL.md`) vs
 BU-P7-003 (`tests/`), BU-P8-035, BU-P8-036 (`docs/schema.md`).
-**PROPOSED:** adopt the tests/schema position (P7/P8) as the operative rule —
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt the tests/schema position (P7/P8) as the operative rule —
 the output directory may sit inside a source repo, with Sergeant handling
 re-ingestion by staging extraction outside it before publish. Downgrade
 BU-P5-107/BU-P5-100 from an absolute prohibition to a **documented
@@ -112,9 +127,16 @@ contradict.
 **Conflict:** `--yes` must **never** be used, vs `--yes` is the user's
 standing consent and the documented sole exception to the ask-user
 escalation rule.
-**Citations:** BU-P1-072, BU-P8-083 (Sergeant `AGENTS.md` /
-`docs/using-sergeant.md`) vs BU-P2-100 (vendored `no-mistakes/SKILL.md`).
-**PROPOSED:** resolve by scope — Sergeant-coordinated runs (W18
+**Citations:** BU-P1-072 (`README.md`), BU-P8-083 (`docs/using-sergeant.md`)
+vs BU-P2-100 (vendored `no-mistakes/SKILL.md`). **Citation correction
+(finding N1-BH-12, adjudication-round1.md A14):** BU-P1-072 was originally
+misattributed to `AGENTS.md` above; its actual `source.path` is
+`README.md` (verified directly in `behavior-units/P1.ndjson`: `"path":
+"reference/sergeant-upstream/README.md"`, locator "README.md L275",
+quote "Do not use `--yes`. Use `--skip=<steps>` only for stages already
+proven irrelevant..."). Fixed in place; no change to the resolution below.
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** resolve by scope — Sergeant-coordinated runs (W18
 `validate-and-ship` invoked by the coordinator, or through W6/W9's shipping
 boundary) forbid `--yes`; the vendored skill's `--yes` exception describes
 standalone `no-mistakes` usage outside Sergeant's coordination, which this
@@ -130,7 +152,8 @@ same rule classified as an engine gap.
 **Citations:** BU-P1-040, BU-P1-131, BU-P8-082 (invariant) vs BU-P7-112
 (`tests/` — override must survive into the brief) vs BU-P2-056 (engine-gap,
 rejected as `engine-pressure.md` G8).
-**PROPOSED:** three-part resolution. **(a)** The prohibition stands as
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** three-part resolution. **(a)** The prohibition stands as
 `agents-invariant` (Article III of `permanent-instructions.md`). **(b)** The
 explicit user override (BU-P7-112) is the sole documented exception path and
 must be threaded verbatim into the worker's brief, never silently honored or
@@ -147,7 +170,8 @@ every shipped script must parse under, vs a distribution-specific target a
 compiled binary makes obsolete.
 **Citations:** BU-P7-033, BU-P7-071, BU-P1-065 (`agents-invariant`) vs
 BU-P8-102 (`obsolete-mechanism`).
-**PROPOSED:** adopt BU-P8-102's obsolete-mechanism ruling — sergeant-rs ships
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt BU-P8-102's obsolete-mechanism ruling — sergeant-rs ships
 a compiled binary with no Bash runtime path in scope at all, so the Bash-3.2
 target cannot bind anything sergeant-rs executes. BU-P7-033/BU-P7-071/
 BU-P1-065 are retained as provenance for *what* the old invariant guaranteed
@@ -163,7 +187,8 @@ rule, vs the identical statement recorded as obsolete and structurally
 reversed by D2.
 **Citations:** BU-P1-057 (stage-context) vs BU-P7-008, BU-P8-064
 (obsolete-mechanism).
-**PROPOSED:** D2 (GAUNTLET.md deviation register — headless `claude -p`
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** D2 (GAUNTLET.md deviation register — headless `claude -p`
 turns, no daemon TTY/pane) settles it. Re-home BU-P1-057 as
 obsolete-mechanism provenance inside M2's cluster in `obsolete-mechanisms.md`
 rather than a live stage-context rule; P1's classification is the outlier and
@@ -176,7 +201,8 @@ new-project phase, vs a backup is created **only after** the user confirms,
 with the skill instructed not to even describe a pre-confirmation backup.
 **Citations:** BU-P5-027 (Phase 4) vs BU-P5-030 (Phase 5) and BU-P7-038
 (`tests/`, stated as a general rule).
-**PROPOSED:** adopt the stricter, test-corroborated rule — no backup write
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt the stricter, test-corroborated rule — no backup write
 occurs before the user has confirmed the destructive action (BU-P5-030 +
 BU-P7-038). This is also the reading consistent with `permanent-instructions.md`
 Article III's standing-authorization boundary ("standing authorization
@@ -193,20 +219,34 @@ existing needs-input state, not an engine gap."
 **Citations:** BU-P5-025 (engine-gap) vs BU-P3-007 (`grilling`,
 stage-context) vs BU-P4-053 (`to-spec`, stage-context with an explicit
 non-gap note).
-**PROPOSED:** already resolved by `engine-pressure.md` G5's narrowing —
-adopt the re-enterable-stage capability as the one true underlying
-representation question. BU-P3-007 and BU-P4-053 need no engine change
-*today* (their round counts are small/bounded enough for existing
-`needs_input` round-trips); both become direct beneficiaries, not separate
-gaps, if a re-enterable stage is ever built for G5's sake. No further
-disagreement remains once the shapes are told apart this way.
+**ADJUDICATED (adjudication-round1.md A13 — overturned):** BU-P4-053's
+"representable today via the existing needs-input state, not an engine gap"
+note stands — and stands for BU-P5-025 too, not only for BU-P3-007/
+BU-P4-053. The distinction the original PROPOSED resolution leaned on
+(BU-P5-025 supposedly needs a not-yet-built re-enterable-stage capability
+that BU-P3-007/BU-P4-053 merely stand to benefit from later) does not
+exist: `engine-pressure.md` G5 is itself rejected on re-derivation, because
+the "never attempted" lower rung its narrowing rested on — a needs_input
+round-trip paired with re-entering the same stage — already exists in the
+shipped engine. Verified directly: `src/domain/work.rs`'s
+`WorkState::can_transition` allows `NeedsInput → Active`, and
+`src/api.rs` exposes both `POST /v1/work/{id}/input` (`work_input`,
+command `work.respond`, "answer a work that asked for input (§12's
+needs-input verb)") and `POST /v1/work/{id}/retry` (`work_retry`,
+"re-enter the current stage (§12's retry verb)") — composed, these are
+exactly the per-question needs_input/retry loop G5's narrowing proposed as
+the missing capability. BU-P5-025 is therefore misclassified as
+`engine-gap`; it reclassifies to `stage-context`, alongside BU-P3-007 and
+BU-P4-053, representable today with no engine change. See
+`engine-pressure.md`'s revised G5 entry for the full re-derivation.
 
 ### X9 — Graph building (Type B)
 **Conflict:** a standalone workflow with its own trigger and all-or-nothing
 merge, vs a stage inside `load-project`.
 **Citations:** BU-P6-088/089/090/091 (workflow `graphify`) vs
 BU-P5-105/106/107/112, BU-P7-003/086/088 (stages of `load-project`).
-**PROPOSED:** adopt W2 `project-graph` as promoted in `synthesis.md` §1 —
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt W2 `project-graph` as promoted in `synthesis.md` §1 —
 independent trigger, bounded outcome (a published graph), and its own
 failure mode justify a standalone workflow; `load-project`'s `40-consume`
 stage is correctly demoted to helper/context per synthesis's own stage
@@ -216,7 +256,8 @@ table.
 **Conflict:** `wiki` with a `00-digest` stage, vs `wiki-daily-digest` as its
 own workflow.
 **Citations:** BU-P5-130/131/137…149 vs BU-P6-092/093.
-**PROPOSED:** adopt W35 `wiki-digest` as the single merged workflow, per
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt W35 `wiki-digest` as the single merged workflow, per
 `synthesis.md` §1's fold.
 
 ### X10 — Installation (Type B)
@@ -225,7 +266,8 @@ checklist from the getting-started docs, with different phase sets and
 different prerequisite lists.
 **Citations:** BU-P5-001…BU-P5-037, BU-P7-036…BU-P7-040 (`sergeant-setup`)
 vs BU-P8-041…BU-P8-051 (`sergeant-install`).
-**PROPOSED:** adopt W3 `sergeant-setup` as the merged workflow (already done
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt W3 `sergeant-setup` as the merged workflow (already done
 in `synthesis.md` §1). For the still-unresolved prerequisite-list
 discrepancy (P5 omits Python 3 and Node; P8 adds them), PROPOSE taking the
 **union** (P8's superset) as `00-detect-prerequisites`'s checked-tool list —
@@ -242,7 +284,8 @@ verification steps inside `load-project`/`sergeant-setup` in P5.
 **Citations:** BU-P6-011, BU-P6-012, BU-P6-013, BU-P6-035, BU-P6-018,
 BU-P6-003 vs BU-P5-092, BU-P5-093, BU-P5-101, BU-P5-102, BU-P5-031,
 BU-P5-034.
-**PROPOSED:** adopt P5's framing, per `synthesis.md` §1 — these fail §6.2's
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt P5's framing, per `synthesis.md` §1 — these fail §6.2's
 bounded-outcome/completion-condition test (a listing is not a procedure with
 a bounded outcome); fold as stages/verification steps of W1 `load-project`
 and W3 `sergeant-setup` as the synthesized stage tables already show. P6's
@@ -261,7 +304,8 @@ BU-P7-099/100/101 vs `fleet-observation` BU-P6-101 and
 handshake)` BU-P7-035…109 vs `respond-and-resume` BU-P6-032/034/078/079/080;
 `software-change (independent review)` BU-P7-063/064 vs
 `review-finding-routing` BU-P6-082/084/085/086.
-**PROPOSED:** adopt the six distinct workflow names (W10–W16) — each is
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt the six distinct workflow names (W10–W16) — each is
 independently bounded, independently triggerable, and independently
 recoverable, which is more legible than one umbrella label spanning six
 unrelated triggers. P7's `software-change` grouping is retained as a
@@ -274,7 +318,8 @@ durable handoff", vs a worker must never poll or sleep and must exit
 cleanly after publishing its condition.
 **Citations:** BU-P1-036 (`AGENTS.md`) vs BU-P7-010
 (`templates/worker-brief.md`), BU-P8-074 (`docs/using-sergeant.md`).
-**PROPOSED:** adopt the stricter rule (must exit cleanly after publishing
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt the stricter rule (must exit cleanly after publishing
 its wait condition) as canonical — it is corroborated by two independent
 sources against `AGENTS.md`'s one, and it is the rule `engine-pressure.md`
 G1's scheduler design already depends on ("no actor process running while
@@ -289,7 +334,8 @@ override, vs an auto-fix must **never** be authorized in Sergeant's
 validation-only workflow.
 **Citations:** BU-P2-080 (vendored gate skill) vs BU-P8-100
 (`docs/troubleshooting.md`).
-**PROPOSED:** adopt the absolute (BU-P8-100, already `agents-invariant` at
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt the absolute (BU-P8-100, already `agents-invariant` at
 Article III — "validation agents never modify source while reporting
 findings") for sergeant-rs's own `no-mistakes` usage. The override capability
 in the vendored skill (BU-P2-080) describes generic upstream behavior this
@@ -303,7 +349,8 @@ reading their own brief, vs the acceptance test that a dependent must be
 **held**, not merely advised, vs an external scheduler that genuinely
 advances stages on completion.
 **Citations:** BU-P5-074 vs BU-P5-065's acceptance test vs BU-P6-016/017.
-**PROPOSED:** already resolved inside `engine-pressure.md` G2's split
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** already resolved inside `engine-pressure.md` G2's split
 acceptance test — adopt the split: **(a)** grouping identity and recording
 (evidenced by `sgt-dispatch`) and **(b)** advance-on-completion enforcement
 (evidenced by the DAG hook). Neither artifact alone evidences both halves;
@@ -317,7 +364,8 @@ boundaries (the docs split reconciliation and the shipping gate into their
 own steps).
 **Citations:** BU-P1-007/107 + BU-P1-008…014 vs BU-P8-055 +
 BU-P8-053/056/058.
-**PROPOSED:** adopt W6's eight-step boundary (already merged in
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt W6's eight-step boundary (already merged in
 `synthesis.md` §1 "on the docs' finer boundary") as the canonical stage
 list — a finer split that keeps reconciliation and the shipping gate as
 independently observable checkpoints is strictly more informative than the
@@ -333,7 +381,8 @@ own pre-push hook).
 machinery) vs `no-mistakes-shipping-gate` BU-P1-069…080 vs
 `no-mistakes (as consumed by software-change)` BU-P7-065/104/105, all vs
 `validate-and-ship` BU-P6-007/008.
-**PROPOSED:** adopt W18 `validate-and-ship` as the single merged workflow
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt W18 `validate-and-ship` as the single merged workflow
 (ten stages, per `synthesis.md` §5's own U2 verdict that §6.3's test
 discriminates cleanly once the source's flat command list is split by
 outcome), with W19 `repo-release-verification` split out as the source
@@ -347,7 +396,8 @@ vs a documented per-invocation operator-consent path that selects exactly
 that argv transport.
 **Citations:** BU-P8-065, BU-P8-085 (absolute) vs BU-P6-047, BU-P8-086
 (consent-gated exception).
-**PROPOSED (genuinely open — same shape as X3):** read the absolute as the
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed, genuinely open — same shape as X3):** read the absolute as the
 default and the consent-gated path as a narrowly-scoped, explicitly-logged,
 single-invocation deviation — matching Article III's "standing authorization
 removes repetitive confirmation only, never secret exposure." Neither source
@@ -362,7 +412,8 @@ the handshake could still be completed, vs cleanup **can** retire an
 unfinished handshake when the owning task is closed and the worker is
 provably dead by four independent proofs.
 **Citations:** BU-P8-104 vs BU-P8-105/BU-P8-106.
-**PROPOSED:** adopt the reconciling reading `synthesis.md` itself already
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt the reconciling reading `synthesis.md` itself already
 offers — refuse-by-default with a proven-dead exception. BU-P8-104's refusal
 is the default; BU-P8-105/BU-P8-106's four-proof exception is the sole,
 narrowly-scoped override. Both units should be read together as one rule,
@@ -376,7 +427,8 @@ invoked, vs the stated architecture that model-invoked disciplines "load
 automatically whenever the task matches" and the standing rule to load a
 procedure whenever its trigger applies.
 **Citations:** BU-P2-051 (+ BU-P3-002/004) vs BU-P1-118, BU-P1-021.
-**PROPOSED:** adopt the orchestrator/discipline split — top-level workflow
+**ADJUDICATED (adjudication-round1.md A14 — no reviewer objection; adopted
+as proposed):** adopt the orchestrator/discipline split — top-level workflow
 selection (W5 `task-intake-and-route`) loads automatically per Article
 VIII's "load a procedure only when its trigger applies," while `implement`
 (W23) and its explicitly no-auto-invoke siblings are *disciplines* selected
@@ -425,9 +477,12 @@ absorb, weak extractions.
 - **Adjudication note:** this is the single citation the X5 resolution
   (§3 above) rests on for its obsolescence ruling. Because it is the
   weaker-confidence side of that conflict (against three `high`-confidence
-  units on the other side), X5's PROPOSED resolution is flagged there as the
-  first candidate to revisit if stronger evidence emerges for either
-  position — this ledger entry and X5's entry should be read together.
+  units on the other side), X5's now-**ADJUDICATED** (A14, no reviewer
+  objection) resolution is still flagged there as the first candidate to
+  revisit if stronger evidence emerges for either position — adjudicated
+  status settles which reading the corpus currently adopts, not the
+  underlying confidence gap; this ledger entry and X5's entry should be read
+  together.
 
 ## 5. Synthesis-unassigned units
 
@@ -462,8 +517,8 @@ so all remain **OPEN** for this milestone's gate.
 | 1 | W8 `dispatch` is 63 units and 12 stages — by far the largest cluster. Either it is genuinely one procedure with twelve checkpoints, or it should split at `70-launch-and-record` into `plan-and-validate` and `launch-fleet`. | `draft-workflows/dispatch/`, `synthesis.md` §1 W8 | OPEN |
 | 2 | W18's ten stages are the U2 answer (does §6.3's reimplementation test discriminate cleanly?). An independent reviewer should reproduce roughly the same ten boundaries from the same units; six or fifteen would mean the test does not discriminate. | `draft-workflows/validate-and-ship/`, conflict X17 | OPEN |
 | 3 | G6 and G7 (`engine-pressure.md`) are the soft rulings. G6 survives on a single §6.5 helper-test failure; G7 was rejected on a reading of §6.7 a reviewer may consider too strict. | `engine-pressure.md` G6, G7 | OPEN |
-| 4 | The G9 rejection re-homes four claims into an existing invariant — a reviewer may reasonably read this as the synthesis grading its own architecture favorably. | `engine-pressure.md` G9 | OPEN |
-| 5 | X4, X5, X6, and X8 are classification conflicts this ledger (via `synthesis.md`) resolved by ruling; each is a candidate for reversal on evidence. | §3 above | OPEN (PROPOSED resolutions recorded, not adjudicated) |
+| 4 | The G9 rejection re-homes four claims into an existing invariant — a reviewer may reasonably read this as the synthesis grading its own architecture favorably. | `engine-pressure.md` G9 | **PARTIALLY ADDRESSED** (adjudication-round1.md A13): the BU-P7-079 quarter of G9's rejection was found circular with X1 and has been re-derived on independent architectural evidence (`src/runtime/surface.rs`, `src/runtime/fsutil.rs`), not on the synthesis's own citation preference — see `engine-pressure.md` G9. The BU-P7-043/049/051 quarters were not entangled with X1 and are unchanged; whether *their* invariant-absorption readings are self-grading remains OPEN for Verify. |
+| 5 | X4, X5, X6, and X8 are classification conflicts this ledger (via `synthesis.md`) resolved by ruling; each is a candidate for reversal on evidence. | §3 above | **PARTIALLY ADDRESSED**: X8 was reversed on evidence at adjudication-round1.md A13 (see §3) — exactly the kind of reversal this row anticipated. X4, X5, X6 were reviewed and adopted as proposed at A14 (no reviewer objection), now ADJUDICATED rather than PROPOSED, but not re-argued from new evidence; a future reviewer may still challenge them per the closing rule below. |
 | 6 | U1's answer (966 units from 179 files, well above the 150–400 scoping estimate) is concentrated in P6/P7/P8 (`bin/`, `tests/`, `docs/`), where a single script or test file routinely yielded 8–15 units — whether that granularity is correct, or whether P6/P7/P8 over-extracted at the sentence level while P2/P3/P4 extracted at the paragraph level, is itself an open finding N2's precision measurement will need to control for. | Corpus-wide (§1 above) | OPEN |
 
 **How to close an OPEN item:** per the N1 contract's binding rules, a
@@ -471,3 +526,65 @@ reviewer challenging any row above must cite the specific units/sections in
 dispute and either accept the PROPOSED resolution, propose a different one
 with its own citations, or record the disagreement as a new conflict entry
 in §3 — silence is not a valid disposition.
+
+## Round-1 adjudication
+
+The refute phase produced 21 findings — 12 boundary-honesty findings
+(N1-BH-01…12) and 9 completeness/invention findings (N1-R3-01…09) from two
+independent reviewers — plus two substantive defects from the structural
+lint. `adjudication-round1.md` (2026-08-10) is the orchestrator's ruling on
+all 21 plus the two lint defects, recorded as fifteen numbered rulings
+A1–A15. Per L9, these rulings are themselves reviewable findings; adjudicating
+does not erase disagreement, it records a position with its evidence.
+
+**Disposition by ruling, as it lands on this repository's artifacts:**
+
+| Ruling | Findings covered | Disposition | Where it lands |
+|---|---|---|---|
+| A1 | lint defect 1 / BH-03 context | `record-shapes.md` §4's representation vocabulary amended to the corpus's actual enum (fixed directly by the orchestrator, not this fixer). | `docs/icm/record-shapes.md` §4 |
+| A2 | R3-01, R3-02, BH-11 | `record-shapes.md` §3 gains the quote-hash preimage convention and a required `quote` field; corpus-wide `quote`/`quote_hash` re-derivation across all 966 units is a separate fixer task, not this one. | `docs/icm/record-shapes.md` §3; `behavior-units/*.ndjson` (not touched by this pass) |
+| A3–A8 | BH-01, BH-02, BH-04, BH-06, BH-07, BH-10 | Draft-workflow structural fixes (dispatch ordering, stage demotion, validate-and-ship restoration, package merges). Out of scope for the two files this pass owns. | `draft-workflows/` |
+| A9–A12 | BH-03/R3-05, BH-08, BH-09, R3-08/R3-09 | Unit-record backfills (rationale, alternatives, normalization, missing coverage). Out of scope for this pass. | `behavior-units/*.ndjson` |
+| **A13** | **BH-05, R3-04, R3-03** | **Implemented this pass.** X1 overturned (test-backed BU-P7-079 wins over doc-backed BU-P8-108, per §5's tests-outrank-docs rule; the circular G9 citation severed). X8 overturned (BU-P4-053's "representable today" reading stands for BU-P5-025 too). G5 rejected on re-derivation against the shipped engine (`src/domain/work.rs`, `src/api.rs`), moved from Surviving to Rejected. G9's BU-P7-079 quarter re-derived on independent architectural evidence (`src/runtime/surface.rs`, `src/runtime/fsutil.rs`), landing again at rejected but on non-circular grounds. | `classification-ledger.md` §3 X1, X8; `engine-pressure.md` G5, G9 |
+| **A14** | (no reviewer objection to X2–X7, X9–X20; BH-12 for X3's citation) | **Implemented this pass.** X2, X4–X7, X9, X9b, X10–X20 each moved PROPOSED → ADJUDICATED, citing this ruling, resolution text otherwise unchanged. X3's citation corrected (BU-P1-072's `source.path` is `README.md`, not `AGENTS.md`, verified against `behavior-units/P1.ndjson`) and also moved to ADJUDICATED. | `classification-ledger.md` §3 |
+| A15 | R3-06, R3-07 | `reference-corpus/lint.py` joins the corpus; `FROZEN.md` written at freeze. Out of scope for this pass — a corpus-wide freeze action, not a ledger edit. | `reference-corpus/lint.py`, `FROZEN.md` (not yet written) |
+
+**What this pass changed, concretely.** `classification-ledger.md` §3: all
+twenty conflict entries (X1–X20, including X9b) carry an **ADJUDICATED**
+status line citing A13 or A14; X1 and X8's resolutions are rewritten to the
+overturned reading; X3's citation is corrected in place. `engine-pressure.md`:
+G5 moved from "Surviving claims" (five slots remain: G1, G2, G3, G4, G6) to
+"Rejected claims" (now four: G5, G7, G8, G9), with its full original claim,
+narrowing, and the re-derivation that overturned it kept on the record; G9's
+BU-P7-079 sub-claim carries both its superseded (circular) rejection ground
+and its re-derived (architectural) one; the roll-up table, survivor/
+rejection counts, and the "Method observation for N2" paragraph are updated
+to match.
+
+**Residuals owned by the Verify pass.** This adjudication round settled the
+21 refute-phase findings' disposition, not every open question the corpus
+still carries:
+
+- §6's Refute-stage challenge docket, items 1, 2, 3, and 6 (W8 `dispatch`'s
+  stage count, W18's ten-stage boundary reproducibility, G6/G7's soft
+  rulings, and U1's extraction-granularity question) remain fully **OPEN** —
+  untouched by A13/A14, they were never in this round's scope.
+- Docket items 4 and 5 are **PARTIALLY ADDRESSED** by this round (see the
+  updated rows in §6 above) but not closed: G9's BU-P7-043/049/051 quarters'
+  self-grading concern is unresolved, and X4/X5/X6 were adopted without new
+  evidence, not re-argued.
+- A2's corpus-wide `quote`/`quote_hash` re-derivation across all 966 units
+  (A9–A12's rationale/alternatives/normalization/coverage backfills, and
+  A3–A8's draft-workflow structural fixes) are separate, larger fixer tasks
+  this pass did not touch — this pass's ownership is scoped to
+  `classification-ledger.md` and `engine-pressure.md` only.
+- A15's `lint.py` addition and `FROZEN.md` freeze action have not run; this
+  document's own consistency (e.g. the corrected X1/X8/X3 entries, the
+  revised G5/G9 entries) has not yet been machine-checked against a lint
+  pass, only hand-verified against `behavior-units/*.ndjson` and the actual
+  `src/` sources cited above.
+
+Any reviewer reopening a residual above follows this document's own closing
+rule: cite the specific units/sections in dispute and either accept, amend
+with new citations, or record a new conflict entry — silence is not a valid
+disposition.

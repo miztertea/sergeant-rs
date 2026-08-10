@@ -21,11 +21,9 @@ Handoff evidence recorded from the verified work surface; readiness bounded and 
 - **sgt-td-memory must record handoff evidence only from a verified worktree, and every git field it stores (branch, HEAD, etc.) must resolve from that specific worktree rather than from the supervisor's own current working directory — proven with two real linked worktrees on different branches/commits, not simulated.**
   (trigger: sgt-td-memory records recovery evidence for a worker; outcome: recorded recovery evidence (branch, commit, etc.) always describes the worker's actual worktree, never an ambient/wrong working directory, even under multi-worktree git setups)
   — `BU-P7-066`, `reference/sergeant-upstream/tests/sgt-td-memory-worktree-test.sh` (lines 1-18)
-- **The interactive worker's wait for harness readiness must be bounded and its outcome reported — a harness that never renders must be caught and reported, not hang forever — and separately, a harness that reaches its pane without ever acknowledging the notification must NOT be misrecorded as orphaned.**
+- **The interactive worker's wait for harness readiness must be bounded and its outcome reported — a harness that never renders must be caught and reported, not hang forever — and separately, a harness that becomes ready without ever acknowledging the notification must NOT be misrecorded as orphaned.**
   (trigger: a launched harness process may never become ready for input; outcome: the worker never spins forever waiting for readiness, and its eventual diagnosis distinguishes 'harness never became ready' from 'harness ready but never acknowledged' rather than conflating both into a generic orphaned status)
   — `BU-P7-110`, `reference/sergeant-upstream/tests/sgt-worker-readiness-test.sh` (lines 1-9)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P7-110` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

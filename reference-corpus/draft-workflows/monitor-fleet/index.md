@@ -4,7 +4,10 @@ name: monitor-fleet
 status: draft
 version: 1
 description: >-
-  Observe fleet state without mutating it.
+  Observe fleet state without mutating it: a bounded, versioned, strictly
+  read-only snapshot plus liveness evaluation. Mutating reconciliation and
+  background-watch lifecycle moved to reconcile-and-cleanup-fleet at N1
+  adjudication A7.
 tags:
   - fleet
   - observability

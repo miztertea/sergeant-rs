@@ -21,11 +21,9 @@ The target's status is one of the four respondable states and its recorded ident
 - **A response can only ever be published against a worker whose current status is needs_input, blocked, waiting, or orphaned — any other status refuses the response outright, so a response is never silently applied to a worker that was not actually asking for one.**
   (trigger: an operator supplies a response for a specific task/repo; outcome: responses are only ever delivered to workers in one of exactly four states that legitimately mean 'this worker is waiting for input')
   — `BU-P6-078`, `reference/sergeant-upstream/bin/sgt-respond` (L202-205)
-- **Publishing a response requires verifying worker identity and ownership evidence (pane, pane_identity, worktree_git_pointer/dir) recorded at dispatch time before the response is written, so a response can never be delivered to the wrong worker or a worktree Sergeant no longer actually owns.**
+- **Publishing a response requires verifying worker identity and ownership evidence (session identity, worktree pointer/directory) recorded at dispatch time before the response is written, so a response can never be delivered to the wrong worker or a worktree Sergeant no longer actually owns.**
   (trigger: a response is about to be published for a specific fleet task/repo; outcome: response delivery is bound to a durably recorded, ownership-verified worker identity rather than a bare task/repo name lookup)
   — `BU-P7-060`, `reference/sergeant-upstream/tests/sgt-respond-test.sh` (lines 9-46)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P7-060` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

@@ -19,11 +19,27 @@ A task's repos are believed terminal and the operator (or an automated sweep) re
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-require-terminal` | actor-stage (§6.4, judgment) | Every targeted repo is safely terminal and the owning task is verifiably closed; "not closed" is distinguished from "could not be looked up". |
-| `10-verify-ownership` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Repo identity, not path, is verified; retry-owner spoofing vectors are rejected. |
-| `20-verify-handshakes` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Acknowledgement is verified, re-verified under lock immediately before deletion, and a terminal seal is written. |
-| `30-remove-surface` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | A resumable cleanup-phase record is published before and after; no process runs with its cwd inside the surface being removed. |
-| `40-retire-state` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Whole-task state is retired only when every repo is cleaned together. |
+| `00-require-terminal` | actor-stage (§6.4, judgment) | Every targeted repo is safely terminal and the owning task is verifiably closed; ownership re-verified, handshakes acknowledged and sealed, each surface removed, whole-task state retired only once every repo is done. |
+
+## Adjudication notes (A4, A7)
+
+At N1 adjudication A7 (BH-07), this package received two mutating stages
+moved from `monitor-fleet` — `20-reconcile-terminal` and
+`30-background-watch` — because they mutate fleet state and this package
+already owns fleet mutation and cleanup.
+
+At N1 adjudication A4 (BH-02), the generic de-staging sweep then applied:
+every stage here whose only ladder justification was the §6.5
+deterministic-machinery boilerplate (`10-verify-ownership`,
+`20-verify-handshakes`, `30-remove-surface`, `40-retire-state`, plus the
+two stages received from `monitor-fleet`) folded into the package's sole
+judgment-bearing stage, `00-require-terminal`, as ordered helper
+invocations. None of the six carried an "Additional note" checkpoint
+argument that survived §6.3's reimplementation test — `30-background-watch`
+in particular argued its own demotion at extraction ("closer to a
+deterministic helper... than a procedural checkpoint"). See
+`00-require-terminal/CONTEXT.md` for the full folded content and
+`provenance.md`'s "Adjudication A4" section for the per-unit disposition.
 
 ## Provenance
 

@@ -42,23 +42,27 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P5-101` | After writing project YAML, load-project runs sgt-list and requires the project to appear exactly once, then runs sgt-context <project> and requires every edited field needed by agents to appear in the resolved output. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (lines 44-46) |
 | `BU-P5-103` | If validation fails after a registration/edit, load-project restores the prior YAML or leaves the new file uncommitted, and reports the exact command error. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (lines 48-49) |
 
-### `30-sync-repositories`
+### `20-register-or-edit` (folded helpers)
 
 | Unit | Statement | Source |
 |---|---|---|
-| `BU-P5-095` | A missing required repository is synced only once the requested work actually requires it, via sgt-sync <project>; the workflow stops if cloning or pulling fails. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (lines 28-29) |
-| `BU-P5-102` | sgt-sync <project> runs only when repositories actually need cloning or refreshing, not unconditionally after every edit. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (line 47) |
-| `BU-P6-013` | Syncing a project's repos treats three distinct repo states differently: an already-cloned repo on a named branch is pulled fast-forward-only (never merged), an existing non-git directory is left untouched with a warning, and a missing repo with a configured URL is cloned; every other combination is reported and skipped rather than guessed at. | `reference/sergeant-upstream/bin/sgt-sync` (L30-45) |
-| `BU-P6-014` | A repo pull only proceeds fast-forward and is skipped with a warning (never force-merged or rebased) when the branch has diverged or has no upstream, and a detached HEAD is skipped outright rather than guessed at. | `reference/sergeant-upstream/bin/sgt-sync` (L33-39) |
-| `BU-P5-109` | If a required repository entry has no clone URL, load-project stops with the repository name and the missing field named explicitly. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (line 73) |
-| `BU-P5-110` | If a required executable is missing, load-project reports the executable and a platform-neutral installation requirement, and never invents a fallback parser. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (line 74) |
+| `BU-P5-095` (folded helper: sync repositories, formerly `30-sync-repositories`) | A missing required repository is synced only once the requested work actually requires it, via sgt-sync <project>; the workflow stops if cloning or pulling fails. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (lines 28-29) |
+| `BU-P5-102` (folded helper: sync repositories) | sgt-sync <project> runs only when repositories actually need cloning or refreshing, not unconditionally after every edit. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (line 47) |
+| `BU-P6-013` (folded helper: sync repositories) | Syncing a project's repos treats three distinct repo states differently: an already-cloned repo on a named branch is pulled fast-forward-only (never merged), an existing non-git directory is left untouched with a warning, and a missing repo with a configured URL is cloned; every other combination is reported and skipped rather than guessed at. | `reference/sergeant-upstream/bin/sgt-sync` (L30-45) |
+| `BU-P6-014` (folded helper: sync repositories) | A repo pull only proceeds fast-forward and is skipped with a warning (never force-merged or rebased) when the branch has diverged or has no upstream, and a detached HEAD is skipped outright rather than guessed at. | `reference/sergeant-upstream/bin/sgt-sync` (L33-39) |
+| `BU-P5-109` (folded helper: sync repositories) | If a required repository entry has no clone URL, load-project stops with the repository name and the missing field named explicitly. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (line 73) |
+| `BU-P5-110` (folded helper: sync repositories) | If a required executable is missing, load-project reports the executable and a platform-neutral installation requirement, and never invents a fallback parser. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (line 74) |
+| `BU-P6-012` (folded helper: report state, formerly `40-report-state`) | Showing a project's status walks every configured repo and reports, per repo, whether it is cloned, its current branch, its working-tree cleanliness, and how far ahead/behind its upstream it is — never mutating anything. | `reference/sergeant-upstream/bin/sgt-status` (L1-2) |
+| `BU-P6-035` (folded helper: report state) | Listing tracked work across a project defaults to showing only open tasks and can be narrowed by status, priority, or an explicit repo subset; every repo is queried independently and repos without an initialized task database are silently skipped rather than erroring the whole listing. | `reference/sergeant-upstream/bin/sgt-td-list` (L2-13) |
 
-### `40-report-state`
+## Adjudication A4 (N1-BH-02 sweep)
 
-| Unit | Statement | Source |
-|---|---|---|
-| `BU-P6-012` | Showing a project's status walks every configured repo and reports, per repo, whether it is cloned, its current branch, its working-tree cleanliness, and how far ahead/behind its upstream it is — never mutating anything. | `reference/sergeant-upstream/bin/sgt-status` (L1-2) |
-| `BU-P6-035` | Listing tracked work across a project defaults to showing only open tasks and can be narrowed by status, priority, or an explicit repo subset; every repo is queried independently and repos without an initialized task database are silently skipped rather than erroring the whole listing. | `reference/sergeant-upstream/bin/sgt-td-list` (L2-13) |
+Original stages ended in `30-sync-repositories` and `40-report-state`.
+
+- `30-sync-repositories` carried only the §6.5 deterministic-machinery boilerplate — no "Additional note" checkpoint argument — so it demotes by A4's default rule.
+- `40-report-state` carried an Additional note: "Borderline per synthesis.md (closer to a query than a checkpoint); kept as a stage because operators do care whether it succeeded before planning." Judged against §6.3's reimplementation test: replacing the status/listing implementation with a different tool tomorrow would leave the surrounding checkpoint (load-project's completion) entirely unchanged — the note's own framing already concedes "closer to a query than a checkpoint," and "operators do care" is not a discriminating rationale (it does not distinguish this stage from any other read-only report). The argument fails the test; **demoted**.
+
+**Decision:** both fold as helper invocations into `20-register-or-edit`, which becomes the workflow's terminal stage (there is no later judgment-bearing stage in this package to fold into instead). The behavior units are not deleted — see `20-register-or-edit/CONTEXT.md`'s "Helpers (folded per N1 adjudication A4)" section. Stage count drops from 5 to 3.
 
 ## Notes
 

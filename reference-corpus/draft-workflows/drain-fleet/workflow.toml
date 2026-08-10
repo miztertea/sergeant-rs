@@ -6,4 +6,4 @@
 [workflow]
 name = "drain-fleet"
 version = "1"
-stages = ["00-set-drain", "10-await-convergence", "20-worker-side-checkpoint", "30-force-stop", "40-undrain"]
+stages = ["30-force-stop"]

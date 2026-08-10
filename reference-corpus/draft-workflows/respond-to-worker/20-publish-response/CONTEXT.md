@@ -18,14 +18,12 @@ The response is durably stored (even under an active drain) before any delivery 
 
 ## Behavior contract
 
-- **sgt-respond must still durably store a delivered response even while a project or global drain is active, but must hold the relaunch of a stalled worker's pane until the drain is lifted — admission control gates only the relaunch action, never the response storage itself.**
+- **Publishing a response must still durably store a delivered response even while a project or global drain is active, but must hold the relaunch of a stalled worker until the drain is lifted — admission control gates only the relaunch action, never the response storage itself.**
   (trigger: an operator responds to a needs_input worker while a drain is active; outcome: an operator's response is never lost merely because the fleet is draining; only the potentially-conflicting relaunch action is deferred)
   — `BU-P7-058`, `reference/sergeant-upstream/tests/sgt-respond-drain-test.sh` (lines 1-3)
 - **`sgt-respond` must publish a response with no response-lock artifact left over on success, on immediate abort (mktemp failure), and on recovery from an empty, dead-PID, or stale-symlink leftover lock — but must fail immediately and actionably ("Response lock has an invalid owner") without touching the pending response when the lock file is not a recognizable lock shape at all.**
   (trigger: sgt-respond attempts to publish a response while an existing (possibly stale) response.lock is present; outcome: every recoverable lock shape (empty dir, dead PID, dangling symlink) converges to a clean publish, while an unrecognizable lock shape fails closed and preserves the original pending response untouched)
   — `BU-P7-035`, `reference/sergeant-upstream/tests/runtime-bash-test.sh` (lines 84-172)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P7-058` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

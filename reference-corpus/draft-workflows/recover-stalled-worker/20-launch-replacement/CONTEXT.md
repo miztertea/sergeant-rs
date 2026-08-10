@@ -18,14 +18,12 @@ The replacement is validated live before the original is retired.
 
 ## Behavior contract
 
-- **During recovery, the replacement worker is only launched, and its identity validated, before the original stalled pane is ever killed, so that any failure in the relaunch sequence leaves the original stalled process intact for investigation rather than losing the supervisor entirely.**
+- **During recovery, the replacement worker is only launched, and its identity validated, before the original stalled worker instance is ever terminated, so that any failure in the relaunch sequence leaves the original stalled process intact for investigation rather than losing the supervisor entirely.**
   (trigger: a stall recovery attempt is relaunching a worker; outcome: a failed recovery attempt never leaves a Work with no supervisor at all)
   — `BU-P6-072`, `reference/sergeant-upstream/bin/sgt-recover` (L12-15)
-- **sgt-recover must validate a replacement supervisor's liveness, published identity, and notification-target creation BEFORE killing the stalled original — the kill must be strictly ordered after the replacement is confirmed live, and every abort path must restore fleet state so the recorded pane still points at the surviving original.**
+- **Recovery must validate a replacement supervisor's liveness, published identity, and notification-target creation BEFORE killing the stalled original — the kill must be strictly ordered after the replacement is confirmed live, and every abort path must restore fleet state so the recorded worker identity still points at the surviving original.**
   (trigger: sgt-recover replaces a stalled worker supervisor with a fresh one; outcome: recovery can never end up with neither a working original nor a working replacement — the destructive step (killing the original) only happens once the replacement is proven viable)
   — `BU-P7-094`, `reference/sergeant-upstream/tests/sgt-recover-replacement-test.sh` (lines 1-11)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P6-072`, `BU-P7-094` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

@@ -19,10 +19,11 @@ A review pass (worker-mission's `30-independent-review`, or code-review) has pro
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-parse-and-sanitize` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Raw review output is parsed and sanitized before anything downstream consumes it. |
-| `10-retain-artifact` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | A sanitized copy is written to durable storage before any external side effect; the failure diagnostic names the retryable next action. |
-| `20-route-each` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Each finding is routed with a dedup marker scoped to axis+source+id+parent+branch; a divergent stored body is refused untouched. |
-| `30-publish-or-clear-gate` | actor-stage (§6.4, judgment) | The gate is published or cleared only after every finding reached tracked work. |
+| `00-publish-or-clear-gate` | actor-stage (§6.4, judgment) | The gate is published or cleared only after every finding reached tracked work. |
+
+## Notes for reviewers
+
+**N1 adjudication A4 (finding N1-BH-02).** This package originally decomposed the routing procedure into four stages (`00-parse-and-sanitize`, `10-retain-artifact`, `20-route-each`, `30-publish-or-clear-gate`). The first three carried no argument beyond the §6.5 deterministic-machinery boilerplate, so all three demote by default and fold into `30-publish-or-clear-gate` (renamed `00-publish-or-clear-gate`, now the workflow's sole stage, since it was already the package's only genuine judgment-bearing checkpoint) as helper invocations. The behavior units survive — see `00-publish-or-clear-gate/CONTEXT.md`'s "Helpers (folded per N1 adjudication A4)" section and `provenance.md`.
 
 ## Provenance
 

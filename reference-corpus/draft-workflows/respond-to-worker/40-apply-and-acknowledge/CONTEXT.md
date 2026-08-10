@@ -24,14 +24,12 @@ Decision applied once, truthful status restored, applied id/generation/status re
 - **An acknowledged response's terminal outcome must be internally consistent: a status of done requires a non-empty result already present, and a status of failed requires a non-blank reason string, or the acknowledgement is refused.**
   (trigger: a response is being acknowledged against a terminal worker status; outcome: a terminal status is never accepted as evidence without the substance (result or reason) that makes it a real terminal outcome)
   — `BU-P6-034`, `reference/sergeant-upstream/bin/sgt-ack-response` (L88-94)
-- **Acknowledging a response must verify the caller-provided response ID matches the pending response, the requesting pane's identity matches the recorded worker pane, and the worker's post-application status/proof file is present and valid — each check refusing (and leaving the pending response untouched) before any archive or acknowledgement state is published.**
+- **Acknowledging a response must verify the caller-provided response ID matches the pending response, the requesting execution context's identity matches the recorded worker identity, and the worker's post-application status/proof file is present and valid — each check refusing (and leaving the pending response untouched) before any archive or acknowledgement state is published.**
   (trigger: sgt-ack-response is invoked to consume a delivered response; outcome: acknowledgement cannot be forged by the wrong pane, the wrong response ID, or a fabricated proof; every validation failure leaves the original response fully intact for a correct retry)
   — `BU-P7-041`, `reference/sergeant-upstream/tests/sgt-ack-response-test.sh` (lines 37-59)
 - **An archived acknowledgement record with an empty (unset) applied-status field must not be treated as matching a proof file with no status= line — this specific empty-vs-empty comparison used to be silently accepted as an already-converged replay, which is a false 'already delivered' the finalizer must refuse.**
   (trigger: sgt-ack-response replays against a pre-existing archive entry; outcome: convergence/replay logic never accepts a degenerate empty-equals-empty comparison as proof of a genuinely completed acknowledgement)
   — `BU-P7-044`, `reference/sergeant-upstream/tests/sgt-ack-response-test.sh` (lines 321-347)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P7-041` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Judgment required
 

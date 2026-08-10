@@ -19,12 +19,11 @@ A Work reaches a needs-input/blocked/failed/done transition and a registered con
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-enqueue` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Identity is hashed from (type, source); a repeat enqueue returns the existing event rather than duplicating it. |
-| `10-drain-and-retry` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | One event claimed at a time under a lock; stale claims are reclaimable; backoff is bounded and exponential. |
-| `20-validate-acknowledgement` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | A strict versioned schema; malformed or oversized responses never count as success. |
-| `30-seal` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | No cleanup while any event is unacknowledged; sealed history is retired, not deleted. |
+| `00-seal` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md; A4 structural exception, see below) | No cleanup while any event is unacknowledged; sealed history is retired, not deleted. |
 
 ## Notes for reviewers
+
+**N1 adjudication A4 (finding N1-BH-02).** This package originally decomposed the callback protocol into four stages (`00-enqueue`, `10-drain-and-retry`, `20-validate-acknowledgement`, `30-seal`). None carried an argument beyond the §6.5 deterministic-machinery boilerplate, so all four demote by default. Unlike other packages in this sweep, none of the four ever carried a "Judgment required" heading — this package has no discretionary actor decision anywhere in it. `00-enqueue`, `10-drain-and-retry`, and `20-validate-acknowledgement` fold into `00-seal` (renamed from `30-seal`, now the workflow's sole stage) as helper invocations; see that stage's "Fixer note (A4 structural exception)" for why it is kept as the structural host rather than the fold producing a stageless package. The behavior units survive as helper material — see `00-seal/CONTEXT.md` and `provenance.md`.
 
 Raises engine-gap **G3** (durable outbound notification queue) — survives with a required amendment narrowing the runtime-owned core to an acknowledgement gate on terminal Work cleanup, not the whole delivery queue. See `reference-corpus/synthesis.md` §5.
 

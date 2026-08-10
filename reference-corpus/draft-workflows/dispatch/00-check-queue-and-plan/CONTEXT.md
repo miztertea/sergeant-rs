@@ -24,17 +24,15 @@ Either an existing tracked task supplies brief/branch/context, or a free-form br
 - **Before dispatching, dispatch states the plan explicitly -- which repos, what each does, dependency order, branch, and backend -- and requires that the plan be confirmed as accurate before proceeding.**
   (trigger: a dispatch plan (from a td task or a free-form brief) is ready; outcome: the operator sees and confirms the exact plan before any worktree or agent is created)
   — `BU-P5-058`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (lines 38-56)
-- **dispatch can be invoked from an existing td task with `sgt-dispatch <project> --td <task-id>`, which auto-detects the owning repo and derives the brief and branch from the task, optionally overriding the repo set explicitly.**
+- **dispatch can be invoked from an existing td task via the dispatch command with an explicit task-id argument, which auto-detects the owning repo and derives the brief and branch from the task, optionally overriding the repo set explicitly.**
   (trigger: an open td task exists for the work; outcome: a dispatch can be launched from tracked-task identity alone, without re-stating the brief)
   — `BU-P5-059`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (lines 58-68)
 - **dispatch can also be invoked from a free-form brief with an explicit repository list, branch name, and dependency string, when no existing td task covers the work.**
   (trigger: no existing td task covers the work; outcome: a dispatch can still be launched from an ad hoc brief with explicit scope, branch, and dependencies)
   — `BU-P5-060`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (lines 70-77)
-- **Dispatch is a bounded, independently invocable procedure: given a project, a brief (or a tracked-work task reference), and a set of target repos, it produces one durable task with an isolated worktree, a rendered mission brief, and a spawned interactive worker per repo — with every side effect (tracked-work creation, worktree acquisition, pane launch) validated and gated before the next repo's dispatch begins.**
+- **Dispatch is a bounded, independently invocable procedure: given a project, a brief (or a tracked-work task reference), and a set of target repos, it produces one durable task with an isolated worktree, a rendered mission brief, and a spawned interactive worker per repo — with every side effect (tracked-work creation, worktree acquisition, worker-process launch) validated and gated before the next repo's dispatch begins.**
   (trigger: an operator or an automated caller (dagr hook) needs a piece of work executed by an agent in one or more repos; outcome: a durable, observable Work exists per targeted repo, each with its own isolated code snapshot and a running worker)
   — `BU-P6-123`, `reference/sergeant-upstream/bin/sgt-dispatch` (L1-5)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P6-123` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Judgment required
 

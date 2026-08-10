@@ -19,17 +19,15 @@ An operator needs to freeze new stage/turn admission — globally or for one pro
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-set-drain` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Admission is refused the instant the drain is set, scope global or per-project, race closed by an explicit lock. |
-| `10-await-convergence` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | A bounded wait; a worker counts as drained only when its exit is provable; timeout leaves the drain active, exits non-zero, and names the unresolved. |
-| `20-worker-side-checkpoint` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Idempotent drain detection; publish handoff and settle the lease before terminating anything. |
-| `30-force-stop` | actor-stage (§6.4, judgment) | Force-stop is refused unless a drain is already active; requires explicit confirmation or dry-run; displays exact identity. |
-| `40-undrain` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Undrain is idempotent, with mutually exclusive scopes. |
+| `30-force-stop` | actor-stage (§6.4, judgment) | Set drain, await convergence, and worker-side checkpoint run first (folded helpers); force-stop is then refused unless a drain is already active, requires explicit confirmation or dry-run, displays exact identity; undrain runs last (folded helper). |
+
+## Adjudication note (A4)
+
+N1 adjudication A4 (BH-02) applied the generic de-staging sweep: `00-set-drain`, `10-await-convergence`, `20-worker-side-checkpoint`, and `40-undrain` all carried no argument beyond the §6.5 "candidate execute-stage workload" boilerplate, and folded into the package's sole judgment-bearing stage, `30-force-stop`, as ordered helper invocations (set-drain/await-convergence/worker-side-checkpoint before the force-stop judgment; undrain after it). Stage count dropped from 5 to 1; no behavior unit was deleted — see `provenance.md`'s "Adjudication A4" section and `30-force-stop/CONTEXT.md`'s "Helper invocations" section.
 
 ## Notes for reviewers
 
 Raises engine-gap **G4** (operator-declared, durable, scope-qualified admission block) — survives, ranked high-evidence/low-cost. See `reference-corpus/synthesis.md` §5.
-
-**Reading `pane`/`tmux` in cited statements.** The following citations in this package's behavior contracts describe identity, liveness, or ownership checks in terms of old Sergeant's tmux pane: `BU-P6-058`, `BU-P7-084`. Per obsolete-mechanism clusters M1-M4 (`reference-corpus/synthesis.md` §4) and deviation register D2, this project structurally replaced the pane with headless per-turn processes owned by the daemon and a durable session/execution identity in the journal — there is no tmux pane in this architecture. Read every 'pane identity' / 'pane liveness' / 'pane recycling' phrase in those citations as **the durable execution or session identity this project already journals**, not as an instruction to introduce tmux. The policy (verify identity before acting, never infer liveness from a UI artifact, settle a lease before terminating) is durable; the pane is not.
 
 ## Provenance
 

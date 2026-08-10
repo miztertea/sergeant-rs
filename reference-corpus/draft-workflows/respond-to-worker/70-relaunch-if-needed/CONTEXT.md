@@ -21,11 +21,9 @@ Convergence attempted through the single finalizer before any refusal; supersede
 - **An outstanding notification action-lease from the worker being responded to is first attempted to converge through the one shared finalizer, using only the agent's own exact completion proof; only if that convergence fails does responding refuse with a specific remediation pointing at the exact evidence path.**
   (trigger: a response relaunch would otherwise clear an outstanding action lease; outcome: a legitimate but unrecorded completion is never discarded by a relaunch, and a genuinely unfinished lease is refused with a concrete remediation, never silently overwritten)
   — `BU-P6-079`, `reference/sergeant-upstream/bin/sgt-respond` (L417-435)
-- **A response relaunch never allows a second, superseding tmux pane to displace the first without preserving the first pane's superseded notification-target identity as evidence — and if that evidence would conflict with already-recorded evidence, the relaunch refuses outright rather than losing the older evidence.**
+- **A response relaunch never allows a second, superseding worker instance to displace the first without preserving the first instance's superseded notification-target identity as evidence — and if that evidence would conflict with already-recorded evidence, the relaunch refuses outright rather than losing the older evidence.**
   (trigger: a relaunch is superseding an existing notification target; outcome: the evidence trail for who was ever asked to act, and when they were superseded, is never lost or silently overwritten)
   — `BU-P6-080`, `reference/sergeant-upstream/bin/sgt-respond` (L437-449)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P6-080` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

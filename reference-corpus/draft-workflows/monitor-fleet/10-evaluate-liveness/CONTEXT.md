@@ -18,11 +18,9 @@ Identity plus recent meaningful progress with a defined fallback chain; a stalle
 
 ## Behavior contract
 
-- **Worker health must never be equated with the in_progress status alone; it requires exact live-process identity plus recent, meaningful progress evidence, using a defined fallback chain (pane activity, then recorded progress timestamp, then file mtime only as a last resort), and once that evidence exceeds the grace window the worker stays in_progress but a nonterminal 'live worker stalled' diagnostic is recorded rather than an automatic failure or kill.**
+- **Worker health must never be equated with the in_progress status alone; it requires exact live-process identity plus recent, meaningful progress evidence, using a defined fallback chain (session activity, then recorded progress timestamp, then file mtime only as a last resort), and once that evidence exceeds the grace window the worker stays in_progress but a nonterminal 'live worker stalled' diagnostic is recorded rather than an automatic failure or kill.**
   (trigger: an operator or sgt-watch --sync evaluates whether an in_progress worker is actually healthy; outcome: a stalled worker is distinguished from a healthy one using layered evidence, and the distinction is recorded durably as a nonterminal diagnostic rather than acted on automatically)
   — `BU-P8-072`, `reference/sergeant-upstream/docs/using-sergeant.md` (L161-172 (Worker states))
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P8-072` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

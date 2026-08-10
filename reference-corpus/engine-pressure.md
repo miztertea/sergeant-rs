@@ -10,11 +10,28 @@ claim template normalized in `docs/icm/record-shapes.md` §5.
 16 behavior units classified `engine-gap`, merged into **nine** distinct
 claims (duplicate/near-duplicate units collapsed to one claim each, per
 `synthesis.md`'s note that three independent partitions sometimes found the
-same seam). **Six survive** the full §6.7 template below, all six narrowed or
-amended from their first-pass statement; **three are rejected**, each with the
-lower rung its behavior is actually absorbed by (N1 contract binding rule: "an
-engine-gap claim without named failed lower rungs is auto-rejected" applies
-equally to a *rejection* — it must name where the behavior actually lives).
+same seam). **Five survive** the full §6.7 template below, all five narrowed
+or amended from their first-pass statement; **four are rejected**, each with
+the lower rung its behavior is actually absorbed by (N1 contract binding
+rule: "an engine-gap claim without named failed lower rungs is auto-rejected"
+applies equally to a *rejection* — it must name where the behavior actually
+lives).
+
+**Round-1 revision (adjudication-round1.md A13).** G5 is a special case
+among the rejected: this document's first pass placed it among the
+survivors ("narrowed — answers contract Unknown U3"). Round-1 adjudication
+required re-verifying its "never attempted" lower rung — a re-enterable
+needs_input stage — against the actually-shipped engine rather than the
+proposal text, per L1's measure-don't-assume discipline extended from the
+Claude adapter to the engine itself. That rung is already shipped
+(`src/domain/work.rs`, `src/api.rs`; see G5's entry below), so the claim is
+rejected on re-derivation, moved out of "Surviving claims" into "Rejected
+claims" below, and its full original reasoning is kept in place rather than
+deleted, so both what it once claimed and why that claim did not survive
+scrutiny remain visible. G9's rejection of BU-P7-079 was also revised this
+round, on unrelated grounds (a severed circular citation, not a shipped-rung
+check) — see G9's entry.
+
 This is content-only pressure evidence for a future milestone's contract
 (`docs/gauntlet/contracts/N1.md` Non-goals; proposal §21.8's trigger
 conditions are the bar a claim must eventually clear) — nothing here
@@ -356,89 +373,22 @@ any in-flight execution.
 ---
 
 ### G5 — Data-dependent, variable-length human-input rounds inside one procedure
-**Verdict:** survives, narrowed — answers contract Unknown U3 · **Rank 5**
-**Claim:** BU-P5-025.
-
-**1. Behavior that cannot be represented (as narrowed).**
-A single stage's procedure must be able to ask N sequential, dependent
-questions where N is determined by earlier answers, stopping for each answer
-before formulating the next, so an early answer can end the interview before
-later questions are even asked — with the total round count not known until
-the user answers earlier rounds.
-
-**2. Source evidence requiring it.**
-- BU-P5-025 — `reference/sergeant-upstream/.agents/skills/sergeant-setup/SKILL.md`
-  lines 169-170
-  (`sha256:6f1054cb57d34e7c66b73513aee1da04745c1d7d45f84a0e59c87849346a7c22`):
-  "Ask these questions in order; stop and wait for each answer before
-  proceeding," with a per-repository sub-loop and a per-named-group sub-loop
-  whose round counts are decided by the user's own prior answers (lines
-  169-184); corroborated by the same wait-for-answer pattern at the clone
-  destination question (lines 109-114) and the Phase 5 backup/diff/confirm
-  sequence (lines 204-216). Recorded confidence: `medium`.
-
-**3. Lower-rung representations attempted.**
-- One actor stage per phase, with the whole multi-question interview embedded
-  in one `CONTEXT.md` turn.
-- One coarse Work `needs_input` round-trip per phase, collecting all of a
-  phase's answers together.
-- One stage per individual question, splitting Phase 4 into a fixed number of
-  stages.
-
-**4. Why each lower rung fails.**
-- *One stage per phase:* the measured Claude adapter (GAUNTLET D2, confirmed
-  at M4) drives bounded headless `claude -p --output-format stream-json`
-  turns with no TTY/pane; a turn either completes or it does not, so nothing
-  inside one turn can suspend after question 1, wait for an out-of-band
-  answer, and resume the same reasoning context to ask question 2.
-- *One coarse per-phase `needs_input` round-trip:* changes the skill's own
-  specified semantics — it requires stopping one question at a time so an
-  early answer (e.g. zero repositories) can end the interview before later
-  questions are even asked; collecting all answers in one round-trip cannot
-  express that early-stop behavior.
-- *One stage per individual question:* expressible today for the fixed-count
-  parts (project name, defaults, identity, graphify path) but not for the
-  per-repository and per-group loops, whose round count depends on the user's
-  own prior answers — the current engine requires a workflow's stage list to
-  be a statically pinned, resolved-before-Work-starts sequence (proposal
-  §3.3), which cannot express a variable number of stages decided at runtime.
-
-**5. Minimum runtime capability required.**
-Either **(a)** a stage class that can emit a structured question, suspend the
-stage's attempt without ending its trajectory, and resume the same actor
-context after an API-delivered answer — an intra-stage `needs_input` loop
-distinct from today's whole-Work `needs_input` — or **(b)** a stage-list
-mechanism that can expand a bounded, data-driven set of question rounds at
-runtime while remaining journaled and replayable across a restart.
-**Adversarial narrowing (synthesis.md §5):** option (a) is over-asking and is
-struck. A lower rung the claim never attempted is sufficient: **a
-re-enterable stage** — the stage ends with `needs_input`, the answer is
-journaled, and the *same stage* is re-entered as a fresh execution that reads
-the accumulated answers from durable state. This covers every quoted
-behavior including early-stop, and needs only one new engine fact: a stage
-may be re-entered an unbounded number of times with its prior answers
-journaled against it. The claim is amended to this scope; option (a) is
-struck.
-
-**6. Observable acceptance test.**
-A workflow stage can ask N sequential, dependent questions where N is
-determined by earlier answers (e.g. one question per repository the user
-names), journaling each answer against the same stage attempt and resuming
-the same actor identity/context after each answer without restarting the
-stage or losing prior answers — verified across a daemon restart mid-interview.
-
-**Cross-check (conflict X8, resolved here):** the same one-question-at-a-time
-shape appears in W28 `grilling` (BU-P3-007) and W31 `to-spec` (BU-P4-053),
-classified there as ordinary actor procedure needing nothing. G5's narrowed
-claim resolves the inconsistency: a re-enterable stage covers those two cases
-without either being a gap, because neither actually needs mid-turn
-suspension-and-resume of the same reasoning context — the re-enterable-stage
-capability, if built, would be a shared foundation, not three separate gaps.
+**Verdict:** **rejected on re-derivation** (adjudication-round1.md A13) —
+moved to "Rejected claims" below. This document's first pass placed G5 among
+the survivors, narrowed to answer contract Unknown U3; Round-1 adjudication
+found that narrowing's "never attempted" lower rung already shipped, so the
+claim did not survive re-derivation. See the full entry under "Rejected
+claims" for the original claim, the original narrowing, and why it now
+fails — nothing about the original reasoning is deleted, only its verdict.
 
 ---
 
 ### G6 — Conditional invocation of a named child procedure with its own checkpoints
 **Verdict:** survives, partially — downgraded to grammar pressure · **Rank 6**
+(originally ranked below G5; with G5's rejection at adjudication-round1.md
+A13, G6 is now the fifth and last surviving claim — rank left as originally
+assigned by `synthesis.md` §5 rather than renumbered, since no reviewer
+re-ran the ranking exercise itself, only G5's individual verdict)
 **Claim:** BU-P5-077 (corroborated by BU-P7-007's five-way routing, itself
 classified `stage` not `engine-gap` — see rejected list's absorption note
 pattern; homed to `draft-workflows/worker-mission/`).
@@ -466,6 +416,28 @@ recovery, and per-subworkflow telemetry); not "cannot be represented at all."
   whole brief, classified `stage` (`software-change`/`10-route-work`) rather
   than `engine-gap` in its own partition; both are evidence for the same
   underlying seam.
+- Corroborating (N1 adjudication A8, BH-10): `draft-workflows/cross-repo-work`'s
+  `60-reconcile` and `draft-workflows/dispatch`'s fleet reconciliation
+  (formerly `40-reconcile-before-launch`, folded under A4 into `80-monitor`)
+  were drafted with the same fleet-wide reconciliation checkpoint duplicated
+  in both packages — the drafter's un-argued instinct being that
+  `cross-repo-work` should simply invoke dispatch's reconciliation procedure
+  rather than re-derive it. Adjudicated: `dispatch` owns fleet reconciliation
+  (its source, `BU-P8-070`, is the authority for the automatic pre-launch
+  sweep); `cross-repo-work/60-reconcile` narrows to repo-set-specific
+  completion facts for the repos in its own Work (PR URLs/heads, CI, review
+  threads, merge and deployment order, terminal task/fleet state for *this*
+  plan's repos) and its stage context *names* dispatch's reconciliation as an
+  adjacent, owned procedure without pretending to invoke it — under
+  `convention.md` §4 rule 1, a `@@name`-style reference cannot smuggle in a
+  child-workflow invocation, and no `kind = "execute"` or child-Work stage
+  exists to invoke it for real. The duplication pressure is the same seam
+  G6 already names: two independently-drafted packages each wanted to hand a
+  bounded sub-procedure to a named other workflow and get its outcome back
+  in their own trajectory, and today's engine gives them no rung between
+  "restate the procedure" and "silently shell out" to do it. This is
+  evidence for G6, not a new claim (G6's downgrade and acceptance test
+  already cover it).
 
 **3. Lower-rung representations attempted.**
 - Shared actor context (a `@@name` reference the worker's stage context
@@ -531,6 +503,119 @@ own, so G6 is not duplicated by them.
 Each rejection names the lower rung — or existing invariant — the behavior is
 actually absorbed by, per this milestone's binding rule that a rejection must
 be evidence-grounded, not merely asserted.
+
+### G5 — Data-dependent, variable-length human-input rounds inside one procedure
+**Rejected on re-derivation (adjudication-round1.md A13).**
+**Claim:** BU-P5-025.
+
+**Original verdict (superseded).** This document's first pass judged this
+claim to *survive*, narrowed, as the answer to contract Unknown U3, on the
+premise that its "never attempted" lower rung — a re-enterable needs_input
+stage — was a genuinely new engine fact. A13 required re-verifying that
+premise against the actually-shipped engine rather than the proposal text.
+It is false: the rung is already shipped. The original claim, evidence, and
+narrowing are kept below unedited (per this document's own completeness
+requirement — a superseded verdict is not silently deleted), followed by the
+re-derivation that overturns it.
+
+**1. Behavior originally claimed (as narrowed by the first pass).**
+A single stage's procedure must be able to ask N sequential, dependent
+questions where N is determined by earlier answers, stopping for each answer
+before formulating the next, so an early answer can end the interview before
+later questions are even asked — with the total round count not known until
+the user answers earlier rounds.
+
+**2. Source evidence.**
+- BU-P5-025 — `reference/sergeant-upstream/.agents/skills/sergeant-setup/SKILL.md`
+  lines 169-170
+  (`sha256:6f1054cb57d34e7c66b73513aee1da04745c1d7d45f84a0e59c87849346a7c22`):
+  "Ask these questions in order; stop and wait for each answer before
+  proceeding," with a per-repository sub-loop and a per-named-group sub-loop
+  whose round counts are decided by the user's own prior answers (lines
+  169-184); corroborated by the same wait-for-answer pattern at the clone
+  destination question (lines 109-114) and the Phase 5 backup/diff/confirm
+  sequence (lines 204-216). Recorded confidence: `medium`.
+
+**3. Lower-rung representations the first pass considered attempted.**
+- One actor stage per phase, with the whole multi-question interview embedded
+  in one `CONTEXT.md` turn — rejected: a bounded headless `claude -p` turn
+  cannot suspend mid-turn and resume the same reasoning context.
+- One coarse Work `needs_input` round-trip per phase, collecting all of a
+  phase's answers together — rejected: loses early-stop.
+- One stage per individual question, splitting Phase 4 into a fixed number of
+  stages — rejected as insufficient for the per-repository/per-group loops,
+  whose round count is not known until runtime.
+- (First pass's own narrowing) a re-enterable stage that ends with
+  `needs_input`, journals the answer, and is re-entered as a fresh execution
+  — judged at the time to require "one new engine fact: a stage may be
+  re-entered an unbounded number of times with its prior answers journaled
+  against it," and therefore counted as an engine gap rather than a fourth
+  attempted-and-working lower rung.
+
+**4. Re-derivation: the assumed-missing rung is shipped.**
+`docs/icm/record-shapes.md` §5 rule 2 requires a rejection to name the
+absorbing rung concretely, not merely assert the behavior is representable.
+Verified directly against the shipped engine, not the proposal text (the
+same discipline CLAUDE.md's LESSONS L1 requires for the Claude adapter,
+extended here to the engine itself):
+- `src/domain/work.rs`'s `WorkState::can_transition`:
+  `Waiting | NeedsInput => matches!(to, Active | Blocked | Failed |
+  Canceled)` — a work in `needs_input` legally transitions back to `active`.
+  `WorkState::for_event_kind` maps `KIND_WORK_NEEDS_INPUT` to
+  `WorkState::NeedsInput`, so this is a real, journaled event-sourced
+  transition, not a proposal-stage sketch.
+- `src/api.rs`'s `work_input` handler — doc comment "`POST
+  /v1/work/{id}/input` — answer a work that asked for input (§12's
+  needs-input verb; `work.respond` in §26's command vocabulary)" — calls
+  `engine.provide_input(&mut core, &id, &req.input)`, resuming the work from
+  `needs_input` with the delivered answer journaled against it.
+- `src/api.rs`'s `work_retry` handler — doc comment "`POST
+  /v1/work/{id}/retry` — re-enter the current stage (§12's retry verb)" —
+  calls `engine.retry(&mut core, &id)`. Re-entering the current stage as a
+  fresh execution is exactly the mechanism the first pass's narrowing
+  proposed as the missing capability.
+
+Composed — a stage ends in `needs_input`, the answer is journaled via
+`work.respond`, and the stage is re-entered via `work.retry` for the next
+round — the shipped engine already has every primitive the narrowed claim's
+"minimum runtime capability required" asked for. No new durable fact needs
+to be owned by the runtime for the behavior BU-P5-025 describes; the
+question of *whether* to retry (continue the interview) versus let the stage
+complete (early-stop) is exactly the ordinary stage-completion judgment an
+actor already makes at the end of any turn, using the accumulated answers it
+reads back from the journaled `needs_input` responses.
+
+**5. Why this is a rejection, not merely a narrower re-scoping.**
+The first pass's §6.7 step 3 (lower rungs attempted) was incomplete by
+omission, not by genuine exhaustion: "one coarse `needs_input` round-trip
+per phase" was the only needs_input-shaped rung it considered, and it
+correctly rejected *that* rung (it loses early-stop). It never evaluated the
+finer-grained rung actually available — one `needs_input` round-trip **per
+question**, with `retry` re-entering the same stage between rounds — which
+is representable today and preserves early-stop exactly: the stage ends
+(`needs_input`) after each question and is retried only if the interview
+continues; an early "zero repositories" answer ends the interview by the
+stage completing instead of retrying, with no unbounded suspension of a
+single turn required.
+
+**6. Disposition.**
+Rejected per adjudication-round1.md A13: "its 'never attempted' lower rung
+(needs_input round-trips) exists in the shipped engine; re-file only if a
+measured N2 run shows the narrower residual gap the finding describes." No
+such N2 measurement exists yet. If a real N2 generation run finds the
+per-question needs_input/retry loop insufficient in practice — for example,
+if an actor's fresh `retry` execution cannot reconstruct enough context from
+journaled answers alone to ask a coherent next question — this is the
+correct claim to re-file, narrowed to that specific, measured residual, not
+to the whole interview shape.
+
+**7. Cross-reference (conflict X8, re-resolved here).** X8 is overturned at
+adjudication-round1.md A13 on this same ground: BU-P4-053's "representable
+today ... not an engine gap" note stands for BU-P5-025 too, not only for
+BU-P3-007/BU-P4-053 as the original PROPOSED resolution held. See
+`classification-ledger.md` §3 X8.
+
+---
 
 ### G7 — Dynamically-discovered checkpoint graph with a claim primitive
 **Rejected.**
@@ -622,20 +707,64 @@ invariant:
   It is a requirement already satisfied by the target architecture, not a gap
   in it.
 - **BU-P7-079** (cleanup's atomic publish/rollback must survive a
-  cross-filesystem worktree/fleet-state split). **Lower rung that absorbs
-  it:** rung **§6.1 (agents-invariant)** — but pointed the *opposite*
-  direction from the claim. `BU-P8-108`
-  (`reference/sergeant-upstream/docs/troubleshooting.md` L203-209,
-  `sha256:5284ecc15a84bbefbb7f5a8e50eac920e691913d45ed0dc39a39293a2719abc2`)
-  states Sergeant **refuses** a cross-filesystem layout outright rather than
-  falling back from atomic rename to a non-atomic copy; this is already
-  homed as an `agents-invariant` unit. The daemon owns one data dir and the
-  journal is the durable state, so the split-filesystem topology this claim
-  describes does not arise in sergeant-rs's architecture at all. This is
-  **conflict X1** — tests (P7) would normally outrank docs (P8) per §5 of
-  the extraction method, but P7's unit is itself a rejected engine-gap claim,
-  so the durable rule is P8's refusal, not P7's fallback-and-report
-  behavior.
+  cross-filesystem worktree/fleet-state split). **Re-derived on its own
+  evidence, per adjudication-round1.md A13.** The original rejection ground
+  (below, superseded) was circular with `classification-ledger.md`'s
+  conflict X1 and has been severed; A13 required re-deriving this claim's
+  verdict independent of that circularity. It **remains rejected**, but now
+  on direct architectural grounds rather than a citation-priority argument.
+
+  *Original ground (superseded, kept for the record):* "rung §6.1
+  (agents-invariant), pointed the opposite direction from the claim —
+  `BU-P8-108` states Sergeant refuses a cross-filesystem layout outright...
+  This is conflict X1 — tests (P7) would normally outrank docs (P8) per §5
+  of the extraction method, but P7's unit is itself a rejected engine-gap
+  claim, so the durable rule is P8's refusal." This is circular: X1's own
+  PROPOSED resolution discounted BU-P7-079's weight *by citing this very
+  rejection*, and this rejection in turn cited X1's preference for P8 —
+  each argument's only support was the other. `classification-ledger.md`
+  now adjudicates X1 the other way (BU-P7-079's statement wins the
+  extraction-priority question, since tests outrank docs once the circular
+  citation is removed), which makes the old rejection's reasoning unusable
+  regardless of which way X1 lands.
+
+  *Re-derivation (independent of X1, verified against the shipped
+  engine, not either source document):* the cross-filesystem split
+  BU-P7-079's test injects — a worktree and a fleet-state directory on
+  different filesystems, forcing a copy-based rename fallback — cannot
+  arise in sergeant-rs's architecture, by construction:
+  - `src/runtime/surface.rs`'s `surface_root` materializes every worktree
+    at `<data_dir>/surfaces/<work_id>/...`, inside the daemon's own single
+    data dir, and `SurfaceError::InsideSourceCheckout` refuses a surface
+    that would live inside a source repository at all ("surfaces live in
+    the daemon data dir, outside every checkout (§11)"). There is no
+    configuration in which a worktree sergeant-rs manages sits outside the
+    same data dir the journal and fleet state live in.
+  - `src/runtime/fsutil.rs`'s `write_atomic_mode` — the codebase's one
+    atomic-publish primitive — creates its temporary file as a sibling of
+    the destination path (`path.with_extension(...)`) and renames it into
+    place; a sibling of a path is by definition on the same filesystem as
+    that path, so this rename can never cross a filesystem boundary. No
+    code path in sergeant-rs publishes state via a rename whose two
+    endpoints could be on different filesystems.
+  - Per CLAUDE.md's "One owner" invariant, the daemon exclusively owns one
+    data dir; fleet/work state (the journal) and every worktree it creates
+    live under that one directory, never split across two independently
+    mounted locations the way old-Sergeant's `~/.local/share/sergeant/
+    fleet/<task-id>/` (fleet state) and an arbitrary user checkout
+    (worktree) could be.
+
+  **Lower rung that absorbs it (re-derived):** the single-data-dir/
+  single-owner construction itself (CLAUDE.md; `src/runtime/surface.rs`
+  §11 comment; `src/runtime/fsutil.rs`'s sibling-rename pattern) — not
+  `BU-P8-108`'s documentation citation. The behavior the claim's test
+  probes (a race during a cross-filesystem rename-with-fallback) has no
+  scenario to occur in, because sergeant-rs never produces the
+  cross-filesystem precondition in the first place. This finding does not
+  depend on which of BU-P7-079/BU-P8-108 the corpus prefers as its
+  *extracted statement* (that is X1's question, now settled the other way,
+  in BU-P7-079's favor); it depends only on reading the actual shipped
+  surface/fsutil code.
 - **BU-P7-049** (a two-party handshake must converge on independently
   verifiable proof rather than refusing forever when the recording party
   dies). **Lower rung that absorbs it:** CLAUDE.md's **adjacent-append
@@ -675,18 +804,28 @@ requirement.)
 | G2 fleet identity + dependency advance | BU-P5-065, BU-P6-016, BU-P6-017 | survives (split acceptance test) | 2 |
 | G3 acknowledgement gate on cleanup | BU-P8-007 | survives (amended, re-file at reduced scope) | 3 |
 | G4 admission block | BU-P6-063 | survives (high evidence, low cost) | 4 |
-| G5 re-enterable needs-input stage | BU-P5-025 | survives (narrowed; answers contract Unknown U3) | 5 |
-| G6 child-workflow invocation | BU-P5-077 | survives partially (downgraded to grammar pressure) | 6 |
+| G5 re-enterable needs-input stage | BU-P5-025 | **rejected on re-derivation** (adjudication-round1.md A13 — lower rung ships today) | — |
+| G6 child-workflow invocation | BU-P5-077 | survives partially (downgraded to grammar pressure) | 6 (now last surviving) |
 | G7 dynamic ticket graph | BU-P4-090 | **rejected** — absorbed at §6.5/§6.6 (shared-context/helper) | — |
 | G8 runtime role enforcement | BU-P2-056 | **rejected** — absorbed at §6.1 (agents-invariant, Article III) | — |
-| G9 crash-safe publication (×4) | BU-P7-043, BU-P7-049, BU-P7-051, BU-P7-079 | **rejected** — absorbed by existing architecture/Article IV | — |
+| G9 crash-safe publication (×4) | BU-P7-043, BU-P7-049, BU-P7-051, BU-P7-079 | **rejected** — three absorbed by existing architecture/Article IV; BU-P7-079 re-derived at A13, absorbed by the single-data-dir/single-owner construction | — |
 
-**Method observation for N2 (synthesis.md §5).** Ten of the sixteen
-first-pass `engine-gap`-classified units survived in some form and six did
-not, but *five of the six survivors needed narrowing* — most often because
-the claim's stated minimum capability was larger than its own evidence
-required. A future generator's "engine-gap quality" measurement should score
-*scope discipline* (is the minimum capability the smallest thing the evidence
-forces?) separately from *rung discipline* (were the lower rungs named and
-genuinely tried?) — the corpus shows they fail independently: G1–G6 all pass
-rung discipline, but only G4 required no scope narrowing at all.
+**Method observation for N2 (synthesis.md §5, revised at adjudication-round1.md
+A13).** Nine of the sixteen first-pass `engine-gap`-classified units survived
+in some form and seven did not, but *four of the five survivors needed
+narrowing* — most often because the claim's stated minimum capability was
+larger than its own evidence required. A future generator's "engine-gap
+quality" measurement should score *scope discipline* (is the minimum
+capability the smallest thing the evidence forces?) separately from *rung
+discipline* (were the lower rungs named and genuinely tried, against what is
+actually shipped?) — the corpus shows they fail independently: G1, G2, G3,
+G4, and G6 all pass rung discipline, but only G4 required no scope narrowing
+at all. **G5 is the sharpest illustration of the rung-discipline axis, added
+this round:** its first-pass "lower rungs attempted" step was not
+dishonest, just incomplete — it never checked its own proposed narrower rung
+(a re-enterable needs_input stage) against the shipped engine, and that rung
+turned out to already exist (`src/domain/work.rs`, `src/api.rs`). Rung
+discipline therefore means more than *naming* the rungs a claim tried — it
+means checking a *candidate absorbing rung* against the real system before
+asserting it is missing, the same discipline LESSONS L1 already demands of
+the Claude adapter, extended here to the engine itself.

@@ -18,7 +18,7 @@ Either the plan is returned (planning-only) or control passes to dispatch; the c
 
 ## Behavior contract
 
-- **If the user requested planning only, cross-repo-work stops after returning the briefs, acceptance evidence, and dependency graph, without dispatching or editing any repository; if implementation was requested, it hands off to the dispatch workflow via sgt-dispatch, and the primary session itself never edits several repositories directly.**
+- **If the user requested planning only, cross-repo-work stops after returning the briefs, acceptance evidence, and dependency graph, without dispatching or editing any repository; if implementation was requested, it hands off to the dispatch workflow via its launch command, and the primary session itself never edits several repositories directly.**
   (trigger: planning is complete; outcome: either the plan is returned for review, or execution is handed to a distinct dispatch procedure -- the planning session never becomes a multi-repo editor itself)
   — `BU-P5-051`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 79-85)
 - **sgt-dispatch must never itself carry out `git checkout -b`, `git push -u origin`, or `gh pr create` as its own inline behavior in the cross-repo-work skill's prose; these operations belong to the dispatched worker, not to the coordinating skill.**

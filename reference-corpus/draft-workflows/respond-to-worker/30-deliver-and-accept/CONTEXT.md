@@ -24,11 +24,9 @@ Bounded readiness gate; on timeout, a nonce-scoped unreachable record plus a rec
 - **The full durable notification handshake (nudge delivered, ack token written, acceptance confirmed, instruction followed exactly once, completion published) must be exercised end-to-end for EVERY harness in the shared registry, twice — once for the initial notification and once for a response notification delivered to a relaunched worker — because a prior test iterated harnesses but never actually reached the handshake files for any harness but one, letting a defect go unnoticed for every other harness.**
   (trigger: any supported harness receives an initial or response notification; outcome: the durable handshake contract is proven identically for every harness the shared registry supports, not merely for the one harness earlier tests happened to cover deeply)
   — `BU-P7-109`, `reference/sergeant-upstream/tests/sgt-worker-handshake-test.sh` (lines 1-15)
-- **sgt-respond must never leave a response indefinitely pending merely because delivery to a live pane exceeded its bounded acknowledgement timeout; rerunning the identical command is the documented bounded-recovery path, performing exactly one worker relaunch and retiring the unresponsive original pane only after the replacement is validated.**
+- **Response delivery must never leave a response indefinitely pending merely because delivery to a live worker session exceeded its bounded acknowledgement timeout; rerunning the identical command is the documented bounded-recovery path, performing exactly one worker relaunch and retiring the unresponsive original worker only after the replacement is validated.**
   (trigger: a delivered response's acknowledgement timeout elapses with no ack from the worker pane; outcome: an operator has one deterministic, safe, idempotent next action (rerun the command) rather than being dead-ended between 'already pending' and 'not yet acknowledged' error states)
   — `BU-P7-059`, `reference/sergeant-upstream/tests/sgt-respond-recovery-test.sh` (lines 1-13)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P7-059` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

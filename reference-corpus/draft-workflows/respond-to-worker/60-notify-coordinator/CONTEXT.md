@@ -27,11 +27,9 @@ The update is classified into exactly one durable event kind and recorded; live 
 - **A worker's escalation notification is delivered as a durable, mode-600 marker file tagged `event=escalation`, and never exposes the message body in that marker; it is separately mirrored into the wiki activity log under a distinct 'Agent Escalation' label so a nonterminal escalation is never mislabeled as a completion.**
   (trigger: a worker publishes a needs_input escalation via sgt-notify; outcome: notification delivery is durable and private (secrets/message text never sit in a world-readable marker) while still being observable via a separate labeled activity trail)
   — `BU-P7-047`, `reference/sergeant-upstream/tests/sgt-notify-test.sh` (lines 30-44)
-- **A `done:` prefixed notification is classified and logged as an 'Agent Completion' event distinct from an escalation, and raw tmux injection (verified here via the literal wake message reaching the tmux log) is available only as an explicit compatibility transport, not the default.**
+- **A `done:`-prefixed notification is classified and logged as an 'Agent Completion' event distinct from an escalation, and direct terminal-injection delivery is available only as an explicit backward-compatibility transport, never the default.**
   (trigger: sgt-notify is called with a done:-prefixed or explicit message; outcome: terminal and nonterminal notifications are classified differently by construction (message prefix), and the legacy tmux-injection transport is opt-in only)
   — `BU-P7-048`, `reference/sergeant-upstream/tests/sgt-notify-test.sh` (line 55)
-
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P7-048` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
 
 ## Deterministic-machinery candidate
 

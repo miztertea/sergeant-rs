@@ -38,5 +38,5 @@ No directly-cited units (delegated or structural — see the stage's own CONTEXT
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P7-066` | sgt-td-memory must record handoff evidence only from a verified worktree, and every git field it stores (branch, HEAD, etc.) must resolve from that specific worktree rather than from the supervisor's own current working directory — proven with two real linked worktrees on different branches/commits, not simulated. | `reference/sergeant-upstream/tests/sgt-td-memory-worktree-test.sh` (lines 1-18) |
-| `BU-P7-110` | The interactive worker's wait for harness readiness must be bounded and its outcome reported — a harness that never renders must be caught and reported, not hang forever — and separately, a harness that reaches its pane without ever acknowledging the notification must NOT be misrecorded as orphaned. | `reference/sergeant-upstream/tests/sgt-worker-readiness-test.sh` (lines 1-9) |
+| `BU-P7-110` | The interactive worker's wait for harness readiness must be bounded and its outcome reported — a harness that never renders must be caught and reported, not hang forever — and separately, a harness that becomes ready without ever acknowledging the notification must NOT be misrecorded as orphaned. | `reference/sergeant-upstream/tests/sgt-worker-readiness-test.sh` (lines 1-9) |
 

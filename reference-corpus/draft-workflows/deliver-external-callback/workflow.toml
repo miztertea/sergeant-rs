@@ -6,4 +6,4 @@
 [workflow]
 name = "deliver-external-callback"
 version = "1"
-stages = ["00-enqueue", "10-drain-and-retry", "20-validate-acknowledgement", "30-seal"]
+stages = ["00-seal"]

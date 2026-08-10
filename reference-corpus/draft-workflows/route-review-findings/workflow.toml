@@ -6,4 +6,4 @@
 [workflow]
 name = "route-review-findings"
 version = "1"
-stages = ["00-parse-and-sanitize", "10-retain-artifact", "20-route-each", "30-publish-or-clear-gate"]
+stages = ["00-publish-or-clear-gate"]

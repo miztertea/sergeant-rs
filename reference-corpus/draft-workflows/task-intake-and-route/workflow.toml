@@ -6,4 +6,4 @@
 [workflow]
 name = "task-intake-and-route"
 version = "1"
-stages = ["01-load-context", "02-check-queue", "03-choose-mode", "04-reconcile-state", "05-confirm-decisions", "06-execute", "07-monitor", "08-handle-decisions", "09-reconcile-deliver"]
+stages = ["01-load-context", "03-choose-mode", "05-confirm-decisions", "06-execute", "08-handle-decisions", "09-reconcile-deliver"]

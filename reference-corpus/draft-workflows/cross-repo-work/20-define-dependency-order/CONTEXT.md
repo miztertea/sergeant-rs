@@ -18,7 +18,7 @@ An acyclic edge set in prerequisite>dependent form; cycles broken by a named con
 
 ## Behavior contract
 
-- **Dependency edges are created only when one repository's merged or deployed result is required by another, expressed in the prerequisite>dependent notation accepted by sgt-dispatch.**
+- **Dependency edges are created only when one repository's merged or deployed result is required by another, expressed in the prerequisite>dependent notation accepted by the dispatch command.**
   (trigger: ownership is assigned; outcome: the dependency graph contains only load-bearing edges, in a syntax the dispatch stage can consume directly)
   — `BU-P5-044`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 40-43)
 - **Recognized dependency-edge evidence includes: a contract/schema producer preceding its consumers, infrastructure/config preceding runtime that requires it, independent implementations running in parallel once an approved contract exists, and deployment dependency recorded separately from code-merge dependency.**
