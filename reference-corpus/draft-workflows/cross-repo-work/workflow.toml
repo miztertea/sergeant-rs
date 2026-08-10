@@ -5,5 +5,5 @@
 
 [workflow]
 name = "cross-repo-work"
-version = "1"
+version = "2"
 stages = ["10-assign-ownership", "20-define-dependency-order", "40-define-delivery-gates", "50-handoff-or-stop", "60-reconcile"]

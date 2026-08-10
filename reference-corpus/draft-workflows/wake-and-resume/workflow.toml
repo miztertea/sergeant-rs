@@ -5,5 +5,5 @@
 
 [workflow]
 name = "wake-and-resume"
-version = "1"
+version = "2"
 stages = ["10-evaluate"]

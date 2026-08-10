@@ -2,7 +2,7 @@
 kind: workflow
 name: dispatch
 status: draft
-version: 1
+version: 2
 description: >-
   Given a project, a brief or tracked task, and a repository set, produce one durable task with an isolated work surface, a rendered mission brief, and a running agent per repository — with every side effect validated and gated before the next repository's dispatch begins.
 tags:

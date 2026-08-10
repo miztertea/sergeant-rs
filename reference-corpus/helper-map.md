@@ -1,5 +1,17 @@
 # Helper Map
 
+> **Superseding note (added post-round-1-adjudication, V10).** The `W`-numbered
+> workflow references and stage names below are `synthesis.md`'s vocabulary
+> as of that phase artifact and are now historical — `adjudication-round1.md`'s
+> structural rulings (A3–A8) reordered, demoted, restored, merged, split, and
+> removed stages and whole packages afterward (e.g. `W19 repo-release-verification`,
+> cited in two entries below, no longer exists as a standalone package — see
+> `provenance-map.md`'s Tombstones section). Each `draft-workflows/<name>/provenance.md`
+> and `workflow.toml` is the authoritative, current source for which package
+> and stage actually consumes a given helper; `adjudication-round1.md` is the
+> bridge document explaining how the two diverge. This note is additive — the
+> entries below are otherwise unedited.
+
 Part of the N1 reference corpus (`docs/gauntlet/contracts/N1.md`, §8.1's
 `helper-map.md`). Sourced from `synthesis.md` §3c ("Shared mechanics") and the
 workflow-local helper list embedded in the same section, applying §6.5/§6.6 of

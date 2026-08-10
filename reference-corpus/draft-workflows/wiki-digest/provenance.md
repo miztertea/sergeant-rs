@@ -8,6 +8,9 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 |---|---|---|
 | `BU-P5-130` | wiki maintains Sergeant's automatic activity captures and a curated daily session digest. | `reference/sergeant-upstream/skills/wiki/SKILL.md` (line 3) |
 | `BU-P5-131` | wiki is loaded only for explicit ingest/backfill/regenerate/inspect/change requests on wiki output; routine dispatch, notification, and cleanup commands write automatic captures without any coordinator action or wiki-skill invocation. | `reference/sergeant-upstream/skills/wiki/SKILL.md` (lines 7-9) |
+| `BU-P1-135` | When the user asks to ingest, backfill, regenerate, inspect, update, or change the wiki, load the wiki procedure, which owns capture behavior, digest generation, schema ownership, and index updates. | `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L116, Procedural skills table row) |
+
+Routed here at N1 verifier round 2 (finding V3): AGENTS.md's routing table names the `wiki` skill, which this package's own notes identify as the same procedure as P6's `wiki-daily-digest` (conflict X9b, folded together as `wiki-digest`); `BU-P1-135` corroborates `BU-P5-131`'s trigger from a second, independent source document.
 
 ## Stages
 

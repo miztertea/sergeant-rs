@@ -2,7 +2,7 @@
 kind: workflow
 name: recover-stalled-worker
 status: draft
-version: 1
+version: 2
 description: >-
   One bounded recovery attempt for a stalled worker: converge on a replacement or escalate — never guess.
 tags:

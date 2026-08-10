@@ -54,3 +54,7 @@ Applying the reference-corpus's N1 round-1 adjudication (`reference-corpus/adjud
 
 Stage count: 6 extracted → 4 surviving. No behavior unit was deleted; `BU-P7-005`, `BU-P7-066`, and `BU-P7-110` remain cited, now under `10-triage-and-route`'s or `40-escalate-or-continue`'s "Helper invocations" section (see those stages' `CONTEXT.md`).
 
+## N1 verifier round 2 (finding V3) — routing note, not a citation
+
+`BU-P5-150` (vertical-slice discipline, `20-implement`), `BU-P5-151` (remediation loop, `30-independent-review`/`20-implement`), `BU-P5-152` (commit/PR/CI/review-thread/dependency-order delivery, `40-escalate-or-continue`), and `BU-P5-153` (td decision logging and `td review` timing, `40-escalate-or-continue`) are the four remaining rows of the same ordered dispatch worker-contract list that `BU-P5-075`–`BU-P5-089` already belong to. Per record-shapes.md §3's one-unit-one-stage rule and this package's own established pattern for that range (see `dispatch/80-monitor/CONTEXT.md`'s "render brief" helper), these four units are cited once, in `dispatch/provenance.md`'s `60-render-brief` section (content `dispatch` *authors* into the brief), not duplicated here. This package is the content's *executor* — the stage each unit's parenthetical above names is where a worker actually carries out that contract item during a mission — but the binding citation stays with the authoring package.
+

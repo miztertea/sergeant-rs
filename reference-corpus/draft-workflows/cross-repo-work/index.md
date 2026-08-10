@@ -2,7 +2,7 @@
 kind: workflow
 name: cross-repo-work
 status: draft
-version: 1
+version: 2
 description: >-
   Decompose a requested outcome across repositories and define delivery order: produce a plan in which every required behavior has exactly one owning repository, an acyclic dependency position, a brief, and acceptance evidence — before any dispatch happens.
 tags:

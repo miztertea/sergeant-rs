@@ -44,15 +44,18 @@ Four stages extracted as their own candidates (ladder §6.5, "deterministic-mach
 - **A drain-lock acquisition failure that stems from the filesystem itself being unable to create hard links (e.g. FAT/exFAT, some CIFS/FUSE mounts) is distinguished from ordinary contention, because spinning to the deadline and reporting 'contended' would send an operator chasing a holder that does not exist.**
   (trigger: the lock filesystem does not support hard links; outcome: an environment-incompatibility failure is reported immediately and correctly, never masquerading as ordinary lock contention)
   — `BU-P6-062`, `reference/sergeant-upstream/bin/_sgt-drain.sh` (L458-467)
-- **A drain refuses new worker starts within its scope while still storing incoming responses generation-safely for later delivery, --wait activates the drain and then waits for in-scope live workers to finish their current turn and exit, and on timeout it leaves the drain active, exits nonzero, and names the unresolved workers without terminating any of them.**
-  (trigger: an operator wants to pause admission of new work, optionally waiting for a graceful stop; outcome: admission is refused immediately, in-flight responses are never lost, and a timed-out graceful wait never silently force-stops anything)
-  — `BU-P8-077`, `reference/sergeant-upstream/docs/using-sergeant.md` (L231-243 (Pause admission with a drain))
+- **A drain refuses new worker starts within its scope while still storing incoming responses generation-safely for later delivery.**
+  (trigger: an operator wants to pause admission of new work; outcome: admission is refused immediately and in-flight responses are never lost)
+  — `BU-P8-110`, `reference/sergeant-upstream/docs/using-sergeant.md` (L237-238 (Pause admission with a drain))
 
 **2. await convergence** (formerly `10-await-convergence`) — a bounded wait; a worker counts as drained only when its exit is provable; timeout leaves the drain active, exits non-zero, and names the unresolved.
 
 - **A worker is only ever counted as having genuinely finished draining when its recorded process is provably gone; absence of recorded identity is explicitly not treated as proof of exit, so an unverifiable worker blocks a drain wait rather than being silently counted as resolved.**
   (trigger: a bounded drain wait is evaluating whether the scope is fully drained; outcome: a drain wait can never falsely report success because a worker's identity happened to be unrecordable)
   — `BU-P6-064`, `reference/sergeant-upstream/bin/sgt-drain` (L147-152)
+- **`--wait` activates the drain and then waits for in-scope live workers to finish their current turn and exit, and on timeout it leaves the drain active, exits nonzero, and names the unresolved workers without terminating any of them.**
+  (trigger: an operator invokes drain --wait after admission has already been refused for the scope; outcome: a timed-out graceful wait never silently force-stops anything, and the operator is told exactly which workers are unresolved)
+  — `BU-P8-111`, `reference/sergeant-upstream/docs/using-sergeant.md` (L238-241 (Pause admission with a drain))
 
 **3. worker-side checkpoint** (formerly `20-worker-side-checkpoint`) — idempotent drain detection; publish handoff and settle the lease before terminating anything.
 

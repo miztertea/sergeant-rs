@@ -5,5 +5,5 @@
 
 [workflow]
 name = "dispatch"
-version = "1"
+version = "2"
 stages = ["00-check-queue-and-plan", "05-classify-risk", "15-check-admission", "20-prepare-intent", "80-monitor", "90-reconcile-fleet"]

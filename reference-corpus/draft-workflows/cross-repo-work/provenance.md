@@ -9,6 +9,9 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P5-038` | cross-repo-work decomposes a requested outcome across the repositories that own it and defines dependency and merge order before any dispatch happens. | `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 8-9) |
 | `BU-P5-039` | cross-repo-work is loaded when the context-resolution output shows more than one repository owns the requested outcome, not merely because the project contains multiple repositories. | `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 13-14) |
 | `BU-P5-056` | dispatch requires load-project (repos/paths/instructions known) and cross-repo-work (repos, dependency order, and per-repo work known, or manually confirmed equivalent) as completed prerequisites. | `reference/sergeant-upstream/skills/dispatch/SKILL.md` (lines 19-21) |
+| `BU-P1-133` | When more than one repository owns the requested outcome, load the cross-repo-work procedure, which owns repository decomposition, dependency and merge order, and per-repository acceptance. | `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L114, Procedural skills table row) |
+
+Routed here at N1 verifier round 2 (finding V3): `BU-P1-133` is AGENTS.md's own Procedural-skills-table row for this workflow, corroborating `BU-P5-039`'s trigger from a second, independent source document.
 
 ## Stages
 

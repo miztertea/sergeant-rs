@@ -5,5 +5,5 @@
 
 [workflow]
 name = "reconcile-and-cleanup-fleet"
-version = "1"
+version = "2"
 stages = ["00-require-terminal"]

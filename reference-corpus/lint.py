@@ -93,24 +93,13 @@ def is_disputed(record):
     return False
 
 
-def is_retired(record):
-    """A documented, self-superseded historical record (kept for id
-    stability / provenance history) — exempt from the strict conditional
-    stage-field requirement the same way a disputed citation is exempt from
-    hash verification. Must say so explicitly in its own notes."""
-    notes = record.get("notes") or ""
-    return "RETIRED at N1 adjudication" in notes
-
-
 def load_units(lint):
-    """Returns (units: dict[id -> record], disputed_count, retired_count,
-    ndjson_errors)."""
+    """Returns (units: dict[id -> record], disputed_count, ndjson_errors)."""
     units = {}
     disputed = 0
-    retired = 0
     if not os.path.isdir(BEHAVIOR_UNITS_DIR):
         lint.fail(f"behavior-units directory not found: {BEHAVIOR_UNITS_DIR}")
-        return units, disputed, retired
+        return units, disputed
 
     for fn in sorted(os.listdir(BEHAVIOR_UNITS_DIR)):
         if not fn.endswith(".ndjson"):
@@ -176,19 +165,22 @@ def load_units(lint):
                 if "engine_gap" not in record:
                     lint.fail(f"[1:required-field] {uid} ({loc}): missing `engine_gap` key (must be present, null unless representation=='engine-gap')")
 
-                # stage required (non-null) when representation is `stage` (a named
-                # stage boundary), except a documented RETIRED historical record
-                # (kept for id stability). `stage-context` legitimately attaches to
-                # a workflow's own Layer-1 CONTEXT.md with no single owning stage
-                # (verified against the corpus: every such case's own `rationale`
-                # states it's workflow-wide context, not a missing field) — record-
-                # shapes.md's "stage or actor-stage" conditional binds the `stage`
-                # rung specifically, not every rung that happens to touch a stage.
+                # stage required (non-null) when representation is `stage` (a
+                # named stage boundary), with no exemption — including a
+                # retired/superseded record: it still names the materialized
+                # stage directory its content now lives under (or, before
+                # this closure round, `is_retired()` exempted it here; that
+                # carve-out is removed as of N1 closure V13, since every
+                # `stage`-representation record, retired or not, now carries
+                # a real non-null `stage`). `stage-context` legitimately
+                # attaches to a workflow's own Layer-1 CONTEXT.md with no
+                # single owning stage (verified against the corpus: every
+                # such case's own `rationale` states it's workflow-wide
+                # context, not a missing field) — record-shapes.md's "stage
+                # or actor-stage" conditional binds the `stage` rung
+                # specifically, not every rung that happens to touch a stage.
                 if representation == "stage" and record.get("stage") is None:
-                    if is_retired(record):
-                        retired += 1
-                    else:
-                        lint.fail(f"[1:conditional-field] {uid} ({loc}): representation `{representation}` requires non-null `stage`")
+                    lint.fail(f"[1:conditional-field] {uid} ({loc}): representation `{representation}` requires non-null `stage`")
 
                 if is_disputed(record):
                     disputed += 1
@@ -199,7 +191,7 @@ def load_units(lint):
                 else:
                     units[uid] = (record, loc)
 
-    return units, disputed, retired
+    return units, disputed
 
 
 def verify_quotes(lint, units, disputed_ids):
@@ -582,7 +574,7 @@ def check_rationale_and_alternatives(lint, units, conflict_named_ids):
 def main():
     lint = Lint()
 
-    units, disputed, retired = load_units(lint)
+    units, disputed = load_units(lint)
     all_unit_ids = set(units.keys())
 
     disputed_ids = {uid for uid, (r, _) in units.items() if is_disputed(r)}
@@ -598,7 +590,7 @@ def main():
     check_rationale_and_alternatives(lint, units, conflict_named_ids)
 
     print(f"units loaded: {len(units)}")
-    print(f"quotes verified: {n_verified}  disputed (exempt): {len(disputed_ids)}  retired (stage-exempt): {retired}")
+    print(f"quotes verified: {n_verified}  disputed (exempt): {len(disputed_ids)}")
     print(f"engine-gap units checked: {n_engine_gap}")
     print(f"decompose files checked: {n_decompose}")
     print(f"conflict-named units (classification-ledger.md §3): {len(conflict_named_ids)}")

@@ -1,5 +1,20 @@
 # Cross-Partition Synthesis (§8.3 step 5)
 
+> **Superseding note (added post-round-1-adjudication, V10).** This
+> document is a **phase artifact**, frozen at the moment it was written: its
+> stage/workflow vocabulary (W-numbers, stage names, stage lists, and the
+> 966-unit census throughout) reflects the corpus *as it stood at synthesis*
+> and is now historical. `adjudication-round1.md`'s structural rulings
+> (A3–A8) subsequently reordered, demoted, restored, merged, split, and
+> removed stages and whole packages — and A9–A12 backfilled, normalized,
+> and added units — none of which is reflected below. **Do not treat this
+> document as a live map of current stage boundaries or unit counts.** For
+> the authoritative, current state of any package, read that package's own
+> `draft-workflows/<name>/provenance.md` and `workflow.toml`; for how the
+> two diverge and why, `adjudication-round1.md` is the bridge document.
+> This note is additive — the content below is preserved unedited as the
+> historical record of the synthesis pass itself.
+
 **Input:** 966 behavior units in `reference-corpus/behavior-units/P1.ndjson` … `P8.ndjson`
 (P1 131, P2 127, P3 96, P4 100, P5 149, P6 142, P7 112, P8 109). No duplicate ids.
 **Source snapshot:** `reference/sergeant-upstream` at the SHA recorded in `reference/UPSTREAM.md`.

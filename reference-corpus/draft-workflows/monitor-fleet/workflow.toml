@@ -5,5 +5,5 @@
 
 [workflow]
 name = "monitor-fleet"
-version = "1"
-stages = ["00-snapshot", "10-evaluate-liveness"]
+version = "2"
+stages = ["00-observe-and-interpret"]

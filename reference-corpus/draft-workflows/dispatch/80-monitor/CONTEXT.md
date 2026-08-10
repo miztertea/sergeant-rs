@@ -78,7 +78,7 @@ Five stages extracted as their own candidates (ladder §6.5, "deterministic-mach
   (trigger: the unpushed-work guard refuses a re-dispatch; outcome: an operator confronted with a safety refusal is always told the safe recovery path, never a destructive workaround, by construction of the error text itself)
   — `BU-P7-070`, `reference/sergeant-upstream/tests/sgt-dispatch-adopt-branch-test.sh` (lines 78-84)
 
-**4. render brief** (formerly `60-render-brief`) — mission, merged instructions, dependency notes, delivery requirements and any verbatim user override are durably carried to the worker before it starts. The BU-P5-075..089 range below is worker-contract content this helper *authors into the brief* but does not itself execute — it is the input to `worker-mission` and `route-review-findings`, not a claim that this stage performs that content's behavior. `BU-P5-074` records that `--deps` *ordering* is expressed here but its *enforcement* is left entirely to the dispatched workers reading their own brief (conflict X15, folded into engine-gap G2's split acceptance test in `reference-corpus/synthesis.md` §5) — recording is this helper's job; enforcement is not.
+**4. render brief** (formerly `60-render-brief`) — mission, merged instructions, dependency notes, delivery requirements and any verbatim user override are durably carried to the worker before it starts. The BU-P5-075..089 range below, plus `BU-P5-150`/`151`/`152`/`153` (routed here at N1 verifier round 2, finding V3 — the remaining rows of the same ordered worker-contract list, items 6/16/17/18) is worker-contract content this helper *authors into the brief* but does not itself execute — it is the input to `worker-mission` and `route-review-findings`, not a claim that this stage performs that content's behavior. `BU-P5-074` records that `--deps` *ordering* is expressed here but its *enforcement* is left entirely to the dispatched workers reading their own brief (conflict X15, folded into engine-gap G2's split acceptance test in `reference-corpus/synthesis.md` §5) — recording is this helper's job; enforcement is not.
 
 - **Each worker's starting context must durably carry its mission, the merged/resolved agent instructions, dependency notes, and delivery requirements, before the worker begins.**
   (trigger: a worktree has been created for a dispatched repository; outcome: the worker never begins without a complete, self-contained starting brief)
@@ -107,6 +107,9 @@ Five stages extracted as their own candidates (ladder §6.5, "deterministic-mach
 - **A worker establishes public behavioral seams from td/spec evidence before writing tests; if a consequential seam is undecided, it escalates needs_input rather than guessing.**
   (trigger: a worker is about to define testable seams; outcome: undecided consequential design points are escalated, never silently assumed)
   — `BU-P5-078`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 174)
+- **A worker implements one vertical slice at a time: a focused failing test, the minimum passing implementation, then refactor; tautological tests, internal mocking, horizontal test/implementation phases, and speculative refactoring are all rejected.**
+  (trigger: a worker begins implementing an established behavioral seam; outcome: implementation proceeds in small, test-first, verifiable increments rather than large untested batches)
+  — `BU-P5-150`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 175)
 - **A worker in needs_input or blocked writes an escalation message and notifies the coordinator; on response, it consumes/removes the response, clears the message, logs the decision to td, restores in_progress, and continues -- the durable requirement is that answering a blocked worker always durably restores forward progress, regardless of the underlying file-based transport.**
   (trigger: a worker needs input or is blocked; outcome: the escalation-to-resume cycle always ends with the worker durably back in progress)
   — `BU-P5-079`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 176)
@@ -128,6 +131,15 @@ Five stages extracted as their own candidates (ladder §6.5, "deterministic-mach
 - **Findings sharing the same originating run, head, owning module, and root cause share one serialized remediation worker/branch; before merging that group, native tests and independent re-reviews verifying mutation-before-validation, partial-publication/rollback, and identity/provenance are rerun; after two remediation cycles, fix dispatch stops and an architectural/root-cause review plus a human decision is required.**
   (trigger: multiple findings share a root cause; outcome: remediation is deduplicated, re-verified before merge, and escalates to a human after bounded retries rather than looping indefinitely)
   — `BU-P5-085`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 184)
+- **A worker remediates every blocking repository-native test and independent-review finding and reruns the affected tests and all required review axes until each reports zero blocking findings; no-mistakes findings are remediated through a separate td dispatch, not inline.**
+  (trigger: review or testing has produced blocking findings; outcome: no dispatched work reaches completion while a blocking finding remains open, and no-mistakes findings stay routed through their own separate remediation path)
+  — `BU-P5-151`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 185)
+- **A worker commits its changes, opens a pull request, waits for required CI to pass, resolves every non-outdated review thread, and satisfies the plan's declared dependency order before considering its work delivered.**
+  (trigger: a worker's implementation and remediation are complete; outcome: delivery evidence (PR, passing CI, resolved review, correct merge ordering) exists before the worker's work is considered done)
+  — `BU-P5-152`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 186)
+- **For tracked work, a worker logs td decisions and hands off, then runs `td review` only once implementation and review evidence are both ready.**
+  (trigger: a worker's work is tracked in td and nears completion; outcome: td's own review step is only invoked once its evidentiary preconditions are actually satisfied, never prematurely)
+  — `BU-P5-153`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 187)
 - **A worker writes its terminal result record and sets its status to done only after every completion gate has passed; a failed status with an exact reason is reserved specifically for an unrecoverable terminal failure.**
   (trigger: a worker reaches a terminal outcome; outcome: the terminal status distinguishes verified success from unrecoverable failure, and neither is asserted prematurely)
   — `BU-P5-086`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 188)

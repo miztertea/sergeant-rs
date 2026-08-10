@@ -9,6 +9,9 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P5-001` | Bootstrapping or repairing a Sergeant installation must be interactive and idempotent: orchestrate only supported commands, and surface any missing capability as a separate tracked issue rather than inventing an undocumented workaround. | `reference/sergeant-upstream/.agents/skills/sergeant-setup/SKILL.md` (lines 8-10) |
 | `BU-P5-002` | sergeant-setup should be loaded when the user wants to install/configure Sergeant for the first time, register a new project or add repositories to an existing one, diagnose/repair a broken or incomplete installation, or verify that an existing setup is working. | `reference/sergeant-upstream/.agents/skills/sergeant-setup/SKILL.md` (lines 14-18) |
 | `BU-P5-003` | sergeant-setup must not be loaded for documentation-only questions or questions about a specific command; those route to sergeant-help instead. | `reference/sergeant-upstream/.agents/skills/sergeant-setup/SKILL.md` (lines 20-21) |
+| `BU-P1-137` | When the user wants to interactively install, configure, or repair a Sergeant installation, load the sergeant-setup procedure, which owns the interactive setup wizard, prerequisite detection, consent-gated install, project YAML interview, sync verification, and an optional treehouse prompt. | `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L118, Procedural skills table row) |
+
+Routed here at N1 verifier round 2 (finding V3): `BU-P1-137` is AGENTS.md's own Procedural-skills-table row for this workflow, corroborating `BU-P5-002`'s trigger from a second, independent source document.
 
 ## Stages
 

@@ -5,5 +5,5 @@
 
 [workflow]
 name = "recover-stalled-worker"
-version = "1"
+version = "2"
 stages = ["00-collect-signals", "40-escalate-on-second-attempt", "50-escalate-undocumented"]

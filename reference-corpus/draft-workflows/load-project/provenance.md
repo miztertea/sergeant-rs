@@ -11,6 +11,9 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P5-040` | cross-repo-work requires load-project to have already resolved repository paths, roles, groups, and instructions. | `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 16-17) |
 | `BU-P5-090` | load-project resolves Sergeant project ownership, configuration, and paths before any work begins. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (line 8) |
 | `BU-P5-091` | load-project is loaded when a project is named, registered, edited, synced, or graphed, or when repository ownership is not already established by sgt-context output. | `reference/sergeant-upstream/skills/load-project/SKILL.md` (lines 12-13) |
+| `BU-P1-132` | When a project is named, registered, edited, synced, or graphed, load the load-project procedure, which owns registry lookup, schema, context loading, project edits, sync, and project Graphify. | `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L113, Procedural skills table row) |
+
+Routed here at N1 verifier round 2 (finding V3): `BU-P1-132` is AGENTS.md's own Procedural-skills-table row for this workflow, corroborating `BU-P5-091`'s trigger from a second, independent source document.
 
 ## Stages
 

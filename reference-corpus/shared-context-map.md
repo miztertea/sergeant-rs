@@ -1,5 +1,15 @@
 # Shared Context Map
 
+> **Superseding note (added post-round-1-adjudication, V10).** The `W`-numbered
+> workflow references below are `synthesis.md`'s vocabulary as of that phase
+> artifact and are now historical — `adjudication-round1.md`'s structural
+> rulings (A3–A8) reordered, demoted, restored, merged, split, and removed
+> stages and whole packages afterward. Each `draft-workflows/<name>/provenance.md`
+> and `workflow.toml` is the authoritative, current source for which package
+> actually shares a given context; `adjudication-round1.md` is the bridge
+> document explaining how the two diverge. This note is additive — the
+> entries below are otherwise unedited.
+
 Part of the N1 reference corpus (`docs/gauntlet/contracts/N1.md`, §8.1's
 `shared-context-map.md`). Sourced from `synthesis.md` §3a ("Named shared
 contexts already conventionalized") and §3b ("Shared guidance"). Per

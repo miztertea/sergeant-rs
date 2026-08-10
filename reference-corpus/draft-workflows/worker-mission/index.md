@@ -2,7 +2,7 @@
 kind: workflow
 name: worker-mission
 status: draft
-version: 1
+version: 2
 description: >-
   From a rendered brief, produce a merged-ready change with evidence — the contract a dispatched worker delivers against.
 tags:

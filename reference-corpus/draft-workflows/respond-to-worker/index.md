@@ -2,7 +2,7 @@
 kind: workflow
 name: respond-to-worker
 status: draft
-version: 1
+version: 2
 description: >-
   A blocked/needs-input/waiting/orphaned worker is durably given exactly one decision, applies it exactly once, and returns to forward progress.
 tags:

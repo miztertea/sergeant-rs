@@ -46,9 +46,11 @@ invocations, the fix survives as invocation order within that stage's
 stages carried no argument beyond the §6.5 "candidate execute-stage
 workload" boilerplate and folded into their nearest surviving
 judgment-bearing neighbor: `10-preflight-capabilities` folded into
-`15-check-admission` (its own "Additional note" argued the checkpoint
-survives implementation swap — exactly what marks it a helper under
-§6.3's reimplementation test); `30-create-tracked-work`,
+`15-check-admission` (its own "Additional note" conceded that the
+checkpoint — nothing was created if the preflight failed — is unchanged by
+swapping which probes implement the check, so it does *not* survive §6.3's
+reimplementation test in the stage's favor — exactly what marks it a
+helper); `30-create-tracked-work`,
 `40-reconcile-before-launch`, `50-acquire-surface`, `60-render-brief`, and
 `70-launch-and-record` folded into `80-monitor`. `15-check-admission`
 itself was judged case-by-case and **kept**: its "Additional note" argues a
@@ -59,7 +61,7 @@ detail), which does not reduce under §6.3's test. Stage count dropped from
 A4" section and each surviving stage's "Helper invocations" section for the
 full disposition.
 
-**Obsolete-mechanism stress test (§8.2).** The `dispatch` skill's tmux/sentinel/worker-Bash machinery (pane identity, pane-as-notification-channel, pane-as-liveness-signal, the nudge loop) carried none of the stage boundaries above — see `reference-corpus/synthesis.md` §4 clusters M1–M4 for the mechanism-vs-policy separation. What survived: preflight-before-side-effect, all-or-nothing tracked-work creation, one canonical intent revision, durable brief delivery, intended→confirmed launch evidence, per-repo failure recorded rather than silent. Worker-contract content this workflow *authors* but does not itself execute (BU-P5-075/076/078/079/080/081/082/083/084/085/086/089) is the input to `worker-mission` and `route-review-findings`.
+**Obsolete-mechanism stress test (§8.2).** The `dispatch` skill's tmux/sentinel/worker-Bash machinery (pane identity, pane-as-notification-channel, pane-as-liveness-signal, the nudge loop) carried none of the stage boundaries above — see `reference-corpus/synthesis.md` §4 clusters M1–M4 for the mechanism-vs-policy separation. What survived: preflight-before-side-effect, all-or-nothing tracked-work creation, one canonical intent revision, durable brief delivery, intended→confirmed launch evidence, per-repo failure recorded rather than silent. Worker-contract content this workflow *authors* but does not itself execute (BU-P5-075/076/078/079/080/081/082/083/084/085/086/089, plus BU-P5-150/151/152/153 routed here at N1 verifier round 2 finding V3) is the input to `worker-mission` and `route-review-findings`.
 
 Reviewers originally flagged this as the corpus's largest single cluster (63 units, 12 stages) — see `reference-corpus/synthesis.md` §8 note 1: either it is genuinely one procedure with twelve checkpoints, or it should split at `70-launch-and-record` into a plan-and-validate workflow and a launch-fleet workflow. A4's de-staging sweep (above) addresses the size concern from a different angle than a workflow split — the checkpoint count actually requiring independent judgment turns out to be five, not twelve. Whether `80-monitor`'s post-fold breadth still argues for a plan-and-validate / launch-fleet split remains an open question for the classification ledger; not resolved here.
 

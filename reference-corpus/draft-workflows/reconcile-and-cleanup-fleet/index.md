@@ -2,7 +2,7 @@
 kind: workflow
 name: reconcile-and-cleanup-fleet
 status: draft
-version: 1
+version: 2
 description: >-
   Require every targeted repo safely terminal and its task verifiably
   closed, then reconcile fleet status, verify ownership and handshake

@@ -2,7 +2,7 @@
 kind: workflow
 name: drain-fleet
 status: draft
-version: 1
+version: 2
 description: >-
   A cooperative, bounded, non-destructive admission block: refuse new work without terminating anything already running.
 tags:

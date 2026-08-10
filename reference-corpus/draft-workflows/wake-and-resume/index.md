@@ -2,7 +2,7 @@
 kind: workflow
 name: wake-and-resume
 status: draft
-version: 1
+version: 2
 description: >-
   Resume a waiting worker when its durable condition is met.
 tags:

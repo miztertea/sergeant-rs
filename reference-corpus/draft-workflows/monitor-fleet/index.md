@@ -2,12 +2,14 @@
 kind: workflow
 name: monitor-fleet
 status: draft
-version: 1
+version: 2
 description: >-
   Observe fleet state without mutating it: a bounded, versioned, strictly
-  read-only snapshot plus liveness evaluation. Mutating reconciliation and
-  background-watch lifecycle moved to reconcile-and-cleanup-fleet at N1
-  adjudication A7.
+  read-only snapshot plus liveness evaluation, interpreted by the workflow's
+  single actor stage. Mutating reconciliation and background-watch lifecycle
+  moved to reconcile-and-cleanup-fleet at N1 adjudication A7; the snapshot
+  and liveness computations folded into one judgment-bearing stage at N1
+  adjudication A4.
 tags:
   - fleet
   - observability

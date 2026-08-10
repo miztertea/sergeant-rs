@@ -11,14 +11,14 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P6-057` | Whether admission (new dispatch or relaunch) is currently allowed is decided purely by the presence of a drain file — global or project-scoped — and an empty or unparseable project name is treated as absent, checking only the global drain rather than erroring. | `reference/sergeant-upstream/bin/_sgt-drain.sh` (L93-107) |
 | `BU-P6-058` | A concurrent 'read drain state, then start new work' race is closed by an explicit admission lock that every dispatch/relaunch procedure and every drain-set/undrain procedure must acquire before reading or writing drain state, so a drain set mid-dispatch is never silently missed. | `reference/sergeant-upstream/bin/_sgt-drain.sh` (L109-114) |
 | `BU-P6-062` | A drain-lock acquisition failure that stems from the filesystem itself being unable to create hard links (e.g. FAT/exFAT, some CIFS/FUSE mounts) is distinguished from ordinary contention, because spinning to the deadline and reporting 'contended' would send an operator chasing a holder that does not exist. | `reference/sergeant-upstream/bin/_sgt-drain.sh` (L458-467) |
-| `BU-P8-077` | A drain refuses new worker starts within its scope while still storing incoming responses generation-safely for later delivery, --wait activates the drain and then waits for in-scope live workers to finish their current turn and exit, and on timeout it leaves the drain active, exits nonzero, and names the unresolved workers without terminating any of them. | `reference/sergeant-upstream/docs/using-sergeant.md` (L231-243 (Pause admission with a drain)) |
+| `BU-P8-110` | A drain refuses new worker starts within its scope while still storing incoming responses generation-safely for later delivery. | `reference/sergeant-upstream/docs/using-sergeant.md` (L237-238 (Pause admission with a drain)) |
 
 ### `10-await-convergence` (folded into `30-force-stop`, N1 adjudication A4)
 
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P6-064` | A worker is only ever counted as having genuinely finished draining when its recorded process is provably gone; absence of recorded identity is explicitly not treated as proof of exit, so an unverifiable worker blocks a drain wait rather than being silently counted as resolved. | `reference/sergeant-upstream/bin/sgt-drain` (L147-152) |
-| `BU-P8-077` | A drain refuses new worker starts within its scope while still storing incoming responses generation-safely for later delivery, --wait activates the drain and then waits for in-scope live workers to finish their current turn and exit, and on timeout it leaves the drain active, exits nonzero, and names the unresolved workers without terminating any of them. | `reference/sergeant-upstream/docs/using-sergeant.md` (L231-243 (Pause admission with a drain)) |
+| `BU-P8-111` | --wait activates the drain and then waits for in-scope live workers to finish their current turn and exit, and on timeout it leaves the drain active, exits nonzero, and names the unresolved workers without terminating any of them. | `reference/sergeant-upstream/docs/using-sergeant.md` (L238-241 (Pause admission with a drain)) |
 
 ### `20-worker-side-checkpoint` (folded into `30-force-stop`, N1 adjudication A4)
 
@@ -54,7 +54,9 @@ Applying the reference-corpus's N1 round-1 adjudication (`reference-corpus/adjud
 | `30-force-stop` | n/a (extracted as actor-stage, §6.4, already judgment-bearing) | n/a | **Kept.** |
 | `40-undrain` | none | Swapping the undrain implementation leaves the checkpoint — idempotent, mutually exclusive scopes — unchanged. | **Demoted** — folded into `30-force-stop` as a following helper invocation. Its `promote` output disposition is inherited by the merged stage output (see `30-force-stop/output/README.md`). |
 
-Stage count: 5 extracted → 1 surviving. No behavior unit was deleted; all nine citations above remain cited, under `30-force-stop`'s own contract or its "Helper invocations" section (see that stage's `CONTEXT.md`).
+Stage count: 5 extracted → 1 surviving. No behavior unit was deleted; all thirteen citations above remain cited, under `30-force-stop`'s own contract or its "Helper invocations" section (see that stage's `CONTEXT.md`).
+
+**N1 verifier round 2 (finding V4).** `00-set-drain` and `10-await-convergence` originally both cited the same unit, `BU-P8-077`, for their respective halves of one upstream sentence (admission-refusal vs. wait/convergence). `BU-P8-077` was split at N1 adjudication A12 into `BU-P8-110` (admission-refusal aspect) and `BU-P8-111` (wait/convergence aspect); its own record now carries an explicit "RETIRED... do not cite BU-P8-077 in new work" note. This provenance table cites the successors — `BU-P8-110` in `00-set-drain`'s row, `BU-P8-111` in `10-await-convergence`'s row — instead of the retired unit, closing both the stale-citation defect and the pre-existing duplicate-citation-across-two-stages defect at once.
 
 ## Notes
 

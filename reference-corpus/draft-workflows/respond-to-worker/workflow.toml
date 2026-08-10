@@ -5,5 +5,5 @@
 
 [workflow]
 name = "respond-to-worker"
-version = "1"
+version = "2"
 stages = ["00-precondition-check", "40-apply-and-acknowledge"]

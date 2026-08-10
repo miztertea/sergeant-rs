@@ -30,43 +30,62 @@ a new conflict, never silently resolve by a single pass.
 
 ## 1. Per-partition unit counts
 
+*Round-1 adjudication added/split units: totals below are post-adjudication
+(979), not the 966 `synthesis.md` was built against. P1 (+6, the AGENTS.md
+routing table), P5 (+4, `dispatch`'s remaining worker-contract items), P6
+(+1, split off `BU-P6-129`), and P8 (+2, split from retired `BU-P8-077`)
+changed; see `adjudication-round1.md` A10/A12 and `provenance-map.md`'s
+matching coverage-summary note.*
+
 | Partition | Units | Source scope (`source-inventory.md`) |
 |---|---|---|
-| P1 | 131 | Root (`AGENTS.md`, `README.md`) — coordinator/executor invariants, direct-mode/dispatch/no-mistakes AGENTS.md-level rules |
+| P1 | 137 | Root (`AGENTS.md`, `README.md`) — coordinator/executor invariants, direct-mode/dispatch/no-mistakes AGENTS.md-level rules |
 | P2 | 127 | `.agents/skills/` dev-skills-a — `code-review`, `diagnosing-bugs`, `implement`, `no-mistakes` (reference), `tdd` |
 | P3 | 96 | `.agents/skills/` dev-skills-b — `grilling`, `grill-with-docs`, `prototype`, `research`, `resolving-merge-conflicts`, `triage` |
 | P4 | 100 | `.agents/skills/` design-skills — `deepen-module`, domain-modeling, `to-spec`, `to-tickets`, `wayfinder` |
-| P5 | 149 | `.agents/skills/sergeant-setup/` + `skills/` ops-skills — `sergeant-setup`, `load-project`, `cross-repo-work`, `dispatch` (skill text), `sergeant-help`, `wiki` |
-| P6 | 142 | `bin/` (shared libs + commands), `mise.toml`, `opencode.json` — drain, wake, dispatch/respond/recover machinery, DAG hooks, callback plumbing |
+| P5 | 153 | `.agents/skills/sergeant-setup/` + `skills/` ops-skills — `sergeant-setup`, `load-project`, `cross-repo-work`, `dispatch` (skill text), `sergeant-help`, `wiki` |
+| P6 | 143 | `bin/` (shared libs + commands), `mise.toml`, `opencode.json` — drain, wake, dispatch/respond/recover machinery, DAG hooks, callback plumbing |
 | P7 | 112 | `tests/` — response/lease/notification lifecycle, dispatch/drain/recovery/cleanup, worker/pane lifecycle, validate/no-mistakes launch |
-| P8 | 109 | `docs/` root-level (`callbacks.md`, `troubleshooting.md`, `using-sergeant.md`, schema docs) — operator-facing behavior and durability contracts |
-| **Total** | **966** | 139 `decompose`-dispositioned files of 179 total (see `provenance-map.md`) |
+| P8 | 111 | `docs/` root-level (`callbacks.md`, `troubleshooting.md`, `using-sergeant.md`, schema docs) — operator-facing behavior and durability contracts |
+| **Total** | **979** | 139 `decompose`-dispositioned files of 179 total (see `provenance-map.md`) |
 
-No duplicate ids across partitions (verified at `synthesis.md`'s input step).
+No duplicate ids across partitions (verified at `synthesis.md`'s input step,
+when the corpus stood at 966; not re-verified against the 13 round-1 ids,
+though none collides by construction — new ids continue each partition's
+existing numeric range).
 
 ## 2. Confidence distribution
 
-**Corpus-wide:** `high` 921 · `medium` 43 · `low` 2.
+*Round-1 adjudication added/split units: figures below are re-derived by
+script against the current `behavior-units/*.ndjson` (979 units), not the
+966-unit distribution originally recorded here. Beyond the thirteen new
+units' own confidence (all `high`), several existing units'
+confidence changed independent of the count — most visibly `BU-P6-129` and
+`BU-P8-077`, both demoted `high` → `low` per A10/A12's narrowing rulings —
+so partitions whose *unit count* didn't move (P7) still show a changed
+distribution.*
+
+**Corpus-wide:** `high` 929 · `medium` 42 · `low` 8.
 
 | Partition | high | medium | low |
 |---|---|---|---|
-| P1 | 128 | 3 | 0 |
+| P1 | 134 | 3 | 0 |
 | P2 | 119 | 8 | 0 |
 | P3 | 95 | 1 | 0 |
 | P4 | 99 | 1 | 0 |
-| P5 | 146 | 3 | 0 |
-| P6 | 138 | 4 | 0 |
-| P7 | 104 | 8 | 0 |
-| P8 | 92 | 15 | 2 |
-| **Total** | **921** | **43** | **2** |
+| P5 | 150 | 3 | 0 |
+| P6 | 138 | 4 | 1 |
+| P7 | 103 | 8 | 1 |
+| P8 | 91 | 14 | 6 |
+| **Total** | **929** | **42** | **8** |
 
-P8 (root-level `docs/`) carries both `low`-confidence units and the largest
-`medium` share (15 of 43) — consistent with `docs/` prose requiring more
-inference from stated behavior to normalized statement than a test file's
-literal assertions or a skill's imperative instructions. This is a
-distribution finding, not a defect: `confidence` records how directly the
-source supports the statement, and documentation is structurally the most
-interpretive source class in the corpus.
+P8 (root-level `docs/`) carries both the largest `low`-confidence share (6
+of 8) and the largest `medium` share (14 of 42) — consistent with `docs/`
+prose requiring more inference from stated behavior to normalized statement
+than a test file's literal assertions or a skill's imperative instructions.
+This is a distribution finding, not a defect: `confidence` records how
+directly the source supports the statement, and documentation is
+structurally the most interpretive source class in the corpus.
 
 **Representation × confidence is not cross-tabulated here** — every
 `engine-gap` claim's confidence is recorded per-claim inside
@@ -444,9 +463,21 @@ entry of `helper-map.md`.
 
 ## 4. Low-confidence units
 
-Two units corpus-wide are `confidence: low`. Both belong to P8; both are
-listed here in full per the N1 gate's requirement to surface, not silently
-absorb, weak extractions.
+*Round-1 adjudication added/split units: eight units corpus-wide are now
+`confidence: low` — not the two this section originally recorded. The two
+original (`BU-P8-028`, `BU-P8-102`) are unchanged and still listed in full
+below; six more were demoted since, independent of the A10/A12 unit-count
+growth: `BU-P6-129` and `BU-P8-077` by A10/A12's own narrowing rulings
+(§2's note above), and `BU-P7-087`/`BU-P8-009`/`BU-P8-056`/`BU-P8-057` at
+N1 verifier round 2's finding V8 (citation-span disputes, honesty-over-
+laundering per A2's ruling — an unreproducible citation is recorded, not
+hidden). The six are listed compactly, not in full per-unit form, as a
+residual for a future pass to expand; see each id's own record in
+`behavior-units/*.ndjson` for the complete note.*
+
+Two of the eight units — the original pair this section was built
+around — belong to P8 and are listed here in full per the N1 gate's
+requirement to surface, not silently absorb, weak extractions.
 
 ### BU-P8-028
 - **Source:** `reference/sergeant-upstream/docs/callbacks.md` L186-196
@@ -484,6 +515,23 @@ absorb, weak extractions.
   underlying confidence gap; this ledger entry and X5's entry should be read
   together.
 
+### The other six (compact form)
+
+| Id | Source | Representation | Why low |
+|---|---|---|---|
+| `BU-P6-129` | `bin/sgt-validate` L2 | `workflow` | Demoted at A10: its single 83-char header-comment quote supported only the coarse workflow-boundary claim, not the four sub-requirements the statement originally asserted; those now rest on stronger sibling citations (`BU-P6-130`, `BU-P6-131`, `BU-P6-133`, `BU-P6-143`). |
+| `BU-P8-077` | `docs/using-sergeant.md` L231-243 | `stage` | Retired at A12: split into `BU-P8-110`/`BU-P8-111`; its own record now admits it is a superseded split, so it is no longer citable as an operative high-confidence unit — retained only for id stability. |
+| `BU-P7-087` | `tests/sgt-graphify-test.sh` line 17 | `helper` | DISPUTED at N1 verifier round 2 finding V8: the cited line is a real, hash-verified quote but an unrelated test-fixture variable declaration; the actual supporting evidence (the F2 symlink-alias fixture comment and lines) sits at L26-28, not the cited locator. |
+| `BU-P8-009` | `docs/callbacks.md` L15 | `agents-invariant` | DISPUTED at N1 verifier round 2 finding V8: the cited span is only the tail fragment of its sentence; the subject and negation ("Sergeant never accepts an") sit on the preceding line (L14), excluded from the quoted span. |
+| `BU-P8-056` | `docs/using-sergeant.md` L23 | `stage-context` | DISPUTED at N1 verifier round 2 finding V8: the cited span is real but is step 3 of the Direct-mode list, not step 2 as the locator claims; the actual step-2 text is one line up, at L22. |
+| `BU-P8-057` | `docs/using-sergeant.md` L24 | `agents-invariant` | DISPUTED at N1 verifier round 2 finding V8: the cited span is real but is step 4 of the Direct-mode list, not step 3 as the locator claims; the actual step-3 text is one line up, at L23. The underlying claim is still true and independently corroborated by `tests/instruction-policy-test.sh`, but this record's own citation does not carry it. |
+
+All four `DISPUTED` entries above are recorded per A2's ruling (see the
+Lesson candidate in `adjudication-round1.md`): an unreproducible or
+mis-anchored citation is a fact the corpus records, not one it hides or
+silently re-anchors. See each id's full record in `behavior-units/*.ndjson`
+for the complete note.
+
 ## 5. Synthesis-unassigned units
 
 Three units have no home in any of `synthesis.md`'s five representation
@@ -519,7 +567,7 @@ so all remain **OPEN** for this milestone's gate.
 | 3 | G6 and G7 (`engine-pressure.md`) are the soft rulings. G6 survives on a single §6.5 helper-test failure; G7 was rejected on a reading of §6.7 a reviewer may consider too strict. | `engine-pressure.md` G6, G7 | OPEN |
 | 4 | The G9 rejection re-homes four claims into an existing invariant — a reviewer may reasonably read this as the synthesis grading its own architecture favorably. | `engine-pressure.md` G9 | **PARTIALLY ADDRESSED** (adjudication-round1.md A13): the BU-P7-079 quarter of G9's rejection was found circular with X1 and has been re-derived on independent architectural evidence (`src/runtime/surface.rs`, `src/runtime/fsutil.rs`), not on the synthesis's own citation preference — see `engine-pressure.md` G9. The BU-P7-043/049/051 quarters were not entangled with X1 and are unchanged; whether *their* invariant-absorption readings are self-grading remains OPEN for Verify. |
 | 5 | X4, X5, X6, and X8 are classification conflicts this ledger (via `synthesis.md`) resolved by ruling; each is a candidate for reversal on evidence. | §3 above | **PARTIALLY ADDRESSED**: X8 was reversed on evidence at adjudication-round1.md A13 (see §3) — exactly the kind of reversal this row anticipated. X4, X5, X6 were reviewed and adopted as proposed at A14 (no reviewer objection), now ADJUDICATED rather than PROPOSED, but not re-argued from new evidence; a future reviewer may still challenge them per the closing rule below. |
-| 6 | U1's answer (966 units from 179 files, well above the 150–400 scoping estimate) is concentrated in P6/P7/P8 (`bin/`, `tests/`, `docs/`), where a single script or test file routinely yielded 8–15 units — whether that granularity is correct, or whether P6/P7/P8 over-extracted at the sentence level while P2/P3/P4 extracted at the paragraph level, is itself an open finding N2's precision measurement will need to control for. | Corpus-wide (§1 above) | OPEN |
+| 6 | U1's answer (966 units from 179 files, well above the 150–400 scoping estimate; round-1 adjudication added/split units since — now 979, see §1) is concentrated in P6/P7/P8 (`bin/`, `tests/`, `docs/`), where a single script or test file routinely yielded 8–15 units — whether that granularity is correct, or whether P6/P7/P8 over-extracted at the sentence level while P2/P3/P4 extracted at the paragraph level, is itself an open finding N2's precision measurement will need to control for. | Corpus-wide (§1 above) | OPEN |
 
 **How to close an OPEN item:** per the N1 contract's binding rules, a
 reviewer challenging any row above must cite the specific units/sections in
@@ -542,7 +590,7 @@ does not erase disagreement, it records a position with its evidence.
 | Ruling | Findings covered | Disposition | Where it lands |
 |---|---|---|---|
 | A1 | lint defect 1 / BH-03 context | `record-shapes.md` §4's representation vocabulary amended to the corpus's actual enum (fixed directly by the orchestrator, not this fixer). | `docs/icm/record-shapes.md` §4 |
-| A2 | R3-01, R3-02, BH-11 | `record-shapes.md` §3 gains the quote-hash preimage convention and a required `quote` field; corpus-wide `quote`/`quote_hash` re-derivation across all 966 units is a separate fixer task, not this one. | `docs/icm/record-shapes.md` §3; `behavior-units/*.ndjson` (not touched by this pass) |
+| A2 | R3-01, R3-02, BH-11 | `record-shapes.md` §3 gains the quote-hash preimage convention and a required `quote` field; corpus-wide `quote`/`quote_hash` re-derivation across all 966 units (979 as of round-1 adjudication's A10/A12 additions/splits) is a separate fixer task, not this one. | `docs/icm/record-shapes.md` §3; `behavior-units/*.ndjson` (not touched by this pass) |
 | A3–A8 | BH-01, BH-02, BH-04, BH-06, BH-07, BH-10 | Draft-workflow structural fixes (dispatch ordering, stage demotion, validate-and-ship restoration, package merges). Out of scope for the two files this pass owns. | `draft-workflows/` |
 | A9–A12 | BH-03/R3-05, BH-08, BH-09, R3-08/R3-09 | Unit-record backfills (rationale, alternatives, normalization, missing coverage). Out of scope for this pass. | `behavior-units/*.ndjson` |
 | **A13** | **BH-05, R3-04, R3-03** | **Implemented this pass.** X1 overturned (test-backed BU-P7-079 wins over doc-backed BU-P8-108, per §5's tests-outrank-docs rule; the circular G9 citation severed). X8 overturned (BU-P4-053's "representable today" reading stands for BU-P5-025 too). G5 rejected on re-derivation against the shipped engine (`src/domain/work.rs`, `src/api.rs`), moved from Surviving to Rejected. G9's BU-P7-079 quarter re-derived on independent architectural evidence (`src/runtime/surface.rs`, `src/runtime/fsutil.rs`), landing again at rejected but on non-circular grounds. | `classification-ledger.md` §3 X1, X8; `engine-pressure.md` G5, G9 |
@@ -574,10 +622,16 @@ still carries:
   self-grading concern is unresolved, and X4/X5/X6 were adopted without new
   evidence, not re-argued.
 - A2's corpus-wide `quote`/`quote_hash` re-derivation across all 966 units
+  (979 as of round-1 adjudication's A10/A12 additions/splits; see §1)
   (A9–A12's rationale/alternatives/normalization/coverage backfills, and
   A3–A8's draft-workflow structural fixes) are separate, larger fixer tasks
   this pass did not touch — this pass's ownership is scoped to
-  `classification-ledger.md` and `engine-pressure.md` only.
+  `classification-ledger.md` and `engine-pressure.md` only. (A9–A12 have
+  since been implemented by a later pass, per the notes on `BU-P1-132`…
+  `BU-P1-137`, `BU-P5-150`…`BU-P5-153`, `BU-P6-143`, and `BU-P8-110`/
+  `BU-P8-111` in `behavior-units/*.ndjson`; this residual bullet is left
+  otherwise unchanged as the historical record of what this specific pass's
+  scope was.)
 - A15's `lint.py` addition and `FROZEN.md` freeze action have not run; this
   document's own consistency (e.g. the corrected X1/X8/X3 entries, the
   revised G5/G9 entries) has not yet been machine-checked against a lint

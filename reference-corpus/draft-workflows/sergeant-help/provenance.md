@@ -2,6 +2,14 @@
 
 Maps every stage (and every workflow-level citation) to the behavior units that justify it, per `docs/gauntlet/contracts/N1.md` and `docs/icm/record-shapes.md` §3. Source snapshot: `reference/sergeant-upstream` at the SHA recorded in `reference/UPSTREAM.md`. Synthesis basis: `reference-corpus/synthesis.md` §1, candidate **W4** `sergeant-help`.
 
+## Workflow-level citations
+
+| Unit | Statement | Source |
+|---|---|---|
+| `BU-P1-136` | When the user asks how to install, configure, use, or troubleshoot Sergeant in a read-only capacity, load the sergeant-help procedure, which owns documentation lookup, command verification, prerequisites, and help responses. | `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L117, Procedural skills table row) |
+
+Routed here at N1 verifier round 2 (finding V3): `BU-P1-136` is AGENTS.md's own Procedural-skills-table row for this workflow, corroborating `BU-P5-114`'s trigger (cited at `20-answer-or-hand-off`, below) from a second, independent source document.
+
 ## Stages
 
 ### `00-classify-and-locate`
