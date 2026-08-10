@@ -44,6 +44,42 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### N3 — 2026-08-10/11, executor-aware stages + two-phase boundary + GP-2 ask
+
+**Mission outcome: contract met; shipping gate passed; closes #14 (B3's
+trigger fired and B3 is closed), #20, #42.** Two-phase external-effect
+boundary (reserve under lock / effect outside / verified settle) across
+START, SEND, and OBSERVE; §15 prepare/launch with join-returning
+stop/interrupt; Claude start-window closed; tagged stage definitions with
+content identity, backward-compatible; per-stage actor selection with
+whole-workflow preflight (§22.4's matrix); GP-2's actor-initiated ask,
+measured on 2.1.226, surviving restart in both directions; §22.5 injection
+matrix bound to engine-written prefixes; §22.6 instruments that can fail.
+**A-N3-1**: burst-50 budget amended to ≥24 works/s — the +2 events/work
+are §22.5-pinned crash windows, not fat; group commit filed as #44 with
+the hard pre-N4 trigger. Gate 276/0, demo green, no leaks. Residuals
+recorded honestly: instruments blind to per-hold regressions <~200 ms
+(perf addendum); the Deferred-Drop backstop leaves a shutdown-race window
+(gate finding, info); git-serialization pin catches 22/23 single runs —
+L7's repeated-run corollary applies.
+
+**Environmental behavior.** One resumed workflow carried the whole loop
+(build→critics→refuters→fixer) + a lean round-2 probe + the pipeline gate:
+B1 Sonnet, B2 Opus (which surfaced the budget breach itself and refused
+the crash-window-deleting fix — upheld), two Opus critics (18 findings,
+18/18 confirmed by refuters — including build-phase errors: Outcome 3
+parsed-but-unrouted; SEND under the lock), Opus fixer (12 commits, 19
+pins), round-2 critic (7 findings, all mutation-demonstrated: the
+unpinned no-substitution fallback, SEND's unpinned §14.5, OBSERVE
+invisible to both instruments, a throughput guard measuring a 230×
+lighter path), round-2 fixer (8 commits — incl. the fsync *accounting*
+instrument where timing was measured inadequate). Pipeline gate found the
+deferred-completion leak on commit failure and, on review, its own fix's
+missing regression test (L7 enforced on the gate itself). Three-for-three:
+every round-2/gate pass found something real the prior pass missed.
+
+---
+
 ### N2 — 2026-08-10, actor-only repo-to-icm: built, run, blind-measured
 
 **Mission outcome: contract met — the workflow exists, ran through the real
