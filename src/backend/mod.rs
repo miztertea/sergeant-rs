@@ -361,8 +361,8 @@ impl Deferred {
     }
 
     /// Absorb another bag (an inner engine step's).
-    pub fn absorb(&mut self, other: Deferred) {
-        self.completions.extend(other.completions);
+    pub fn absorb(&mut self, mut other: Deferred) {
+        self.completions.extend(std::mem::take(&mut other.completions));
     }
 
     /// Whether anything is outstanding.
@@ -381,10 +381,31 @@ impl Deferred {
     }
 
     /// Wait for every completion, in the order they were collected.
-    pub fn wait(self) {
-        for completion in self.completions {
+    pub fn wait(mut self) {
+        for completion in std::mem::take(&mut self.completions) {
             completion.wait();
         }
+    }
+}
+
+/// A bag dropped with completions still outstanding — an early return via
+/// `?` between a push and the eventual `.wait()`, not a caller that forgot
+/// to drain it (the `#[must_use]` catches that case at compile time). The
+/// tail work still has to run somewhere, and the core lock this always
+/// drops under (§22.6) forbids blocking here, so it is handed to a detached
+/// thread rather than silently discarded — the same failure issue #14/B3
+/// closed, reintroduced at an internal error-propagation boundary.
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        let completions = std::mem::take(&mut self.completions);
+        if completions.is_empty() {
+            return;
+        }
+        std::thread::spawn(move || {
+            for completion in completions {
+                completion.wait();
+            }
+        });
     }
 }
 
