@@ -61,7 +61,19 @@ before naming anything.
    a `.sergeant/common/contexts/` or `.sergeant/common/scripts/` entry with
    that name already exists, say so and note whether this candidate's
    contract actually matches it (a same-name mismatch is worth flagging,
-   not silently assumed to be the same thing).
+   not silently assumed to be the same thing). Group by *contract* — what
+   the helper does, for whom — not by originating file. **Once grouped,
+   check for the over-promotion tell** (`../_config/icm-ladder.md` §6.6):
+   if a group's membership maps one-to-one onto a single source file's own
+   `helper`/`shared-helper` units — this file's group is exactly this
+   file's units, every other covered file gets its own separate group the
+   same way — record that plainly as a note on the bucket, naming which
+   files mirror this way. That is file-shape mirroring, not behavior-shape
+   clustering, and it is evidence for `80-adversarial-review` to
+   re-examine `40-classify`'s §6.3 answers for those units, not something
+   to quietly reshape into a tidier-looking cluster here (this stage
+   reports what the classification records actually said, per "What must
+   not happen" below — it does not re-classify to make the tell disappear).
 6. **Obsolete-mechanism findings** (`representation: obsolete-mechanism`
    records). Name the mechanism, the settled fact that already replaces it
    (carried from the behavior unit's `notes`, per the ladder's own

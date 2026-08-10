@@ -10,7 +10,9 @@
 | ../_config/run-discipline.md | L3 | the blindness rule and the `# AMBIGUOUS — NOT RESOLVED` propagation rule |
 | ../00-contract/output/contract.md | L4 | upstream — run identity (subject repo + revision) for the measurement package |
 | ../10-inventory/output/inventory.md | L4 | upstream — source-coverage stats, and any recorded unreached paths (meta-level grammar pressure) |
-| ../20-harvest/output/behavior-units.ndjson | L4 | upstream — extraction-coverage stats, including any recorded unreached partitions (meta-level grammar pressure) |
+| ../20-harvest/output/behavior-units.ndjson | L4 | upstream — extraction-coverage stats |
+| ../20-harvest/output/partition-ledger.md | L4 | upstream — whether every partition reached `done`; any `pending` row is meta-level grammar pressure (this run needed more than one `20-harvest` attempt and was not, or not yet, retried) |
+| ../20-harvest/output/consequence-class-sweep.md | L4 | upstream — whether the five-class sweep actually covers every `decompose` file with no blank cells; a gap here is itself worth naming in the measurement package, not just a `40-classify` concern |
 | ../30-normalize/output/behavior-units.normalized.ndjson | L4 | upstream — normalization outcome stats |
 | ../40-classify/output/classifications.ndjson | L4 | upstream — representation-mix stats and the classification records this stage's adjudication may amend |
 | ../50-synthesize/output/candidates.md | L4 | upstream — candidate-yield stats |
@@ -83,15 +85,15 @@ not `90-reconcile/` itself (`docs/gauntlet/notes/n2-fake-backend-semantics.md`).
    have been more convenient."
 4. Only after 1–3 are complete and written to their output files, close the
    run in this exact order — `finalize.py`'s `git rm` fails on a file that
-   was never `git add`ed, and its `git commit` takes no pathspec (it
-   commits whatever is currently staged), so staging deliberately and in
-   the right order is what makes the closing commit both complete and free
-   of anything unrelated:
+   was never `git add`ed, and its own closing `git commit` takes no
+   pathspec (it commits whatever is currently staged), so staging
+   deliberately and in the right order is what makes the closing commit(s)
+   both complete and free of anything unrelated:
    1. `git add` every stage's populated `output/` directory under this
       workflow's own tree (from the repository root:
       `git add .sergeant/workflows/repo-to-icm/*/output/`). If anything
       *else* happens to be staged in this worktree right now, unstage it
-      first (`git restore --staged <path>`) — the closing commit should
+      first (`git restore --staged <path>`) — the closing commit(s) should
       contain only this run's own artifacts, not an unrelated staged
       change riding along.
    2. Preview the disposition plan: `python3
@@ -100,17 +102,25 @@ not `90-reconcile/` itself (`docs/gauntlet/notes/n2-fake-backend-semantics.md`).
       `output/measurement-package.md`, under a `## Finalize` heading.
    3. `git add` `output/measurement-package.md` again now that it carries
       the preview — this is what gets the finalize record itself inside
-      the same closing commit finalize.py is about to make, instead of a
-      dirty file left over after it.
+      finalize.py's own commit(s), instead of a dirty file left over after
+      it.
    4. Run `python3 .sergeant/workflows/repo-to-icm/scripts/finalize.py`
-      (no `--dry-run`, no other argument) for real. Its single `git commit`
-      (no pathspec) now captures everything staged in steps 1 and 3 plus
-      its own `git rm` of evidence-class/undeclared files, in one commit —
-      the "final commit" this run's own D9 disposition policy promises.
-      This is a helper: review its result, do not assume the engine
-      interpreted it for you (`docs/icm/convention.md` §5). If it exits
-      `REFUSED` (ambiguous disposition), that is a real defect to record,
-      not to route around by hand-editing files it should have finalized.
+      (no `--dry-run`, no other argument) for real. **This now produces two
+      commits, not one, on an ordinary run** (evidence-preservation guard,
+      GP-5b): first a *capture* commit of everything staged in steps 1 and
+      3 (making every evidence-class/undeclared file reachable in history
+      before anything is removed), then the *removal* commit (its own
+      `git rm` of evidence-class/undeclared files) — the "final commit"
+      this run's own D9 disposition policy promises is now the second of
+      the two, and both are finalize.py's own doing in this one invocation,
+      not a separate step you run. This is a helper: review its result, do
+      not assume the engine interpreted it for you
+      (`docs/icm/convention.md` §5). If it exits `REFUSED` — either an
+      ambiguous disposition, or a file slated for removal that turned out
+      to be neither staged nor committed at all (the literal GP-5b shape:
+      something under `output/` that step 1's `git add` genuinely never
+      reached) — that is a real defect to record, not to route around by
+      hand-editing or hand-committing files it should have finalized.
 
 ## Output
 

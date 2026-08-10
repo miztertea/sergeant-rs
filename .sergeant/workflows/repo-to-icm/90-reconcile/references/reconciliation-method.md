@@ -52,7 +52,12 @@ gap, not a shortcut:
 INTERNALLY COMPUTABLE (report a real value for each, from the stage named):
 
 source coverage           file counts by disposition, partition count
-                           (../10-inventory/output/inventory.md)
+                           (../10-inventory/output/inventory.md); whether
+                           every partition reached `done`
+                           (../20-harvest/output/partition-ledger.md) and
+                           whether the consequence-class sweep covers every
+                           `decompose` file with no blank cells
+                           (../20-harvest/output/consequence-class-sweep.md)
 behavioral precision       of the citations THIS RUN itself sampled and
                            reverified: fraction of ../80-adversarial-review's
                            Axis 2 citation-reverification sample that

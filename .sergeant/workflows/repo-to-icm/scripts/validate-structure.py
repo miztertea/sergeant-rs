@@ -68,12 +68,20 @@ CHECKS (§9.7, "The initial validator ... should check")
   S14 (admitted mode only) this package's name is listed in the root
       catalog, `.sergeant/index.md` (convention.md §1 rule 1 /
       record-shapes.md §1 rule 2)
+  S15 (admitted mode only) `scripts/finalize.py`'s evidence-preservation
+      guard (GP-5b) actually holds: `scripts/test-finalize-evidence-guard.py`
+      is run against a disposable git sandbox and must exit 0. Only
+      meaningful for this workflow's own tree, since drafts never carry a
+      `finalize.py` of their own.
 
-Exit 0 iff clean. Stdlib only.
+Exit 0 iff clean. Stdlib only, except S15, which shells out to `git` inside
+a temp directory (never this checkout) via
+`scripts/test-finalize-evidence-guard.py`.
 """
 
 import os
 import re
+import subprocess
 import sys
 import tomllib
 
@@ -484,6 +492,33 @@ def check_root_catalog(lint, pkg_name, repo_root, mode):
         lint.fail("S14", f"{pkg_name}: not listed in .sergeant/index.md (root catalog)")
 
 
+def check_finalize_evidence_guard(lint, pkg_dir, pkg_name, mode):
+    """S15 (admitted mode only): `scripts/finalize.py`'s evidence-
+    preservation guard (GP-5b) is proven, not assumed — run
+    `scripts/test-finalize-evidence-guard.py` (a disposable git-sandbox
+    test, touches nothing under `pkg_dir`) and fail lint if it does not
+    exit 0. Skipped for draft candidates: a generated package never carries
+    its own `finalize.py`, so there is nothing this check could exercise."""
+    if mode != "admitted":
+        return
+    test_script = os.path.join(pkg_dir, "scripts", "test-finalize-evidence-guard.py")
+    if not os.path.isfile(test_script):
+        lint.fail("S15", f"{pkg_name}: scripts/test-finalize-evidence-guard.py not found — the evidence-preservation guard (GP-5b) is unverified")
+        return
+    try:
+        r = subprocess.run(
+            [sys.executable, test_script],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        lint.fail("S15", f"{pkg_name}: could not run scripts/test-finalize-evidence-guard.py: {e}")
+        return
+    if r.returncode != 0:
+        detail = (r.stdout + r.stderr).strip().splitlines()
+        tail = " | ".join(detail[-3:]) if detail else "(no output)"
+        lint.fail("S15", f"{pkg_name}: scripts/test-finalize-evidence-guard.py failed (exit {r.returncode}): {tail}")
+
+
 def check_engine_gap_records(lint, pkg_dir, pkg_name):
     required = {
         "behavior", "source_evidence", "lower_rungs_attempted",
@@ -598,6 +633,7 @@ def validate(pkg_dir, mode, repo_root, lint):
 
     check_at_references(lint, pkg_dir, pkg_name, repo_root)
     check_root_catalog(lint, pkg_name, repo_root, mode)
+    check_finalize_evidence_guard(lint, pkg_dir, pkg_name, mode)
     n_gap = check_engine_gap_records(lint, pkg_dir, pkg_name)
     check_unclassified_executables(lint, pkg_dir, pkg_name)
     return n_gap

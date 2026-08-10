@@ -43,6 +43,45 @@ implementation actor reaches for before declaring implementation complete,
 it is a helper (§6.5 below), not a stage — a script does not become a
 stage merely because it is executable.
 
+**The question must actually be answered, not skipped past.** N2
+adjudicated exactly this failure at scale
+(`docs/gauntlet/runs/n2-run2/comparison-c2-boundaries.md` §4.2): 73% of one
+run's corpus was classified `helper`/`shared-helper` with a rationale that
+answered §6.5's question ("is this deterministic machinery subordinate to
+some checkpoint?") *without ever recording an answer to §6.3's own
+question* for the same behavior — the reference corpus, applying the
+identical documented test to the identical sentence in the identical file,
+answered §6.3 "yes, operators would want this measured" every time. **A
+unit may not be classified `helper`, `shared-helper`, or `shared-context`
+without its `rationale` first stating the §6.3 answer explicitly — including
+when that answer is "no."** "This is deterministic machinery" is not itself
+a §6.3 answer; it is where you land *after* answering §6.3 "no, replacing
+the implementation would not remove a checkpoint anyone cared about" and
+continuing down the ladder. A rationale that jumps straight to §6.5's
+language without that sentence has not cleared §6.3 — it has skipped it.
+`40-classify/CONTEXT.md` states this as a required step, the same way this
+run's own reference (`reference-corpus/`) required it in its own A4
+adjudication (`docs/gauntlet/runs/n2-run2/comparison-c2-boundaries.md` §3):
+a checkpoint question is answered *before* a lower-rung classification is
+legal, not assumed by arriving there.
+
+**The over-promotion tell, downstream.** `50-synthesize` clusters
+`helper`/`shared-helper` records by contract (what a helper does, for whom
+— `references/synthesis-method.md` bucket 5), not by originating file. If,
+once clustered, a bucket-5 group's membership maps one-to-one onto a single
+source file's own extracted units — this file's helper group is exactly
+this file's units, no more, no fewer, and every other covered file gets its
+own separate group the same way — that is not behavior-shape clustering, it
+is file-shape mirroring, and it is the visible symptom of the same
+rung-ordering error one stage upstream: §6.5 was answered before §6.3 was.
+A behavior correctly classified `helper` because of what it *does* should
+cluster with other helpers doing the same thing regardless of which file
+happened to contain them; a corpus where helper clusters instead reproduce
+the inventory's own file list one-for-one is the tell that §6.3 was never
+actually asked (`docs/gauntlet/runs/n2-run2/comparison-c2-boundaries.md`
+§4.2's own worked examples: `sgt-recover`, `sgt-respond`, `sgt-watch`,
+`sgt-drain*` each became its own single-file helper cluster this way).
+
 ## 6.4 — Does the checkpoint require judgment?
 
 Does an actor need to inspect evidence, choose among alternatives, ask the

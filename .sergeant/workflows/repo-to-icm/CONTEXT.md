@@ -48,8 +48,9 @@ worktree.
                    output paths, success criteria
 10-inventory     → output/: deterministic source inventory (decompose /
                    helper-evidence / obsolete-candidate / reference-only)
-20-harvest       → output/: source-cited behavior units (NDJSON), no ICM
-                   form assigned yet
+20-harvest       → output/: source-cited behavior units (NDJSON, no ICM
+                   form assigned yet), a per-partition checkpoint ledger,
+                   and a consequence-class sweep record
 30-normalize     → output/: the same units rewritten independent of old
                    filenames and mechanisms
 40-classify      → output/: one classification record per behavior unit,
@@ -110,12 +111,73 @@ runs, not this one.
   `90-reconcile` at the close of a run. It is deterministic machinery
   (`docs/icm/convention.md` §5): it reads dispositions, it does not decide
   whether an artifact should exist — that judgment belongs to the stage
-  that wrote it.
+  that wrote it. Before removing anything it now verifies every file it is
+  about to remove is already reachable in a committed tree, and refuses
+  outright (fail-closed, nothing modified) rather than deleting a file that
+  was never actually committed — see the module docstring and
+  `docs/gauntlet/runs/n2-run2/grammar-pressure-report.md` GP-5b.
+- `scripts/test-finalize-evidence-guard.py` — a standalone sandbox test
+  proving `finalize.py`'s evidence-preservation guard holds in both
+  directions (refuses on an uncommitted file, proceeds on a committed one).
+  Not invoked by any stage; run by a human or CI directly, and by
+  `validate-structure.py`'s `[S15]` check against this workflow's own tree.
 
-Both are helpers subordinate to their invoking stage's judgment
+All three are helpers subordinate to their invoking stage's judgment
 (`docs/icm/convention.md` §5) — their exit status and structured output are
 something the actor reviews and acts on, not something the engine
-interprets on its own. A stage invoking either one states the exact
-repository-root-relative invocation and this run's working-directory
+interprets on its own. A stage invoking one of the first two states the
+exact repository-root-relative invocation and this run's working-directory
 convention in its own `CONTEXT.md` (see `70-lint` and `90-reconcile`) — this
 orientation file does not itself hand a stranger an executable command.
+
+## v2: how `20-harvest` handles volume (read before assuming one turn is enough)
+
+N2 run 2 covered 16 of 136 `decompose`-dispositioned files in one `20-harvest`
+turn before its context window closed (`docs/gauntlet/runs/n2-run2/
+grammar-pressure-report.md` GP-1). The adjudicated fix is authoring
+guidance, not an engine change — two shapes were weighed:
+
+- **Rejected: split `20-harvest` into a fixed sequence of numbered
+  partition-slice stages** (e.g. `20a-harvest-p1` … `20e-harvest-p5`, one
+  per `10-inventory` partition, each a genuinely fresh actor turn). This
+  requires committing, at workflow-*authoring* time, to a maximum partition
+  count — but `10-inventory/CONTEXT.md` is explicit that this workflow "is
+  not scoped to any one repository shape," so the partition count a future
+  subject repository's inventory produces is unbounded and unknowable in
+  advance. A repository whose inventory yields more partitions than the
+  provisioned slots reproduces the identical volume-wall failure this fix
+  exists to close, merely relocated to a higher, less visible threshold —
+  and every slot a smaller repository doesn't need is a wasted stage
+  directory, `CONTEXT.md`, Inputs table, and `output/README.md` to author
+  and maintain. It also multiplies engine-visible stage identity for
+  something that fails §6.3's own reimplementation test applied to the
+  *stage boundary itself*: "harvest partition 3" is not a checkpoint
+  operators would care about independently of "harvest partition 1" — it is
+  the same checkpoint kind repeated, homogeneous iteration inside one
+  parent, not distinct procedural structure (the same conclusion
+  grammar-pressure-report.md's §21.8 section reaches: this is iteration, not
+  workflow composition).
+- **Chosen: keep `20-harvest` as the single stage it already is, and give it
+  an explicit per-partition checkpoint-and-retry protocol** (below). This
+  matches a mechanism the engine already ships and that run 2's own journal
+  exercised (by accident, via a different bug) and proved works: a stage
+  that cannot finish within one turn stops cleanly at a partition boundary,
+  writes a durable, `promote`d partition ledger recording exactly which
+  partitions are done and which remain, and is re-entered as a **fresh
+  execution** — fresh actor turn, fresh context window — via `sgt work
+  retry`, picking up from the ledger rather than starting over. This scales
+  to however many partitions a given repository's inventory actually
+  produces, with no author-time upper bound, at the cost of relying on a
+  human (or an orchestrating caller) to notice an incomplete ledger and
+  issue the retry — which is the same shape `00-contract`'s own fail-closed
+  `# AMBIGUOUS — NOT RESOLVED` marker already relies on (a human or caller
+  acting on a durable, explicit signal this workflow writes, not a new
+  engine primitive). It does **not** depend on the actor-initiated
+  mid-turn ask primitive GP-2 confirms is not yet wired to a real harness —
+  the actor never tries to pause *inside* a turn; it simply ends its turn
+  early and honestly, the same way `10-inventory`'s existing "On volume"
+  section already does for a single-turn stage.
+
+`20-harvest/CONTEXT.md` and `20-harvest/references/partition-checkpoint-
+protocol.md` carry the operative version of this protocol; `_config/
+icm-ladder.md` and this file are the record of the choice.

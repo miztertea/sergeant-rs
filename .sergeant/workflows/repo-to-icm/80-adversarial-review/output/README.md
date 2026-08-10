@@ -14,7 +14,8 @@ reviewable in the diff like any other change.
 
 `findings.ndjson` — one finding per line, per `../CONTEXT.md`'s record
 shape, tagged by axis (`boundary-honesty` / `invention` /
-`engine-gap-refutation`) and severity. `review-summary.md` — which candidate
+`engine-gap-refutation` / `structural-self-consistency`) and severity.
+`review-summary.md` — which candidate
 packages and axes were actually applied, plus finding counts.
 
 Both are the raw evidence for the "Review convergence" measurement

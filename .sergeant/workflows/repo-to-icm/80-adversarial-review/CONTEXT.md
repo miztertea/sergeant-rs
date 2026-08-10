@@ -14,6 +14,10 @@
 | ../50-synthesize/output/candidates.md | L4 | upstream — what a materialized package's shape is checked against for Axis 2's hidden-translation check |
 | ../60-draft/output/draft-report.md | L4 | upstream artifact produced by `60-draft` — the manifest naming every materialized candidate package this review challenges |
 | ../70-lint/output/lint-report.md | L4 | upstream artifact produced by `70-lint` — the lint report, so already-fixed mechanical defects are not re-litigated as findings |
+| ../10-inventory/output/inventory.md | L4 | upstream — the file/partition counts Axis 4's self-consistency check recomputes and cross-checks |
+| ../20-harvest/output/behavior-units.ndjson | L4 | upstream — the raw (pre-normalize) corpus; Axis 4 recomputes its own distinct-`source.path` and unit counts rather than trusting any stage's stated headline number |
+| ../20-harvest/output/partition-ledger.md | L4 | upstream — Axis 4 cross-checks this against `inventory.md`'s partition list and `behavior-units.ndjson`'s coverage |
+| ../20-harvest/output/consequence-class-sweep.md | L4 | upstream — Axis 4 checks it names a row for every `decompose` file with no blank cells |
 
 ## You are a fresh execution
 
@@ -40,15 +44,16 @@ you to cross it yourself.
 
 ## Purpose
 
-Apply the three challenge axes in `references/challenge-checklist.md` —
-boundary honesty, invention, engine-gap refutation — to everything this run
-has produced so far. Produce findings; do not fix anything yourself
-(reconciliation and repair are `90-reconcile`'s job).
+Apply the four challenge axes in `references/challenge-checklist.md` —
+boundary honesty, invention, engine-gap refutation, structural
+self-consistency — to everything this run has produced so far. Produce
+findings; do not fix anything yourself (reconciliation and repair are
+`90-reconcile`'s job).
 
 ## What must become true here (durable outcome)
 
 `output/findings.ndjson` exists (possibly empty, if genuinely nothing was
-found — but only after real effort under all three axes) and
+found — but only after real effort under all four axes) and
 `output/review-summary.md` states which candidate packages and which axes
 were actually applied, with finding counts by axis and severity. A finding
 you did not write down did not happen, as far as `90-reconcile` is
@@ -63,7 +68,7 @@ concerned.
    ambiguous" line) — do not silently review artifacts you know rest on an
    unresolved contract as if they were ordinary output.
 
-Work through `references/challenge-checklist.md`'s three axes in order,
+Work through `references/challenge-checklist.md`'s four axes in order,
 against every candidate package `../60-draft` materialized:
 
 1. **Boundary honesty** — publication boundary, layer boundary, blindness
@@ -79,6 +84,17 @@ against every candidate package `../60-draft` materialized:
    every surviving `engine-gap` record; check `why_each_fails` for
    rung-specific reasoning and `observable_acceptance_test` for a checkable
    scenario; disqualify anything reading as "would be convenient."
+4. **Structural self-consistency** — three checks this stage can run
+   entirely blind, no `reference-corpus/` needed: recompute every
+   cross-artifact count rather than trusting a stated headline number;
+   recompute `quote_hash` directly over each sampled record's *stored*
+   `quote` field, not only over a re-located source span; sanity-check the
+   `representation` distribution against the ladder's own shape. N2 run 2's
+   own review pass missed all three while otherwise being genuinely
+   effortful (`docs/gauntlet/runs/n2-run2/comparison-c1-coverage-recall.md`
+   §4.1, `comparison-scorecard.md` D-1/D-6,
+   `grammar-pressure-report.md` GP-6) — see
+   `references/challenge-checklist.md` Axis 4 for the exact method.
 
 Write every finding to `output/findings.ndjson` per this record shape:
 
@@ -86,7 +102,8 @@ Write every finding to `output/findings.ndjson` per this record shape:
 {"id": "AF-0001", "axis": "invention", "target": "<candidate>/provenance.md", "description": "...", "evidence": "...", "severity": "high"}
 ```
 
-`axis` is one of `boundary-honesty`, `invention`, `engine-gap-refutation`.
+`axis` is one of `boundary-honesty`, `invention`, `engine-gap-refutation`,
+`structural-self-consistency`.
 `severity` is `high` (a violation as described in this workflow's governing
 documents), `medium` (a real weakness that does not rise to a documented
 violation), or `low` (worth recording, unlikely to change an outcome). This

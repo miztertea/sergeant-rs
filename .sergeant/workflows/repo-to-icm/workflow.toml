@@ -9,8 +9,21 @@
 # directory listing under this workflow's own tree MUST agree with it
 # lexically (docs/icm/convention.md §1 rule 4) — checked by
 # scripts/validate-structure.py.
+#
+# v2 (this version): responds to the N2 run-2 comparison
+# (docs/gauntlet/runs/n2-run2/comparison-scorecard.md,
+# grammar-pressure-report.md) with content-only changes — still ten stages,
+# same order, same engine. `20-harvest` gains a per-partition
+# checkpoint-and-retry protocol and a mandatory consequence-class sweep
+# (both new `promote`d artifacts, not new stages — see ../CONTEXT.md "v2:
+# how 20-harvest handles volume" for the shape chosen and the one rejected);
+# `40-classify` requires an explicit §6.3 answer before any `helper`/
+# `shared-helper` classification and a self-check for the over-promotion
+# tell; `80-adversarial-review` gains a fourth axis (structural
+# self-consistency); `scripts/finalize.py` gains an evidence-preservation
+# guard (GP-5b / issue #29).
 
 [workflow]
 name = "repo-to-icm"
-version = "1"
+version = "2"
 stages = ["00-contract", "10-inventory", "20-harvest", "30-normalize", "40-classify", "50-synthesize", "60-draft", "70-lint", "80-adversarial-review", "90-reconcile"]

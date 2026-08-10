@@ -1,4 +1,4 @@
-# Adversarial review — the three challenge axes
+# Adversarial review — the four challenge axes
 
 Layer 3 (stable across runs), local to `80-adversarial-review`. You are a
 fresh execution: you have not seen any earlier stage's reasoning, only this
@@ -110,6 +110,107 @@ For every `representation: engine-gap` record surviving through
 - Check every field for "would be convenient" / "could be more elegant" in
   any form — this disqualifies the claim outright per rule 4, regardless of
   how the other fields read.
+
+## Axis 4 — Structural self-consistency (blind, no reference needed)
+
+N2 run 2's own review pass was genuinely effortful under axes 1–3 and still
+missed three cheap, purely self-checkable defects sitting inside its own
+declared scope — one hash-truncation self-consistency defect in 14.8% of
+the corpus, a headline coverage count contradicted by the same document's
+own file list two sentences earlier, and a representation skew (`shared-
+helper` ~9x overrepresented) that a promotion-only over-staging check could
+never see (`docs/gauntlet/runs/n2-run2/comparison-c1-coverage-recall.md`
+§4.1, `comparison-scorecard.md` D-1/D-6, `grammar-pressure-report.md` GP-6).
+None of the three checks below requires opening `reference-corpus/` or
+knowing the "right" answer — they check this run's own artifacts against
+each other and against internal arithmetic.
+
+### 1. Self-consistency of counts
+
+Every count one of this run's own artifacts asserts *about another of this
+run's own artifacts* must be independently recomputed from the artifact
+itself, not copied from whatever stated it. A mismatch is a finding
+regardless of which side turns out to be right — the point is that nothing
+downstream should have to guess which number to trust.
+
+- Recompute the number of distinct `source.path` values in
+  `../20-harvest/output/behavior-units.ndjson` yourself (a plain count over
+  the file, not a number quoted from any other artifact) and compare it
+  against: `../10-inventory/output/inventory.md`'s total `decompose` file
+  count, `../20-harvest/output/partition-ledger.md`'s `done` partition
+  membership, and any headline coverage number stated in
+  `../30-normalize/output/behavior-units.normalized.ndjson`,
+  `../50-synthesize/output/candidates.md`, or `../60-draft/output/
+  draft-report.md`. Every one of these should agree with your own recount;
+  any that doesn't is a finding, naming both the recomputed value and the
+  contradicting stated value and exactly where each was found.
+- Confirm `../20-harvest/output/consequence-class-sweep.md` has exactly one
+  row per `decompose` file named in `../10-inventory/output/inventory.md`,
+  with no blank cells (per `../20-harvest/references/
+  consequence-class-checklist.md`) — a missing row or a blank cell is a
+  finding under this axis, not a silent gap.
+- Confirm `../20-harvest/output/partition-ledger.md` shows every partition
+  `done`, in the same order and under the same names
+  `../10-inventory/output/inventory.md` recorded — a `pending` row this far
+  into the run, or a partition named in one file but not the other, is a
+  finding.
+
+### 2. Hash-vs-stored-quote verification (not just span re-verification)
+
+Axis 2's citation re-verification (re-locating the full span from the
+source file and hashing it) confirms the cited span is *real* — but by
+design it never checks whether the record's own **stored** `quote` field
+still hashes to its own stored `quote_hash`, so it structurally cannot
+catch a record whose `quote` has silently drifted from what its
+`quote_hash` was actually computed over (e.g., truncation applied after the
+hash, or a re-typed span). For the same sample Axis 2 draws for citation
+re-verification, **additionally** recompute `sha256` directly over the
+stored `quote` field's raw bytes (JSON-unescape it first — a literal
+newline byte and the two characters `\`+`n` in the JSON text must hash
+identically, per `../_config/evidence-policy.md`) and compare to the
+record's own stored `quote_hash`. A record can pass span-reopening and
+still fail this — that mismatch is itself a finding, independent of and in
+addition to whatever Axis 2 found for the same record.
+
+### 3. Representation-distribution sanity vs the ladder
+
+Compute the full distribution of `representation` values across
+`../40-classify/output/classifications.ndjson` — counts and percentages,
+computed by you, not copied from `../50-synthesize/output/candidates.md`'s
+own summary (that would just be re-checking count self-consistency, not
+this). Sanity-check the shape against the ladder itself, blind — no
+reference numbers needed for any of these:
+
+- **Skew toward machinery.** If `helper` + `shared-helper` together account
+  for a large majority of the corpus while `stage` + `stage-context`
+  together account for a small minority, that skew is itself a finding
+  requiring you to re-examine a sample of the `helper`/`shared-helper`
+  records for the §6.3-before-§6.5 rung-ordering error
+  (`../_config/icm-ladder.md` §6.3's "the question must actually be
+  answered" note): does each sampled record's `rationale` actually state
+  an explicit §6.3 answer before its §6.5 reasoning, or does it jump
+  straight to "this is deterministic machinery"? The latter, found on
+  re-check, is an `invention`-or-`structural-self-consistency` finding
+  either way — record it under this axis since the trigger was the
+  distribution shape, not an individual citation.
+- **The over-promotion tell.** Group the `helper`/`shared-helper` records
+  by the `source.path` of their originating behavior unit (from
+  `../30-normalize/output/behavior-units.normalized.ndjson`, joined by
+  `behavior_id`). If a group's membership maps one-to-one onto a single
+  source file — this file's helper records, and only this file's, form
+  their own cluster, with every other covered file doing the same — that
+  is file-shape mirroring, not behavior-shape clustering
+  (`../_config/icm-ladder.md` §6.6), and is a finding on its own even
+  before reading any individual `rationale`.
+- **Unused tiers.** If `shared-context`, `obsolete-mechanism`, or
+  `engine-gap` are all zero across a corpus of any real size, that is
+  itself the thing to challenge, not a null result to accept silently —
+  name at least a few candidate units (from any representation) whose
+  underlying behavior comes closest to each unused rung's own question and
+  record, for each, why it does not actually clear that rung. A rung that
+  produced zero records because you tried and it genuinely never fit is a
+  clean result; a rung that produced zero because nothing was ever
+  routed to its question is a finding.
 
 ## Recording findings
 
