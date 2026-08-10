@@ -6,6 +6,21 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L13 — A builder's probe of its own pin is evidence, never verification
+
+S1 phase 1: launched as a single self-probing builder under a stretched
+P1-PERF precedent (the process error ruling R-S0-12 records). The
+owner-ordered lean round 2 then proved empirically why that shortcut is
+never safe: the builder's revert-probe of its own SIGTERM pin passed, and
+the fresh test-honesty critic still found the composition unpinned —
+reverting only `Drop` left every m6 test green, because the pin called
+`stop()` explicitly while the rig's two real users rely on `Drop` alone.
+Bug Sprint 1's parts-vs-composition shape, third recorded instance, this
+time in the instrument underneath the program's published numbers. Rule
+(now R-S0-12): any executable diff takes the full multi-axis loop;
+template exemptions end where a diff begins; a self-probe is input to the
+panel, not a substitute for it.
+
 ## L12 — Authority lives in the artifact: re-read the governing text at decision time
 
 S0/S1, 2026-08-10 (numbered assuming the N-branch's L11 lands first; renumber
