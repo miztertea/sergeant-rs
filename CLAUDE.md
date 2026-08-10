@@ -34,7 +34,7 @@ Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integ
 
 ## Testing rules specific to this repo
 
-- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m6_surfaces.rs` (218 total + 2 opt-in, per GAUNTLET.md's Bug Sprint 1 entry). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
+- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m6_surfaces.rs` (221 total + 2 opt-in as of S1 phase 1 — the instrument pins added three). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
 - A fix without a test that fails when the fix is reverted is not done (LESSONS L7). Every advertised backend capability flag needs a contract test against the installed harness (L8).
 - The Claude adapter's behavior is *measured*, never assumed from docs — exit codes lie, `subtype` lies, model aliases silently substitute (L1). The version gate is pinned in `src/backend/claude.rs`; re-measure on any CLI version bump.
 - After running suites, `pgrep -f "debug/sgt --data-dir"` should find nothing (note: quoting matters — an unquoted pattern matches your own shell).
