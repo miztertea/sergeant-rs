@@ -1,7 +1,10 @@
 # ICM Filesystem Convention
 
-Governing document: `reference/proposal-next-iteration-icm-workflows.md`
-§§6, 7.1–7.2, 7.5–7.6. Milestone: `docs/gauntlet/contracts/N1.md`.
+Governing documents: `reference/proposal-next-iteration-icm-workflows.md`
+§§6, 7.1–7.2, 7.5–7.6, and the published ICM protocol itself (Van Clief &
+McDermott, arXiv 2603.16021 — the four-layer context model in §6 below is
+adopted from it by owner direction 2026-08-10; register row D9). Milestone:
+`docs/gauntlet/contracts/N1.md`.
 
 This document is normative for anyone authoring `.sergeant/` content by hand
 and for any future generator (`repo-to-icm`, N2) producing it. It defines
@@ -33,20 +36,40 @@ classification records, engine-gap claims).
 │   └── <workflow-name>/
 │       ├── workflow.toml
 │       ├── index.md
+│       ├── CONTEXT.md                  # Layer 1: workflow orientation
+│       ├── _config/                    # Layer 3, workflow-shared
+│       │   └── <policy-or-method>.md
 │       ├── scripts/
 │       │   └── <workflow-local helper>
-│       ├── 00-<stage-name>/CONTEXT.md
-│       ├── 10-<stage-name>/CONTEXT.md
+│       ├── 00-<stage-name>/
+│       │   ├── CONTEXT.md              # Layer 2: the stage contract
+│       │   ├── references/             # Layer 3, stage-specific
+│       │   │   └── <method>.md
+│       │   ├── scripts/
+│       │   │   └── <stage-local helper>
+│       │   └── output/                 # Layer 4: per-run artifacts
+│       │       └── README.md           # declares expected artifacts
+│       ├── 10-<stage-name>/
+│       │   └── ...
 │       └── ...
 └── drafts/
     └── workflows/
         └── <candidate-name>/
             ├── index.md
             ├── workflow.toml
+            ├── CONTEXT.md
             ├── provenance.md
+            ├── _config/
             ├── scripts/
-            └── 00-.../CONTEXT.md
+            └── 00-.../
+                └── CONTEXT.md ...
 ```
+
+Only `workflow.toml`, stage ordering, and each stage's `CONTEXT.md` are
+read by the engine today; every other path is authoring convention the
+actor navigates itself (§7.1). `_config/`, `references/`, and `output/`
+directories are OPTIONAL per workflow and per stage — a stage with nothing
+stable to reference and no declared artifact simply omits them.
 
 Rules:
 
@@ -73,6 +96,66 @@ Rules:
    (proposal §9.7 lists this as a structural-validator check).
 5. Every actor stage directory MUST contain a `CONTEXT.md`. A stage
    directory without one is not a stage anyone can run and is a violation.
+
+## 1a. The four context layers (ICM)
+
+Adopted from the published ICM protocol (arXiv 2603.16021), which splits
+context on two axes the flat model conflates: **orientation vs. contract**
+and **stable-across-runs vs. produced-per-run**.
+
+```text
+Layer 1  <workflow>/CONTEXT.md      orientation: what this workflow is for,
+                                    how its stages relate, how an actor
+                                    routes itself — never stage instructions
+Layer 2  <stage>/CONTEXT.md         the stage contract: what must become
+                                    true here, with an Inputs table naming
+                                    exactly which files load at this stage
+Layer 3  references/, _config/,     reference material STABLE ACROSS RUNS:
+         common/contexts/           methods, policies, rubrics; edited only
+                                    to change every future run
+Layer 4  <stage>/output/            working artifacts PRODUCED PER RUN,
+                                    written in the work surface, traveling
+                                    with the Work branch
+```
+
+Rules:
+
+1. **Layer 2 carries an Inputs table.** Every stage `CONTEXT.md` MUST
+   declare which files an actor loads at stage entry (see
+   `record-shapes.md` §1a for the shape). An actor reading files the stage
+   did not declare is exploration (allowed, its judgment); a stage whose
+   *contract* depends on a file its Inputs table omits is a violation —
+   dependency tracking is the interpretability ICM is named for.
+2. **The layer split is lifetime, not distance.** A file belongs in Layer 3
+   iff it does not change between runs of the workflow; it belongs in
+   Layer 4 iff a run produces it. Mixing them — per-run scratch written
+   into `references/`, or a stable rubric parked in `output/` — is a
+   violation: it forces every later reader (actor or human) to re-sort
+   what the filesystem should already have sorted.
+3. **The edit-source principle.** Fixing a defect by editing a Layer 4
+   artifact fixes one run; fixing it by editing the Layer 2/3 source fixes
+   every future run. Actors SHOULD surface source-level defects they meet
+   (a wrong rubric, a stale method) as findings for the workflow's owner
+   rather than silently compensating in output — outputs are edit
+   surfaces, but the source is where permanence lives.
+4. **Layer 4 declares its shape up front.** An `output/` directory in the
+   authored tree contains only a `README.md` (or equivalently `.gitkeep`
+   plus documentation in the stage `CONTEXT.md`) declaring the expected
+   artifacts. Per-run artifacts are written there in the materialized work
+   surface and are Git-tracked on the Work branch — reviewable in the
+   diff like any other change. This is the lower-rung answer to the
+   proposal's deferred artifact declaration (§24.4): declared locations,
+   no engine collection, no artifact manifest machinery.
+5. **Layer 1 is not a super-stage.** The workflow `CONTEXT.md` orients; it
+   MUST NOT contain stage instructions, and no stage may require reading it
+   in place of its own contract. The engine does not deliver Layer 1 —
+   stages that need it name it in their Inputs table (typically only
+   `00-`).
+6. Downstream stages consume upstream Layer 4 artifacts by naming them in
+   their own Inputs table (e.g. `10-hypothesize` inputs
+   `00-reproduce/output/reproduction.md`). That named handoff — not shared
+   conversation state — is how context flows between stages; the engine's
+   fresh-execution-per-stage model (§7.1) depends on it.
 
 ## 2. The draft publication boundary
 

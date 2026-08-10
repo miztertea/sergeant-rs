@@ -66,6 +66,39 @@ Rules:
    `index.md`. A published workflow missing from the root list is a
    violation (`convention.md` §1.1).
 
+## 1a. Stage `CONTEXT.md` Inputs table (Layer 2 contract)
+
+Adopted from the published ICM protocol (`convention.md` §1a, register row
+D9). Every stage `CONTEXT.md` opens with an Inputs table naming exactly
+which files load at stage entry:
+
+```markdown
+## Inputs
+
+| File | Layer | Why |
+|---|---|---|
+| ../CONTEXT.md | L1 | workflow orientation (first stage only) |
+| references/reproduction-method.md | L3 | the method this stage applies |
+| ../_config/evidence-policy.md | L3 | what counts as evidence |
+| ../00-reproduce/output/reproduction.md | L4 | upstream artifact consumed here |
+```
+
+Rules:
+
+1. Paths are relative to the stage directory; every path MUST resolve
+   inside the workflow's directory or `.sergeant/common/` (a `@@name`
+   reference in the prose is equivalent to an Inputs row for its resolved
+   file and SHOULD be listed for completeness).
+2. `Layer` is `L1`, `L3`, or `L4` — a stage never inputs another stage's
+   `CONTEXT.md` (L2 is a contract between the engine and that stage's
+   actor, not shared material).
+3. An L4 input MUST name a file some earlier stage's `output/` declares.
+   An L4 input from a *later* stage is a violation (the order in
+   `workflow.toml` is the dependency order).
+4. The table is the stage's declared dependency set. Exploration beyond it
+   is actor judgment and legal; a contract-bearing dependency missing from
+   the table is a violation (`convention.md` §1a rule 1).
+
 ## 2. Authored metadata versus observed telemetry
 
 Two categories of fact exist about a workflow and MUST NOT be mixed in one
