@@ -87,3 +87,91 @@ execution boundary. Filed here rather than fixed here.
 
 Until then the burst-50 throughput budget stands breached at ~24.5 works/s
 against a ≥28 floor, on the record, with the cause named.
+
+---
+
+# Wave-2 addendum (2026-08-10, after the review round's fixes)
+
+Same harness, same container, same day, release binary rebuilt from the fix
+series; three runs, `PERF_S1_BURSTS="1 50" PERF_S1_SETTLE=2`.
+
+## The core-lock verdict above was overstated (INV-N3-08)
+
+Row 3 of the headline table read "**holds**" on the strength of t9 and t10, and
+per L9 that verdict is itself gradeable. It was a claim about two code paths
+reported as a claim about the lock. The instrument could park the fake inside
+`launch` and inside a stop `Completion` and nowhere else, so it was structurally
+incapable of seeing the three external effects that were still under the guard
+when it returned "holds":
+
+- `git rev-parse`/`symbolic-ref`/`worktree add`/`worktree remove` per
+  repository, on submit, retry and cancel (INV-N3-02 — measured at 86 ms for
+  one `worktree add` on a 3.4 MB `.git` in this container);
+- `Command::spawn("claude" …)` plus three thread spawns on every `respond`
+  (INV-N3-03 — SEND was never split);
+- `ClaudeBackend::observe` walking `/proc` for a restart-classified handle.
+
+The correct wave-1 verdict was **"holds for LAUNCH and for the STOP archive
+join; unmeasured elsewhere"**. It is recorded here rather than edited above:
+the table is what was reported, and this is what was wrong with it.
+
+## What the instrument is now
+
+Timing tests can only cover the effects someone thought to gate, so the budget
+is no longer defended by timing alone:
+
+| instrument | covers |
+|---|---|
+| m6 `t11_external_effects_live_only_in_the_out_of_lock_performers` | **the class.** Every `materialize`/`rematerialize`/`teardown`/`backend.launch`/`backend.send` call site in `runtime/engine.rs` must lie inside a performer that takes no `Core`, with the two single-owner exceptions named in the test. Moving one back into a `&mut Core` path fails here with the call site printed. |
+| m2 t9 / t10 / **t11** | LAUNCH, the STOP archive join, and now SEND (the fake grew a send gate). |
+| m4 n19 / n20 / n21 | the git phases: no worktree exists when `begin_start` returns; the worktree still exists when `begin_retire_run` returns; a cancel landing mid-`git` records the surface and tears it down. |
+| m2 `INDEPENDENT_REQUEST_BUDGET` | 1 s → **200 ms** (N3-08: the old bound was ~500× the value this document reports). |
+
+## The throughput breach is closed
+
+| budget (R-N0-4) | bound | wave 1 | wave 2 | verdict |
+|---|---|---|---|---|
+| single-submit e2e p50 | ≤ 50 ms | 39.3 ms | **42.9 ms** (39.2 / 43.7 / 45.7) | holds |
+| submission throughput, burst 50 | ≥ 28 works/s | 24.5 (breached) | **32.7 works/s** (33.6 / 32.6 / 31.8) | **holds** |
+| core-lock discipline | no external I/O, process wait or thread join under the lock | "holds" — overstated, see above | holds, on the instruments above | holds |
+
+The same-machine control (`fdbadcd`, pre-boundary) measured 33.0 works/s in
+wave 1. At 32.7 the two-phase boundary now costs **≈1%** of burst throughput
+rather than 25%, with the two extra fsynced events per work unchanged at 18.0.
+
+Nothing was traded away for it. The +2 events/work the wave-1 breach was
+attributed to are still there, and `stage.entered`/`execution.reserved` are
+still two appends (the merge stays rejected: §22.5 enumerates their two sides as
+distinct injection windows). What changed is what else was holding the writer:
+submission no longer discovers the workspace, reads every stage's `CONTEXT.md`,
+probes harnesses or runs three `git` processes per repository under the core
+mutex, and neither cancel nor retry runs git under it. The single-writer path
+the P1 baseline identified as the bottleneck is now doing only journal work.
+
+**Consequence for the A-N3-1 ruling.** The amendment lowered the burst-50 floor
+to ≥24 works/s for this milestone because the boundary breached ≥28. The breach
+is gone, so the amendment is no longer load-bearing — the original R-N0-4 floor
+is met with ~17% headroom. That is a fact for the panel to rule on, not a licence
+to edit the ruling: A-N3-1 also filed **#44 (journal group commit) with a hard
+trigger, "lands before the N4 contract ships"**, and that trigger was justified
+by Docker's added reserved-event volume rather than by this milestone's number.
+It should survive the amendment it came with.
+
+## A bug the fix uncovered, and its guard
+
+Moving git off the core lock removed the accidental serialization the core lock
+had been providing, and a burst of 50 submissions promptly ran
+`git worktree add`/`remove` against one `.git` from many threads at once. Git
+does not serialize that: two teardowns in the first wave-2 run failed with
+`fatal: failed to read .git/worktrees/<other-work>/commondir` — one process
+walking the worktree registry while another rewrote it — and, failing closed as
+designed, *retained* those worktrees. Honest, journaled, and still two surfaces
+left on disk out of 51 (`hygiene_s1_verdict: dirty`).
+
+`runtime::surface` now takes a per-source-repository lock across each worktree
+mutation. It is not the core lock, it blocks no request, and two works in
+different repositories still proceed in parallel. The three runs above are
+`hygiene_s1_verdict: clean`, zero surface dirs. Pinned by
+`concurrent_surfaces_on_one_repository_all_materialize_and_retire_cleanly`,
+which fails 5 runs in 8 with the lock removed and passes deterministically with
+it — the same shape the bug had.
