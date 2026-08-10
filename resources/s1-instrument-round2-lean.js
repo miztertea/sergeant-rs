@@ -74,6 +74,18 @@ coverage build (a probe of one stage script's guards is fine; the 15+ min build 
 
 const AXES = [
   {
+    key: 'spec-fidelity',
+    model: 'opus',
+    effort: 'medium',
+    focus: `spec-fidelity: the phase-1 diff vs docs/gauntlet/contracts/S1-COVERAGE.md's
+"Phase 1" list (items 1-7) and the S0 rulings it cites. Every listed deliverable present
+and nothing beyond the list (the contract's own scope line: "EXACTLY the contract's
+phase-1 list, nothing more"). The R-S0-3 command lines must appear VERBATIM in the
+committed stage scripts — a paraphrased convention is the L11 failure the ruling exists
+to prevent. Design decisions rung-logged; commits separable per L10 (one deliverable
+class per commit, no fix folded into an unrelated build).`,
+  },
+  {
     key: 'test-honesty',
     model: 'fable',
     effort: 'high',
