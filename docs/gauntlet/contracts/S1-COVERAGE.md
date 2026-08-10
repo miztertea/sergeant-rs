@@ -132,7 +132,8 @@ its own pins" is self-grading — the pattern's core rule forbids trusting it,
 and the ledger holds three precedents of self-verified fixes that reverted
 clean. Phase 1 therefore gets a lean round 2 before the SHA freezes
 (`resources/s1-instrument-round2-lean.js`): fresh blind critics over the
-phase-1 diff — test-honesty on Fable-high (independently re-probing every
-pin), invariants+simplicity combined on Opus-medium — batched Opus refuters,
+phase-1 diff — spec-fidelity on Sonnet-high (enumerated-list check,
+R-S0-13), test-honesty on Opus-high (independently re-probing every pin),
+invariants+simplicity combined on Opus-medium — batched Opus refuters,
 Opus fixer if findings confirm. The measurement SHA is whatever tip this
 round leaves green.
