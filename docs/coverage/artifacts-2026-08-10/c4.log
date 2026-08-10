@@ -1,0 +1,50 @@
+
+[1m== stage c4 — 2026-08-10T16:35:59Z[0m
+   disk: 17 GB free (floor 10 GB)
+   toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
+   profraw before: 94
+   profraws to merge: 94
+   $ cargo llvm-cov report --summary-only
+Filename                      Regions    Missed Regions     Cover   Functions  Missed Functions  Executed       Lines      Missed Lines     Cover    Branches   Missed Branches     Cover
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+api.rs                           1703               129    92.43%         149                 3    97.99%        1090                71    93.49%           0                 0         -
+backend/claude.rs                1681               106    93.69%          93                 9    90.32%        1277                82    93.58%           0                 0         -
+backend/fake.rs                   682                19    97.21%          50                 1    98.00%         420                 8    98.10%           0                 0         -
+backend/mod.rs                     57                 8    85.96%           9                 0   100.00%          48                 8    83.33%           0                 0         -
+cli.rs                            976               121    87.60%          61                 8    86.89%         647                74    88.56%           0                 0         -
+daemon.rs                         445                50    88.76%          24                 0   100.00%         270                21    92.22%           0                 0         -
+domain/event.rs                   270                 9    96.67%          12                 0   100.00%         149                 2    98.66%           0                 0         -
+domain/mod.rs                      31                 0   100.00%           2                 0   100.00%          16                 0   100.00%           0                 0         -
+domain/profile.rs                  22                 0   100.00%           1                 0   100.00%          17                 0   100.00%           0                 0         -
+domain/work.rs                    124                 5    95.97%           8                 0   100.00%         105                 3    97.14%           0                 0         -
+domain/workflow.rs                362                31    91.44%          20                 3    85.00%         210                26    87.62%           0                 0         -
+domain/workspace.rs               368                17    95.38%          22                 3    86.36%         253                17    93.28%           0                 0         -
+main.rs                             3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
+runtime/analytics.rs             1260               114    90.95%          61                 6    90.16%         764                51    93.32%           0                 0         -
+runtime/blob.rs                    79                 3    96.20%           8                 0   100.00%          53                 1    98.11%           0                 0         -
+runtime/engine.rs                1257               162    87.11%          56                13    76.79%         857               119    86.11%           0                 0         -
+runtime/fsutil.rs                 288                15    94.79%          15                 1    93.33%         134                 5    96.27%           0                 0         -
+runtime/git.rs                     72                 0   100.00%           7                 0   100.00%          47                 0   100.00%           0                 0         -
+runtime/graph.rs                  560                26    95.36%          16                 1    93.75%         299                14    95.32%           0                 0         -
+runtime/journal.rs                488                88    81.97%          30                 3    90.00%         290                36    87.59%           0                 0         -
+runtime/mod.rs                     47                 0   100.00%           3                 0   100.00%          31                 0   100.00%           0                 0         -
+runtime/projection.rs             353                28    92.07%          18                 0   100.00%         237                 6    97.47%           0                 0         -
+runtime/recovery.rs               335                18    94.63%          19                 0   100.00%         187                 9    95.19%           0                 0         -
+runtime/router.rs                 226                 6    97.35%          13                 1    92.31%         176                 3    98.30%           0                 0         -
+runtime/surface.rs                701                38    94.58%          28                 6    78.57%         398                24    93.97%           0                 0         -
+telemetry.rs                      734                84    88.56%          43                 6    86.05%         423                51    87.94%           0                 0         -
+tui.rs                           1469               206    85.98%          93                 6    93.55%         863               127    85.28%           0                 0         -
+web.rs                            705               110    84.40%          32                 2    93.75%         376                68    81.91%           0                 0         -
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+TOTAL                           15298              1393    90.89%         894                72    91.95%        9640               826    91.43%           0                 0         -
+   $ cargo llvm-cov report --lcov --output-path /home/user/sergeant-rs/target/llvm-cov-reports/lcov.info
+
+    Finished report saved to /home/user/sergeant-rs/target/llvm-cov-reports/lcov.info
+   $ cargo llvm-cov report --html --output-dir /home/user/sergeant-rs/target/llvm-cov-reports/html
+
+    Finished report saved to /home/user/sergeant-rs/target/llvm-cov-reports/html/html
+   merged 94 of 94 profraw file(s) into /home/user/sergeant-rs/target/llvm-cov-target/sergeant-rs.profdata
+   summary: /home/user/sergeant-rs/docs/coverage/artifacts-2026-08-10/c4-summary.txt · lcov+html: /home/user/sergeant-rs/target/llvm-cov-reports
+   profraw produced=0 mergeable=0 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 0
+   stage c4 ok
