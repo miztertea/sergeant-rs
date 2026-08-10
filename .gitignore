@@ -1,2 +1,12 @@
 /target
 .DS_Store
+
+# Python bytecode. Nothing here is built from Python, but the committed
+# evidence tree carries scripts that get run, and the compiled output of a
+# run is not evidence. The `.pyc` already tracked under
+# `reference/sergeant-upstream/` deliberately stays tracked (R-S0-8):
+# `reference/UPSTREAM.md` pins that tree byte-for-byte to an upstream SHA, so
+# untracking it would break a provenance claim to tidy up a file the language
+# bar never counted. This rule is about the next one, not that one.
+__pycache__/
+*.pyc
