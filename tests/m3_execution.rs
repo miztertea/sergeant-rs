@@ -49,6 +49,7 @@ use sergeant_rs::domain::work::{
 };
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_WORKFLOW_BOUND,
+    WorkflowDefinition,
 };
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::{
@@ -107,13 +108,19 @@ fn init_repo(path: &Path) -> String {
 
 /// Write a workflow into a repository: `.sergeant/workflows/<name>/…`.
 fn write_workflow(root: &Path, name: &str, stages: &[(&str, &str)]) {
+    write_workflow_with_tables(root, name, stages, "")
+}
+
+/// Write a workflow, with optional raw `[stage."<id>"]` tables (N3 §12.2)
+/// appended verbatim after the `[workflow]` section.
+fn write_workflow_with_tables(root: &Path, name: &str, stages: &[(&str, &str)], tables: &str) {
     let dir = root.join(".sergeant/workflows").join(name);
     let ids: Vec<String> = stages.iter().map(|(id, _)| format!("{id:?}")).collect();
     std::fs::create_dir_all(&dir).expect("workflow dir");
     std::fs::write(
         dir.join("workflow.toml"),
         format!(
-            "[workflow]\nname = \"{name}\"\nversion = \"1\"\nstages = [{}]\n",
+            "[workflow]\nname = \"{name}\"\nversion = \"1\"\nstages = [{}]\n{tables}",
             ids.join(", ")
         ),
     )
@@ -583,6 +590,21 @@ async fn t3_full_run_completes_every_stage_and_retires_the_surface() {
         bound[0].payload["workflow"]["stages"][0]["context"],
         "first stage context"
     );
+    // N3 §12.2/§22.3: this legacy `workflow.toml` carries no `[stage.*]`
+    // tables, so the pinned definition must show the same actor-default
+    // outcome the tagged-stage tests exercise explicitly — the resolved
+    // executor spec is journaled whether or not the workflow tagged it.
+    assert_eq!(bound[0].payload["workflow"]["stages"][0]["kind"], "actor");
+    assert!(bound[0].payload["workflow"]["stages"][0]["harness"].is_null());
+    assert!(bound[0].payload["workflow"]["stages"][0]["profile"].is_null());
+    let content_hash = bound[0].payload["workflow"]["content_hash"]
+        .as_str()
+        .expect("content_hash is a string");
+    assert_eq!(
+        content_hash.len(),
+        64,
+        "content_hash is a hex-encoded BLAKE3 digest: {content_hash}"
+    );
 
     // Surface retired: worktree removed, branch retained.
     let surface = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
@@ -622,6 +644,120 @@ async fn t3_full_run_completes_every_stage_and_retires_the_surface() {
     assert_eq!(
         torn[0].payload["report"]["bindings"][0]["disposition"],
         "removed"
+    );
+
+    handle.shutdown().await;
+}
+
+/// N3 Outcome 2 (§12.2, §22.3): a `[stage."<id>"]` table's `kind`/`harness`/
+/// `profile` are pinned into `workflow.bound` verbatim, and — because the
+/// engine only ever consults the projection folded from that journaled
+/// event, never re-reading `workflow.toml` — an edit to the file after bind
+/// cannot retroactively change what a running Work sees, even mid-run.
+#[tokio::test]
+async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bind() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_workflow_with_tables(
+        &repo,
+        "tagged-tiny",
+        &[
+            ("00-first", "first stage context"),
+            ("10-second", "second stage context"),
+        ],
+        "\n[stage.\"00-first\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
+    );
+
+    // needs_input on the first stage gives a window, mid-run, to mutate the
+    // workflow's files on disk before the run continues.
+    let (registry, fake) = one_fake([
+        FakeStep::needs_input("continue?"),
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "tagged run",
+        json!({"workflow": "tagged-tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "needs_input");
+
+    // The tagged stage's executor spec, and the untagged stage's
+    // actor-default outcome, are both already in the journal.
+    let bound = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
+    assert_eq!(bound.len(), 1);
+    let stages = &bound[0].payload["workflow"]["stages"];
+    assert_eq!(stages[0]["id"], "00-first");
+    assert_eq!(stages[0]["kind"], "actor");
+    assert_eq!(stages[0]["harness"], "alt-harness");
+    assert_eq!(stages[0]["profile"], "alt-profile");
+    assert_eq!(stages[1]["id"], "10-second");
+    assert_eq!(stages[1]["kind"], "actor");
+    assert!(stages[1]["harness"].is_null());
+    assert!(stages[1]["profile"].is_null());
+    let pinned_hash = bound[0].payload["workflow"]["content_hash"]
+        .as_str()
+        .expect("content_hash")
+        .to_string();
+
+    // Mutate the workflow on disk: different harness for the already-pinned
+    // stage, and different context for the stage not yet entered. A fresh
+    // `resolve()` of the same name now sees different content...
+    write_workflow_with_tables(
+        &repo,
+        "tagged-tiny",
+        &[
+            ("00-first", "first stage context"),
+            ("10-second", "second stage context, EDITED AFTER BIND"),
+        ],
+        "\n[stage.\"00-first\"]\nkind = \"actor\"\nharness = \"edited-harness\"\nprofile = \"edited-profile\"\n",
+    );
+    let edited = WorkflowDefinition::resolve(&repo, "tagged-tiny").expect("resolve edited");
+    assert_ne!(
+        edited.content_hash, pinned_hash,
+        "the edit must actually be execution-relevant, or this test proves nothing"
+    );
+
+    // ...but delivering input and letting the run continue must still use
+    // exactly what was pinned: the second stage's context reaching the
+    // backend is the original, not the edited, text.
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "yes"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    assert_eq!(body["work"]["state"], "completed");
+    let starts = fake.starts();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(
+        starts[1].context, "second stage context",
+        "a mid-run file edit must not reach a stage not yet entered"
+    );
+
+    // And the journal itself never rewrote the bound event: it is exactly
+    // the one record from before the edit, hash included.
+    let bound_after = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
+    assert_eq!(bound_after.len(), 1);
+    assert_eq!(bound_after[0], bound[0]);
+    assert_eq!(
+        bound_after[0].payload["workflow"]["content_hash"],
+        pinned_hash
+    );
+    assert_eq!(
+        bound_after[0].payload["workflow"]["stages"][0]["harness"],
+        "alt-harness"
     );
 
     handle.shutdown().await;

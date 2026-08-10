@@ -24,7 +24,24 @@
 //! Stage state is journal events and is **orthogonal to Work state** (§10):
 //! `Work.state` is one of the eight §10 values, the current stage is a
 //! separate coordinate, and neither is derived from the other.
+//!
+//! **Tagged stage definitions** (proposal §12, N3 Outcome 2). A legacy
+//! `workflow.toml` — bare `[workflow]` with a `stages` list — still parses
+//! identically: every stage defaults to an actor stage with no explicit
+//! harness/profile (§12.1). A workflow may additionally declare optional
+//! `[stage."<id>"]` tables keyed by stage id, carrying `kind` (only `"actor"`
+//! is legal this milestone; N4 adds `"execute"`, §11.2), and the actor-only
+//! `harness`/`profile` fields (§12.2). Unknown kinds, unknown fields, and a
+//! table naming a stage the `stages` list never declared all fail closed at
+//! load time (§22.3) rather than being silently ignored — this module never
+//! guesses at what a workflow author meant. The resolved
+//! [`WorkflowDefinition`] carries a [`WorkflowDefinition::content_hash`]:
+//! a stable identity over every execution-relevant field (descriptor, stage
+//! order, per-stage executor tag, contexts), so a bound run's pinned
+//! procedure can be told apart from a same-named workflow whose content later
+//! changed.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -62,13 +79,54 @@ pub const KIND_STAGE_FAILED: &str = "stage.failed";
 /// Event kind: a stage was canceled.
 pub const KIND_STAGE_CANCELED: &str = "stage.canceled";
 
-/// One stage: an ordered directory with actor-readable context.
+/// What kind of executor performs a stage (§11, §12.2, §13.1).
+///
+/// `Actor` is the only legal kind this milestone (N3 Outcome 2). `Execute`
+/// (a declared container image run through Docker, §11.2) is N4 scope; a
+/// `[stage."<id>"]` table naming any other kind fails closed at load time
+/// rather than being accepted and ignored (§22.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StageKind {
+    /// A native reasoning harness performs this stage (§11.1).
+    #[default]
+    Actor,
+}
+
+impl StageKind {
+    /// The kind's canonical snake_case name, as it appears in `workflow.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StageKind::Actor => "actor",
+        }
+    }
+}
+
+/// One stage: an ordered directory with actor-readable context, tagged with
+/// the executor that performs it (§12.2, §13.1).
+///
+/// `kind`/`harness`/`profile` are additive over the legacy shape: a stage
+/// with no `[stage."<id>"]` table gets `kind: Actor`, `harness: None`,
+/// `profile: None` — the same actor-default semantics §12.1 describes for a
+/// bare `workflow.toml`. `#[serde(default)]` on the tagged fields also lets a
+/// `workflow.bound` payload journaled before N3 replay cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageDefinition {
     /// Directory name, which is also the stage id (`10-implement`).
     pub id: String,
     /// The stage's `CONTEXT.md`, carried verbatim.
     pub context: String,
+    /// The executor kind. Always `Actor` this milestone.
+    #[serde(default)]
+    pub kind: StageKind,
+    /// Explicit stage-level harness (§12.2). `None` means "use the Work
+    /// actor default" (§12.5) — resolved by the router, not here.
+    #[serde(default)]
+    pub harness: Option<String>,
+    /// Explicit stage-level launch profile (§12.2). `None` means "use the
+    /// Work/profile default".
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// A resolved workflow: ordered stages plus the identity of what produced it.
@@ -83,6 +141,15 @@ pub struct WorkflowDefinition {
     pub source: String,
     /// Stages in execution order.
     pub stages: Vec<StageDefinition>,
+    /// Stable content-identity hash over every execution-relevant field:
+    /// descriptor (name, version), stage order, each stage's executor tag
+    /// (kind/harness/profile), and every context verbatim (§22.3). Deliberately
+    /// excludes `source`, which is provenance, not procedure: the same
+    /// content loaded from two different paths is the same workflow.
+    /// Hex-encoded BLAKE3 over a canonical JSON projection of the fields
+    /// above.
+    #[serde(default)]
+    pub content_hash: String,
 }
 
 /// Per-stage lifecycle status. Orthogonal to [`crate::domain::work::WorkState`]
@@ -201,6 +268,31 @@ pub enum WorkflowError {
         /// The repeated stage id.
         stage: String,
     },
+    /// A `[stage."<id>"]` table names a `kind` this milestone does not
+    /// support. `"actor"` is the only legal kind (N3 Outcome 2, §12.2).
+    #[error(
+        "{path} declares stage {stage:?} with unknown kind {kind:?} (only \"actor\" is supported)"
+    )]
+    UnknownStageKind {
+        /// Path of the descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The unsupported `kind` value.
+        kind: String,
+    },
+    /// A `[stage."<id>"]` table names a stage id the `stages` list never
+    /// declared. Metadata for a stage that does not exist is refused rather
+    /// than silently ignored.
+    #[error(
+        "{path} declares a [stage.{stage:?}] table, but {stage:?} is not in this workflow's stage order"
+    )]
+    UndeclaredStageTable {
+        /// Path of the descriptor.
+        path: String,
+        /// The stage id the table names.
+        stage: String,
+    },
     /// A workflow with no stages could never make progress.
     #[error("{path} declares no stages")]
     NoStages {
@@ -221,6 +313,11 @@ pub enum WorkflowError {
 #[serde(deny_unknown_fields)]
 struct WorkflowFile {
     workflow: WorkflowSection,
+    /// Optional `[stage."<id>"]` tables (§12.2), keyed by stage id. A
+    /// `BTreeMap` gives deterministic iteration, which matters for the
+    /// undeclared-table check's error ordering under multiple offenders.
+    #[serde(default, rename = "stage")]
+    stages_meta: BTreeMap<String, StageTable>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +326,25 @@ struct WorkflowSection {
     name: String,
     version: String,
     stages: Vec<String>,
+}
+
+/// One `[stage."<id>"]` table (§12.2). `deny_unknown_fields` is what turns an
+/// execute-only field (`image`, `command`, `workdir`, ...) written under an
+/// actor stage's table into a fail-closed parse error instead of a silently
+/// ignored typo (§22.3) — this milestone models no execute-stage fields at
+/// all, so any of them here is necessarily misplaced.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageTable {
+    /// `"actor"` if present; absent defaults to actor too (§12.1's
+    /// no-table default applies the same way inside an explicit table that
+    /// only sets `harness`/`profile`).
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    harness: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 /// The built-in `software-change` workflow, embedded at build time from
@@ -301,8 +417,12 @@ impl WorkflowDefinition {
                 directory,
             });
         }
-        let mut stages = Vec::with_capacity(parsed.workflow.stages.len());
-        for id in check_stage_ids(&parsed.workflow.stages, &path)? {
+        let ids = check_stage_ids(&parsed.workflow.stages, &path)?;
+        check_stage_tables(&ids, &parsed.stages_meta, &path)?;
+        let mut stages = Vec::with_capacity(ids.len());
+        for id in ids {
+            let (kind, harness, profile) =
+                resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
             let stage_dir = dir.join(&id);
             let context_path = stage_dir.join(CONTEXT_FILE);
             if !context_path.is_file() {
@@ -317,13 +437,22 @@ impl WorkflowDefinition {
                     path: context_path.display().to_string(),
                     source,
                 })?;
-            stages.push(StageDefinition { id, context });
+            stages.push(StageDefinition {
+                id,
+                context,
+                kind,
+                harness,
+                profile,
+            });
         }
+        let content_hash =
+            compute_content_hash(&parsed.workflow.name, &parsed.workflow.version, &stages);
         Ok(Self {
             name: parsed.workflow.name,
             version: parsed.workflow.version,
             source: dir.display().to_string(),
             stages,
+            content_hash,
         })
     }
 
@@ -331,8 +460,12 @@ impl WorkflowDefinition {
     pub fn embedded() -> Result<Self, WorkflowError> {
         let path = format!("<embedded>/{DEFAULT_WORKFLOW}/{WORKFLOW_FILE}");
         let parsed = parse_descriptor(EMBEDDED_WORKFLOW_TOML, &path)?;
-        let mut stages = Vec::with_capacity(parsed.workflow.stages.len());
-        for id in check_stage_ids(&parsed.workflow.stages, &path)? {
+        let ids = check_stage_ids(&parsed.workflow.stages, &path)?;
+        check_stage_tables(&ids, &parsed.stages_meta, &path)?;
+        let mut stages = Vec::with_capacity(ids.len());
+        for id in ids {
+            let (kind, harness, profile) =
+                resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
             let context = EMBEDDED_CONTEXTS
                 .iter()
                 .find(|(stage, _)| *stage == id)
@@ -342,13 +475,22 @@ impl WorkflowDefinition {
                     stage: id.clone(),
                     missing: format!("<embedded>/{DEFAULT_WORKFLOW}/{id}/{CONTEXT_FILE}"),
                 })?;
-            stages.push(StageDefinition { id, context });
+            stages.push(StageDefinition {
+                id,
+                context,
+                kind,
+                harness,
+                profile,
+            });
         }
+        let content_hash =
+            compute_content_hash(&parsed.workflow.name, &parsed.workflow.version, &stages);
         Ok(Self {
             name: parsed.workflow.name,
             version: parsed.workflow.version,
             source: SOURCE_EMBEDDED.to_string(),
             stages,
+            content_hash,
         })
     }
 
@@ -396,6 +538,98 @@ fn check_stage_ids(ids: &[String], path: &str) -> Result<Vec<String>, WorkflowEr
         }
     }
     Ok(ids.to_vec())
+}
+
+/// Every `[stage."<id>"]` table must name a stage the `stages` list actually
+/// declares (§12.2, §22.3) — metadata for a nonexistent stage is refused, not
+/// silently kept around unused. `BTreeMap` iteration keeps the reported
+/// offender deterministic when more than one table is undeclared.
+fn check_stage_tables(
+    ids: &[String],
+    tables: &BTreeMap<String, StageTable>,
+    path: &str,
+) -> Result<(), WorkflowError> {
+    for key in tables.keys() {
+        if !ids.iter().any(|id| id == key) {
+            return Err(WorkflowError::UndeclaredStageTable {
+                path: path.to_string(),
+                stage: key.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one stage's `[stage."<id>"]` table, if it declared one, into its
+/// executor tag. No table (the legacy shape, §12.1) and a table with no
+/// `kind` both mean `Actor` with no explicit harness/profile — the same
+/// actor-default outcome either way. An explicit `kind` other than `"actor"`
+/// fails closed (§22.3): this milestone has no other legal kind to fall back
+/// to.
+fn resolve_stage_tag(
+    id: &str,
+    table: Option<&StageTable>,
+    path: &str,
+) -> Result<(StageKind, Option<String>, Option<String>), WorkflowError> {
+    let Some(table) = table else {
+        return Ok((StageKind::Actor, None, None));
+    };
+    let kind = match table.kind.as_deref() {
+        None | Some("actor") => StageKind::Actor,
+        Some(other) => {
+            return Err(WorkflowError::UnknownStageKind {
+                path: path.to_string(),
+                stage: id.to_string(),
+                kind: other.to_string(),
+            });
+        }
+    };
+    Ok((kind, table.harness.clone(), table.profile.clone()))
+}
+
+/// A stage's contribution to the workflow content-identity hash: every
+/// execution-relevant field, nothing provenance-only (no directory paths).
+#[derive(Serialize)]
+struct ContentIdentityStage<'a> {
+    id: &'a str,
+    kind: StageKind,
+    harness: Option<&'a str>,
+    profile: Option<&'a str>,
+    context: &'a str,
+}
+
+/// The workflow content-identity hash (§22.3): BLAKE3 over a canonical JSON
+/// projection of `name`, `version`, and each stage's execution-relevant
+/// fields in order. Struct-derived `Serialize` fixes field order, so the
+/// only way two workflows land on the same hash is genuinely identical
+/// content — the same guarantee reordering `stages` or renaming a stage id
+/// would break, which is exactly what §22.3 requires this hash to detect.
+/// `source` (embedded vs. a directory path) is deliberately excluded: it says
+/// where the definition came from, not what it does.
+fn compute_content_hash(name: &str, version: &str, stages: &[StageDefinition]) -> String {
+    #[derive(Serialize)]
+    struct ContentIdentity<'a> {
+        name: &'a str,
+        version: &'a str,
+        stages: Vec<ContentIdentityStage<'a>>,
+    }
+    let identity = ContentIdentity {
+        name,
+        version,
+        stages: stages
+            .iter()
+            .map(|s| ContentIdentityStage {
+                id: &s.id,
+                kind: s.kind,
+                harness: s.harness.as_deref(),
+                profile: s.profile.as_deref(),
+                context: &s.context,
+            })
+            .collect(),
+    };
+    let bytes =
+        serde_json::to_vec(&identity).expect("ContentIdentity has no non-serializable field");
+    blake3::hash(&bytes).to_hex().to_string()
 }
 
 #[cfg(test)]
@@ -531,5 +765,303 @@ mod tests {
             WorkflowDefinition::resolve(root, "typo"),
             Err(WorkflowError::Malformed { .. })
         ));
+    }
+
+    /// Writes one stage's `CONTEXT.md`, creating its directory.
+    fn write_stage(wf: &Path, id: &str, context: &str) {
+        std::fs::create_dir_all(wf.join(id)).expect("stage dir");
+        std::fs::write(wf.join(id).join(CONTEXT_FILE), context).expect("stage context");
+    }
+
+    /// §22.3: a legacy `workflow.toml` (bare `[workflow]`, no `[stage.*]`
+    /// tables at all) parses identically to before — every stage resolves to
+    /// the same actor-default outcome N3 assigns a stage with an *explicit*
+    /// but empty `[stage."<id>"]` table (§12.1's default text describes one
+    /// outcome, reached two ways).
+    #[test]
+    fn legacy_workflow_defaults_every_stage_to_an_untagged_actor() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "legacy");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"legacy\"\nversion = \"1\"\nstages = [\"00-only\", \"10-next\"]\n",
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-only", "first");
+        write_stage(&wf, "10-next", "second");
+
+        let workflow = WorkflowDefinition::resolve(root, "legacy").expect("resolve");
+        for stage in &workflow.stages {
+            assert_eq!(stage.kind, StageKind::Actor);
+            assert_eq!(stage.harness, None);
+            assert_eq!(stage.profile, None);
+        }
+        assert!(
+            !workflow.content_hash.is_empty(),
+            "every resolved workflow carries a content-identity hash"
+        );
+    }
+
+    /// §22.3: a `[stage."<id>"]` table pins `kind`, `harness`, and `profile`
+    /// onto the resolved stage; a stage with no table stays untagged.
+    #[test]
+    fn a_tagged_stage_table_pins_kind_harness_and_profile() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "tagged");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"tagged\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-review\", \"10-close\"]\n",
+                "\n",
+                "[stage.\"00-review\"]\n",
+                "kind = \"actor\"\n",
+                "harness = \"claude\"\n",
+                "profile = \"review\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-review", "review context");
+        write_stage(&wf, "10-close", "close context");
+
+        let workflow = WorkflowDefinition::resolve(root, "tagged").expect("resolve");
+        assert_eq!(workflow.stages[0].kind, StageKind::Actor);
+        assert_eq!(workflow.stages[0].harness.as_deref(), Some("claude"));
+        assert_eq!(workflow.stages[0].profile.as_deref(), Some("review"));
+        // The untagged second stage keeps the legacy actor-default outcome.
+        assert_eq!(workflow.stages[1].kind, StageKind::Actor);
+        assert_eq!(workflow.stages[1].harness, None);
+        assert_eq!(workflow.stages[1].profile, None);
+    }
+
+    /// §22.3: an unknown `kind` fails closed rather than being coerced to
+    /// `actor` or silently ignored. `"actor"` is the only legal kind this
+    /// milestone (N3 Outcome 2) — `"execute"` is real vocabulary from the
+    /// proposal (§12.3), reserved for N4, and still not accepted yet.
+    #[test]
+    fn an_unknown_stage_kind_fails_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "bad-kind");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"bad-kind\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-only\"]\n",
+                "\n",
+                "[stage.\"00-only\"]\n",
+                "kind = \"execute\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-only", "context");
+
+        let err = WorkflowDefinition::resolve(root, "bad-kind").expect_err("must refuse");
+        assert!(
+            matches!(&err, WorkflowError::UnknownStageKind { stage, kind, .. }
+                if stage == "00-only" && kind == "execute"),
+            "expected an unknown-kind refusal naming the offending stage and kind, got {err}"
+        );
+    }
+
+    /// §22.3: a `[stage."<id>"]` table for an id the `stages` list never
+    /// declared is refused rather than kept around unused.
+    #[test]
+    fn a_stage_table_for_an_undeclared_stage_id_fails_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "ghost-table");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"ghost-table\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-only\"]\n",
+                "\n",
+                "[stage.\"99-ghost\"]\n",
+                "kind = \"actor\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-only", "context");
+
+        let err = WorkflowDefinition::resolve(root, "ghost-table").expect_err("must refuse");
+        assert!(
+            matches!(&err, WorkflowError::UndeclaredStageTable { stage, .. } if stage == "99-ghost"),
+            "expected a refusal naming the undeclared table, got {err}"
+        );
+    }
+
+    /// §22.3: an unrecognized key inside a `[stage."<id>"]` table is a parse
+    /// failure, not a silently ignored typo — the same discipline
+    /// `malformed_workflows_fail_closed` already pins for `[workflow]`.
+    #[test]
+    fn unknown_fields_in_a_stage_table_fail_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "typo-stage");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"typo-stage\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-only\"]\n",
+                "\n",
+                "[stage.\"00-only\"]\n",
+                "harnass = \"claude\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-only", "context");
+
+        assert!(matches!(
+            WorkflowDefinition::resolve(root, "typo-stage"),
+            Err(WorkflowError::Malformed { .. })
+        ));
+    }
+
+    /// §22.3: execute-only fields (§12.3's `image`/`command`/`workdir`/...)
+    /// written into a stage table are rejected rather than ignored. This
+    /// milestone models no execute-stage fields at all, so any of them here
+    /// is necessarily misplaced — `deny_unknown_fields` is what does the
+    /// rejecting, exercised here with the actual proposal vocabulary rather
+    /// than an arbitrary typo.
+    #[test]
+    fn execute_only_fields_on_an_actor_stage_fail_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "misplaced");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"misplaced\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-only\"]\n",
+                "\n",
+                "[stage.\"00-only\"]\n",
+                "kind = \"actor\"\n",
+                "image = \"python:3.13-slim\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-only", "context");
+
+        assert!(matches!(
+            WorkflowDefinition::resolve(root, "misplaced"),
+            Err(WorkflowError::Malformed { .. })
+        ));
+    }
+
+    /// §22.3: the content-identity hash changes when a context changes, when
+    /// a stage's harness/profile changes, and when stage order changes for
+    /// the same set of ids — but not when only `source` differs (the same
+    /// content loaded from two different directories hashes the same).
+    #[test]
+    fn content_identity_tracks_execution_relevant_fields_only() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        let base = workflow_dir(root, "base");
+        std::fs::create_dir_all(&base).expect("workflow dir");
+        std::fs::write(
+            base.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"base\"\nversion = \"1\"\nstages = [\"00-a\", \"10-b\"]\n",
+        )
+        .expect("descriptor");
+        write_stage(&base, "00-a", "context a");
+        write_stage(&base, "10-b", "context b");
+        let baseline = WorkflowDefinition::resolve(root, "base").expect("resolve base");
+
+        // An exact duplicate under a second root, so its absolute `source`
+        // path necessarily differs while the declared name still matches
+        // its own directory (`load_dir` requires that, independent of this
+        // hash question).
+        let other_root = tempfile::TempDir::new().expect("tempdir");
+        let dup = workflow_dir(other_root.path(), "base");
+        std::fs::create_dir_all(&dup).expect("workflow dir");
+        std::fs::write(
+            dup.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"base\"\nversion = \"1\"\nstages = [\"00-a\", \"10-b\"]\n",
+        )
+        .expect("descriptor");
+        write_stage(&dup, "00-a", "context a");
+        write_stage(&dup, "10-b", "context b");
+        let duplicate = WorkflowDefinition::load_dir(&dup).expect("resolve dup");
+        assert_ne!(baseline.source, duplicate.source);
+        assert_eq!(
+            baseline.content_hash, duplicate.content_hash,
+            "source is provenance, not execution-relevant content"
+        );
+
+        // Each variant below needs its own root: `load_dir` requires the
+        // declared name to match the directory name, and every variant
+        // keeps `name = "base"` on purpose — only its content changes, so a
+        // hash difference can be attributed to that content alone rather
+        // than a coincidental name change.
+
+        // Changed context.
+        let context_root = tempfile::TempDir::new().expect("tempdir");
+        let changed_context = workflow_dir(context_root.path(), "base");
+        std::fs::create_dir_all(&changed_context).expect("workflow dir");
+        std::fs::write(
+            changed_context.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"base\"\nversion = \"1\"\nstages = [\"00-a\", \"10-b\"]\n",
+        )
+        .expect("descriptor");
+        write_stage(&changed_context, "00-a", "context a, but different");
+        write_stage(&changed_context, "10-b", "context b");
+        let changed = WorkflowDefinition::load_dir(&changed_context).expect("resolve changed");
+        assert_ne!(baseline.content_hash, changed.content_hash);
+
+        // Changed harness on an otherwise identical stage.
+        let harness_root = tempfile::TempDir::new().expect("tempdir");
+        let changed_harness = workflow_dir(harness_root.path(), "base");
+        std::fs::create_dir_all(&changed_harness).expect("workflow dir");
+        std::fs::write(
+            changed_harness.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"base\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-a\", \"10-b\"]\n",
+                "\n",
+                "[stage.\"00-a\"]\n",
+                "harness = \"codex\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&changed_harness, "00-a", "context a");
+        write_stage(&changed_harness, "10-b", "context b");
+        let harnessed = WorkflowDefinition::load_dir(&changed_harness).expect("resolve harness");
+        assert_ne!(baseline.content_hash, harnessed.content_hash);
+
+        // Reordered stages: same ids, same contexts, different order.
+        let reorder_root = tempfile::TempDir::new().expect("tempdir");
+        let reordered = workflow_dir(reorder_root.path(), "base");
+        std::fs::create_dir_all(&reordered).expect("workflow dir");
+        std::fs::write(
+            reordered.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"base\"\nversion = \"1\"\nstages = [\"10-b\", \"00-a\"]\n",
+        )
+        .expect("descriptor");
+        write_stage(&reordered, "00-a", "context a");
+        write_stage(&reordered, "10-b", "context b");
+        let reorder = WorkflowDefinition::load_dir(&reordered).expect("resolve reorder");
+        assert_ne!(baseline.content_hash, reorder.content_hash);
     }
 }
