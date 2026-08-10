@@ -2273,6 +2273,73 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
     );
 }
 
+/// The same teardown, composed the way the rig's real users get it: `Drop`.
+///
+/// The pin above never executes `Drop` at all — it calls `stop()` first, which
+/// latches `stopped`, so `Drop`'s body is not the thing under test. Measured,
+/// not reasoned about: with `Drop::drop` reverted to the pre-repair
+/// `child.kill(); child.wait()` and `stop()` left intact, that test and the
+/// whole m6 suite still pass. And `Drop` is the *only* teardown the two
+/// production users of this rig have — the embedded-assets probe and doctor's
+/// live-daemon arm both `start()` and never `stop()`. So the part was pinned
+/// and the composition, which is what §6.1's loss site 1 actually rides on,
+/// was not.
+///
+/// This test therefore reads evidence the rig cannot author, because the
+/// *daemon* writes it. Measured on this container with two temp data dirs,
+/// one `kill -TERM` and one `kill -KILL`: after SIGTERM the daemon runs
+/// `run_until_signal`'s shutdown tail — journals `daemon.stopped`, removes
+/// `runtime.json` — and after SIGKILL it journals nothing and leaves the
+/// descriptor behind. `DataDir`'s own `Drop` cannot substitute for this: it
+/// asserts only that no daemon *survived*, and a SIGKILLed daemon has not
+/// survived.
+#[test]
+fn the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown() {
+    let data = DataDir::new();
+    let cwd = TempDir::new().expect("tempdir");
+
+    let pid = {
+        let spawned = SpawnedDaemon::start(&data, cwd.path(), &[]);
+        let pid = spawned.child.id();
+        assert!(
+            daemon::pid_alive(pid),
+            "the rig must hand back a live daemon, or this test measures nothing"
+        );
+        assert!(
+            daemon::descriptor_path(data.path()).exists(),
+            "a serving daemon must have published its descriptor first, or its absence \
+             below would prove nothing"
+        );
+        pid
+        // Scope ends here, and `Drop` is the only teardown that runs — no
+        // `stop()` call, exactly like the rig's two production users.
+    };
+
+    assert!(
+        !daemon::pid_alive(pid),
+        "the dropped rig must not leave daemon pid {pid} running"
+    );
+    assert!(
+        !daemon::descriptor_path(data.path()).exists(),
+        "the dropped daemon must have removed its own runtime.json, which only the \
+         SIGTERM shutdown path does. The descriptor is still there, so the daemon was \
+         killed rather than asked — and a SIGKILLed process flushes nothing at exit, \
+         its coverage profile included (§6.1 loss site 1)"
+    );
+    let stopped = Journal::replay_data_dir(data.path())
+        .expect("replay the journal")
+        .filter_map(Result::ok)
+        .filter(|event| event.kind == daemon::KIND_DAEMON_STOPPED)
+        .count();
+    assert_eq!(
+        stopped,
+        1,
+        "the dropped daemon must have journaled exactly one {} event; {stopped} means \
+         its shutdown path did not run to the end",
+        daemon::KIND_DAEMON_STOPPED
+    );
+}
+
 // ------------------------------------------------------- spawned-daemon rig
 
 /// How the rig's own daemon ended, and what the kernel said about it.
