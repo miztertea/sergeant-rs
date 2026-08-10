@@ -176,6 +176,15 @@ different repositories still proceed in parallel. The three runs above are
 which fails 5 runs in 8 with the lock removed and passes deterministically with
 it — the same shape the bug had.
 
+> **Round-2 correction (N3R2-06).** Re-measured over 18 runs against a reverted
+> `with_repository`: 17 fail, 1 passes. A real guard, but a ~6% chance per run
+> of a reverted fix going unnoticed — L7's corollary ("single-run green is not
+> a gate") landing on one named test. The test now runs five independent bursts
+> against the same `.git` instead of one, which takes the escape probability to
+> ~0.06^5 for ~2.5 s of wall clock; re-measured after the change, 22 of 23 runs
+> fail with the lock removed and the sole escape was the first run after a
+> rebuild. It is no longer a coin flip.
+
 ---
 
 # Round-2 addendum (2026-08-10): the blind band these instruments leave

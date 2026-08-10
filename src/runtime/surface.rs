@@ -579,6 +579,16 @@ mod tests {
     /// core lock and blocks no request. This is the regression test for it:
     /// without the serialization it fails as a flake, which is exactly how the
     /// bug presented.
+    ///
+    /// **Why it races the same repository more than once.** One burst of
+    /// [`WORKS`] threads reproduces the bug about 17 times in 18 with the lock
+    /// removed (measured, round-2 finding N3R2-06) — a real guard, and still a
+    /// ~6% chance per run that a reverted fix goes unnoticed. That is L7's
+    /// corollary ("single-run green is not a gate") landing on one specific
+    /// test, and the cheap answer is to make one run *be* several: with
+    /// [`ROUNDS`] independent bursts the escape probability is 0.06^5, about
+    /// one run in 1.3 million, for ~2.5 s of wall clock. Anyone reverting the
+    /// per-repository lock now sees red, not a coin flip.
     #[test]
     fn concurrent_surfaces_on_one_repository_all_materialize_and_retire_cleanly() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -587,41 +597,46 @@ mod tests {
         // Enough overlap that adds and removes interleave inside git's own
         // `.git/worktrees` registry, which is where the measured failure was.
         const WORKS: usize = 24;
+        // Independent races against the same `.git`, so a single lucky
+        // interleaving cannot pass the test on its own.
+        const ROUNDS: usize = 5;
 
-        let reports: Vec<TeardownReport> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..WORKS)
-                .map(|i| {
-                    let data = data.clone();
-                    let spec = spec.clone();
-                    scope.spawn(move || {
-                        let work_id = format!("01CONCURRENT{i:04}");
-                        let surface = materialize(&data, &work_id, std::slice::from_ref(&spec))
-                            .unwrap_or_else(|e| panic!("materialize {work_id}: {e}"));
-                        teardown(&surface)
+        for round in 0..ROUNDS {
+            let reports: Vec<TeardownReport> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..WORKS)
+                    .map(|i| {
+                        let data = data.clone();
+                        let spec = spec.clone();
+                        scope.spawn(move || {
+                            let work_id = format!("01CONCURRENT{round}{i:03}");
+                            let surface = materialize(&data, &work_id, std::slice::from_ref(&spec))
+                                .unwrap_or_else(|e| panic!("materialize {work_id}: {e}"));
+                            teardown(&surface)
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("surface thread"))
-                .collect()
-        });
-        assert_eq!(reports.len(), WORKS);
-        for report in &reports {
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("surface thread"))
+                    .collect()
+            });
+            assert_eq!(reports.len(), WORKS);
+            for report in &reports {
+                assert!(
+                    report.clean,
+                    "a concurrent teardown must not retain a worktree it could have \
+                     removed (round {round} of {ROUNDS}): {report:?}"
+                );
+            }
             assert!(
-                report.clean,
-                "a concurrent teardown must not retain a worktree it could have \
-                 removed: {report:?}"
+                !data.join(SURFACES_DIR).exists()
+                    || std::fs::read_dir(data.join(SURFACES_DIR))
+                        .expect("surfaces dir")
+                        .next()
+                        .is_none(),
+                "no surface root survives a clean teardown (round {round} of {ROUNDS})"
             );
         }
-        assert!(
-            !data.join(SURFACES_DIR).exists()
-                || std::fs::read_dir(data.join(SURFACES_DIR))
-                    .expect("surfaces dir")
-                    .next()
-                    .is_none(),
-            "no surface root survives a clean teardown"
-        );
     }
 
     /// A temp repository with one commit.
