@@ -23,16 +23,25 @@
 //! decisions, not uncertainty, and re-deciding them at every restart would be
 //! the daemon inventing state the journal never recorded.
 //!
-//! `pending` is the one other state this looks at, and only in one shape.
-//! Submitting is several appends — `work.submitted`, then the engine's
-//! materialization, binding and `work.started` records — so a crash inside
-//! that window leaves a `pending` work that already has a run record. Nothing
-//! else will ever pick it up (`retry` refuses `pending`, and a retried
-//! `command_id` replays the recorded outcome without re-planning), and the
-//! surviving prefix may name git state created in the user's repository. That
-//! is uncertainty, not a decision, so it fails closed to `blocked` with the
-//! evidence. A `pending` work with *no* run record is untouched: it is an
-//! intent the daemon never started, which is exactly what it looks like.
+//! `pending` is the other state this looks at for the work's own status, and
+//! only in one shape. Submitting is several appends — `work.submitted`, then
+//! the engine's materialization, binding and `work.started` records — so a
+//! crash inside that window leaves a `pending` work that already has a run
+//! record. Nothing else will ever pick it up (`retry` refuses `pending`, and
+//! a retried `command_id` replays the recorded outcome without re-planning),
+//! and the surviving prefix may name git state created in the user's
+//! repository. That is uncertainty, not a decision, so it fails closed to
+//! `blocked` with the evidence. A `pending` work with *no* run record is
+//! untouched: it is an intent the daemon never started, which is exactly
+//! what it looks like.
+//!
+//! Terminal work (`completed` / `failed` / `canceled`) is never reconsidered
+//! for its own status, but its surface teardown is swept if the completion
+//! tail's crash window (issue #9) left it unfinished: a run that records a
+//! surface but no `surface.torn_down` gets teardown re-run and the missing
+//! event appended, evidence from disk rather than a guess. This never
+//! changes a work's state and never blocks startup — see
+//! [`reconcile_terminal_surface`](crate::runtime::engine::Engine::reconcile_terminal_surface).
 
 use serde::{Deserialize, Serialize};
 
