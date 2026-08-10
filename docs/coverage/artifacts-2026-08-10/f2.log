@@ -1,0 +1,6 @@
+
+[1m== stage f2 — 2026-08-10T16:43:14Z[0m
+   disk: 17 GB free (floor 10 GB)
+   toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
+   profraw before: 94
+   $ cargo llvm-cov clean --profraw-only

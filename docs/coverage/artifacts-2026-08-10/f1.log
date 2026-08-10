@@ -1,0 +1,38 @@
+
+[1m== stage f1 — 2026-08-10T16:36:23Z[0m
+   disk: 17 GB free (floor 10 GB)
+   toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
+   profraw before: 94
+   $ cargo test --no-run
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.37s
+  Executable unittests src/lib.rs (target/debug/deps/sergeant_rs-58150b8dfe9415a0)
+  Executable unittests src/main.rs (target/debug/deps/sgt-8672fb013a3d3d18)
+  Executable tests/m1_event_core.rs (target/debug/deps/m1_event_core-6a1754784b1ff14e)
+  Executable tests/m2_daemon_api.rs (target/debug/deps/m2_daemon_api-8830e02b6cb16b5b)
+  Executable tests/m3_execution.rs (target/debug/deps/m3_execution-9e953f60016505b6)
+  Executable tests/m4_backends.rs (target/debug/deps/m4_backends-b388c1e5312edfdc)
+  Executable tests/m5_projections.rs (target/debug/deps/m5_projections-7feffc30a1438f0c)
+  Executable tests/m6_surfaces.rs (target/debug/deps/m6_surfaces-0c9fa9e14b33fe2a)
+   run 1: rc=0 wall=48s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 2: rc=0 wall=38s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 3: rc=0 wall=43s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 4: rc=0 wall=39s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 5: rc=0 wall=39s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 6: rc=0 wall=38s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 7: rc=0 wall=38s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 8: rc=0 wall=38s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 9: rc=0 wall=38s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   run 10: rc=0 wall=38s failed=0
+   hygiene: leaked daemons [] /tmp entries 0
+   profraw produced=0 mergeable=0 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 0
+   stage f1 ok
