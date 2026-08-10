@@ -5591,3 +5591,148 @@ fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
         "closing a closed window appends nothing"
     );
 }
+
+// ------------------------------- §14.5's checklist, clause by clause
+//
+// `reservation_is_stale` enumerates four clauses as "§14.5's checklist, in
+// order": the Work still exists; it has not gone terminal; the reservation this
+// launch belongs to is still the run's outstanding one; the stage attempt it
+// named is still the current one. Only the second was pinned — deleting either
+// of the last two left the whole suite green (N3-03, N3-04), which is L7's
+// definition of an unpinned fix.
+//
+// Neither is reachable through today's *API* (`begin_retry` refuses an active
+// work, `begin_input` requires `needs_input`), and that is the point: they are
+// defensive clauses guarding a boundary the next executor — a Docker container
+// whose completion callback arrives whenever it arrives — will make reachable.
+// A defensive clause with no test is prose. The journal is the only truth, so
+// these drive the superseding decision through it, exactly as a concurrent
+// request would have left it.
+
+/// §14.5, clause 3: a launch whose reservation was superseded by another is
+/// recorded as late evidence and its context stopped — it never becomes the
+/// run's execution behind the newer decision's back.
+#[test]
+fn n23_a_launch_whose_reservation_was_superseded_never_becomes_the_execution() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3STALE145A";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+
+    // While the launch is in flight, a second reservation for the same stage
+    // and attempt becomes the run's outstanding one.
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        json!({"reservation": {
+            "execution_id": "01N3SUPERSEDER",
+            "backend": FAKE_BACKEND_NAME,
+            "native_id": "fake-session-01N3SUPERSEDER",
+            "stage_id": "00-only",
+            "index": 0,
+            "attempt": 2,
+            "stage_kind": "actor",
+        }}),
+    );
+
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "superseded");
+    let detail = abandoned[0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&execution_id) && detail.contains("01N3SUPERSEDER"),
+        "the detail must name both reservations: {detail}"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "a superseded launch never becomes the run's execution"
+    );
+    assert!(
+        fake.stop_requests().contains(&execution_id),
+        "the orphan it created is asked to stop: {:?}",
+        fake.stop_requests()
+    );
+    assert_eq!(
+        core.registry.state().runs[work_id]
+            .reservation
+            .as_ref()
+            .map(|r| r.execution_id.as_str()),
+        Some("01N3SUPERSEDER"),
+        "and the newer reservation is left standing"
+    );
+}
+
+/// §14.5, clause 4 (and §22.5's "no wrong attempt advanced" at the *settle*
+/// boundary rather than the recovery one): a launch for an attempt the run has
+/// moved past is late evidence, not a result.
+#[test]
+fn n24_a_launch_for_a_superseded_attempt_does_not_advance_the_current_one() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3STALE145B";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+
+    // The run moved to a third attempt of the same stage while the second
+    // attempt's launch was still in flight. Its reservation is untouched, so
+    // clause 3 passes and clause 4 is the one under test.
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 3}),
+    );
+
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "superseded");
+    assert!(
+        abandoned[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("attempt 3")),
+        "the detail must name the attempt the run actually moved to: {}",
+        abandoned[0]
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "the wrong attempt is never advanced"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-only".to_string(), 3),
+        "and the current attempt is untouched"
+    );
+    assert!(
+        fake.stop_requests().contains(&execution_id),
+        "the orphan it created is asked to stop: {:?}",
+        fake.stop_requests()
+    );
+}
