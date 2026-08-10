@@ -702,6 +702,139 @@ fn blank_journal_line_fails_closed() {
     assert!(Journal::open(dir.path()).is_err());
 }
 
+/// Invariant — `replay_after`'s skip-scan tolerates a wholly empty trailing
+/// segment: a segment rotation can create the next segment file before any
+/// event ever lands in it (the shape a crash between `create_segment` and
+/// its first write would leave). `first_seq` reports `None` for such a
+/// segment ("cannot rule anything out"), so it must neither error nor be
+/// mistaken for holding the wanted seq — replay_after must skip a fully
+/// stale earlier segment via the scan *and* pass straight through the empty
+/// trailing one without producing a phantom item or an error.
+#[test]
+fn replay_after_skips_empty_trailing_rotation_segment() {
+    let dir = TempDir::new().expect("tempdir");
+    // Small threshold: two appends force a real rotation, so segments 1 and
+    // 2 each hold exactly one real event.
+    let mut journal = Journal::open_with(dir.path(), 1).expect("open small-segment journal");
+    let e1 = journal.append(draft("tick", None)).expect("append 1");
+    let e2 = journal.append(draft("tick", None)).expect("append 2");
+    assert!(segment_path(dir.path(), 1).exists());
+    assert!(segment_path(dir.path(), 2).exists());
+
+    // Hand-construct the trailing empty segment 3: rotation created the file
+    // but (in this simulated crash window) nothing was ever appended to it.
+    let seg3 = segment_path(dir.path(), 3);
+    fs::File::create(&seg3).expect("create empty trailing segment");
+    assert_eq!(fs::metadata(&seg3).expect("stat seg3").len(), 0);
+
+    // after = e1.seq: the scan must skip all of segment 1 (its first_seq is
+    // <= after+1), land on segment 2 for e2, and pass through the empty
+    // segment 3 without error or a phantom event.
+    let results: Vec<_> = journal
+        .replay_after(e1.seq)
+        .expect("replay_after must not error on the empty trailing segment")
+        .collect();
+    assert_eq!(
+        results.len(),
+        1,
+        "only e2 is past `after`, and the empty trailing segment adds nothing"
+    );
+    let got = results[0].as_ref().expect("e2 replays cleanly");
+    assert_eq!(got.seq, e2.seq);
+    assert_eq!(got.id, e2.id);
+}
+
+/// Invariant — a malformed *first* line of a segment that the `replay_after`
+/// skip-scan must inspect surfaces as `first_seq`'s own
+/// `Malformed { line: 1, .. }`, exactly like the mid-journal malformed-line
+/// cases above (~:494, ~:676) rather than being silently treated as "no
+/// events yet" or skipped past.
+#[test]
+fn replay_after_surfaces_malformed_first_line_of_second_segment() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut journal = Journal::open_with(dir.path(), 1).expect("open small-segment journal");
+    let e1 = journal.append(draft("tick", None)).expect("append 1");
+    journal.append(draft("tick", None)).expect("append 2"); // rotates into segment 2
+
+    // The journal opened and validated cleanly above; corrupt segment 2's
+    // one and only (first) line afterwards, simulating on-disk corruption
+    // discovered only when replay_after's skip-scan later reads it.
+    let seg2 = segment_path(dir.path(), 2);
+    fs::write(&seg2, b"{this is not an event}\n").expect("corrupt segment 2 line 1");
+
+    let err = journal
+        .replay_after(e1.seq)
+        .expect_err("a malformed first line of a scanned segment must fail the skip-scan");
+    assert!(
+        matches!(
+            &err,
+            JournalError::Malformed { line: 1, segment, .. } if segment == "00000002.ndjson"
+        ),
+        "got {err:?}"
+    );
+}
+
+/// Invariant — `Replay::next`'s file-open io arm: a segment listed at replay
+/// construction time can vanish before the iterator actually opens it (a
+/// concurrent deletion, or any other race between listing and reading). The
+/// io error must surface through `next()` — never a panic, never a silent
+/// empty result — and the iterator must latch failed so every subsequent
+/// call returns `None`, never retrying or yielding a phantom item.
+#[test]
+fn replay_next_surfaces_io_error_for_segment_deleted_after_listing() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut journal = Journal::open(dir.path()).expect("open");
+    journal.append(draft("tick", None)).expect("append 1");
+
+    let mut replay = journal.replay().expect("replay (lists segments)");
+    // Delete the segment after it was listed but before the iterator has
+    // opened it — `next()` has not been called yet.
+    fs::remove_file(segment_path(dir.path(), 1)).expect("delete segment after listing");
+
+    let first = replay
+        .next()
+        .expect("the io error must surface, not a silent end of iteration");
+    assert!(
+        matches!(&first, Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
+        "got {first:?}"
+    );
+
+    // The iterator is now failed and must stay that way.
+    assert!(replay.next().is_none());
+    assert!(replay.next().is_none());
+}
+
+/// Invariant — `Replay::next`'s line-read io arm: `BufRead::lines()` fails at
+/// the io layer (not at JSON parsing) when a segment's bytes are not valid
+/// UTF-8, a different failure site than the JSON-malformed-line tests above.
+/// The error must surface through `next()` and the iterator must latch
+/// failed exactly like the deleted-segment case.
+#[test]
+fn replay_next_surfaces_io_error_for_invalid_utf8_segment() {
+    let dir = TempDir::new().expect("tempdir");
+    {
+        let mut journal = Journal::open(dir.path()).expect("open");
+        journal.append(draft("tick", None)).expect("append 1");
+    }
+    let seg = segment_path(dir.path(), 1);
+    // 0xFF is never a valid UTF-8 lead byte; Lines must fail reading it
+    // before serde_json ever sees a string.
+    fs::write(&seg, [0xFFu8, b'\n']).expect("write invalid-utf8 segment");
+
+    let mut replay = Journal::replay_data_dir(dir.path()).expect("replay");
+    let first = replay
+        .next()
+        .expect("the io error must surface, not a silent end of iteration");
+    assert!(
+        matches!(&first, Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData),
+        "got {first:?}"
+    );
+
+    // The iterator is now failed and must stay that way.
+    assert!(replay.next().is_none());
+    assert!(replay.next().is_none());
+}
+
 /// Invariant — a snapshot rewrite lands as an atomic replace (a fresh file
 /// renamed over the path), never as an in-place truncate of the previous
 /// snapshot, and leaves no tmp litter behind.
