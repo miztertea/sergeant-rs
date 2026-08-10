@@ -44,6 +44,41 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### N2 — 2026-08-10, actor-only repo-to-icm: built, run, blind-measured
+
+**Mission outcome: contract met — the workflow exists, ran through the real
+engine, and the measurement returned a verdict.** The verdict:
+**§22.2 NOT met** — generator v1 silently missed 11 consequence-class
+behaviors within its covered scope; recall 47.3% in-scope, precision clean
+(zero invention, every quote verbatim at the pinned SHA), representation
+skewed ~9× toward shared-helper vs the reference's judgment tiers.
+Scorecard + grammar-pressure report in `docs/gauntlet/runs/n2-run2/`.
+Grammar pressure adjudicated: **GP-2 (actor-initiated mid-run ask) is the
+sole confirmed engine gap licensing Program B scope**; the volume wall
+(16/136 files per single-actor turn) is real but its engine claim was
+rejected — partitioned harvest stages and intra-stage iteration are untried
+lower rungs; §21.8 composition trigger NOT fired. Two resilience results
+measured incidentally: run 1 propagated a setup ambiguity fail-closed
+through all 10 stages with zero invention; run 2's daemon restart correctly
+blocked a stale fake execution (recovery invariant confirmed at GP-4).
+Defect #29 filed (finalize.py deleted a never-committed evidence file).
+U1 measured (needs_input/respond holds and resumes the same execution);
+U3 answered (dispositions + finalize executed on a real work branch).
+
+**Environmental behavior.** Build workflow (7 agents: measure-first U1,
+3 Sonnet builders, validator, 2 blind Opus critics — 31 findings, 7 error),
+Sonnet fix round (30/31 closed, one measured doc-vs-engine correction),
+two measurement runs (12 agents each; run-2 resumed once after a wedged
+harvest actor — workflow-runner failure, not engine), comparison (3 Sonnet
+comparers + Opus adjudicator; the adjudicator overturned C1's
+hash-integrity claim on re-verification and confirmed the rest). ~4.2M
+subagent tokens this milestone. Orchestrator error recorded: run 1's
+intent named no subject/revision and omitted UPSTREAM.md — the workflow's
+fail-closed discipline caught it end-to-end. Scripts archived
+(n2-build/-run/-run2/-compare).
+
+---
+
 ### N1 — 2026-08-10, ICM convention + adjudicated Sergeant reference decomposition
 
 **Mission outcome: contract met; corpus frozen at version 1** (`reference-corpus/FROZEN.md`).
