@@ -175,3 +175,61 @@ different repositories still proceed in parallel. The three runs above are
 `concurrent_surfaces_on_one_repository_all_materialize_and_retire_cleanly`,
 which fails 5 runs in 8 with the lock removed and passes deterministically with
 it — the same shape the bug had.
+
+---
+
+# Round-2 addendum (2026-08-10): the blind band these instruments leave
+
+Recorded, not fixed. Round-2 finding N3R2-05 measured what the tightened
+budgets actually catch, and the honest answer has a hole in the middle of it
+that a reader of the tables above would not guess.
+
+## The per-lock-hold band: anything under ~200 ms
+
+`INDEPENDENT_REQUEST_BUDGET` went from 1 s to 200 ms in wave 2, and that change
+has real teeth: with a 300 ms blocking sleep under the submit guard, m2's t9
+and t11 both fail with the intended message, where the old 1 s bound would have
+passed it without a murmur. But the value the boundary was moved for is 86 ms —
+the measured cost of one `git worktree add` on a 3.4 MB `.git` in this
+container, i.e. INV-N3-02 itself — and with an 86 ms sleep under that same
+guard **nothing in the tree fails**. The §22.6 instruments see a hold of 200 ms
+or more; below that they see nothing, however many times per second it happens.
+
+The throughput floor does not close the band either, and it is a slower
+instrument than it looks: m2's t12 (rewritten in round 2 to submit on the real
+path) catches any effect of duration *d* serialized under the guard once
+`1/d` drops below its 12 works/s floor, i.e. from about **80 ms** upward. Below
+that the wall-clock signal is inside the run-to-run spread of a shared test
+host. A second fsync per journal append — A-N3-1's own cost story — is ~5% of a
+submit here (38.2 → 36.8 works/s), which is to say invisible.
+
+So, stated plainly: **the contract's Budgets section is blind to any
+per-lock-hold regression shorter than ~200 ms, and to any per-submit cost
+smaller than ~80 ms, no matter how often it is paid.**
+
+## Why it is not simply tightened
+
+These suites run in parallel with seven others on shared cores. A 20 ms
+independent-request budget would fail on a scheduler hiccup rather than on a
+regression, and a flaky budget does not get investigated, it gets deleted —
+which is the failure mode L7's corollary describes from the other side. The
+200 ms figure is two orders of magnitude above the ~2 ms a contended journal
+commit actually costs here and two orders below the failures it was written to
+catch; the band between "measurably wrong" and "provably fine" is the price of
+not flaking.
+
+## What stands in the band's place
+
+Nothing timing-based, deliberately. The instruments that cover the small-effect
+case are structural and do not measure duration at all, so a 1 ms effect trips
+them exactly as readily as a 900 ms one:
+
+| instrument | sees |
+|---|---|
+| m6 `t11_external_effects_live_only_in_the_out_of_lock_performers` | any `materialize`/`rematerialize`/`teardown`/`launch`/`send`/`observe`/`resume` call site that moves into a `&mut Core` path, at any cost |
+| m6 `t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for` | a second durability syscall per append, at any cost |
+| m4 n19 / n20 / n21 | the git phases, by what exists on disk when a phase returns rather than by how long it took |
+
+The timing tests are the backstop for effects nobody thought to enumerate. They
+are not, and after this measurement should not be described as, the primary
+defence of the §22.6 budget.
