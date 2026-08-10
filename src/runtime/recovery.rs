@@ -61,6 +61,10 @@ pub struct ReconcileReport {
     /// which this restart finished and journaled. Empty on a clean restart.
     #[serde(default)]
     pub surfaces_retired: Vec<String>,
+    /// Terminal works whose *reservation* a crash left outstanding, closed by
+    /// this restart (§22.5's cancel-during-launch window).
+    #[serde(default)]
+    pub reservations_retired: Vec<String>,
 }
 
 /// Reconcile every in-flight work against its backend (§25).
@@ -138,6 +142,36 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
         .map(|work| work.id.clone())
         .collect();
 
+    // §22.5's cancel-during-launch window. `begin_retire_run` closes an
+    // outstanding reservation when a work goes terminal, but a daemon killed
+    // between the cancel landing and `settle_launch` running never got there —
+    // and nothing else would ever look, because reconciliation reads only
+    // `active` work, `pending`-but-started work, and terminal work missing a
+    // teardown (which a cancel has already written). The result was a
+    // permanently unsettled reservation, naming a possibly-live native context
+    // in a worktree cancel had just removed, that `work show` reported as open
+    // forever. These are the works whose reservation this restart closes.
+    let stranded_reservations: Vec<String> = core
+        .registry
+        .state()
+        .works
+        .values()
+        .filter(|work| {
+            matches!(
+                work.state,
+                WorkState::Completed | WorkState::Failed | WorkState::Canceled
+            )
+        })
+        .filter(|work| {
+            core.registry
+                .state()
+                .runs
+                .get(&work.id)
+                .is_some_and(|run| run.unsettled_reservation().is_some())
+        })
+        .map(|work| work.id.clone())
+        .collect();
+
     let mut report = ReconcileReport::default();
     for work_id in in_flight {
         match engine.reconcile_work(core, &work_id) {
@@ -163,6 +197,20 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
     // Nothing is *blocked* on it: the work already reached its conclusion, and
     // rewriting that conclusion because its scaffolding could not be swept
     // would be the daemon inventing state the journal never recorded.
+    // Ordered before the surface sweep on purpose: closing the record of a
+    // possibly-live external identity is the more urgent of the two, and a
+    // teardown that fails must not stop it happening.
+    for work_id in stranded_reservations {
+        match engine.reconcile_terminal_reservation(core, &work_id) {
+            Ok(true) => report.reservations_retired.push(work_id),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                work_id,
+                error = %e,
+                "could not close a reservation a crash left open on a terminal work"
+            ),
+        }
+    }
     for work_id in stranded_surfaces {
         match engine.reconcile_terminal_surface(core, &work_id) {
             Ok(true) => report.surfaces_retired.push(work_id),

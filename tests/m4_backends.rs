@@ -79,8 +79,8 @@ use sergeant_rs::domain::work::{
     KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, WorkState,
 };
 use sergeant_rs::domain::workflow::{
-    KIND_STAGE_BLOCKED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
-    KIND_WORKFLOW_BOUND,
+    KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED,
+    KIND_STAGE_NEEDS_INPUT, KIND_WORKFLOW_BOUND,
 };
 use sergeant_rs::domain::workspace::RepositorySpec;
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
@@ -4373,13 +4373,24 @@ fn n3_a_late_launch_cannot_revive_work_that_moved_on() {
         events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
         "the superseded execution never becomes the run's execution"
     );
+    // Two closures of the same reservation, in the order they were learned:
+    // the cancel closed the *record* (it could not know whether the effect had
+    // happened, so `launched` is null), and the launch reporting back closed
+    // the *effect* (it had, so `launched` is true and the orphan is stopped).
     let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
-    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned.len(), 2, "{abandoned:?}");
     assert_eq!(abandoned[0]["execution_id"], execution_id);
-    assert_eq!(abandoned[0]["reason"], "superseded");
-    assert_eq!(abandoned[0]["launched"], true);
+    assert_eq!(abandoned[0]["reason"], "work_retired");
+    assert!(
+        abandoned[0]["launched"].is_null(),
+        "the cancel cannot know whether the launch happened: {}",
+        abandoned[0]
+    );
+    assert_eq!(abandoned[1]["execution_id"], execution_id);
+    assert_eq!(abandoned[1]["reason"], "superseded");
+    assert_eq!(abandoned[1]["launched"], true);
     assert_eq!(
-        abandoned[0]["stop"]["requested"], true,
+        abandoned[1]["stop"]["requested"], true,
         "the orphan the launch created is asked to stop, not left running"
     );
     assert!(
@@ -5442,5 +5453,113 @@ fn n16_window8_cleanup_done_before_the_cleanup_append() {
     assert_eq!(
         core.registry.state().works[work_id].state,
         WorkState::Completed
+    );
+}
+
+/// §22.5's **cancel-during-launch** window, which had no treatment at all.
+///
+/// The two-phase boundary made a new one: a daemon killed after a cancel lands
+/// and before `settle_launch` runs leaves a reservation outstanding on a work
+/// that is already terminal. `begin_retire_run` closes it on the live path, but
+/// a crash skips that — and reconciliation looked at `active` work,
+/// `pending`-but-started work, and terminal work *missing a teardown*, which a
+/// cancel has already written. So the reservation stayed open forever: no
+/// `execution.abandoned` would ever close it, no restart would ever look, and
+/// `work show` kept reporting an open reservation on a canceled work.
+///
+/// §22.5's rules still bind: nothing is started, nothing is stopped, nothing is
+/// removed. The reserved identity travels into the event, because it is the
+/// thing an operator has to go and look for.
+#[test]
+fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W7B";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W7BEXEC"),
+    );
+    // The cancel landed — stage marked, work canceled, surface torn down —
+    // and then the daemon died before the launch reported back.
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_CANCELED,
+        json!({"stage_id": "00-first", "detail": "work canceled"}),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_CANCELED,
+        json!({"from": "active"}),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_SURFACE_TORN_DOWN,
+        json!({"report": {"work_id": work_id, "clean": true, "bindings": []}}),
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_some(),
+        "the window this test is about must actually be open"
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(
+        report.reservations_retired,
+        vec![work_id.to_string()],
+        "a terminal work with an open reservation must be looked at: {report:?}"
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none(),
+        "and the window closed"
+    );
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], "01N3W7BEXEC");
+    assert_eq!(abandoned[0]["reason"], "unsettled_at_restart");
+    assert_eq!(
+        abandoned[0]["native_id"], "fake-session-01N3W7BEXEC",
+        "no owned external identity lost"
+    );
+    assert!(
+        abandoned[0]["launched"].is_null(),
+        "whether the effect happened is exactly what this window cannot know"
+    );
+
+    // §22.5's convergence rules, unchanged by the closure.
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "no terminal work revived"
+    );
+    assert!(fake.starts().is_empty(), "no external effect started twice");
+    assert!(
+        fake.stop_requests().is_empty(),
+        "nothing unproven is killed"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-first".to_string(), 1),
+        "no wrong attempt advanced"
+    );
+
+    // Convergent: a second restart finds nothing left to do.
+    let again = recovery::reconcile(&engine, &mut core).expect("reconcile twice");
+    assert!(again.reservations_retired.is_empty(), "{again:?}");
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_ABANDONED).len(),
+        1,
+        "closing a closed window appends nothing"
     );
 }

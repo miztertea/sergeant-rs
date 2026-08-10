@@ -1293,10 +1293,92 @@ impl Engine {
         }
         let mut deferred = Deferred::new();
         self.stop_execution(core, work_id, reason, &mut deferred)?;
+        // A reservation whose launch has not reported back is *not* covered by
+        // the STOP above: `stop_execution` reads `run.execution`, and a
+        // reservation has no execution yet. Left standing, it is an open
+        // two-phase window on a work that has already concluded — `work show`
+        // keeps reporting an outstanding reservation on a canceled work, and a
+        // crash before the in-flight launch settles leaves a record no restart
+        // will ever look at, because reconciliation skips terminal work.
+        self.abandon_reservation(core, work_id, &run, "work_retired", reason)?;
         Ok(Step {
             next: self.teardown_next(core, work_id, false),
             deferred,
         })
+    }
+
+    /// Close an outstanding reservation on a work that has gone terminal.
+    ///
+    /// Bookkeeping only, and deliberately so. Sergeant committed to an
+    /// execution identity and cannot tell whether the external effect ever
+    /// happened, so this closes the *record* and nothing else: nothing is
+    /// started, nothing is stopped, nothing is removed (§22.5's "no unproven
+    /// state deleted"), and the reserved identity travels into the event so an
+    /// operator has the thing to go and look for.
+    ///
+    /// Returns whether an event was appended, so recovery can report it.
+    fn abandon_reservation(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        reason: &str,
+        detail: &str,
+    ) -> Result<bool, EngineError> {
+        let Some(reservation) = run.unsettled_reservation().cloned() else {
+            return Ok(false);
+        };
+        let identity = match &reservation.native_id {
+            Some(native_id) => format!("reserved native identity {native_id}"),
+            None => "no native identity had been reserved yet".to_string(),
+        };
+        self.commit(
+            core,
+            work_id,
+            KIND_EXECUTION_ABANDONED,
+            json!({
+                "execution_id": reservation.execution_id,
+                "backend": reservation.backend,
+                "native_id": reservation.native_id,
+                "stage_id": reservation.stage_id,
+                "attempt": reservation.attempt,
+                "reason": reason,
+                "detail": format!(
+                    "{detail}; the launch of execution {} ({identity}) never reported back, so \
+                     the reservation is closed as abandoned — sergeant did not start it a \
+                     second time and removed nothing it cannot prove it owns",
+                    reservation.execution_id
+                ),
+                // Unknown, and said so: `false` would claim the effect never
+                // happened, which is exactly what this window cannot know.
+                "launched": Value::Null,
+            }),
+        )?;
+        Ok(true)
+    }
+
+    /// Close a reservation a crash left outstanding on a work that is already
+    /// terminal (§22.5's cancel-during-launch window).
+    ///
+    /// The non-crash path is handled by [`Engine::begin_retire_run`]; this is
+    /// the same closure for the daemon that died between the cancel landing
+    /// and `settle_launch` running. Restart reconciliation never looked at
+    /// terminal work for this, so the reservation stayed open forever and
+    /// `work show` kept reporting it.
+    pub fn reconcile_terminal_reservation(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+    ) -> Result<bool, EngineError> {
+        let run = self.run(core, work_id)?;
+        let state = self.work_state(core, work_id)?;
+        self.abandon_reservation(
+            core,
+            work_id,
+            &run,
+            "unsettled_at_restart",
+            &format!("this work is {state} and a daemon restart found its reservation open"),
+        )
     }
 
     /// Drive a run forward from whatever its backend now says.
