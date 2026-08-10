@@ -626,3 +626,327 @@ pub fn pid_alive(pid: u32) -> bool {
 pub fn descriptor_path(data_dir: &Path) -> PathBuf {
     data_dir.join(DESCRIPTOR_FILE)
 }
+
+/// Issue #35: the committer thread's own failure paths (`commit_normalized_events`'s
+/// `Weak` upgrade, the `journaling_sink` closure's send-after-gone branch)
+/// and `export_events`'s two non-`Ok` arms (`Lagged`, `Closed`).
+///
+/// These are unit tests against the private functions directly, not through
+/// `start_with`: every scenario here is a race between the daemon going away
+/// and something still trying to use it, and racing the real HTTP surface to
+/// get there reliably would be slower and less precise than driving the
+/// committer's channel and the export loop's broadcast receiver by hand.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::event::Event;
+    use crate::domain::work::{KIND_WORK_COMPLETED, KIND_WORK_NEEDS_INPUT, KIND_WORK_SUBMITTED};
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+    use std::time::Duration;
+
+    /// A minimal, directly-constructed [`Core`] over a fresh journal — no
+    /// HTTP surface, no engine, just what the committer and the export loop
+    /// actually touch.
+    fn test_core(data_dir: &Path) -> Core {
+        let journal = Journal::open(data_dir).expect("open journal");
+        let mut registry = work_registry_projection();
+        registry
+            .catch_up(journal.replay().expect("replay"))
+            .expect("catch up");
+        let (events_tx, _) = broadcast::channel(16);
+        Core {
+            journal,
+            registry,
+            events_tx,
+        }
+    }
+
+    /// Poll the journal (lock-free: [`Journal::replay_data_dir`] only reads
+    /// segment files, so this works while another handle still holds the
+    /// journal's own exclusive lock) until `kind` shows up, bounded so a
+    /// regression that stops committing fails the test instead of hanging
+    /// it.
+    fn wait_for_kind(data_dir: &Path, kind: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let found = Journal::replay_data_dir(data_dir)
+                .expect("replay")
+                .filter_map(|e| e.ok())
+                .any(|e| e.kind == kind);
+            if found {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{kind:?} never appeared in the journal"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Wait for a thread to finish without ever blocking indefinitely: a
+    /// committer that hangs instead of returning fails this assertion
+    /// cleanly rather than hanging the whole test binary.
+    fn join_with_deadline(handle: std::thread::JoinHandle<()>, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while !handle.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "thread did not finish within {timeout:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        handle.join().expect("thread panicked");
+    }
+
+    /// A `work.needs_input` event: the fold's one unconditional, parent-free
+    /// counter (`sergeant_needs_input_total`), so a test can prove something
+    /// was recorded without also standing up a `work.submitted` span to
+    /// parent it under.
+    fn needs_input_event(seq: u64) -> Event {
+        EventDraft::new(
+            EventSource::new("daemon", "test"),
+            KIND_WORK_NEEDS_INPUT,
+            json!({}),
+        )
+        .with_work_id(format!("w{seq}"))
+        .into_event(seq)
+    }
+
+    /// A `work.submitted`/`work.completed` pair for `work_id`: the fold's
+    /// span-opening and span-closing events, exported the moment the span
+    /// closes (`with_exporters` uses a simple, synchronous exporter — see
+    /// its own doc comment) rather than on any periodic timer.
+    fn work_submitted_event(seq: u64, work_id: &str) -> Event {
+        EventDraft::new(
+            EventSource::new("daemon", "test"),
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": work_id, "intent": "x"}}),
+        )
+        .with_work_id(work_id)
+        .into_event(seq)
+    }
+
+    /// See [`work_submitted_event`].
+    fn work_completed_event(seq: u64, work_id: &str) -> Event {
+        EventDraft::new(
+            EventSource::new("daemon", "test"),
+            KIND_WORK_COMPLETED,
+            json!({}),
+        )
+        .with_work_id(work_id)
+        .into_event(seq)
+    }
+
+    /// The largest value a `u64` counter reports across every export batch.
+    ///
+    /// Not a sum: this is driven from inside a live tokio runtime (the
+    /// `#[tokio::test]` executor), so the SDK's `PeriodicReader` can fire its
+    /// own background collect in addition to the test's explicit
+    /// `force_flush` — telemetry.rs's own equivalent helper never sees this,
+    /// since its tests are plain `#[test]`s with no runtime to drive that
+    /// background task at all. Every collect of a cumulative counter reports
+    /// the *total so far*, so summing batches double-counts; the largest
+    /// value is the true total regardless of how many times collection ran.
+    fn counter_total(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+        exporter
+            .get_finished_metrics()
+            .expect("metrics")
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .filter(|metric| metric.name() == name)
+            .map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    sum.data_points().map(|dp| dp.value()).sum::<u64>()
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `commit_normalized_events` commits while its `Weak<Core>` still
+    /// upgrades, and stops committing — without panicking or hanging — the
+    /// moment the daemon's last strong reference is gone. This is the exact
+    /// race `journaling_sink`'s doc comment names: "must not keep the
+    /// journal alive past the daemon that owns it".
+    ///
+    /// A draft queued *before* the drop but only dequeued *after* it must
+    /// still be dropped, not committed — queuing happens on whichever
+    /// thread calls the sink, dequeuing happens later on the committer's own
+    /// thread, and the two are allowed to interleave any way the scheduler
+    /// likes.
+    #[test]
+    fn the_committer_commits_while_the_core_lives_and_drops_events_once_it_is_gone() {
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let core = Arc::new(tokio::sync::Mutex::new(test_core(data.path())));
+        let weak = Arc::downgrade(&core);
+        let (tx, rx) = std::sync::mpsc::channel::<EventDraft>();
+
+        let handle = std::thread::spawn(move || commit_normalized_events(&weak, &rx));
+
+        tx.send(EventDraft::new(
+            EventSource::new("test", "t"),
+            "test.alive",
+            json!({}),
+        ))
+        .expect("queue alive");
+        wait_for_kind(data.path(), "test.alive");
+
+        // The daemon's only strong reference to its own core goes away.
+        drop(core);
+        tx.send(EventDraft::new(
+            EventSource::new("test", "t"),
+            "test.after_drop",
+            json!({}),
+        ))
+        .expect("queue after drop");
+        drop(tx);
+
+        join_with_deadline(handle, Duration::from_secs(5));
+
+        let kinds: Vec<String> = Journal::replay_data_dir(data.path())
+            .expect("replay")
+            .map(|e| e.expect("event").kind)
+            .collect();
+        assert!(
+            kinds.contains(&"test.alive".to_string()),
+            "the draft sent while the core was alive must be committed: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"test.after_drop".to_string()),
+            "a draft the committer only sees after the core is gone must \
+             never be committed: {kinds:?}"
+        );
+    }
+
+    /// The sink `journaling_sink` returns is a plain closure over a channel
+    /// `Sender`; once the committer thread has actually exited (its
+    /// receiver goes with it), every further call must be swallowed as a
+    /// warning, never propagated as a panic — an adapter emitting from
+    /// *its* thread has no one to hand a delivery failure to.
+    #[test]
+    fn sink_calls_after_the_committer_is_gone_never_panic_and_never_land_in_the_journal() {
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let core = Arc::new(tokio::sync::Mutex::new(test_core(data.path())));
+        let sink = journaling_sink(core.clone());
+
+        // Drop the only strong reference the committer could ever upgrade
+        // to, then wake it: the next draft it dequeues finds the core
+        // already gone, so it returns — taking its receiver, the sink's
+        // only counterpart, with it.
+        drop(core);
+        sink(EventDraft::new(
+            EventSource::new("test", "t"),
+            "test.wake",
+            json!({}),
+        ));
+
+        // Keep calling the sink across a generous window. The committer's
+        // per-message work is a couple of microseconds (no I/O — just a
+        // failed `Weak::upgrade`), so well before this loop ends the
+        // channel's receiving half is gone and every remaining call here
+        // exercises exactly the branch under test. If it panicked instead
+        // of logging, this loop would abort right there.
+        for i in 0..200 {
+            sink(EventDraft::new(
+                EventSource::new("test", "t"),
+                format!("test.after_gone.{i}"),
+                json!({}),
+            ));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let kinds: Vec<String> = Journal::replay_data_dir(data.path())
+            .expect("replay")
+            .map(|e| e.expect("event").kind)
+            .collect();
+        assert!(
+            !kinds.iter().any(|k| k.starts_with("test.")),
+            "nothing sent after the core was dropped may ever reach the \
+             journal: {kinds:?}"
+        );
+    }
+
+    /// A receiver that lags does not end `export_events`: the surviving tail
+    /// the ring buffer actually kept is still recorded after the gap.
+    ///
+    /// Three throwaway sends into a two-slot channel before anyone ever
+    /// calls `recv()` guarantee (not race) that the first `recv()` reports
+    /// `Lagged(3)` rather than delivering in order — broadcast's own
+    /// documented overwrite contract, not scheduler luck — leaving exactly
+    /// the last two sends, one work's open/close pair, in the buffer.
+    #[tokio::test]
+    async fn export_events_keeps_recording_after_the_broadcast_receiver_lags() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Arc::new(Telemetry::with_exporters(spans.clone(), metrics));
+
+        let (tx, rx) = broadcast::channel::<Event>(2);
+        for seq in 0..3u64 {
+            tx.send(work_submitted_event(seq, &format!("junk{seq}")))
+                .expect("buffer junk");
+        }
+        tx.send(work_submitted_event(10, "survivor"))
+            .expect("buffer open");
+        tx.send(work_completed_event(11, "survivor"))
+            .expect("buffer close");
+        drop(tx);
+
+        // A clone, not a move: `export_events` drops its own reference on
+        // return, and a `Telemetry` whose refcount reaches zero drops its
+        // `SdkTracerProvider` with it, which discards this in-memory
+        // exporter's already-recorded spans along the way — a live
+        // reference must outlast the call, or the assertion below inspects
+        // an exporter the drop has already emptied.
+        tokio::time::timeout(Duration::from_secs(5), export_events(telemetry.clone(), rx))
+            .await
+            .expect(
+                "export_events must return once the sender side is gone, \
+             even after lagging",
+            );
+
+        let finished = spans.get_finished_spans().expect("spans");
+        assert_eq!(
+            finished.len(),
+            1,
+            "Lagged must not end the loop: the surviving open/close pair \
+             must still open and close a span — if Lagged ended it \
+             instead of continuing, this would be empty: {finished:?}"
+        );
+        assert_eq!(finished[0].name, "work");
+    }
+
+    /// `Closed` force-flushes before returning, rather than just returning:
+    /// without the flush, whatever the fold already recorded stays stuck in
+    /// the SDK's pending batch and this counter reads back 0.
+    #[tokio::test]
+    async fn export_events_force_flushes_and_returns_when_the_channel_closes() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Arc::new(Telemetry::with_exporters(spans, metrics.clone()));
+
+        let (tx, rx) = broadcast::channel::<Event>(4);
+        tx.send(needs_input_event(1)).expect("send");
+        drop(tx);
+
+        // If `export_events` did not return on `Closed`, this would hang
+        // forever; the timeout turns that failure mode into a clean
+        // assertion instead of a stuck test binary. A clone, not a move,
+        // for the same reason as the Lagged test above: `telemetry` must
+        // outlive the call so the assertion below is not reading an
+        // exporter the drop already emptied.
+        tokio::time::timeout(Duration::from_secs(5), export_events(telemetry.clone(), rx))
+            .await
+            .expect("export_events must return once the sender side is gone");
+
+        assert_eq!(
+            counter_total(&metrics, "sergeant_needs_input_total"),
+            1,
+            "Closed must force_flush before returning"
+        );
+    }
+}

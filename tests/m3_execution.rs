@@ -1509,6 +1509,180 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     handle.shutdown().await;
 }
 
+/// Retry's re-attachment falls back to a fresh branch cut from the recorded
+/// base SHA when the branch teardown was supposed to have retained is gone —
+/// deleted by something outside sergeant between the failed attempt and the
+/// retry. §12 promises retry as the one door back out of `failed`, and that
+/// promise must hold even when the "durable" half of a torn-down surface
+/// (the branch) has itself vanished out from under it.
+#[tokio::test]
+async fn retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    let base_sha = init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([
+        FakeStep::fail("boom"),
+        FakeStep::complete(),
+        FakeStep::complete(),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "branch vanishes before retry",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "failed");
+
+    let branch = format!("sergeant/{work_id}");
+    assert!(
+        branch_exists(&repo, &branch),
+        "teardown must retain the branch on failure"
+    );
+
+    // Something outside sergeant deletes the branch teardown was supposed
+    // to have kept — a stray cleanup, an operator, a rebase.
+    git(&repo, &["branch", "-D", &branch]);
+    assert!(!branch_exists(&repo, &branch));
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "retry must not fail just because the retained branch is gone: {body}"
+    );
+    assert_eq!(body["work"]["state"], "completed");
+
+    // The branch is back — recreated by the fallback, not merely reused.
+    assert!(
+        branch_exists(&repo, &branch),
+        "rematerialize must recreate the branch retry needs"
+    );
+
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let rematerialized: Vec<&Event> = materialized
+        .iter()
+        .filter(|e| e.payload["rematerialized"] == true)
+        .collect();
+    assert_eq!(
+        rematerialized.len(),
+        1,
+        "retry must record the rematerialization: {materialized:?}"
+    );
+    let binding = &rematerialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(
+        binding["base_sha"], base_sha,
+        "provenance is unchanged by the fallback"
+    );
+    assert_eq!(
+        binding["head_sha"], base_sha,
+        "with no branch left to preserve, the rebuilt worktree starts \
+         exactly at the recorded base SHA"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Teardown's own `RetainedError` disposition: a worktree Git itself
+/// refuses to remove, distinct from a dirty one it declines to touch.
+///
+/// `chattr +i` marks the worktree directory immutable at the filesystem
+/// level rather than merely unwritable by permission bits — this daemon
+/// (and this test suite) runs as root, for whom an ordinary permission bit
+/// is not an obstacle, but the immutable attribute blocks deletion
+/// regardless of privilege. `git status --porcelain` still succeeds (reads
+/// are unaffected), so teardown proceeds to the removal itself and only
+/// that fails, giving `RetainedError` — not `RetainedDirty` — with Git's
+/// own diagnostic, and the same evidence journaled.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journaled() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "git cannot delete this worktree",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // The worktree stays clean; only Git's own removal is blocked.
+    let chattr = Command::new("chattr")
+        .args(["+i", worktree.to_str().expect("utf8 path")])
+        .status()
+        .expect("run chattr");
+    assert!(
+        chattr.success(),
+        "chattr +i must succeed to set up this fixture"
+    );
+
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    let report = &torn[0].payload["report"];
+    assert_eq!(
+        report["clean"], false,
+        "a removal Git refuses is not a clean teardown"
+    );
+    assert_eq!(report["bindings"][0]["disposition"], "retained_error");
+    assert!(
+        report["bindings"][0]["detail"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "Git's own diagnostic must be recorded, not swallowed: {report}"
+    );
+    assert!(
+        worktree.is_dir(),
+        "a worktree Git refused to remove must survive teardown"
+    );
+
+    // Clear the immutable bit so the tempdir guards can actually reclaim
+    // the fixture on drop.
+    let cleared = Command::new("chattr")
+        .args(["-i", worktree.to_str().expect("utf8 path")])
+        .status()
+        .expect("run chattr");
+    assert!(cleared.success(), "chattr -i must succeed to clean up");
+
+    handle.shutdown().await;
+}
+
 /// Cancelling a work parked in `blocked` retires the stage it was parked in.
 /// The stage coordinate is orthogonal to work state (§10), which is exactly
 /// why it has to be retired explicitly: a canceled work whose stage still
