@@ -275,6 +275,19 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
                     core,
                 )
             }
+            EngineNext::Surface(pending) => {
+                drop(held.take()); // nor run git: `git worktree add` is a
+                // fork/exec/wait per repository on a checkout the daemon does
+                // not own and cannot bound (§22.6).
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = state.core.lock().await;
+                (
+                    work_id,
+                    state.engine.settle_surface(&mut core, pending, outcome),
+                    core,
+                )
+            }
         };
         let (work_id, outcome, core) = settled;
         match outcome {
@@ -591,7 +604,7 @@ struct SubmitRequest {
 }
 
 /// §13's origin metadata: who is asking, and from where.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Origin {
     /// Front-end harness name, e.g. `claude`. Drives origin affinity.
     #[serde(default)]
@@ -621,6 +634,45 @@ async fn submit_work(
     if let Err(resp) = parse_command_id(&req.command_id) {
         return *resp;
     }
+    // Planning happens with **no lock held**. It reads the filesystem —
+    // `Workspace::discover` walks up to the git root and parses
+    // `sergeant.toml`, `WorkflowDefinition::resolve` reads every stage's
+    // `CONTEXT.md` — and probes every harness the run will use (§17.5). All of
+    // that is external I/O on paths the daemon does not own, which §22.6 keeps
+    // out from under the core lock; it is also, by construction, side-effect
+    // free, so running it before the guard costs nothing but a re-check.
+    //
+    // The re-check is the price. Two concurrent submissions of the same
+    // `command_id` can now both plan; exactly-once is preserved by taking the
+    // guard afterwards and consulting the recorded outcome there, which is the
+    // same single-writer decision it always was — just made after the reading
+    // rather than around it.
+    let origin = req.origin.clone().unwrap_or_default();
+    let planned = if req.intent.trim().is_empty() {
+        None
+    } else {
+        let engine = state.engine.clone();
+        let backend = req.backend.clone();
+        let workflow = req.workflow.clone();
+        let profile = req.profile.clone();
+        let repositories = req.repositories.clone();
+        let origin_cwd = origin.cwd.clone();
+        let origin_client = origin.client.clone();
+        Some(
+            blocking(move || {
+                engine.plan(&SubmitContext {
+                    cwd: origin_cwd.as_deref(),
+                    origin_client: origin_client.as_deref(),
+                    backend: backend.as_deref(),
+                    workflow: workflow.as_deref(),
+                    profile: profile.as_deref(),
+                    repositories: &repositories,
+                })
+            })
+            .await,
+        )
+    };
+
     let mut core = state.core.lock().await;
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
@@ -663,21 +715,14 @@ async fn submit_work(
         );
     }
 
-    // Plan before creating anything. Workspace topology, workflow content,
-    // routing and profile are all decided here, with no side effects — so a
-    // submission that cannot be routed is rejected with §13's available
-    // options instead of creating work that immediately dies. `Ok(None)`
-    // means the client offered no repository context; the work is accepted
-    // and stays `pending`, exactly as it did before there was an engine.
-    let origin = req.origin.unwrap_or_default();
-    let plan = match state.engine.plan(&SubmitContext {
-        cwd: origin.cwd.as_deref(),
-        origin_client: origin.client.as_deref(),
-        backend: req.backend.as_deref(),
-        workflow: req.workflow.as_deref(),
-        profile: req.profile.as_deref(),
-        repositories: &req.repositories,
-    }) {
+    // The plan decided above, before the guard: workspace topology, workflow
+    // content, routing, profiles and the §17.5 stage preflight, all with no
+    // side effects — so a submission that cannot be routed is rejected with
+    // §13's available options instead of creating work that immediately dies.
+    // `Ok(None)` means the client offered no repository context; the work is
+    // accepted and stays `pending`, exactly as it did before there was an
+    // engine.
+    let plan = match planned.expect("planned whenever the intent is non-empty") {
         Ok(plan) => plan,
         Err(e) => {
             let status = engine_error_status(&e);

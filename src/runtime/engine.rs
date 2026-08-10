@@ -51,7 +51,7 @@ use crate::runtime::projection::WorkRun;
 use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage};
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfaceError,
-    SurfacePlan, materialize, rematerialize, teardown,
+    SurfacePlan, TeardownReport, WorkSurface, materialize, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
@@ -272,6 +272,101 @@ pub struct SendOutcome {
     observed: Option<Result<Observation, BackendError>>,
 }
 
+/// A git operation the engine has committed to and must now perform **with
+/// the core lock released** (§14.2's middle phase, applied to §11's surfaces).
+///
+/// Materializing a surface is three `git` fork/exec/wait cycles per repository
+/// on a checkout sergeant does not own and cannot bound; teardown and
+/// re-attachment are more of the same. Measured in this container, a single
+/// `git worktree add` on a 3.4 MB `.git` takes 86 ms — and a monorepo is not
+/// 3.4 MB. Under the guard that is every other request on the daemon, reads
+/// included, queueing behind someone else's checkout.
+pub struct PendingSurface {
+    work_id: String,
+    effect: SurfaceEffect,
+}
+
+/// Which git operation a [`PendingSurface`] carries, and what the engine will
+/// do with the result once it has the lock back.
+pub enum SurfaceEffect {
+    /// Create the run's worktrees, then bind the workflow and enter stage 0.
+    Materialize {
+        /// Data dir the `surfaces/` tree lives under.
+        data_dir: PathBuf,
+        /// The plan whose repositories are being materialized, carried so the
+        /// binding it produces is the one that was admitted.
+        plan: Box<StartPlan>,
+    },
+    /// Re-attach the worktrees a terminal teardown removed, then re-enter the
+    /// stage this retry is for.
+    Rematerialize {
+        /// The recorded surface, whose branches are the durable part.
+        surface: WorkSurface,
+        /// Stage index the retry re-enters.
+        index: usize,
+        /// Attempt number it re-enters as.
+        attempt: u32,
+    },
+    /// Remove the worktrees and report what the disk actually held.
+    Teardown {
+        /// The recorded surface.
+        surface: WorkSurface,
+        /// Whether a restart, rather than the run itself, is what recorded it.
+        recovered: bool,
+    },
+}
+
+impl std::fmt::Debug for PendingSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let effect = match &self.effect {
+            SurfaceEffect::Materialize { .. } => "materialize",
+            SurfaceEffect::Rematerialize { .. } => "rematerialize",
+            SurfaceEffect::Teardown { .. } => "teardown",
+        };
+        f.debug_struct("PendingSurface")
+            .field("work_id", &self.work_id)
+            .field("effect", &effect)
+            .finish()
+    }
+}
+
+impl PendingSurface {
+    /// The work this operation serves.
+    pub fn work_id(&self) -> &str {
+        &self.work_id
+    }
+
+    /// Run the git operation. **Never while holding the core lock.**
+    pub fn perform(&self) -> SurfaceOutcome {
+        match &self.effect {
+            SurfaceEffect::Materialize { data_dir, plan } => SurfaceOutcome::Materialized(
+                materialize(data_dir, &self.work_id, &plan.repositories),
+            ),
+            SurfaceEffect::Rematerialize { surface, .. } => {
+                // A retry whose worktrees are all still on disk needs no git
+                // at all; asking here rather than under the guard keeps even
+                // the `stat` calls out of it.
+                if surface.bindings.iter().all(|b| b.worktree_path.exists()) {
+                    return SurfaceOutcome::Rematerialized(Ok(None));
+                }
+                SurfaceOutcome::Rematerialized(rematerialize(surface).map(Some))
+            }
+            SurfaceEffect::Teardown { surface, .. } => SurfaceOutcome::TornDown(teardown(surface)),
+        }
+    }
+}
+
+/// What [`PendingSurface::perform`] came back with.
+#[derive(Debug)]
+pub enum SurfaceOutcome {
+    /// A fresh surface, or the failure that left none.
+    Materialized(Result<WorkSurface, SurfaceError>),
+    /// A re-attached surface, `None` when nothing needed re-attaching.
+    Rematerialized(Result<Option<WorkSurface>, SurfaceError>),
+    /// Teardown never fails: it reports what it found (§11 fails closed).
+    TornDown(TeardownReport),
+}
+
 /// What the engine needs before it can crank again.
 #[derive(Debug)]
 pub enum Next {
@@ -287,6 +382,9 @@ pub enum Next {
     /// Deliver this outside the lock, then feed the result back through
     /// [`Engine::settle_send`].
     Send(Box<PendingSend>),
+    /// Run this git operation outside the lock, then feed the result back
+    /// through [`Engine::settle_surface`].
+    Surface(Box<PendingSurface>),
 }
 
 /// One crank of the engine: everything it committed under this lock hold,
@@ -702,26 +800,110 @@ impl Engine {
         self.run_inline(core, step)
     }
 
-    /// [`Engine::start`]'s first phase: everything up to and including the
-    /// first stage's reservation, all of it under the caller's lock.
+    /// [`Engine::start`]'s first phase: journal the intent to materialize, and
+    /// hand the git back to the caller.
     ///
-    /// The daemon calls this, releases the core guard, performs the returned
-    /// [`Next::Launch`], and comes back through [`Engine::settle_launch`].
+    /// This used to run `git worktree add` — three fork/exec/wait cycles per
+    /// repository — under the caller's guard. It is now §14.2's first phase and
+    /// nothing more: one append, then a [`Next::Surface`] the daemon performs
+    /// with the lock released. The binding, the `work.started` transition and
+    /// the first stage's reservation all happen in
+    /// [`Engine::settle_surface`], back under the lock, exactly as before.
+    ///
+    /// **L6 audit.** The append order is unchanged and so are its windows: the
+    /// intent to materialize is durable before anything can create a branch in
+    /// a repository sergeant does not own, and
+    /// [`Engine::reconcile_crashed_start`] still turns whatever prefix
+    /// survives into a `blocked` work with that inventory as its evidence.
+    /// Releasing the guard in the middle adds no window a crash did not
+    /// already have — a crash and a released lock leave the journal in exactly
+    /// the same state — it adds the *concurrency* case, which `settle_surface`
+    /// answers with §14.5's rule.
     pub fn begin_start(
         &self,
         core: &mut Core,
         work: &Work,
         plan: &StartPlan,
     ) -> Result<Step, EngineError> {
-        // Recorded first: everything below this line can create a branch and
-        // a worktree in a repository sergeant does not own.
+        // Recorded first: everything the returned effect does can create a
+        // branch and a worktree in a repository sergeant does not own.
         self.commit(
             core,
             &work.id,
             KIND_SURFACE_MATERIALIZING,
             json!({"plan": SurfacePlan::new(&self.data_dir, &work.id, &plan.repositories)}),
         )?;
-        let surface = match materialize(&self.data_dir, &work.id, &plan.repositories) {
+        Ok(Step {
+            next: Next::Surface(Box::new(PendingSurface {
+                work_id: work.id.clone(),
+                effect: SurfaceEffect::Materialize {
+                    data_dir: self.data_dir.clone(),
+                    plan: Box::new(plan.clone()),
+                },
+            })),
+            deferred: Deferred::new(),
+        })
+    }
+
+    /// §14.2's third phase for a git operation.
+    ///
+    /// Takes the boxed pending by value for the same reason the launch phase
+    /// does: `Next` carries it boxed, and unboxing at every call site to hand
+    /// it back would be churn, not clarity.
+    #[allow(clippy::boxed_local)]
+    pub fn settle_surface(
+        &self,
+        core: &mut Core,
+        pending: Box<PendingSurface>,
+        outcome: SurfaceOutcome,
+    ) -> Result<Step, EngineError> {
+        let work_id = pending.work_id.clone();
+        match (pending.effect, outcome) {
+            (SurfaceEffect::Materialize { plan, .. }, SurfaceOutcome::Materialized(result)) => {
+                self.settle_materialize(core, &work_id, &plan, result)
+            }
+            (
+                SurfaceEffect::Rematerialize {
+                    surface,
+                    index,
+                    attempt,
+                },
+                SurfaceOutcome::Rematerialized(result),
+            ) => self.settle_rematerialize(core, &work_id, &surface, index, attempt, result),
+            (SurfaceEffect::Teardown { recovered, .. }, SurfaceOutcome::TornDown(report)) => {
+                let mut payload = json!({"report": report});
+                if recovered {
+                    payload["recovered"] = Value::Bool(true);
+                }
+                self.commit(core, &work_id, KIND_SURFACE_TORN_DOWN, payload)?;
+                Ok(Step::parked())
+            }
+            // Unreachable by construction — every producer pairs the effect
+            // with its own outcome — and a silent no-op would be the worst
+            // possible answer if it ever became reachable, since the git has
+            // already run. Fail closed with the mismatch named.
+            (_, outcome) => {
+                let detail =
+                    format!("surface effect settled with a mismatched outcome: {outcome:?}");
+                self.block(
+                    core,
+                    &work_id,
+                    "internal surface-phase mismatch",
+                    Some(detail),
+                )?;
+                Ok(Step::parked())
+            }
+        }
+    }
+
+    fn settle_materialize(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        plan: &StartPlan,
+        result: Result<WorkSurface, SurfaceError>,
+    ) -> Result<Step, EngineError> {
+        let surface = match result {
             Ok(surface) => surface,
             Err(SurfaceError::PartialFailure { source, teardown }) => {
                 // Earlier repositories in this request got a real worktree
@@ -730,13 +912,13 @@ impl Engine {
                 // mystery, and put it in the evidence too.
                 self.commit(
                     core,
-                    &work.id,
+                    work_id,
                     KIND_SURFACE_TORN_DOWN,
                     json!({"report": teardown}),
                 )?;
                 self.block(
                     core,
-                    &work.id,
+                    work_id,
                     &format!("cannot materialize work surface: {source}"),
                     Some(serde_json::to_string(&teardown).unwrap_or_default()),
                 )?;
@@ -745,22 +927,41 @@ impl Engine {
             Err(e) => {
                 self.block(
                     core,
-                    &work.id,
+                    work_id,
                     &format!("cannot materialize work surface: {e}"),
                     None,
                 )?;
                 return Ok(Step::parked());
             }
         };
+        // The surface exists in the user's repositories now, so it is recorded
+        // before anything else is decided — including when the decision turns
+        // out to be "this work is gone". §22.5's "no owned external identity
+        // lost" is not only about harness sessions.
         self.commit(
             core,
-            &work.id,
+            work_id,
             KIND_SURFACE_MATERIALIZED,
             json!({"surface": surface}),
         )?;
+        // §14.5, for the phase that created worktrees: a cancel may have
+        // landed while git ran. A late materialization does not start a work
+        // that is no longer pending — it hands the worktrees straight back to
+        // teardown instead of leaving them on disk with no owner.
+        if let Some(why) = self.start_is_stale(core, work_id) {
+            tracing::info!(
+                work_id,
+                why,
+                "tearing down a surface whose start was superseded"
+            );
+            return Ok(Step {
+                next: self.teardown_next(core, work_id, false),
+                deferred: Deferred::new(),
+            });
+        }
         self.commit(
             core,
-            &work.id,
+            work_id,
             KIND_WORKFLOW_BOUND,
             json!({
                 "workflow": plan.workflow,
@@ -776,15 +977,31 @@ impl Engine {
         )?;
         self.transition(
             core,
-            &work.id,
+            work_id,
             KIND_WORK_STARTED,
             json!({"backend": plan.route.backend, "workflow": plan.workflow.name}),
         )?;
-        let next = self.reserve_stage(core, &work.id, 0, 1)?;
+        let next = self.reserve_stage(core, work_id, 0, 1)?;
         Ok(Step {
             next,
             deferred: Deferred::new(),
         })
+    }
+
+    /// Why a materialization's result may no longer start a run, or `None`.
+    ///
+    /// The work must still exist and still be `pending`: `work.started` is the
+    /// only transition out of `pending` the engine makes, and anything else
+    /// that moved it — a cancel — did so deliberately.
+    fn start_is_stale(&self, core: &Core, work_id: &str) -> Option<String> {
+        match core.registry.state().works.get(work_id) {
+            None => Some("the work no longer exists".to_string()),
+            Some(work) if work.state != WorkState::Pending => Some(format!(
+                "work is {} — a surface that finished afterwards cannot start it",
+                work.state
+            )),
+            Some(_) => None,
+        }
     }
 
     /// Drive a [`Step`] to a park **inline**, performing every launch and
@@ -811,6 +1028,10 @@ impl Engine {
                 Next::Send(pending) => {
                     let outcome = pending.perform();
                     step = self.settle_send(core, pending, outcome)?;
+                }
+                Next::Surface(pending) => {
+                    let outcome = pending.perform();
+                    step = self.settle_surface(core, pending, outcome)?;
                 }
             }
         }
@@ -920,30 +1141,94 @@ impl Engine {
         // `surface.materializing` marker of its own: re-attachment can only
         // recreate paths and a branch the recorded surface already names, so
         // a crash here leaves nothing the journal has not already declared.
+        //
+        // It is git, so it is §14.2's middle phase like every other git: the
+        // effect goes back to the caller and the re-entry happens in
+        // `settle_surface`. A run with no recorded surface has nothing to
+        // re-attach and re-enters right here, under this lock.
         if let Some(surface) = run.surface.clone() {
-            let needs_surface = surface.bindings.iter().any(|b| !b.worktree_path.exists());
-            if needs_surface {
-                match rematerialize(&surface) {
-                    Ok(surface) => self.commit(
-                        core,
-                        work_id,
-                        KIND_SURFACE_MATERIALIZED,
-                        json!({"surface": surface, "rematerialized": true}),
-                    )?,
-                    Err(e) => {
-                        return Err(e.into());
-                    }
-                };
-            }
+            return Ok(Step {
+                next: Next::Surface(Box::new(PendingSurface {
+                    work_id: work_id.to_string(),
+                    effect: SurfaceEffect::Rematerialize {
+                        surface,
+                        index: current.index,
+                        attempt: current.attempt + 1,
+                    },
+                })),
+                deferred: Deferred::new(),
+            });
         }
+        self.reenter_stage(
+            core,
+            work_id,
+            &current.stage_id,
+            current.index,
+            current.attempt + 1,
+        )
+    }
 
+    fn settle_rematerialize(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        surface: &WorkSurface,
+        index: usize,
+        attempt: u32,
+        result: Result<Option<WorkSurface>, SurfaceError>,
+    ) -> Result<Step, EngineError> {
+        match result {
+            Ok(Some(surface)) => self.commit(
+                core,
+                work_id,
+                KIND_SURFACE_MATERIALIZED,
+                json!({"surface": surface, "rematerialized": true}),
+            )?,
+            // Nothing needed re-attaching: the worktrees were still there.
+            Ok(None) => {}
+            Err(e) => return Err(e.into()),
+        }
+        // §14.5 again: the retry may have been overtaken while git ran. The
+        // paths this recreated are ones the recorded surface already named, so
+        // nothing new is owned — but the run must not be re-entered behind a
+        // newer decision's back.
+        if !matches!(
+            self.work_state(core, work_id)?,
+            WorkState::Failed | WorkState::Blocked | WorkState::Waiting
+        ) {
+            tracing::info!(
+                work_id,
+                "a retry was superseded while its surface re-attached"
+            );
+            return Ok(Step::parked());
+        }
+        let stage_id = surface
+            .bindings
+            .first()
+            .map(|_| ())
+            .and_then(|()| self.run(core, work_id).ok())
+            .and_then(|run| run.current_stage().map(|s| s.stage_id.clone()))
+            .unwrap_or_default();
+        self.reenter_stage(core, work_id, &stage_id, index, attempt)
+    }
+
+    /// The half of retry that is pure journal: resume the work and reserve the
+    /// stage's next attempt.
+    fn reenter_stage(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        stage_id: &str,
+        index: usize,
+        attempt: u32,
+    ) -> Result<Step, EngineError> {
         self.transition(
             core,
             work_id,
             KIND_WORK_RESUMED,
-            json!({"reason": "retry", "stage_id": current.stage_id}),
+            json!({"reason": "retry", "stage_id": stage_id}),
         )?;
-        let next = self.reserve_stage(core, work_id, current.index, current.attempt + 1)?;
+        let next = self.reserve_stage(core, work_id, index, attempt)?;
         Ok(Step {
             next,
             deferred: Deferred::new(),
@@ -1008,9 +1293,8 @@ impl Engine {
         }
         let mut deferred = Deferred::new();
         self.stop_execution(core, work_id, reason, &mut deferred)?;
-        self.tear_down_surface(core, work_id)?;
         Ok(Step {
-            next: Next::Parked,
+            next: self.teardown_next(core, work_id, false),
             deferred,
         })
     }
@@ -1183,8 +1467,7 @@ impl Engine {
                     KIND_WORK_FAILED,
                     json!({"reason": reason, "stage_id": stage.stage_id}),
                 )?;
-                self.tear_down_surface(core, work_id)?;
-                Ok(Next::Parked)
+                Ok(self.teardown_next(core, work_id, false))
             }
             BackendSignal::StageCompleted { summary } => {
                 let mut payload = json!({"stage_id": stage.stage_id, "index": stage.index});
@@ -1207,8 +1490,7 @@ impl Engine {
                     KIND_WORK_COMPLETED,
                     json!({"stages": workflow.stages.len()}),
                 )?;
-                self.tear_down_surface(core, work_id)?;
-                Ok(Next::Parked)
+                Ok(self.teardown_next(core, work_id, false))
             }
         }
     }
@@ -2064,10 +2346,30 @@ impl Engine {
         Ok(())
     }
 
-    /// Tear the surface down and journal the report (never silently).
-    fn tear_down_surface(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
-        self.tear_down_surface_marked(core, work_id, false)
-            .map(|_| ())
+    /// The effect that will tear this run's surface down, or [`Next::Parked`]
+    /// when there is nothing to tear down.
+    ///
+    /// Idempotent through the projection: a run that already has a teardown
+    /// report yields no effect, so re-running teardown (the crash window, a
+    /// second restart) touches no repository and appends nothing.
+    ///
+    /// The removal itself — `git worktree remove` per repository — is the
+    /// caller's to perform outside the guard, which is why this returns an
+    /// intent rather than a report.
+    fn teardown_next(&self, core: &Core, work_id: &str, recovered: bool) -> Next {
+        let Ok(run) = self.run(core, work_id) else {
+            return Next::Parked;
+        };
+        let Some(surface) = run.surface.clone() else {
+            return Next::Parked;
+        };
+        if run.teardown.is_some() {
+            return Next::Parked; // already retired
+        }
+        Next::Surface(Box::new(PendingSurface {
+            work_id: work_id.to_string(),
+            effect: SurfaceEffect::Teardown { surface, recovered },
+        }))
     }
 
     /// Finish a teardown a crash swallowed, on a work that is already
@@ -2095,41 +2397,25 @@ impl Engine {
     /// rather than pretending it landed with the completion.
     ///
     /// Returns whether an event was appended.
+    ///
+    /// This one performs its own git inline, and that is correct here and
+    /// nowhere else: it runs between journal replay and the first served
+    /// request, where nothing is queueing behind the guard because nothing is
+    /// being served (`runtime::recovery`'s single-owner window).
     pub fn reconcile_terminal_surface(
         &self,
         core: &mut Core,
         work_id: &str,
     ) -> Result<bool, EngineError> {
-        self.tear_down_surface_marked(core, work_id, true)
-    }
-
-    /// The one teardown path: both callers above are this, differing only in
-    /// whether the record says a restart is what wrote it.
-    ///
-    /// Idempotent through the projection: a run that already has a teardown
-    /// report is left alone, so re-running teardown (the crash window, a
-    /// second restart) appends nothing and touches no repository.
-    fn tear_down_surface_marked(
-        &self,
-        core: &mut Core,
-        work_id: &str,
-        recovered: bool,
-    ) -> Result<bool, EngineError> {
-        let Ok(run) = self.run(core, work_id) else {
+        let Next::Surface(pending) = self.teardown_next(core, work_id, true) else {
             return Ok(false);
         };
-        let Some(surface) = run.surface.clone() else {
-            return Ok(false);
-        };
-        if run.teardown.is_some() {
-            return Ok(false); // already retired
-        }
-        let report = teardown(&surface);
-        let mut payload = json!({"report": report});
-        if recovered {
-            payload["recovered"] = Value::Bool(true);
-        }
-        self.commit(core, work_id, KIND_SURFACE_TORN_DOWN, payload)?;
+        let outcome = pending.perform();
+        // A teardown settles to `Parked` with an empty `Deferred`; running it
+        // inline here is the single-owner path, so there is no crank to hand
+        // the Step to.
+        let step = self.settle_surface(core, pending, outcome)?;
+        self.run_inline(core, step)?;
         Ok(true)
     }
 

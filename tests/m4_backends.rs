@@ -84,12 +84,13 @@ use sergeant_rs::domain::workflow::{
 };
 use sergeant_rs::domain::workspace::RepositorySpec;
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
-use sergeant_rs::runtime::engine::{Engine, Next};
+use sergeant_rs::runtime::engine::{Engine, Next, PendingLaunch, Step, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::work_registry_projection;
 use sergeant_rs::runtime::recovery;
 use sergeant_rs::runtime::surface::{
-    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN, materialize, work_branch,
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, materialize,
+    work_branch,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -3523,6 +3524,210 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
     );
 }
 
+// ------------------- §14.2 applied to git: the surface effect boundary
+//
+// INV-N3-02: submission held the core mutex across `Workspace::discover`, every
+// stage's `CONTEXT.md` read and three `git` fork/exec/wait cycles per
+// repository; cancel held it across `git worktree remove`; retry across the
+// re-attachment. `git worktree add` on a 3.4 MB `.git` measures 86 ms in this
+// container, and the repository is one the daemon does not own and cannot
+// bound. These pin the phase split the way n1 pins it for the harness: at the
+// moment the authoritative phase returns, the git provably has not run.
+
+/// A workspace plan for `repo`, resolved exactly as a submission would.
+fn plan_for(engine: &Engine, repo: &Path) -> sergeant_rs::runtime::engine::StartPlan {
+    engine
+        .plan(&SubmitContext {
+            cwd: Some(repo),
+            ..SubmitContext::default()
+        })
+        .expect("plan")
+        .expect("a workspace")
+}
+
+/// §14.2 phase 1 for a surface: `begin_start` journals the *intent* to
+/// materialize and hands the git back. No worktree exists yet, and no
+/// `surface.materialized` has been journaled — both of which would be true if
+/// the fork/exec had happened under the caller's lock.
+#[test]
+fn n19_materializing_a_surface_is_an_effect_the_caller_performs() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let mut core = core(data.path());
+    let work_id = "01N3SURFACE1";
+    submit_work(&mut core, work_id, "materialize me");
+    let work = core.registry.state().works[work_id].clone();
+    let plan = plan_for(&engine, &repo);
+
+    let step = engine
+        .begin_start(&mut core, &work, &plan)
+        .expect("begin start");
+    let Next::Surface(pending) = step.next else {
+        panic!("phase 1 must hand the git back to the caller");
+    };
+
+    // The load-bearing negatives: the intent is durable, the effect is not.
+    assert_eq!(
+        kinds_of(&core, work_id),
+        vec![
+            "work.submitted".to_string(),
+            KIND_SURFACE_MATERIALIZING.to_string()
+        ],
+        "nothing past the intent may be journaled by phase 1"
+    );
+    assert!(
+        !data.path().join("surfaces").join(work_id).exists(),
+        "no worktree may exist while the guard is still held"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Pending,
+        "the work does not become active until the surface really exists"
+    );
+
+    // Phase 2 and 3, as the daemon runs them.
+    let outcome = pending.perform();
+    let step = engine
+        .settle_surface(&mut core, pending, outcome)
+        .expect("settle surface");
+    assert!(matches!(step.next, Next::Launch(_)), "then the first stage");
+    assert!(
+        data.path().join("surfaces").join(work_id).exists(),
+        "the surface exists once the effect has run"
+    );
+    let kinds = kinds_of(&core, work_id);
+    assert!(
+        kinds.contains(&KIND_SURFACE_MATERIALIZED.to_string())
+            && kinds.contains(&KIND_WORKFLOW_BOUND.to_string())
+            && kinds.contains(&KIND_WORK_STARTED.to_string()),
+        "and the binding lands with the lock back: {kinds:?}"
+    );
+}
+
+/// The same boundary on the way out: `begin_retire_run` marks the stage,
+/// requests the STOP and hands `git worktree remove` back — the worktree is
+/// still on disk when the authoritative phase returns.
+#[test]
+fn n20_tearing_a_surface_down_is_an_effect_the_caller_performs() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let mut core = core(data.path());
+    let work_id = "01N3SURFACE2";
+    submit_work(&mut core, work_id, "cancel me");
+    let work = core.registry.state().works[work_id].clone();
+    let plan = plan_for(&engine, &repo);
+    engine.start(&mut core, &work, &plan).expect("start");
+    let worktree = core.registry.state().runs[work_id]
+        .surface
+        .as_ref()
+        .expect("surface")
+        .bindings[0]
+        .worktree_path
+        .clone();
+    assert!(worktree.exists(), "the run has a real worktree");
+
+    commit(&mut core, work_id, KIND_WORK_CANCELED, json!({}));
+    let step = engine
+        .begin_retire_run(&mut core, work_id, "work canceled")
+        .expect("begin retire");
+    let Next::Surface(pending) = step.next else {
+        panic!("teardown must be handed back to the caller");
+    };
+    assert!(
+        worktree.exists(),
+        "the removal may not have happened while the guard was held"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).is_empty(),
+        "and nothing may claim it did"
+    );
+
+    let outcome = pending.perform();
+    let step = engine
+        .settle_surface(&mut core, pending, outcome)
+        .expect("settle surface");
+    drain(&engine, &mut core, step);
+    assert!(!worktree.exists(), "the effect removed it");
+    let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1, "and the report is journaled once");
+    assert_eq!(torn[0]["report"]["clean"], true);
+}
+
+/// §14.5 for the surface phase: a cancel that lands while `git worktree add`
+/// is running must not be started over the top of — and the worktrees the git
+/// did create must not be left on disk with no owner.
+#[test]
+fn n21_a_cancel_during_materialization_records_the_surface_and_tears_it_down() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let mut core = core(data.path());
+    let work_id = "01N3SURFACE3";
+    submit_work(&mut core, work_id, "cancel me mid-git");
+    let work = core.registry.state().works[work_id].clone();
+    let plan = plan_for(&engine, &repo);
+
+    let step = engine
+        .begin_start(&mut core, &work, &plan)
+        .expect("begin start");
+    let Next::Surface(pending) = step.next else {
+        panic!("expected the materialize effect");
+    };
+    // The git runs with the guard released — and in that window the human
+    // cancels, which is a decision the journal already holds by the time the
+    // worktrees report back.
+    let outcome = pending.perform();
+    commit(&mut core, work_id, KIND_WORK_CANCELED, json!({}));
+
+    let step = engine
+        .settle_surface(&mut core, pending, outcome)
+        .expect("settle surface");
+    drain(&engine, &mut core, step);
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "a late surface must not revive a work that moved on"
+    );
+    assert!(fake.starts().is_empty(), "and must not start a stage on it");
+    // Nothing owned is lost: the surface git created is journaled, and then
+    // torn down rather than abandoned in the user's repository.
+    assert_eq!(
+        events_of(&core, work_id, KIND_SURFACE_MATERIALIZED).len(),
+        1,
+        "the worktrees that were created are recorded"
+    );
+    let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1, "and removed: {torn:?}");
+    assert!(
+        !data.path().join("surfaces").join(work_id).exists(),
+        "no orphan surface root"
+    );
+}
+
 /// Minimal git repo for daemon-path tests.
 fn init_repo(path: &Path) {
     let git = |args: &[&str]| {
@@ -3912,6 +4117,65 @@ fn kinds_of(core: &Core, work_id: &str) -> Vec<String> {
         .collect()
 }
 
+/// Crank a [`Step`] the way the daemon does — performing every external
+/// effect outside any lock — until it hands back a launch to inspect.
+///
+/// A retry now begins with a *surface* effect (§14.2 applied to git: the
+/// worktree re-attachment is a `git worktree add`, not a journal append), so a
+/// test that wants the launch phase has to walk the same crank the daemon
+/// walks rather than assuming the first step is the launch.
+fn drain(engine: &Engine, core: &mut Core, step: Step) {
+    let mut step = step;
+    loop {
+        match step.next {
+            Next::Parked => {
+                step.deferred.wait();
+                return;
+            }
+            Next::Launch(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_launch(core, pending, outcome)
+                    .expect("settle launch");
+            }
+            Next::Send(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_send(core, pending, outcome)
+                    .expect("settle send");
+            }
+            Next::Surface(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_surface(core, pending, outcome)
+                    .expect("settle surface");
+            }
+        }
+    }
+}
+
+fn advance_to_launch(engine: &Engine, core: &mut Core, step: Step) -> Box<PendingLaunch> {
+    let mut step = step;
+    loop {
+        match step.next {
+            Next::Launch(pending) => return pending,
+            Next::Surface(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_surface(core, pending, outcome)
+                    .expect("settle surface");
+            }
+            Next::Send(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_send(core, pending, outcome)
+                    .expect("settle send");
+            }
+            Next::Parked => panic!("the crank parked before it reached a launch"),
+        }
+    }
+}
+
 /// §14.2 phase 1 and 3: `execution.reserved` is durable — with the allocated
 /// id, the reserved native identity and the pinned executor spec — **before**
 /// the backend is asked to launch anything, and `execution.started` only
@@ -3933,13 +4197,7 @@ fn n1_the_reservation_is_journaled_before_anything_is_launched() {
     journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
 
     let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
-    let Next::Launch(pending) = step.next else {
-        panic!("retry must reserve an execution and hand back its launch");
-    };
-    assert!(
-        !step.deferred.is_pending(),
-        "reserving a stage waits on nothing"
-    );
+    let pending = advance_to_launch(&engine, &mut core, step);
 
     // Phase 1 is complete and durable; phase 2 has not happened.
     let reserved = events_of(&core, work_id, KIND_EXECUTION_RESERVED);
@@ -4029,9 +4287,7 @@ fn n2_a_failed_launch_abandons_its_reservation_and_blocks_the_work() {
     journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
 
     let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
-    let Next::Launch(pending) = step.next else {
-        panic!("expected a launch");
-    };
+    let pending = advance_to_launch(&engine, &mut core, step);
     let execution_id = pending.execution_id().to_string();
     // The harness goes away between the reservation and the launch — the
     // window the two-phase boundary opens on purpose.
@@ -4084,9 +4340,7 @@ fn n3_a_late_launch_cannot_revive_work_that_moved_on() {
     journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
 
     let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
-    let Next::Launch(pending) = step.next else {
-        panic!("expected a launch");
-    };
+    let pending = advance_to_launch(&engine, &mut core, step);
     let execution_id = pending.execution_id().to_string();
 
     // …and while that launch is in flight, the human cancels.

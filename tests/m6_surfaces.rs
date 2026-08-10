@@ -2071,6 +2071,118 @@ fn declared_event_kinds() -> Vec<(String, String)> {
     found
 }
 
+/// §22.6, structurally: every external effect the engine performs lives
+/// inside a pending-effect performer, and nowhere a `&mut Core` can reach.
+///
+/// INV-N3-08's finding about the wave-1 verdict was that the instrument could
+/// only park the fake inside LAUNCH and inside a stop `Completion`, so "no
+/// external I/O, process wait or thread join under the core lock" was a claim
+/// about two paths reported as a claim about the lock. Timing tests can only
+/// ever cover the effects someone thought to gate. This one covers the class:
+/// the engine's git and harness calls must appear only in
+/// `PendingSurface::perform`, `PendingLaunch::perform`/`launch` and
+/// `PendingSend::perform`, which take no `Core` and therefore cannot be called
+/// with the guard held by construction.
+///
+/// Like t5's `ApiViews` pin, widening this is meant to be deliberate: moving
+/// an effect back into a `&mut Core` path fails here with the call site named.
+#[test]
+fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
+    let source = code_only(&read_source("runtime/engine.rs"));
+    // The performers, by the exact signatures that make them safe: none of
+    // them can see a `Core`.
+    let performers = [
+        (
+            "impl PendingSurface",
+            "pub fn perform(&self) -> SurfaceOutcome",
+        ),
+        (
+            "impl PendingLaunch",
+            "pub fn perform(&self) -> LaunchOutcome",
+        ),
+        ("impl PendingSend", "pub fn perform(&self) -> SendOutcome"),
+    ];
+    let mut ranges = Vec::new();
+    for (block, signature) in performers {
+        let start = source
+            .find(block)
+            .unwrap_or_else(|| panic!("engine.rs must declare `{block}`"));
+        assert!(
+            source[start..].contains(signature),
+            "`{block}` must expose `{signature}` — the performer's whole safety \
+             property is that it never receives a Core"
+        );
+        ranges.push((start, block_end(&source, start)));
+    }
+    // `PendingLaunch::launch` is the raw effect the two-phase tests drive by
+    // hand; it lives in the same block and is covered by the range above.
+    //
+    // One call site is deliberately outside them and named here rather than
+    // left to be discovered: startup recovery's terminal-surface sweep runs
+    // between journal replay and the first served request, where nothing is
+    // queueing behind the guard because nothing is being served.
+    // Two call sites are deliberately outside them and named here rather
+    // than left to be discovered, both single-owner paths where no request is
+    // queueing behind the guard because no request is being served:
+    // `reconcile_terminal_surface` (startup recovery's sweep) and
+    // `run_inline` (recovery and the deterministic tests, which hold the only
+    // reference to the Core there is — see its own doc comment).
+    for single_owner in ["pub fn reconcile_terminal_surface", "fn run_inline"] {
+        let start = source
+            .find(single_owner)
+            .unwrap_or_else(|| panic!("engine.rs must declare `{single_owner}`"));
+        ranges.push((start, block_end(&source, start)));
+    }
+
+    for effect in [
+        "materialize(",
+        "rematerialize(",
+        "teardown(",
+        "backend.launch(",
+        "backend.send(",
+        "pending.perform(",
+    ] {
+        for (index, _) in source.match_indices(effect) {
+            // `self.tear_down…`/`…rematerialize` as part of a longer
+            // identifier is a different symbol; require a boundary.
+            let preceded_by_ident = source[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if preceded_by_ident {
+                continue;
+            }
+            assert!(
+                ranges
+                    .iter()
+                    .any(|(start, end)| index > *start && index < *end),
+                "src/runtime/engine.rs calls `{effect}` outside every out-of-lock \
+                 performer, near: {:?}",
+                &source[index.saturating_sub(120)..(index + 60).min(source.len())]
+            );
+        }
+    }
+}
+
+/// The end of the `{ … }` block that starts at or after `from`.
+fn block_end(source: &str, from: usize) -> usize {
+    let open = source[from..].find('{').expect("a block") + from;
+    let mut depth = 0usize;
+    for (offset, c) in source[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + offset;
+                }
+            }
+            _ => {}
+        }
+    }
+    source.len()
+}
+
 fn read_source(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")
