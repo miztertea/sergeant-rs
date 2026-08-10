@@ -40,7 +40,7 @@ use sergeant_rs::domain::work::{
 use sergeant_rs::runtime::journal::Journal;
 
 mod support;
-use support::DataDir;
+use support::{DataDir, ReapSignal};
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
@@ -1266,6 +1266,15 @@ fn stop_daemon(dir: &Path) {
 /// daemons it is supposed to kill — a changed command line, a `/proc` that is
 /// not there — this fails here instead of quietly resuming the accumulation
 /// (89 live daemons on one container, measured, before the guard existed).
+///
+/// It also pins *how* the reaper stops what it finds. The guard has always
+/// escalated SIGTERM → SIGKILL, but it used to report only pids, so a daemon
+/// that slept through the ten-second grace was reaped identically to one that
+/// shut down cleanly — the difference showed up nowhere. It is not cosmetic:
+/// a SIGKILLed process runs nothing at exit, so under instrumentation it
+/// contributes no coverage profile, and "the numbers are low" would have been
+/// the only symptom. The reaper now names the signal each pid needed, and
+/// this test asserts the healthy answer: SIGTERM was enough.
 #[test]
 fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
     let dir = DataDir::new();
@@ -1288,7 +1297,24 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
     );
 
     let reaped = dir.reap();
-    assert_eq!(reaped, spawned, "the guard must reap what it found");
+    assert_eq!(
+        reaped.iter().map(|daemon| daemon.pid).collect::<Vec<_>>(),
+        spawned,
+        "the guard must reap what it found"
+    );
+    assert_eq!(
+        reaped
+            .iter()
+            .map(|daemon| daemon.signal)
+            .collect::<Vec<_>>(),
+        vec![ReapSignal::Term],
+        "the reaper must report the signal each daemon needed, and a daemon that handles \
+         SIGTERM must need only that one: a reported {kill} means either the daemon slept \
+         through the {grace}s grace or the reaper stopped asking politely, and both are \
+         losses — nothing registered at exit runs after SIGKILL",
+        kill = ReapSignal::Kill,
+        grace = 10,
+    );
     assert!(
         dir.daemon_pids().is_empty(),
         "after the reap nothing may still be running on this data dir"

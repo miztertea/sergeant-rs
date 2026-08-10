@@ -32,6 +32,50 @@ const TERM_GRACE: Duration = Duration::from_secs(10);
 /// How long it then gets to disappear from the process table.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 
+/// The signal a daemon actually needed before it went away.
+///
+/// Reported rather than inferred: the reaper records what it *sent*, so a
+/// change to the escalation order shows up in the report instead of hiding
+/// behind "it died, didn't it".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapSignal {
+    /// The polite one. The daemon runs its shutdown path and returns from
+    /// `main`, which is also the only path that flushes anything registered
+    /// to run at exit — coverage profiles among them.
+    Term,
+    /// The rude one, used only after `TERM_GRACE` elapsed. Nothing at-exit
+    /// runs: a SIGKILLed daemon contributes no coverage profile (measured,
+    /// see `scripts/coverage/README.md`), so a run where this appears is a
+    /// run whose numbers are short by whatever that daemon executed.
+    Kill,
+}
+
+impl ReapSignal {
+    /// The `kill(1)` flag that delivers it.
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Term => "-TERM",
+            Self::Kill => "-KILL",
+        }
+    }
+}
+
+impl std::fmt::Display for ReapSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Term => "SIGTERM",
+            Self::Kill => "SIGKILL",
+        })
+    }
+}
+
+/// One reaped daemon and the strongest signal the reaper had to send it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReapedDaemon {
+    pub pid: u32,
+    pub signal: ReapSignal,
+}
+
 /// A temporary sergeant data dir that reaps the daemons running on it.
 ///
 /// Construct one wherever a test points the `sgt` binary at a data dir: any
@@ -61,11 +105,11 @@ impl DataDir {
     }
 
     /// Kill every daemon on this data dir and wait for it to go, returning
-    /// the pids that had to be killed.
+    /// the pids that had to be killed and the signal each one needed.
     ///
     /// Idempotent, and safe to call from a test that also stops its daemon
     /// the polite way — a data dir with no daemon on it reaps nothing.
-    pub fn reap(&self) -> Vec<u32> {
+    pub fn reap(&self) -> Vec<ReapedDaemon> {
         reap_daemons(self.temp.path())
     }
 
@@ -144,29 +188,55 @@ pub fn daemon_pids(data_dir: &Path) -> Vec<u32> {
 
 /// SIGTERM every daemon on `data_dir`, then SIGKILL whatever is left.
 ///
-/// Returns the pids that were signalled, so a test can assert the rig did
-/// something rather than trusting it silently.
-pub fn reap_daemons(data_dir: &Path) -> Vec<u32> {
+/// Returns what was signalled and with what, so a test can assert the rig
+/// did something rather than trusting it silently — and so the escalation
+/// stops being invisible. The SIGKILL fallback used to fire without a word:
+/// the run still went green, the daemon still died, and the only trace was a
+/// coverage profile that never arrived. A `Kill` in this report is therefore
+/// also announced on stderr, because `Drop` throws the value away and the
+/// escalation is exactly the thing a discarded return value must not hide.
+pub fn reap_daemons(data_dir: &Path) -> Vec<ReapedDaemon> {
     let pids = daemon_pids(data_dir);
     if pids.is_empty() {
-        return pids;
+        return Vec::new();
     }
-    signal(&pids, "-TERM");
-    if wait_until_gone(data_dir, TERM_GRACE) {
-        return pids;
+    // Built from the signals actually sent, never from "it went away, so
+    // TERM must have done it": that inference would report `Term` for a
+    // reaper that had been changed to open with SIGKILL.
+    let mut reaped = signal(&pids, ReapSignal::Term);
+    if !wait_until_gone(data_dir, TERM_GRACE) {
+        for killed in signal(&daemon_pids(data_dir), ReapSignal::Kill) {
+            match reaped.iter_mut().find(|seen| seen.pid == killed.pid) {
+                Some(seen) => seen.signal = killed.signal,
+                None => reaped.push(killed),
+            }
+        }
+        wait_until_gone(data_dir, KILL_GRACE);
     }
-    signal(&daemon_pids(data_dir), "-KILL");
-    wait_until_gone(data_dir, KILL_GRACE);
-    pids
+    for daemon in &reaped {
+        if daemon.signal == ReapSignal::Kill {
+            eprintln!(
+                "support::reap_daemons: daemon {} on {:?} ignored SIGTERM for {}s and needed \
+                 SIGKILL — it flushed nothing at exit (coverage profiles included)",
+                daemon.pid,
+                data_dir,
+                TERM_GRACE.as_secs()
+            );
+        }
+    }
+    reaped
 }
 
-fn signal(pids: &[u32], signal: &str) {
-    for pid in pids {
-        let _ = std::process::Command::new("kill")
-            .arg(signal)
-            .arg(pid.to_string())
-            .status();
-    }
+fn signal(pids: &[u32], signal: ReapSignal) -> Vec<ReapedDaemon> {
+    pids.iter()
+        .map(|&pid| {
+            let _ = std::process::Command::new("kill")
+                .arg(signal.flag())
+                .arg(pid.to_string())
+                .status();
+            ReapedDaemon { pid, signal }
+        })
+        .collect()
 }
 
 fn wait_until_gone(data_dir: &Path, budget: Duration) -> bool {
