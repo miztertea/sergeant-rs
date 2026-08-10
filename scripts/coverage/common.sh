@@ -8,8 +8,9 @@
 #   * a recorded toolchain fingerprint, and a refusal to continue when the
 #     recorded one and the live one disagree (R-S0-2 — profdata from two
 #     rustc versions must never be merged into one number);
-#   * profraw accounting: produced / merged / discarded per stage, with each
-#     unmergeable file named rather than silently dropped (§6.3);
+#   * profraw accounting: produced / merged / discarded / **lost** per stage,
+#     with each unmergeable or vanished file named rather than silently
+#     dropped (§6.3), and a stage failure on any loss it did not declare;
 #   * the post-stage hygiene sweep — no `sgt` daemon may outlive a stage;
 #   * one artifacts directory, one log per stage, small enough to commit.
 #
@@ -22,6 +23,12 @@
 #   COV_MIN_FREE_GB disk floor, in GB            (default 10)
 #   COV_ALLOW_DRIFT=1  record a toolchain change instead of refusing — for a
 #                      deliberate re-baseline only; profdata is NOT reused.
+#   COV_TARGET_DIR  the collection tree          (default target/llvm-cov-target)
+#   COV_PROFDATA    the llvm-profdata to use     (default the rustup component's)
+#
+# The last two are overridable so the harness's own accounting can be tested
+# against a scratch directory (`scripts/coverage/selftest.sh`) instead of a
+# real 10-minute collection run. No stage script sets them.
 
 set -euo pipefail
 
@@ -34,16 +41,18 @@ COV_MIN_FREE_GB="${COV_MIN_FREE_GB:-10}"
 # into and writes its profraws under target/llvm-cov-target/, which keeps the
 # instrumented objects out of the plain `target/` the repo's gates use. Two
 # build trees total, which is the ceiling R-S0-6 sets.
-COV_TARGET_DIR="$COV_ROOT/target/llvm-cov-target"
+COV_TARGET_DIR="${COV_TARGET_DIR:-$COV_ROOT/target/llvm-cov-target}"
 
 # The rustup component's tools, never the system LLVM: system LLVM 18 cannot
 # read a profraw written by rustc 1.94's LLVM 21.
 COV_LLVM_BIN="$(dirname "$(rustc --print target-libdir)")/bin"
-COV_PROFDATA="$COV_LLVM_BIN/llvm-profdata"
+COV_PROFDATA="${COV_PROFDATA:-$COV_LLVM_BIN/llvm-profdata}"
 
 COV_STAGE=""
 COV_LOG=""
 COV_BEFORE=""
+COV_LOSS_EXPECTED=0
+COV_LOSS_REASON=""
 
 cov_say() { printf '   %s\n' "$*" | tee -a "${COV_LOG:-/dev/null}"; }
 cov_head() { printf '\n\033[1m== %s\033[0m\n' "$*" | tee -a "${COV_LOG:-/dev/null}"; }
@@ -111,6 +120,19 @@ cov_profraw_mergeable() {
   "$COV_PROFDATA" merge -sparse -o /dev/null "$1" >/dev/null 2>&1
 }
 
+# Declare that this stage removes profraws on purpose, with the reason.
+#
+# Exactly one stage does: F2's census passes each open with
+# `cargo llvm-cov clean --profraw-only`, because a census must not pool into
+# the baseline's profdata. R-S0-6 asks for failure on *unaccounted* loss, and
+# this is what accounting for it looks like — the loss is still counted, still
+# named file by file, and the reason is written into the committed tsv. What
+# the declaration buys is only that it is not a stage failure.
+cov_expect_profraw_loss() {
+  COV_LOSS_EXPECTED=1
+  COV_LOSS_REASON="${1:-declared, no reason given}"
+}
+
 # --- stage lifecycle -------------------------------------------------------
 
 # cov_stage_begin <stage-name>
@@ -123,6 +145,8 @@ cov_stage_begin() {
   cov_preflight_disk
   cov_record_versions
   COV_BEFORE="$(cov_profraw_list)"
+  COV_LOSS_EXPECTED=0
+  COV_LOSS_REASON=""
   cov_say "profraw before: $(printf '%s' "$COV_BEFORE" | grep -c . || true)"
   COV_STAGE_T0="$(date +%s)"
 }
@@ -130,20 +154,35 @@ cov_stage_begin() {
 # cov_stage_end <min-produced> <why>
 #
 # Closes the accounting: how many profraws this stage produced, how many of
-# them the toolchain can merge, how many it cannot (each named). A stage that
-# produced fewer than <min-produced> is a failed measurement, not a fast one —
-# the usual cause is that the binary under test never flushed.
+# them the toolchain can merge, how many it cannot (each named), and how many
+# that were there when the stage began are *gone*. A stage that produced fewer
+# than <min-produced> is a failed measurement, not a fast one — the usual
+# cause is that the binary under test never flushed.
+#
+# The loss half is not symmetry for its own sake. The whole C1–C3 → C4 pooled
+# shape rests on one measured claim (README claim 3: `--no-report` pools, it
+# does not clean). Counting additions only, a tool bump that falsified that
+# claim would leave every stage clearing its floor and C4's own guards
+# (profraws > 0, profdata mtime moved) passing, with the baseline quietly
+# describing the last suite alone. `comm -23` is what turns that from an
+# assumption into a check.
 cov_stage_end() {
   local min="${1:-1}" why="${2:-the stage must have produced coverage data}"
-  local after produced count merged=0 discarded=0 name
+  local after produced count merged=0 discarded=0 name lost lost_count
   after="$(cov_profraw_list)"
   produced="$(comm -13 <(printf '%s\n' "$COV_BEFORE") <(printf '%s\n' "$after") | grep . || true)"
   count="$(printf '%s' "$produced" | grep -c . || true)"
+  lost="$(comm -23 <(printf '%s\n' "$COV_BEFORE") <(printf '%s\n' "$after") | grep . || true)"
+  lost_count="$(printf '%s' "$lost" | grep -c . || true)"
 
-  # The named-quarantine file exists only when there is something to name; an
-  # empty one in the artifacts dir would read as "checked and clean" even for
-  # a stage that never got as far as checking.
-  rm -f "$COV_ARTIFACTS/$COV_STAGE-profraw-discarded.txt"
+  # Both named files exist only when there is something to name; an empty one
+  # in the artifacts dir would read as "checked and clean" even for a stage
+  # that never got as far as checking.
+  rm -f "$COV_ARTIFACTS/$COV_STAGE-profraw-discarded.txt" \
+        "$COV_ARTIFACTS/$COV_STAGE-profraw-lost.txt"
+  if [ "$lost_count" -gt 0 ]; then
+    printf '%s\n' "$lost" > "$COV_ARTIFACTS/$COV_STAGE-profraw-lost.txt"
+  fi
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     if cov_profraw_mergeable "$COV_TARGET_DIR/$name"; then
@@ -161,9 +200,12 @@ cov_stage_end() {
     printf 'profraw_produced\t%s\n' "$count"
     printf 'profraw_mergeable\t%s\n' "$merged"
     printf 'profraw_discarded\t%s\n' "$discarded"
+    printf 'profraw_lost\t%s\n' "$lost_count"
+    printf 'profraw_loss_expected\t%s\n' \
+      "$([ "$COV_LOSS_EXPECTED" = 1 ] && printf '%s' "$COV_LOSS_REASON" || printf 'no')"
     printf 'profraw_total\t%s\n' "$(printf '%s' "$after" | grep -c . || true)"
   } > "$COV_ARTIFACTS/$COV_STAGE-accounting.tsv"
-  cov_say "profraw produced=$count mergeable=$merged discarded=$discarded"
+  cov_say "profraw produced=$count mergeable=$merged discarded=$discarded lost=$lost_count"
 
   cov_hygiene
 
@@ -175,6 +217,18 @@ cov_stage_end() {
 $COV_STAGE-profraw-discarded.txt). One of these is enough to make the report stage exit 1 with \
 'no profile can be merged' — quarantine them deliberately and record the loss, never leave them \
 in the tree (§6.3)."
+  fi
+  if [ "$lost_count" -gt 0 ] && [ "$COV_LOSS_EXPECTED" != 1 ]; then
+    cov_fail "$lost_count profraw file(s) that existed when this stage began are gone \
+(named in $COV_STAGE-profraw-lost.txt). Nothing in this pipeline may delete another stage's \
+profiles: C1–C3 pool into one profdata at C4, so a stage that cleans behind itself makes the \
+baseline describe only the suites that ran after it — and every floor and mtime guard would \
+still pass. Either a stage is cleaning (declare it with cov_expect_profraw_loss and say why), \
+or --no-report has stopped pooling (README measured claim 3) and the whole staged shape needs \
+re-measuring (R-S0-6)."
+  fi
+  if [ "$lost_count" -gt 0 ]; then
+    cov_say "profraw loss accounted for: $COV_LOSS_REASON"
   fi
   cov_say "stage $COV_STAGE ok"
 }
@@ -189,6 +243,7 @@ in the tree (§6.3)."
 # `target/debug/sgt`. Both are run anyway: the contract names the first, the
 # second also catches the uninstrumented census arm, and over-detection is the
 # safe direction. The pids are deduplicated before they are reported.
+
 cov_hygiene() {
   local instrumented plain leaked tmp
   instrumented="$(pgrep -f "llvm-cov-target/debug/sgt --data-dir" || true)"

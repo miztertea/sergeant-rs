@@ -73,7 +73,19 @@ deliberate re-baseline).
   `<stage>-profraw-discarded.txt` and fails the stage, because one such file
   is enough to kill the whole report (measured below). A stage that produces
   fewer profraws than its floor fails too — the spawning suites' floor is what
-  proves subprocess flushes actually arrived.
+  proves subprocess flushes actually arrived. The accounting runs in **both**
+  directions: files that were present when the stage began and are gone at the
+  end are counted as `profraw_lost`, named in `<stage>-profraw-lost.txt`, and
+  fail the stage. Additions-only accounting could not fail on loss at all, and
+  loss is the failure mode the staged shape is exposed to — the entire
+  C1–C3 → C4 pool rests on measured claim 3 below, and if a tool bump ever
+  falsified it, every stage would still clear its floor and C4's guards
+  (profraws > 0, profdata mtime moved) would still pass while the baseline
+  quietly described the last suite only. One stage loses profraws on purpose:
+  F2's census passes open with `clean --profraw-only`, and declare it with
+  `cov_expect_profraw_loss`, which records the loss and its reason in the tsv
+  instead of failing. That declaration is the *account* in "unaccounted loss"
+  (R-S0-6) — there is exactly one, and it is in the committed evidence.
 - **Hygiene sweep** — `pgrep -f "llvm-cov-target/debug/sgt --data-dir"` and the
   uninstrumented equivalent must both find nothing; `/tmp` residue is counted
   and recorded. Quoting matters: an unquoted pattern matches the shell that

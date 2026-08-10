@@ -2340,6 +2340,37 @@ fn the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown() {
     );
 }
 
+// -------------------------------------------------- coverage-harness pins
+
+/// `scripts/coverage/` grades the S1 baseline; something has to grade it.
+///
+/// It lives in this suite because this suite already owns the `scripts/`
+/// surface — `t4` runs `scripts/demo.sh` the same way, for the same reason:
+/// a shell script outside the gate is a script whose checks are claims. The
+/// selftest itself needs no instrumented build and no collection run; it
+/// drives `common.sh`'s accounting against a scratch directory of empty
+/// `.profraw` files and asserts the thing that was measurably unenforceable
+/// before: that a stage which destroys an earlier stage's profiles fails.
+/// It used to print "stage ok" and exit 0.
+#[test]
+fn the_coverage_harness_grades_its_own_accounting() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/coverage/selftest.sh");
+    assert!(script.exists(), "scripts/coverage/selftest.sh must exist");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/coverage/selftest.sh");
+    assert!(
+        output.status.success(),
+        "the coverage harness's selftest must pass\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ------------------------------------------------------- spawned-daemon rig
 
 /// How the rig's own daemon ended, and what the kernel said about it.

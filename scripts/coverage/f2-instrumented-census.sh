@@ -29,6 +29,13 @@ CEILING="${COV_CENSUS_CEILING_S:-14400}"
 BASE_ARTIFACTS="$COV_ARTIFACTS"
 
 cov_stage_begin f2
+# The one stage in this harness that deletes profraws on purpose (the
+# `clean --profraw-only` at the top of each pass, above). Declared so the
+# accounting records the loss with its reason instead of failing the stage —
+# every other stage's loss is a real defect and does fail. See
+# `cov_expect_profraw_loss` in common.sh.
+cov_expect_profraw_loss "each census pass opens with cargo llvm-cov clean --profraw-only, \
+so the baseline's profdata is not polluted by census runs (R-S0-6)"
 RUNS="$COV_ARTIFACTS/f2-runs.tsv"
 printf 'run\tstage\toutcome\twall_s\n' > "$RUNS"
 printf 'run\tstage\ttest\n' > "$COV_ARTIFACTS/f2-failures.tsv"
