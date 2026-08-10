@@ -21,3 +21,10 @@ commits, never rewrites — the file is the record of what ran.
   disjoint surfaces (fixtures + in-module pokes for #30/#32/#33/#34/#37/
   #39/#41), then the full loop — two-critic panel, batched refuters,
   fixer (R-S0-12: code is code, waves included).
+- `s2-wave2-gauntlet.js` — S2 wave 2 (fault injection: #30 remainder,
+  #31/#35/#36/#38/#40, #37's SSE pair). Protocol revision from wave-1
+  lessons: builders return a guard map instead of self-probing; ONE
+  independent Opus prober executes the whole wave's mutations batched in
+  a single disposable worktree (L13 as design, disk-safe), plus probes of
+  its own devising; probe survivors enter the fix round as executed
+  evidence, not refutable claims.
