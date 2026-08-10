@@ -958,6 +958,38 @@ async fn t2_the_dashboard_serves_real_data_and_is_embedded() {
     assert_eq!(handed.trim(), url, "--open must hand over the same URL");
 }
 
+/// `--open`'s failure path (`open_in_browser`): a `$BROWSER` that runs and
+/// exits nonzero must fail the command with the exit status named, not
+/// swallow it — the URL was already printed before the browser was asked to
+/// open it, so a silent failure here would leave the user unsure whether the
+/// pointer they were just given is even good.
+#[test]
+fn web_open_reports_a_browser_that_refuses_to_open_it() {
+    let data = DataDir::new();
+    let output = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("web")
+        .arg("--open")
+        .env("BROWSER", "/bin/false")
+        .output()
+        .expect("run sgt web --open");
+    assert!(
+        !output.status.success(),
+        "a browser opener that refuses must fail the command"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("/bin/false") && stderr.contains("exited with"),
+        "the failure must name the opener and how it failed: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1"),
+        "the dashboard URL must still be printed even though --open failed: {stdout}"
+    );
+}
+
 // ---------------------------------------------------------------- 3. doctor
 
 /// Acceptance 3. Doctor is green on a healthy install, names the failing
@@ -1268,6 +1300,59 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     assert!(
         stdout.contains("remedy:"),
         "human report must carry a remedy"
+    );
+}
+
+/// The journal check's *other* failure arm: `corrupt_journal` above only
+/// ever reaches "replay failed after N events" (a line the replay gets to
+/// and cannot parse). `Journal::replay_data_dir` can also fail before it
+/// reads a single line — the journal directory itself is unusable — and that
+/// is a different branch in `journal_check` with a different message
+/// ("cannot open the journal" vs. "replay failed after…"). A regular file
+/// where `journal/` should be a directory is the dir-as-file trick that
+/// reaches it: `.exists()` is still true (so the check does not take the
+/// fresh-install "no journal yet" branch), but `read_dir` on it fails.
+#[test]
+fn doctor_reports_a_journal_it_cannot_even_open() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(data.path()).expect("data dir");
+    std::fs::write(data.path().join("journal"), b"not a directory").expect("write file");
+
+    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    assert_ne!(
+        code,
+        Some(0),
+        "a journal directory that is a file must fail the install"
+    );
+    let (_, json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let report: Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(report["healthy"], false);
+    let check = named_check(&report, "journal");
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("cannot open the journal")),
+        "this is the open failure, not the replay-failed-partway-through one: {check}"
+    );
+    assert!(
+        check["remedy"].is_string(),
+        "the open failure must name a remedy too: {check}"
+    );
+    assert!(stdout.contains("remedy:"));
+
+    // The check downstream of it declines for the same reason a torn
+    // journal makes it decline: nothing was replayed to build a projection
+    // from.
+    let projection = named_check(&report, "projection");
+    assert_eq!(projection["status"], "warn", "{projection}");
+    assert!(
+        projection["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("not attempted")),
+        "{projection}"
     );
 }
 
