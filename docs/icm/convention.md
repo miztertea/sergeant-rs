@@ -161,11 +161,21 @@ Open questions (recorded, not resolved — N2's runs are the measurement):
 
 - **Merge-back semantics for Layer 4.** ICM assumes a static workspace
   whose outputs accumulate; Sergeant's Work branches are meant to merge.
-  Working rule until measured: per-run `output/` artifacts are Work-branch
-  evidence, and the workflow's closing stage explicitly decides what is
-  promoted into the merge and what is dropped — silence promotes nothing.
-  Whether that rule survives real runs (or needs `.gitignore`d outputs, a
-  strip step, or an engine-owned artifact home) is an N2 observation.
+  Working rule (owner-shaped, 2026-08-10; measured by N2): every declared
+  output carries a **disposition** in its stage's `output/README.md` —
+  `promote` (survives into the merge) or `evidence` (Work-branch record
+  only) — and a workflow that declares any output ends with a
+  deterministic **finalize** step that applies the policy mechanically:
+  keep `promote` files, remove `evidence`-class and undeclared files in a
+  final commit ("silence promotes nothing", executed rather than
+  reviewed; removed files remain in Work-branch history). Today the
+  finalize step is a shared helper invoked by the closing actor stage; it
+  is a canonical execute-stage workload once `kind = "execute"` exists.
+  Judgment about *whether* an artifact should exist belongs to the stage
+  that writes it, not to finalize — authors wanting conditional logic in
+  finalize is grammar pressure to record, not accommodate. Both halves
+  are structurally lintable (disposition present; finalize step present
+  when outputs are declared).
 - **Inputs-table enforceability.** Lint can verify that listed paths
   resolve and that L4 inputs come from earlier stages (machine-checkable).
   *Completeness* — no contract-bearing dependency omitted — is
