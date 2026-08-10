@@ -44,3 +44,28 @@ Cited by scripts/coverage/README.md's wall-clock deadline ranking.
    src/runtime/journal.rs        598 lines     29 under #[cfg(test)]     5%
    src/runtime/engine.rs        1424 lines     67 under #[cfg(test)]     5%
    TOTAL src                   18861 lines   3396 under #[cfg(test)]  18.0%
+
+== full-suite behavior under CPU contention (the instrumentation proxy) ==
+   `cargo test`, default parallel harness, this container:
+     baseline (idle)        37, 39, 36, 38, 39 s   -> 5/5 green
+     4 CPU hogs (~1.9x)     71 s                   -> green
+     8 CPU hogs (~2.5x)     92 s                   -> green
+   Instrumentation is estimated at 1.5-3x, so the suite's wall-clock
+   deadlines survived a hand-applied slowdown across most of that range.
+   This is a proxy, not the measurement: contention slows everything
+   uniformly, while instrumentation slows instrumented code specifically and
+   adds profile writes at exit. F2 is the real answer.
+
+== one observed, unreproduced failure (R-S0-7 discipline: named, not escalated) ==
+   During the first full `cargo test` after the probe worktree was deleted
+   (m6 took 31.2 s against its usual 9 s — the box was doing something else),
+   two m6 tests failed together:
+     t1_the_events_endpoint_filters_and_tails_by_work
+     t2_the_dashboard_serves_real_data_and_is_embedded
+   Not reproduced since: m6 alone green, 5 idle full runs green, 2 contended
+   full runs green (7 attempts). The transcript was lost — that run's output
+   was filtered through grep rather than captured — which is itself the
+   lesson: the F1/F2 census runners keep the full log of any run that fails.
+   Recorded by name so the census can recognize a recurrence rather than
+   greet it as new. Neither test is one the phase-1 diff touches; t1 does not
+   use the SpawnedDaemon rig at all.
