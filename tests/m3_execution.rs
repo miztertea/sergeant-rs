@@ -1553,6 +1553,25 @@ async fn retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone() {
     git(&repo, &["branch", "-D", &branch]);
     assert!(!branch_exists(&repo, &branch));
 
+    // …and the repository moves on, so the two candidate start points for
+    // the rebuilt worktree are *different commits*. Without this the
+    // fixture's `main` still points at `base_sha` (one commit from
+    // `init_repo`, an uncommitted workflow, a failed attempt that committed
+    // nothing), and "cut from the recorded base SHA" would be
+    // indistinguishable from "cut from whatever the default branch happens
+    // to point at now" — the head_sha assertion below would hold either way.
+    std::fs::write(repo.join("DRIFT.md"), "main moved on\n").expect("write drift file");
+    git(&repo, &["add", "DRIFT.md"]);
+    git(
+        &repo,
+        &["commit", "-m", "main moves on after the failed attempt"],
+    );
+    let main_tip = git(&repo, &["rev-parse", "HEAD"]);
+    assert_ne!(
+        main_tip, base_sha,
+        "the fixture must leave main ahead of the recorded base SHA"
+    );
+
     let (status, body) = post(
         &client,
         &handle,
@@ -1590,10 +1609,31 @@ async fn retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone() {
     assert_eq!(
         binding["head_sha"], base_sha,
         "with no branch left to preserve, the rebuilt worktree starts \
-         exactly at the recorded base SHA"
+         exactly at the recorded base SHA — not at {main_tip}, where the \
+         repository's default branch has since moved to"
     );
 
     handle.shutdown().await;
+}
+
+/// Clears an `chattr +i` immutable bit however the test that set it leaves.
+///
+/// The immutable directory lives inside a `TempDir`, and `TempDir::drop`
+/// *swallows* removal errors — so a panicking assertion between setting the
+/// bit and clearing it would leave a directory behind that not even root can
+/// `rm` until someone runs `chattr -i` by hand. A straight-line clear only
+/// runs on the happy path; a `Drop` runs on the unwinding one too. Same
+/// shape as `m2_daemon_api.rs`'s `ReapOnDrop`.
+#[cfg(target_os = "linux")]
+struct ClearImmutableOnDrop(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for ClearImmutableOnDrop {
+    fn drop(&mut self) {
+        // Best-effort by construction: a `Drop` that panics during an
+        // unwind aborts the process, which would hide the real failure.
+        let _ = Command::new("chattr").arg("-i").arg(&self.0).status();
+    }
 }
 
 /// Teardown's own `RetainedError` disposition: a worktree Git itself
@@ -1607,6 +1647,14 @@ async fn retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone() {
 /// are unaffected), so teardown proceeds to the removal itself and only
 /// that fails, giving `RetainedError` — not `RetainedDirty` — with Git's
 /// own diagnostic, and the same evidence journaled.
+///
+/// **Environment precondition** (deliberately a hard failure, not a silent
+/// skip — this is the only test covering the `RetainedError` disposition, so
+/// an environment that cannot run it must say so rather than quietly drop
+/// the coverage): `chattr` on `PATH`, `TMPDIR` on a filesystem that honours
+/// `FS_IMMUTABLE_FL` (ext4/xfs/btrfs do; tmpfs and overlayfs do not), and
+/// `CAP_LINUX_IMMUTABLE`. `#[cfg(target_os = "linux")]` gates the OS only;
+/// the setup assertion below reports the other three.
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journaled() {
@@ -1634,14 +1682,20 @@ async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journal
             .expect("worktree"),
     );
 
-    // The worktree stays clean; only Git's own removal is blocked.
+    // The worktree stays clean; only Git's own removal is blocked. The
+    // guard is armed *before* the bit is set, so every path out of this
+    // test from here on clears it (see `ClearImmutableOnDrop`); arming it
+    // for a `chattr` that then fails costs one no-op `chattr -i`.
+    let _immutable = ClearImmutableOnDrop(worktree.clone());
     let chattr = Command::new("chattr")
         .args(["+i", worktree.to_str().expect("utf8 path")])
         .status()
-        .expect("run chattr");
+        .expect("chattr must be on PATH for this fixture (see the doc comment)");
     assert!(
         chattr.success(),
-        "chattr +i must succeed to set up this fixture"
+        "chattr +i must succeed to set up this fixture: needs \
+         CAP_LINUX_IMMUTABLE and a TMPDIR filesystem that honours \
+         FS_IMMUTABLE_FL (see the doc comment)"
     );
 
     let (status, _) = post(
@@ -1672,15 +1726,10 @@ async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journal
         "a worktree Git refused to remove must survive teardown"
     );
 
-    // Clear the immutable bit so the tempdir guards can actually reclaim
-    // the fixture on drop.
-    let cleared = Command::new("chattr")
-        .args(["-i", worktree.to_str().expect("utf8 path")])
-        .status()
-        .expect("run chattr");
-    assert!(cleared.success(), "chattr -i must succeed to clean up");
-
     handle.shutdown().await;
+    // `_immutable` drops here — after `shutdown`, before the `TempDir`s
+    // declared above it — clearing the bit so their teardown can reclaim
+    // the worktree.
 }
 
 /// Cancelling a work parked in `blocked` retires the stage it was parked in.
