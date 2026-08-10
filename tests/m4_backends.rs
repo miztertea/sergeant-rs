@@ -629,6 +629,28 @@ impl StubClaude {
 /// assistant's text, and the result envelope with `modelUsage`.
 const RECORDED_TURN: &str = include_str!("fixtures/claude-2.1.226-turn.jsonl");
 
+/// The recorded `post_turn_summary` line for a turn that asked nothing, from
+/// the N3 ask measurement (`tests/fixtures/README.md` documents its
+/// provenance and why it is a separate file).
+const RECORDED_POST_TURN_SUMMARY: &str =
+    include_str!("fixtures/claude-2.1.226-post-turn-summary-no-ask.jsonl");
+
+/// A *complete* recorded turn: the four kept lines with the measured
+/// `post_turn_summary` spliced in where 2.1.226 emits it — immediately before
+/// the `result` envelope.
+///
+/// The recording omits that line, and a stream without it is a stream saying
+/// "this build has lost the ask grammar", which the adapter now (correctly)
+/// acts on by withdrawing `Capabilities::ask`. A fixture must not make the
+/// CLI look like something it is not, in either direction.
+fn recorded_turn() -> String {
+    let mut lines: Vec<&str> = RECORDED_TURN.lines().filter(|l| !l.is_empty()).collect();
+    let envelope = lines.pop().expect("the result envelope is the last line");
+    lines.push(RECORDED_POST_TURN_SUMMARY.trim());
+    lines.push(envelope);
+    lines.into_iter().map(|line| format!("{line}\n")).collect()
+}
+
 /// The substitution envelope, **derived** from the recorded one by three
 /// named edits (`tests/fixtures/README.md` documents each). Not a recording:
 /// print-mode substitution cannot be provoked on an entitled account, and the
@@ -893,7 +915,7 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
     let repo = TempDir::new().expect("repo");
     init_repo(repo.path());
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut claude = ClaudeConfig::new(data.path());
     claude.executable = stub.path.clone();
 
@@ -1302,7 +1324,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
     std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
 
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.claude_home = Some(home.path().to_path_buf());
     // Not the executable the profile names: the profile's must win here too.
@@ -1397,7 +1419,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
 fn a_recorded_turn_is_normalized_and_archived_verbatim() {
     let data = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     let backend = ClaudeBackend::new(config);
@@ -1464,7 +1486,7 @@ fn a_recorded_turn_is_normalized_and_archived_verbatim() {
         .expect("raw transcript archived");
     assert_eq!(
         String::from_utf8_lossy(&blob),
-        RECORDED_TURN,
+        recorded_turn(),
         "the archive is the stream, byte for byte"
     );
     // And the turn-ended event carries the same ref, so a turn with no
@@ -1547,7 +1569,7 @@ fn an_envelope_less_turn_still_surfaces_its_raw_capture() {
 fn a_failed_raw_archive_is_reported_with_its_reason() {
     let data = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     let backend = ClaudeBackend::new(config);
@@ -1591,7 +1613,7 @@ fn a_failed_raw_archive_is_reported_with_its_reason() {
 fn stop_latches_and_a_stopped_execution_refuses_input() {
     let data = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     let backend = ClaudeBackend::new(config);
@@ -1842,7 +1864,7 @@ fn a_forged_handle_never_resolves_against_the_claude_adapter() {
     let data = TempDir::new().expect("tempdir");
     let home = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     config.claude_home = Some(home.path().to_path_buf());
@@ -1971,7 +1993,7 @@ fn capabilities_match_behaviour_for_every_backend() {
     let data = TempDir::new().expect("tempdir");
     let home = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     config.claude_home = Some(home.path().to_path_buf());
@@ -4895,6 +4917,72 @@ fn n18_a_refused_reattach_still_fails_the_answer_closed() {
     assert!(
         events_of(core, work_id, KIND_EXECUTION_RECONCILED).is_empty(),
         "a re-adoption that did not happen is not claimed"
+    );
+}
+
+/// L8's other half for `ask`: the claim is withdrawn when its evidence goes.
+///
+/// INV-N3-06 — the probe gates on version and `--help`, neither of which can
+/// see whether the installed build still emits `system/post_turn_summary`, and
+/// the absence used to fail *open*: the stage completed carrying the
+/// unanswered question as its summary, with `ask: true` still on the wire.
+/// Driven here through the stub, which is the only place a stream-grammar
+/// change can be simulated without a CLI that has one.
+#[test]
+fn n27_the_ask_claim_is_withdrawn_when_the_stream_stops_carrying_its_evidence() {
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(data.path());
+    // A build that completes turns and no longer emits the line: the exact
+    // shape "post_turn_summary changes subtype or drops needs_action" leaves
+    // behind (docs/gauntlet/notes/n3-claude-ask-measurement.md, "re-measure
+    // when").
+    stub.replays(RECORDED_TURN);
+    let mut config = ClaudeConfig::new(data.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+    assert!(
+        backend.capabilities().ask,
+        "the claim starts where 2.1.226 was measured"
+    );
+
+    let handle = backend
+        .start(&start_request(
+            "e-grammar-gone",
+            data.path(),
+            "complete without a summary line",
+            Some("haiku"),
+        ))
+        .expect("start");
+    let observation = wait_settled(&backend, &handle, Duration::from_secs(10));
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "the turn itself still completes: {observation:?}"
+    );
+    assert!(
+        !backend.capabilities().ask && !backend.ask_grammar_intact(),
+        "a capability whose evidence is absent must not stay advertised (L1, L8)"
+    );
+
+    // The measured grammar keeps the claim: same adapter shape, same turn,
+    // with the line 2.1.226 actually emits.
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn());
+    let mut config = ClaudeConfig::new(data.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+    let handle = backend
+        .start(&start_request(
+            "e-grammar-intact",
+            data.path(),
+            "complete with the measured summary line",
+            Some("haiku"),
+        ))
+        .expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+    assert!(
+        backend.capabilities().ask,
+        "a turn that carried the line — even asking nothing — is the evidence"
     );
 }
 

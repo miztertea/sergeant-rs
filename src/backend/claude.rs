@@ -77,6 +77,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
@@ -160,6 +161,23 @@ fn actor_question(summary: &Value) -> Option<String> {
         return None;
     }
     Some(question.to_string())
+}
+
+/// Did this finished turn show that the CLI no longer speaks the ask grammar?
+///
+/// The narrow rule, for the same reason [`actor_question`] has one: only a
+/// turn that ran to completion — a `type:"result"` envelope, not killed by
+/// sergeant — is evidence about the *grammar*. An interrupted or crashed turn
+/// legitimately has no `post_turn_summary`, and reading that as "the line is
+/// gone" would withdraw a measured capability because a human hit cancel.
+///
+/// The distinction this makes is the one INV-N3-06 named: `post_turn_summary
+/// == None` (no such line at all) and `Some({needs_action: ""})` (the line is
+/// there and the actor asked nothing) were treated identically, so the
+/// disappearance of the line was indistinguishable from a turn that ended
+/// cleanly — which is the direction that fails open.
+fn turn_lost_the_ask_grammar(outcome: &TurnOutcome) -> bool {
+    outcome.envelope.is_some() && !outcome.interrupted && outcome.post_turn_summary.is_none()
 }
 
 /// Launch configuration for the adapter.
@@ -523,6 +541,18 @@ pub struct ClaudeBackend {
     probe_outcome: OnceLock<ProbeOutcome>,
     state: Arc<Mutex<AdapterState>>,
     sink: Mutex<Option<EventSink>>,
+    /// Whether the installed CLI still emits the stream-json line
+    /// [`Capabilities::ask`] rests on. Starts `true` — 2.1.226 was measured
+    /// emitting one `system`/`post_turn_summary` per turn — and is lowered
+    /// the first time a turn completes normally without one.
+    ///
+    /// The probe cannot check this: `--version` and `--help` say nothing
+    /// about the stream grammar, and the only honest place to learn it is a
+    /// turn. Before this existed the absence failed *open* — any later build
+    /// that dropped, renamed or re-shaped the line silently restored the
+    /// pre-N3 GP-2 behaviour (the stage completes carrying the unanswered
+    /// question as its summary) with `ask: true` still on the wire.
+    ask_grammar: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ClaudeBackend {
@@ -542,7 +572,19 @@ impl ClaudeBackend {
             probe_outcome: OnceLock::new(),
             state: Arc::new(Mutex::new(AdapterState::default())),
             sink: Mutex::new(None),
+            ask_grammar: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Whether this adapter has seen evidence that the installed CLI still
+    /// speaks the ask grammar (§11.1's explicit semantic signal).
+    ///
+    /// Lowered — never raised — by [`turn_lost_the_ask_grammar`]: one
+    /// completed turn with no `post_turn_summary` at all is enough to
+    /// withdraw the claim, because the failure it guards against is silent.
+    /// `sgt doctor` reads it through [`Backend::capabilities`].
+    pub fn ask_grammar_intact(&self) -> bool {
+        self.ask_grammar.load(Ordering::Relaxed)
     }
 
     /// Install the event sink normalized events are pushed through (§27).
@@ -886,6 +928,7 @@ impl ClaudeBackend {
 
         let reader = TurnReader {
             backend_state: Arc::clone(&self.state),
+            ask_grammar: Arc::clone(&self.ask_grammar),
             sink: self.sink.lock().expect("claude sink lock").clone(),
             data_dir: self.config.data_dir.clone(),
             execution_id: execution_id.to_string(),
@@ -912,6 +955,9 @@ impl ClaudeBackend {
 /// ingestion end to end: raw archive, normalization, outcome recording.
 struct TurnReader {
     backend_state: Arc<Mutex<AdapterState>>,
+    /// The adapter's ask-grammar claim, lowered from here when a turn
+    /// completes without the line it rests on.
+    ask_grammar: Arc<AtomicBool>,
     sink: Option<EventSink>,
     data_dir: PathBuf,
     execution_id: String,
@@ -962,15 +1008,21 @@ impl TurnReader {
             return;
         };
         let interrupted = execution.interrupt_requested;
-        execution.turn = TurnState::Finished(TurnOutcome {
+        let outcome = TurnOutcome {
             envelope: envelope.clone(),
             interrupted,
             raw_blob: raw_blob.clone(),
             raw_error: raw_error.clone(),
             stderr: stderr.clone(),
             post_turn_summary: summary.clone(),
-        });
+        };
+        execution.turn = TurnState::Finished(outcome.clone());
         drop(state);
+
+        // L1/L8 at runtime: a completed turn that carried no
+        // `post_turn_summary` is the CLI telling this adapter that the
+        // evidence `Capabilities::ask` rests on is gone.
+        self.note_ask_grammar(&outcome);
 
         // Every turn ends with this event, whatever it left behind. It is
         // the only place the §20 blob ref reaches the journal for a turn
@@ -1103,6 +1155,37 @@ impl TurnReader {
         }
     }
 
+    /// Withdraw [`Capabilities::ask`] if this turn showed the grammar it
+    /// rests on has gone, and say so once, where a reader will find it.
+    fn note_ask_grammar(&self, outcome: &TurnOutcome) {
+        if !turn_lost_the_ask_grammar(outcome) {
+            return;
+        }
+        // Only the first one matters: the claim is already withdrawn after
+        // that, and an event per turn thereafter would be noise.
+        if !self.ask_grammar.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            execution_id = %self.execution_id,
+            "the installed claude CLI completed a turn with no system/post_turn_summary \
+             line; withdrawing the `ask` capability"
+        );
+        self.emit(
+            "conversation.turn.grammar_unmeasured",
+            json!({
+                "capability": "ask",
+                "expected": format!("system/{POST_TURN_SUMMARY_SUBTYPE}"),
+                "session_id": self.session_id,
+                "detail":
+                    "a turn completed with a result envelope and no post_turn_summary line; \
+                     the evidence `Capabilities::ask` rests on is not present in this CLI's \
+                     stream, so the claim is withdrawn rather than left failing open",
+                "raw": outcome.raw_blob,
+            }),
+        );
+    }
+
     fn emit(&self, kind: &str, payload: Value) {
         if let Some(sink) = &self.sink {
             sink(EventDraft {
@@ -1171,8 +1254,11 @@ impl Backend for ClaudeBackend {
             // them against the installed CLI). That is a structured record,
             // not an inference from prose, so the claim is `true` — and it is
             // the only reason it is: without that line this would be `false`
-            // and every ask would silently complete its stage.
-            ask: true,
+            // and every ask would silently complete its stage. Which is why
+            // it is a *runtime* answer rather than a constant — the probe
+            // cannot see the stream grammar, so the first turn that completes
+            // without the line withdraws the claim (`ask_grammar_intact`).
+            ask: self.ask_grammar_intact(),
         }
     }
 
@@ -2411,6 +2497,117 @@ mod tests {
             observe_envelope(&execution, &envelope, &outcome).signal,
             BackendSignal::Failed { .. }
         ));
+    }
+
+    /// INV-N3-06: `Capabilities::ask` rests on a stream-json line the probe
+    /// cannot check, and its absence used to fail *open*.
+    ///
+    /// `post_turn_summary == None` and `Some({needs_action: ""})` were treated
+    /// identically, so a later CLI that dropped, renamed or re-shaped the line
+    /// would silently restore the pre-N3 behaviour — the stage completes
+    /// carrying the unanswered question as its summary — with `ask: true`
+    /// still on the wire and nothing but an opt-in, token-spending test to
+    /// notice. The adapter can tell at runtime, from the one place the answer
+    /// exists: a turn.
+    #[test]
+    fn a_completed_turn_with_no_post_turn_summary_withdraws_the_ask_claim() {
+        let completed = |summary: Option<Value>| TurnOutcome {
+            envelope: Some(json!({"type": "result", "is_error": false, "result": "done"})),
+            interrupted: false,
+            raw_blob: None,
+            raw_error: None,
+            stderr: String::new(),
+            post_turn_summary: summary,
+        };
+
+        // The measured 2.1.226 shapes, both of which carry the line: the
+        // capability survives an ask *and* a turn that asked nothing.
+        assert!(!turn_lost_the_ask_grammar(&completed(Some(json!({
+            "type": "system", "subtype": POST_TURN_SUMMARY_SUBTYPE,
+            "needs_action": "postgres or sqlite?",
+        })))));
+        assert!(!turn_lost_the_ask_grammar(&completed(Some(json!({
+            "type": "system", "subtype": POST_TURN_SUMMARY_SUBTYPE,
+            "needs_action": "",
+        })))));
+
+        // The line is gone: the evidence the claim rests on is not there.
+        assert!(turn_lost_the_ask_grammar(&completed(None)));
+
+        // A turn sergeant killed, and one that died without an envelope, are
+        // not evidence about the grammar — withdrawing a measured capability
+        // because a human hit cancel would be its own invention.
+        let mut interrupted = completed(None);
+        interrupted.interrupted = true;
+        assert!(!turn_lost_the_ask_grammar(&interrupted));
+        let mut crashed = completed(None);
+        crashed.envelope = None;
+        assert!(!turn_lost_the_ask_grammar(&crashed));
+    }
+
+    /// …and the withdrawal reaches the capability list, once.
+    #[test]
+    fn the_withdrawn_ask_claim_is_what_the_capability_list_reports() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backend = ClaudeBackend::new(ClaudeConfig::new(dir.path()));
+        assert!(
+            backend.capabilities().ask && backend.ask_grammar_intact(),
+            "measured on 2.1.226: see docs/gauntlet/notes/n3-claude-ask-measurement.md"
+        );
+
+        let emitted = Arc::new(Mutex::new(Vec::<EventDraft>::new()));
+        let sink_events = Arc::clone(&emitted);
+        backend.set_event_sink(Arc::new(move |draft| {
+            sink_events.lock().expect("sink lock").push(draft);
+        }));
+        let reader = TurnReader {
+            backend_state: Arc::clone(&backend.state),
+            ask_grammar: Arc::clone(&backend.ask_grammar),
+            sink: backend.sink.lock().expect("sink lock").clone(),
+            data_dir: dir.path().to_path_buf(),
+            execution_id: "e-grammar".to_string(),
+            work_id: "w-grammar".to_string(),
+            session_id: "s-grammar".to_string(),
+            model: None,
+            child: Arc::new(Mutex::new(
+                std::process::Command::new("true")
+                    .spawn()
+                    .expect("spawn true"),
+            )),
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+        };
+        let outcome = TurnOutcome {
+            envelope: Some(json!({"type": "result", "is_error": false, "result": "done"})),
+            interrupted: false,
+            raw_blob: None,
+            raw_error: None,
+            stderr: String::new(),
+            post_turn_summary: None,
+        };
+
+        reader.note_ask_grammar(&outcome);
+        assert!(
+            !backend.capabilities().ask,
+            "an unmeasurable capability fails closed (L1, L8)"
+        );
+        reader.note_ask_grammar(&outcome);
+
+        let events = emitted.lock().expect("sink lock");
+        let notices: Vec<&EventDraft> = events
+            .iter()
+            .filter(|e| e.kind == "conversation.turn.grammar_unmeasured")
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the withdrawal is journaled once, not once per turn: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(notices[0].payload["capability"], "ask");
+        assert_eq!(
+            notices[0].payload["expected"],
+            format!("system/{POST_TURN_SUMMARY_SUBTYPE}")
+        );
     }
 
     fn test_execution(model: Option<&str>) -> ClaudeExecution {

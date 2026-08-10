@@ -96,10 +96,41 @@ evidence permits:
   model the work never authorized is not a checkpoint to put a human in front
   of.
 
+## The claim is withdrawn at runtime when its evidence goes (added wave 2)
+
+The probe cannot check any of this. `--version` and `--help` say nothing about
+the stream grammar, so the whole capability rests on a line the installation
+gate is structurally unable to see — and the absence used to fail *open*:
+`actor_question` reads a missing summary as "the actor did not ask", so a build
+that dropped, renamed or re-shaped the line would silently restore the pre-N3
+behaviour with `ask: true` still on the wire (finding INV-N3-06).
+
+The adapter now learns it from the one place the answer exists — a turn. A turn
+that runs to completion (`type:"result"`, not killed by sergeant) and carries no
+`post_turn_summary` at all lowers `ClaudeBackend::ask_grammar_intact`, which is
+what `Capabilities::ask` reports, and emits one
+`conversation.turn.grammar_unmeasured` event naming the missing subtype. It is
+lowered, never raised: one such turn is enough to withdraw the claim, because
+the failure it guards against is silent.
+
+The distinction that makes it work is the one the pre-N3 code did not draw:
+`post_turn_summary == None` (no such line) and `Some({needs_action: ""})` (the
+line is there, the actor asked nothing) are now different facts. An interrupted
+or crashed turn is neither — withdrawing a measured capability because a human
+hit cancel would be its own invention.
+
 ## Where the claim is pinned
 
 - `src/backend/claude.rs` unit tests: both records above, verbatim, plus the
-  empty/whitespace/missing cases and the pin-substitution precedence.
+  empty/whitespace/missing cases and the pin-substitution precedence; and the
+  withdrawal rule above, including the interrupted/crashed exclusions and the
+  one-event-per-adapter guarantee.
+- `tests/m4_backends.rs`
+  `n27_the_ask_claim_is_withdrawn_when_the_stream_stops_carrying_its_evidence`
+  — token-free, through the stub: a build that completes turns without the line
+  loses the capability; one that carries it (even asking nothing) keeps it.
+  `tests/fixtures/claude-2.1.226-post-turn-summary-no-ask.jsonl` holds prompt
+  B's line verbatim so the deterministic fixtures replay a *complete* turn.
 - `tests/m4_backends.rs` `a5_real_claude_reports_an_actor_authored_question_as_needs_input`
   — opt-in (`SERGEANT_CLAUDE_TESTS=1 … -- --ignored`), drives one real haiku
   turn through the adapter and fails loudly, naming this file, if 2.1.226 (or

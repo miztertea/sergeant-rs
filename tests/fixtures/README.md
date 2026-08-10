@@ -18,6 +18,27 @@ and the `result` envelope — are byte-for-byte as the CLI emitted them.
 Nothing here is authored: this is a recording, and it is what the
 deterministic §20/§27 tests replay.
 
+## `claude-2.1.226-post-turn-summary-no-ask.jsonl` — recorded, from another turn
+
+One verbatim `system`/`post_turn_summary` line, recorded 2026-08-10 against the
+same 2.1.226 build during the N3 ask measurement
+(`docs/gauntlet/notes/n3-claude-ask-measurement.md`, "prompt B"): a turn that
+was told to answer and ask nothing, so `needs_action` is the empty string.
+
+It is kept separately, and named separately, because it is **not** from the
+turn above — that turn's own `post_turn_summary` was among the 22 lines the
+recording dropped, and inventing it back would be exactly the fabrication this
+directory refuses. Tests that need a *complete* turn splice this line in before
+the recorded `result` envelope (`recorded_turn()` in `tests/m4_backends.rs`),
+which is where 2.1.226 emits it, and the splice is a documented composition of
+two recordings rather than a claim to be one.
+
+Why any test needs it: the adapter withdraws `Capabilities::ask` when a turn
+completes with no `post_turn_summary` at all (INV-N3-06 — the absence used to
+fail open). Replaying a stream that omits the line is therefore a stream that
+says "this CLI has lost the ask grammar", which is true of the fixture and
+false of the CLI.
+
 ## `claude-2.1.226-substitution-envelope.derived.json` — derived, not recorded
 
 **This file is not a recording, and the name says so.** The M4 contract's
