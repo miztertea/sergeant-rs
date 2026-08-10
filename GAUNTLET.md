@@ -43,6 +43,26 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### BACKLOG CONSOLIDATION — 2026-08-10
+
+Everything outstanding from the build cycle now lives in one place: the
+GitHub issue tracker (#3–#25). P1-PERF filed #3–#13 (measured findings);
+this sweep added #14–#25 from the development record — the registered
+backlog rows (B3→#14, B2→#15), the accepted-with-ruling M6 warts (TUI
+reconnect #16, timeout-knob silence #24), the structural debts named at
+P0 close-out (retention/GC #17, /proc portability #18, doctor disk check
+#23), the coverage gaps (real-Claude soak #19, crash-point injection #20,
+dashboard JS #21, workspace edge cases #22), and the D6 Codex descope
+(#25, blocked on a measurable environment). Deliberately NOT filed: B1
+(snapshot identity binding — dormant by design, its trigger is itself a
+design guard; it stays a ledger row), the L10 commit-hygiene rule
+(process, binding via LESSONS, not work), and §38's OpenCode/Prime/MCP
+deferrals (roadmap without current intent — the proposal already records
+them). The backlog rows in this file now carry their issue numbers as the
+live tracking surface; the ledger remains the record of *why*.
+
+---
+
 ### P1-PERF — 2026-08-10, load/stress baseline + issue backlog
 
 **Mission outcome: contract met.** The full S1–S7 matrix ran at contract
