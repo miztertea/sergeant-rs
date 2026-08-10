@@ -1858,6 +1858,85 @@ mod tests {
         }
     }
 
+    /// `data:` lines belonging to one SSE frame are joined by a literal `\n`
+    /// (the SSE spec's join rule; the code is lines 1766-1767) — not by bare
+    /// concatenation, which the second half proves: split across a number's
+    /// minus sign and its digit, the two chunks only reassemble into the
+    /// value `-5` when nothing is inserted between them, so a decoder that
+    /// really joins with a newline must fail to parse that split rather than
+    /// silently producing a value nobody sent.
+    #[test]
+    fn decode_frame_coalesces_data_lines_with_a_real_newline() {
+        // An ordinary split, at an object-member boundary, decodes into
+        // exactly the event that boundary was cut from.
+        let frame = "data: {\"schema\":\"sergeant.event/v1\",\"seq\":7,\"id\":\"01H7X8Y9Z\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\ndata: \"kind\":\"test.seeded\",\"payload\":{\"n\":3}}";
+        let event = decode_frame(frame)
+            .expect("a frame whose data: is split across two lines still decodes");
+        assert_eq!(event.seq, 7);
+        assert_eq!(event.id, "01H7X8Y9Z");
+        assert_eq!(event.kind, "test.seeded");
+        assert_eq!(event.payload, json!({"n": 3}));
+
+        // Split at a number's minus sign instead: without the joining
+        // newline, `-` and `5` on separate data: lines read back together as
+        // the valid number -5. The newline this test pins turns that into a
+        // `-` followed by whitespace then `5`, which is not a legal JSON
+        // number.
+        let split_number = "data: {\"schema\":\"sergeant.event/v1\",\"seq\":9,\"id\":\"01NEG\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\"kind\":\"test.seeded\",\"payload\":{\"n\":-\ndata: 5}}";
+        assert_eq!(
+            decode_frame(split_number),
+            None,
+            "the two data: lines must not be concatenated without the newline \
+             the SSE spec requires between them"
+        );
+    }
+
+    /// Comment lines — axum's keep-alive shape (`KeepAlive`, used above) —
+    /// carry no `data:` and must be skipped without ending the frame or
+    /// corrupting the real payload beside them.
+    #[test]
+    fn decode_frame_skips_comment_and_keep_alive_lines() {
+        assert_eq!(
+            decode_frame(": keep-alive"),
+            None,
+            "a frame that is only a comment carries no event"
+        );
+        let single_line = "{\"schema\":\"sergeant.event/v1\",\"seq\":2,\"id\":\"01Z\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\"kind\":\"test.seeded\",\"payload\":{\"n\":2}}";
+        let frame = format!(": keep-alive\ndata: {single_line}");
+        let event = decode_frame(&frame)
+            .expect("a comment line beside a data: line must not swallow the event");
+        assert_eq!(event.seq, 2);
+        assert_eq!(event.id, "01Z");
+    }
+
+    /// The two `stage_label` arms besides "both known" and "nothing at
+    /// all": an index with no known total still reads its one-based
+    /// position, and the absence of an index drops the position segment
+    /// entirely — whether or not a total happens to be present.
+    #[test]
+    fn stage_label_reads_an_index_without_a_total_and_no_index_at_all() {
+        let index_only = json!({"stage_id": "10-implement", "index": 3, "status": "blocked"});
+        assert_eq!(
+            stage_label(&index_only),
+            "10-implement 4 · blocked",
+            "an index without a known total still reads its one-based position"
+        );
+
+        let of_only = json!({"stage_id": "20-test", "of": 5, "status": "queued"});
+        assert_eq!(
+            stage_label(&of_only),
+            "20-test · queued",
+            "no index means no position segment, even when `of` is present"
+        );
+
+        let neither = json!({"stage_id": "20-test", "status": "queued"});
+        assert_eq!(
+            stage_label(&neither),
+            "20-test · queued",
+            "no index and no total: still no position segment"
+        );
+    }
+
     async fn test_state(data_dir: &std::path::Path) -> ApiState {
         let journal = Journal::open(data_dir).expect("open journal");
         let mut registry = work_registry_projection();

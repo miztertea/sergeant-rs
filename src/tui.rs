@@ -1217,6 +1217,47 @@ mod tests {
         );
     }
 
+    /// The respond and cancel flows are both abandonable, and each abandon
+    /// sets a status the header shows — the regression this pins is a
+    /// status that silently stays whatever it was before, which nobody
+    /// would notice without reading the code, since both flows already
+    /// return `Action::None` either way.
+    #[test]
+    fn abandoning_respond_or_cancel_leaves_a_status_saying_so() {
+        let mut app = App::new();
+        app.rows = fleet_rows(&fleet_of(&[("a", "needs_input")]));
+
+        // Esc while composing a response abandons it without submitting.
+        app.on_key(KeyCode::Char('i'));
+        assert!(app.input.is_some(), "'i' opens the respond prompt");
+        for c in "partial".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(
+            app.on_key(KeyCode::Esc),
+            Action::None,
+            "abandoning a response is not a submission"
+        );
+        assert!(app.input.is_none(), "the prompt closes");
+        assert_eq!(app.status, "respond canceled");
+
+        // Its sibling: anything but y/Y after 'c' abandons the cancel
+        // confirmation.
+        assert_eq!(
+            app.on_key(KeyCode::Char('c')),
+            Action::None,
+            "no cancel yet — this keystroke only opens the confirmation"
+        );
+        assert!(app.confirming_cancel);
+        assert_eq!(
+            app.on_key(KeyCode::Char('n')),
+            Action::None,
+            "declining the confirmation issues no command"
+        );
+        assert!(!app.confirming_cancel, "the confirmation closes either way");
+        assert_eq!(app.status, "cancel abandoned");
+    }
+
     #[test]
     fn only_state_bearing_events_ask_for_a_refresh() {
         let mut app = App::new();

@@ -603,4 +603,54 @@ mod tests {
         assert_eq!(stage_label(&stage), "10-implement 2/4 · running");
         assert_eq!(stage_label(&Value::Null), "-");
     }
+
+    /// A second, sparse fixture: every `render_work` section's "nothing
+    /// here" branch, all at once. The only fixture this page is exercised
+    /// against elsewhere always binds a repository surface, so the unbound,
+    /// no-execution, no-events shape never rendered before this.
+    #[test]
+    fn render_work_renders_every_sections_empty_branch() {
+        let system = json!({"version": "0.1.0", "api_revision": "v1", "data_dir": "/tmp/d"});
+        let detail = json!({
+            "work": {"state": "pending", "intent": "do a thing"},
+            "workflow": {"name": "wf", "version": 1, "source": "inline", "stages": []},
+            "stage": null,
+            "surface": {"bindings": []},
+            "teardown": null,
+            "execution": null,
+            "route_source": null,
+        });
+        let events = json!({"events": []});
+
+        let html = render_work(&system, "01ABC", &detail, &events, "tok");
+
+        assert!(
+            html.contains("no repository surface bound"),
+            "an unbound work must say so rather than showing an empty table: {html}"
+        );
+        assert!(
+            !html.contains("<th>repository</th>"),
+            "the surface table must not render at all when there are no bindings: {html}"
+        );
+        assert!(
+            !html.contains("teardown:"),
+            "a work that was never torn down must not show a teardown line: {html}"
+        );
+        assert!(
+            html.contains("no live execution"),
+            "a work with no live execution must say so: {html}"
+        );
+        assert!(
+            html.contains("no normalized conversation events yet"),
+            "an empty event list must not render an empty activity table: {html}"
+        );
+        assert!(
+            html.contains("no transitions recorded"),
+            "an empty event list must not render an empty transitions table: {html}"
+        );
+        assert!(
+            html.contains("no usage reported by this backend"),
+            "an empty event list must not render an empty usage table: {html}"
+        );
+    }
 }
