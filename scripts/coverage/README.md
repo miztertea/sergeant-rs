@@ -183,7 +183,7 @@ Two risk classes, and the second is the dangerous one:
 | --- | --- | --- | --- | --- |
 | `m2_daemon_api.rs:57` | 10 s | *every* HTTP request m2 makes (shared client timeout) | unknown | **unknown** — the tightest of the four client timeouts and the one covering the most calls |
 | `support/mod.rs:31` + `m6_surfaces.rs:2425` | 10 s | daemon shutdown after SIGTERM, before SIGKILL | unknown | **unknown, and the one that costs coverage**: exceeding it means SIGKILL, which means that daemon's profile never exists. Both reapers now report the escalation instead of hiding it |
-| `m4_backends.rs:1164…3077` (14 sites) | 10 s | a stub-backed turn settling (`wait_settled`) | unknown | **unknown** — the most-repeated bound in the suite; the stubs are shell scripts (uninstrumented) but the adapter around them is not |
+| `m4_backends.rs:1164…3077` (16 sites) | 10 s | a stub-backed turn settling (`wait_settled`) | unknown | **unknown** — the most-repeated bound in the suite; the stubs are shell scripts (uninstrumented) but the adapter around them is not |
 | `m2_daemon_api.rs:1040/1042` | 10 s each | N SSE events to arrive; one chunk to arrive | unknown | unknown |
 | `m4_backends.rs:405`, `m4:608` | 10 s | N normalized events / N recorded launches to appear (async reader thread) | unknown | unknown |
 | `m4_backends.rs:2912` | 10 s | liveness settling to `Exited` after an orphan is killed | unknown | unknown |
