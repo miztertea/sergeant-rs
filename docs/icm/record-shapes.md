@@ -18,8 +18,9 @@ records live inside.
 
 ## 1. `index.md` front matter (OKF-compatible)
 
-Every admitted workflow's `index.md`, and the root `.sergeant/index.md`,
-carries front matter in this shape (§7.3):
+Every admitted workflow's `index.md` carries front matter in this shape
+(§7.3). The root `.sergeant/index.md` is the catalog, not an entry — it has
+its own shape, defined in rule 2 below:
 
 ```markdown
 ---
