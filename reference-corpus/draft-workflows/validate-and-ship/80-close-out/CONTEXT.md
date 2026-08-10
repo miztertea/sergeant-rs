@@ -1,0 +1,52 @@
+# 80-close-out: close out
+
+## Inputs
+
+| File | Layer | Why |
+|---|---|---|
+| ../70-reconcile-custody/output/README.md | L4 | upstream artifact produced by `70-reconcile-custody` |
+
+## Purpose
+
+Stop driving at `checks-passed`; on `failed`/`cancelled`, fix on the same branch and re-drive; summarize what the pipeline found and fixed.
+
+Trigger (workflow-level): Implementation, native tests, lint and independent review are complete and the coordinator has reached the approved shipping boundary.
+
+## What must become true here (durable outcome)
+
+Stop driving at `checks-passed`; on `failed`/`cancelled`, fix on the same branch and re-drive; summarize what the pipeline found and fixed.
+
+## Behavior contract
+
+- **`checks-passed` means the change is validated and CI is green but the PR is not yet merged; the actor is done driving the pipeline and should tell the user the PR is ready to review and merge (link is in the `help` line) without waiting for the merge, since no-mistakes keeps monitoring the PR in the background until merged, closed, or idle-timed-out.**
+  (trigger: the pipeline reaches the checks-passed outcome; outcome: the actor stops driving and hands the merge decision to the user, while the pipeline's own monitor continues in the background)
+  — `BU-P2-086`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Outcome: checks-passed, lines 169-176)
+- **`passed` means the changes cleared the gate and the PR was merged or closed.**
+  (trigger: the pipeline reaches the passed outcome; outcome: the workflow's fully-terminal success state is reached)
+  — `BU-P2-087`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Outcome: passed, lines 177-177)
+- **`failed` or `cancelled` mean the change did not clear the gate; the actor reads the output, fixes whatever is pointed at (a failing test, lint error, or a skipped finding), commits the fix on the same feature branch, and drives the pipeline again with a fresh `axi run --intent` or `no-mistakes rerun`; the actor must not leave the user at a failed outcome without either retrying or explaining what blocks it.**
+  (trigger: the pipeline reaches a failed or cancelled outcome; outcome: the actor either retries after a concrete fix or explicitly explains the blocker to the user — never silence)
+  — `BU-P2-088`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Outcomes: failed/cancelled, lines 178-186)
+- **The CI step deliberately keeps watching the PR after checks pass, so `axi run` returns `checks-passed` as soon as checks are green rather than blocking on the human merge; the actor must never poll or re-run waiting for the merge.**
+  (trigger: checks have passed but the PR is not yet merged; outcome: the actor does not poll or loop waiting for a human merge; the pipeline's own monitor covers it)
+  — `BU-P2-095`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (CI monitor stays live, lines 198-200)
+- **A PR that falls behind the default branch or hits a merge conflict after checks pass needs no command from the actor and must never be hand-rebased: the still-running CI monitor detects an actual conflict, rebases onto the base, resolves it, and re-pushes itself; a merely-behind-but-clean PR needs nothing since the platform merges it; the one exception is when the monitor is no longer running (PR closed, run aborted/superseded, idle-timed-out, or auto-fix attempts exhausted), in which case the actor recovers with `no-mistakes rerun`, which cancels the stale monitor and re-runs the full pipeline including a deterministic rebase step; `no-mistakes axi run` must not be used to refresh a still-active PR, since after checks-passed it just reattaches to the running monitor without rebasing.**
+  (trigger: a PR has passed checks and later drifts behind the base or conflicts; outcome: drift/conflict is resolved by the pipeline's own live monitor automatically; the actor intervenes only when that monitor has stopped, and then via `rerun`, never a hand-rebase)
+  — `BU-P2-096`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (PR drift handling, lines 202-214)
+- **On a successful outcome (`checks-passed` or `passed`), the actor closes the loop with the user by summarizing what happened during the pipeline concisely and readably — what was validated and what was found — and if the output includes a `fixes` table, explicitly acknowledges and lists each fix the pipeline made that the actor's original change missed.**
+  (trigger: the pipeline reaches a successful terminal or near-terminal outcome; outcome: the user receives an honest, itemized summary including fixes the pipeline had to make)
+  — `BU-P2-097`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Success closeout, lines 216-221)
+- **Stop driving at checks-passed: the PR is ready and no-mistakes monitors it in the background, so do not poll or wait for merge.**
+  (trigger: a run reaches checks-passed; outcome: coordinator involvement ends at checks-passed rather than continuing through merge)
+  — `BU-P1-077`, `reference/sergeant-upstream/README.md` (README.md L293)
+- **Remediation that changes HEAD still requires independent rereview before updating the readiness marker, but must not trigger repeated no-mistakes review cycles.**
+  (trigger: remediation changes HEAD after an initial validation pass; outcome: rereview happens exactly once per remediation without re-running the whole gate)
+  — `BU-P1-043`, `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L155-157)
+
+## Judgment required
+
+This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+
+## Output
+
+Declared in `output/README.md` (Layer 4). See that file for the expected artifact and its merge disposition.

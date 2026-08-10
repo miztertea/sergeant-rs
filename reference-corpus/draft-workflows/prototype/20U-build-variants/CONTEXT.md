@@ -1,0 +1,53 @@
+# 20U-build-variants: build variants
+
+## Inputs
+
+| File | Layer | Why |
+|---|---|---|
+| ../10-record-question/output/README.md | L4 | upstream artifact produced by `10-record-question` |
+
+## Purpose
+
+UI variants are built to answer the recorded question.
+
+Trigger (workflow-level): The user wants to sanity-check whether a state model or logic feels right, or explore what a UI should look like.
+
+## What must become true here (durable outcome)
+
+UI variants are built to answer the recorded question.
+
+## Behavior contract
+
+- **The UI-prototype branch produces several structurally distinct UI variants on one route, switchable live in the browser, from which the user picks or recombines before the rest is discarded.**
+  (trigger: the branch question is about what something should look like; outcome: several in-browser-switchable UI variants exist for the user to compare)
+  — `BU-P3-029`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (header, line 3)
+- **The UI branch prefers mounting variants inside an existing page (sub-shape A) over a standalone throwaway route (sub-shape B), because judging a variant against the app's real surrounding context is more informative than judging it in isolation.**
+  (trigger: the UI-prototype branch has been selected; outcome: sub-shape A is chosen unless no existing page can host the variants)
+  — `BU-P3-030`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (sub-shape rationale, line 16)
+- **When sub-shape B is used, the new throwaway route must follow the project's existing routing convention and be named so it is obviously a prototype.**
+  (trigger: sub-shape B has been chosen; outcome: the throwaway route is discoverable as a prototype and does not introduce a new routing convention)
+  — `BU-P3-031`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (sub-shape B naming, line 28)
+- **The UI branch defaults to producing three variants and caps at five, beyond which additional variants are considered noise rather than useful signal.**
+  (trigger: generating UI variants; outcome: the number of variants produced falls between the default of three and a hard cap of five)
+  — `BU-P3-032`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (process step1, line 38)
+- **Each UI variant must differ structurally (layout, information hierarchy, primary affordance), not merely cosmetically; if two drafts converge, one must be redone with an explicit constraint forcing structural divergence.**
+  (trigger: drafting UI variants; outcome: every variant produced is structurally distinct from the others)
+  — `BU-P3-033`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (process step2, line 54)
+- **The variant switcher UI must be gated off in production builds so that an accidental merge of prototype code cannot expose it to real users.**
+  (trigger: building the variant switcher; outcome: the switcher never renders in a production build)
+  — `BU-P3-034`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (process step4, line 90)
+- **UI variants must not perform real mutations; any mutation a variant needs should hit a stub, keeping the prototype scoped to appearance rather than backend correctness.**
+  (trigger: building or wiring a UI variant; outcome: no UI variant performs a real write against production systems)
+  — `BU-P3-038`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (Anti-patterns, line 111)
+
+## Judgment required
+
+This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+
+## Additional note
+
+Conditional: entered only when `00-select-branch` selected the UI branch. Mutually exclusive with `20L-build-logic`.
+
+## Output
+
+Declared in `output/README.md` (Layer 4). See that file for the expected artifact and its merge disposition.

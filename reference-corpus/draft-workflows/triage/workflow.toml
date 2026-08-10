@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "triage"
+version = "1"
+stages = ["00-show-attention", "10-gather-context", "20-verify", "30-recommend", "40-grill-if-underspecified", "50-apply-outcome"]

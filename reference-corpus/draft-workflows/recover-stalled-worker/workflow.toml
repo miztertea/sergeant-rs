@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "recover-stalled-worker"
+version = "1"
+stages = ["00-collect-signals", "10-preflight", "20-launch-replacement", "30-retire-original", "40-escalate-on-second-attempt", "50-escalate-undocumented"]

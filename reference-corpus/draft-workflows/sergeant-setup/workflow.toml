@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "sergeant-setup"
+version = "1"
+stages = ["00-detect-prerequisites", "05-file-capability-gaps", "10-install-commands", "20-global-config", "30-project-interview", "40-repair-existing", "50-sync-and-verify", "60-task-tracking-init", "70-optional-capabilities", "90-completion-summary"]

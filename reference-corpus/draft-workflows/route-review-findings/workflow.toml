@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "route-review-findings"
+version = "1"
+stages = ["00-parse-and-sanitize", "10-retain-artifact", "20-route-each", "30-publish-or-clear-gate"]

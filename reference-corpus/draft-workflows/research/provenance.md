@@ -1,0 +1,30 @@
+# Provenance — Research
+
+Maps every stage (and every workflow-level citation) to the behavior units that justify it, per `docs/gauntlet/contracts/N1.md` and `docs/icm/record-shapes.md` §3. Source snapshot: `reference/sergeant-upstream` at the SHA recorded in `reference/UPSTREAM.md`. Synthesis basis: `reference-corpus/synthesis.md` §1, candidate **W27** `research`.
+
+## Workflow-level citations
+
+| Unit | Statement | Source |
+|---|---|---|
+| `BU-P3-040` | research is a workflow that investigates a question against high-trust primary sources and writes the findings to a Markdown file in the repository. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (frontmatter: description) |
+| `BU-P3-041` | The research workflow is delegated to a background/asynchronous execution context so the requester's foreground work is not blocked while sources are read. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (body line 6) |
+
+## Stages
+
+### `00-investigate`
+
+| Unit | Statement | Source |
+|---|---|---|
+| `BU-P3-042` | Research must be conducted against primary sources (official docs, source code, specs, first-party APIs) rather than secondary summaries, with every claim traced back to its owning source. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 1, line 10) |
+
+### `10-write-findings`
+
+| Unit | Statement | Source |
+|---|---|---|
+| `BU-P3-043` | The investigation's output is a single Markdown file where every claim carries a source citation. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 2, line 11) |
+| `BU-P3-044` | The findings file is placed according to the repository's existing note-keeping convention, or in a sensible location (with the choice explicitly stated) if no convention exists. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 3, line 12) |
+
+## Notes
+
+**Synthesis notes:** Delegated to a background execution context (BU-P3-041) — that delegation is a *scheduling* property of how research is invoked, not a stage of the procedure itself.
+

@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "vet-external-skill"
+version = "1"
+stages = ["00-read-source", "10-confirm-provenance", "20-check-actions", "30-verify-no-conflict", "40-pin-source", "50-test-in-disposable-copy", "60-update-managed", "60-update-owned"]

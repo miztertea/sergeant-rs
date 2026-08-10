@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "direct-implementation"
+version = "1"
+stages = ["01-load-task-context", "02-reconcile-existing-state", "03-claim-and-implement", "04-validate", "05-shipping-gate", "06-pr-and-merge", "07-record-outcomes"]

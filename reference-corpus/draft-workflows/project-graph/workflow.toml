@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "project-graph"
+version = "1"
+stages = ["00-resolve-output-path", "10-extract-per-repo", "20-merge-or-fail", "30-publish-atomically"]
