@@ -38,6 +38,23 @@ and the HTML tree stay out of git: the bulky exports go to
 `target/llvm-cov-reports/` (`COV_REPORTS`), and the artifacts dir records their
 sizes and the lcov's SHA-256 instead.
 
+### Where the stage scripts differ from §5's quoted block, and why
+
+The seven collection lines and `report --summary-only` appear verbatim. Two
+report lines carry an argument the proposal wrote as a placeholder or left to
+the default, both recorded here so the baseline can quote the real thing:
+
+- `report --lcov --output-path "$COV_REPORTS/lcov.info"` — §5 writes
+  `<artifacts>/lcov.info`. `<artifacts>` resolves to `target/llvm-cov-reports/`
+  rather than the committed evidence dir, because the lcov is megabytes of
+  regenerable derivative and the committed dir is meant to stay readable.
+  Its size and SHA-256 are committed instead.
+- `report --html --output-dir "$COV_REPORTS/html"` — §5 writes bare
+  `--html`, whose default output is `target/llvm-cov/html`. The explicit
+  directory keeps every export in one place beside the lcov, and keeps a
+  third `target/` subtree from appearing next to the two build trees R-S0-6
+  allows.
+
 Other knobs: `COV_MIN_FREE_GB` (default 10), `COV_CENSUS_CEILING_S` (default
 14400 — R-S0-7's ~4 h ceiling; a census that would cross it stops and records
 the shortfall by name), `COV_ALLOW_DRIFT=1` (accept a toolchain change as a
