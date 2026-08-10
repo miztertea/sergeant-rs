@@ -20,7 +20,7 @@ First build is slow: bundled DuckDB compiles ~500 C++ translation units (~10 min
 
 ## What this is
 
-A local agent execution daemon (`sgt`): durable Work items run staged workflows in git-worktree surfaces, executed by native agent harnesses (Claude via headless `claude -p` turns; a deterministic fake backend for tests), with the entire trajectory event-sourced into an append-only journal. Specified by `reference/proposal-depot-rust-execution-surface.md` (which calls the product "Depot"); departures from it live in GAUNTLET.md's deviation register D1–D8 and are settled — re-litigate one only by arguing its ruling is wrong, not by noticing the deviation exists.
+A local agent execution daemon (`sgt`): durable Work items run staged workflows in git-worktree surfaces, executed by native agent harnesses (Claude via headless `claude -p` turns; a deterministic fake backend for tests), with the entire trajectory event-sourced into an append-only journal. Specified by `reference/proposal-depot-rust-execution-surface.md` (which calls the product "Depot"); the N-series (ICM workflows, per-stage harnesses, Docker execute stages) is governed by its successor, `reference/proposal-next-iteration-icm-workflows.md`, kicked off by the N0 contract's rulings. Departures from either proposal live in GAUNTLET.md's deviation register and are settled — re-litigate one only by arguing its ruling is wrong, not by noticing the deviation exists.
 
 ## Architecture — the invariants that shape everything
 

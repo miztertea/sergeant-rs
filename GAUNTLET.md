@@ -24,6 +24,7 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 |---|---|---|---|
 | D1 | Product named Depot; `depot.toml`; `depot` CLI | Product **sergeant-rs**; `sergeant.toml`; binary `sgt` | Owner decision 2026-08-08 |
 | D2 | Claude adapter drives a held `attach` (per Sergeant's tmux design) | Daemon has no TTY/pane. Leading M4 candidate (2026-08-08): headless turn sequence — `claude -p --output-format stream-json` with prompt on stdin, `--resume <session_id>` per later turn; session identity is durable, process exists per turn. Proven in production by no-mistakes (`internal/agent/claude.go`, vendored knowledge in LESSONS L2). The spike's rejection of `-p --resume` was Sergeant-specific (live-`--bg` refusal + persistent-TTY doctrine), neither applies here. To be confirmed by M4 contract tests (R5: installed harness capability; interrupt/restart/concurrency semantics still unmeasured). Fallbacks: SessionStart-hook injection, `--bg` + stop→resume. **Confirmed at M4** (see the M4 ledger entry below): headless print-mode turns proved adequate; fallbacks unused. | Measured spike facts + no tmux in scope; see M4 contract Unknowns and the M4 ledger entry |
+| D9 | Successor proposal §7.1/§12.4 draws a flat stage layout — `CONTEXT.md` per stage, optional stage docs, shared contexts under `common/`; artifact declaration explicitly deferred (§24.4) | The ICM convention (`docs/icm/convention.md` §1a) adopts the published ICM protocol's four-layer model (Van Clief & McDermott, arXiv 2603.16021): workflow-level `CONTEXT.md` (L1 orientation), stage `CONTEXT.md` with a mandatory Inputs table (L2), `references/`+`_config/` stable-across-runs material (L3), per-stage `output/` declared per-run artifacts (L4, traveling with the Work branch) | Owner direction 2026-08-10 ("the proposal minimized ICM a bit too much"), grounded in the owner's IdeaOS ICM source record. R5: the named published protocol supplies the shapes; zero engine change — all four layers are ordinary worktree files, and L4 is the lower-rung answer to §24.4's deferred artifact declaration. Landed mid-N1 before the Draft phase consumed the convention docs. |
 | D8 | M6 contract budgets "ratatui + crossterm (§34-named, R5)" | `ratatui` only; crossterm is reached exclusively through `ratatui::crossterm` re-exports | Builder narrowing, registered at M6 adjudication (D5 precedent): declaring crossterm separately could resolve a second version whose `KeyEvent` differs from ratatui's backend type — one declaration means one resolution (R1). Rung-noted in Cargo.toml; pinned by `the_tui_stack_is_ratatui_with_crossterm_reached_through_it`. |
 | D7 | M5 contract budgets `tracing-opentelemetry` (§28-named) | `opentelemetry` + `opentelemetry_sdk` + `opentelemetry-otlp` directly; no tracing bridge | Builder measurement-adjacent ruling, registered at M5 adjudication (flagged by the checkpoint gate): the tracing-bridge cannot represent the §28 work→stage→execution span tree — spans there follow tokio task structure, not the engine's domain structure; building spans directly from journal/engine events preserves the §28 shape (R5: the named OTel crates themselves; the bridge dropped as R1 — machinery that cannot express the requirement). Rationale in `src/telemetry.rs` module docs. |
 | D6 | §38 P0 includes "native Codex execution"; owner's original scope decision was full P0 | Claude is the only native adapter in this prototype; Codex (and the M0-era `backend/codex.rs` stub) deferred until an environment exists where Codex can actually be measured | Owner decision 2026-08-08. Measure-first doctrine (L1) + the L7 lesson: adapter code that cannot be validated against the real harness is prose with a compiler. The §15 trait remains backend-neutral, so a future Codex adapter is additive. |
@@ -42,6 +43,112 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 ---
 
 ## Ledger entries
+
+### N2 — 2026-08-10, actor-only repo-to-icm: built, run, blind-measured
+
+**Mission outcome: contract met — the workflow exists, ran through the real
+engine, and the measurement returned a verdict.** The verdict:
+**§22.2 NOT met** — generator v1 silently missed 11 consequence-class
+behaviors within its covered scope; recall 47.3% in-scope, precision clean
+(zero invention, every quote verbatim at the pinned SHA), representation
+skewed ~9× toward shared-helper vs the reference's judgment tiers.
+Scorecard + grammar-pressure report in `docs/gauntlet/runs/n2-run2/`.
+Grammar pressure adjudicated: **GP-2 (actor-initiated mid-run ask) is the
+sole confirmed engine gap licensing Program B scope**; the volume wall
+(16/136 files per single-actor turn) is real but its engine claim was
+rejected — partitioned harvest stages and intra-stage iteration are untried
+lower rungs; §21.8 composition trigger NOT fired. Two resilience results
+measured incidentally: run 1 propagated a setup ambiguity fail-closed
+through all 10 stages with zero invention; run 2's daemon restart correctly
+blocked a stale fake execution (recovery invariant confirmed at GP-4).
+Defect #29 filed (finalize.py deleted a never-committed evidence file).
+U1 measured (needs_input/respond holds and resumes the same execution);
+U3 answered (dispositions + finalize executed on a real work branch).
+
+**Environmental behavior.** Build workflow (7 agents: measure-first U1,
+3 Sonnet builders, validator, 2 blind Opus critics — 31 findings, 7 error),
+Sonnet fix round (30/31 closed, one measured doc-vs-engine correction),
+two measurement runs (12 agents each; run-2 resumed once after a wedged
+harvest actor — workflow-runner failure, not engine), comparison (3 Sonnet
+comparers + Opus adjudicator; the adjudicator overturned C1's
+hash-integrity claim on re-verification and confirmed the rest). ~4.2M
+subagent tokens this milestone. Orchestrator error recorded: run 1's
+intent named no subject/revision and omitted UPSTREAM.md — the workflow's
+fail-closed discipline caught it end-to-end. Scripts archived
+(n2-build/-run/-run2/-compare).
+
+---
+
+### N1 — 2026-08-10, ICM convention + adjudicated Sergeant reference decomposition
+
+**Mission outcome: contract met; corpus frozen at version 1** (`reference-corpus/FROZEN.md`).
+Convention docs (`docs/icm/`) carry the D9 four-layer ICM model (owner-directed
+mid-milestone: L1 orientation / L2 stage contract with Inputs table / L3
+stable references / L4 per-run outputs with declared promote|evidence
+disposition + deterministic finalize). Corpus: 979 behavior units (966
+extracted from 139 decompose-files + 13 adjudication additions/splits), every
+quote script-verified against its source span, 4 citations honestly marked
+disputed; 34 draft workflow packages / 116 stages; 20 conflicts ADJUDICATED;
+4 surviving engine-pressure claims. Gate items all evidenced: per-file
+dispositions (source-inventory), two independent reviewers (boundary-honesty
++ completeness lenses, Opus), disagreements preserved (classification-ledger
++ adjudication-round1.md), structural lint committed and green (`lint.py`,
+orchestrator-re-run at freeze).
+
+**Environmental behavior.** Three workflows, 37 agents, ~8.4M subagent
+tokens, ~7h wall (2-wide concurrency ceiling): decomposition (17 agents —
+Sonnet extraction/drafting, Opus synthesis + 2 blind reviewers), fixer (15 —
+Sonnet fixers, Opus verifier), closure (5 Sonnet). The panel structure paid
+for itself twice: round-1 refute returned 21 findings (5 error) including
+44% of stages being machinery promoted via a future-engine justification
+(A4 demoted 71; N2's measurement would have been graded against over-staged
+gold) and the unenforceable-hash finding that became L11; the fixer round's
+Opus verifier then caught 13 closure gaps including a skipped package and a
+ruling written up but never applied to the record (V2) — fixed and re-linted.
+Orchestrator errors recorded: the parallel convention-doc agent's enum
+contradicted the extraction vocabulary (A1 — spec doc amended, corpus stood);
+adjudication A12 said "route the new units into provenance" without naming an
+owner, and no fixer owned it (V3). Scripts archived in
+`reference/gauntlet-workflows.zip` (n1-decomposition, n1-fixer, n1-closure).
+Unknowns resolved: U1 966 base units (vs 150–400 scoping estimate); U2
+no-mistakes decomposed without composition machinery (validate-and-ship, 9
+stages post-A5); U3 sergeant-setup's interactivity fit needs_input — its
+engine-gap claim (G5) was *rejected*: the lower rung already shipped.
+
+---
+
+### N0 — 2026-08-10, Next Iteration kickoff: proposal accepted, remediation adjudicated
+
+**Mission outcome: contract met — adjudication-only, zero code delta.** The
+successor proposal (`reference/proposal-next-iteration-icm-workflows.md`,
+audited against 27c00ef, delivered via the owner's IdeaOS corpus) is accepted
+as the governing document for the N-series with one owner-accepted amendment:
+retention (#17/#4) may no longer be silently parked — the N4 contract cannot
+be written without a retention design ruling (R-N0-3). Full rulings
+R-N0-1…R-N0-7 in `docs/gauntlet/contracts/N0.md`: #14/B3 and #20 fold into
+N3's two-phase-boundary scope and gates (their registered triggers fire
+there); #6/#7/#10 become regression budgets, not blockers; #18 → N5;
+#19 narrows into N2's real-Claude measurement run. Claude CLI 2.1.226 is
+confirmed as the measured floor (`MIN_TRUSTED_VERSION` already says so — M4
+re-measured on this exact version; owner ruling: older versions stay refused
+as unmeasured). Deviation-register scope extends to the successor proposal
+from this entry forward.
+
+**Environment evidence for Program B feasibility (measured this session):**
+`dockerd` 29.3.1 runs in this container (vfs, `--bridge=none
+--iptables=false`); registry pulls are egress-blocked, but a locally-built
+`FROM scratch` static image completes the full contract lifecycle — build,
+run, bind-mount read *and* write, `--network=none`, exact cleanup. §22.7's
+matrix is therefore executable here with Sergeant-owned probe images; only
+cold-pull/digest-pull/registry-auth tests need a qualified host. N5 platform
+qualification runs on the owner's macOS/Windows machines later, by design.
+
+**Environmental behavior.** Orchestrator-only (no panel): N0 produced
+rulings, not artifacts a blind panel could grade — the rulings themselves
+remain reviewable findings (L9) and every later contract that consumes one
+(N3, N4, N5, N2) re-exposes it to fresh critics at its own gate.
+
+---
 
 ### BUG SPRINT 1 — 2026-08-10, issues #3 #5 #9 #24
 

@@ -1,0 +1,46 @@
+# Validate and Ship (no-mistakes)
+Draft workflow package — candidate **W18** `validate-and-ship` from the N1
+manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
+decomposed from `reference/sergeant-upstream` per
+`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
+it is never delivered as a stage's instructions; each stage's own
+`CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
+§1a rule 5).
+
+## Purpose
+
+The single final shipping boundary: validate a committed change through the pipeline to a terminal outcome, routing every finding, without the validating actor ever editing the code.
+
+## Trigger
+
+Implementation, native tests, lint and independent review are complete and the coordinator has reached the approved shipping boundary.
+
+## Stages
+
+| Stage | Ladder rung (as extracted) | Durable outcome |
+|---|---|---|
+| `00-check-scope` | actor-stage (§6.4, judgment) | The invocation mode (validate-only / task-first) is determined and any specific user request is translated into concrete pipeline flags. Directly-invoked entry only — restored per N1 adjudication A5. |
+| `10-do-the-work` | actor-stage (§6.4, judgment) | In task-first mode, the described task is carried out and committed on a feature branch before validation begins. Directly-invoked entry only — restored per N1 adjudication A5. |
+| `20-select-intent-transport` | actor-stage (§6.4, judgment) | (Coordinator-launched entry only) readiness verified, launch reservation acquired, isolated snapshot reserved and re-verified; then, for either entry, the transport is probed against the installed build's real capability, decided once with explicit consent for the exposing option, recorded twice for audit, and re-checked before the run. Folds three demoted checkpoints (N1 adjudication A4) and this package's repo-release-verification re-homing (N1 adjudication A6). |
+| `30-start-run` | actor-stage (§6.4, judgment) | A run exists on a feature branch with committed history, a verbatim intent, an initialized repo and a runnable pipeline agent; an in-flight matching run is reattached, never duplicated. Re-rung from a §6.5 boilerplate classification to actor-stage per N1 adjudication A5 — see the stage's own CONTEXT.md. |
+| `40-drive-gates` | actor-stage (§6.4, judgment) | Every gate resolved by exactly one response; ask-user findings relayed verbatim and never resolved autonomously; the actor never edits the pipeline-owned worktree, aborts, or reruns to escape a gate; every actionable finding routed to a deduplicated owning-repo task. Folds a demoted checkpoint (N1 adjudication A4). |
+| `50-reconcile-custody` | actor-stage (§6.4, judgment) | The structured branch-sync state is processed rather than improvised: sync / continue / recover-custody, never reset, stash, force or branch replacement. |
+| `60-close-out` | actor-stage (§6.4, judgment) | Stop driving at `checks-passed`; on `failed`/`cancelled`, fix on the same branch and re-drive; summarize what the pipeline found and fixed; any coordinator ownership transfer during the run is durably logged. Folds a demoted checkpoint (N1 adjudication A4). |
+
+`00-verify-readiness`, `10-acquire-launch-reservation`, and `20-reserve-isolated-snapshot` (original numbering) were demoted per N1 adjudication A4 and folded into `20-select-intent-transport`; `60-route-findings` was demoted and folded into `40-drive-gates`; `90-handover-log` was demoted and folded into `60-close-out`. See each surviving stage's own `CONTEXT.md` and `provenance.md`'s "Adjudication A4" section for the per-stage keep/demote reasoning. `00-check-scope` and `10-do-the-work` were restored (never dissolved) and `40-start-run` (original numbering, now `30-start-run`) was re-rung to an actor stage, per N1 adjudication A5 (finding N1-BH-04) — see `provenance.md`'s "Adjudication A5" section. `repo-release-verification` was demoted from a standalone workflow and re-homed into `20-select-intent-transport` per N1 adjudication A6 — see `provenance.md`'s "Re-homed from repo-release-verification (A6)" section.
+
+## Relationships to other workflows
+
+- `40-drive-gates` delegates part of its outcome to **route-review-findings** (folded from the demoted `60-route-findings`).
+
+## Notes for reviewers
+
+**U2 verdict** (`reference-corpus/synthesis.md` §1): the §6.3 reimplementation test *does* discriminate cleanly here, but only after the source's flat command list is split by outcome — the things that failed the test and became helpers, not stages, are the individual commands (`axi`, `axi status`, `axi logs`, `axi abort`, `axi sync --check`; BU-P2-101), the output grammar (BU-P2-102), the `--intent-file`/`--intent` flag choice (BU-P1-071), and the branch-sync decision table (BU-P1-078).
+
+**Two entry variants, redesigned per N1 adjudication A5.** Coordinator-launched entry begins at `20-select-intent-transport` (its folded helpers cover the readiness-marker, launch-reservation, and isolated-snapshot preconditions that only apply to a coordinator handing off an already-reviewed worker commit). Directly-invoked entry (`/no-mistakes`, run by the actor in the current session) begins at `00-check-scope`, proceeds through `10-do-the-work` in task-first mode, and rejoins the shared pipeline at `20-select-intent-transport`. `00-check-scope`/`10-do-the-work` were previously dissolved into workflow-level citations and prose rather than materialized as stages, to dodge an id collision with what were then `10-acquire-launch-reservation`/`20-reserve-isolated-snapshot` — adjudication A5 (finding N1-BH-04) confirmed that was a violation (id collisions are renamed, never dissolved) and directed their restoration; renumbering the whole package (see the stage table above) both resolved the collision and gave the two entry variants a coherent single ordered list, per convention.md's single-linear-stage-list model (no engine-level branching exists at this milestone).
+
+Per A11, the reader-note previously repeating "read `pane`/`tmux` as this project's durable session/execution identity" has been removed as redundant: the affected statements (`BU-P7-104`, `BU-P8-089`, both folded into `60-close-out`) are cited here already normalized to that reading in the corpus (`behavior-units/*.ndjson`); see deviation register D2 and obsolete-mechanism clusters M1-M4 (`reference-corpus/synthesis.md` §4) for the underlying obsolescence.
+
+## Provenance
+
+See `provenance.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.

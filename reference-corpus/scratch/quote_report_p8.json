@@ -1,0 +1,1429 @@
+[
+ {
+  "id": "BU-P8-001",
+  "locator": "L3-6",
+  "used_range": [
+   3,
+   6
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 248,
+  "span_bytes": 248,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-002",
+  "locator": "L30 (Documentation authority)",
+  "used_range": [
+   30,
+   30
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 63,
+  "span_bytes": 63,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-003",
+  "locator": "L31 (Documentation authority)",
+  "used_range": [
+   31,
+   31
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 86,
+  "span_bytes": 86,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-004",
+  "locator": "L32 (Documentation authority)",
+  "used_range": [
+   32,
+   32
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 73,
+  "span_bytes": 73,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-005",
+  "locator": "L34-36 (Documentation authority)",
+  "used_range": [
+   34,
+   36
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 195,
+  "span_bytes": 195,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-006",
+  "locator": "L38-39",
+  "used_range": [
+   38,
+   39
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 153,
+  "span_bytes": 153,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-007",
+  "locator": "L165-167 (Retry And Recovery)",
+  "used_range": [
+   165,
+   167
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 234,
+  "span_bytes": 234,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-008",
+  "locator": "L10-14 (Configure A Profile)",
+  "used_range": [
+   10,
+   14
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 332,
+  "span_bytes": 332,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-009",
+  "locator": "L15",
+  "used_range": [
+   15,
+   15
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 33,
+  "span_bytes": 33,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-010",
+  "locator": "L21-49 (Register An Origin)",
+  "used_range": [
+   21,
+   49
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 975,
+  "span_bytes": 975,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-011",
+  "locator": "L44-49",
+  "used_range": [
+   44,
+   49
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 321,
+  "span_bytes": 321,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-012",
+  "locator": "L31-33",
+  "used_range": [
+   31,
+   33
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 213,
+  "span_bytes": 213,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-013",
+  "locator": "L51-52",
+  "used_range": [
+   51,
+   52
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 146,
+  "span_bytes": 146,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-014",
+  "locator": "L58-65 (table)",
+  "used_range": [
+   58,
+   65
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 296,
+  "span_bytes": 296,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-015",
+  "locator": "L67-70",
+  "used_range": [
+   67,
+   70
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 220,
+  "span_bytes": 220,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-016",
+  "locator": "L80-82",
+  "used_range": [
+   80,
+   82
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 169,
+  "span_bytes": 169,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-017",
+  "locator": "L84-87",
+  "used_range": [
+   84,
+   87
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 306,
+  "span_bytes": 306,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-018",
+  "locator": "L87-90",
+  "used_range": [
+   87,
+   90
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 232,
+  "span_bytes": 232,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-019",
+  "locator": "L94-116",
+  "used_range": [
+   94,
+   116
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 1137,
+  "span_bytes": 1137,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-020",
+  "locator": "L118-120",
+  "used_range": [
+   118,
+   120
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 211,
+  "span_bytes": 211,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-021",
+  "locator": "L124-138",
+  "used_range": [
+   124,
+   138
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 932,
+  "span_bytes": 932,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-022",
+  "locator": "L134-137",
+  "used_range": [
+   134,
+   137
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 307,
+  "span_bytes": 307,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-023",
+  "locator": "L143-149 (Retry And Recovery)",
+  "used_range": [
+   143,
+   149
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 512,
+  "span_bytes": 512,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-024",
+  "locator": "L151-156",
+  "used_range": [
+   151,
+   156
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 135,
+  "span_bytes": 135,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-025",
+  "locator": "L158-163",
+  "used_range": [
+   158,
+   163
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 213,
+  "span_bytes": 213,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-026",
+  "locator": "L167-179",
+  "used_range": [
+   167,
+   179
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 645,
+  "span_bytes": 645,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-027",
+  "locator": "L174-184",
+  "used_range": [
+   174,
+   184
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 524,
+  "span_bytes": 524,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-028",
+  "locator": "L186-196 (ws-lab Consumer Handoff)",
+  "used_range": [
+   186,
+   196
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 616,
+  "span_bytes": 616,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-029",
+  "locator": "L3",
+  "used_range": [
+   3,
+   3
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 150,
+  "span_bytes": 150,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-030",
+  "locator": "L19",
+  "used_range": [
+   19,
+   19
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 273,
+  "span_bytes": 275,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-031",
+  "locator": "L21-24",
+  "used_range": [
+   21,
+   24
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 282,
+  "span_bytes": 282,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-032",
+  "locator": "L43, L64-71",
+  "used_range": [
+   64,
+   71
+  ],
+  "multi_range": true,
+  "other_ranges": [
+   [
+    43,
+    43
+   ]
+  ],
+  "quote_len_chars": 508,
+  "span_bytes": 508,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-033",
+  "locator": "L85-89",
+  "used_range": [
+   85,
+   89
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 246,
+  "span_bytes": 246,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-034",
+  "locator": "L54",
+  "used_range": [
+   54,
+   54
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 256,
+  "span_bytes": 256,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-035",
+  "locator": "L79",
+  "used_range": [
+   79,
+   79
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 340,
+  "span_bytes": 340,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-036",
+  "locator": "L81",
+  "used_range": [
+   81,
+   81
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 442,
+  "span_bytes": 442,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-037",
+  "locator": "L93-107 (Instruction layering)",
+  "used_range": [
+   93,
+   107
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 763,
+  "span_bytes": 769,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-038",
+  "locator": "L104-107",
+  "used_range": [
+   104,
+   107
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 248,
+  "span_bytes": 248,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-039",
+  "locator": "L60",
+  "used_range": [
+   60,
+   60
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 255,
+  "span_bytes": 261,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-040",
+  "locator": "L111-117",
+  "used_range": [
+   111,
+   117
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 368,
+  "span_bytes": 374,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-041",
+  "locator": "L6-27 (Prerequisites)",
+  "used_range": [
+   6,
+   27
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 493,
+  "span_bytes": 493,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-042",
+  "locator": "L51-53",
+  "used_range": [
+   51,
+   53
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 165,
+  "span_bytes": 165,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-043",
+  "locator": "L82-83",
+  "used_range": [
+   82,
+   83
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 148,
+  "span_bytes": 148,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-044",
+  "locator": "L85-94",
+  "used_range": [
+   85,
+   94
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 218,
+  "span_bytes": 218,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-045",
+  "locator": "L102-110",
+  "used_range": [
+   102,
+   110
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 396,
+  "span_bytes": 396,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-046",
+  "locator": "L141-142",
+  "used_range": [
+   141,
+   142
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 142,
+  "span_bytes": 142,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-047",
+  "locator": "L144-151",
+  "used_range": [
+   144,
+   151
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 213,
+  "span_bytes": 213,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-048",
+  "locator": "L153-161",
+  "used_range": [
+   153,
+   161
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 207,
+  "span_bytes": 207,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-049",
+  "locator": "L163-171",
+  "used_range": [
+   163,
+   171
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 439,
+  "span_bytes": 439,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-050",
+  "locator": "L173-182",
+  "used_range": [
+   173,
+   182
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 371,
+  "span_bytes": 371,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-051",
+  "locator": "L192-202 (Completion checklist)",
+  "used_range": [
+   192,
+   202
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 604,
+  "span_bytes": 604,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-052",
+  "locator": "L3-12 (Start with project context)",
+  "used_range": [
+   3,
+   12
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 234,
+  "span_bytes": 234,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-053",
+  "locator": "L18-19 (Direct mode)",
+  "used_range": [
+   18,
+   19
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 111,
+  "span_bytes": 111,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-054",
+  "locator": "L30-33 (Dispatch mode)",
+  "used_range": [
+   30,
+   33
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 146,
+  "span_bytes": 146,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-055",
+  "locator": "L21-28 (Direct mode)",
+  "used_range": [
+   21,
+   28
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 529,
+  "span_bytes": 529,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-056",
+  "locator": "L23 (Direct mode, step 2)",
+  "used_range": [
+   23,
+   23
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 75,
+  "span_bytes": 75,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-057",
+  "locator": "L24 (Direct mode, step 3)",
+  "used_range": [
+   24,
+   24
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 42,
+  "span_bytes": 42,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-058",
+  "locator": "L26 (Direct mode, step 6)",
+  "used_range": [
+   26,
+   26
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 70,
+  "span_bytes": 70,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-059",
+  "locator": "L54-58 (Dispatch mode)",
+  "used_range": [
+   54,
+   58
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 346,
+  "span_bytes": 346,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-060",
+  "locator": "L60-64",
+  "used_range": [
+   60,
+   64
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 404,
+  "span_bytes": 404,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-061",
+  "locator": "L65-66",
+  "used_range": [
+   65,
+   66
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 154,
+  "span_bytes": 154,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-062",
+  "locator": "L66-67",
+  "used_range": [
+   66,
+   67
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 91,
+  "span_bytes": 91,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-063",
+  "locator": "L69-73",
+  "used_range": [
+   69,
+   73
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 313,
+  "span_bytes": 313,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-064",
+  "locator": "L75-77",
+  "used_range": [
+   75,
+   77
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 166,
+  "span_bytes": 166,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-065",
+  "locator": "L83-86",
+  "used_range": [
+   83,
+   86
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 290,
+  "span_bytes": 290,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-066",
+  "locator": "L80-86",
+  "used_range": [
+   80,
+   86
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 502,
+  "span_bytes": 504,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-067",
+  "locator": "L99-102 (Security posture)",
+  "used_range": [
+   99,
+   102
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 238,
+  "span_bytes": 238,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-068",
+  "locator": "L103-106",
+  "used_range": [
+   103,
+   106
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 286,
+  "span_bytes": 288,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-069",
+  "locator": "L112-117",
+  "used_range": [
+   112,
+   117
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 442,
+  "span_bytes": 442,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-070",
+  "locator": "L137-155 (Monitor work)",
+  "used_range": [
+   137,
+   155
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 617,
+  "span_bytes": 617,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-071",
+  "locator": "L157-159",
+  "used_range": [
+   157,
+   159
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 226,
+  "span_bytes": 226,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-072",
+  "locator": "L161-172 (Worker states)",
+  "used_range": [
+   161,
+   172
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 844,
+  "span_bytes": 844,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-073",
+  "locator": "L178-184 (Worker states table)",
+  "used_range": [
+   178,
+   184
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 913,
+  "span_bytes": 913,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-074",
+  "locator": "L188-190 (Resume deferred work)",
+  "used_range": [
+   188,
+   190
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 224,
+  "span_bytes": 224,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-075",
+  "locator": "L196-208, L224-227 (wake condition table)",
+  "used_range": [
+   196,
+   208
+  ],
+  "multi_range": true,
+  "other_ranges": [
+   [
+    224,
+    227
+   ]
+  ],
+  "quote_len_chars": 800,
+  "span_bytes": 802,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-076",
+  "locator": "L216-222",
+  "used_range": [
+   216,
+   222
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 530,
+  "span_bytes": 530,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-077",
+  "locator": "L231-243 (Pause admission with a drain)",
+  "used_range": [
+   231,
+   243
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 694,
+  "span_bytes": 694,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-078",
+  "locator": "L241-243",
+  "used_range": [
+   241,
+   243
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 215,
+  "span_bytes": 215,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-079",
+  "locator": "L253-262 (Respond to a worker)",
+  "used_range": [
+   253,
+   262
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 359,
+  "span_bytes": 359,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-080",
+  "locator": "L272-281 (Respond to a worker)",
+  "used_range": [
+   272,
+   281
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 748,
+  "span_bytes": 748,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-081",
+  "locator": "L283-296 (Recover one stalled worker)",
+  "used_range": [
+   283,
+   296
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 689,
+  "span_bytes": 689,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-082",
+  "locator": "L312-317 (Final no-mistakes boundary)",
+  "used_range": [
+   312,
+   317
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 383,
+  "span_bytes": 383,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-083",
+  "locator": "L318-327",
+  "used_range": [
+   318,
+   327
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 535,
+  "span_bytes": 535,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-084",
+  "locator": "L328-331",
+  "used_range": [
+   328,
+   331
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 300,
+  "span_bytes": 300,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-085",
+  "locator": "L333-339 (Intent transport and the argv consent gate)",
+  "used_range": [
+   333,
+   339
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 350,
+  "span_bytes": 350,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-086",
+  "locator": "L340-346",
+  "used_range": [
+   340,
+   346
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 499,
+  "span_bytes": 499,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-087",
+  "locator": "L348-355",
+  "used_range": [
+   348,
+   355
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 598,
+  "span_bytes": 598,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-088",
+  "locator": "L359-374 (Coordinator ownership and handover)",
+  "used_range": [
+   359,
+   374
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 780,
+  "span_bytes": 780,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-089",
+  "locator": "L376-379",
+  "used_range": [
+   376,
+   379
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 323,
+  "span_bytes": 323,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-090",
+  "locator": "L384-387",
+  "used_range": [
+   384,
+   387
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 313,
+  "span_bytes": 313,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-091",
+  "locator": "L392-395",
+  "used_range": [
+   392,
+   395
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 286,
+  "span_bytes": 286,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-092",
+  "locator": "L399-408 (Clean completed fleet state)",
+  "used_range": [
+   399,
+   408
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 446,
+  "span_bytes": 446,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-093",
+  "locator": "L420-429 (Wiki operations)",
+  "used_range": [
+   420,
+   429
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 250,
+  "span_bytes": 250,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-094",
+  "locator": "L3-4",
+  "used_range": [
+   3,
+   4
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 140,
+  "span_bytes": 140,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-095",
+  "locator": "L52-68 (Worker says in_progress but is not moving)",
+  "used_range": [
+   52,
+   68
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 970,
+  "span_bytes": 970,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-096",
+  "locator": "L72-74 (Worker became orphaned after blocking)",
+  "used_range": [
+   72,
+   74
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 247,
+  "span_bytes": 247,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-097",
+  "locator": "L77-86 (Response already pending)",
+  "used_range": [
+   77,
+   86
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 611,
+  "span_bytes": 611,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-098",
+  "locator": "L88-93 (Pane is missing)",
+  "used_range": [
+   88,
+   93
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 259,
+  "span_bytes": 259,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-099",
+  "locator": "L96-100 (Repeated notifications)",
+  "used_range": [
+   96,
+   100
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 264,
+  "span_bytes": 264,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-100",
+  "locator": "L102-113 (no-mistakes is parked)",
+  "used_range": [
+   102,
+   113
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 402,
+  "span_bytes": 402,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-101",
+  "locator": "L114-116",
+  "used_range": [
+   114,
+   116
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 221,
+  "span_bytes": 221,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-102",
+  "locator": "L129-146 (Bash 3.2 validation)",
+  "used_range": [
+   129,
+   146
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 698,
+  "span_bytes": 698,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-103",
+  "locator": "L148-152 (Graphify output is wrong or recursive)",
+  "used_range": [
+   148,
+   152
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 271,
+  "span_bytes": 271,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-104",
+  "locator": "L154-164 (Cleanup refuses or state is partial)",
+  "used_range": [
+   154,
+   164
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 679,
+  "span_bytes": 679,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-105",
+  "locator": "L166-186 (Cleanup refuses an unfinished response handshake)",
+  "used_range": [
+   166,
+   186
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 1199,
+  "span_bytes": 1201,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-106",
+  "locator": "L188-197",
+  "used_range": [
+   188,
+   197
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 759,
+  "span_bytes": 761,
+  "truncated": true
+ },
+ {
+  "id": "BU-P8-107",
+  "locator": "L199-201",
+  "used_range": [
+   199,
+   201
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 223,
+  "span_bytes": 227,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-108",
+  "locator": "L203-209 (fleet state and worktree must be on the same filesystem)",
+  "used_range": [
+   203,
+   209
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 482,
+  "span_bytes": 482,
+  "truncated": false
+ },
+ {
+  "id": "BU-P8-109",
+  "locator": "L242-244",
+  "used_range": [
+   242,
+   244
+  ],
+  "multi_range": false,
+  "other_ranges": [],
+  "quote_len_chars": 221,
+  "span_bytes": 221,
+  "truncated": false
+ }
+]

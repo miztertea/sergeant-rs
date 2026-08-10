@@ -1,0 +1,16 @@
+# repo-to-icm — admitted workflow (N2, docs/gauntlet/contracts/N2.md;
+# proposal §9). Converts a repository's distributed procedural knowledge
+# into DRAFT ICM workflow packages under .sergeant/drafts/workflows/, plus
+# an evidence-backed measurement report. It does not publish workflows and
+# it does not modify the engine (proposal §9.1).
+#
+# Ten ordinary actor stages (§9.2: every stage in version 0 is an actor
+# stage — no engine change). Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4) — checked by
+# scripts/validate-structure.py.
+
+[workflow]
+name = "repo-to-icm"
+version = "1"
+stages = ["00-contract", "10-inventory", "20-harvest", "30-normalize", "40-classify", "50-synthesize", "60-draft", "70-lint", "80-adversarial-review", "90-reconcile"]
