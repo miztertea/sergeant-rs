@@ -89,6 +89,7 @@ use super::{
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::profile::Profile;
 use crate::runtime::blob::BlobStore;
+use crate::runtime::graph::KIND_CONVERSATION_ASK;
 
 /// Name this backend registers under.
 pub const CLAUDE_BACKEND_NAME: &str = "claude";
@@ -116,6 +117,50 @@ pub const REQUIRED_FLAGS: &[&str] = &[
 
 /// Environment variable naming the `claude` executable to use.
 pub const CLAUDE_BIN_ENV: &str = "SGT_CLAUDE_BIN";
+
+/// The stream-json `system` subtype carrying a turn's end-of-turn status
+/// (measured on 2.1.226 — see [`actor_question`]).
+pub const POST_TURN_SUMMARY_SUBTYPE: &str = "post_turn_summary";
+
+/// The actor's question from one `post_turn_summary` line, when it asked one.
+///
+/// **Measured, 2.1.226** (`docs/gauntlet/notes/n3-claude-ask-measurement.md`),
+/// two haiku turns in print-mode stream-json:
+///
+/// ```text
+/// turn told to ask a question →
+///   {"type":"system","subtype":"post_turn_summary",
+///    "status_category":"blocked",
+///    "status_detail":"Which database should I target: **postgres** or **sqlite**?",
+///    "needs_action":"Which database should I target: **postgres** or **sqlite**?"}
+/// turn told to answer and ask nothing →
+///   {"type":"system","subtype":"post_turn_summary",
+///    "status_category":"review_ready","status_detail":"user requested confirmation",
+///    "needs_action":""}
+/// ```
+///
+/// So `needs_action` is the discriminator, and it carries the actor's own
+/// words. The rule here is deliberately the narrow one: a **non-empty
+/// `needs_action` string** is an ask, and nothing else is. Two reasons for not
+/// also keying on `status_category`:
+///
+/// - its vocabulary is unmeasured beyond the two values above, and L1's rule
+///   is that an unmeasured field is not evidence;
+/// - the two possible errors are not symmetric. Parking a stage that did not
+///   really need parking costs a human one `respond`; completing a stage
+///   whose actor was waiting for an answer is the silent-invention failure
+///   GP-2 was filed about. The branch that fails closed is the one that
+///   parks, so the narrow rule is the one that parks.
+///
+/// The category travels into the evidence regardless, because it is what an
+/// operator reads when the decision looks wrong.
+fn actor_question(summary: &Value) -> Option<String> {
+    let question = summary.get("needs_action")?.as_str()?.trim();
+    if question.is_empty() {
+        return None;
+    }
+    Some(question.to_string())
+}
 
 /// Launch configuration for the adapter.
 #[derive(Debug, Clone)]
@@ -265,6 +310,15 @@ struct TurnOutcome {
     raw_error: Option<String>,
     /// Captured stderr, for evidence when things went wrong.
     stderr: String,
+    /// The turn's last `system`/`post_turn_summary` line, verbatim.
+    ///
+    /// Measured on 2.1.226 (see the module docs and
+    /// `docs/gauntlet/notes/n3-claude-ask-measurement.md`): print-mode
+    /// stream-json emits exactly one of these per turn, and its
+    /// `needs_action` field carries the actor's own question when the actor
+    /// ended the turn asking one. This is the structured record GP-2's ask
+    /// primitive needs; without it the adapter would be guessing from prose.
+    post_turn_summary: Option<Value>,
 }
 
 impl TurnOutcome {
@@ -872,12 +926,13 @@ impl TurnReader {
     fn run(self, stdout: std::process::ChildStdout) {
         let mut raw = String::new();
         let mut envelope: Option<Value> = None;
+        let mut summary: Option<Value> = None;
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             raw.push_str(&line);
             raw.push('\n');
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                self.ingest_line(&value, &mut envelope);
+                self.ingest_line(&value, &mut envelope, &mut summary);
             }
         }
         // Stdout is closed; the process has exited or is about to. Reap it.
@@ -913,6 +968,7 @@ impl TurnReader {
             raw_blob: raw_blob.clone(),
             raw_error: raw_error.clone(),
             stderr: stderr.clone(),
+            post_turn_summary: summary.clone(),
         });
         drop(state);
 
@@ -956,8 +1012,35 @@ impl TurnReader {
 
     /// Normalize one stream-json line into §27 events. System lines are
     /// left to the raw archive: they are vendor plumbing, not conversation.
-    fn ingest_line(&self, value: &Value, envelope: &mut Option<Value>) {
+    fn ingest_line(
+        &self,
+        value: &Value,
+        envelope: &mut Option<Value>,
+        summary: &mut Option<Value>,
+    ) {
         match value.get("type").and_then(Value::as_str) {
+            // §11.1's explicit semantic signal, as 2.1.226 actually emits it.
+            // Only this subtype is read; the rest of the `system` stream stays
+            // vendor plumbing that lives in the raw archive.
+            Some("system")
+                if value.get("subtype").and_then(Value::as_str)
+                    == Some(POST_TURN_SUMMARY_SUBTYPE) =>
+            {
+                if let Some(question) = actor_question(value) {
+                    // The actor's own words, journaled as the actor's — a
+                    // separate fact from the engine's `stage.needs_input`,
+                    // which is sergeant's decision about what to do with it.
+                    self.emit(
+                        KIND_CONVERSATION_ASK,
+                        json!({
+                            "session_id": self.session_id,
+                            "question": question,
+                            "status_category": value.get("status_category").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+                *summary = Some(value.clone());
+            }
             Some("assistant") => {
                 let content = value
                     .pointer("/message/content")
@@ -1079,9 +1162,17 @@ impl Backend for ClaudeBackend {
             human_attach: false,
             usage: true,
             native_subagents: false,
-            // Nothing measured yet about whether 2.1.226 can report an
-            // actor-authored question; unmeasured is `false` (L8).
-            ask: false,
+            // GP-2, measured on 2.1.226 rather than assumed: print-mode
+            // stream-json emits one `system`/`post_turn_summary` per turn
+            // whose `needs_action` field carries the actor's own question
+            // when the actor ended the turn asking one, and is the empty
+            // string when it did not (see `actor_question` for the two
+            // measured records, and the opt-in contract test that re-measures
+            // them against the installed CLI). That is a structured record,
+            // not an inference from prose, so the claim is `true` — and it is
+            // the only reason it is: without that line this would be `false`
+            // and every ask would silently complete its stage.
+            ask: true,
         }
     }
 
@@ -1673,6 +1764,10 @@ fn observe_envelope(
         };
     }
     // Pin verification layer 3: substitution detection from model fields.
+    // Ordered *before* the ask check on purpose: a turn that ran on the wrong
+    // model fails, whatever it asked. Parking such a stage in `needs_input`
+    // would put a human in front of a question produced by a model the work
+    // never authorized.
     match verify_model_pin(execution.model.as_deref(), envelope) {
         PinVerdict::Substituted(ran) => Observation {
             native: NativeState::Exited,
@@ -1685,17 +1780,46 @@ fn observe_envelope(
             },
             evidence: raw_evidence(session, outcome),
         },
-        verdict => Observation {
-            native: NativeState::Exited,
-            signal: BackendSignal::StageCompleted {
-                summary: Some(result_text),
-            },
-            evidence: Some(format!(
-                "session {session}; model_pin={}; raw={}",
-                verdict.as_json(),
-                outcome.raw_evidence()
-            )),
-        },
+        verdict => {
+            // GP-2: the actor asked. A turn that ends on a question is not a
+            // completed stage — it is a stage waiting on a human, resumable
+            // by `respond` on this same conversation (`--resume` continues
+            // it, U1's semantics unchanged). Before this branch existed, the
+            // question became the completion summary and the workflow moved
+            // on without it ever being answered.
+            if let Some(question) = outcome.post_turn_summary.as_ref().and_then(actor_question) {
+                let category = outcome
+                    .post_turn_summary
+                    .as_ref()
+                    .and_then(|s| s.get("status_category"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                return Observation {
+                    // The *turn's* process is gone; the conversation is not,
+                    // and SEND resumes it. §25's separation, unchanged: the
+                    // exited process says nothing about the stage.
+                    native: NativeState::Exited,
+                    signal: BackendSignal::ask(question),
+                    evidence: Some(format!(
+                        "session {session}; actor asked at turn end \
+                         (post_turn_summary.status_category={category:?}); model_pin={}; raw={}",
+                        verdict.as_json(),
+                        outcome.raw_evidence()
+                    )),
+                };
+            }
+            Observation {
+                native: NativeState::Exited,
+                signal: BackendSignal::StageCompleted {
+                    summary: Some(result_text),
+                },
+                evidence: Some(format!(
+                    "session {session}; model_pin={}; raw={}",
+                    verdict.as_json(),
+                    outcome.raw_evidence()
+                )),
+            }
+        }
     }
 }
 
@@ -1903,6 +2027,7 @@ mod tests {
             "session_id": "s"
         });
         let outcome = TurnOutcome {
+            post_turn_summary: None,
             envelope: Some(envelope.clone()),
             interrupted: false,
             raw_blob: None,
@@ -1927,6 +2052,7 @@ mod tests {
         let execution = test_execution(Some("opus"));
         let envelope = substitution_envelope();
         let outcome = TurnOutcome {
+            post_turn_summary: None,
             envelope: Some(envelope.clone()),
             interrupted: false,
             raw_blob: Some("b3:aa".to_string()),
@@ -1950,6 +2076,7 @@ mod tests {
     fn a_missing_envelope_is_resumable_when_interrupted_and_unknown_otherwise() {
         let mut execution = test_execution(None);
         execution.turn = TurnState::Finished(TurnOutcome {
+            post_turn_summary: None,
             envelope: None,
             interrupted: true,
             raw_blob: Some("b3:cc".to_string()),
@@ -1961,6 +2088,7 @@ mod tests {
         assert_eq!(observation.signal, BackendSignal::Running);
 
         execution.turn = TurnState::Finished(TurnOutcome {
+            post_turn_summary: None,
             envelope: None,
             interrupted: false,
             raw_blob: None,
@@ -1992,6 +2120,7 @@ mod tests {
             "type": "result", "subtype": "success", "result": "looks fine to me"
         });
         let outcome = TurnOutcome {
+            post_turn_summary: None,
             envelope: Some(envelope.clone()),
             interrupted: false,
             raw_blob: None,
@@ -2164,6 +2293,126 @@ mod tests {
         assert_eq!(truncate("", 4), "");
     }
 
+    /// GP-2, measured: `post_turn_summary.needs_action` is the discriminator,
+    /// and it is the *only* one this adapter reads.
+    ///
+    /// Both records below are the literal lines 2.1.226 emitted for the two
+    /// prompts recorded in `docs/gauntlet/notes/n3-claude-ask-measurement.md`.
+    /// The empty-string case is the one that matters most: a turn that asked
+    /// nothing still emits the line, so "the line exists" would have been a
+    /// capability claim with no discrimination in it at all.
+    #[test]
+    fn the_actor_question_comes_from_needs_action_and_nothing_else() {
+        let asked = json!({
+            "type": "system", "subtype": "post_turn_summary",
+            "status_category": "blocked",
+            "status_detail": "Which database should I target: **postgres** or **sqlite**?",
+            "needs_action": "Which database should I target: **postgres** or **sqlite**?",
+        });
+        assert_eq!(
+            actor_question(&asked).as_deref(),
+            Some("Which database should I target: **postgres** or **sqlite**?")
+        );
+        let did_not_ask = json!({
+            "type": "system", "subtype": "post_turn_summary",
+            "status_category": "review_ready",
+            "status_detail": "user requested confirmation",
+            "needs_action": "",
+        });
+        assert_eq!(actor_question(&did_not_ask), None);
+        // Whitespace is not a question, and a missing/non-string field is
+        // not evidence of one either.
+        assert_eq!(actor_question(&json!({"needs_action": "   "})), None);
+        assert_eq!(actor_question(&json!({"needs_action": null})), None);
+        assert_eq!(actor_question(&json!({})), None);
+        // And a category alone never conjures one: an unmeasured vocabulary
+        // is not a signal (L1).
+        assert_eq!(actor_question(&json!({"status_category": "blocked"})), None);
+    }
+
+    /// A turn that ends on an actor-authored question parks the stage instead
+    /// of completing it — and the question, not the adapter, is the author.
+    ///
+    /// This is the whole of GP-2 at the adapter boundary. Before it, the
+    /// measured ask turn returned `StageCompleted { summary: "Which database
+    /// should I target…" }`: the workflow moved to the next stage carrying the
+    /// unanswered question as its predecessor's result.
+    #[test]
+    fn an_actor_authored_question_parks_the_stage_rather_than_completing_it() {
+        let execution = test_execution(None);
+        let envelope = json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "Which database should I target: **postgres** or **sqlite**?",
+        });
+        let outcome = TurnOutcome {
+            post_turn_summary: Some(json!({
+                "type": "system", "subtype": "post_turn_summary",
+                "status_category": "blocked",
+                "needs_action": "Which database should I target: **postgres** or **sqlite**?",
+            })),
+            envelope: Some(envelope.clone()),
+            interrupted: false,
+            raw_blob: Some("b3:aa".to_string()),
+            raw_error: None,
+            stderr: String::new(),
+        };
+        let observation = observe_envelope(&execution, &envelope, &outcome);
+        match &observation.signal {
+            BackendSignal::NeedsInput { prompt, asked_by } => {
+                assert_eq!(
+                    prompt,
+                    "Which database should I target: **postgres** or **sqlite**?"
+                );
+                assert_eq!(*asked_by, crate::backend::AskAuthor::Actor);
+            }
+            other => panic!("expected an actor ask, got {other:?}"),
+        }
+        // The turn's process is gone; the conversation is not (§25).
+        assert_eq!(observation.native, NativeState::Exited);
+        let evidence = observation.evidence.unwrap_or_default();
+        assert!(
+            evidence.contains("status_category"),
+            "the unmeasured category travels as evidence, never as the decision: {evidence}"
+        );
+
+        // Same turn, no question: the stage completes exactly as before.
+        let quiet = TurnOutcome {
+            post_turn_summary: Some(json!({
+                "type": "system", "subtype": "post_turn_summary",
+                "status_category": "review_ready", "needs_action": "",
+            })),
+            ..outcome
+        };
+        assert!(matches!(
+            observe_envelope(&execution, &envelope, &quiet).signal,
+            BackendSignal::StageCompleted { .. }
+        ));
+    }
+
+    /// An ask never outranks a model-pin substitution. Parking a stage would
+    /// put a human in front of a question produced by a model the work never
+    /// authorized; the pin failure is the outcome, and it stays the outcome.
+    #[test]
+    fn a_substituted_pin_still_fails_even_when_the_actor_asked() {
+        let execution = test_execution(Some("opus"));
+        let envelope = substitution_envelope();
+        let outcome = TurnOutcome {
+            post_turn_summary: Some(json!({
+                "type": "system", "subtype": "post_turn_summary",
+                "status_category": "blocked", "needs_action": "which one?",
+            })),
+            envelope: Some(envelope.clone()),
+            interrupted: false,
+            raw_blob: None,
+            raw_error: None,
+            stderr: String::new(),
+        };
+        assert!(matches!(
+            observe_envelope(&execution, &envelope, &outcome).signal,
+            BackendSignal::Failed { .. }
+        ));
+    }
+
     fn test_execution(model: Option<&str>) -> ClaudeExecution {
         ClaudeExecution {
             session_id: "s".to_string(),
@@ -2175,6 +2424,7 @@ mod tests {
             permission_args: vec![],
             turns: 1,
             turn: TurnState::Finished(TurnOutcome {
+                post_turn_summary: None,
                 envelope: None,
                 interrupted: false,
                 raw_blob: None,

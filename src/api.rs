@@ -47,8 +47,8 @@ use crate::domain::workflow::{
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{Engine, EngineError, Next as EngineNext, Step, SubmitContext};
 use crate::runtime::graph::{
-    KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED, KIND_CONVERSATION_USER,
-    KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
+    KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
+    KIND_CONVERSATION_USER, KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry, WorkRun};
@@ -1398,6 +1398,7 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_SURFACE_TORN_DOWN,
     KIND_CONVERSATION_USER,
     KIND_CONVERSATION_ASSISTANT_COMPLETED,
+    KIND_CONVERSATION_ASK,
     KIND_CONVERSATION_TURN_ENDED,
     KIND_TOOL_REQUESTED,
     KIND_TOOL_COMPLETED,

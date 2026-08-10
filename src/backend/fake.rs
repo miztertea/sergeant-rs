@@ -53,6 +53,7 @@ pub fn parse_script(script: &str) -> Vec<FakeStep> {
                 "complete" if detail.is_empty() => Some(FakeStep::complete()),
                 "complete" => Some(FakeStep::complete_with(detail)),
                 "needs_input" => Some(FakeStep::needs_input(detail)),
+                "ask" => Some(FakeStep::ask(detail)),
                 "waiting" => Some(FakeStep::waiting(detail)),
                 "blocked" => Some(FakeStep::blocked(detail)),
                 "fail" => Some(FakeStep::fail(detail)),
@@ -90,6 +91,15 @@ impl FakeStep {
     /// Asks for human input — the *adapter* asking (a gate, a policy stop).
     pub fn needs_input(prompt: &str) -> Self {
         Self::running(BackendSignal::needs_input(prompt))
+    }
+
+    /// GP-2's ask: the **actor** authored this question and is waiting for a
+    /// human answer on the same execution. Distinct from
+    /// [`FakeStep::needs_input`] in exactly the way the two are distinct in a
+    /// real harness — same park, different author — so a test can prove the
+    /// engine carries the authorship instead of flattening it.
+    pub fn ask(question: &str) -> Self {
+        Self::running(BackendSignal::ask(question))
     }
 
     /// Waits on an external condition.
@@ -275,6 +285,11 @@ impl FakeBackend {
                 resume: true,
                 model_selection: true,
                 profiles: true,
+                // The fake's "actor" is its script, and a scripted
+                // `FakeStep::ask` is an unambiguous structured record of the
+                // actor authoring a question — which is precisely what the
+                // capability claims. Nothing is inferred from prose.
+                ask: true,
                 ..Capabilities::default()
             },
             state: Arc::new(Mutex::new(FakeState {
@@ -419,6 +434,27 @@ impl FakeBackend {
     /// Whether the backend still considers an execution live.
     pub fn is_live(&self, execution_id: &str) -> bool {
         self.native_state(execution_id) == Some(NativeState::Running)
+    }
+
+    /// The running actor authors a question, mid-execution (GP-2).
+    ///
+    /// This is the out-of-band half of the ask primitive: nothing about the
+    /// script decided it, and no engine call produced it — a live execution
+    /// changed what it is saying while the engine was elsewhere, exactly as a
+    /// real actor does when it reaches a decision it cannot make alone. The
+    /// next OBSERVE reports it as [`AskAuthor::Actor`](super::AskAuthor::Actor).
+    ///
+    /// Returns whether the execution was known; an ask against an execution
+    /// this backend never had is refused, not invented.
+    pub fn actor_asks(&self, execution_id: &str, question: &str) -> bool {
+        let mut state = self.lock();
+        match state.executions.get_mut(execution_id) {
+            Some(execution) => {
+                execution.step.signal = BackendSignal::ask(question);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Reprogram every live execution to "the stage finished and the native

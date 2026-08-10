@@ -64,7 +64,7 @@ use sergeant_rs::backend::claude::{
 };
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
-    Backend, BackendError, BackendRegistry, BackendSignal, ExecutionHandle, NativeState,
+    AskAuthor, Backend, BackendError, BackendRegistry, BackendSignal, ExecutionHandle, NativeState,
     ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, journaling_sink};
@@ -4294,4 +4294,255 @@ fn n5_a_stop_naming_another_execution_does_not_latch_the_current_one() {
             .stop_requested,
         "and a stop that names it does"
     );
+}
+
+// --------------------------------- GP-2 / #42. the actor-initiated ask
+//
+// N2's grammar-pressure report found exactly one confirmed engine gap: a live
+// actor had no way to say "I cannot proceed without a human decision". The
+// state it needs already existed (`needs_input`, resumable by `respond` on the
+// same execution — U1, docs/gauntlet/notes/n2-fake-backend-semantics.md); what
+// was missing was a pathway from the harness's own output into it, and any way
+// to tell the actor's question apart from a gate's.
+
+/// A scripted `ask` parks the stage on the actor's question, and `respond`
+/// resumes **the same execution** — U1's semantics, unchanged, which is the
+/// point: the ask primitive reuses the existing resume verb rather than
+/// inventing a second one.
+#[test]
+fn n6_an_actor_authored_ask_parks_the_stage_and_respond_resumes_the_same_execution() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::ask("postgres or sqlite?"), FakeStep::complete()],
+    );
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASK00001";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput,
+        "the actor's question parks the work"
+    );
+    let parked = events_of(&core, work_id, KIND_STAGE_NEEDS_INPUT);
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0]["detail"], "postgres or sqlite?");
+    assert_eq!(
+        parked[0]["asked_by"], "actor",
+        "the authorship of the question is part of the record (GP-2)"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_WORK_NEEDS_INPUT)[0]["asked_by"],
+        "actor"
+    );
+
+    // U1: the answer goes to the execution that asked, not to a new one.
+    let execution_id = core.registry.state().runs[work_id]
+        .execution
+        .as_ref()
+        .expect("execution")
+        .execution_id
+        .clone();
+    engine
+        .provide_input(&mut core, work_id, "postgres")
+        .expect("respond");
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["postgres".to_string()],
+        "the answer reached the execution that asked"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).len(),
+        1,
+        "answering an ask continues the conversation; it does not start a second one"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed
+    );
+}
+
+/// The same park, authored by the *adapter* rather than the actor, is
+/// recorded as such.
+///
+/// Without this half, `asked_by` would be a field nothing could disagree with
+/// — and a capability flag that cannot be wrong is not a measurement.
+#[test]
+fn n7_an_adapter_authored_need_for_input_is_not_reported_as_an_actor_ask() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::needs_input("unlock me")]);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASK00002";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    let parked = events_of(&core, work_id, KIND_STAGE_NEEDS_INPUT);
+    assert_eq!(parked[0]["detail"], "unlock me");
+    assert_eq!(
+        parked[0]["asked_by"], "adapter",
+        "a gate is not an actor, and the trajectory has to be able to say so"
+    );
+}
+
+/// An ask raised **mid-execution**, out of band — the shape a real actor
+/// produces, where nothing the engine did caused the question.
+///
+/// The engine sees it on its next observation, which is what `respond`,
+/// `retry` and restart reconciliation all trigger.
+#[test]
+fn n8_a_live_execution_can_raise_a_question_between_engine_calls() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASK00003";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Active,
+        "the execution is still working"
+    );
+    let execution_id = core.registry.state().runs[work_id]
+        .execution
+        .as_ref()
+        .expect("execution")
+        .execution_id
+        .clone();
+
+    // The actor reaches a decision it cannot make alone.
+    assert!(fake.actor_asks(&execution_id, "which environment?"));
+    engine.resume(&mut core, work_id).expect("resume");
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput
+    );
+    let parked = events_of(&core, work_id, KIND_STAGE_NEEDS_INPUT);
+    assert_eq!(parked[0]["detail"], "which environment?");
+    assert_eq!(parked[0]["asked_by"], "actor");
+
+    // An ask against an execution this backend never had is refused, not
+    // invented — the same identity rule every other verb obeys.
+    assert!(!fake.actor_asks("never-started", "who are you?"));
+}
+
+/// L8: the capability list and the contract-test list are the same list.
+///
+/// Every registered backend advertising `ask` must be able to *produce* an
+/// actor-authored question, and every one that does not must never report
+/// one. The fake is checked here directly; the Claude adapter's half is the
+/// opt-in live test below plus the unit tests over the two measured
+/// `post_turn_summary` records in `src/backend/claude.rs`.
+#[test]
+fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    assert!(fake.capabilities().ask, "the fake advertises the ask");
+    let request = StartRequest {
+        work_id: "w".to_string(),
+        execution_id: "e-ask".to_string(),
+        stage_id: "00-only".to_string(),
+        attempt: 1,
+        cwd: PathBuf::from("/tmp"),
+        intent: "i".to_string(),
+        context: "c".to_string(),
+        model: None,
+        profile: None,
+    };
+    let handle = fake.start(&request).expect("start");
+    assert_eq!(
+        fake.observe(&handle).expect("observe").signal.asked_by(),
+        None,
+        "a working execution is not asking anything"
+    );
+    assert!(fake.actor_asks("e-ask", "postgres or sqlite?"));
+    assert_eq!(
+        fake.observe(&handle).expect("observe").signal,
+        BackendSignal::ask("postgres or sqlite?"),
+        "the advertised capability is one the backend can actually honour"
+    );
+
+    // The Claude adapter advertises it too, on the strength of the measured
+    // `post_turn_summary` line; a build whose adapter stopped being able to
+    // report authorship must lower the flag rather than keep the claim.
+    let claude = ClaudeBackend::new(ClaudeConfig::new(Path::new("/nonexistent")));
+    assert!(
+        claude.capabilities().ask,
+        "measured on 2.1.226: see docs/gauntlet/notes/n3-claude-ask-measurement.md"
+    );
+}
+
+/// Opt-in, spends real tokens: the ask, measured against the installed CLI.
+///
+/// L8's rule is that an advertised verb without a contract test against the
+/// installed harness is an unmeasured claim. This is that test for `ask`: one
+/// haiku turn told it cannot proceed without a decision, driven through the
+/// real adapter, must come back as `NeedsInput` authored by the actor — not as
+/// a completed stage whose summary happens to end in a question mark.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored"]
+fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
+    if !claude_live_enabled("a5_real_claude_reports_an_actor_authored_question_as_needs_input") {
+        return;
+    }
+    let data = TempDir::new().expect("tempdir");
+    let work = TempDir::new().expect("tempdir");
+    let mut config = ClaudeConfig::new(data.path());
+    config.env.insert("IS_SANDBOX".to_string(), "1".to_string());
+    let backend = ClaudeBackend::new(config);
+
+    let request = StartRequest {
+        work_id: "01N3LIVEASK".to_string(),
+        execution_id: ulid(),
+        stage_id: "00-ask".to_string(),
+        attempt: 1,
+        cwd: work.path().to_path_buf(),
+        intent: "I cannot proceed without knowing one thing.".to_string(),
+        context: "Which database should I target, postgres or sqlite? Ask me that question \
+                  and stop; do not guess and do not do anything else."
+            .to_string(),
+        model: Some("claude-haiku-4-5-20251001".to_string()),
+        profile: None,
+    };
+    let handle = backend.start(&request).expect("start");
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let observation = loop {
+        let observation = backend.observe(&handle).expect("observe");
+        if observation.native != NativeState::Running {
+            break observation;
+        }
+        assert!(Instant::now() < deadline, "the turn never finished");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    backend.stop(&handle).expect("stop").wait();
+
+    match &observation.signal {
+        BackendSignal::NeedsInput { prompt, asked_by } => {
+            assert_eq!(
+                *asked_by,
+                AskAuthor::Actor,
+                "the question is the actor's, and the adapter must say so"
+            );
+            assert!(
+                !prompt.trim().is_empty(),
+                "the parked stage carries the actor's own words"
+            );
+            eprintln!("measured actor ask: {prompt}");
+        }
+        other => panic!(
+            "2.1.226 no longer maps an end-of-turn question to needs_input: {other:?} \
+             (evidence: {:?}). Re-measure and, if the affordance is gone, lower \
+             Capabilities::ask to false rather than guessing from prose (L1/L8).",
+            observation.evidence
+        ),
+    }
 }
