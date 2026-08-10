@@ -43,6 +43,55 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### P1-PERF — 2026-08-10, load/stress baseline + issue backlog
+
+**Mission outcome: contract met.** The full S1–S7 matrix ran at contract
+scale against the release binary at 499c061; every cell filled, every
+scenario's hygiene sweep clean. Deliverables: the rerunnable harness
+(`scripts/perf/`, commit 348623b — including the measured SGT_FAKE_SCRIPT
+semantics: one global FIFO of steps, popped per execution-start and per
+input-send), the baseline document (`docs/perf/baseline-2026-08-10.md`),
+and **eleven GitHub issues (#3–#13)** — the phase's stated product. Nothing
+was fixed, per contract. Headline numbers: idle 28.6 MB / 15 fds / 9
+threads; submission plateau 28–39 works/s independent of concurrency
+(daemon saturates first — Unknown #2 resolved); churn cost ~25 kB RSS per
+work, never reclaimed (#4); graph reads 9.7 ms p50 at 1k-event depth;
+rebuild holds the §21 budget with growing margin (14.6k–29.2k events/s at
+10k–50k); kill -9 ×3 recovery: zero lost/illegal/duplicated/orphaned, and
+the command-ID crash-window index positively confirmed under ambiguous
+client retry. The seeded TUI orphan repro upgraded on measurement from
+"needs SIGKILL" to "wedges spinning ~80% CPU" — critical, #3.
+
+**Environmental behavior.** One workflow: Opus harness builder (smoke-
+tested all seven scenarios before handoff), seven Sonnet runners strictly
+sequential to keep measurement windows unshared, two batched Opus
+verifiers; 10 agents, 1.30M tokens, ~108 min. 22 findings → 21 confirmed
+on independent reproduction, 1 refuted (S4's claimed 35% submit-latency
+rise under SSE subscribers — run-to-run noise). Runners honestly filed
+harness defects against their own instrument (#13) and flagged the
+workflow brief's script-name drift (s3-graph/s5-scale vs the committed
+s3-deep/s5-journal) instead of papering over it — they followed the
+committed harness, correctly. The verification pass measured one finding
+as WORSE than claimed (TUI orphan: pre-signal CPU spin) and corrected one
+severity down (S1 surface-dir leak major→minor per-instance).
+
+**Adjudication rulings.** (1) The empty `surfaces/<work-id>/` leak
+recurred in all seven scenarios — deduplicated to one issue (#5), minor
+per-instance, unbounded in aggregate; its connection to the S6
+completion-tail crash window (#9: a torn-down surface whose teardown
+event is lost) is noted in both issues. (2) The S4 refutation stands;
+recorded in the baseline doc. (3) The throughput plateau (#6) is ruled an
+observation, not a defect — the single-writer journal invariant predicts
+it — and is linked to B3 as the second measured symptom of core-lock
+serialization. (4) The TUI column collision (#11) and doctor floor (#12)
+are intake for the planned usability phase, not P1 work. (5) The no-fix
+rule held: zero product or harness lines changed after the contract
+commit; harness gaps went to #13. (6) Positive results are recorded with
+the same weight as defects: crash idempotency, §21 rebuild margin, SSE
+fd-per-subscriber exactness, TUI 0.03% idle CPU.
+
+---
+
 ### P0 CLOSE-OUT — 2026-08-09, prototype complete
 
 The §38 P0 vertical slice is done: seven gauntlet units (M0–M6), one crate,
