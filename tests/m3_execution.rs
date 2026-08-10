@@ -51,6 +51,7 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_WORKFLOW_BOUND,
     WorkflowDefinition,
 };
+use sergeant_rs::runtime::engine::{Engine, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
@@ -1551,6 +1552,82 @@ async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
         "the restarted daemon exposes the current stage's pinned executor: {view}"
     );
     handle.shutdown().await;
+}
+
+/// §22.6's "probing a slow external executable", pinned rather than assumed.
+///
+/// N3-05: `ClaudeBackend::prepare` is documented as doing "no process, no
+/// adapter state, and no blocking call", and the engine calls it under the core
+/// lock on that basis — but on a cold probe cache it forks `claude --version`
+/// and blocks on the child. The claim held only by the accident that
+/// `daemon::start` pre-warms every backend's probe, and nothing tested that
+/// dependency.
+///
+/// It is no longer an accident. Two mechanisms guarantee a warm cache by the
+/// time anything runs under the guard, and both are asserted here: the daemon
+/// probes every registered backend before it serves a request, and §17.5's
+/// preflight — which runs inside `plan`, with no lock held — probes every
+/// harness the workflow's stages name, including one no submission has ever
+/// routed to.
+#[tokio::test]
+async fn t7e_every_harness_a_run_will_use_is_probed_before_the_lock_is_taken() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    mixed_harness_repo(
+        &repo,
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
+    );
+
+    // 1. The daemon's pre-warm, before any request exists.
+    let alt = FakeBackend::new("alt-harness");
+    let (registry, fake) = one_fake([]);
+    let registry = registry.with(Arc::new(alt.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    assert!(
+        alt.probe_count() >= 1 && fake.probe_count() >= 1,
+        "daemon startup must probe every registered backend before serving: \
+         alt={} fake={}",
+        alt.probe_count(),
+        fake.probe_count()
+    );
+    handle.shutdown().await;
+
+    // 2. The preflight, on a registry that was never pre-warmed — which is the
+    // case that matters, because it is the one the pre-warm does not cover.
+    let alt = FakeBackend::new("alt-harness");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let engine = Engine::new(
+        Arc::new(
+            BackendRegistry::new()
+                .with(Arc::new(fake.clone()))
+                .with(Arc::new(alt.clone())),
+        ),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    assert_eq!(alt.probe_count(), 0, "cold, as a fresh registry is");
+
+    let plan = engine
+        .plan(&SubmitContext {
+            cwd: Some(&repo),
+            workflow: Some("mixed"),
+            ..SubmitContext::default()
+        })
+        .expect("plan")
+        .expect("a workspace");
+    assert!(
+        alt.probe_count() >= 1,
+        "§17.5's preflight must probe a harness only a stage names — otherwise \
+         the first `prepare` for that stage pays for it under the core lock"
+    );
+    assert_eq!(
+        plan.stage_bindings
+            .iter()
+            .map(|b| b.harness.as_str())
+            .collect::<Vec<_>>(),
+        vec![FAKE_BACKEND_NAME, "alt-harness", FAKE_BACKEND_NAME]
+    );
 }
 
 /// 8. A daemon restart re-observes in-flight work through the backend

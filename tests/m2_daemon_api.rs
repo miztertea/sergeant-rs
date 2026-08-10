@@ -1675,12 +1675,20 @@ fn concurrent_stale_replacement_leaves_the_surviving_daemon_discoverable() {
 /// How long an unrelated request may take while an executor is parked inside
 /// an external effect.
 ///
-/// The measured baseline (`docs/perf/baseline-2026-08-10.md`) puts a single
-/// submit's p50 at 37.9 ms and a burst-50 p95 at 1.1 s, so one second is
-/// comfortably above the honest cost of a contended journal commit and
-/// infinitely below the failure this catches — a request that waits for a
-/// stalled harness is a request that never returns at all.
-const INDEPENDENT_REQUEST_BUDGET: Duration = Duration::from_secs(1);
+/// §22.6 bounds this by "the explicitly allowed journal commit interval",
+/// measured at ~2 ms/event, and the requests below are answered in ~2 ms when
+/// the boundary holds. The budget was one second — ~500× the value the
+/// milestone reports (N3-08), which meant a regression that made independent
+/// requests take 900 ms passed unchanged.
+///
+/// 200 ms instead: two orders of magnitude above the honest cost of a
+/// contended journal commit, and two orders below the failure this exists to
+/// catch. Deliberately not tighter — these suites run in parallel, and a
+/// scheduler hiccup under `cargo test -j` is not the regression being looked
+/// for. It is also now tight enough to catch a *queued* request rather than
+/// only a permanently blocked one: one `git worktree add` on a real monorepo
+/// under the guard would exceed it.
+const INDEPENDENT_REQUEST_BUDGET: Duration = Duration::from_millis(200);
 
 /// Seed a data dir with a run parked in `blocked` on `00-only`, so a `retry`
 /// through the API reserves and launches a second attempt.
@@ -2060,5 +2068,77 @@ async fn t11_a_stalled_send_does_not_hold_the_core_lock() {
         delivered,
         vec!["postgres".to_string()],
         "the answer still reached the same execution"
+    );
+}
+
+// ------------------------------------- the throughput floor, as a guard
+//
+// N3-10: adjudication A-N3-1 amended the burst-50 floor to ">=24 works/s with
+// the control-measured delta documented", against a measurement whose slowest
+// run was 24.2 — about 1% of headroom — and enforcement was a shell script run
+// by hand. Nothing in m1..m6 asserted a throughput floor at all, so a further
+// regression below the amended floor shipped silently.
+
+/// Submission throughput has an automated floor.
+///
+/// **What this is and is not.** It is *not* the A-N3-1 budget: 24 works/s at
+/// burst 50 is measured by `scripts/perf/s1-burst.sh` on a quiet machine, and
+/// asserting it here — inside a suite that runs in parallel with seven others
+/// on shared cores — would be a coin flip, which is worse than no guard
+/// because a flaky floor gets deleted. It is the guard the budget lacked: an
+/// order-of-magnitude floor that cannot flake and that a real regression
+/// cannot slip under. Putting an fsync back per event, or a `git` call back
+/// under the submit guard, lands well below it.
+///
+/// The number: the amended budget is 24 works/s; this asserts 4, a 6× margin
+/// for a contended test host. When the group-commit fix (#44) lands, this
+/// floor rises with the measurement rather than being left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t12_submission_throughput_has_an_automated_floor() {
+    /// Works per second the daemon must sustain on a burst, on any host a
+    /// test suite runs on.
+    const THROUGHPUT_FLOOR: f64 = 4.0;
+    const BURST: usize = 25;
+
+    let dir = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let started = Instant::now();
+    let mut inflight = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        inflight.push(tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid(), "intent": "throughput floor"}))
+                .send()
+                .await
+                .expect("submit")
+                .status()
+        }));
+    }
+    let mut created = 0usize;
+    for task in inflight {
+        if task.await.expect("submit task").is_success() {
+            created += 1;
+        }
+    }
+    let elapsed = started.elapsed();
+    handle.shutdown().await;
+
+    assert_eq!(created, BURST, "every submission must be accepted");
+    let rate = BURST as f64 / elapsed.as_secs_f64();
+    eprintln!("burst {BURST}: {rate:.1} works/s in {elapsed:?}");
+    assert!(
+        rate >= THROUGHPUT_FLOOR,
+        "submission throughput fell to {rate:.1} works/s at burst {BURST}, below the \
+         {THROUGHPUT_FLOOR} works/s floor. The A-N3-1 budget is 24 works/s at burst 50 \
+         (docs/perf/n3-two-phase-boundary-2026-08-10.md); this floor is six times looser \
+         and is only tripped by a structural regression — an extra fsync per event, or an \
+         external effect back under the core lock."
     );
 }

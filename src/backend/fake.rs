@@ -240,6 +240,7 @@ struct FakeState {
     interrupt_requests: Vec<String>,
     resume_requests: Vec<(String, ResumeRequest)>,
     observations: Vec<String>,
+    probes: usize,
     available: bool,
     detail: Option<String>,
 }
@@ -309,6 +310,7 @@ impl FakeBackend {
                 interrupt_requests: Vec::new(),
                 resume_requests: Vec::new(),
                 observations: Vec::new(),
+                probes: 0,
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
             })),
@@ -430,6 +432,17 @@ impl FakeBackend {
     /// launch configuration" is a property tests assert directly.
     pub fn resume_requests(&self) -> Vec<(String, ResumeRequest)> {
         self.lock().resume_requests.clone()
+    }
+
+    /// How many times PROBE has been asked of this backend.
+    ///
+    /// The real adapters cache their probe after the first call, so *when* the
+    /// first one happens decides whether a later `prepare` under the core lock
+    /// forks `claude --version` or reads a warm cache (§22.6's "probing a slow
+    /// external executable"). That ordering is a property tests assert, not an
+    /// accident of startup.
+    pub fn probe_count(&self) -> usize {
+        self.lock().probes
     }
 
     /// Execution ids OBSERVE was called for, in order.
@@ -586,7 +599,8 @@ impl Backend for FakeBackend {
     }
 
     fn probe(&self) -> ProbeReport {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.probes += 1;
         ProbeReport {
             available: state.available,
             detail: state.detail.clone(),
