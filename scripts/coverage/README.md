@@ -82,7 +82,7 @@ deliberate re-baseline).
   falsified it, every stage would still clear its floor and C4's guards
   (profraws > 0, profdata mtime moved) would still pass while the baseline
   quietly described the last suite only. One stage loses profraws on purpose:
-  F2's census passes open with `clean --profraw-only`, and declare it with
+  F2's census passes open with `clean --profraw-only`, so F2 declares it with
   `cov_expect_profraw_loss`, which records the loss and its reason in the tsv
   instead of failing. That declaration is the *account* in "unaccounted loss"
   (R-S0-6) — there is exactly one, and it is in the committed evidence.
@@ -92,6 +92,31 @@ deliberate re-baseline).
   typed it. Inside a script file it cannot (pgrep skips itself, and the
   parent's argv is the script path) — the same line pasted into `bash -c`
   finds itself, which is how this check has been fooled before.
+
+  The two halves are deliberately not enforced alike, which R-S0-1's gate
+  regime ("zero leaked daemons, zero `/tmp` residue") does not itself
+  distinguish: **a leaked daemon fails the stage; `/tmp` residue is recorded
+  and does not**. A leaked daemon is unambiguous — it holds a deleted data dir
+  and its profile never arrived. `/tmp` is shared with everything else on the
+  container, and this repo's own suite legitimately has a `sgt-demo-*`
+  directory in flight while m6's `t4` runs, so a count taken at a stage
+  boundary cannot tell that from residue. The number is therefore evidence a
+  reader compares across stages (a count that only ever grows is the signal),
+  not a gate. Recorded here rather than left to be inferred from the code.
+
+### What C0 does and does not prove
+
+C0 resolves proposal §14's first Unknown by parsing `LLVM_PROFILE_FILE` out of
+`cargo llvm-cov show-env` and hard-stopping unless it is absolute and carries
+`%p`. Worth being exact about the scope, because measured claim 1 below says
+the two flows differ: **the string C0 checks belongs to the `show-env` flow,
+and every collection this harness runs is a *managed* run** (`cargo llvm-cov
+--no-report …`), which writes elsewhere. Both patterns were measured absolute
+on 0.8.7, so C0's verdict is currently true of both — but a future tool bump
+that made only the *managed* pattern relative would not trip C0. What would
+catch that is C1–C3's profraw floor: a relative pattern scatters profiles into
+the `TempDir` cwds the suites delete, and the stage's produced-count collapses
+below its floor. C0 is the cheap early stop, not the defense.
 
 ## Measured behavior of cargo-llvm-cov 0.8.7
 

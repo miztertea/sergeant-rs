@@ -13,6 +13,15 @@
 #
 # Recorded, not asserted from documentation (doctrine 1 / L1 at the tool
 # boundary): the exact `show-env` output goes into the artifacts dir verbatim.
+#
+# SCOPE, stated so nobody over-reads the hard stop: the pattern checked here
+# is `show-env`'s, and every collection this harness runs is a *managed* run
+# (`cargo llvm-cov --no-report …`), whose profraws land one directory down —
+# see the README's measured claim 1. Both patterns were measured absolute on
+# 0.8.7, so this verdict is true of both today; a bump that made only the
+# managed pattern relative would slip past C0 and be caught instead by C1–C3's
+# produced-profraw floor, which collapses when profiles scatter into deleted
+# cwds. C0 is the cheap early stop, not the defense.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

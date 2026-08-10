@@ -260,7 +260,16 @@ re-measuring (R-S0-6)."
 # `target/debug/sgt`. Both are run anyway: the contract names the first, the
 # second also catches the uninstrumented census arm, and over-detection is the
 # safe direction. The pids are deduplicated before they are reported.
-
+#
+# The two halves of R-S0-1's sweep are deliberately not enforced alike: a
+# leaked daemon FAILS the stage, `/tmp` residue is RECORDED and does not. A
+# leaked daemon is unambiguous — deleted data dir held open, profile never
+# written. `/tmp` is shared with the rest of the container, and this repo's
+# own m6 `t4` legitimately has a `sgt-demo-*` directory in flight while it
+# runs, so a count at a stage boundary cannot separate that from residue. The
+# number is cross-stage evidence for a reader (a count that only grows is the
+# signal), not a gate. Said out loud here because "zero /tmp residue" in the
+# gate regime reads like a check, and this one is a measurement.
 cov_hygiene() {
   local instrumented plain leaked tmp
   instrumented="$(pgrep -f "llvm-cov-target/debug/sgt --data-dir" || true)"
