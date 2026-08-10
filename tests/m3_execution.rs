@@ -2173,6 +2173,72 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     handle.shutdown().await;
 }
 
+/// §14 against §13: a profile that launches a different backend than routing
+/// resolved to is refused, and the refusal names the tier that made the
+/// choice.
+///
+/// The two ways this could quietly go wrong are the two §13 forbids: running
+/// the profile's backend (silently overruling the route) or running the
+/// routed backend with a profile configured for another (a permission mode
+/// and a model pin meant for a different harness). Nothing pinned it: the
+/// profile that exists in this suite agrees with its route, so the check
+/// could be deleted and every test would still pass. Routing here is the
+/// last tier — no explicit backend, no workspace default — because that is
+/// the tier a user is least likely to have in mind when naming a profile.
+#[tokio::test]
+async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_routed() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+
+    let data = TempDir::new().expect("tempdir");
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+         [[profile]]\nname = \"elsewhere\"\nbackend = \"codex\"\n\
+         default_model = \"gpt-nonexistent\"\n",
+    )
+    .expect("sergeant.toml");
+
+    // No explicit backend and no workspace default: the daemon's global
+    // default routes this, which is tier four.
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "a profile for a backend this work is not routed to",
+        json!({"profile": "elsewhere"}),
+    )
+    .await;
+
+    assert_eq!(status, 422, "the mismatch must be refused: {body}");
+    assert_eq!(body["error"]["code"], "profile_backend_mismatch");
+    let message = body["error"]["message"].as_str().expect("message");
+    for named in ["elsewhere", "codex", FAKE_BACKEND_NAME, "global_default"] {
+        assert!(
+            message.contains(named),
+            "the refusal must name {named:?} so the user can fix either side: {message}"
+        );
+    }
+
+    // Refused before anything ran: no execution, and no work to inspect.
+    assert!(
+        fake.starts().is_empty(),
+        "a refused submission must not launch the routed backend either, got {:?}",
+        fake.starts()
+    );
+    let list = get(&client, &handle, "/v1/work").await;
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "nothing was accepted: {list}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A submission with no repository context is a *captured intent*: there is
 /// no workspace to materialize, which §9 answers definitely rather than
 /// failing. But "nothing to materialize" is not "nothing to honour" — a

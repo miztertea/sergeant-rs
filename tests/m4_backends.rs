@@ -3521,6 +3521,92 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
     );
 }
 
+/// §15's three vocabularies, variant by variant, with `as_str` and the wire
+/// form checked against each other.
+///
+/// These names are durable, not diagnostics: `native=exited,
+/// signal=stage_completed` is the evidence restart reconciliation writes into
+/// the journal, `runtime_scope` is journaled with every probe, and both
+/// `Observation` and `ProbeReport` cross `/v1` as the serde form. `as_str`
+/// and serde derive those names independently, so a renamed variant that
+/// touched only one of them would split the vocabulary in two — with every
+/// already-written journal on the far side. Only the reconcile evidence's
+/// two most common values were pinned anywhere before this.
+#[test]
+fn the_backend_contracts_wire_vocabulary_is_pinned_variant_by_variant() {
+    fn wire<T: serde::Serialize>(value: &T) -> Value {
+        serde_json::to_value(value).expect("serialize")
+    }
+
+    for (scope, name) in [
+        (RuntimeScope::External, "external"),
+        (RuntimeScope::PerProfile, "per_profile"),
+        (RuntimeScope::PerWorkspace, "per_workspace"),
+        (RuntimeScope::PerExecution, "per_execution"),
+    ] {
+        assert_eq!(scope.as_str(), name, "{scope:?}");
+        assert_eq!(wire(&scope), json!(name), "{scope:?} on the wire");
+    }
+
+    for (state, name) in [
+        (NativeState::Running, "running"),
+        (NativeState::Exited, "exited"),
+        (NativeState::Unknown, "unknown"),
+    ] {
+        assert_eq!(state.as_str(), name, "{state:?}");
+        assert_eq!(wire(&state), json!(name), "{state:?} on the wire");
+    }
+
+    let signals = [
+        (BackendSignal::Running, "running"),
+        (
+            BackendSignal::StageCompleted {
+                summary: Some("done".to_string()),
+            },
+            "stage_completed",
+        ),
+        (
+            BackendSignal::NeedsInput {
+                prompt: "which one?".to_string(),
+            },
+            "needs_input",
+        ),
+        (
+            BackendSignal::Waiting {
+                reason: "ci".to_string(),
+            },
+            "waiting",
+        ),
+        (
+            BackendSignal::Blocked {
+                reason: "gate".to_string(),
+            },
+            "blocked",
+        ),
+        (
+            BackendSignal::Failed {
+                reason: "tests".to_string(),
+            },
+            "failed",
+        ),
+    ];
+    for (signal, name) in &signals {
+        assert_eq!(&signal.as_str(), name, "{signal:?}");
+        assert_eq!(
+            wire(signal)["signal"],
+            json!(name),
+            "{signal:?}: the tag a client reads must be the name we journal"
+        );
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        signals.iter().map(|(signal, _)| signal.as_str()).collect();
+    assert_eq!(
+        distinct.len(),
+        signals.len(),
+        "two signals sharing a name would collapse two stage outcomes into one"
+    );
+}
+
 /// Minimal git repo for daemon-path tests.
 fn init_repo(path: &Path) {
     let git = |args: &[&str]| {

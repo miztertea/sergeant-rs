@@ -1258,6 +1258,129 @@ mod tests {
         assert_eq!(app.status, "cancel abandoned");
     }
 
+    /// The rest of the keymap, in one pass: the keys that answer differently
+    /// depending on which screen is in front, and the keystrokes that must
+    /// answer with nothing at all.
+    ///
+    /// The suite's other key tests all drive the two write flows. What was
+    /// unpinned is the read side — that `q` leaves the program from the fleet
+    /// but only leaves the *screen* from a detail (and clears what that
+    /// screen was showing), and that every key with no meaning here is inert
+    /// rather than falling into a neighbour's arm.
+    #[test]
+    fn the_keymap_answers_by_screen_and_is_inert_everywhere_else() {
+        let mut app = App::new();
+        app.rows = fleet_rows(&fleet_of(&[("a", "running")]));
+
+        // Enter opens the detail screen for the selected work…
+        assert_eq!(app.on_key(KeyCode::Enter), Action::Refresh);
+        assert_eq!(app.screen, Screen::Detail);
+        app.detail = json!({"work": {"state": "running"}});
+        app.detail_events = vec![json!({"seq": 1, "kind": "work.started"})];
+
+        // …and `q` there is "back", not "quit", with nothing of the old work
+        // left to paint over the next one.
+        assert_eq!(app.on_key(KeyCode::Char('q')), Action::None);
+        assert_eq!(app.screen, Screen::Fleet);
+        assert!(!app.quit, "leaving a detail screen must not leave the TUI");
+        assert_eq!(app.detail_id, None);
+        assert_eq!(app.detail, Value::Null);
+        assert!(app.detail_events.is_empty());
+
+        // From the fleet, the same key is the exit. So is Esc, on both
+        // screens — the two keys are one arm.
+        assert_eq!(app.on_key(KeyCode::Enter), Action::Refresh);
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert_eq!(app.screen, Screen::Fleet, "Esc backs out of a detail too");
+        assert_eq!(app.on_key(KeyCode::Char('r')), Action::Refresh);
+        assert_eq!(app.on_key(KeyCode::Esc), Action::Quit);
+        assert!(app.quit);
+
+        // Keys with no meaning are inert, in every mode this app has.
+        let mut app = App::new();
+        assert_eq!(
+            app.on_key(KeyCode::Enter),
+            Action::None,
+            "Enter on an empty fleet opens nothing"
+        );
+        assert_eq!(app.on_key(KeyCode::Char('z')), Action::None);
+        assert_eq!(app.on_key(KeyCode::Tab), Action::None);
+        assert!(!app.quit && app.screen == Screen::Fleet);
+        app.rows = fleet_rows(&fleet_of(&[("a", "needs_input")]));
+        app.on_key(KeyCode::Char('i'));
+        assert_eq!(
+            app.on_key(KeyCode::Tab),
+            Action::None,
+            "a key the composer has no use for must not close it"
+        );
+        assert!(app.input.is_some());
+
+        // An empty answer is refused rather than sent as one…
+        assert_eq!(app.on_key(KeyCode::Enter), Action::None);
+        assert_eq!(app.status, "respond needs an answer");
+        // …and so are both write verbs with nothing selected.
+        let mut app = App::new();
+        app.input = Some("an answer to nobody".to_string());
+        assert_eq!(app.on_key(KeyCode::Enter), Action::None);
+        assert_eq!(app.status, "no work selected");
+        app.confirming_cancel = true;
+        assert_eq!(
+            app.on_key(KeyCode::Char('y')),
+            Action::None,
+            "a confirmed cancel with nothing selected cancels nothing"
+        );
+    }
+
+    /// What the detail screen paints for a work in a terminal state whose
+    /// surface is gone, while an answer is being typed.
+    ///
+    /// The acceptance render in the m6 suite only ever reaches this screen
+    /// with a bound surface and no prompt open, so the "(no repository
+    /// surface bound)" line, the composer's own footer, and the red state
+    /// colour were never painted.
+    #[test]
+    fn the_detail_screen_paints_a_failed_work_with_no_surface_and_an_open_prompt() {
+        let mut app = App::new();
+        app.system = json!({"version": "0.1.0", "api_revision": "v1", "data_dir": "/tmp/d"});
+        app.screen = Screen::Detail;
+        app.detail_id = Some("01FAILED".to_string());
+        app.detail = json!({
+            "work": {"state": "failed", "intent": "a thing that failed"},
+            "workflow": {"name": "wf", "version": 1},
+            "stage": {"stage_id": "00-only", "index": 0, "of": 1, "status": "failed"},
+            "surface": {"bindings": []},
+            "execution": null,
+        });
+        app.input = Some("retry it".to_string());
+
+        let screen = screen_text(&app);
+        assert!(
+            screen.contains("(no repository surface bound)"),
+            "a work whose surface is gone says so where the bindings were: {screen}"
+        );
+        assert!(
+            screen.contains("answer> retry it"),
+            "the footer becomes the composer while a prompt is open, so the \
+             keymap is not advertised as available: {screen}"
+        );
+        assert!(
+            !screen.contains("j/k move"),
+            "…and the keymap is gone while it is: {screen}"
+        );
+        assert_eq!(
+            state_style("failed").fg,
+            Some(Color::Red),
+            "a terminal failure is red"
+        );
+        assert_eq!(state_style("canceled").fg, Some(Color::Red));
+        assert_eq!(state_style("blocked").fg, Some(Color::Red));
+        assert_eq!(
+            state_style("active").fg,
+            Some(Color::Cyan),
+            "and anything still in flight is not"
+        );
+    }
+
     #[test]
     fn only_state_bearing_events_ask_for_a_refresh() {
         let mut app = App::new();
@@ -1755,5 +1878,25 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    /// The whole screen as the text a terminal would show — same idea as
+    /// `header_text`, one screen wider.
+    fn screen_text(app: &App) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))
+            .expect("a test terminal");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("draw the screen");
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

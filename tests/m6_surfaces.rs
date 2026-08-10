@@ -958,6 +958,150 @@ async fn t2_the_dashboard_serves_real_data_and_is_embedded() {
     assert_eq!(handed.trim(), url, "--open must hand over the same URL");
 }
 
+/// A TUI holding a detail screen for a work the daemon no longer has falls
+/// back to the fleet instead of painting a corpse.
+///
+/// The data dir can be replaced under a running client (a restore, a wiped
+/// scratch dir, a `--data-dir` pointed somewhere else) and the detail screen
+/// is the one part of `App` that keeps asking about a specific id. A refresh
+/// that answered 404 used to be indistinguishable from a refresh that failed:
+/// this arm is why the screen recovers rather than either erroring out or
+/// re-rendering the last body it happened to hold.
+#[tokio::test]
+async fn a_detail_screen_whose_work_vanished_falls_back_to_the_fleet() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("which budget?")]).await;
+    let work_id = submit(&handle, repo.path(), "still here", "tiny").await;
+    let client = client_for(&handle);
+
+    let mut app = App::new();
+    app.detail_id = Some(work_id.clone());
+    app.screen = Screen::Detail;
+    app.refresh(&client).await.expect("first read");
+    assert!(
+        !app.detail_events.is_empty(),
+        "the detail screen starts with a real work's events"
+    );
+
+    // The work the screen is showing is gone; the fleet behind it is not.
+    app.detail_id = Some("01NOSUCHWORKATALL".to_string());
+    app.refresh(&client)
+        .await
+        .expect("a work that vanished is not a client failure");
+
+    assert_eq!(app.screen, Screen::Fleet, "the screen falls back");
+    assert_eq!(app.detail_id, None, "and stops asking about the dead id");
+    assert_eq!(app.detail, Value::Null);
+    assert!(
+        app.detail_events.is_empty(),
+        "nothing of the vanished work is left to paint"
+    );
+    assert!(
+        !app.rows.is_empty(),
+        "the fleet it fell back to is the live one"
+    );
+    assert!(
+        !screen_text(&render(&app)).contains("01NOSUCHWORKATALL"),
+        "and the screen says nothing about the id that is gone"
+    );
+
+    handle.shutdown().await;
+}
+
+/// The work page's two fault answers, which the happy path never reaches.
+///
+/// A dashboard is where a person looks when something is already wrong, so
+/// its own failures have to be legible: a work id that is not there is a 404
+/// carrying the dashboard's chrome (not a bare axum body, and not a 200 page
+/// full of empty sections), and a journal the daemon cannot read is a 500
+/// that *names the fault* — the failure mode this arm exists for is a page
+/// that renders "no transitions recorded" over a read error and tells the
+/// browser a different story than `/v1/events` tells an HTTP client.
+#[tokio::test]
+async fn the_dashboard_answers_a_missing_work_and_an_unreadable_journal_as_faults() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("which budget?")]).await;
+    let work_id = submit(&handle, repo.path(), "readable, then not", "tiny").await;
+
+    // --- a work id that is not there ---------------------------------------
+    let missing = get_text(
+        &format!(
+            "{}/ui/work/01NOSUCHWORKATALL?token={}",
+            handle.endpoint, handle.token
+        ),
+        404,
+    )
+    .await;
+    assert!(
+        missing.contains("no work with id 01NOSUCHWORKATALL"),
+        "the 404 page must name the id that is not there: {missing}"
+    );
+    assert!(
+        missing.contains("dashboard.js") && missing.contains("id=\"ticker\""),
+        "…and still be the dashboard, so the reader can navigate on: {missing}"
+    );
+    assert!(
+        !missing.contains("no transitions recorded"),
+        "a work that does not exist must not be dressed as one with no history: {missing}"
+    );
+
+    // --- a journal the daemon cannot read ----------------------------------
+    //
+    // A well-formed JSON line that is not a well-formed Event, appended in
+    // place: what a torn or bit-flipped append looks like on replay (the
+    // shape m2 uses for the same class).
+    let journal_dir = data.path().join("journal");
+    let mut segments: Vec<_> = std::fs::read_dir(&journal_dir)
+        .expect("journal dir")
+        .filter_map(|entry| {
+            let path = entry.expect("entry").path();
+            (path.extension().is_some_and(|ext| ext == "ndjson")).then_some(path)
+        })
+        .collect();
+    segments.sort();
+    let segment = segments.last().expect("a segment exists").clone();
+    let mut text = std::fs::read_to_string(&segment).expect("read segment");
+    text.push_str("{ \"not\": \"an event\" }\n");
+    std::fs::write(&segment, text).expect("append malformed line");
+
+    let broken = get_text(
+        &format!(
+            "{}/ui/work/{}?token={}",
+            handle.endpoint, work_id, handle.token
+        ),
+        500,
+    )
+    .await;
+    assert!(
+        broken.contains("this work's events could not be read"),
+        "the read failure must be named on the page: {broken}"
+    );
+    assert!(
+        broken.contains("sgt doctor"),
+        "…with the thing to do about it: {broken}"
+    );
+    for green in [
+        "no transitions recorded",
+        "no normalized conversation events yet",
+        "no usage reported by this backend",
+    ] {
+        assert!(
+            !broken.contains(green),
+            "a read failure must never be rendered as an empty section ({green:?}): {broken}"
+        );
+    }
+
+    handle.shutdown().await;
+}
+
 /// `--open`'s failure path (`open_in_browser`): a `$BROWSER` that runs and
 /// exits nonzero must fail the command with the exit status named, not
 /// swallow it — the URL was already printed before the browser was asked to

@@ -653,4 +653,122 @@ mod tests {
             "an empty event list must not render an empty usage table: {html}"
         );
     }
+
+    /// Its opposite: the fixture with something in every section.
+    ///
+    /// The sparse fixture above pinned the "nothing here" branches, and the
+    /// live-daemon render in the m6 suite reaches this page with a torn-down
+    /// surface and no §27 activity — so the activity and usage tables, and
+    /// every arm of the per-kind `activity_detail` line, rendered nowhere.
+    /// They are where the dashboard puts a backend's own words in front of a
+    /// human, which is exactly the content that must not reach the page as
+    /// markup.
+    #[test]
+    fn render_work_renders_activity_usage_and_teardown_when_there_is_something_to_show() {
+        let system = json!({"version": "0.1.0", "api_revision": "v1", "data_dir": "/tmp/d"});
+        let detail = json!({
+            "work": {"state": "completed", "intent": "do a thing"},
+            "workflow": {"name": "wf", "version": 1, "source": "inline", "stages": ["00-only"]},
+            "stage": {"stage_id": "00-only", "index": 0, "of": 1, "status": "completed"},
+            "surface": {"bindings": []},
+            "teardown": {"reason": "work completed"},
+            "execution": null,
+            "route_source": "global_default",
+        });
+        let events = json!({"events": [
+            {"seq": 11, "kind": "conversation.user", "payload": {"text": "hello <there>"}},
+            {"seq": 12, "kind": "conversation.assistant.completed",
+             "payload": {"text": "done"}},
+            {"seq": 13, "kind": "tool.requested",
+             "payload": {"name": "Bash", "input": {"command": "ls"}}},
+            {"seq": 14, "kind": "tool.completed",
+             "payload": {"tool_use_id": "tu_1", "content": "README.md"}},
+            // A kind the renderer has no special case for, and one with no
+            // payload at all: both fall through to the compacted form.
+            {"seq": 15, "kind": "conversation.assistant.thinking", "payload": {"tokens": 12}},
+            {"seq": 16, "kind": "tool.requested", "payload": {"name": "Read"}},
+            {"seq": 17, "kind": "usage.updated", "payload": {
+                "usage": {"input_tokens": 120, "output_tokens": 34},
+                "total_cost_usd": 0.0042,
+                "model_pin": {"verdict": "honored"},
+            }},
+        ]});
+
+        let html = render_work(&system, "01ABC", &detail, &events, "tok");
+
+        assert!(
+            html.contains("teardown: work completed"),
+            "a torn-down surface says why: {html}"
+        );
+        for (needle, what) in [
+            ("<th>seq</th><th>kind</th><th>detail</th>", "activity table"),
+            ("conversation.user", "an activity row's kind"),
+            (
+                "hello &lt;there&gt;",
+                "an assistant/user line's text, escaped",
+            ),
+            (
+                "Bash {&quot;command&quot;:&quot;ls&quot;}",
+                "a tool request's name and input",
+            ),
+            (
+                "tu_1 &quot;README.md&quot;",
+                "a tool result's id and content",
+            ),
+            (
+                "{&quot;tokens&quot;:12}",
+                "an unrecognised kind's compacted payload",
+            ),
+            ("<th>cost usd</th>", "usage table"),
+            (
+                "<td>120</td><td>34</td><td>0.0042</td><td>honored</td>",
+                "a usage row",
+            ),
+        ] {
+            assert!(
+                html.contains(needle),
+                "the {what} must render ({needle:?} not found in): {html}"
+            );
+        }
+        assert!(
+            !html.contains("<there>"),
+            "a backend's words must never reach the page as markup: {html}"
+        );
+        assert!(
+            html.contains("<td class=\"wrap\">Read </td>"),
+            "a tool request with no input renders the name and nothing else, \
+             not the word null: {html}"
+        );
+        for green in [
+            "no normalized conversation events yet",
+            "no usage reported by this backend",
+        ] {
+            assert!(
+                !html.contains(green),
+                "a populated section must not also claim to be empty: {green:?}"
+            );
+        }
+    }
+
+    /// A work id that is not there is still a dashboard page — chrome, live
+    /// ticker and all — and the id it echoes back is escaped like every other
+    /// text node. The 404 body is the one page rendered from a value that
+    /// came straight off the URL.
+    #[test]
+    fn a_missing_work_is_a_dashboard_page_with_its_id_escaped() {
+        let system = json!({"version": "0.1.0", "api_revision": "v1", "data_dir": "/tmp/d"});
+        let html = render_missing_work(&system, "01A&B<script>", "tok");
+        assert!(
+            html.contains("no work with id 01A&amp;B&lt;script&gt;"),
+            "the id is echoed, escaped — ampersand included: {html}"
+        );
+        assert!(
+            !html.contains("<script>"),
+            "an id off the URL must never reach the page as markup: {html}"
+        );
+        assert!(
+            html.contains("id=\"ticker\"") && html.contains("dashboard.js"),
+            "a 404 keeps the chrome, so the page is still live: {html}"
+        );
+    }
 }
