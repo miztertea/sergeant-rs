@@ -28,11 +28,17 @@ use std::path::Path;
 use std::process::Output;
 use std::time::{Duration, Instant};
 
+use std::future::Future;
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use sergeant_rs::daemon::{self, DaemonHandle, RuntimeDescriptor};
+use sergeant_rs::backend::BackendRegistry;
+use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
+use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle, RuntimeDescriptor};
 use sergeant_rs::domain::event::{EVENT_SCHEMA, Event};
+use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_CANCELED, KIND_WORK_SUBMITTED,
     WorkState,
@@ -1656,4 +1662,291 @@ fn concurrent_stale_replacement_leaves_the_surviving_daemon_discoverable() {
 
     drop(blackhole);
     stop_daemon(dir.path());
+}
+
+// --------------------------------------------- §22.6 core-lock discipline
+//
+// R-N0-4's newest budget: "no external I/O, process wait, or thread join under
+// the core lock". A negative about a lock cannot be asserted by timing a fast
+// path — it has to be provoked. So these tests park an executor *inside* an
+// external effect, indefinitely, and then ask the daemon to serve unrelated
+// requests. If the lock were held across the effect, they would never answer.
+
+/// How long an unrelated request may take while an executor is parked inside
+/// an external effect.
+///
+/// The measured baseline (`docs/perf/baseline-2026-08-10.md`) puts a single
+/// submit's p50 at 37.9 ms and a burst-50 p95 at 1.1 s, so one second is
+/// comfortably above the honest cost of a contended journal commit and
+/// infinitely below the failure this catches — a request that waits for a
+/// stalled harness is a request that never returns at all.
+const INDEPENDENT_REQUEST_BUDGET: Duration = Duration::from_secs(1);
+
+/// Seed a data dir with a run parked in `blocked` on `00-only`, so a `retry`
+/// through the API reserves and launches a second attempt.
+///
+/// Written straight to the journal *before* the daemon starts, because the
+/// daemon owns the data dir exclusively once it has: this is the only honest
+/// way for a test to hand it a starting position.
+fn seed_blocked_run(data_dir: &Path, work_id: &str) {
+    let mut journal = Journal::open(data_dir).expect("open journal");
+    let mut append = |kind: &str, payload: Value| {
+        journal
+            .append(
+                EventDraft::new(EventSource::new("test", "seed"), kind, payload)
+                    .with_work_id(work_id),
+            )
+            .expect("append");
+    };
+    append(
+        "work.submitted",
+        json!({"work": {
+            "id": work_id,
+            "intent": "stall me",
+            "repositories": [],
+            "state": "pending",
+            "created_by": "test",
+            "created_at": "2026-08-10T00:00:00Z",
+        }}),
+    );
+    append(
+        "workflow.bound",
+        json!({
+            "workflow": {"name": "tiny", "version": "1", "source": "test",
+                         "stages": [{"id": "00-only", "context": "c"}]},
+            "backend": FAKE_BACKEND_NAME,
+        }),
+    );
+    append(
+        "surface.materialized",
+        json!({"surface": {
+            "work_id": work_id,
+            "root": data_dir,
+            "bindings": [{
+                "repository": "solo",
+                "source_path": data_dir,
+                "base_branch": "main",
+                "base_sha": "0".repeat(40),
+                "worktree_path": data_dir,
+                "work_branch": format!("sergeant/{work_id}"),
+                "head_sha": "0".repeat(40),
+            }],
+        }}),
+    );
+    append(
+        "stage.entered",
+        json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+    );
+    append("work.started", json!({}));
+    append(
+        "stage.blocked",
+        json!({"stage_id": "00-only", "detail": "seeded"}),
+    );
+    append("work.blocked", json!({"reason": "seeded"}));
+}
+
+/// Start a daemon whose only backend is `fake`, so a test can stall it.
+async fn start_with_fake(data_dir: &Path, fake: &FakeBackend) -> DaemonHandle {
+    daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
+}
+
+/// Issue a request while an executor is stalled and describe what happened.
+///
+/// Deliberately non-panicking: the caller releases the stall and shuts the
+/// daemon down *before* asserting. A test that panics with a request still in
+/// flight leaves graceful shutdown waiting for a response that will never come
+/// — the failure then reads as a hung suite instead of a named budget breach
+/// (measured, while probing this very test).
+async fn timed(
+    label: &str,
+    future: impl Future<Output = Result<reqwest::StatusCode, reqwest::Error>>,
+) -> Result<Duration, String> {
+    let started = Instant::now();
+    match tokio::time::timeout(INDEPENDENT_REQUEST_BUDGET, future).await {
+        Err(_) => Err(format!(
+            "{label} was still unanswered after {INDEPENDENT_REQUEST_BUDGET:?} while an executor \
+             was stalled — the core lock is being held across an external effect (§22.6)"
+        )),
+        Ok(Err(e)) => Err(format!("{label} failed while an executor was stalled: {e}")),
+        Ok(Ok(status)) if !status.is_success() => Err(format!(
+            "{label} answered {status} while an executor was stalled"
+        )),
+        Ok(Ok(_)) => Ok(started.elapsed()),
+    }
+}
+
+/// §22.6: a deliberately stalled **launch** blocks nothing else.
+///
+/// The fake's `launch` parks in a gate — the stand-in for a harness process
+/// spawn, an image pull, a container create — and stays parked until this test
+/// releases it. Meanwhile an unrelated read (`GET /v1/work`) and an unrelated
+/// *mutation* (`POST /v1/work`) both have to complete. They can only do that
+/// if the reservation phase released the core guard before the launch, which
+/// is precisely §14.2's boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t9_a_stalled_launch_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKLAUNCH";
+    seed_blocked_run(dir.path(), work_id);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    fake.hold_launches();
+    let retry = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    // Rendezvous, not a sleep: proceed only once the executor is provably
+    // parked inside the external effect.
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_launches(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake launch never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    // Unwind the stall first, then judge: see `timed`.
+    fake.release_launches();
+    let retried = retry.await.expect("retry task");
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled launch: read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(retried.is_success(), "the stalled retry answered {retried}");
+}
+
+/// §22.6 + **issue #14 / backlog B3**: a stalled evidence archive blocks
+/// nothing else either.
+///
+/// B3 recorded the exact shape of this: `ClaudeBackend::stop` joined the
+/// turn's transcript-archive thread while the API handler held the core lock,
+/// so a concurrent request waited out one flush. The fix was named there too —
+/// "a §15 trait-shape change: `stop` returning a join token the caller awaits
+/// after releasing the core guard" — and that is what `Completion`/`Deferred`
+/// are. Here the fake's stop hands back a completion that parks indefinitely;
+/// the cancel that triggered it is still in flight, and an unrelated read must
+/// still answer.
+///
+/// The other half of the promise is checked at the end: the cancel does not
+/// return until its completion has actually run, so STOP's evidence guarantee
+/// survives the move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t10_a_stalled_evidence_archive_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKARCHIVE";
+    seed_blocked_run(dir.path(), work_id);
+
+    // `hang` keeps the retried execution alive, so the cancel below has a
+    // real native context to stop.
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+
+    fake.hold_archives();
+    let cancel = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/cancel"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("cancel request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_archives(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the stop completion never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    // The cancel is still waiting on its own completion — that is B3's
+    // evidence promise, kept outside the guard rather than under it.
+    let cancel_still_waiting = !cancel.is_finished();
+
+    fake.release_archives();
+    let canceled = cancel.await.expect("cancel task");
+    let stops = fake.stop_requests();
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled archive: read {read:?}");
+    read.expect("independent read");
+    assert!(
+        cancel_still_waiting,
+        "the cancel must not report done before the adapter's evidence tail has run"
+    );
+    assert!(canceled.is_success(), "the cancel answered {canceled}");
+    assert_eq!(
+        stops.len(),
+        1,
+        "exactly one stop reached the backend: {stops:?}"
+    );
 }
