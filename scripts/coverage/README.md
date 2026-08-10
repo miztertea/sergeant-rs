@@ -226,7 +226,16 @@ Suite wall times on this container, uninstrumented, for scale: m1 1.1 s,
 m4 3.1 s, m2 6.6 s, m3 6.4 s, m6 8.8 s, m5 9.5 s, `--lib` 1.5 s. At the
 estimated 1.5–3× slowdown, no *total* approaches any bound above — the risk is
 concentrated in the individual operations whose headroom is marked unknown,
-and in the four fixed sleeps. C1–C3's recorded wall times per stage are the
-first real data on that; a deadline that fails only under instrumentation is
-an S2 finding with its own disposition, **never** a bound that gets quietly
-loosened.
+and in the four fixed sleeps.
+
+One empirical check on all of it, run in phase 1 and recorded in
+`docs/coverage/artifacts-2026-08-10/phase1-measurements.txt`: a full
+`cargo test` takes 37 s idle, 71 s under four CPU hogs (~1.9×) and 92 s under
+eight (~2.5×), **green every time**. That is a proxy for instrumentation, not
+a substitute — contention slows everything uniformly, whereas instrumentation
+slows instrumented code specifically and adds a profile write at exit, which
+is a cost the fixed sleeps and the SIGTERM graces feel and a CPU hog does not.
+But it does mean the unknown-headroom rows above are unknown, not suspected:
+nothing in the suite is known to sit near its bound. F2 answers it properly. A
+deadline that fails only under instrumentation is an S2 finding with its own
+disposition, **never** a bound that gets quietly loosened.
