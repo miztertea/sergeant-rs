@@ -232,6 +232,9 @@ struct FakeExecution {
 struct FakeState {
     script: VecDeque<FakeStep>,
     executions: BTreeMap<String, FakeExecution>,
+    /// Contexts this adapter no longer holds in memory but which still exist
+    /// out in the world — see [`FakeBackend::forget_executions`].
+    forgotten: BTreeMap<String, FakeExecution>,
     starts: Vec<StartRequest>,
     stop_requests: Vec<String>,
     interrupt_requests: Vec<String>,
@@ -300,6 +303,7 @@ impl FakeBackend {
             state: Arc::new(Mutex::new(FakeState {
                 script: script.into_iter().collect(),
                 executions: BTreeMap::new(),
+                forgotten: BTreeMap::new(),
                 starts: Vec::new(),
                 stop_requests: Vec::new(),
                 interrupt_requests: Vec::new(),
@@ -481,6 +485,24 @@ impl FakeBackend {
             }
             None => false,
         }
+    }
+
+    /// Drop this adapter's *memory* of every execution while leaving the
+    /// contexts themselves intact — the shape a daemon restart leaves for an
+    /// adapter whose native contexts are durable.
+    ///
+    /// This is the Claude case made scriptable. A restarted `ClaudeBackend`
+    /// has an empty execution table while the conversations it started are
+    /// still on disk: SEND and OBSERVE answer `UnknownExecution`, and §15
+    /// RESUME is the one verb that can bring a context back into the
+    /// adapter's hands. Sharing a `FakeBackend` across a simulated restart
+    /// modelled only the *other* case — an adapter that somehow remembered
+    /// everything — which is why nothing caught a `respond` that could not
+    /// survive one.
+    pub fn forget_executions(&self) {
+        let mut state = self.lock();
+        let remembered = std::mem::take(&mut state.executions);
+        state.forgotten.extend(remembered);
     }
 
     /// Reprogram every live execution to "the stage finished and the native
@@ -685,9 +707,14 @@ impl Backend for FakeBackend {
         Ok(self.completion())
     }
 
-    /// RESUME re-adopts a known execution; §25's identity rule applies the
-    /// same as everywhere else — a handle without this context's native
-    /// identity is not recognised, it is refused.
+    /// RESUME re-adopts an execution; §25's identity rule applies the same as
+    /// everywhere else — a handle without this context's native identity is
+    /// not recognised, it is refused.
+    ///
+    /// A context this adapter has *forgotten* (see
+    /// [`FakeBackend::forget_executions`]) is exactly what RESUME is for: it
+    /// comes back into the execution table and later SENDs continue it, which
+    /// is the promise `Ok` makes on the real adapter too.
     fn resume(
         &self,
         handle: &ExecutionHandle,
@@ -697,6 +724,18 @@ impl Backend for FakeBackend {
         state
             .resume_requests
             .push((handle.execution_id.clone(), request.clone()));
+        if let Some(forgotten) = state.forgotten.get(&handle.execution_id)
+            && handle.native_id.as_deref() == Some(forgotten.native_id.as_str())
+        {
+            let readopted = state
+                .forgotten
+                .remove(&handle.execution_id)
+                .expect("presence checked above");
+            state
+                .executions
+                .insert(handle.execution_id.clone(), readopted);
+            return Ok(());
+        }
         self.resolve(&state, handle)?;
         Ok(())
     }

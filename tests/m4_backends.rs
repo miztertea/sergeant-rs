@@ -4480,6 +4480,159 @@ fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
     );
 }
 
+/// GP-2 across a **daemon restart**: an actor's question that is still parked
+/// when the daemon dies must still be answerable, and the human's answer must
+/// not be consumed and dropped.
+///
+/// A work in `needs_input` is the work most likely to be sitting there when a
+/// restart happens — it is waiting on a person. Startup reconciliation
+/// deliberately leaves it alone (a park is a decision, not uncertainty), so the
+/// restarted adapter's empty execution table is discovered by the `respond`
+/// itself. Before the fix, that `respond` journaled `stage.input_received` and
+/// `work.resumed`, then failed `UnknownExecution` and blocked: the answer
+/// durable in the journal and reachable by nothing, because `retry` re-enters
+/// the stage as a new attempt and never re-delivers it.
+///
+/// The fake models the real shape via `forget_executions` — adapter memory
+/// gone, native context intact — which is precisely the Claude case: the
+/// conversation is a file on disk and §15 RESUME is what re-adopts it.
+#[test]
+fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
+    // Bound before the local `core` shadows the helper of the same name.
+    let reopen = core;
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::ask("postgres or sqlite?"), FakeStep::complete()],
+    );
+    let registry = Arc::new(BackendRegistry::new().with(Arc::new(fake.clone())));
+    let engine = Engine::new(Arc::clone(&registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASKRESTART";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput,
+        "the actor's question parks the work"
+    );
+    let execution_id = core.registry.state().runs[work_id]
+        .execution
+        .as_ref()
+        .expect("execution")
+        .execution_id
+        .clone();
+
+    // The daemon dies while the human is still thinking. The projection is
+    // rebuilt from the journal; the adapter's memory is not rebuilt at all.
+    drop(core);
+    fake.forget_executions();
+    let engine = Engine::new(registry, None, data.path());
+    let mut restarted = reopen(data.path());
+    let core = &mut restarted;
+    let report = recovery::reconcile(&engine, core).expect("reconcile");
+    assert!(
+        report.resumed.is_empty() && report.blocked.is_empty(),
+        "a parked work is a decision; recovery must not re-decide it: {report:?}"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput
+    );
+
+    // The human answers the restarted daemon.
+    engine
+        .provide_input(core, work_id, "postgres")
+        .expect("respond after a restart");
+
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["postgres".to_string()],
+        "the answer reached the execution that asked it"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed,
+        "and the run continued from it"
+    );
+    assert_eq!(
+        events_of(core, work_id, KIND_EXECUTION_STARTED).len(),
+        1,
+        "re-adoption continues the conversation; it never starts a second one"
+    );
+
+    // §15 RESUME is what made it reachable, and the trajectory says so —
+    // with the launch configuration re-supplied from the journal, not
+    // invented (`ResumeRequest`'s own contract).
+    let resumes = fake.resume_requests();
+    assert_eq!(resumes.len(), 1, "exactly one re-adoption: {resumes:?}");
+    assert_eq!(resumes[0].0, execution_id);
+    assert_eq!(resumes[0].1.work_id, work_id);
+    let reconciled = events_of(core, work_id, KIND_EXECUTION_RECONCILED);
+    assert_eq!(
+        reconciled.len(),
+        1,
+        "the re-adoption is journaled, not silent: {reconciled:?}"
+    );
+    assert_eq!(reconciled[0]["reattached"], true);
+    assert_eq!(reconciled[0]["execution_id"], execution_id);
+}
+
+/// An adapter that *refuses* the re-adoption still fails the work closed, with
+/// its own refusal as the evidence — the reattach is a recovery of a provable
+/// context, never a way to soften ambiguity (§25).
+#[test]
+fn n18_a_refused_reattach_still_fails_the_answer_closed() {
+    let reopen = core;
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::ask("postgres or sqlite?")]);
+    let registry = Arc::new(BackendRegistry::new().with(Arc::new(fake.clone())));
+    let engine = Engine::new(Arc::clone(&registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASKREFUSED";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+    engine.retry(&mut core, work_id).expect("retry");
+
+    // Nothing survived: the adapter has neither memory of the execution nor
+    // a context to re-adopt, which is what a lost native session looks like.
+    drop(core);
+    let vanished = FakeBackend::new(FAKE_BACKEND_NAME);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(vanished.clone()))),
+        None,
+        data.path(),
+    );
+    let mut restarted = reopen(data.path());
+    let core = &mut restarted;
+    engine
+        .provide_input(core, work_id, "postgres")
+        .expect("respond is accepted, then fails closed");
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked,
+        "an unprovable context blocks rather than guessing"
+    );
+    let blocked = events_of(core, work_id, KIND_WORK_BLOCKED);
+    let reason = blocked
+        .last()
+        .and_then(|b| b["reason"].as_str())
+        .unwrap_or_default();
+    assert!(
+        reason.contains("cannot deliver input"),
+        "the refusal is the reason: {reason}"
+    );
+    // The answer itself is still durable — it is the input the operator gave.
+    let received = events_of(core, work_id, KIND_STAGE_INPUT_RECEIVED);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["input"], "postgres");
+    assert!(
+        events_of(core, work_id, KIND_EXECUTION_RECONCILED).is_empty(),
+        "a re-adoption that did not happen is not claimed"
+    );
+}
+
 /// Opt-in, spends real tokens: the ask, measured against the installed CLI.
 ///
 /// L8's rule is that an advertised verb without a contract test against the

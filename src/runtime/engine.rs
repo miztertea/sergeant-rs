@@ -202,6 +202,10 @@ pub struct PendingSend {
     execution: ExecutionRecord,
     backend: Arc<dyn Backend>,
     input: String,
+    /// What a re-adoption would need, if the adapter turns out to have
+    /// forgotten this execution (see [`PendingSend::perform`]). `None` for a
+    /// run with no recorded surface, where there is nothing to resume into.
+    resume: Option<ResumeRequest>,
 }
 
 impl std::fmt::Debug for PendingSend {
@@ -222,13 +226,39 @@ impl PendingSend {
 
     /// Deliver the input and observe what the turn now says — both outside
     /// the core lock.
+    ///
+    /// **Reattach first if the adapter has forgotten this execution.** A work
+    /// parked in `needs_input` is, by construction, the work most likely to be
+    /// sitting there when a daemon is restarted: it is waiting on a human, and
+    /// humans take longer than daemons live. Startup reconciliation
+    /// deliberately does not touch it — a parked work is a decision, not
+    /// uncertainty (`runtime::recovery`'s own rule) — so the first thing that
+    /// can discover the adapter no longer holds the context is the answer
+    /// itself. Without this, that answer was journaled, refused with
+    /// `UnknownExecution`, and left durable but unreachable: `retry` re-enters
+    /// the stage as a fresh attempt and never re-delivers it.
+    ///
+    /// RESUME is the verb §15 provides for exactly this, and it is the
+    /// adapter's decision, not the engine's: one that cannot evidence the
+    /// context refuses, the refusal is what `settle_send` records, and the
+    /// work fails closed as it did before. RESUME never starts a turn, so a
+    /// re-adoption costs nothing and creates no second execution.
     pub fn perform(&self) -> SendOutcome {
         let handle = handle_of(&self.execution);
-        let delivered = self.backend.send(&handle, &self.input);
+        let mut reattached = false;
+        let mut delivered = self.backend.send(&handle, &self.input);
+        if let (Err(BackendError::UnknownExecution { .. }), Some(request)) =
+            (&delivered, &self.resume)
+            && self.backend.capabilities().resume
+            && self.backend.resume(&handle, request).is_ok()
+        {
+            reattached = true;
+            delivered = self.backend.send(&handle, &self.input);
+        }
         let observed = delivered.is_ok().then(|| self.backend.observe(&handle));
         SendOutcome {
             delivered,
-            reattached: false,
+            reattached,
             observed,
         }
     }
@@ -848,6 +878,7 @@ impl Engine {
                 execution,
                 backend,
                 input: input.to_string(),
+                resume: self.resume_request(&run, work_id),
             })),
             deferred: Deferred::new(),
         })
