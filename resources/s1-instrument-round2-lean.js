@@ -66,10 +66,13 @@ const BUILD_SCHEMA = {
 const HYGIENE = `Probe hygiene (binding, L5): mutation probes ONLY in a disposable git worktree
 (git worktree add /tmp/probe-<name> HEAD; git worktree remove --force after; the worktree
 gets its OWN target dir — never set CARGO_TARGET_DIR), NEVER the main tree; report every
-probe. Exploration budget: the phase-1 layer is \`git diff ${BASE}..HEAD\` — read that
-diff, the files it touches, the S1 contract (docs/gauntlet/contracts/S1-COVERAGE.md), the
-S0 rulings (docs/gauntlet/contracts/S0.md), and directly referenced code; not a
-whole-repo re-audit. Never run the opt-in real-Claude tests. Never run a full instrumented
+probe. Exploration budget: the phase-1 layer is \`git diff ${BASE}..HEAD\` RESTRICTED to
+the builder's surfaces — tests/, scripts/, .github/, .gitattributes, .gitignore,
+docs/coverage/ — read that part of the diff, the files it touches, the S1 contract
+(docs/gauntlet/contracts/S1-COVERAGE.md), the S0 rulings (S0.md), and directly referenced
+code; not a whole-repo re-audit. Orchestrator record commits in the same range
+(docs/gauntlet/, reference/notes/, CLAUDE.md, resources/) are OUT of scope — the
+adjudication surface, not the reviewed code. Never run the opt-in real-Claude tests. Never run a full instrumented
 coverage build (a probe of one stage script's guards is fine; the 15+ min build is not).`
 
 const AXES = [
