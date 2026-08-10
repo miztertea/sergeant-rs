@@ -43,6 +43,39 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### N0 — 2026-08-10, Next Iteration kickoff: proposal accepted, remediation adjudicated
+
+**Mission outcome: contract met — adjudication-only, zero code delta.** The
+successor proposal (`reference/proposal-next-iteration-icm-workflows.md`,
+audited against 27c00ef, delivered via the owner's IdeaOS corpus) is accepted
+as the governing document for the N-series with one owner-accepted amendment:
+retention (#17/#4) may no longer be silently parked — the N4 contract cannot
+be written without a retention design ruling (R-N0-3). Full rulings
+R-N0-1…R-N0-7 in `docs/gauntlet/contracts/N0.md`: #14/B3 and #20 fold into
+N3's two-phase-boundary scope and gates (their registered triggers fire
+there); #6/#7/#10 become regression budgets, not blockers; #18 → N5;
+#19 narrows into N2's real-Claude measurement run. Claude CLI 2.1.226 is
+confirmed as the measured floor (`MIN_TRUSTED_VERSION` already says so — M4
+re-measured on this exact version; owner ruling: older versions stay refused
+as unmeasured). Deviation-register scope extends to the successor proposal
+from this entry forward.
+
+**Environment evidence for Program B feasibility (measured this session):**
+`dockerd` 29.3.1 runs in this container (vfs, `--bridge=none
+--iptables=false`); registry pulls are egress-blocked, but a locally-built
+`FROM scratch` static image completes the full contract lifecycle — build,
+run, bind-mount read *and* write, `--network=none`, exact cleanup. §22.7's
+matrix is therefore executable here with Sergeant-owned probe images; only
+cold-pull/digest-pull/registry-auth tests need a qualified host. N5 platform
+qualification runs on the owner's macOS/Windows machines later, by design.
+
+**Environmental behavior.** Orchestrator-only (no panel): N0 produced
+rulings, not artifacts a blind panel could grade — the rulings themselves
+remain reviewable findings (L9) and every later contract that consumes one
+(N3, N4, N5, N2) re-exposes it to fresh critics at its own gate.
+
+---
+
 ### BUG SPRINT 1 — 2026-08-10, issues #3 #5 #9 #24
 
 **Mission outcome: all four fixed, pinned, landed as four separable commits
