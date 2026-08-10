@@ -4,7 +4,7 @@ Layer 3 (stable across runs), local to `50-synthesize`. Turns a flat file of
 per-unit classification records into named, describable candidates a human
 (and `60-draft`) can act on.
 
-## The six buckets
+## The seven buckets
 
 Every classification record from `../40-classify/output/classifications.ndjson`
 lands in exactly one of these buckets, by its `representation` field. Work
@@ -13,7 +13,15 @@ before naming anything.
 
 1. **Workflow candidates** (`representation: workflow` records, plus the
    `stage`/`stage-context`/`helper` records whose `workflow` field names
-   the same candidate). For each distinct `workflow` value seen across the
+   the same candidate — `docs/icm/record-shapes.md` §4 requires every
+   `stage`/`stage-context`/workflow-local-`helper` record to carry a
+   non-empty `workflow` field, so this sweep should never meet one without
+   it; if you do find a `helper` (or `stage`/`stage-context`) record with no
+   `workflow` value, that is a `40-classify`-stage defect surfacing here,
+   not something to silently resolve — record it under the same
+   `## Unattached records` heading bucket 3 defines below, rather than
+   dropping it or inventing a `workflow` value for it). For each distinct
+   `workflow` value seen across the
    corpus, produce one candidate: a short kebab-case name (unique within
    this run's output — check against every other candidate name you are
    about to mint, and against `.sergeant/workflows/` and
@@ -37,8 +45,12 @@ before naming anything.
    with that `workflow`+`stage` exists yet, that is a synthesis-time
    defect** — a stage-context unit implying a checkpoint no one classified
    as a stage. Do not silently invent a stage to hang it on and do not
-   silently drop the unit; record it under a `## Unattached stage-context
-   units` heading naming the gap plainly.
+   silently drop the unit; record it under a `## Unattached records`
+   heading naming the gap plainly (the same heading bucket 1 uses for a
+   workflow-local `helper`/`stage` record missing its required `workflow`
+   field — both are the same class of synthesis-time defect: a record this
+   stage cannot place without inventing a fact `40-classify` should have
+   supplied).
 4. **Permanent-instruction candidates** (`representation: agents-invariant`
    records). List them; do not draft them into any workflow package (this
    workflow does not publish, and `AGENTS.md` changes are the promotion
@@ -68,9 +80,14 @@ before naming anything.
 
 - A classification record silently absent from every bucket. Every
   `behavior_id` in `../40-classify/output/classifications.ndjson` appears
-  in exactly one bucket (buckets 1–3 count as one appearance for a
-  `stage`/`stage-context` record: the unit is a stage or an attachment to
-  one, not both).
+  in exactly one bucket appearance across all seven buckets: buckets 1–3
+  count as one appearance for a `stage`/`stage-context` record (the unit is
+  a stage or an attachment to one, not both); a record landing in the
+  `## Unattached records` heading (bucket 1 or 3) also counts as its one
+  appearance — it is accounted for, just not attached to anything; buckets
+  4–7 (`agents-invariant`, `shared-helper`/`shared-context`,
+  `obsolete-mechanism`, `engine-gap`) are otherwise one record = one direct
+  appearance, keyed by `representation` alone.
 - A candidate name invented with no member records citing it — every
   candidate you write down traces back to at least one `behavior_id`.
 - Manufacturing a workflow/stage candidate's boundary to look tidy rather

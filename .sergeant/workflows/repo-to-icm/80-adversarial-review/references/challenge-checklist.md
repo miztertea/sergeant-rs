@@ -10,7 +10,7 @@ you have specifically checked for one.
 ## Axis 1 — Boundary honesty
 
 - **Publication boundary.** Every candidate package named in
-  `../60-draft/output/manifest.md` (or equivalent) actually lives under
+  `../60-draft/output/draft-report.md` actually lives under
   `.sergeant/drafts/workflows/`, never `.sergeant/workflows/`. Its
   `index.md` declares `status: draft`. No candidate directory exists
   identically in both trees (`docs/icm/convention.md` §2 rules 2–3).
@@ -23,14 +23,28 @@ you have specifically checked for one.
   run-independent material, never the reverse.
 - **Blindness boundary.** Grep every artifact this run has produced so far
   (`../00-contract` through `../70-lint` outputs, and every materialized
-  draft package) for any citation — a `source.path`, a `source.locator`, a
-  quoted span — that points inside `reference-corpus/`. Any hit is a
-  contamination finding and should be marked highest severity: it means
-  this run's evidence is not actually independent of the answer key it will
-  later be measured against. **Do not open `reference-corpus/` yourself to
-  perform this check** — grep the *generated* artifacts for the literal
-  string `reference-corpus`, you do not need to read the target of a match
-  to know it is a boundary violation.
+  draft package) for the literal string `reference-corpus`. This is a
+  first pass, not the finding itself — **a correctly-executed `00-contract`
+  is expected to produce exactly one such hit, in its own `contract.md`'s
+  exclusion record** (`00-contract/CONTEXT.md`: "name it in `contract.md`"),
+  and that expected hit is not a finding. Do not open `reference-corpus/`
+  itself to perform this check; you do need to read enough of *this run's
+  own text* around every other hit to classify it, because the grep alone
+  cannot tell a citation from a mention:
+  - A hit inside a **citation field** — a behavior unit's `source.path`,
+    `source.locator`, or a quoted span backing a `quote`/`quote_hash`; a
+    `provenance.md` entry; a finding's own `target`/`evidence` naming a
+    location inside `reference-corpus/` — means this run's evidence is not
+    actually independent of the answer key. That is a contamination
+    finding, highest severity.
+  - A hit that is **prose repeating the exclusion policy's own wording**
+    (e.g. a summary that copies `contract.md`'s exclusion line, or restates
+    this checklist's or `../_config/run-discipline.md`'s own text) is not
+    itself a finding — it did not have to open the directory to write that.
+  - If you cannot place a hit in either bucket from context alone, do not
+    guess which it is; record it as a `medium`-severity finding describing
+    exactly what you found and why it was ambiguous, rather than silently
+    dropping it or inflating it to `high` on suspicion alone.
 - **Name-collision boundary.** No candidate workflow name collides with
   `repo-to-icm` itself, with any other candidate this run produced, or with
   any name already under `.sergeant/workflows/`.

@@ -4,9 +4,10 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../00-contract/output/README.md | L4 | upstream artifact produced by `00-contract` — subject repository and pinned revision every citation resolves against |
-| ../10-inventory/output/README.md | L4 | upstream artifact produced by `10-inventory` — which files are dispositioned `decompose`, and their partitions |
+| ../00-contract/output/contract.md | L4 | upstream artifact produced by `00-contract` — subject repository and pinned revision every citation resolves against |
+| ../10-inventory/output/inventory.md | L4 | upstream artifact produced by `10-inventory` — which files are dispositioned `decompose`, and their partitions |
 | ../_config/evidence-policy.md | L3 | the required record shape and the quote+hash discipline |
+| ../_config/run-discipline.md | L3 | the blindness rule (this stage mints citations — the highest-risk stage for it) and the `# AMBIGUOUS — NOT RESOLVED` propagation rule |
 | references/extraction-example.md | L3 | a worked example of the shape, including the one-behavior-per-unit split |
 
 ## Purpose
@@ -28,6 +29,9 @@ independent behavior once read closely; that is a legitimate outcome, but
 it must be a recorded decision, not a silent gap).
 
 ## How to do it
+
+0. If `contract.md` or `inventory.md` opens with `# AMBIGUOUS — NOT
+   RESOLVED`, do not proceed — follow `../_config/run-discipline.md` §2.
 
 Work through the inventory's `decompose` partitions in the order
 `10-inventory` recorded them. For each file in a partition:

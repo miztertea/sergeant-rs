@@ -37,33 +37,69 @@ grammar-pressure report below.
 `output/measurement-package.md` reports what this run can honestly measure
 **without** the reference corpus — this run's actors never opened it, and
 this stage does not either (see the blindness note in `../CONTEXT.md`).
-Pull from every upstream stage's own declared output:
+
+Proposal §9.9 names ten measurement dimensions. This file states all ten by
+name here (so recovering them never requires opening the proposal, which no
+stage's Inputs table can name — `docs/icm/convention.md` §1a rule 1 governs
+what this stage may depend on, and the proposal lives outside this
+workflow's own tree). Five require comparing against `reference-corpus/`
+and are **out of reach for this run's blindness rule**; five are
+**internally computable** from this run's own artifacts alone. Report both
+groups explicitly — a dimension silently missing from either group is a
+gap, not a shortcut:
 
 ```text
-run identity           subject repo + revision (../00-contract)
-source coverage         file counts by disposition, partition count (../10-inventory)
-extraction coverage      unit count, any unreached partitions (../20-harvest)
-normalization outcome    unit count after rewrite/split, confidence shifts (../30-normalize)
-representation mix       classification record counts by `representation` (../40-classify)
-candidate yield          counts of workflow/stage/helper/shared/invariant/
-                         obsolete-mechanism/engine-pressure candidates (../50-synthesize)
-draft materialization    candidate packages produced, paths (../60-draft)
-draft validity           validator pass/fail per candidate, mechanical vs.
-                         substantive defect counts (../70-lint)
-review convergence       finding counts by axis/severity, accept/reject/park
-                         counts (this stage's own adjudication-log.md)
+INTERNALLY COMPUTABLE (report a real value for each, from the stage named):
+
+source coverage           file counts by disposition, partition count
+                           (../10-inventory/output/inventory.md)
+behavioral precision       of the citations THIS RUN itself sampled and
+                           reverified: fraction of ../80-adversarial-review's
+                           Axis 2 citation-reverification sample that
+                           verified cleanly (no invention finding) — record
+                           numerator/denominator, e.g. "9/10 sampled
+                           citations verified", not a bare percentage from a
+                           small sample (../80-adversarial-review/output/
+                           findings.ndjson, review-summary.md)
+provenance completeness    fraction of materialized stages/candidates whose
+                           provenance.md cites at least one real behavior_id
+                           (../70-lint/output/lint-report.md's [S8] results
+                           per candidate, cross-checked against any Axis-2
+                           invention findings on fabricated citations)
+draft validity             validator pass/fail per candidate, mechanical vs.
+                           substantive defect counts (../70-lint)
+review convergence         finding counts by axis/severity, accept/reject/
+                           park counts (this stage's own adjudication-log.md)
+
+NOT COVERED HERE (require reference-corpus/ comparison — a separate, later
+process performed by independent comparers not bound by this run's
+blindness rule, docs/gauntlet/contracts/N2.md Outcome §3):
+
+behavioral recall, workflow-boundary agreement, stage-boundary agreement,
+representation agreement, engine-gap quality
+
+SUPPORTING RUN STATISTICS (context for the above, not §9.9 dimensions in
+their own right — report them too, but do not mistake this list for the
+ten-dimension list):
+
+run identity              subject repo + revision (../00-contract)
+extraction coverage       unit count, any unreached partitions (../20-harvest)
+normalization outcome     unit count after rewrite/split, confidence shifts
+                          (../30-normalize)
+representation mix        classification record counts by `representation`
+                          (../40-classify)
+candidate yield           counts of workflow/stage/helper/shared/invariant/
+                          obsolete-mechanism/engine-pressure candidates
+                          (../50-synthesize)
+draft materialization     candidate packages produced, paths (../60-draft)
 ```
 
-State plainly, once, which of proposal §9.9's ten measurement dimensions
-this package does **not** and cannot cover from inside this run —
-behavioral recall, workflow-boundary agreement, stage-boundary agreement,
-representation agreement, and engine-gap quality all require comparing
-against `reference-corpus/`, which is a separate, later process performed
-by independent comparers who are not bound by this run's blindness rule
-(`docs/gauntlet/contracts/N2.md` Outcome §3). Reporting this honestly is
-itself part of the "generator preserves uncertainty instead of inventing
-confidence" gate item (proposal §22.1 item 9) — do not attempt to estimate
-those five dimensions from inside this run to fill the gap.
+State plainly, once, which five §9.9 dimensions this package does **not**
+and cannot cover from inside this run, using the exact names above.
+Reporting this honestly is itself part of the "generator preserves
+uncertainty instead of inventing confidence" gate item (proposal §22.1 item
+9) — do not attempt to estimate those five dimensions from inside this run
+to fill the gap.
 
 ## 3. The grammar-pressure report
 
@@ -79,16 +115,56 @@ both use the same template:
   unchanged, tagged `"source": "behavior"` with the originating
   `behavior_id`.
 - **Meta-level.** Pressure this workflow's *own* stages hit while executing
-  — e.g. `20-harvest` recording partitions it could not reach within one
-  turn because no fan-out exists; a candidate needing a shared sub-procedure
-  with its own retry/measurement that `docs/icm/convention.md` §4 rule 1
-  rules out expressing through `@@name`; `70-lint` finding a substantive
+  — e.g. `10-inventory` or `20-harvest` recording paths/partitions they
+  could not reach within one turn because no fan-out exists;
+  `60-draft` recording that its materialized packages sit outside the D9
+  disposition/finalize mechanism entirely (no stage `output/` governs
+  per-run content written elsewhere in the worktree); a candidate needing a
+  shared sub-procedure with its own retry/measurement that
+  `docs/icm/convention.md` §4 rule 1 rules out expressing through `@@name`;
+  `00-contract` recording that this turn had no way to pause and ask a
+  human when the subject/revision/scope was ambiguous
+  (`../_config/run-discipline.md` §2); `70-lint` finding a substantive
   defect no lower-rung repair mechanism in this grammar can fix without
   inventing judgment machinery it was not given. Scan every upstream
   stage's own output for this kind of explicitly-recorded gap (do not
   invent one that was not actually recorded — this is consolidation, not
   new discovery) and write each as a full six-field record, tagged
   `"source": "meta"` and naming which stage surfaced it.
+
+### Record shape
+
+Each line is a wrapper around the six-field `engine_gap` template, nested
+exactly as a classification record nests it (never flattened to top
+level), and **never carrying a `representation` field** — this is not a
+classification record, and `scripts/validate-structure.py`'s `[S9]` check
+only inspects records whose `representation` is literally `engine-gap`;
+omitting that field here keeps this consolidation file correctly out of
+`[S9]`'s scope (which governs classification ledgers, not this file).
+
+Behavior-level (`source: behavior`) — `behavior_id` identifies the
+originating unit:
+
+```json
+{"source": "behavior", "behavior_id": "BU-0117", "engine_gap": {"behavior": "...", "source_evidence": ["BU-0117"], "lower_rungs_attempted": ["..."], "why_each_fails": {"...": "..."}, "minimum_runtime_capability_required": "...", "observable_acceptance_test": "..."}}
+```
+
+Meta-level (`source: meta`) — there is no behavior unit behind a meta-level
+gap, so `stage` (which stage's own output surfaced the moment) replaces
+`behavior_id`, and the nested template's own `source_evidence` field names
+*where the gap was recorded* instead of a `behavior_id` list — a pointer
+precise enough for a reader to re-open the actual recorded note (e.g.
+`"20-harvest/output/behavior-units.ndjson: coverage note, partitions P4/P7
+not reached"`), never a bare restatement of the gap itself:
+
+```json
+{"source": "meta", "stage": "20-harvest", "engine_gap": {"behavior": "...", "source_evidence": ["20-harvest/output/behavior-units.ndjson: coverage note, partitions P4/P7 not reached"], "lower_rungs_attempted": ["..."], "why_each_fails": {"...": "..."}, "minimum_runtime_capability_required": "...", "observable_acceptance_test": "..."}}
+```
+
+Both variants carry all six `engine_gap` fields, verbatim field names, all
+populated — the same completeness bar `40-classify` applies (§6.7: missing
+`lower_rungs_attempted` or `why_each_fails` is auto-rejected, not merely
+flagged).
 
 A moment that amounts to "we ran out of turn budget" or "this would have
 been more convenient with branching" without a rung-specific mechanical

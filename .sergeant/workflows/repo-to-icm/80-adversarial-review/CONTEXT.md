@@ -5,10 +5,15 @@
 | File | Layer | Why |
 |---|---|---|
 | references/challenge-checklist.md | L3 | the three challenge axes (boundary honesty, invention, engine-gap refutation) and how to apply each |
-| ../00-contract/output/README.md | L4 | upstream artifact produced by `00-contract` — this run's scope/exclusion record, needed to check the blindness boundary was actually honored |
-| ../40-classify/output/README.md | L4 | upstream artifact produced by `40-classify` — the classification records (rationale, alternatives, engine-gap claims) this review interrogates directly |
-| ../60-draft/output/README.md | L4 | upstream artifact produced by `60-draft` — the manifest naming every materialized candidate package this review challenges |
-| ../70-lint/output/README.md | L4 | upstream artifact produced by `70-lint` — the lint report, so already-fixed mechanical defects are not re-litigated as findings |
+| ../_config/evidence-policy.md | L3 | the quote+hash recomputation procedure Axis 2's citation re-verification uses |
+| ../_config/icm-ladder.md | L3 | the reimplementation test (Axis 2 over-staging) and the rungs Axis 3 must independently re-attempt |
+| ../_config/run-discipline.md | L3 | the blindness rule this stage both follows itself and checks that earlier stages honored |
+| ../00-contract/output/contract.md | L4 | upstream artifact produced by `00-contract` — this run's scope/exclusion record, needed to check the blindness boundary was actually honored |
+| ../30-normalize/output/behavior-units.normalized.ndjson | L4 | upstream — the corpus Axis 2's citation-reverification sample is drawn from |
+| ../40-classify/output/classifications.ndjson | L4 | upstream artifact produced by `40-classify` — the classification records (rationale, alternatives, engine-gap claims) this review interrogates directly |
+| ../50-synthesize/output/candidates.md | L4 | upstream — what a materialized package's shape is checked against for Axis 2's hidden-translation check |
+| ../60-draft/output/draft-report.md | L4 | upstream artifact produced by `60-draft` — the manifest naming every materialized candidate package this review challenges |
+| ../70-lint/output/lint-report.md | L4 | upstream artifact produced by `70-lint` — the lint report, so already-fixed mechanical defects are not re-litigated as findings |
 
 ## You are a fresh execution
 
@@ -50,6 +55,13 @@ you did not write down did not happen, as far as `90-reconcile` is
 concerned.
 
 ## How to do it
+
+0. If `../00-contract/output/contract.md` (or any other Inputs-table
+   artifact) opens with `# AMBIGUOUS — NOT RESOLVED`, that propagation
+   failing to reach this stage's own inputs cleanly *is itself* a Boundary
+   Honesty finding to record (name which artifact, quote its "What is
+   ambiguous" line) — do not silently review artifacts you know rest on an
+   unresolved contract as if they were ordinary output.
 
 Work through `references/challenge-checklist.md`'s three axes in order,
 against every candidate package `../60-draft` materialized:

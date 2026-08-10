@@ -5,8 +5,9 @@
 | File | Layer | Why |
 |---|---|---|
 | ../_config/evidence-policy.md | L3 | the record shape and citation fields that must survive this rewrite unchanged |
+| ../_config/run-discipline.md | L3 | the blindness rule and the `# AMBIGUOUS — NOT RESOLVED` propagation rule |
 | references/normalization-method.md | L3 | what changes, what never does, and how to re-check unit boundaries while rewriting |
-| ../20-harvest/output/README.md | L4 | upstream artifact produced by `20-harvest` — the raw extracted units this stage rewrites |
+| ../20-harvest/output/behavior-units.ndjson | L4 | upstream artifact produced by `20-harvest` — the raw extracted units this stage rewrites |
 
 ## Purpose
 
@@ -27,6 +28,10 @@ recording the split, same source evidence) where normalization revealed a
 conjoined behavior. No unit from the input silently disappears.
 
 ## How to do it
+
+0. If `../20-harvest/output/behavior-units.ndjson` opens with `#
+   AMBIGUOUS — NOT RESOLVED`, do not proceed — follow
+   `../_config/run-discipline.md` §2.
 
 Go through `../20-harvest/output/behavior-units.ndjson` in order, one
 record at a time:

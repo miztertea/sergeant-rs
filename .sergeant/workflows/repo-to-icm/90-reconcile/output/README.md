@@ -22,7 +22,8 @@ require the separate, later blind comparison against `reference-corpus/`
 and are not covered here), ending with `../scripts/finalize.py`'s recorded
 output. `grammar-pressure.ndjson` — every surviving engine-gap claim,
 behavior-level and meta-level, as full six-field records
-(`docs/gauntlet/contracts/N2.md` Outcome §4).
+(`docs/gauntlet/contracts/N2.md` Outcome §4; exact wrapper shape in
+`references/reconciliation-method.md` §3).
 
 All three are `promote`: they are this run's final deliverable record — the
 measurement package and grammar-pressure report this milestone exists to

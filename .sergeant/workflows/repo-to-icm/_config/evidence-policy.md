@@ -56,15 +56,37 @@ A `quote_hash` that does not verify against `quote` — or a `quote` that does
 not appear contiguously at `source.locator` in `source.path` — is
 indistinguishable from invention, and later lint (`70-lint`) rejects it on
 that basis, not on trust. Do not write a hash you have not actually computed
-against the exact bytes you copied. In a shell, over the exact span:
+against the exact bytes you copied.
+
+**The hash always covers the exact raw bytes of the quoted span as they sit
+in the source file — never the JSON-escaped string form the NDJSON line
+itself uses for `quote`.** JSON escaping (a literal newline becoming `\n`
+inside the record) is a serialization detail of this NDJSON line, not a
+change to the span; a literal newline byte in the file and the two
+characters `\`+`n` in the JSON text must hash identically, because both
+represent the exact same underlying byte.
+
+**Extraction is capture-once, reuse-twice**, so `quote` and `quote_hash`
+can never drift from each other over a stray trailing newline:
 
 ```sh
-printf '%s' "$QUOTE" | sha256sum
+QUOTE="$(sed -n '3,5p' path/to/file)"    # command substitution strips the
+                                          # trailing newline(s) `sed` would
+                                          # otherwise add — $QUOTE is now
+                                          # the exact span, byte for byte
+printf '%s' "$QUOTE" | sha256sum         # hash exactly what you captured
 ```
 
-If you quoted a byte range from the file directly (recommended over
-retyping), hash that extracted range, not a retyped approximation of it —
-retyping risks whitespace/line-ending drift that silently breaks the hash.
+Use `$QUOTE`'s captured value verbatim as `quote` (JSON-escape it for the
+NDJSON line — escaping is encoding, not a change to the bytes hashed), and
+the `sha256sum` output as `quote_hash`. Do not retype the span by hand and
+do not hash a separately-typed value — capture once with the command above,
+then reuse that single captured value for both fields; retyping risks
+whitespace/line-ending drift that silently breaks the hash. This is also
+exactly what `80-adversarial-review` reproduces when it recomputes
+`quote_hash` independently (`printf '%s' "$QUOTE" | sha256sum` against the
+byte range it identifies itself) — following the identical recipe here is
+what makes that later recomputation agree with this one.
 
 ## One behavior per unit
 

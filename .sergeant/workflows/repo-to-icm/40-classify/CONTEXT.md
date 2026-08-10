@@ -5,8 +5,9 @@
 | File | Layer | Why |
 |---|---|---|
 | ../_config/icm-ladder.md | L3 | the decomposition ladder (§6.1-6.7) this stage applies to every unit, in order |
+| ../_config/run-discipline.md | L3 | the blindness rule and the `# AMBIGUOUS — NOT RESOLVED` propagation rule |
 | references/classification-record-shape.md | L3 | the exact record fields, conditional requirements, and the empty-`alternatives_considered` rule |
-| ../30-normalize/output/README.md | L4 | upstream artifact produced by `30-normalize` — the normalized behavior units this stage classifies |
+| ../30-normalize/output/behavior-units.normalized.ndjson | L4 | upstream artifact produced by `30-normalize` — the normalized behavior units this stage classifies |
 
 ## Purpose
 
@@ -26,6 +27,10 @@ carries `rationale` and `alternatives_considered` meeting
 copy-pasteable onto an adjacent rung.
 
 ## How to do it
+
+0. If `../30-normalize/output/behavior-units.normalized.ndjson` opens with
+   `# AMBIGUOUS — NOT RESOLVED`, do not proceed — follow
+   `../_config/run-discipline.md` §2.
 
 Go through `../30-normalize/output/behavior-units.normalized.ndjson` in
 order, one unit at a time:

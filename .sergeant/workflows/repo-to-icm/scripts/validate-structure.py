@@ -55,6 +55,19 @@ CHECKS (§9.7, "The initial validator ... should check")
       instruction forgot to classify it (every executable file under the
       tree is referenced by name from some CONTEXT.md or _config file in
       the same tree)
+  S11 a stage `output/README.md` that declares an expected artifact also
+      declares a disposition for it (docs/icm/convention.md §1a, D9:
+      "every declared output carries a disposition")
+  S12 if any stage declares an output artifact, the workflow's closing
+      stage's own CONTEXT.md names a finalize step (docs/icm/convention.md
+      §1a, D9: "a workflow that declares any output ends with a
+      deterministic finalize step")
+  S13 `version` is a bare integer (never a quoted string) in both
+      `index.md` front matter and `workflow.toml`, and the two agree
+      (record-shapes.md §1: "a monotonically increasing integer")
+  S14 (admitted mode only) this package's name is listed in the root
+      catalog, `.sergeant/index.md` (convention.md §1 rule 1 /
+      record-shapes.md §1 rule 2)
 
 Exit 0 iff clean. Stdlib only.
 """
@@ -172,23 +185,26 @@ def check_front_matter(lint, pkg_dir, pkg_name, expect_status):
 
 
 def check_workflow_toml(lint, pkg_dir, pkg_name):
-    """Returns declared stage list, or None on hard parse failure."""
+    """Returns (declared stage list, raw `[workflow]` toml section), or
+    (None, None) on hard parse failure. The raw section is returned (not
+    just `stages`) so callers can also inspect `version`'s TOML type
+    (S13) without re-parsing the file."""
     toml_path = os.path.join(pkg_dir, "workflow.toml")
     if not os.path.isfile(toml_path):
         lint.fail("S3", f"{pkg_name}: missing workflow.toml")
-        return None
+        return None, None
     try:
         with open(toml_path, "rb") as f:
             data = tomllib.load(f)
     except tomllib.TOMLDecodeError as e:
         lint.fail("S3", f"{pkg_name}: workflow.toml: {e}")
-        return None
+        return None, None
 
     section = data.get("workflow", {})
     stages = section.get("stages")
     if not isinstance(stages, list) or not stages:
         lint.fail("S3", f"{pkg_name}: workflow.toml has no non-empty `workflow.stages` array")
-        return None
+        return None, section
 
     if section.get("name") != pkg_name:
         lint.fail("S1", f"{pkg_name}: workflow.toml `name: {section.get('name')}` does not match directory name")
@@ -212,7 +228,48 @@ def check_workflow_toml(lint, pkg_dir, pkg_name):
             f"{pkg_name}: workflow.toml stages {stages} != stage-directory lexical order {stage_dirs}",
         )
 
-    return stages
+    return stages, section
+
+
+def check_version_types(lint, pkg_name, fm, toml_section):
+    """S13: `version` MUST carry a monotonically increasing integer
+    *value* (record-shapes.md §1) in both `index.md` front matter and
+    `workflow.toml` — but the two files do not use the same TOML/YAML
+    representation of that value, and this check deliberately does not
+    force them to.
+
+    `src/domain/workflow.rs`'s `WorkflowSection.version` is a Rust `String`
+    (`#[serde(deny_unknown_fields)]`, no custom deserializer) — a bare TOML
+    integer in `workflow.toml` fails to load with a hard parse error
+    (measured: `invalid type: integer `1`, expected a string`), not a lint
+    warning. So `workflow.toml`'s `version` MUST be a quoted TOML string
+    whose *content* is nonetheless digits-only (record-shapes.md's integer
+    *value* requirement, satisfied through the type the engine actually
+    accepts) — never `"v1"`, `"1.0"`, or similar. `index.md`'s `version` is
+    never read by the engine at all (`docs/icm/convention.md`: "the current
+    loader ... reads only a declared `workflow.toml` and its stage
+    `CONTEXT.md` files"), so record-shapes.md's rule applies there at face
+    value: a bare integer, not a quoted string. Both forms' *numeric value*
+    must agree."""
+    if fm is None or toml_section is None:
+        return
+
+    idx_raw = fm.get("version")
+    toml_version = toml_section.get("version")
+
+    idx_ok = idx_raw is not None and re.fullmatch(r"\d+", str(idx_raw))
+    if idx_raw is not None and not idx_ok:
+        lint.fail("S13", f"{pkg_name}: index.md `version: {idx_raw!r}` is not a bare integer (record-shapes.md §1)")
+
+    toml_ok = isinstance(toml_version, str) and re.fullmatch(r"\d+", toml_version)
+    if toml_version is not None and not toml_ok:
+        if isinstance(toml_version, int):
+            lint.fail("S13", f"{pkg_name}: workflow.toml `version = {toml_version}` is a TOML integer, which src/domain/workflow.rs's loader rejects (measured) — it must be a quoted, digits-only string (e.g. `version = \"{toml_version}\"`)")
+        else:
+            lint.fail("S13", f"{pkg_name}: workflow.toml `version = {toml_version!r}` must be a digits-only string (record-shapes.md §1's integer value, in the string type the engine's loader requires)")
+
+    if idx_ok and toml_ok and int(idx_raw) != int(toml_version):
+        lint.fail("S13", f"{pkg_name}: index.md `version: {idx_raw}` disagrees with workflow.toml `version = \"{toml_version}\"`")
 
 
 def check_inputs_table(lint, pkg_dir, pkg_name, stage_id, all_stages_in_order, repo_root):
@@ -300,11 +357,6 @@ def check_inputs_table(lint, pkg_dir, pkg_name, stage_id, all_stages_in_order, r
             lint.fail("S4", f"{pkg_name}/{stage_id}: Inputs row path `{file_col}` does not resolve to an existing file ({resolved})")
             continue
 
-    for at_name in AT_NAME_RE.findall(text):
-        resolved = os.path.join(repo_root, ".sergeant", "common", "contexts", f"{at_name}.md")
-        if not os.path.isfile(resolved):
-            lint.fail("S5", f"{pkg_name}/{stage_id}: `@@{at_name}` does not resolve to {os.path.relpath(resolved, repo_root)}")
-
 
 def check_provenance(lint, pkg_dir, pkg_name, stages):
     provenance_path = os.path.join(pkg_dir, "provenance.md")
@@ -322,6 +374,114 @@ def check_provenance(lint, pkg_dir, pkg_name, stages):
     for stage_id in stages:
         if stage_id not in text:
             lint.fail("S8", f"{pkg_name}: provenance.md never mentions stage `{stage_id}`")
+
+
+def check_at_references(lint, pkg_dir, pkg_name, repo_root):
+    """S5: every `@@name` token anywhere under this package's authored
+    Markdown — not just a stage's own CONTEXT.md — MUST resolve to
+    `.sergeant/common/contexts/<name>.md`. `output/` is skipped: it holds
+    per-run artifacts (Layer 4), and a generated artifact that happens to
+    quote a literal `@@something` from the SUBJECT repository's own docs
+    must never be mistaken for this workflow's own shared-context syntax.
+
+    The literal token `@@name` (case-insensitive) is convention.md §4's own
+    documentation placeholder for "a name goes here" — this file, and
+    `references/draft-package-template.md`, both use it that way to
+    *describe* the syntax without invoking it. Treating that mention as a
+    real reference needing resolution would demand a shared context
+    literally named "name", which no author would ever mean; it is
+    excluded here so authors can write the token in its own defining prose
+    without periphrasis.
+    """
+    for dirpath, dirnames, filenames in os.walk(pkg_dir):
+        dirnames[:] = [d for d in dirnames if d != "output"]
+        for fn in filenames:
+            if not fn.endswith(".md"):
+                continue
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, pkg_dir)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for at_name in AT_NAME_RE.findall(text):
+                if at_name.lower() == "name":
+                    continue
+                resolved = os.path.join(repo_root, ".sergeant", "common", "contexts", f"{at_name}.md")
+                if not os.path.isfile(resolved):
+                    lint.fail("S5", f"{pkg_name}: {rel}: `@@{at_name}` does not resolve to {os.path.relpath(resolved, repo_root)}")
+
+
+ARTIFACT_DECLARED_RE = re.compile(r"\*\*Expected artifacts?:\*\*")
+DISPOSITION_TABLE_HEADER_RE = re.compile(r"^\|\s*File\s*\|\s*Disposition\s*\|", re.MULTILINE)
+DISPOSITION_LINE_RE = re.compile(r"\*\*Disposition:\*\*\s*`[a-zA-Z_-]+`")
+
+
+def check_dispositions(lint, pkg_dir, pkg_name, stages):
+    """S11: an `output/README.md` that declares an expected artifact MUST
+    also declare a disposition for it — either the single-artifact
+    `**Disposition:**` line or a `| File | Disposition |` table row per
+    artifact (docs/icm/convention.md §1a, D9 working rule: "every declared
+    output carries a disposition"). A README with neither is exactly the
+    ambiguity `scripts/finalize.py` itself refuses to guess at — this
+    check surfaces it at lint time instead of at finalize time."""
+    for stage_id in stages:
+        readme_path = os.path.join(pkg_dir, stage_id, "output", "README.md")
+        if not os.path.isfile(readme_path):
+            continue
+        with open(readme_path, encoding="utf-8") as f:
+            text = f.read()
+        if not ARTIFACT_DECLARED_RE.search(text):
+            continue
+        if not (DISPOSITION_TABLE_HEADER_RE.search(text) or DISPOSITION_LINE_RE.search(text)):
+            lint.fail("S11", f"{pkg_name}/{stage_id}: output/README.md declares an expected artifact but no `**Disposition:**` line or Disposition table (docs/icm/convention.md §1a, D9)")
+
+
+def check_finalize_step(lint, pkg_dir, pkg_name, stages):
+    """S12: if any stage declares an output artifact, the workflow's
+    closing (last-in-order) stage's own CONTEXT.md MUST name a finalize
+    step (docs/icm/convention.md §1a, D9: "a workflow that declares any
+    output ends with a deterministic finalize step"). This only checks
+    that a finalize step is *named*, not that it runs correctly — the
+    actor's own judgment governs the helper's result (convention.md §5)."""
+    if not stages:
+        return
+    any_output = False
+    for stage_id in stages:
+        readme_path = os.path.join(pkg_dir, stage_id, "output", "README.md")
+        if os.path.isfile(readme_path):
+            with open(readme_path, encoding="utf-8") as f:
+                if ARTIFACT_DECLARED_RE.search(f.read()):
+                    any_output = True
+                    break
+    if not any_output:
+        return
+    last_stage = stages[-1]
+    last_context = os.path.join(pkg_dir, last_stage, "CONTEXT.md")
+    if not os.path.isfile(last_context):
+        return  # already reported by S4
+    with open(last_context, encoding="utf-8") as f:
+        text = f.read()
+    if "finalize" not in text.lower():
+        lint.fail("S12", f"{pkg_name}: outputs are declared but the closing stage `{last_stage}` names no finalize step (docs/icm/convention.md §1a, D9)")
+
+
+def check_root_catalog(lint, pkg_name, repo_root, mode):
+    """S14 (admitted mode only): a published workflow absent from the root
+    catalog is a violation (convention.md §1 rule 1 / record-shapes.md §1
+    rule 2). A draft candidate is correctly NOT catalogued yet, so this is
+    skipped in draft mode."""
+    if mode != "admitted":
+        return
+    catalog_path = os.path.join(repo_root, ".sergeant", "index.md")
+    if not os.path.isfile(catalog_path):
+        lint.fail("S14", f"{pkg_name}: .sergeant/index.md (root catalog) does not exist")
+        return
+    with open(catalog_path, encoding="utf-8") as f:
+        text = f.read()
+    if pkg_name not in text:
+        lint.fail("S14", f"{pkg_name}: not listed in .sergeant/index.md (root catalog)")
 
 
 def check_engine_gap_records(lint, pkg_dir, pkg_name):
@@ -425,14 +585,19 @@ def validate(pkg_dir, mode, repo_root, lint):
         if "/drafts/workflows/" not in pkg_dir.replace(os.sep, "/") + "/":
             lint.fail("S7", f"{pkg_name}: validated as a draft but is not under `.sergeant/drafts/workflows/`")
 
-    check_front_matter(lint, pkg_dir, pkg_name, expect_status)
-    stages = check_workflow_toml(lint, pkg_dir, pkg_name)
+    fm = check_front_matter(lint, pkg_dir, pkg_name, expect_status)
+    stages, toml_section = check_workflow_toml(lint, pkg_dir, pkg_name)
+    check_version_types(lint, pkg_name, fm, toml_section)
     if stages:
         for stage_id in stages:
             check_inputs_table(lint, pkg_dir, pkg_name, stage_id, stages, repo_root)
         if mode == "draft":
             check_provenance(lint, pkg_dir, pkg_name, stages)
+        check_dispositions(lint, pkg_dir, pkg_name, stages)
+        check_finalize_step(lint, pkg_dir, pkg_name, stages)
 
+    check_at_references(lint, pkg_dir, pkg_name, repo_root)
+    check_root_catalog(lint, pkg_name, repo_root, mode)
     n_gap = check_engine_gap_records(lint, pkg_dir, pkg_name)
     check_unclassified_executables(lint, pkg_dir, pkg_name)
     return n_gap

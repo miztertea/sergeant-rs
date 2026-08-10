@@ -5,6 +5,7 @@
 | File | Layer | Why |
 |---|---|---|
 | ../CONTEXT.md | L1 | workflow orientation (first stage only) |
+| ../_config/run-discipline.md | L3 | the blindness rule and the fail-closed `# AMBIGUOUS — NOT RESOLVED` propagation convention this stage's own "Fail closed" section uses |
 
 You are the first stage of `repo-to-icm`. Nothing upstream has run yet — the
 Work's initiating task (whatever the caller told Sergeant when this Work was
@@ -20,10 +21,29 @@ and this run alone:
 
 1. **Subject repository and revision.** Which repository (a path in this
    worktree, or a named subtree of it) and which exact Git revision — a full
-   SHA, not a branch or tag that can move. If the Work's task does not name
-   a revision, resolve `HEAD` of the named subject and record the resulting
-   SHA; if it does not name a subject at all, stop and ask rather than
-   guessing which directory in the worktree is meant.
+   SHA, not a branch or tag that can move. Two genuinely different cases,
+   and you must tell them apart before resolving anything:
+   - **The subject is a live checkout** (it has its own `.git`, checkable
+     with `git -C <subject> rev-parse --is-inside-work-tree`; a plain
+     directory living inside this outer worktree with no `.git` of its own
+     fails this check even if `git -C <subject> rev-parse HEAD` returns
+     *something* — that something is the outer repository's own moving
+     HEAD, not the subject's). Only here does "resolve `HEAD`" mean
+     anything: `git -C <subject> rev-parse HEAD`.
+   - **The subject is a vendored subtree** (no `.git` of its own — e.g.
+     `reference/sergeant-upstream`, tracked as ordinary files inside this
+     outer repository). Its pinned revision is not something to (re)derive
+     from `git rev-parse` inside it — there is no such object to resolve
+     against. It is a recorded fact: look for that subject's own provenance
+     document (a file like `UPSTREAM.md` alongside it, or named in the
+     Work's task) and use the SHA recorded there verbatim. If the Work's
+     task names a subject with no such record and no `.git`, that is the
+     ambiguity the next paragraph is about — do not invent a resolution
+     method it doesn't have.
+
+   If the Work's task does not name a revision, resolve it per whichever
+   case above actually applies; if it does not name a subject at all, this
+   is the ambiguity the "Fail closed" paragraph below covers.
 2. **Scope.** What is in bounds for `10-inventory` to enumerate — normally
    "everything under the subject repository's root," narrowed only by
    exclusions named below.
@@ -53,19 +73,44 @@ and this run alone:
 
 ## How to do it
 
-Work in the order above. Resolve the revision with the subject repository's
-own tooling (e.g. `git -C <subject> rev-parse HEAD` or the named ref) rather
-than trusting a possibly-stale value in the task text — if the resolved SHA
-disagrees with what the task claimed, record the resolved value and note
-the discrepancy; do not silently prefer one over the other.
+Work in the order above. Resolve the revision per the live-checkout-vs-
+vendored-subtree distinction above rather than trusting a possibly-stale
+value in the task text — if the resolved SHA disagrees with what the task
+claimed, record the resolved value, note the discrepancy, and record which
+resolution method you used (both because a stranger reading `contract.md`
+later needs to know how to re-verify it, and because the two cases need
+different verification procedures downstream: `git -C <subject> ...` for a
+live checkout, re-reading the same provenance document for a vendored one).
 
 **Fail closed, not by guessing.** If the subject repository, its revision,
 or the scope is ambiguous after reading the Work's task and this worktree,
-stop here and ask rather than picking a plausible default. Every stage
-downstream of you treats `contract.md` as settled fact; an unresolved
-ambiguity you paper over becomes their silent error, not yours to fix later
-(this mirrors the reference corpus's own "pin the fixed point" discipline —
-fail here, not inside a later stage).
+do not pick a plausible default. On the engine this workflow runs on today,
+an actor stage has no way to pause its own turn and wait for a human's
+answer mid-run — that is a `needs_input`/`waiting` transition the runtime
+drives from *outside* the actor's turn, never something the turn itself can
+request (`docs/gauntlet/notes/n2-fake-backend-semantics.md`). So the
+fail-closed action actually available to you is: still write
+`output/contract.md`, but make the ambiguity the document's own headline
+rather than a fabricated answer —
+
+```text
+# AMBIGUOUS — NOT RESOLVED
+
+What is ambiguous: <the specific missing/conflicting fact>
+What was checked: <what you looked at before concluding it's ambiguous>
+```
+
+— and record **no** invented subject, revision, or scope in its place. Every
+stage downstream of you treats `contract.md` as settled fact, with exactly
+one exception: a `contract.md` opening with `# AMBIGUOUS — NOT RESOLVED` is
+itself the fail-closed signal — see `../_config/run-discipline.md`, which
+every downstream stage's Inputs table names, for what a stage receiving one
+must do (stop, do not proceed on invented values). Also record this turn's
+inability to ask as a meta-level grammar-pressure moment
+(`../_config/run-discipline.md`; `90-reconcile/references/
+reconciliation-method.md` §3) — the workflow's current grammar has no
+actor-initiated "ask a human mid-run" primitive, which is real signal, not
+something to paper over by pretending the ambiguity resolved itself.
 
 ## Output
 

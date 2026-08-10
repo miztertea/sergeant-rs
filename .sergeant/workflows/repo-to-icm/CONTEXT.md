@@ -19,28 +19,16 @@ runnable procedure until a human crosses the publication boundary
 
 ## The blindness rule (read before touching anything)
 
-If this run's purpose is **measurement** — comparing generated output
-against an already-adjudicated reference decomposition (as in the N2
-measurement run against `reference/sergeant-upstream`, graded against
-`reference-corpus/`) — then for the entire run, every stage's actor is
-**blind to `reference-corpus/`**: never open it, never grep it, never let
-it enter a prompt, never let a helper's output surface its contents. This
-is not a preference; contaminating the run with the answer key invalidates
-the measurement it exists to produce (`docs/gauntlet/contracts/N2.md`
-Outcome §2). A stage that needs to check its own output's shape uses
-`scripts/validate-structure.py`, never `reference-corpus/lint.py` or any
-file under `reference-corpus/` — those are the graders' tools, applied
-*after* this run completes, by a separate comparison process this
-workflow's actors do not perform. If a stage's actor is ever tempted to
-peek "just to check the shape," that temptation is itself the signal to
-stop and re-read this paragraph.
-
-Outside a measurement run (e.g. a first decomposition of a repository with
-no existing reference corpus), this rule is vacuous — there is nothing to
-be blind to — but the discipline it enforces (cite only the *target*
-repository under decomposition, never a pre-existing answer) still holds:
-never source a behavior unit's `quote` from anywhere but the repository
-this run is decomposing.
+This run's central safety constraint — for a **measurement** run, every
+stage's actor is blind to `reference-corpus/`, full stop — is stage
+instruction, not orientation, so per §1a rule 5 (Layer 1 "MUST NOT contain
+stage instructions") its operative text lives in `_config/run-discipline.md`
+(Layer 3), which every stage's own Inputs table names, not here. What
+follows is orientation only: expect every stage to be bound by it for the
+whole time it runs, and expect a fail-closed `# AMBIGUOUS — NOT RESOLVED`
+marker (same file, §2) to propagate down the pipeline rather than be
+silently papered over if `00-contract` ever has to fail closed instead of
+guessing.
 
 ## How the stages hand off
 
@@ -103,6 +91,10 @@ runs, not this one.
 
 ## Shared config (`_config/`, Layer 3)
 
+- `_config/run-discipline.md` — the blindness rule and the
+  `# AMBIGUOUS — NOT RESOLVED` fail-closed propagation convention. Named in
+  every stage's own Inputs table (not just `00-contract`'s), since it binds
+  every stage for the whole run, not only the first one.
 - `_config/evidence-policy.md` — the citation/quote/hash discipline every
   stage that touches a behavior unit (`20-harvest` onward) must follow.
 - `_config/icm-ladder.md` — the §6 decomposition ladder distilled for
@@ -123,4 +115,7 @@ runs, not this one.
 Both are helpers subordinate to their invoking stage's judgment
 (`docs/icm/convention.md` §5) — their exit status and structured output are
 something the actor reviews and acts on, not something the engine
-interprets on its own.
+interprets on its own. A stage invoking either one states the exact
+repository-root-relative invocation and this run's working-directory
+convention in its own `CONTEXT.md` (see `70-lint` and `90-reconcile`) — this
+orientation file does not itself hand a stranger an executable command.

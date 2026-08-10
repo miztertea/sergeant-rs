@@ -60,14 +60,16 @@ authority to decide.
 
 ## Process
 
-1. Run `../scripts/validate-structure.py <candidate-path>` for every
-   candidate `60-draft` materialized.
+1. Run `python3 .sergeant/workflows/repo-to-icm/scripts/validate-structure.py
+   <candidate-path>` (from the repository root — see `../CONTEXT.md`
+   "Working directory") for every candidate `60-draft` materialized.
 2. Classify each reported defect using the test above.
 3. Fix every mechanical defect directly in the candidate package; re-run the
    validator.
 4. Repeat 1–3 until no more mechanical defects remain (substantive ones may
    remain — that is expected and is not a failure of this stage).
-5. Record everything in `output/lint-report.md` per `../CONTEXT.md`.
+5. Record everything in `output/lint-report.md` per `../CONTEXT.md`,
+   including the no-argument run against this workflow's own tree.
 
 When genuinely unsure whether a defect is mechanical, treat it as
 substantive — a wrongly "fixed" substantive defect hides real signal from

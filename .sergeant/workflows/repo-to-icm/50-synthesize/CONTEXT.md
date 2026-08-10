@@ -4,9 +4,11 @@
 
 | File | Layer | Why |
 |---|---|---|
-| references/synthesis-method.md | L3 | the six buckets and how to cluster/order/name candidates within each |
-| ../40-classify/output/README.md | L4 | upstream artifact produced by `40-classify` — the per-unit classification records this stage clusters |
-| ../30-normalize/output/README.md | L4 | upstream artifact produced by `30-normalize` — the normalized `statement`/`trigger`/`outcome` text needed to name candidates and order stages (classification records alone carry no readable behavior text) |
+| references/synthesis-method.md | L3 | the seven buckets and how to cluster/order/name candidates within each |
+| ../_config/icm-ladder.md | L3 | bucket 6's obsolete-mechanism naming requirement and bucket 7's engine-gap template both refer back to this |
+| ../_config/run-discipline.md | L3 | the blindness rule and the `# AMBIGUOUS — NOT RESOLVED` propagation rule |
+| ../40-classify/output/classifications.ndjson | L4 | upstream artifact produced by `40-classify` — the per-unit classification records this stage clusters |
+| ../30-normalize/output/behavior-units.normalized.ndjson | L4 | upstream artifact produced by `30-normalize` — the normalized `statement`/`trigger`/`outcome` text needed to name candidates and order stages (classification records alone carry no readable behavior text) |
 
 ## Purpose
 
@@ -14,13 +16,13 @@ Turn the flat, per-unit classification ledger into named, describable
 candidates: workflow candidates with ordered member stages, stage-context
 attachments, permanent-instruction candidates, shared helper/context
 candidates, obsolete-mechanism findings, and engine-pressure candidates —
-per `references/synthesis-method.md`'s six buckets. This stage clusters and
+per `references/synthesis-method.md`'s seven buckets. This stage clusters and
 names; it does not materialize files under the draft namespace — that is
 `60-draft`'s job.
 
 ## What must become true here (durable outcome)
 
-`output/candidates.md` exists, organized by the six buckets in
+`output/candidates.md` exists, organized by the seven buckets in
 `references/synthesis-method.md`, with every classification record from
 `../40-classify/output/classifications.ndjson` accounted for in exactly one
 bucket appearance, traceable back to its `behavior_id`(s). No candidate is
@@ -28,7 +30,11 @@ named without at least one member record citing it.
 
 ## How to do it
 
-Follow `references/synthesis-method.md`'s six buckets in order:
+0. If `../40-classify/output/classifications.ndjson` opens with `#
+   AMBIGUOUS — NOT RESOLVED`, do not proceed — follow
+   `../_config/run-discipline.md` §2.
+
+Follow `references/synthesis-method.md`'s seven buckets in order:
 
 1. Group `workflow`-rung (and workflow-attached `stage`/`helper`) records
    into named workflow candidates — kebab-case name, a real trigger/outcome/

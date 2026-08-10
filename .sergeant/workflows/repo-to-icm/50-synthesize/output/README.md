@@ -5,7 +5,7 @@ is empty in the authored tree; a run of this stage writes its artifact here
 in the materialized work surface, Git-tracked on the Work branch and
 reviewable in the diff like any other change.
 
-**Expected artifact:** `candidates.md` — the six clustered buckets from
+**Expected artifact:** `candidates.md` — the seven clustered buckets from
 `references/synthesis-method.md` (workflow/stage candidates,
 stage-context attachments, permanent-instruction candidates, shared
 helper/context candidates, obsolete-mechanism findings, engine-pressure

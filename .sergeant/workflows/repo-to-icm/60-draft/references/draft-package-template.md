@@ -26,8 +26,14 @@ including this very workflow's own name, `repo-to-icm`.
 │                      status: draft, version: 1, description (a real
 │                      trigger/outcome/completion sentence, not a restatement
 │                      of the name), tags (optional)
-├── workflow.toml      [workflow] name = "<candidate-name>", version = "1",
-│                      stages = [ordered list matching directory names exactly]
+├── workflow.toml      [workflow] name = "<candidate-name>", version = "1"
+│                      (a quoted, DIGITS-ONLY string — never "v1" or
+│                      "1.0". The engine's own loader requires the TOML
+│                      type to be a string (measured: a bare TOML integer
+│                      fails to parse); record-shapes.md §1's integer
+│                      requirement is about the *value*, satisfied by
+│                      digits-only content, not the TOML type), stages =
+│                      [ordered list matching directory names exactly]
 ├── CONTEXT.md          Layer 1 orientation only — what this candidate is for,
 │                      how its stages relate. No stage instructions here.
 ├── provenance.md       maps every stage (and the workflow as a whole) to the
