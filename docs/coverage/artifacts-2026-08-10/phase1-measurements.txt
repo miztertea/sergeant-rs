@@ -69,3 +69,24 @@ Cited by scripts/coverage/README.md's wall-clock deadline ranking.
    Recorded by name so the census can recognize a recurrence rather than
    greet it as new. Neither test is one the phase-1 diff touches; t1 does not
    use the SpawnedDaemon rig at all.
+
+== config pins verified by observation (R-S0-5: these have no revert probe) ==
+   $ git check-attr linguist-vendored -- reference/UPSTREAM.md
+     reference/UPSTREAM.md: linguist-vendored: set
+   $ git check-attr linguist-vendored -- reference-corpus/anything.md
+     reference-corpus/anything.md: linguist-vendored: set          (N-branch path, pre-marked)
+   $ git check-attr linguist-vendored -- .sergeant/workflows/x/workflow.toml
+     .sergeant/workflows/x/workflow.toml: linguist-vendored: set   (N-branch path, pre-marked)
+   $ git check-attr linguist-generated -- Cargo.lock
+     Cargo.lock: linguist-generated: set
+   $ git check-attr linguist-vendored linguist-generated -- src/lib.rs
+     src/lib.rs: both unspecified                                  (the crate still counts)
+   $ git check-ignore -v --no-index docs/__pycache__/x.pyc src/foo.pyc
+     .gitignore:11:__pycache__/   docs/__pycache__/x.pyc
+     .gitignore:12:*.pyc          src/foo.pyc
+   $ git check-ignore -q reference/sergeant-upstream/ ; echo $?
+     1  -> not ignored, and `git ls-files reference/ | grep -c '\.pyc$'` is still 1:
+           the vendored .pyc stays tracked (R-S0-8).
+   The CI trigger has no local observation available — no runner in this
+   container. It is pinned by the next push, per R-S0-5, and until then the
+   only evidence is the file: `on: push: branches: [main]` + `pull_request`.
