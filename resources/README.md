@@ -28,3 +28,7 @@ commits, never rewrites — the file is the record of what ran.
   a single disposable worktree (L13 as design, disk-safe), plus probes of
   its own devising; probe survivors enter the fix round as executed
   evidence, not refutable claims.
+- `s2-wave3-gauntlet.js` — S2 wave 3 close-out sweep: one Opus blind
+  auditor over the re-measured residual map (declines recorded with
+  reasons, not silence), the independent prober, fixer on survivors.
+  Census, CI lane, and MARK & LOG are orchestrator-run after it.
