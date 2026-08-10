@@ -251,20 +251,39 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
             drop(held.take()); // never wait on an adapter under the guard
             blocking(move || deferred.wait()).await;
         }
-        let EngineNext::Launch(pending) = next else {
-            return held;
+        let settled = match next {
+            EngineNext::Parked => return held,
+            EngineNext::Launch(pending) => {
+                drop(held.take()); // never launch under the guard
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = state.core.lock().await;
+                (
+                    work_id,
+                    state.engine.settle_launch(&mut core, pending, outcome),
+                    core,
+                )
+            }
+            EngineNext::Send(pending) => {
+                drop(held.take()); // nor deliver input under it (§14.2 for SEND)
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = state.core.lock().await;
+                (
+                    work_id,
+                    state.engine.settle_send(&mut core, pending, outcome),
+                    core,
+                )
+            }
         };
-        drop(held.take()); // never launch under the guard
-        let outcome = blocking(|| pending.launch()).await;
-        let work_id = pending.work_id().to_string();
-        let mut core = state.core.lock().await;
-        match state.engine.settle_launch(&mut core, pending, outcome) {
+        let (work_id, outcome, core) = settled;
+        match outcome {
             Ok(next_step) => {
                 held = Some(core);
                 step = next_step;
             }
             Err(e) => {
-                tracing::error!(work_id = %work_id, error = %e, "settling a launch failed");
+                tracing::error!(work_id = %work_id, error = %e, "settling an external effect failed");
                 return Some(core);
             }
         }

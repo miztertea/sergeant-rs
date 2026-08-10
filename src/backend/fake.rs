@@ -257,6 +257,11 @@ pub struct FakeBackend {
     /// gate must not be holding the backend's own lock, or the instrument
     /// would measure the fake's contention instead of the daemon's.
     launch_gate: Arc<Gate>,
+    /// Where SEND can be made to stall. SEND is an external effect too — for
+    /// a print-mode harness it is the same fork/exec LAUNCH is — so §22.6's
+    /// instrument has to be able to park inside it, or the budget's verdict
+    /// is a claim about the paths the instrument happens to reach.
+    send_gate: Arc<Gate>,
     /// Where a STOP [`Completion`] can be made to stall — the fake's stand-in
     /// for the Claude adapter's transcript-archive join (issue #14/B3).
     archive_gate: Arc<Gate>,
@@ -304,6 +309,7 @@ impl FakeBackend {
                 detail: Some("deterministic in-process test backend".to_string()),
             })),
             launch_gate: Arc::new(Gate::default()),
+            send_gate: Arc::new(Gate::default()),
             archive_gate: Arc::new(Gate::default()),
             archive_armed: Arc::new(Mutex::new(false)),
         }
@@ -352,6 +358,26 @@ impl FakeBackend {
     /// it rather than sleeping and hoping.
     pub fn await_stalled_launches(&self, n: usize, timeout: Duration) -> bool {
         self.launch_gate.wait_for_waiting(n, timeout)
+    }
+
+    /// Stall every later SEND until [`FakeBackend::release_sends`].
+    ///
+    /// The §22.6 instrument for the other verb that creates external work.
+    /// `ClaudeBackend::send` spawns a `claude -p --resume` turn plus its
+    /// reader threads, so a `respond` is as much a process spawn as a launch
+    /// is — and it is the verb GP-2's ask primitive resumes through.
+    pub fn hold_sends(&self) {
+        self.send_gate.hold();
+    }
+
+    /// Let stalled sends through.
+    pub fn release_sends(&self) {
+        self.send_gate.release();
+    }
+
+    /// Block until `n` sends are parked in the gate, or the timeout expires.
+    pub fn await_stalled_sends(&self, n: usize, timeout: Duration) -> bool {
+        self.send_gate.wait_for_waiting(n, timeout)
     }
 
     /// Make STOP/INTERRUPT hand back a *deferred* [`Completion`] — the fake's
@@ -606,7 +632,11 @@ impl Backend for FakeBackend {
         })
     }
 
+    /// SEND is an external effect, and therefore gated exactly as LAUNCH is —
+    /// the gate is passed before the state lock, so a parked send holds
+    /// nothing of the backend's own.
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
+        self.send_gate.pass();
         let mut state = self.lock();
         self.resolve(&state, handle)?;
         // Delivering input advances this execution to the next scripted step:

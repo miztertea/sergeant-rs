@@ -136,16 +136,110 @@ impl PendingLaunch {
         &self.reservation.execution_id
     }
 
-    /// Perform the external effect.
+    /// Perform the external effects this phase owns: LAUNCH, and the first
+    /// OBSERVE of what it produced.
     ///
     /// **Never call this while holding the core lock** — it is the process
     /// spawn, the container create, the thing §22.6 exists to keep out from
     /// under the daemon's single writer. The engine cannot enforce that
     /// (it never sees a guard, only `&mut Core`), so it is stated here and
     /// instrumented by the §22.6 tests.
+    ///
+    /// OBSERVE rides along rather than being left to `settle_launch` because
+    /// it is an external effect too — for the Claude adapter, a handle it has
+    /// no memory of sends it walking `/proc` — and §22.6 lists "reading a
+    /// large output stream" beside the spawn. Taking it here also costs
+    /// nothing: `drive` would have asked the same question one line later,
+    /// and asking twice is not guaranteed to get the same answer.
+    pub fn perform(&self) -> LaunchOutcome {
+        let handle = self.backend.launch(&self.prepared);
+        let observed = handle
+            .as_ref()
+            .ok()
+            .map(|handle| self.backend.observe(handle));
+        LaunchOutcome { handle, observed }
+    }
+
+    /// LAUNCH alone, without the observation — the raw external effect, for
+    /// callers that want to drive the two phases apart by hand.
     pub fn launch(&self) -> Result<ExecutionHandle, BackendError> {
         self.backend.launch(&self.prepared)
     }
+}
+
+/// What [`PendingLaunch::perform`] came back with: the launch's own result,
+/// and the observation taken of it outside the lock (absent when there was
+/// nothing to observe because the launch failed).
+#[derive(Debug)]
+pub struct LaunchOutcome {
+    handle: Result<ExecutionHandle, BackendError>,
+    observed: Option<Result<Observation, BackendError>>,
+}
+
+impl From<Result<ExecutionHandle, BackendError>> for LaunchOutcome {
+    /// A launch result with no observation attached: `settle_launch` then
+    /// takes the observation itself, as it did before the phase existed.
+    fn from(handle: Result<ExecutionHandle, BackendError>) -> Self {
+        Self {
+            handle,
+            observed: None,
+        }
+    }
+}
+
+/// Input the engine has committed to delivering, to be handed to the harness
+/// **with the core lock released** (§14.2's middle phase, applied to SEND).
+///
+/// SEND is the other verb that creates external work, and for a print-mode
+/// harness it is the same effect START is: a process fork/exec plus the reader
+/// threads that ingest its stdout. It is also the resume path of GP-2's ask
+/// primitive — the verb a human's answer travels through — so leaving it under
+/// the guard would have put the milestone's own feature on the wrong side of
+/// the milestone's own boundary.
+pub struct PendingSend {
+    work_id: String,
+    stage_id: String,
+    execution: ExecutionRecord,
+    backend: Arc<dyn Backend>,
+    input: String,
+}
+
+impl std::fmt::Debug for PendingSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingSend")
+            .field("work_id", &self.work_id)
+            .field("execution_id", &self.execution.execution_id)
+            .field("stage_id", &self.stage_id)
+            .finish()
+    }
+}
+
+impl PendingSend {
+    /// The work this delivery serves.
+    pub fn work_id(&self) -> &str {
+        &self.work_id
+    }
+
+    /// Deliver the input and observe what the turn now says — both outside
+    /// the core lock.
+    pub fn perform(&self) -> SendOutcome {
+        let handle = handle_of(&self.execution);
+        let delivered = self.backend.send(&handle, &self.input);
+        let observed = delivered.is_ok().then(|| self.backend.observe(&handle));
+        SendOutcome {
+            delivered,
+            reattached: false,
+            observed,
+        }
+    }
+}
+
+/// What [`PendingSend::perform`] came back with.
+#[derive(Debug)]
+pub struct SendOutcome {
+    delivered: Result<(), BackendError>,
+    reattached: bool,
+    observed: Option<Result<Observation, BackendError>>,
 }
 
 /// What the engine needs before it can crank again.
@@ -160,6 +254,9 @@ pub enum Next {
     /// case *is* `Parked`: every observation that does not enter a stage
     /// returns one, so the enum is moved far more often than it is filled.
     Launch(Box<PendingLaunch>),
+    /// Deliver this outside the lock, then feed the result back through
+    /// [`Engine::settle_send`].
+    Send(Box<PendingSend>),
 }
 
 /// One crank of the engine: everything it committed under this lock hold,
@@ -678,8 +775,12 @@ impl Engine {
             match next {
                 Next::Parked => return Ok(()),
                 Next::Launch(pending) => {
-                    let outcome = pending.launch();
+                    let outcome = pending.perform();
                     step = self.settle_launch(core, pending, outcome)?;
+                }
+                Next::Send(pending) => {
+                    let outcome = pending.perform();
+                    step = self.settle_send(core, pending, outcome)?;
                 }
             }
         }
@@ -734,19 +835,22 @@ impl Engine {
             KIND_WORK_RESUMED,
             json!({"reason": "input_received"}),
         )?;
-        if let Err(e) = backend.send(&handle_of(&execution), input) {
-            self.commit(
-                core,
-                work_id,
-                KIND_STAGE_BLOCKED,
-                json!({"stage_id": stage_id, "detail": e.to_string()}),
-            )?;
-            self.block(core, work_id, &format!("cannot deliver input: {e}"), None)?;
-            return Ok(Step::parked());
-        }
-        let mut deferred = Deferred::new();
-        let next = self.drive(core, work_id, None, &mut deferred)?;
-        Ok(Step { next, deferred })
+        // The delivery itself is the external effect and goes back to the
+        // caller (§14.2): `ClaudeBackend::send` forks a `claude -p --resume`
+        // turn and three reader threads, which is precisely what §22.6 forbids
+        // under the guard. The two appends above are the authoritative half
+        // and stay here — the answer is durable before anything is spawned, so
+        // a crash in the window loses the turn, never the human's words.
+        Ok(Step {
+            next: Next::Send(Box::new(PendingSend {
+                work_id: work_id.to_string(),
+                stage_id,
+                execution,
+                backend,
+                input: input.to_string(),
+            })),
+            deferred: Deferred::new(),
+        })
     }
 
     /// Re-enter the current stage (§12's retry verb).
@@ -913,7 +1017,7 @@ impl Engine {
         &self,
         core: &mut Core,
         work_id: &str,
-        initial: Option<Observation>,
+        initial: Option<Result<Observation, BackendError>>,
         deferred: &mut Deferred,
     ) -> Result<Next, EngineError> {
         let run = self.run(core, work_id)?;
@@ -928,28 +1032,25 @@ impl Engine {
         })?;
         let backend = self.backend_for(work_id, &execution.backend)?;
 
-        let observation = match initial {
-            Some(observation) => observation,
-            None => match backend.observe(&handle_of(&execution)) {
-                Ok(observation) => observation,
-                Err(e) => {
-                    // §25: the adapter cannot classify the native context.
-                    // Ambiguity fails closed, with the evidence recorded.
-                    self.commit(
-                        core,
-                        work_id,
-                        KIND_STAGE_BLOCKED,
-                        json!({"stage_id": stage.stage_id, "detail": e.to_string()}),
-                    )?;
-                    self.block(
-                        core,
-                        work_id,
-                        "backend could not observe the execution",
-                        Some(e.to_string()),
-                    )?;
-                    return Ok(Next::Parked);
-                }
-            },
+        let observation = match initial.unwrap_or_else(|| backend.observe(&handle_of(&execution))) {
+            Ok(observation) => observation,
+            Err(e) => {
+                // §25: the adapter cannot classify the native context.
+                // Ambiguity fails closed, with the evidence recorded.
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_BLOCKED,
+                    json!({"stage_id": stage.stage_id, "detail": e.to_string()}),
+                )?;
+                self.block(
+                    core,
+                    work_id,
+                    "backend could not observe the execution",
+                    Some(e.to_string()),
+                )?;
+                return Ok(Next::Parked);
+            }
         };
         if observation.native == NativeState::Unknown {
             self.commit(
@@ -1195,7 +1296,7 @@ impl Engine {
         let mut deferred = Deferred::new();
         match disposition {
             ReconcileDisposition::Resumed => {
-                let next = self.drive(core, work_id, resumed_from, &mut deferred)?;
+                let next = self.drive(core, work_id, resumed_from.map(Ok), &mut deferred)?;
                 // Recovery is the single-owner path: nothing is served yet,
                 // so performing the launch here holds up no request.
                 self.run_inline(
@@ -1365,25 +1466,35 @@ impl Engine {
         if !backend.capabilities().resume {
             return Ok(false);
         }
-        let Some(surface) = run.surface.as_ref() else {
+        let Some(request) = self.resume_request(run, work_id) else {
             return Ok(false);
-        };
-        // Re-supplied from what sergeant journaled, never rebuilt from
-        // defaults: the pin and the profile are the human's decisions about
-        // cost and about permissions — and, since N3, the *stage's* decisions
-        // (§12.5). Re-adopting a stage 10 execution under stage 00's profile
-        // would be the same fabrication, one field further in.
-        let stage_profile = run.current_stage_profile();
-        let request = ResumeRequest {
-            work_id: work_id.to_string(),
-            cwd: surface.execution_cwd(),
-            model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
-            profile: stage_profile,
         };
         backend
             .resume(&handle_of(execution), &request)
             .map(|()| true)
             .map_err(|e| format!("could not reattach to the native context: {e}"))
+    }
+
+    /// The §15 RESUME request for a run, rebuilt from what sergeant journaled.
+    ///
+    /// `None` for a run with no recorded surface: [`ResumeRequest`] carries the
+    /// directory later turns run in, and inventing one is the fabrication its
+    /// own contract forbids.
+    ///
+    /// Everything else here is re-supplied, never defaulted: the pin and the
+    /// profile are the human's decisions about cost and about permissions —
+    /// and, since N3, the *stage's* decisions (§12.5). Re-adopting a stage 10
+    /// execution under stage 00's profile would be the same fabrication, one
+    /// field further in.
+    fn resume_request(&self, run: &WorkRun, work_id: &str) -> Option<ResumeRequest> {
+        let surface = run.surface.as_ref()?;
+        let stage_profile = run.current_stage_profile();
+        Some(ResumeRequest {
+            work_id: work_id.to_string(),
+            cwd: surface.execution_cwd(),
+            model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
+            profile: stage_profile,
+        })
     }
 
     /// Fail a work whose *start* crashed part-way closed (§25).
@@ -1618,8 +1729,10 @@ impl Engine {
         &self,
         core: &mut Core,
         pending: Box<PendingLaunch>,
-        outcome: Result<ExecutionHandle, BackendError>,
+        outcome: impl Into<LaunchOutcome>,
     ) -> Result<Step, EngineError> {
+        let LaunchOutcome { handle, observed } = outcome.into();
+        let outcome = handle;
         let mut deferred = Deferred::new();
         let work_id = pending.work_id.clone();
         let reservation = &pending.reservation;
@@ -1713,8 +1826,109 @@ impl Engine {
             KIND_EXECUTION_STARTED,
             json!({"execution": record}),
         )?;
-        let next = self.drive(core, &work_id, None, &mut deferred)?;
+        let next = self.drive(core, &work_id, observed, &mut deferred)?;
         Ok(Step { next, deferred })
+    }
+
+    /// §14.2's third phase for SEND: verify the delivery still belongs to the
+    /// run's current execution, then act on what the turn now says.
+    ///
+    /// The staleness rule is §14.5's, unchanged in substance: between the
+    /// `stage.input_received` append and this call the guard was open, so a
+    /// cancel may have retired the run underneath the delivery. A late answer
+    /// does not revive it. What is recorded then is the delivery as the late
+    /// evidence it is — including whether the harness actually took it — so
+    /// the trajectory shows a human's words reaching a context whose work had
+    /// already moved on, rather than showing nothing at all.
+    pub fn settle_send(
+        &self,
+        core: &mut Core,
+        pending: Box<PendingSend>,
+        outcome: SendOutcome,
+    ) -> Result<Step, EngineError> {
+        let SendOutcome {
+            delivered,
+            reattached,
+            observed,
+        } = outcome;
+        let work_id = pending.work_id.clone();
+        if let Some(why) = self.delivery_is_stale(core, &pending) {
+            self.commit(
+                core,
+                &work_id,
+                KIND_EXECUTION_ABANDONED,
+                json!({
+                    "execution_id": pending.execution.execution_id,
+                    "backend": pending.execution.backend,
+                    "native_id": pending.execution.native_id,
+                    "stage_id": pending.stage_id,
+                    "attempt": pending.execution.attempt,
+                    "verb": "send",
+                    "reason": "superseded",
+                    "detail": why,
+                    "delivered": delivered.is_ok(),
+                    "reattached": reattached,
+                }),
+            )?;
+            return Ok(Step::parked());
+        }
+        if let Err(e) = delivered {
+            self.commit(
+                core,
+                &work_id,
+                KIND_STAGE_BLOCKED,
+                json!({"stage_id": pending.stage_id, "detail": e.to_string()}),
+            )?;
+            self.block(core, &work_id, &format!("cannot deliver input: {e}"), None)?;
+            return Ok(Step::parked());
+        }
+        if reattached {
+            // §15 RESUME happened on this path, so the trajectory says so —
+            // the same fact `execution.reconciled` records at restart, in the
+            // one other place this daemon can come to own a context again.
+            self.record_reconcile(
+                core,
+                &work_id,
+                Some(&pending.execution),
+                ReconcileDisposition::Resumed,
+                true,
+                "re-adopted the native context to deliver a human's answer",
+            )?;
+        }
+        let mut deferred = Deferred::new();
+        let next = self.drive(core, &work_id, observed, &mut deferred)?;
+        Ok(Step { next, deferred })
+    }
+
+    /// Why a delivery's result may no longer be applied, or `None` if it may.
+    ///
+    /// [`Engine::reservation_is_stale`]'s rule, for the verb that has no
+    /// reservation: the Work still exists, it is still `active` (the
+    /// `work.resumed` this delivery was committed with put it there), and the
+    /// run's current execution is still the one the input was handed to.
+    fn delivery_is_stale(&self, core: &Core, pending: &PendingSend) -> Option<String> {
+        let registry = core.registry.state();
+        let Some(work) = registry.works.get(&pending.work_id) else {
+            return Some("the work no longer exists".to_string());
+        };
+        if work.state != WorkState::Active {
+            return Some(format!(
+                "work is {} — an answer that arrived afterwards cannot move it",
+                work.state
+            ));
+        }
+        match registry
+            .runs
+            .get(&pending.work_id)
+            .and_then(|r| r.execution.as_ref())
+        {
+            Some(current) if current.execution_id == pending.execution.execution_id => None,
+            Some(current) => Some(format!(
+                "execution {} was superseded by {}",
+                pending.execution.execution_id, current.execution_id
+            )),
+            None => Some("the run no longer records an execution".to_string()),
+        }
     }
 
     /// Why a launch's result may no longer be applied, or `None` if it may.

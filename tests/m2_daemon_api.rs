@@ -1950,3 +1950,115 @@ async fn t10_a_stalled_evidence_archive_does_not_hold_the_core_lock() {
         "exactly one stop reached the backend: {stops:?}"
     );
 }
+
+/// §22.6 for **SEND**, and GP-2's ask through the daemon path (§14.2 applied
+/// to the other verb that creates external work).
+///
+/// `respond` is the resume path of the milestone's own ask primitive, and for
+/// a print-mode harness delivering an answer is the same fork/exec a launch is
+/// — `ClaudeBackend::send` spawns `claude -p --resume` plus three reader
+/// threads. Until the fake could be parked inside SEND there was no instrument
+/// that could tell whether that ran under the guard; now there is, and this is
+/// it. The ask is authored by the *actor* (`FakeStep::ask`) and crosses the
+/// HTTP surface, so the composition of Outcome 4 with Outcome 1 is exercised
+/// on the path the feature actually runs on rather than inline in the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11_a_stalled_send_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKSEND";
+    seed_blocked_run(dir.path(), work_id);
+
+    // Retry launches an execution whose actor immediately asks a question;
+    // `hang` keeps the context alive so the answer has somewhere to go.
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [
+            FakeStep::ask("which database should I target?"),
+            FakeStep::hang(),
+        ],
+    );
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+
+    // The actor's authorship reached the journal through the daemon path.
+    let asked: Vec<Value> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == "work.needs_input" && e.work_id.as_deref() == Some(work_id))
+        .map(|e| e.payload)
+        .collect();
+    assert_eq!(asked.len(), 1, "the run must be parked on the actor's ask");
+    assert_eq!(asked[0]["asked_by"], "actor");
+    assert_eq!(asked[0]["prompt"], "which database should I target?");
+
+    fake.hold_sends();
+    let respond = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/input"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid(), "input": "postgres"}))
+                .send()
+                .await
+                .expect("input request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_sends(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake send never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    fake.release_sends();
+    let responded = respond.await.expect("respond task");
+    let delivered = fake.inputs(&fake.starts()[0].execution_id);
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled send: read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(
+        responded.is_success(),
+        "the stalled respond answered {responded}"
+    );
+    assert_eq!(
+        delivered,
+        vec!["postgres".to_string()],
+        "the answer still reached the same execution"
+    );
+}
