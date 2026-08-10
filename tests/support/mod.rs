@@ -200,9 +200,15 @@ pub fn reap_daemons(data_dir: &Path) -> Vec<ReapedDaemon> {
     if pids.is_empty() {
         return Vec::new();
     }
-    // Built from the signals actually sent, never from "it went away, so
-    // TERM must have done it": that inference would report `Term` for a
-    // reaper that had been changed to open with SIGKILL.
+    // Built from the escalation branch this call actually took, never from
+    // "it went away, so TERM must have done it": that inference would report
+    // `Term` for a reaper that had been changed to open with SIGKILL.
+    //
+    // What it is not: proof of the signal the kernel delivered. The label and
+    // `ReapSignal::flag()` are two halves of the same claim, so a mutation to
+    // `flag()` alone moves both. m2's reaper test therefore checks the
+    // *daemon's* evidence — descriptor removed, `daemon.stopped` journaled —
+    // beside this label, because only the daemon can testify to what it got.
     let mut reaped = signal(&pids, ReapSignal::Term);
     if !wait_until_gone(data_dir, TERM_GRACE) {
         for killed in signal(&daemon_pids(data_dir), ReapSignal::Kill) {

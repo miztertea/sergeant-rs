@@ -1274,7 +1274,9 @@ fn stop_daemon(dir: &Path) {
 /// a SIGKILLed process runs nothing at exit, so under instrumentation it
 /// contributes no coverage profile, and "the numbers are low" would have been
 /// the only symptom. The reaper now names the signal each pid needed, and
-/// this test asserts the healthy answer: SIGTERM was enough.
+/// this test asserts the healthy answer: SIGTERM was enough — first from the
+/// reaper's report, then, because a report about oneself is not evidence,
+/// from what the daemon left behind on its way out.
 #[test]
 fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
     let dir = DataDir::new();
@@ -1318,6 +1320,34 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
     assert!(
         dir.daemon_pids().is_empty(),
         "after the reap nothing may still be running on this data dir"
+    );
+
+    // The assertion above is the reaper's own label — what it *says* it sent.
+    // On its own that is self-grading, and measurably so: with
+    // `ReapSignal::flag()`'s `Term` arm changed to `-KILL`, the reaper still
+    // builds `ReapedDaemon { signal: Term }` and the label assertion still
+    // passes while every daemon dies of SIGKILL. So the evidence below is
+    // read from the *daemon* instead. Measured on this container, one temp
+    // data dir per signal: after SIGTERM the daemon runs its shutdown tail —
+    // journals `daemon.stopped`, removes `runtime.json` — and after SIGKILL
+    // it journals nothing and leaves the descriptor on disk.
+    assert!(
+        !daemon::descriptor_path(dir.path()).exists(),
+        "the reaped daemon must have removed its own runtime descriptor, which only \
+         the SIGTERM shutdown path does. Still present means the daemon was killed \
+         rather than asked, whatever the report above says it sent."
+    );
+    let stopped = Journal::replay_data_dir(dir.path())
+        .expect("replay the journal")
+        .filter_map(Result::ok)
+        .filter(|event| event.kind == daemon::KIND_DAEMON_STOPPED)
+        .count();
+    assert_eq!(
+        stopped,
+        1,
+        "the reaped daemon must have journaled exactly one {} event; {stopped} means \
+         the signal it actually received was not one it could handle",
+        daemon::KIND_DAEMON_STOPPED
     );
     // …and the guard's `Drop` then finds nothing to complain about, which is
     // the assertion every other test in this file gets for free.
