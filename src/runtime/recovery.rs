@@ -48,6 +48,10 @@ pub struct ReconcileReport {
     pub resumed: Vec<String>,
     /// Works whose executions could not be classified; now `blocked`.
     pub blocked: Vec<String>,
+    /// Terminal works whose surface teardown a crash left unrecorded, and
+    /// which this restart finished and journaled. Empty on a clean restart.
+    #[serde(default)]
+    pub surfaces_retired: Vec<String>,
 }
 
 /// Reconcile every in-flight work against its backend (§25).
@@ -85,6 +89,46 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
         .map(|work| work.id.clone())
         .collect();
 
+    // The completion tail's crash window (L6, issue #9). `work.completed` /
+    // `work.failed` / `work.canceled` and the `surface.torn_down` that follows
+    // are adjacent appends; a kill between them leaves a terminal work whose
+    // surface the journal still records as live. Until now nothing looked at
+    // terminal work again, so the missing event stayed missing forever and —
+    // when the crash landed before `teardown()` itself ran — a worktree and a
+    // surface root stayed on disk with no owner. These are the works whose
+    // teardown this restart finishes and records.
+    //
+    // **Scope, stated so the issue can be closed honestly.** This is a
+    // forward fix, and only that. It is keyed on the *missing event*, so a
+    // work whose `surface.torn_down` is already recorded is never looked at
+    // again — including the ones torn down before `teardown()` learned to
+    // remove the empty root (issue #5), whose `surfaces/<work-id>/` are still
+    // on disk in any data dir that predates it. Reclaiming those means
+    // deleting directories no journal entry points at, which is a garbage
+    // collector's job and not a recovery pass's: recovery acts on evidence
+    // that something was left unfinished, and there is none here. Tracked as
+    // issue #17.
+    let stranded_surfaces: Vec<String> = core
+        .registry
+        .state()
+        .works
+        .values()
+        .filter(|work| {
+            matches!(
+                work.state,
+                WorkState::Completed | WorkState::Failed | WorkState::Canceled
+            )
+        })
+        .filter(|work| {
+            core.registry
+                .state()
+                .runs
+                .get(&work.id)
+                .is_some_and(|run| run.surface.is_some() && run.teardown.is_none())
+        })
+        .map(|work| work.id.clone())
+        .collect();
+
     let mut report = ReconcileReport::default();
     for work_id in in_flight {
         match engine.reconcile_work(core, &work_id) {
@@ -101,6 +145,25 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
             block_on_reconcile_error(engine, core, &work_id, &e);
         }
         report.blocked.push(work_id);
+    }
+    // Isolated like every other work's reconciliation, and for a smaller
+    // stake: a terminal work's audit trail is worth finishing, never worth
+    // refusing to start the daemon over. A failure here (a wedged journal, a
+    // git that will not answer) leaves the work exactly as it was — terminal,
+    // with the teardown still unrecorded — so the next restart tries again.
+    // Nothing is *blocked* on it: the work already reached its conclusion, and
+    // rewriting that conclusion because its scaffolding could not be swept
+    // would be the daemon inventing state the journal never recorded.
+    for work_id in stranded_surfaces {
+        match engine.reconcile_terminal_surface(core, &work_id) {
+            Ok(true) => report.surfaces_retired.push(work_id),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                work_id,
+                error = %e,
+                "could not finish the surface teardown a crash interrupted"
+            ),
+        }
     }
     Ok(report)
 }

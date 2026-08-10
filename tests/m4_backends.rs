@@ -74,18 +74,21 @@ use sergeant_rs::domain::execution::{
 };
 use sergeant_rs::domain::profile::Profile;
 use sergeant_rs::domain::work::{
-    KIND_WORK_BLOCKED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED,
-    KIND_WORK_STARTED, KIND_WORK_SUBMITTED, WorkState,
+    KIND_WORK_BLOCKED, KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED,
+    KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, WorkState,
 };
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_WORKFLOW_BOUND,
 };
+use sergeant_rs::domain::workspace::RepositorySpec;
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
 use sergeant_rs::runtime::engine::Engine;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::work_registry_projection;
 use sergeant_rs::runtime::recovery;
-use sergeant_rs::runtime::surface::KIND_SURFACE_MATERIALIZED;
+use sergeant_rs::runtime::surface::{
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN, materialize, work_branch,
+};
 
 // ---------------------------------------------------------------- helpers
 
@@ -2498,6 +2501,260 @@ fn a4_a_crash_inside_the_reconcile_append_window_rederives_on_restart() {
         "the retirement is idempotent across the crash window (stop_requested folds)"
     );
     assert!(events_of(&core, work_id, KIND_WORK_FAILED).is_empty());
+}
+
+/// L6 audit of the *completion tail*: `work.completed` and the
+/// `surface.torn_down` that follows it are two adjacent appends, and a kill
+/// between them left the audit trail incomplete forever — reconciliation only
+/// ever looked at work believed in flight, so a terminal work was never
+/// examined again (P1-PERF S6, issue #9).
+///
+/// Both sides of the window are provoked here, deterministically, by writing
+/// the journal a kill -9 would have left:
+///
+/// - **before `teardown()` ran** — the worktree and the surface root are still
+///   on disk with nothing that would ever remove them;
+/// - **after it ran, before the append** — the disk is already clean and only
+///   the record is missing.
+///
+/// After a restart the trail must be whole in both, and the disk swept in the
+/// first: recovery re-derives the teardown from what the disk actually holds
+/// (evidence, not a guess), marks the event `recovered`, and converges — a
+/// second restart appends nothing.
+#[test]
+fn a4_a_crash_between_completion_and_teardown_is_swept_on_restart() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path());
+    let mut core = core(data.path());
+
+    // Two completed works, one per side of the window.
+    let stranded = "01M4TAILDISK";
+    let recorded = "01M4TAILREC";
+    let mut surfaces = Vec::new();
+    for (work_id, name) in [(stranded, "left"), (recorded, "right")] {
+        let repo = repos.path().join(name);
+        init_repo(&repo);
+        let spec = RepositorySpec {
+            name: name.to_string(),
+            path: repo.clone(),
+        };
+        // A real surface, materialized exactly as the engine materializes it.
+        let surface =
+            materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("materialize");
+        submit_work(&mut core, work_id, "completed just before the crash");
+        commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            json!({"surface": surface}),
+        );
+        commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+        commit(
+            &mut core,
+            work_id,
+            KIND_WORK_COMPLETED,
+            json!({"stages": 1}),
+        );
+        surfaces.push((work_id, repo, surface));
+    }
+    // …and for the second one, teardown had already reached the disk when the
+    // daemon died: the worktree (and its root) are gone, the event is not.
+    let (_, right_repo, right_surface) = &surfaces[1];
+    let right_worktree = right_surface.bindings[0].worktree_path.clone();
+    std::fs::remove_dir_all(&right_worktree).expect("simulate the completed removal");
+    std::fs::remove_dir(&right_surface.root).expect("simulate the completed removal");
+
+    let (_, left_repo, left_surface) = &surfaces[0];
+    let left_worktree = left_surface.bindings[0].worktree_path.clone();
+    assert!(
+        left_worktree.is_dir(),
+        "the stranded worktree is still there"
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("recovery must not abort");
+    assert_eq!(
+        report.surfaces_retired,
+        vec![stranded.to_string(), recorded.to_string()],
+        "both interrupted teardowns are finished and named in the report"
+    );
+    assert!(
+        report.blocked.is_empty() && report.resumed.is_empty(),
+        "a work that reached its conclusion is not re-decided: {report:?}"
+    );
+
+    // The trail is whole, and it says when it was written.
+    for work_id in [stranded, recorded] {
+        let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+        assert_eq!(torn.len(), 1, "{work_id}: exactly one teardown record");
+        assert_eq!(
+            torn[0]["recovered"], true,
+            "{work_id}: the record must not pretend it landed with the completion"
+        );
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Completed,
+            "{work_id}: sweeping scaffolding never rewrites the outcome"
+        );
+        assert!(events_of(&core, work_id, KIND_WORK_BLOCKED).is_empty());
+    }
+
+    // The stranded surface is swept — the disposition is the *measured* one,
+    // and the branch is retained exactly as teardown always retains it.
+    let left = events_of(&core, stranded, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(left[0]["report"]["bindings"][0]["disposition"], "removed");
+    assert_eq!(left[0]["report"]["clean"], true);
+    assert!(
+        !left_worktree.exists() && !left_surface.root.exists(),
+        "a crash before teardown must not strand a worktree forever: {}",
+        left_surface.root.display()
+    );
+    assert!(
+        sergeant_rs::runtime::git::git_succeeds(
+            left_repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", work_branch(stranded)),
+            ],
+        ),
+        "recovery's teardown keeps the branch, like every other teardown"
+    );
+
+    // The already-swept one is recorded from evidence too: the worktree is
+    // gone, so `missing` is the honest disposition — never a claimed removal.
+    let right = events_of(&core, recorded, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(right[0]["report"]["bindings"][0]["disposition"], "missing");
+    assert_eq!(right[0]["report"]["clean"], false);
+    assert!(sergeant_rs::runtime::git::git_succeeds(
+        right_repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", work_branch(recorded)),
+        ],
+    ));
+
+    // And it converges: the next restart finds nothing left to do.
+    let again = recovery::reconcile(&engine, &mut core).expect("second restart");
+    assert!(
+        again.surfaces_retired.is_empty(),
+        "a swept surface is not swept twice: {again:?}"
+    );
+    for work_id in [stranded, recorded] {
+        assert_eq!(
+            events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(),
+            1,
+            "{work_id}: the teardown record stays single across restarts"
+        );
+    }
+}
+
+/// The other side of the sweep: what it does when the disk refuses.
+///
+/// The test above provokes the two dispositions where the surface *goes*
+/// (`removed`, `missing`). The claim the sweep makes is stronger than that —
+/// the report states what the disk actually holds — and the branch that
+/// claim leans on hardest is the one where it holds something: a worktree
+/// with uncommitted work in it is retained, named, and its root left in
+/// place, because teardown fails closed and never deletes what it cannot
+/// establish is disposable. That branch is covered for a direct `teardown()`
+/// (`surface.rs`), but through recovery it has two properties of its own,
+/// and neither was exercised: the retained surface must still get its record
+/// (once), and a *retained* surface must not be re-swept on every restart
+/// from then on — an audit trail that grows a teardown event per boot would
+/// be worse than the missing one this fix is about.
+///
+/// A canceled work carries it, which is also the point: the sweep admits
+/// `completed | failed | canceled`, and until now only `completed` had ever
+/// been through it.
+#[test]
+fn a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path());
+    let mut core = core(data.path());
+
+    let work_id = "01M4TAILDIRTY";
+    let repo = repos.path().join("dirty");
+    init_repo(&repo);
+    let spec = RepositorySpec {
+        name: "dirty".to_string(),
+        path: repo.clone(),
+    };
+    let surface = materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("surface");
+    submit_work(&mut core, work_id, "canceled with work still in the tree");
+    commit(
+        &mut core,
+        work_id,
+        KIND_SURFACE_MATERIALIZED,
+        json!({"surface": surface}),
+    );
+    commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_CANCELED,
+        json!({"reason": "operator"}),
+    );
+
+    // Uncommitted work in the worktree: the thing teardown must not throw away.
+    let worktree = surface.bindings[0].worktree_path.clone();
+    std::fs::write(worktree.join("half-done.txt"), "not committed anywhere\n")
+        .expect("dirty the worktree");
+
+    let report = recovery::reconcile(&engine, &mut core).expect("recovery must not abort");
+    assert_eq!(
+        report.surfaces_retired,
+        vec![work_id.to_string()],
+        "a canceled work's interrupted teardown is swept like a completed one's"
+    );
+
+    let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1, "exactly one teardown record");
+    assert_eq!(torn[0]["recovered"], true);
+    assert_eq!(
+        torn[0]["report"]["bindings"][0]["disposition"], "retained_dirty",
+        "the record must say what the disk holds: {}",
+        torn[0]["report"]
+    );
+    assert_eq!(torn[0]["report"]["clean"], false);
+    assert!(
+        torn[0]["report"]["bindings"][0]["changes"]
+            .as_str()
+            .is_some_and(|changes| changes.contains("half-done.txt")),
+        "…with git's own evidence for why: {}",
+        torn[0]["report"]
+    );
+    assert!(
+        worktree.join("half-done.txt").is_file(),
+        "recovery must never delete uncommitted work it found on disk"
+    );
+    assert!(
+        surface.root.is_dir(),
+        "and the root stays while something is still inside it: {}",
+        surface.root.display()
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "sweeping scaffolding never rewrites the outcome"
+    );
+
+    // The convergence property this branch does not share with the removed
+    // one: the surface is still there, and it must still not be swept twice.
+    let again = recovery::reconcile(&engine, &mut core).expect("second restart");
+    assert!(
+        again.surfaces_retired.is_empty(),
+        "a retained surface is recorded once, not once per restart: {again:?}"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(),
+        1,
+        "the teardown record stays single across restarts"
+    );
 }
 
 /// A stop attempt that never reached a native context must not disable the
