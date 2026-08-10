@@ -60,23 +60,77 @@ DATA_DIR="$WORKDIR/data"
 REPO="$WORKDIR/service"
 mkdir -p "$DATA_DIR"
 
+# How long the daemon gets to shut down on SIGTERM before SIGKILL, and then
+# to leave the process table. The same ten and five seconds as
+# `tests/support/mod.rs`'s reaper: two teardown paths that disagreed about
+# "too slow" would report a slow shutdown differently depending on which one
+# ran, and this script's daemon is reaped by nothing else — its data dir is a
+# bare `mktemp -d`, not a `DataDir`, so no test guard can see it.
+DEMO_TERM_GRACE_TENTHS=100
+DEMO_KILL_GRACE_TENTHS=50
+
+# Wait up to <tenths> tenths of a second for <pid> to disappear.
+wait_gone() { # wait_gone <pid> <tenths>
+  local pid="$1" tenths="$2" i=0
+  while [ "$i" -lt "$tenths" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
 cleanup() {
+  local status=$?
   # The daemon outlives this shell by design (it is detached), so it is asked
-  # to stop explicitly. A demo that leaks a daemon holding a deleted data dir
-  # would be its own worst advertisement.
+  # to stop explicitly, escalated if it will not, and *verified gone before
+  # anything is deleted*. The order is the point: `rm -rf` under a live daemon
+  # leaves it running on a directory that no longer exists — the exact shape
+  # that accumulated 89 orphans on one container — and, because SIGKILL runs
+  # nothing registered at exit, it also throws away whatever the daemon would
+  # have flushed on the way out (its coverage profile, when this script is run
+  # under instrumentation). TERM → 10s grace → KILL → verify-gone, matching
+  # the reaper in tests/support/mod.rs.
+  #
+  # PIN, AND ITS LIMITS (R-S0-5, recorded honestly). The check below is
+  # self-pinning only in part: `tests/m6_surfaces.rs` t4 runs this script and
+  # requires exit 0, so a daemon that survived teardown fails that test rather
+  # than passing unnoticed. What that does *not* exercise is everything past
+  # the happy path — on a healthy run the daemon always stops on SIGTERM, so
+  # the escalation branch, the survival branch and this early `exit 1` are
+  # never taken by the suite, and no test asserts which signal was needed.
+  # They were exercised by hand in a disposable worktree (S1 phase 1) by
+  # pointing the teardown at a live unrelated pid and confirming the script
+  # exited nonzero with the directory still on disk. Two further gaps stay
+  # open by construction: `kill -0` cannot tell a reused pid from the original
+  # daemon, and a daemon that never wrote `runtime.json` is invisible here.
+  local pid=""
   if [ -f "$DATA_DIR/runtime.json" ]; then
     pid="$(sed -n 's/.*"pid": *\([0-9]*\).*/\1/p' "$DATA_DIR/runtime.json" | head -1)"
-    [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-      kill -0 "${pid:-0}" 2>/dev/null || break
-      sleep 0.1
-    done
   fi
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    if ! wait_gone "$pid" "$DEMO_TERM_GRACE_TENTHS"; then
+      printf 'demo.sh: daemon %s ignored SIGTERM for %ss — escalating to SIGKILL (nothing registered at exit runs)\n' \
+        "$pid" "$((DEMO_TERM_GRACE_TENTHS / 10))" >&2
+      kill -KILL "$pid" 2>/dev/null || true
+      wait_gone "$pid" "$DEMO_KILL_GRACE_TENTHS" || true
+    fi
+  fi
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    # Fail closed: never delete a data dir out from under a live daemon, and
+    # never let the run be reported as clean when it was not.
+    printf 'demo.sh: daemon %s survived SIGTERM and SIGKILL — leaving %s on disk\n' \
+      "$pid" "$WORKDIR" >&2
+    exit 1
+  fi
+
   if [ "${KEEP_DEMO_DIR:-0}" = "1" ]; then
     echo "demo directory kept at $WORKDIR"
   else
     rm -rf "$WORKDIR"
   fi
+  exit "$status"
 }
 trap cleanup EXIT
 
