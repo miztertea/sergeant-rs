@@ -8,6 +8,10 @@ commits, never rewrites — the file is the record of what ran.
 
 - `s1-instrument-gauntlet.js` — S1 phase 1: instrument repairs + hygiene +
   harness build (contract: `docs/gauntlet/contracts/S1-COVERAGE.md`).
+- `s1-instrument-round2-lean.js` — S1 phase 1, lean round 2: fresh blind
+  critics over the phase-1 diff (test-honesty independently re-probes every
+  pin), batched refuters, fixer. Added at owner challenge 2026-08-10; the
+  measurement SHA freezes only after this round leaves the tree green.
 - `s1-analysis-gauntlet.js` — S1 phase 2/3 support: per-stage artifact
   analysis and the batched reproduce-or-refute pass over candidate
   findings. Phase 2's stage execution itself is orchestrator-run from

@@ -116,13 +116,23 @@ four and records them in the harness doc).
 
 ## Gauntlet depth
 
-Role-based (P1-PERF precedent), one workflow committed at
-`resources/s1-coverage-gauntlet.js`: one Opus-high builder for phase 1
-(instrument repairs + harness, gates green, revert-probes its own pins);
-phase 2 executed by the orchestrator running the committed stage scripts
-sequentially with Sonnet analysis runners parsing each stage's artifacts;
-one batched Opus refuter pass over candidate findings (reproduce-or-refute
-against the lcov/html evidence and the tree; probe hygiene per L5); no
-product-fix round exists in this phase by design — instrument-defect fixes
-restart phase 2 per R-S0-4. Orchestrator adjudicates, writes the baseline
-doc and ledger entry, and files findings.
+Role-based (P1-PERF precedent), workflows committed under `resources/`:
+one Opus-high builder for phase 1 (instrument repairs + harness, gates
+green, revert-probes its own pins); phase 2 executed by the orchestrator
+running the committed stage scripts sequentially with Sonnet analysis
+runners parsing each stage's artifacts; one batched Opus refuter pass over
+candidate findings (reproduce-or-refute against the lcov/html evidence and
+the tree; probe hygiene per L5); no product-fix round exists in this phase
+by design — instrument-defect fixes restart phase 2 per R-S0-4.
+Orchestrator adjudicates, writes the baseline doc and ledger entry, and
+files findings.
+
+**Amended 2026-08-10 (owner challenge, pre-freeze):** "builder revert-probes
+its own pins" is self-grading — the pattern's core rule forbids trusting it,
+and the ledger holds three precedents of self-verified fixes that reverted
+clean. Phase 1 therefore gets a lean round 2 before the SHA freezes
+(`resources/s1-instrument-round2-lean.js`): fresh blind critics over the
+phase-1 diff — test-honesty on Fable-high (independently re-probing every
+pin), invariants+simplicity combined on Opus-medium — batched Opus refuters,
+Opus fixer if findings confirm. The measurement SHA is whatever tip this
+round leaves green.
