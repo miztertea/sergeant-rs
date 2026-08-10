@@ -43,6 +43,50 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### BUG SPRINT 1 — 2026-08-10, issues #3 #5 #9 #24
+
+**Mission outcome: all four fixed, pinned, landed as four separable commits
+(L10)** — 6167f4c (#5 surface-root removal, the syscall as the guard),
+f91d95c (#9 terminal-surface sweep on restart, re-derivation over compound
+per L6, `recovered: true` provenance), dc157e5 (#24 warn-once on an
+unapplied timeout override), de193a2 (#3 pty-death exit + bounded reader
+join). Gates 218/0 orchestrator-verified, zero leaked daemons, zero /tmp
+residue. Issues auto-close on merge via Fixes-tags.
+
+**The measurement that shaped #3 (L1 vindicated again):** the ~80% spin
+lives *inside* crossterm 0.29 — its unix event source treats a
+zero-length pty read as "no data yet" and loops, so `event::poll` never
+returns after hangup and no caller-side error handling can see it. The
+fix therefore guards *before* handing the fd to the reader (open
+/dev/tty, ENXIO discriminates hangup from transient errors — measured),
+adds a 500 ms watch arm that ends the session (orphan now self-exits in
+~1 s, was SIGKILL-only), and bounds the join so the *class* — not just
+the instance — can never wedge the process again.
+
+**Environmental behavior.** Lean gauntlet, 5 agents (~764k tokens, ~109
+min): Opus fixer, Fable invariants + Opus test-honesty critics, batched
+refuter, Opus round-2 fixer. Panel earned its keep: 6 findings, all 6
+confirmed, headlined by a test-honesty **error** — round 1 pinned #3's
+*parts* but not their *composition* (a two-line mutation removing the
+guard's wiring and the bounded join reproduced the wedge with every test
+green). Round 2 pinned composition (the tick the reader actually
+receives, the watch arm ending the loop, run() mapping TerminalGone to
+exit 0, the unbounded join failing the suite), ENXIO discrimination, the
+printed (not merely computed) #24 warning, and the canceled-work sweep
+case. One residual startup-window hangup edge → issue #26, not silence.
+Ruling: pre-fix leaked surface roots stay (GC belongs to #17) — the
+sweep is journal-keyed and does not delete directories no event points
+at; correctly declined by the fixer.
+
+**Method note (shared-cache hazard, third bite):** probe copies sharing
+the main checkout's CARGO_TARGET_DIR overwrite its binary slots — three
+early "fixed binary" pty measurements were silently measuring a probe
+build until the fixer caught it and rebuilt. Standing rule for probe
+prompts: after any probe-copy build, rebuild the main checkout before
+measuring its binary.
+
+---
+
 ### BACKLOG CONSOLIDATION — 2026-08-10
 
 Everything outstanding from the build cycle now lives in one place: the
