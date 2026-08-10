@@ -1866,6 +1866,90 @@ async fn t9_a_stalled_launch_does_not_hold_the_core_lock() {
     assert!(retried.is_success(), "the stalled retry answered {retried}");
 }
 
+/// §22.6 for the **observation** a launch is followed by.
+///
+/// OBSERVE is the third external effect and the one nothing could park in:
+/// `FakeBackend` had gates for LAUNCH, SEND and the stop completion, and none
+/// for OBSERVE, so "the observation is taken outside the guard" was an
+/// unmeasured claim — setting `observed: None` in both performers, which puts
+/// it back under the lock, left all 269 tests green (round-2 finding
+/// N3R2-03). It is not an idle effect either: for the Claude adapter, a handle
+/// it has no memory of sends it walking `/proc`, and §22.6 lists "reading a
+/// large output stream" beside the process spawn.
+///
+/// Same shape as t9, one effect later: the launch goes through, the
+/// observation that follows it parks indefinitely, and independent requests
+/// must still answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t9b_a_stalled_observation_after_a_launch_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKOBSERVE";
+    seed_blocked_run(dir.path(), work_id);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    // The launch itself is left free: what is under test is the effect on the
+    // far side of it, which is only reachable once the launch has happened.
+    fake.hold_observes();
+    let retry = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_observes(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake observation never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    fake.release_observes();
+    let retried = retry.await.expect("retry task");
+    let observed = fake.observations();
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled observe (launch): read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(retried.is_success(), "the stalled retry answered {retried}");
+    assert!(
+        !observed.is_empty(),
+        "the launch must actually have been followed by an observation"
+    );
+}
+
 /// §22.6 + **issue #14 / backlog B3**: a stalled evidence archive blocks
 /// nothing else either.
 ///
@@ -2210,6 +2294,104 @@ async fn t11b_a_delivery_that_lands_after_a_cancel_does_not_revive_the_work() {
     assert_eq!(late["reason"], "superseded");
     assert_eq!(late["delivered"], true);
     assert_eq!(late["execution_id"], execution_id);
+}
+
+/// §22.6 for the observation a **delivery** is followed by — t9b's other half.
+///
+/// The two performers observe on two different paths, and an instrument that
+/// can only park inside one says nothing about the other; that asymmetry is
+/// how SEND itself survived wave 1 under the guard. So the SEND-side
+/// observation gets its own rendezvous rather than being assumed to follow
+/// from the LAUNCH-side one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11c_a_stalled_observation_after_a_send_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKOBSSEND";
+    seed_blocked_run(dir.path(), work_id);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [
+            FakeStep::ask("which database should I target?"),
+            FakeStep::hang(),
+        ],
+    );
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    // Retry first, with observations free: the launch's own observation is
+    // what parks the run on the ask, and t9b covers that one.
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+    let before = fake.observations().len();
+
+    fake.hold_observes();
+    let respond = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/input"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid(), "input": "postgres"}))
+                .send()
+                .await
+                .expect("input request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_observes(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake observation never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    fake.release_observes();
+    let responded = respond.await.expect("respond task");
+    let after = fake.observations().len();
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled observe (send): read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(
+        responded.is_success(),
+        "the stalled respond answered {responded}"
+    );
+    assert!(
+        after > before,
+        "the delivery must actually have been followed by an observation \
+         ({before} before, {after} after)"
+    );
 }
 
 // ------------------------------------- the throughput floor, as a guard

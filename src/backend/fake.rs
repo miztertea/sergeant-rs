@@ -266,6 +266,16 @@ pub struct FakeBackend {
     /// instrument has to be able to park inside it, or the budget's verdict
     /// is a claim about the paths the instrument happens to reach.
     send_gate: Arc<Gate>,
+    /// Where OBSERVE can be made to stall. OBSERVE is the third external
+    /// effect and the least obviously one: for the Claude adapter a handle it
+    /// has no memory of sends it walking `/proc`, and §22.6 lists "reading a
+    /// large output stream" beside the process spawn. It rides home in
+    /// [`PendingLaunch::perform`](crate::runtime::engine::PendingLaunch::perform)
+    /// and [`PendingSend::perform`](crate::runtime::engine::PendingSend::perform)
+    /// for exactly that reason — and an instrument that cannot park inside it
+    /// cannot say so, which is how an OBSERVE moved back under the guard
+    /// survived wave 1 and wave 2 both.
+    observe_gate: Arc<Gate>,
     /// Where a STOP [`Completion`] can be made to stall — the fake's stand-in
     /// for the Claude adapter's transcript-archive join (issue #14/B3).
     archive_gate: Arc<Gate>,
@@ -316,6 +326,7 @@ impl FakeBackend {
             })),
             launch_gate: Arc::new(Gate::default()),
             send_gate: Arc::new(Gate::default()),
+            observe_gate: Arc::new(Gate::default()),
             archive_gate: Arc::new(Gate::default()),
             archive_armed: Arc::new(Mutex::new(false)),
         }
@@ -384,6 +395,26 @@ impl FakeBackend {
     /// Block until `n` sends are parked in the gate, or the timeout expires.
     pub fn await_stalled_sends(&self, n: usize, timeout: Duration) -> bool {
         self.send_gate.wait_for_waiting(n, timeout)
+    }
+
+    /// Stall every later OBSERVE until [`FakeBackend::release_observes`].
+    ///
+    /// The §22.6 instrument for the third external effect. Both performers
+    /// take their observation before handing the outcome back to the settle
+    /// phase; parking inside it is the only way to tell that apart from an
+    /// observation taken with the guard already re-acquired.
+    pub fn hold_observes(&self) {
+        self.observe_gate.hold();
+    }
+
+    /// Let stalled observations through.
+    pub fn release_observes(&self) {
+        self.observe_gate.release();
+    }
+
+    /// Block until `n` observations are parked in the gate, or time out.
+    pub fn await_stalled_observes(&self, n: usize, timeout: Duration) -> bool {
+        self.observe_gate.wait_for_waiting(n, timeout)
     }
 
     /// Make STOP/INTERRUPT hand back a *deferred* [`Completion`] — the fake's
@@ -687,7 +718,11 @@ impl Backend for FakeBackend {
         Ok(())
     }
 
+    /// OBSERVE is an external effect too, and therefore gated exactly as
+    /// LAUNCH and SEND are — the gate is passed before the state lock, so a
+    /// parked observation holds nothing of the backend's own.
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError> {
+        self.observe_gate.pass();
         let mut state = self.lock();
         state.observations.push(handle.execution_id.clone());
         let execution = self.resolve(&state, handle)?;

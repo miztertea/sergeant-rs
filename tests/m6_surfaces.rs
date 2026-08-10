@@ -2086,6 +2086,16 @@ fn declared_event_kinds() -> Vec<(String, String)> {
 ///
 /// Like t5's `ApiViews` pin, widening this is meant to be deliberate: moving
 /// an effect back into a `&mut Core` path fails here with the call site named.
+///
+/// Round-2 finding N3R2-03: the enumeration was itself incomplete. OBSERVE
+/// and §15 RESUME are external effects — a handle the Claude adapter has no
+/// memory of sends it walking `/proc`, and §22.6 names "reading a large
+/// output stream" beside the spawn — and both performers were changed to take
+/// their observation outside the guard for exactly that reason. But neither
+/// verb was on this list, so an OBSERVE inside a `&mut Core` function was
+/// invisible here, and one was: `drive` used to fall back to observing itself
+/// whenever a caller handed it no observation. Both verbs are enumerated now,
+/// and every remaining call site is named below as a single-owner path.
 #[test]
 fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
     let source = code_only(&read_source("runtime/engine.rs"));
@@ -2117,17 +2127,23 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
     // `PendingLaunch::launch` is the raw effect the two-phase tests drive by
     // hand; it lives in the same block and is covered by the range above.
     //
-    // One call site is deliberately outside them and named here rather than
-    // left to be discovered: startup recovery's terminal-surface sweep runs
-    // between journal replay and the first served request, where nothing is
-    // queueing behind the guard because nothing is being served.
-    // Two call sites are deliberately outside them and named here rather
-    // than left to be discovered, both single-owner paths where no request is
-    // queueing behind the guard because no request is being served:
-    // `reconcile_terminal_surface` (startup recovery's sweep) and
-    // `run_inline` (recovery and the deterministic tests, which hold the only
-    // reference to the Core there is — see its own doc comment).
-    for single_owner in ["pub fn reconcile_terminal_surface", "fn run_inline"] {
+    // The call sites deliberately outside them, named here rather than left
+    // to be discovered. Every one is a single-owner path: startup recovery,
+    // which runs between journal replay and the first served request, and the
+    // inline drivers recovery and the deterministic tests use, which hold the
+    // only reference to the Core there is (see `run_inline`'s doc comment).
+    // Nothing is queueing behind the guard in any of them, because nothing is
+    // being served. Adding to this list is the deliberate act; adding to it
+    // for a path the daemon serves requests from would be a lie the timing
+    // tests (m2's t9/t9b/t10/t11/t11c) would then catch.
+    for single_owner in [
+        "pub fn reconcile_terminal_surface",
+        "fn run_inline",
+        "pub fn resume(&self",
+        "pub fn reconcile_work",
+        "fn reserved_identity_liveness",
+        "fn reattach",
+    ] {
         let start = source
             .find(single_owner)
             .unwrap_or_else(|| panic!("engine.rs must declare `{single_owner}`"));
@@ -2140,6 +2156,8 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
         "teardown(",
         "backend.launch(",
         "backend.send(",
+        "backend.observe(",
+        "backend.resume(",
         "pending.perform(",
     ] {
         for (index, _) in source.match_indices(effect) {

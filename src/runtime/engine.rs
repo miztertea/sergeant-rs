@@ -177,8 +177,10 @@ pub struct LaunchOutcome {
 }
 
 impl From<Result<ExecutionHandle, BackendError>> for LaunchOutcome {
-    /// A launch result with no observation attached: `settle_launch` then
-    /// takes the observation itself, as it did before the phase existed.
+    /// A launch result with no observation attached, for a caller that drove
+    /// [`PendingLaunch::launch`] by hand. `settle_launch` records the start
+    /// and parks: it does not observe on the caller's behalf, because it runs
+    /// with the core lock held and OBSERVE is an external effect (§22.6).
     fn from(handle: Result<ExecutionHandle, BackendError>) -> Self {
         Self {
             handle,
@@ -1384,52 +1386,58 @@ impl Engine {
     /// Drive a run forward from whatever its backend now says.
     ///
     /// This is the only place stage progression happens, and the only signals
-    /// it acts on are the backend's explicit ones. It loops because completing
-    /// a stage enters the next one, which may itself already have something to
-    /// say; every iteration either returns or advances to a later stage, so
-    /// the loop is bounded by the workflow's stage count.
-    pub fn resume(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
-        let step = self.begin_resume(core, work_id)?;
-        self.run_inline(core, step)
-    }
-
-    /// [`Engine::resume`]'s first phase (see [`Engine::begin_start`]).
-    pub fn begin_resume(&self, core: &mut Core, work_id: &str) -> Result<Step, EngineError> {
-        let mut deferred = Deferred::new();
-        let next = self.drive(core, work_id, None, &mut deferred)?;
-        Ok(Step { next, deferred })
-    }
-
-    /// [`Engine::resume`]'s implementation, with an optional pre-fetched
-    /// `Observation` for the first loop iteration.
+    /// it acts on are the backend's explicit ones.
     ///
-    /// Restart reconciliation ([`Engine::reconcile_work`]) already calls
-    /// `backend.observe()` once to decide whether the run resumes at all; a
-    /// second OBSERVE right after to actually drive it would double the call
-    /// for no reason, and the two calls are not guaranteed to agree. `initial`
-    /// lets reconciliation hand the answer it already has to the first
-    /// iteration; every later iteration (a fresh stage after this one
-    /// completes) always observes fresh, because nothing has asked yet.
+    /// **A single-owner path**, exactly as [`Engine::run_inline`] is: finding
+    /// out where the run *is* means an OBSERVE, and this function takes it
+    /// with a `&mut Core` in hand. That is only safe where the caller holds
+    /// the only reference to the Core there is — recovery and the
+    /// deterministic tests. The daemon's request path never calls it: every
+    /// observation it acts on rides home in a performer's outcome, taken with
+    /// the guard released (§22.6, and m6's t11 enforces it structurally).
+    pub fn resume(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
+        let run = self.run(core, work_id)?;
+        let Some(execution) = run.execution.clone() else {
+            return Ok(());
+        };
+        let backend = self.backend_for(work_id, &execution.backend)?;
+        let observed = backend.observe(&handle_of(&execution));
+        let mut deferred = Deferred::new();
+        let next = self.drive(core, work_id, observed, &mut deferred)?;
+        self.run_inline(core, Step { next, deferred })
+    }
+
+    /// Act on one observation of the run's current execution.
+    ///
+    /// The observation is **always supplied**, never taken here. Every caller
+    /// is either a settle phase — which was handed one by the performer that
+    /// took it outside the guard — or a single-owner path that took its own
+    /// before calling. An OBSERVE inside this function would be an external
+    /// call under the core lock on the daemon's hottest path, and the version
+    /// of it that used to sit behind an `Option::unwrap_or_else` here was
+    /// invisible to every instrument in the tree (round-2 finding N3R2-03).
+    ///
+    /// It does not loop: completing a stage enters the next one, whose
+    /// *launch* goes back to the caller so the guard is released between them.
     fn drive(
         &self,
         core: &mut Core,
         work_id: &str,
-        initial: Option<Result<Observation, BackendError>>,
+        initial: Result<Observation, BackendError>,
         deferred: &mut Deferred,
     ) -> Result<Next, EngineError> {
         let run = self.run(core, work_id)?;
-        let Some(execution) = run.execution.clone() else {
+        if run.execution.is_none() {
             return Ok(Next::Parked);
-        };
+        }
         let Some(stage) = run.current_stage().cloned() else {
             return Ok(Next::Parked);
         };
         let workflow = run.workflow.clone().ok_or_else(|| EngineError::NoRun {
             work_id: work_id.to_string(),
         })?;
-        let backend = self.backend_for(work_id, &execution.backend)?;
 
-        let observation = match initial.unwrap_or_else(|| backend.observe(&handle_of(&execution))) {
+        let observation = match initial {
             Ok(observation) => observation,
             Err(e) => {
                 // §25: the adapter cannot classify the native context.
@@ -1691,7 +1699,13 @@ impl Engine {
         let mut deferred = Deferred::new();
         match disposition {
             ReconcileDisposition::Resumed => {
-                let next = self.drive(core, work_id, resumed_from.map(Ok), &mut deferred)?;
+                // `Resumed` is only ever produced with the Observation it
+                // was classified from, and `drive` acts on that one rather
+                // than asking a second time — the two answers are not
+                // guaranteed to agree, and this one is the evidence the
+                // disposition was journaled against.
+                let observed = resumed_from.expect("a resumed disposition carries its observation");
+                let next = self.drive(core, work_id, Ok(observed), &mut deferred)?;
                 // Recovery is the single-owner path: nothing is served yet,
                 // so performing the launch here holds up no request.
                 self.run_inline(
@@ -2274,7 +2288,17 @@ impl Engine {
             KIND_EXECUTION_STARTED,
             json!({"execution": record}),
         )?;
-        let next = self.drive(core, &work_id, observed, &mut deferred)?;
+        // An outcome with no observation attached is a launch reported without
+        // one — the `From<Result<ExecutionHandle, _>>` shape, which exists for
+        // callers driving the two phases apart by hand. There is nothing to
+        // act on and nothing to be gained by asking here: an OBSERVE taken at
+        // this point would be an external call with the guard held, which is
+        // the whole thing the phase exists to prevent. The run is recorded as
+        // started and left where it is.
+        let next = match observed {
+            Some(observed) => self.drive(core, &work_id, observed, &mut deferred)?,
+            None => Next::Parked,
+        };
         Ok(Step { next, deferred })
     }
 
@@ -2344,7 +2368,15 @@ impl Engine {
             )?;
         }
         let mut deferred = Deferred::new();
-        let next = self.drive(core, &work_id, observed, &mut deferred)?;
+        // `PendingSend::perform` observes whenever the delivery succeeded, and
+        // a failed delivery returned above — so the `None` arm is a delivery
+        // that reported success without an observation, which nothing here
+        // constructs. It parks rather than observing under the guard, for the
+        // same reason `settle_launch`'s does.
+        let next = match observed {
+            Some(observed) => self.drive(core, &work_id, observed, &mut deferred)?,
+            None => Next::Parked,
+        };
         Ok(Step { next, deferred })
     }
 
