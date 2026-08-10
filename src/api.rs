@@ -240,8 +240,10 @@ async fn blocking<T>(f: impl FnOnce() -> T) -> T {
 /// It **returns the guard it is still holding** when the crank ends with the
 /// lock in hand and nothing outstanding, so the caller can render its response
 /// without queueing for the mutex a fourth time. That is not a shortcut around
-/// the boundary: the guard is dropped before every launch and before every
-/// completion wait, which are the only places §22.6 cares about.
+/// the boundary: the guard is dropped before every effect and before every
+/// completion wait, which are the only places §22.6 cares about — in one place
+/// each, so there is no arm that can be missed and no arm whose drop is
+/// decoration.
 async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'_, Core>> {
     let mut step = step;
     let mut held: Option<tokio::sync::MutexGuard<'_, Core>> = None;
@@ -251,10 +253,26 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
             drop(held.take()); // never wait on an adapter under the guard
             blocking(move || deferred.wait()).await;
         }
+        if matches!(next, EngineNext::Parked) {
+            return held;
+        }
+        // Every remaining arm performs an external effect — a harness spawn, a
+        // `claude -p --resume` turn, a `git worktree add` fork/exec/wait on a
+        // checkout the daemon does not own and cannot bound. So the guard goes
+        // first, once, for all of them (§14.2, §22.6).
+        //
+        // Once, rather than a line per arm: the per-arm drops were three
+        // copies of one invariant, and the copy in the SEND arm could not run
+        // — `provide_input` drops the guard before calling `crank`, and no
+        // settle produces `Next::Send`, so that arm is only ever reached on the
+        // first iteration with nothing held. A line that cannot execute is not
+        // a boundary, whatever its comment says (round-2 finding N3R2-07).
+        // Stated here it executes for every effect, including any later path
+        // that does hand a SEND back from a settle.
+        drop(held.take());
         let settled = match next {
-            EngineNext::Parked => return held,
+            EngineNext::Parked => unreachable!("returned above"),
             EngineNext::Launch(pending) => {
-                drop(held.take()); // never launch under the guard
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
                 let mut core = state.core.lock().await;
@@ -265,7 +283,6 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
                 )
             }
             EngineNext::Send(pending) => {
-                drop(held.take()); // nor deliver input under it (§14.2 for SEND)
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
                 let mut core = state.core.lock().await;
@@ -276,9 +293,6 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
                 )
             }
             EngineNext::Surface(pending) => {
-                drop(held.take()); // nor run git: `git worktree add` is a
-                // fork/exec/wait per repository on a checkout the daemon does
-                // not own and cannot bound (§22.6).
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
                 let mut core = state.core.lock().await;
