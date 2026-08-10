@@ -1974,6 +1974,80 @@ mod tests {
         )
     }
 
+    /// Guard for the history loop's cursor bookkeeping in `forward_events`
+    /// (`last_sent = event.seq`), which nothing else in the suite reaches.
+    ///
+    /// That assignment has no effect on what history itself delivers —
+    /// `events_after` is called once, before the loop, so the tail is already
+    /// fixed. It matters in exactly one place: it is the floor a *later*
+    /// refill or dedup starts from. `m2_daemon_api.rs`'s mid-replay resume
+    /// test cannot see it (it reads history frames and disconnects, never
+    /// reaching the live half), and lag cannot be provoked through the real
+    /// HTTP surface without pushing past the daemon's 1024-slot broadcast.
+    /// Driving `forward_events` directly makes it deterministic instead:
+    ///
+    /// 1. a one-slot sink wedges the pump *inside* the history loop, so it
+    ///    has not yet called `live.recv()`;
+    /// 2. twenty commits then overflow the sixteen-slot broadcast, so the
+    ///    subscriber's very first `recv()` is `Lagged` — by the channel's own
+    ///    overwrite contract, not by scheduler luck;
+    /// 3. draining resumes history to its end, and the refill that follows
+    ///    starts from `last_sent`.
+    ///
+    /// One frame per event is `send_sse`'s contract, so an exact frame count
+    /// is an exact "no gap, no repeat": a cursor left one short re-delivers
+    /// the last history frame and this reads 26.
+    #[tokio::test]
+    async fn a_lag_refill_resumes_from_the_last_history_frame_the_pump_actually_sent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        const HISTORY: u32 = 5;
+        const LIVE: u32 = 20; // > the 16-slot broadcast `test_state` builds
+        {
+            let mut core = state.core.lock().await;
+            for n in 1..=HISTORY {
+                core.commit(seeded(n)).expect("commit history");
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+
+        // One frame out: the pump is past `subscribe` and inside the history
+        // loop. It cannot reach `live.recv()` from here — three history
+        // frames remain and the sink holds one — so everything committed
+        // below piles up unread in the broadcast ring.
+        let first = rx.recv().await.expect("the first history frame");
+        assert!(first.is_ok(), "the pump never sends a stream error");
+
+        {
+            let mut core = state.core.lock().await;
+            for n in HISTORY + 1..=HISTORY + LIVE {
+                core.commit(seeded(n)).expect("commit live");
+            }
+        }
+
+        let total = (HISTORY + LIVE) as usize;
+        let mut frames = 1;
+        while frames < total {
+            let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("every committed event must reach the stream")
+                .expect("the pump must not close the stream");
+            assert!(frame.is_ok(), "the pump never sends a stream error");
+            frames += 1;
+        }
+        let extra = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "the lag refill must start after the last history frame the pump \
+             sent, not repeat it: {extra:?}"
+        );
+
+        pump.abort();
+    }
+
     /// The TOCTOU this test provokes: `with_analytics` reads `last_seq`,
     /// releases the analytics lock to fetch the journal tail, then
     /// re-acquires the lock to fold it. A concurrent request's `catch_up`
