@@ -18,7 +18,10 @@
 //! durable output of a run, the worktree is scaffolding. Teardown **fails
 //! closed**: a worktree with uncommitted or untracked changes, a worktree that
 //! has vanished, or a removal Git refuses is *recorded* in the teardown report
-//! and left alone. Sergeant never destroys work it did not create.
+//! and left alone. Sergeant never destroys work it did not create. The
+//! per-work root goes too, but only once it is empty — `remove_dir`, never a
+//! recursive delete, so anything teardown retained keeps the directory it
+//! lives in.
 
 use std::path::{Path, PathBuf};
 
@@ -390,6 +393,11 @@ pub fn teardown(surface: &WorkSurface) -> TeardownReport {
             disposition,
         });
     }
+    // The worktrees live one level *below* the surface root, so removing them
+    // leaves the root itself behind. It is scaffolding this module created
+    // (`materialize`), and nothing removed it: measured at P1-PERF as one
+    // empty `surfaces/<work-id>/` per work, in every scenario, never reclaimed.
+    remove_surface_root(&surface.root);
     let clean = bindings
         .iter()
         .all(|b| b.disposition == BindingDisposition::Removed);
@@ -397,6 +405,32 @@ pub fn teardown(surface: &WorkSurface) -> TeardownReport {
         work_id: surface.work_id.clone(),
         bindings,
         clean,
+    }
+}
+
+/// Remove the per-work surface root, but only once nothing is left inside it.
+///
+/// `remove_dir` *is* the whole guard, and deliberately so: it refuses a
+/// directory that still holds anything, which is exactly teardown's
+/// fail-closed rule expressed by the syscall. A binding retained dirty, a
+/// removal git refused, a multi-repo surface with one worktree still standing
+/// — each leaves the root in place with its contents intact, and only the last
+/// worktree's departure empties it. Sergeant never recursively deletes a
+/// surface directory.
+///
+/// Best-effort and idempotent by construction: an already-removed root, a root
+/// that never existed, and a root someone else is holding open all leave the
+/// report unchanged, so re-running teardown after a crash between this call
+/// and the `surface.torn_down` append converges instead of erroring (L6).
+/// The parent (`surfaces/`) is fsynced so the removal survives the crash that
+/// L6 window is about — the mirror of `create_dir_all_durable`'s dirent sync
+/// on the way in.
+fn remove_surface_root(root: &Path) {
+    if std::fs::remove_dir(root).is_ok()
+        && let Some(parent) = root.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
 }
 
@@ -701,6 +735,87 @@ mod tests {
         assert!(
             !source.join(".sergeant-data/01LINK/solo").exists(),
             "a refused surface must leave no worktree"
+        );
+    }
+
+    /// Teardown removes the scaffolding it created — the per-work surface
+    /// root included — and removes it only once it is genuinely empty.
+    ///
+    /// The regression: `git worktree remove` deletes the worktree one level
+    /// *below* the root, and nothing ever removed the root, so every work
+    /// left an empty `surfaces/<work-id>/` behind for the life of the data
+    /// dir (measured in all seven P1-PERF scenarios). Minor per instance,
+    /// unbounded in aggregate.
+    ///
+    /// The three cases together are the rule: empty ⇒ gone, still-occupied ⇒
+    /// kept (fail closed, never a recursive delete), already-gone ⇒ no error.
+    #[test]
+    fn teardown_removes_the_surface_root_once_it_is_empty() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mut first = repo(&dir.path().join("first"));
+        first.name = "first".to_string();
+        let mut second = repo(&dir.path().join("second"));
+        second.name = "second".to_string();
+
+        // One repository: the root is empty after the worktree goes.
+        let solo = materialize(data.path(), "01ROOT", std::slice::from_ref(&first))
+            .expect("materialize solo");
+        let root = solo.root.clone();
+        assert!(root.is_dir(), "materialize created the root");
+        let report = teardown(&solo);
+        assert!(report.clean);
+        assert!(
+            !root.exists(),
+            "an emptied surface root must not outlive the work: {}",
+            root.display()
+        );
+        assert!(
+            data.path().join(SURFACES_DIR).is_dir(),
+            "only the per-work root goes; the surfaces directory itself stays"
+        );
+        // …and tearing the same surface down again is a no-op, not an error:
+        // the crash window between the removal and the `surface.torn_down`
+        // append is re-run, not repaired (L6).
+        let again = teardown(&solo);
+        assert_eq!(again.bindings[0].disposition, BindingDisposition::Missing);
+        assert!(!root.exists());
+
+        // Two repositories: the root survives until the last worktree is
+        // gone. Tearing down a surface that names only the first binding
+        // leaves the second worktree — and therefore the root — untouched.
+        let pair = materialize(data.path(), "01PAIR", &[first, second]).expect("materialize pair");
+        let pair_root = pair.root.clone();
+        let partial = WorkSurface {
+            bindings: pair.bindings[..1].to_vec(),
+            ..pair.clone()
+        };
+        teardown(&partial);
+        assert!(
+            pair_root.is_dir(),
+            "a root still holding another repository's worktree must be kept"
+        );
+        assert!(pair.bindings[1].worktree_path.is_dir(), "untouched");
+        teardown(&pair);
+        assert!(
+            !pair_root.exists(),
+            "the last binding's removal takes the root with it"
+        );
+
+        // A retained worktree keeps its root: teardown fails closed, and the
+        // root is where the retained thing lives.
+        let dirty_spec = repo(&dir.path().join("dirty"));
+        let dirty = materialize(data.path(), "01DIRTY", std::slice::from_ref(&dirty_spec))
+            .expect("materialize dirty");
+        std::fs::write(dirty.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
+        let report = teardown(&dirty);
+        assert!(matches!(
+            report.bindings[0].disposition,
+            BindingDisposition::RetainedDirty { .. }
+        ));
+        assert!(
+            dirty.root.is_dir() && dirty.bindings[0].worktree_path.is_dir(),
+            "uncommitted work is never removed, and neither is the root holding it"
         );
     }
 
