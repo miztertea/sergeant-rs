@@ -1,5 +1,5 @@
 
-[1m== stage c1 — 2026-08-10T16:43:14Z[0m
+[1m== stage c1 — 2026-08-10T16:44:00Z[0m
    disk: 17 GB free (floor 10 GB)
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
    profraw before: 0
@@ -9,48 +9,48 @@ info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by pass
      Running unittests src/lib.rs (target/llvm-cov-target/debug/deps/sergeant_rs-58150b8dfe9415a0)
 
 running 88 tests
-test api::tests::an_override_that_is_not_applied_says_so ... ok
 test api::tests::the_client_timeout_override_only_ever_raises_the_default ... ok
+test api::tests::an_override_that_is_not_applied_says_so ... ok
 test backend::claude::tests::a_missing_envelope_is_resumable_when_interrupted_and_unknown_otherwise ... ok
-test backend::claude::tests::an_adopted_conversation_claims_no_interrupt_and_no_verdict ... ok
 test backend::claude::tests::alias_matching_is_segment_wise ... ok
+test backend::claude::tests::an_adopted_conversation_claims_no_interrupt_and_no_verdict ... ok
 test backend::claude::tests::a_substituted_pin_fails_the_stage_despite_mission_success ... ok
 test backend::claude::tests::an_envelope_that_cannot_say_no_error_is_an_error ... ok
 test backend::claude::tests::an_error_envelope_is_a_structured_failure_not_ambiguity ... ok
-test backend::claude::tests::pin_verification_needs_positive_evidence ... ok
 test backend::claude::tests::liveness_matches_turn_argv_and_not_a_quoted_session_id ... ok
-test backend::claude::tests::preflight_rejects_provider_qualified_and_empty_pins ... ok
 test backend::claude::tests::restart_classification_fails_closed_on_unreadable_liveness ... ok
+test backend::claude::tests::pin_verification_needs_positive_evidence ... ok
+test backend::claude::tests::preflight_rejects_provider_qualified_and_empty_pins ... ok
 test backend::claude::tests::truncate_cuts_on_character_boundaries ... ok
 test backend::claude::tests::version_parses_the_measured_output_shape ... ok
 test backend::claude::tests::session_uuids_are_v4_shaped_and_unique ... ok
-test backend::fake::tests::a_hang_ignores_stop_but_a_compliant_context_exits ... ok
 test backend::fake::tests::a_handle_must_carry_the_native_identity_the_backend_issued ... ok
 test backend::fake::tests::an_unknown_execution_is_an_error_not_a_guess ... ok
+test backend::fake::tests::a_hang_ignores_stop_but_a_compliant_context_exits ... ok
 test backend::fake::tests::capabilities_are_advertised_and_never_emulated ... ok
+test backend::fake::tests::interrupt_resume_and_history_behave_like_the_real_adapters ... ok
 test backend::fake::tests::one_step_per_execution_in_script_order_then_the_default ... ok
 test domain::event::tests::draft_into_event_stamps_envelope ... ok
-test domain::event::tests::rfc3339_known_instants ... ok
-test backend::fake::tests::interrupt_resume_and_history_behave_like_the_real_adapters ... ok
-test domain::event::tests::unix_millis_inverts_the_formatter_and_refuses_other_shapes ... ok
-test domain::tests::only_a_single_child_component_is_a_plain_name ... ok
 test domain::event::tests::explicit_null_known_field_reads_as_unset_and_unknown_nulls_survive ... ok
+test domain::event::tests::unix_millis_inverts_the_formatter_and_refuses_other_shapes ... ok
+test domain::event::tests::rfc3339_known_instants ... ok
+test domain::tests::only_a_single_child_component_is_a_plain_name ... ok
+test domain::work::tests::completed_and_canceled_are_absorbing ... ok
+test domain::profile::tests::a_profile_carries_launch_configuration_and_cannot_declare_a_credential ... ok
 test domain::work::tests::event_kinds_map_to_states_one_to_one ... ok
 test domain::work::tests::state_serde_is_snake_case ... ok
-test domain::work::tests::completed_and_canceled_are_absorbing ... ok
 test domain::work::tests::the_transition_table_is_exactly_this ... ok
-test domain::profile::tests::a_profile_carries_launch_configuration_and_cannot_declare_a_credential ... ok
 test domain::workflow::tests::embedded_default_parses_with_its_stage_contexts ... ok
 test domain::workflow::tests::a_repositorys_own_workflow_wins_over_the_embedded_one ... ok
 test domain::workflow::tests::a_workflow_name_may_not_escape_the_workflows_directory ... ok
 test domain::workspace::tests::a_repository_named_twice_in_one_selection_is_refused ... ok
 test domain::workflow::tests::malformed_workflows_fail_closed ... ok
 test domain::workspace::tests::a_repository_name_may_not_escape_the_surface_root ... ok
-test domain::workspace::tests::two_repositories_may_not_share_a_name ... ok
 test domain::workspace::tests::two_names_for_one_repository_are_refused_before_anything_is_created ... ok
-test runtime::analytics::tests::folding_is_idempotent_over_a_replayed_prefix ... ok
-test runtime::analytics::tests::every_canned_query_runs_against_an_empty_projection ... ok
+test domain::workspace::tests::two_repositories_may_not_share_a_name ... ok
 test runtime::analytics::tests::an_unparseable_timestamp_leaves_a_null_cell_and_never_fails_the_fold ... ok
+test runtime::analytics::tests::every_canned_query_runs_against_an_empty_projection ... ok
+test runtime::analytics::tests::folding_is_idempotent_over_a_replayed_prefix ... ok
 test runtime::engine::tests::blocking_an_already_blocked_work_records_the_new_reason ... ok
 test api::tests::a_concurrent_catch_up_failure_never_folds_a_stale_tail ... ok
 test runtime::fsutil::tests::create_dir_all_durable_creates_nested_dirs_and_is_idempotent ... ok
@@ -60,17 +60,17 @@ test runtime::graph::tests::a_tool_call_is_linked_to_its_cause_only_when_the_jou
 test runtime::graph::tests::stage_precedence_links_consecutive_attempts_and_never_the_first ... ok
 test runtime::graph::tests::unknown_kinds_and_malformed_payloads_derive_nothing ... ok
 test runtime::journal::tests::segment_creation_past_the_8_digit_namespace_fails_closed ... ok
+test runtime::fsutil::tests::a_transient_holder_of_a_lock_this_process_has_held_is_waited_out ... ok
 test runtime::recovery::tests::an_active_work_with_no_execution_fails_closed_with_the_stage_marked ... ok
-test runtime::recovery::tests::one_works_reconcile_failure_does_not_stop_the_others ... ok
 test runtime::router::tests::an_origin_client_that_names_no_backend_falls_through_to_the_default ... ok
 test runtime::router::tests::an_unavailable_selection_never_substitutes_another_provider ... ok
 test runtime::router::tests::precedence_is_explicit_then_affinity_then_workspace_then_global ... ok
 test runtime::router::tests::unknown_and_absent_selections_fail_with_the_options ... ok
-test runtime::fsutil::tests::a_transient_holder_of_a_lock_this_process_has_held_is_waited_out ... ok
+test runtime::recovery::tests::one_works_reconcile_failure_does_not_stop_the_others ... ok
 test runtime::analytics::tests::the_schema_declares_exactly_the_tables_it_advertises ... ok
 test runtime::surface::tests::a_surface_needs_at_least_one_repository ... ok
-test runtime::surface::tests::a_surface_inside_the_source_checkout_is_refused ... ok
 test runtime::surface::tests::a_symlinked_path_cannot_smuggle_a_surface_into_the_checkout ... ok
+test runtime::surface::tests::a_surface_inside_the_source_checkout_is_refused ... ok
 test runtime::surface::tests::a_later_repository_failing_rolls_back_the_earlier_ones ... ok
 test runtime::surface::tests::a_vanished_worktree_is_recorded_and_leaves_the_path_reusable ... ok
 test telemetry::tests::export_is_off_unless_switched_on_and_the_switch_is_explicit ... ok
@@ -78,8 +78,8 @@ test telemetry::tests::the_endpoint_is_configurable_and_defaults ... ok
 test tui::tests::a_dead_tail_stays_visible_after_the_next_command ... ok
 test tui::tests::a_fleet_row_is_the_api_body_projected_field_by_field ... ok
 test tui::tests::a_gone_terminal_is_not_reported_as_a_failure ... ok
-test runtime::surface::tests::a_worktree_deleted_after_a_dirty_teardown_can_still_be_rematerialized ... ok
 test tui::tests::a_hangup_ends_the_session_through_the_watch ... ok
+test runtime::surface::tests::a_worktree_deleted_after_a_dirty_teardown_can_still_be_rematerialized ... ok
 test tui::tests::a_write_key_needs_a_second_keystroke ... ok
 test tui::tests::navigation_is_bounded_by_the_fleet ... ok
 test tui::tests::only_a_terminal_that_was_there_can_hang_up ... ok
@@ -95,3 +95,11 @@ test web::tests::an_absent_field_reads_as_a_dash_and_a_present_one_as_itself ...
 test web::tests::an_unreadable_journal_is_named_not_rendered_as_emptiness ... ok
 test web::tests::text_nodes_and_attributes_are_escaped ... ok
 test tui::tests::shutdown_does_not_park_on_a_reader_that_will_not_finish ... ok
+test runtime::fsutil::tests::a_held_lock_is_still_refused_and_is_free_again_once_released ... ok
+test tui::tests::shutdown_leaves_a_wedged_reader_behind ... ok
+
+test result: ok. 88 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+
+   profraw produced=1 mergeable=1 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 0
+   stage c1 ok

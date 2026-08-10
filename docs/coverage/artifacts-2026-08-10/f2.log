@@ -4,3 +4,12 @@
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
    profraw before: 94
    $ cargo llvm-cov clean --profraw-only
+   pass 1: rc=0 wall=46s
+   $ cargo llvm-cov clean --profraw-only
+   pass 2: rc=0 wall=43s
+   $ cargo llvm-cov clean --profraw-only
+   pass 3: rc=0 wall=43s
+   profraw produced=90 mergeable=90 discarded=0 lost=90
+   hygiene: leaked daemons [] /tmp entries 0
+   profraw loss accounted for: each census pass opens with cargo llvm-cov clean --profraw-only, so the baseline's profdata is not polluted by census runs (R-S0-6)
+   stage f2 ok

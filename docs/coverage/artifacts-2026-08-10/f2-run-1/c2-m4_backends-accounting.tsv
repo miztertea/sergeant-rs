@@ -1,0 +1,9 @@
+stage	c2-m4_backends
+wall_s	3
+profraw_before	2
+profraw_produced	1
+profraw_mergeable	1
+profraw_discarded	0
+profraw_lost	0
+profraw_loss_expected	no
+profraw_total	3

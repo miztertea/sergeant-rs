@@ -1,0 +1,34 @@
+
+[1m== stage c2-m5_projections — 2026-08-10T16:44:16Z[0m
+   disk: 17 GB free (floor 10 GB)
+   toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
+   profraw before: 9
+   $ cargo llvm-cov --no-report --test m5_projections
+info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running tests/m5_projections.rs (target/llvm-cov-target/debug/deps/m5_projections-7feffc30a1438f0c)
+
+running 17 tests
+test a_fold_that_fails_part_way_never_answers_out_of_a_short_table ... ok
+test otlp_export_reaches_a_collector_listening_on_the_configured_endpoint ... ok
+test provenance_checking_rejects_every_mislabelled_edge ... ok
+test real_adapter_events_populate_the_conversation_tables_and_tool_spans ... ok
+test a_projection_that_cannot_catch_up_answers_503_and_never_wrong_rows ... ok
+test a_fresh_daemon_answers_from_the_journal_alone ... ok
+test rebuilding_reproduces_the_conversation_tables_a_real_adapter_fills ... ok
+test t2_the_duckdb_file_has_exactly_one_owner ... ok
+test a_restart_over_the_existing_projection_file_rebuilds_it ... ok
+test t1_rebuild_from_scratch_reproduces_every_canned_answer ... ok
+test t3_every_graph_edge_resolves_to_an_event_that_justifies_it ... ok
+test t5_enabled_export_emits_the_span_tree_and_metrics ... ok
+test t4_deleting_the_projections_directory_loses_nothing ... ok
+test the_journal_tail_read_is_exact_at_every_offset_across_segments ... ok
+test t5_disabled_export_runs_no_exporter_machinery ... ok
+test t6_the_daemon_answers_three_section_22_questions ... ok
+test rebuild_latency_on_a_realistic_journal_is_measured ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.98s
+
+   profraw produced=6 mergeable=6 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 0
+   stage c2-m5_projections ok
