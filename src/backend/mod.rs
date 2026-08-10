@@ -362,7 +362,8 @@ impl Deferred {
 
     /// Absorb another bag (an inner engine step's).
     pub fn absorb(&mut self, mut other: Deferred) {
-        self.completions.extend(std::mem::take(&mut other.completions));
+        self.completions
+            .extend(std::mem::take(&mut other.completions));
     }
 
     /// Whether anything is outstanding.
