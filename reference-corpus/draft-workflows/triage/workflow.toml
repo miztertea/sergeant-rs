@@ -5,5 +5,5 @@
 
 [workflow]
 name = "triage"
-version = "1"
-stages = ["00-show-attention", "10-gather-context", "20-verify", "30-recommend", "40-grill-if-underspecified", "50-apply-outcome"]
+version = "2"
+stages = ["10-gather-context", "20-verify", "30-recommend", "40-grill-if-underspecified", "50-apply-outcome"]

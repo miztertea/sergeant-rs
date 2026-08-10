@@ -28,7 +28,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 |---|---|---|
 | `BU-P4-068` | Unless the user explicitly asked to publish immediately, present the proposed ticket breakdown first and ask only whether granularity, ownership, and blocking edges are correct -- do not re-ask about decisions already made. | `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Confirm the Breakdown, L100-109) |
 
-### `30-publish`
+### `20-confirm-breakdown` (helper invocation, folded from demoted `30-publish`)
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -41,4 +41,8 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 |---|---|---|
 | `BU-P4-072` | When reporting the dispatch frontier, recommend one worker per owning repository as the default concurrency, unless the project explicitly supports more. | `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Report the Dispatch Frontier, L181-182) |
 | `BU-P4-073` | Do not actually dispatch any ticket unless the user asked to begin implementation; reporting the frontier is not itself authorization to start work. | `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Report the Dispatch Frontier, L189) |
+
+## Adjudication A4
+
+- **`30-publish` — DEMOTED.** Its CONTEXT.md carried only the §6.5 deterministic-machinery boilerplate ("candidate execute-stage workload") with no additional checkpoint argument (no "Additional note" section). Per A4's default rule, folded into `20-confirm-breakdown` as a helper invocation; `BU-P4-070`/`BU-P4-071` move with it. The stage directory is removed; `40-report-frontier`'s Inputs table now points to `20-confirm-breakdown/output/README.md`. No renumbering: `00`, `10`, `20`, `40` remain correctly ordered without `30`.
 

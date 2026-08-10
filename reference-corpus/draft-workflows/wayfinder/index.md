@@ -2,7 +2,7 @@
 kind: workflow
 name: wayfinder
 status: draft
-version: 1
+version: 2
 description: >-
   Map an unfamiliar frontier of a codebase or problem space, ticket-izing decisions and resolving them one at a time.
 tags:

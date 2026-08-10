@@ -25,7 +25,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P4-089` | Whether something belongs in a ticket or in the fog is decided by whether the question can already be stated precisely, not by whether it can already be answered. | `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Fog of war, L88) |
 | `BU-P4-091` | Out-of-scope work never belongs in the fog section, because fog only gathers toward the destination; work beyond the destination is recorded in its own Out of scope section instead, and out-of-scope work never later graduates into a ticket unless the destination itself is redrawn as a fresh effort. | `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Out of scope, L97) |
 
-### `20-create-tickets`
+### `10-map-frontier` (helper invocation, folded from demoted `20-create-tickets`)
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -50,4 +50,9 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P4-076` | Wayfinder defaults to planning only: each ticket resolves a decision and the map is done once nothing is left to decide, not once the underlying work is executed; an effort may explicitly override this default in its own Notes to carry execution into the map. | `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Plan don't do, L13) |
 | `BU-P4-097` | After creating research-type tickets during charting, immediately fire a research subagent per ticket in parallel to resolve it, capturing findings on a throwaway branch with a context pointer back to the ticket. | `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Chart the map, L115) |
 | `BU-P4-100` | Because unblocked tickets may be worked in parallel by other users, a session working through the map should expect other sessions to be editing the tracker concurrently. | `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Work through the map, L128) |
+
+## Adjudication A4
+
+- **`20-create-tickets` — DEMOTED.** Its CONTEXT.md carried only the §6.5 deterministic-machinery boilerplate ("candidate execute-stage workload") with no additional checkpoint argument (no "Additional note" section). Per A4's default rule, folded into `10-map-frontier` as a helper invocation; `BU-P4-096` moves with it. The stage directory is removed; `30-resolve-one`'s Inputs table now points to `10-map-frontier/output/README.md`. No renumbering: `00`, `10`, `30`, `40` remain correctly ordered without `20`.
+- **`40-regraduate-fog` — not a machinery stage, no A4 action.** It is classified `actor-stage (§6.4, judgment)` with its own "Judgment required" section; its "Additional note" (G7 engine-gap discussion) is a genuine actor-stage argument, not the §6.5 boilerplate, so it is outside A4's scope entirely.
 

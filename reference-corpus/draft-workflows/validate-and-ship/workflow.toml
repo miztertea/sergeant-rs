@@ -5,5 +5,5 @@
 
 [workflow]
 name = "validate-and-ship"
-version = "1"
-stages = ["00-verify-readiness", "10-acquire-launch-reservation", "20-reserve-isolated-snapshot", "30-select-intent-transport", "40-start-run", "50-drive-gates", "60-route-findings", "70-reconcile-custody", "80-close-out", "90-handover-log"]
+version = "2"
+stages = ["00-check-scope", "10-do-the-work", "20-select-intent-transport", "30-start-run", "40-drive-gates", "50-reconcile-custody", "60-close-out"]

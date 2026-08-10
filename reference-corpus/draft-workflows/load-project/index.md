@@ -2,7 +2,7 @@
 kind: workflow
 name: load-project
 status: draft
-version: 1
+version: 2
 description: >-
   Establish, before any mutation, which repositories own the requested outcome, where they are, what instructions govern them, and what state they are in.
 tags:

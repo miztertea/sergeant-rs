@@ -5,5 +5,5 @@
 
 [workflow]
 name = "research"
-version = "1"
-stages = ["00-investigate", "10-write-findings"]
+version = "2"
+stages = ["00-investigate"]

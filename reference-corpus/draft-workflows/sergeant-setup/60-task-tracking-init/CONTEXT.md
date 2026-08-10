@@ -5,7 +5,7 @@
 | File | Layer | Why |
 |---|---|---|
 | ../_config/standing-constraints.md | L3 | constraints binding every stage of this workflow |
-| ../50-sync-and-verify/output/README.md | L4 | upstream artifact produced by `50-sync-and-verify` |
+| ../40-repair-existing/output/README.md | L4 | upstream artifact produced by `40-repair-existing` |
 
 ## Purpose
 
@@ -32,6 +32,13 @@ Tracked-work storage initialized per registered repo, each behind explicit conse
 ## Judgment required
 
 This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+
+## Helpers (folded per N1 adjudication A4)
+
+`50-sync-and-verify` carried no argument beyond the §6.5 deterministic-machinery boilerplate — no "Additional note" checkpoint argument — so it demotes by default and folds into this stage as a helper invocation performed before per-repo task-tracking initialization begins:
+
+- **Sync and verify.** After the project YAML is written, sergeant-setup runs sgt-list, sgt-context <project>, sgt-status <project>, and sgt-sync <project> in that fixed order, stopping at the first failure with its full output and never advancing to the next command until the previous one succeeds.
+  — `BU-P5-031`, `reference/sergeant-upstream/.agents/skills/sergeant-setup/SKILL.md` (lines 220-231)
 
 ## Output
 

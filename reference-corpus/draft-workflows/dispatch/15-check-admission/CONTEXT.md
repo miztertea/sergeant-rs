@@ -50,7 +50,7 @@ Blocks on `drain-fleet`'s admission-block state — this is a real cross-workflo
   (trigger: a model/variant pin cannot be applied; outcome: the failure diagnostic distinguishes a measured incapability from simple absence of measurement)
   — `BU-P1-094`, `reference/sergeant-upstream/README.md` (README.md L205-210, fail-closed distinction)
 - **A worker never launches with a harness it cannot honor: the capability gate (is the harness accepted), a readiness probe, and the launch invocation are all validated up front, before any fleet state directory is even created, so an invalid harness is rejected before durable state exists to clean up.**
-  (trigger: a worker supervisor is about to own an interactive harness pane; outcome: an unusable harness is rejected immediately, never discovered later as an unsatisfiable hang)
+  (trigger: a worker supervisor is about to own an interactive harness execution instance; outcome: an unusable harness is rejected immediately, never discovered later as an unsatisfiable hang)
   — `BU-P6-107`, `reference/sergeant-upstream/bin/sgt-interactive-worker` (L33-40)
 - **Which pinned model tuple a dispatched worker will run is resolved with a fixed, explicit-only precedence — a per-invocation flag beats an environment variable, which beats no pin at all — with no project-level or per-repo default in the precedence chain by deliberate decision, not by omission, and the resolution and its shape are both validated before any intent file, task, or worktree exists.**
   (trigger: a dispatch is choosing which model tuple to pin for its workers; outcome: the source of a pinned model is always explicit and recorded, never an implicit config default a caller might not realize is in effect)

@@ -2,7 +2,7 @@
 kind: workflow
 name: resolving-merge-conflicts
 status: draft
-version: 1
+version: 2
 description: >-
   Resolve an in-progress git merge/rebase conflict without inventing behavior or aborting.
 tags:

@@ -8,17 +8,17 @@
 
 ## Purpose
 
-An explicit user confirmation gate before any action.
+An explicit user confirmation gate before any action; decisions landed during the interview are then captured as ADRs/glossary entries per domain-modeling conventions.
 
 Trigger (workflow-level): A plan or design needs interview-style stress-testing that should also produce durable domain artifacts.
 
 ## What must become true here (durable outcome)
 
-An explicit user confirmation gate before any action.
+An explicit user confirmation gate before any action; decisions landed during the interview are captured as ADRs/glossary entries per domain-modeling conventions.
 
 ## Behavior contract
 
-No behavior units are cited directly against this stage; its content is wholly delegated (see Delegation below) or is the workflow's own structural connective tissue. This is recorded explicitly rather than invented to fill the section.
+No behavior units are cited directly against the confirmation-gate part of this stage; its content is wholly delegated (see Delegation below) or is the workflow's own structural connective tissue. This is recorded explicitly rather than invented to fill the section.
 
 ## Judgment required
 
@@ -27,6 +27,17 @@ This is an actor stage (ladder §6.4): the acting harness must inspect evidence,
 ## Delegation
 
 This stage's outcome is produced by running **grilling** to its own completion (context composition today — see `docs/icm/convention.md` §4 on `@@name` versus true nested-workflow invocation, which does not exist yet).
+
+## Helper invocation: capture decisions
+
+Demoted from a standalone stage (`20-capture-decisions`) at N1 adjudication A4: its only stage-level justification was the §6.5 deterministic-machinery boilerplate, with no additional checkpoint argument, so it folds into this stage as a helper invocation performed once understanding is confirmed. No `kind = "execute"` stage exists in the current engine, so the acting harness performs the capture operation itself using domain-modeling's document conventions:
+
+- **grill-with-docs is a workflow that sharpens a plan or design through interview while producing durable design docs (ADRs, glossary) as a side effect.**
+  (trigger: user invokes grill-with-docs (or its trigger phrase) on a plan/design; outcome: the plan/design reaches shared understanding and ADR/glossary docs exist for the decisions made)
+  — `BU-P3-001`, `reference/sergeant-upstream/.agents/skills/grill-with-docs/SKILL.md` (frontmatter: description)
+- **grill-with-docs is defined by composing two other procedures: it runs the grilling interview loop while using the domain-modeling skill to capture ADRs/glossary entries as decisions land.**
+  (trigger: grill-with-docs invocation; outcome: a grilling interview occurs and its outputs are captured via domain-modeling's document conventions)
+  — `BU-P3-003`, `reference/sergeant-upstream/.agents/skills/grill-with-docs/SKILL.md` (body line 7)
 
 ## Output
 

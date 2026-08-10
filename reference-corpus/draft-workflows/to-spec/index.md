@@ -2,7 +2,7 @@
 kind: workflow
 name: to-spec
 status: draft
-version: 1
+version: 2
 description: >-
   Turn a plan/design into a published spec ticket: gathered context, sketched seams, confirmed with the user, published on template.
 tags:

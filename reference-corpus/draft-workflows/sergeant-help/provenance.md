@@ -32,3 +32,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P5-114` | sergeant-help is loaded when the user asks what Sergeant is, how to install/configure/use it, where skills come from, how to run a command/workflow, or how to diagnose a Sergeant error. | `reference/sergeant-upstream/skills/sergeant-help/SKILL.md` (lines 7-8) |
 | `BU-P5-115` | sergeant-help is never used as a substitute for load-project, cross-repo-work, dispatch, or wiki once the user has actually requested execution of those procedures. | `reference/sergeant-upstream/skills/sergeant-help/SKILL.md` (lines 12-13) |
 
+## Adjudication A4 (N1-BH-02 sweep)
+
+No changes. All three stages (`00-classify-and-locate`, `10-resolve-source-conflicts`, `20-answer-or-hand-off`) were classified "Judgment required" (§6.4) at extraction; none carries a "Deterministic-machinery candidate" (§6.5) heading anywhere in this package, so no stage is in scope for A4's default-demote or case-by-case reimplementation test. Stage count unchanged at 3.
+

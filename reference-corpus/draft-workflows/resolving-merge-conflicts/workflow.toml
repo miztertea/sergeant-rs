@@ -5,5 +5,5 @@
 
 [workflow]
 name = "resolving-merge-conflicts"
-version = "1"
-stages = ["00-assess-state", "10-research-intent", "20-resolve-hunks", "30-validate", "40-finish"]
+version = "2"
+stages = ["10-research-intent", "20-resolve-hunks"]

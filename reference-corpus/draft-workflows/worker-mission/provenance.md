@@ -4,7 +4,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 
 ## Stages
 
-### `00-pin-scope`
+### `00-pin-scope` (folded into `10-triage-and-route`, N1 adjudication A4)
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -33,10 +33,24 @@ No directly-cited units (delegated or structural — see the stage's own CONTEXT
 | `BU-P7-009` | Every Sergeant notification must be acknowledged, then explicitly accepted by the supervisor, then acted on exactly once and marked complete — each step writing the same supervisor-scoped token to a distinct named file; repeated nudges carrying the same token are retries of the same action, never new work. | `reference/sergeant-upstream/templates/worker-brief.md` (section '### 4. Escalate and resume') |
 | `BU-P7-012` | Before every new `needs_input` or `blocked` publication, a worker must increment a monotonic per-worktree gate-generation counter and persist it before writing the waiting status and message; a repeated blocker message is a new gate only when the generation actually advanced. | `reference/sergeant-upstream/templates/worker-brief.md` (section '### 4. Escalate and resume') |
 
-### `50-publish-result`
+### `50-publish-result` (folded into `40-escalate-or-continue`, N1 adjudication A4)
 
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P7-066` | sgt-td-memory must record handoff evidence only from a verified worktree, and every git field it stores (branch, HEAD, etc.) must resolve from that specific worktree rather than from the supervisor's own current working directory — proven with two real linked worktrees on different branches/commits, not simulated. | `reference/sergeant-upstream/tests/sgt-td-memory-worktree-test.sh` (lines 1-18) |
 | `BU-P7-110` | The interactive worker's wait for harness readiness must be bounded and its outcome reported — a harness that never renders must be caught and reported, not hang forever — and separately, a harness that becomes ready without ever acknowledging the notification must NOT be misrecorded as orphaned. | `reference/sergeant-upstream/tests/sgt-worker-readiness-test.sh` (lines 1-9) |
+
+## Adjudication A4
+
+Applying the reference-corpus's N1 round-1 adjudication (`reference-corpus/adjudication-round1.md` A4, finding N1-BH-02):
+
+| Stage | Additional note present? | §6.3 reimplementation test | Decision |
+|---|---|---|---|
+| `00-pin-scope` | none | Swapping the ref-fetch/base-pin implementation leaves the checkpoint — a recorded, reproducible diff scope exists before implementation — unchanged. | **Demoted** — folded into `10-triage-and-route` as a preceding helper invocation. |
+| `10-triage-and-route` | yes (engine-gap G6 note), but already `actor-stage` (§6.4) — n/a to the demotion test | n/a | **Kept** as extracted. |
+| `20-implement`, `30-independent-review` | n/a (extracted as actor-stage, §6.4) | n/a | **Kept** as extracted. |
+| `40-escalate-or-continue` | yes (obsolete-mechanism M5 note), but already `actor-stage` (§6.4) — n/a to the demotion test | n/a | **Kept** as extracted. |
+| `50-publish-result` | none | Swapping the handoff-recording/readiness-wait implementation leaves the checkpoint — verified-worktree evidence, bounded readiness — unchanged. | **Demoted** — folded into `40-escalate-or-continue` as a following helper invocation. Its `promote` output disposition is inherited by the merged stage output (see `40-escalate-or-continue/output/README.md`). |
+
+Stage count: 6 extracted → 4 surviving. No behavior unit was deleted; `BU-P7-005`, `BU-P7-066`, and `BU-P7-110` remain cited, now under `10-triage-and-route`'s or `40-escalate-or-continue`'s "Helper invocations" section (see those stages' `CONTEXT.md`).
 

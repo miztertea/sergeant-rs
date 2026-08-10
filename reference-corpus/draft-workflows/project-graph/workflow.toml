@@ -5,5 +5,5 @@
 
 [workflow]
 name = "project-graph"
-version = "1"
+version = "2"
 stages = ["00-resolve-output-path", "20-merge-or-fail"]

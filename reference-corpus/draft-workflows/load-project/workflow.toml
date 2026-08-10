@@ -5,5 +5,5 @@
 
 [workflow]
 name = "load-project"
-version = "1"
+version = "2"
 stages = ["00-resolve-project-name", "10-resolve-context", "20-register-or-edit"]

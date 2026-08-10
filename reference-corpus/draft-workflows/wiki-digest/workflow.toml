@@ -5,5 +5,5 @@
 
 [workflow]
 name = "wiki-digest"
-version = "1"
-stages = ["00-read-schema", "10-dry-run", "20-inspect-preview", "30-generate", "40-publish-and-index", "50-log-ingest"]
+version = "2"
+stages = ["00-inspect-preview"]

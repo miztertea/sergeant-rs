@@ -16,9 +16,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 
 ### `10-implement-with-tdd`
 
-No directly-cited units (delegated or structural — see the stage's own CONTEXT.md).
-
-### `20-verify`
+No directly-cited units against the stage's own judgment-bearing outcome (delegated or structural — see the stage's own CONTEXT.md). Folds the demoted `20-verify` checkpoint as a helper (see Adjudication A4 below):
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -26,13 +24,18 @@ No directly-cited units (delegated or structural — see the stage's own CONTEXT
 
 ### `30-review`
 
-No directly-cited units (delegated or structural — see the stage's own CONTEXT.md).
-
-### `40-commit`
+No directly-cited units against the stage's own judgment-bearing outcome (delegated or structural — see the stage's own CONTEXT.md). Folds the demoted `40-commit` checkpoint as a helper (see Adjudication A4 below):
 
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P2-055` | The final step of implement is to commit the work to the current branch. | `reference/sergeant-upstream/.agents/skills/implement/SKILL.md` (body, lines 15-15) |
+
+## Adjudication A4
+
+N1 adjudication A4 (finding N1-BH-02, `reference-corpus/adjudication-round1.md`): every stage whose `CONTEXT.md` justification was only the §6.5 deterministic-machinery boilerplate is demoted by default, folded into the adjacent judgment-bearing stage as a helper invocation.
+
+- **`20-verify` — DEMOTED.** Classified at extraction as deterministic machinery (ladder §6.5) with no "Additional note" checkpoint argument; fails the reimplementation test as an independent checkpoint (running typecheck/tests is a repeatable operation subordinate to the implementation checkpoint, not itself a durable state anyone inspects). Folded into `10-implement-with-tdd` (its sole neighbor, and the stage whose ongoing judgment it is subordinate to) as a helper. `BU-P2-053` survives, re-homed.
+- **`40-commit` — DEMOTED.** Same boilerplate-only classification, no surviving checkpoint argument. Folded into `30-review` (its only neighbor; committing is the mechanical conclusion of a reviewed, verified change, not an independently observable checkpoint). `BU-P2-055` survives, re-homed. `30-review`'s output now carries the `promote` disposition `40-commit`'s output previously carried, since `30-review` is now the workflow's last stage.
 
 ## Notes
 

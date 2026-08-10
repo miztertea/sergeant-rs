@@ -47,15 +47,13 @@ Every checked tool is classified present / installable / unsupported; required g
   (trigger: the prerequisite verification step completes; outcome: installation only proceeds once the specific capability surface it depends on is proven present, not merely assumed from a tool's name being on PATH)
   — `BU-P8-042`, `reference/sergeant-upstream/docs/getting-started.md` (L51-53)
 
-> **Read `pane`/`tmux` above as this project's durable execution/session identity, not literally.** Old Sergeant's tmux pane is obsolete here (deviation register D2; `reference-corpus/synthesis.md` §4 clusters M1-M4) — `BU-P5-010`, `BU-P8-041` carry a durable identity/liveness/ownership policy that survives the pane; the pane itself does not.
+Per A11 and the workflow-level `CONTEXT.md`'s "Notes for reviewers" section: read `pane`/`tmux` in `BU-P5-010` and `BU-P8-041` above as this project's durable execution/session identity, not literally — old Sergeant's tmux pane is obsolete here (deviation register D2). That reading rule is stated once at the workflow level rather than repeated per stage.
 
-## Deterministic-machinery candidate
+## Judgment required (kept per N1 adjudication A4)
 
-Classified at extraction as deterministic machinery crossing this checkpoint (ladder §6.5) — a repeatable operation subordinate to the stage's outcome. No `kind = "execute"` stage exists in the current engine (N1 is content-only; the governing proposal's Phase B is not adopted at this milestone), so this remains an ordinary actor stage: the acting harness performs or invokes the equivalent deterministic step(s) itself (a helper script, or the operations named in the behavior contract above) and reports the structured result. It is a candidate `execute`-stage workload the moment that stage kind exists (proposal §12.3, §9.7).
+This stage was originally extracted as "Deterministic-machinery candidate" (§6.5), but that classification does not survive §6.3's reimplementation test: the behavior contract's actual gate — "does not continue past Phase 1 until every required prerequisite is present **or the user explicitly accepts the risk of proceeding without it**" (`BU-P5-013`) — requires an actor to ask the user and weigh a risk-acceptance exception, structurally identical to the confirm-then-act pattern this package's other stages (`05`, `10`, `20`, `30`, `40`, `60`, `70`) are already classified "Judgment required" for. Swapping the detection tool (a different shell probe, a different mise task) would leave that risk-acceptance gate completely unchanged — it is not incidental machinery, it is the checkpoint. **Kept as an actor stage; reclassified from §6.5 to §6.4.** See `provenance.md`'s "Adjudication A4" section.
 
-## Additional note
-
-BU-P7-026 is cross-referenced from the shared-context map (§3b `skill-discovery`, per synthesis.md's † marker) rather than owned here — it is repeated because the same probe rule (accept any of OpenCode/Claude/Goose as a satisfying harness) is this stage's own prerequisite check.
+The original Additional note is preserved unaffected by this reclassification: `BU-P7-026` is cross-referenced from the shared-context map (§3b `skill-discovery`, per synthesis.md's † marker) rather than owned here — it is repeated because the same probe rule (accept any of OpenCode/Claude/Goose as a satisfying harness) is this stage's own prerequisite check.
 
 ## Output
 

@@ -171,7 +171,7 @@ row.
 | `mise.toml` | P6 | 5 | BU-P6-001 BU-P6-002 BU-P6-003 BU-P6-004 BU-P6-005 | helper-map.md (install-plumbing) ×2; draft-workflows/sergeant-setup/; helper-map.md (capability-probe); helper-map.md (harness-registry) |
 | `opencode.json` | P6 | 1 | BU-P6-006 | shared-context-map.md (skill-discovery) |
 | `schema/project.yaml.example` | P7 | 4 | BU-P7-001 BU-P7-002 BU-P7-003 BU-P7-004 | shared-context-map.md (project-configuration) ×2; draft-workflows/dispatch/; draft-workflows/project-graph/ |
-| `scripts/hooks/pre-push` | P6 | 3 | BU-P6-007 BU-P6-008 BU-P6-009 | draft-workflows/repo-release-verification/ ×2; helper-map.md (install-plumbing) |
+| `scripts/hooks/pre-push` | P6 | 3 | BU-P6-007 BU-P6-008 BU-P6-009 | draft-workflows/validate-and-ship/ ×2 (re-homed from draft-workflows/repo-release-verification/, N1 adjudication A6 — see Tombstones); helper-map.md (install-plumbing) |
 | `skills/cross-repo-work/SKILL.md` | P5 | 16 | BU-P5-038 BU-P5-039 BU-P5-040 BU-P5-041 BU-P5-042 BU-P5-043 BU-P5-044 BU-P5-045 BU-P5-046 BU-P5-047 BU-P5-048 BU-P5-049 BU-P5-050 BU-P5-051 BU-P5-052 BU-P5-053 | draft-workflows/cross-repo-work/ ×15; draft-workflows/load-project/ |
 | `skills/dispatch/SKILL.md` | P5 | 36 | BU-P5-054 BU-P5-055 BU-P5-056 BU-P5-057 BU-P5-058 BU-P5-059 BU-P5-060 BU-P5-061 BU-P5-062 BU-P5-063 BU-P5-064 BU-P5-065 BU-P5-066 BU-P5-067 BU-P5-068 BU-P5-069 BU-P5-070 BU-P5-071 BU-P5-072 BU-P5-073 BU-P5-074 BU-P5-075 BU-P5-076 BU-P5-077 BU-P5-078 BU-P5-079 BU-P5-080 BU-P5-081 BU-P5-082 BU-P5-083 BU-P5-084 BU-P5-085 BU-P5-086 BU-P5-087 BU-P5-088 BU-P5-089 | draft-workflows/dispatch/ ×28; obsolete-mechanisms.md (M2 Pane as the worker's process) ×2; helper-map.md (worktree-pool) ×2; draft-workflows/cross-repo-work/; obsolete-mechanisms.md (M5 Loose worktree files as durable state); engine-pressure.md (G2 fleet identity + dependency advance); engine-pressure.md (G6 child-workflow invocation) |
 | `skills/load-project/SKILL.md` | P5 | 23 | BU-P5-090 BU-P5-091 BU-P5-092 BU-P5-093 BU-P5-094 BU-P5-095 BU-P5-096 BU-P5-097 BU-P5-098 BU-P5-099 BU-P5-100 BU-P5-101 BU-P5-102 BU-P5-103 BU-P5-104 BU-P5-105 BU-P5-106 BU-P5-107 BU-P5-108 BU-P5-109 BU-P5-110 BU-P5-111 BU-P5-112 | draft-workflows/load-project/ ×17; draft-workflows/project-graph/ ×5; permanent-instructions.md (Article VII — Instruction and documentation authority) |
@@ -236,3 +236,9 @@ row.
 | `tests/sgt-worker-model-tuple-test.sh` | P7 | 1 | BU-P7-111 | draft-workflows/dispatch/ |
 | `tests/sgt-worker-readiness-test.sh` | P7 | 1 | BU-P7-110 | draft-workflows/worker-mission/ |
 | `tests/sgt-worker-test.sh` | P7 | 1 | BU-P7-106 | obsolete-mechanisms.md (M2 Pane as the worker's process) |
+
+## Tombstones
+
+Destinations removed after this map was built, with where their units actually live now.
+
+- **`draft-workflows/repo-release-verification/`** (candidate **W19**, `synthesis.md` §1) — removed per N1 adjudication A6 (finding N1-BH-06, `adjudication-round1.md`). The package was demoted from a standalone workflow: its split from `validate-and-ship` during synthesis was file-shape mirroring (matching the proposal's own worked example by name), and §6.2's workflow test was never actually argued for it. Its two units, `BU-P6-007` and `BU-P6-008` (this repository's own git pre-push hook), are re-homed as a helper inside `draft-workflows/validate-and-ship/20-select-intent-transport/`. The row above (`scripts/hooks/pre-push`) has been updated in place to point at the new destination; this entry is the tombstone for the removed package directory itself. See `draft-workflows/validate-and-ship/provenance.md`'s "Re-homed from repo-release-verification (A6)" section for the full record.

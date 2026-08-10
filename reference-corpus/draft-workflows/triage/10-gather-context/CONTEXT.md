@@ -4,17 +4,17 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../00-show-attention/output/README.md | L4 | upstream artifact produced by `00-show-attention` |
+| ../CONTEXT.md | L1 | workflow orientation (first stage only, since `00-show-attention` was demoted into this stage — N1 adjudication A4) |
 
 ## Purpose
 
-The item and prior notes are read; an already-implemented check and out-of-scope-KB concept match are run.
+Three fixed attention buckets are shown, oldest first; the item and prior notes are read; an already-implemented check and out-of-scope-KB concept match are run.
 
 Trigger (workflow-level): An item is at the front of one of the three fixed attention buckets, oldest first.
 
 ## What must become true here (durable outcome)
 
-The item and prior notes are read; an already-implemented check and out-of-scope-KB concept match are run.
+Three fixed attention buckets are shown, oldest first; the item and prior notes are read; an already-implemented check and out-of-scope-KB concept match are run.
 
 ## Behavior contract
 
@@ -28,6 +28,20 @@ The item and prior notes are read; an already-implemented check and out-of-scope
 ## Judgment required
 
 This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+
+## Helper invocation: show attention
+
+Demoted from a standalone stage (`00-show-attention`) at N1 adjudication A4: its only stage-level justification was the §6.5 deterministic-machinery boilerplate, with no additional checkpoint argument, so it folds into this stage as a helper invocation performed before gathering context on the selected item. No `kind = "execute"` stage exists in the current engine, so the acting harness performs the query itself:
+
+- **When asked what needs attention, the workflow queries the tracker and presents three fixed buckets ordered oldest-first.**
+  (trigger: the maintainer asks what needs attention; outcome: three ordered buckets of attention-worthy items are shown)
+  — `BU-P3-062`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 58)
+- **The third discovery bucket is needs-info items where the reporter has posted activity since the last triage notes, signaling they need re-evaluation.**
+  (trigger: an item is in needs-info and the reporter has replied; outcome: the item surfaces in the attention list for re-evaluation)
+  — `BU-P3-063`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 62)
+- **The discovery bucket filter excludes non-external PRs, but this filter applies only to unprompted discovery — an explicitly named PR is triaged regardless of who authored it.**
+  (trigger: PRs are included in the attention buckets; outcome: internal PRs never appear via discovery, but can always be triaged by explicit request)
+  — `BU-P3-064`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 64)
 
 ## Output
 

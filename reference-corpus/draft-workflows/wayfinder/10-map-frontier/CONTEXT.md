@@ -8,13 +8,13 @@
 
 ## Purpose
 
-Breadth-first mapping; stop and do not create a map if no fog exists.
+Breadth-first mapping; stop and do not create a map if no fog exists; specifiable decisions then become child issues first, with blocking edges wired in a second pass.
 
 Trigger (workflow-level): A destination is named that requires mapping fog before it can be reached.
 
 ## What must become true here (durable outcome)
 
-Breadth-first mapping; stop and do not create a map if no fog exists.
+Breadth-first mapping; stop and do not create a map if no fog exists; specifiable decisions become child issues first, blocking edges wired in a second pass.
 
 ## Behavior contract
 
@@ -34,6 +34,14 @@ Breadth-first mapping; stop and do not create a map if no fog exists.
 ## Judgment required
 
 This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+
+## Helper invocation: create tickets
+
+Demoted from a standalone stage (`20-create-tickets`) at N1 adjudication A4: its only stage-level justification was the §6.5 deterministic-machinery boilerplate, with no additional checkpoint argument, so it folds into this stage as a helper invocation performed once the frontier is mapped. No `kind = "execute"` stage exists in the current engine, so the acting harness performs the ticket-creation operation itself:
+
+- **When creating a wayfinder map, create the tickets that can already be specified as child issues first, then wire their blocking edges in a second pass, because issues need ids before they can reference each other.**
+  (trigger: specifiable decisions have been identified during charting; outcome: the resulting ticket set has correct blocking edges despite the two-pass creation order)
+  — `BU-P4-096`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Chart the map, L114)
 
 ## Output
 

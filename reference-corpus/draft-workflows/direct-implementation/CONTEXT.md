@@ -20,12 +20,12 @@ The user explicitly asks to work in this session, and one repository owns the co
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
 | `01-load-task-context` | actor-stage (§6.4, judgment) | The task's originating context is loaded and understood. |
-| `02-reconcile-existing-state` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Existing branch/worktree/handoff state is inspected and resumed rather than duplicated. |
-| `03-claim-and-implement` | actor-stage (§6.4, judgment) | The task is claimed and the change is implemented. |
+| `03-claim-and-implement` | actor-stage (§6.4, judgment) | The task is claimed and the change is implemented; folds the demoted `02-reconcile-existing-state` checkpoint as a helper (N1 adjudication A4). |
 | `04-validate` | actor-stage (§6.4, judgment) | The change is validated against native project checks. |
 | `05-shipping-gate` | actor-stage (§6.4, judgment) | The shipping gate runs at the approved boundary only. |
-| `06-pr-and-merge` | actor-stage (§6.4, judgment) | A PR is opened and merged per repository convention. |
-| `07-record-outcomes` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Outcomes are recorded against the owning tracked task. |
+| `06-pr-and-merge` | actor-stage (§6.4, judgment) | A PR is opened and merged per repository convention; folds the demoted `07-record-outcomes` checkpoint as a helper (N1 adjudication A4). |
+
+`02-reconcile-existing-state` and `07-record-outcomes` were demoted per N1 adjudication A4 (finding N1-BH-02): both were classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate. Their behavior units survive, folded into the adjacent judgment-bearing stage as helper invocations — see each stage's own `CONTEXT.md` and `provenance.md`'s "Adjudication A4" section.
 
 ## Relationships to other workflows
 

@@ -19,12 +19,13 @@ A topic needs to be researched, or docs/API facts need gathering, and reading le
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-investigate` | actor-stage (§6.4, judgment) | Primary sources only, every claim traced. |
-| `10-write-findings` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | One Markdown file, every claim cited, placed per the repo's convention or an explicitly stated choice. |
+| `00-investigate` | actor-stage (§6.4, judgment) | Primary sources only, every claim traced; one Markdown file, every claim cited, placed per the repo's convention or an explicitly stated choice. |
 
 ## Notes for reviewers
 
 Delegated to a background execution context (BU-P3-041) — that delegation is a *scheduling* property of how research is invoked, not a stage of the procedure itself.
+
+**N1 adjudication A4:** the former `10-write-findings` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `00-investigate` as a helper invocation. See `provenance.md`'s "Adjudication A4" section.
 
 ## Provenance
 

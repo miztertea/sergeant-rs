@@ -19,10 +19,10 @@ Explicitly invoked to implement a defined piece of work (never auto-loaded).
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `10-implement-with-tdd` | actor-stage (§6.4, judgment) | Implementation proceeds seam by seam. |
-| `20-verify` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Typecheck and focused tests run during implementation; the full suite runs once at the end. |
-| `30-review` | actor-stage (§6.4, judgment) | The change is reviewed. |
-| `40-commit` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The verified change is committed. |
+| `10-implement-with-tdd` | actor-stage (§6.4, judgment) | Implementation proceeds seam by seam; folds the demoted `20-verify` checkpoint as a helper (N1 adjudication A4). |
+| `30-review` | actor-stage (§6.4, judgment) | The change is reviewed; folds the demoted `40-commit` checkpoint as a helper (N1 adjudication A4). |
+
+`20-verify` and `40-commit` were demoted per N1 adjudication A4 (finding N1-BH-02): both were classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate. Their behavior units survive, folded into the adjacent judgment-bearing stage as helper invocations — see each stage's own `CONTEXT.md` and `provenance.md`'s "Adjudication A4" section.
 
 ## Relationships to other workflows
 

@@ -2,7 +2,7 @@
 kind: workflow
 name: sergeant-setup
 status: draft
-version: 1
+version: 2
 description: >-
   Bring an installation from any partial state to a verified-complete state without ever silently reconfiguring anything the operator did not consent to.
 tags:

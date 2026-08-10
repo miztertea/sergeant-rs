@@ -5,5 +5,5 @@
 
 [workflow]
 name = "route-review-findings"
-version = "1"
+version = "2"
 stages = ["00-publish-or-clear-gate"]

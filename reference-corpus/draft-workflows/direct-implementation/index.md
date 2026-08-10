@@ -2,7 +2,7 @@
 kind: workflow
 name: direct-implementation
 status: draft
-version: 1
+version: 2
 description: >-
   Implement in the current session, against one owning repository, under the same delivery contract as a dispatched worker.
 tags:

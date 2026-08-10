@@ -22,9 +22,9 @@ For Sergeant-owned skills: update this repository through a reviewed PR and run 
   (trigger: updating a Sergeant-owned skill; outcome: no Sergeant-owned skill changes ship without passing review and the full test suite, including the instruction-policy test)
   — `BU-P1-127`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L142-144, Sergeant-owned update path)
 
-## Deterministic-machinery candidate
+## Judgment required
 
-Classified at extraction as deterministic machinery crossing this checkpoint (ladder §6.5) — a repeatable operation subordinate to the stage's outcome. No `kind = "execute"` stage exists in the current engine (N1 is content-only; the governing proposal's Phase B is not adopted at this milestone), so this remains an ordinary actor stage: the acting harness performs or invokes the equivalent deterministic step(s) itself (a helper script, or the operations named in the behavior contract above) and reports the structured result. It is a candidate `execute`-stage workload the moment that stage kind exists (proposal §12.3, §9.7).
+Reclassified from `stage (§6.3, deterministic-machinery candidate)` to actor-stage at N1 adjudication A4: the checkpoint here is not running the test suite (deterministic machinery) but the decision that gates it — updating only through a reviewed PR, i.e. human review plus a passing instruction-policy test and full suite before changes ship. That decision survives any reimplementation of how the tests themselves are run (§6.3's test), so it is genuine judgment: the acting harness must prepare the change for review and confirm the gating conditions are met, or explain why not — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
 
 ## Additional note
 

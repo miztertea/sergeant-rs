@@ -5,5 +5,5 @@
 
 [workflow]
 name = "grill-with-docs"
-version = "1"
-stages = ["00-interview-loop", "10-confirm-understanding", "20-capture-decisions"]
+version = "2"
+stages = ["00-interview-loop", "10-confirm-understanding"]

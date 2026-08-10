@@ -2,7 +2,7 @@
 kind: workflow
 name: vet-external-skill
 status: draft
-version: 1
+version: 2
 description: >-
   Vet an external skill through a fixed sequence before adopting it, and keep already-adopted skills updated through the same discipline.
 tags:

@@ -5,5 +5,5 @@
 
 [workflow]
 name = "wayfinder"
-version = "1"
-stages = ["00-name-destination", "10-map-frontier", "20-create-tickets", "30-resolve-one", "40-regraduate-fog"]
+version = "2"
+stages = ["00-name-destination", "10-map-frontier", "30-resolve-one", "40-regraduate-fog"]

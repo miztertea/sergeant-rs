@@ -2,7 +2,7 @@
 kind: workflow
 name: project-graph
 status: draft
-version: 1
+version: 2
 description: >-
   Produce exactly one merged, published graph per project, outside every source repository, usable for architecture questions.
 tags:

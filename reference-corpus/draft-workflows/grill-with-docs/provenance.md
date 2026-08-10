@@ -16,9 +16,7 @@ No directly-cited units (delegated or structural — see the stage's own CONTEXT
 
 ### `10-confirm-understanding`
 
-No directly-cited units (delegated or structural — see the stage's own CONTEXT.md).
-
-### `20-capture-decisions`
+No directly-cited units against the confirmation-gate content. The following are cited as a helper invocation folded from the demoted `20-capture-decisions` stage:
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -28,4 +26,8 @@ No directly-cited units (delegated or structural — see the stage's own CONTEXT
 ## Notes
 
 **Synthesis notes:** This is the corpus's cleanest example of workflow composition **without** nesting — representable today by inlining `grilling`'s two stages ahead of the capture step, which is why it does *not* raise an engine gap. Explicit-invocation-only (BU-P3-002).
+
+## Adjudication A4
+
+- **`20-capture-decisions` — DEMOTED.** Its CONTEXT.md carried only the §6.5 deterministic-machinery boilerplate ("candidate execute-stage workload") with no additional checkpoint argument (no "Additional note" section). Per A4's default rule, folded into `10-confirm-understanding` as a helper invocation; `BU-P3-001`/`BU-P3-003` and the stage's citations move with it. The stage directory is removed; `10-confirm-understanding` absorbs the workflow's terminal `promote` output disposition.
 

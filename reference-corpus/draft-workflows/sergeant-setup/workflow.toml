@@ -5,5 +5,5 @@
 
 [workflow]
 name = "sergeant-setup"
-version = "1"
-stages = ["00-detect-prerequisites", "05-file-capability-gaps", "10-install-commands", "20-global-config", "30-project-interview", "40-repair-existing", "50-sync-and-verify", "60-task-tracking-init", "70-optional-capabilities", "90-completion-summary"]
+version = "2"
+stages = ["00-detect-prerequisites", "05-file-capability-gaps", "10-install-commands", "20-global-config", "30-project-interview", "40-repair-existing", "60-task-tracking-init", "70-optional-capabilities"]

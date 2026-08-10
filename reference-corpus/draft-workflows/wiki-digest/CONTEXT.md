@@ -19,16 +19,13 @@ A digest is due (scheduled) or explicitly requested; or the schema/logic changed
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-read-schema` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The schema is read before any behavior change; a missing schema stops the run before any page is written. |
-| `10-dry-run` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | A dry run always runs first when regenerating or changing logic. |
-| `20-inspect-preview` | actor-stage (§6.4, judgment) | Secrets, duplicate entities, wrong outcomes, unresolved errors are checked; a secret stops the run and only the source *class* is recorded. |
-| `30-generate` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Synthesis, never a transcript; collected from every configured source with unavailable ones silently skipped. |
-| `40-publish-and-index` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The page exists and is linked, or the page is kept, its path reported, and the digest marked incomplete; an existing page is never overwritten with less information. |
-| `50-log-ingest` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The ingest is logged. |
+| `00-inspect-preview` | actor-stage (§6.4, judgment; absorbs `00-read-schema`, `10-dry-run`, `30-generate`, `40-publish-and-index`, `50-log-ingest` per A4) | Secrets, duplicate entities, wrong outcomes, unresolved errors are checked; a secret stops the run and only the source *class* is recorded. |
 
 ## Notes for reviewers
 
 P5's `wiki` and P6's `wiki-daily-digest` are the same procedure (conflict X9b) and are folded together here.
+
+**N1 adjudication A4 (finding N1-BH-02).** This package originally decomposed the digest pipeline into six stages mirroring a linear script pipeline (read schema → dry run → inspect preview → generate → publish and index → log ingest). Only `20-inspect-preview` was ever classified "Judgment required" (§6.4); the other five were justified solely by the §6.5 deterministic-machinery boilerplate, and none carried an "Additional note" checkpoint argument. All five demote by A4's default rule and fold into the single review checkpoint, renamed `00-inspect-preview` (now the workflow's sole stage). This is the honest reading of a package whose original six-stage shape used a future `execute`-stage kind as its justification (convention §5 rule 1 forbids exactly this): the digest job is a scripted pipeline with one human-in-the-loop gate, not six independent durable checkpoints. Stage count drops from 6 to 1; the behavior units survive — see `00-inspect-preview/CONTEXT.md`'s "Helpers (folded per N1 adjudication A4)" section and `provenance.md`.
 
 ## Provenance
 

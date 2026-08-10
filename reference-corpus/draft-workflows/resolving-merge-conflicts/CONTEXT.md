@@ -19,11 +19,10 @@ A git merge or rebase is in a conflicted state.
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-assess-state` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The current merge/rebase state is assessed. |
-| `10-research-intent` | actor-stage (§6.4, judgment) | The intent behind each conflicting side is researched. |
-| `20-resolve-hunks` | actor-stage (§6.4, judgment) | Both intents are preserved, or one is picked with the trade-off recorded; behavior is never invented; the merge is never aborted. |
-| `30-validate` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Typecheck, tests, format run in that order. |
-| `40-finish` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The merge/rebase is completed. |
+| `10-research-intent` | actor-stage (§6.4, judgment) | The intent behind each conflicting side is researched; folds the demoted `00-assess-state` checkpoint as a helper (N1 adjudication A4). |
+| `20-resolve-hunks` | actor-stage (§6.4, judgment) | Both intents are preserved, or one is picked with the trade-off recorded; behavior is never invented; the merge is never aborted; folds the demoted `30-validate` and `40-finish` checkpoints as helpers (N1 adjudication A4). |
+
+`00-assess-state`, `30-validate`, and `40-finish` were demoted per N1 adjudication A4 (finding N1-BH-02): each was classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate. Their behavior units survive, folded into the adjacent judgment-bearing stage as helper invocations — see each stage's own `CONTEXT.md` and `provenance.md`'s "Adjudication A4" section.
 
 ## Provenance
 

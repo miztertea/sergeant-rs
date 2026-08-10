@@ -22,9 +22,9 @@ For skills.sh-managed skills: rerun the official installer and inspect the diff 
   (trigger: updating a skills.sh-managed skill; outcome: no update is accepted without inspecting its diff and lock-file change first)
   — `BU-P1-126`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L138-139, skills.sh update path)
 
-## Deterministic-machinery candidate
+## Judgment required
 
-Classified at extraction as deterministic machinery crossing this checkpoint (ladder §6.5) — a repeatable operation subordinate to the stage's outcome. No `kind = "execute"` stage exists in the current engine (N1 is content-only; the governing proposal's Phase B is not adopted at this milestone), so this remains an ordinary actor stage: the acting harness performs or invokes the equivalent deterministic step(s) itself (a helper script, or the operations named in the behavior contract above) and reports the structured result. It is a candidate `execute`-stage workload the moment that stage kind exists (proposal §12.3, §9.7).
+Reclassified from `stage (§6.3, deterministic-machinery candidate)` to actor-stage at N1 adjudication A4: the checkpoint here is not the installer rerun (external, deterministic machinery outside Sergeant's control) but the decision that follows it — inspecting the diff and updated lock file and deciding whether to accept the update. That decision survives any reimplementation of how the installer itself is invoked (§6.3's test), so it is genuine judgment: the acting harness must inspect evidence and decide whether to accept the update, or explain why not — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
 
 ## Additional note
 

@@ -2,7 +2,7 @@
 kind: workflow
 name: wiki-digest
 status: draft
-version: 1
+version: 2
 description: >-
   Generate and publish a schema-driven wiki digest from configured sources, previewed before publication and never regressing an existing page.
 tags:

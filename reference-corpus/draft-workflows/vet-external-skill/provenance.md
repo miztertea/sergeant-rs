@@ -34,17 +34,12 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 |---|---|---|
 | `BU-P1-123` | Verify the external skill does not conflict with repository AGENTS.md or safety policy. | `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L129, vet step 4) |
 
-### `40-pin-source`
-
-| Unit | Statement | Source |
-|---|---|---|
-| `BU-P1-124` | Pin or lock the external skill's source where the installer supports it. | `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L130, vet step 5) |
-
 ### `50-test-in-disposable-copy`
 
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P1-125` | Test the external skill in a disposable repository or worktree before broad installation. | `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L131, vet step 6) |
+| `BU-P1-124` (helper invocation, folded from demoted `40-pin-source`) | Pin or lock the external skill's source where the installer supports it. | `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L130, vet step 5) |
 
 ### `60-update-managed`
 
@@ -60,5 +55,11 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 
 ## Notes
 
-**Synthesis notes:** Six ordered checkpoints (`00`-`50`) plus two mutually exclusive update variants (`60-update-managed`/`60-update-owned`) reached only when refreshing an already-adopted skill. Each step's outcome ("the source was read", "the actions were checked", "it was tested in a disposable copy") survives any reimplementation of *how* the checking is done — a strong candidate for the smallest complete reference workflow in the corpus.
+**Synthesis notes:** Five ordered checkpoints (`00`-`30`, `50`) plus two mutually exclusive update variants (`60-update-managed`/`60-update-owned`) reached only when refreshing an already-adopted skill. Each step's outcome ("the source was read", "the actions were checked", "it was tested in a disposable copy") survives any reimplementation of *how* the checking is done — a strong candidate for the smallest complete reference workflow in the corpus.
+
+## Adjudication A4
+
+- **`40-pin-source` — DEMOTED.** Its CONTEXT.md carried only the §6.5 deterministic-machinery boilerplate ("candidate execute-stage workload") with no additional checkpoint argument (no "Additional note" section). Per A4's default rule, folded into `50-test-in-disposable-copy` as a helper invocation; `BU-P1-124` moves with it. The stage directory is removed; `50-test-in-disposable-copy`'s Inputs table now points to `30-verify-no-conflict/output/README.md`. No renumbering: `00`, `10`, `20`, `30`, `50`, `60`/`60` remain correctly ordered without `40`.
+- **`60-update-managed` — KEPT (reclassified).** Carried the §6.5 boilerplate plus a real "Additional note": it is an alternate entry point (reached only when updating an already-adopted, skills.sh-managed skill, not during the `00`-`50` sequence) and mutually exclusive with `60-update-owned`. Judged against §6.3's reimplementation test: the checkpoint is not the installer mechanism but the decision to accept the update after inspecting its diff/lock-file change — that decision is unchanged by any reimplementation of the installer, so it is genuine judgment, not subordinate machinery. There is also no larger stage for it to be "subordinate" to (it is an independent alternate-entry checkpoint, not a step inside another stage's crossing). Argument survives — kept, and reclassified from `stage (§6.3, deterministic-machinery candidate)` to `actor-stage (§6.4, judgment)`; its CONTEXT.md's "Deterministic-machinery candidate" section is replaced with a "Judgment required" section, the "Additional note" is preserved unchanged.
+- **`60-update-owned` — KEPT (reclassified).** Same reasoning as `60-update-managed`: the "Additional note" establishes it as the mutually-exclusive alternate-entry counterpart, and the actual checkpoint — gating changes on a reviewed PR plus a passing instruction-policy test and full suite — is a genuine judgment/review gate that survives reimplementation of the test-runner mechanism. Kept and reclassified identically.
 

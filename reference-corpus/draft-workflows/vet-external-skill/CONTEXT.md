@@ -23,14 +23,15 @@ Before adopting an external skill, or when an adopted skill needs updating.
 | `10-confirm-provenance` | actor-stage (§6.4, judgment) | The external skill's source and update mechanism are confirmed. |
 | `20-check-actions` | actor-stage (§6.4, judgment) | The external skill's filesystem, shell, network, Git, and credential actions are checked. |
 | `30-verify-no-conflict` | actor-stage (§6.4, judgment) | The external skill does not conflict with repository AGENTS.md or safety policy. |
-| `40-pin-source` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The external skill's source is pinned or locked where the installer supports it. |
-| `50-test-in-disposable-copy` | actor-stage (§6.4, judgment) | The external skill is tested in a disposable repository or worktree before broad installation. |
-| `60-update-managed` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | For skills.sh-managed skills: rerun the official installer and inspect the diff and updated lock file before accepting changes. |
-| `60-update-owned` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | For Sergeant-owned skills: update this repository through a reviewed PR and run the instruction-policy test plus the full test suite. |
+| `50-test-in-disposable-copy` | actor-stage (§6.4, judgment) | The external skill's source is pinned or locked where the installer supports it; the skill is tested in a disposable repository or worktree before broad installation. |
+| `60-update-managed` | actor-stage (§6.4, judgment — reclassified, N1 adjudication A4) | For skills.sh-managed skills: rerun the official installer and inspect the diff and updated lock file before accepting changes. |
+| `60-update-owned` | actor-stage (§6.4, judgment — reclassified, N1 adjudication A4) | For Sergeant-owned skills: update this repository through a reviewed PR and run the instruction-policy test plus the full test suite. |
 
 ## Notes for reviewers
 
-Six ordered checkpoints (`00`-`50`) plus two mutually exclusive update variants (`60-update-managed`/`60-update-owned`) reached only when refreshing an already-adopted skill. Each step's outcome ("the source was read", "the actions were checked", "it was tested in a disposable copy") survives any reimplementation of *how* the checking is done — a strong candidate for the smallest complete reference workflow in the corpus.
+Five ordered checkpoints (`00`-`30`, `50`) plus two mutually exclusive update variants (`60-update-managed`/`60-update-owned`) reached only when refreshing an already-adopted skill. Each step's outcome ("the source was read", "the actions were checked", "it was tested in a disposable copy") survives any reimplementation of *how* the checking is done — a strong candidate for the smallest complete reference workflow in the corpus.
+
+**N1 adjudication A4:** the former `40-pin-source` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `50-test-in-disposable-copy` as a helper invocation. `60-update-managed` and `60-update-owned` also carried the §6.5 boilerplate, but each also carried a real "Additional note" checkpoint argument; judged against §6.3's reimplementation test, both are KEPT (their outcome — a human/agent decision to accept an update after inspection — survives any reimplementation of the underlying installer/test mechanism) and reclassified from `stage (§6.3, deterministic-machinery candidate)` to `actor-stage (§6.4, judgment)`. No renumbering: `00`, `10`, `20`, `30`, `50`, `60`/`60` remain correctly ordered without `40`. See `provenance.md`'s "Adjudication A4" section.
 
 ## Provenance
 

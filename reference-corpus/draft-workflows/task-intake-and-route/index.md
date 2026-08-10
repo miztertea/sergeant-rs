@@ -2,7 +2,7 @@
 kind: workflow
 name: task-intake-and-route
 status: draft
-version: 1
+version: 2
 description: >-
   The standing entry procedure every task passes through before any implementation workflow starts: it turns a user request into a chosen, scoped execution mode.
 tags:

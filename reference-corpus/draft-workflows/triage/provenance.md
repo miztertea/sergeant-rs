@@ -20,20 +20,15 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 
 ## Stages
 
-### `00-show-attention`
-
-| Unit | Statement | Source |
-|---|---|---|
-| `BU-P3-062` | When asked what needs attention, the workflow queries the tracker and presents three fixed buckets ordered oldest-first. | `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 58) |
-| `BU-P3-063` | The third discovery bucket is needs-info items where the reporter has posted activity since the last triage notes, signaling they need re-evaluation. | `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 62) |
-| `BU-P3-064` | The discovery bucket filter excludes non-external PRs, but this filter applies only to unprompted discovery — an explicitly named PR is triaged regardless of who authored it. | `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 64) |
-
 ### `10-gather-context`
 
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P3-065` | Triaging a specific item begins by fully reading the item and prior triage notes, exploring the codebase via its domain glossary and ADRs, and running two checks: whether the behavior is already implemented (by domain concept, not literal wording) and whether the request resembles a prior recorded out-of-scope rejection. | `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 70) |
 | `BU-P3-089` | Matching a new issue against the out-of-scope KB is done by concept similarity rather than literal keyword overlap. | `reference/sergeant-upstream/.agents/skills/triage/OUT-OF-SCOPE.md` (line 75) |
+| `BU-P3-062` (helper invocation, folded from demoted `00-show-attention`) | When asked what needs attention, the workflow queries the tracker and presents three fixed buckets ordered oldest-first. | `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 58) |
+| `BU-P3-063` (helper invocation, folded from demoted `00-show-attention`) | The third discovery bucket is needs-info items where the reporter has posted activity since the last triage notes, signaling they need re-evaluation. | `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 62) |
+| `BU-P3-064` (helper invocation, folded from demoted `00-show-attention`) | The discovery bucket filter excludes non-external PRs, but this filter applies only to unprompted discovery — an explicitly named PR is triaged regardless of who authored it. | `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 64) |
 
 ### `20-verify`
 
@@ -71,4 +66,8 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 ## Notes
 
 **Synthesis notes:** `resume` and `quick-override` (BU-P3-075, BU-P3-073) are documented re-entry variants of this same stage sequence, not separate stage directories. BU-P3-060's transition graph is explicitly non-linear (loops, maintainer override at any point) — the source extractor considered and rejected an engine-gap claim for it, and that rejection is upheld here: each transition is a fresh invocation of a stage, not a control-flow construct the runtime must own.
+
+## Adjudication A4
+
+- **`00-show-attention` — DEMOTED.** Its CONTEXT.md carried only the §6.5 deterministic-machinery boilerplate ("candidate execute-stage workload") with no additional checkpoint argument (no "Additional note" section). Per A4's default rule, folded into `10-gather-context` as a helper invocation; `BU-P3-062`/`BU-P3-063`/`BU-P3-064` and the stage's citations move with it. The stage directory is removed. No renumbering needed: the remaining ordinals `10-50` are already in correct order without a leading `00`.
 

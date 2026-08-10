@@ -4,7 +4,7 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../30-publish/output/README.md | L4 | upstream artifact produced by `30-publish` |
+| ../20-confirm-breakdown/output/README.md | L4 | upstream artifact produced by `20-confirm-breakdown` (absorbed the demoted `30-publish` stage — N1 adjudication A4) |
 
 ## Purpose
 

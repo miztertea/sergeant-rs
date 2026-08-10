@@ -5,5 +5,5 @@
 
 [workflow]
 name = "implement"
-version = "1"
-stages = ["10-implement-with-tdd", "20-verify", "30-review", "40-commit"]
+version = "2"
+stages = ["10-implement-with-tdd", "30-review"]

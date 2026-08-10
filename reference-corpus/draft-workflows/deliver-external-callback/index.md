@@ -2,7 +2,7 @@
 kind: workflow
 name: deliver-external-callback
 status: draft
-version: 1
+version: 2
 description: >-
   Durable at-least-once notification to a registered external consumer.
 tags:

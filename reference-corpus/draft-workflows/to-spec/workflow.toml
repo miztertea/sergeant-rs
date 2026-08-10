@@ -5,5 +5,5 @@
 
 [workflow]
 name = "to-spec"
-version = "1"
-stages = ["00-gather-context", "10-sketch-seams", "20-write-and-publish"]
+version = "2"
+stages = ["00-gather-context", "10-sketch-seams"]

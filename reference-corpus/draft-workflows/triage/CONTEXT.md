@@ -19,8 +19,7 @@ An item is at the front of one of the three fixed attention buckets, oldest firs
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-show-attention` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Three fixed buckets, oldest first. |
-| `10-gather-context` | actor-stage (§6.4, judgment) | The item and prior notes are read; an already-implemented check and out-of-scope-KB concept match are run. |
+| `10-gather-context` | actor-stage (§6.4, judgment) | Three fixed buckets, oldest first; the item and prior notes are read; an already-implemented check and out-of-scope-KB concept match are run. |
 | `20-verify` | actor-stage (§6.4, judgment) | The claim is reproduced or the PR diff is tested, reported as confirmed/failed/insufficient. |
 | `30-recommend` | actor-stage (§6.4, judgment) | A category/state proposal is made, then the run waits for direction. |
 | `40-grill-if-underspecified` | actor-stage (§6.4, judgment) | Underspecified items are escalated to an interview. |
@@ -33,6 +32,8 @@ An item is at the front of one of the three fixed attention buckets, oldest firs
 ## Notes for reviewers
 
 `resume` and `quick-override` (BU-P3-075, BU-P3-073) are documented re-entry variants of this same stage sequence, not separate stage directories. BU-P3-060's transition graph is explicitly non-linear (loops, maintainer override at any point) — the source extractor considered and rejected an engine-gap claim for it, and that rejection is upheld here: each transition is a fresh invocation of a stage, not a control-flow construct the runtime must own.
+
+**N1 adjudication A4:** the former `00-show-attention` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-gather-context` as a helper invocation. Stage ordinals are unchanged (`10`-`50` are already correctly ordered without `00`) — see `provenance.md`'s "Adjudication A4" section.
 
 ## Provenance
 

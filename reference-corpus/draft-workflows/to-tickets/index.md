@@ -2,7 +2,7 @@
 kind: workflow
 name: to-tickets
 status: draft
-version: 1
+version: 2
 description: >-
   Break a plan, spec, investigation, findings register, PR, or conversation into dependency-aware tracer-bullet work.
 tags:

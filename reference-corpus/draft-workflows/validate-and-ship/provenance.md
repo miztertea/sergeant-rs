@@ -1,42 +1,39 @@
 # Provenance — Validate and Ship (no-mistakes)
 
-Maps every stage (and every workflow-level citation) to the behavior units that justify it, per `docs/gauntlet/contracts/N1.md` and `docs/icm/record-shapes.md` §3. Source snapshot: `reference/sergeant-upstream` at the SHA recorded in `reference/UPSTREAM.md`. Synthesis basis: `reference-corpus/synthesis.md` §1, candidate **W18** `validate-and-ship`.
+Maps every stage (and every workflow-level citation) to the behavior units that justify it, per `docs/gauntlet/contracts/N1.md` and `docs/icm/record-shapes.md` §3. Source snapshot: `reference/sergeant-upstream` at the SHA recorded in `reference/UPSTREAM.md`. Synthesis basis: `reference-corpus/synthesis.md` §1, candidate **W18** `validate-and-ship`. Restructured per N1 adjudication (`reference-corpus/adjudication-round1.md` A4, A5, A6).
 
 ## Workflow-level citations
 
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P2-057` | no-mistakes is a local gate that validates code changes through a fixed pipeline of stages — intent, rebase, review, test, document, lint, push, PR, CI — before they reach the configured push target. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (gate description, lines 15-16) |
-| `BU-P2-058` | When the user invokes /no-mistakes, the actor reports the outcome at the end; if the user asks for something specific (e.g. 'skip the lint step'), the actor translates that request into the matching `axi run` flag itself (e.g. `--skip=lint`), consulting `axi run --help` for available flags. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (invocation, lines 20-23) |
 | `BU-P1-071` | A run may be started from an intent file (--intent-file) or an inline intent string (--intent). | `reference/sergeant-upstream/README.md` (README.md L271-273, invocation forms) |
 | `BU-P1-078` | If the outcome is failed or cancelled, inspect branch_sync state first: sync means run axi sync, continue_active_run means keep driving the reported run, and recover_custody means run axi sync --recover. | `reference/sergeant-upstream/README.md` (README.md L295-298, branch_sync remediation) |
 | `BU-P2-101` | A fixed set of read-only or narrowly-scoped inspection/control commands exists: `axi` (home view), `axi status` (full detail plus cached branch_sync), `axi sync --check` (verify an offered plan), `axi sync` (apply an offered plan), `axi sync --recover` (return custody), `axi logs --step <name> --full`, `axi abort` (current-branch run), `axi abort --run <id>` (specific run, works outside its worktree). | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Inspecting-state command reference, lines 253-262) |
 | `BU-P2-102` | Output is TOON (`key: value` pairs, `name[N]{cols}:` tables, `help[N]:` hints); a non-terminal run object may include `awaiting_agent: parked <duration>`; a `running`/`fixing` run may include an `active_steps` table; the bottom `help` list names next commands; errors print as `error: ...` with a `help` list; exit codes are `0` (success/no-op/normal gate), `1` (failed/cancelled terminal outcomes), `2` (bad usage). | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Output format and exit codes, lines 264-271) |
+| `BU-P6-129` | Launching the shipping-gate validator is its own bounded, independently invocable top-level procedure — a coordinator-owned validation run launched beside an interactive worker's task — distinct from the worker's own mission; the specific preconditions that gate it (readiness marker, isolated snapshot, resolved ownership) are separately recorded, each on its own stronger citation, as sibling units of this same workflow. | `reference/sergeant-upstream/bin/sgt-validate` (L2) — `confidence: low` per N1 adjudication A10 (finding N1-BH-08): narrowed from a four-requirement over-claim on a single 83-character header-comment quote to only the coarse workflow-boundary claim that quote actually supports. |
 
 ## Stages
 
-### `00-verify-readiness`
+### `00-check-scope`
 
 | Unit | Statement | Source |
 |---|---|---|
-| `BU-P6-130` | A validation run can only be launched once the worker has published a readiness marker asserting the exact intent revision, the exact reviewed head commit, and that all three independent review axes (standards, spec, readiness) explicitly passed — a stale head, a mismatched intent revision, or any axis not equal to 'passed' each refuse the launch with its own specific reason. | `reference/sergeant-upstream/bin/sgt-validate` (L236-269) |
-| `BU-P8-082` | A worker may only request the final no-mistakes boundary by writing durable validation-ready evidence (intent_revision, head_sha, and pass/fail for standards/spec/readiness review) and notifying the coordinator; the worker itself is forbidden from running no-mistakes. | `reference/sergeant-upstream/docs/using-sergeant.md` (L312-317 (Final no-mistakes boundary)) |
+| `BU-P2-059` | no-mistakes has two invocation modes: validate-only, where the user's changes are already committed and the actor just validates and reports; and task-first, where the actor first carries out the described task, then validates the result. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Two ways to invoke, lines 30-31) |
+| `BU-P2-058` | When the user invokes /no-mistakes, the actor reports the outcome at the end; if the user asks for something specific (e.g. 'skip the lint step'), the actor translates that request into the matching `axi run` flag itself (e.g. `--skip=lint`), consulting `axi run --help` for available flags. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (invocation, lines 20-23) |
 
-### `10-acquire-launch-reservation`
+Restored per N1 adjudication A5 — see "Adjudication A5" below.
 
-| Unit | Statement | Source |
-|---|---|---|
-| `BU-P8-084` | Before cloning the validation checkout or publishing any launch state, the coordinator must acquire an identity-checked validation-launch reservation for that exact task/repository pair, and concurrent launch attempts fail closed until the recorded owner exits or stale-ownership recovery proves the reservation abandoned. | `reference/sergeant-upstream/docs/using-sergeant.md` (L328-331) |
-| `BU-P6-129` | Launching the shipping-gate validator is a bounded, gated procedure: a coordinator-owned validation run requires a worker-published readiness marker proving the exact reviewed commit and every review axis passed, an isolated validation code snapshot preserving that exact commit, and either the original dispatching coordinator or an explicitly-claimed replacement to own it — with every precondition checked before any state is committed. | `reference/sergeant-upstream/bin/sgt-validate` (L2) |
-
-### `20-reserve-isolated-snapshot`
+### `10-do-the-work`
 
 | Unit | Statement | Source |
 |---|---|---|
-| `BU-P6-133` | Validation runs against a code-cloned isolated snapshot, not the worker's live worktree — created via a shared, no-checkout local clone then checked out at the exact reviewed commit, with an owner marker recorded inside the clone's own git directory — so a shipping-gate run can never observe a worktree the worker continues to mutate concurrently. | `reference/sergeant-upstream/bin/sgt-validate` (L829-845, L855-858) |
-| `BU-P6-044` | The isolated validation code snapshot's identity is re-verified against the reviewed commit immediately before invoking the shipping-gate tool — the snapshot must still be at the exact reviewed HEAD and have a clean tree — so validation can never silently run against code that changed after review. | `reference/sergeant-upstream/bin/sgt-validation-worker` (L123-129) |
+| `BU-P2-060` | In task-first mode, before changing or committing anything the actor inspects `git status`, preserves unrelated pre-existing uncommitted changes, and when committing, commits only the changes belonging to the user's task. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 1, lines 36-38) |
+| `BU-P2-061` | The actor makes the changes the task describes and commits them on a feature branch; if the user is on the repository's default branch, a feature branch must be created first, because the gate validates committed history on a non-default branch. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 2, lines 39-42) |
 
-### `30-select-intent-transport`
+Restored per N1 adjudication A5 — see "Adjudication A5" below.
+
+### `20-select-intent-transport`
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -46,13 +43,27 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P7-105` | sgt-validation-worker must pass the canonical intent to no-mistakes via an `--intent-file` path rather than inline content in argv (so intent content never appears in process arguments/listings), and capability-probing invocations of no-mistakes (--version, `axi run --help`) must not count as a validation run. | `reference/sergeant-upstream/tests/sgt-validation-worker-test.sh` (lines 37-38) |
 | `BU-P6-042` | Before invoking the shipping-gate tool, the validation worker re-reads and re-hashes the canonical intent file and refuses to proceed if its content changed since the coordinator's own initial verification, so a content edit made in the gap between launch and run is caught rather than silently validated. | `reference/sergeant-upstream/bin/sgt-validation-worker` (L172-183) |
 
-### `40-start-run`
+Folds the demoted `00-verify-readiness`, `10-acquire-launch-reservation`, `20-reserve-isolated-snapshot` checkpoints (original numbering) as helpers, coordinator-launched entry only (see "Adjudication A4" below):
 
 | Unit | Statement | Source |
 |---|---|---|
-| `BU-P2-059` | no-mistakes has two invocation modes: validate-only, where the user's changes are already committed and the actor just validates and reports; and task-first, where the actor first carries out the described task, then validates the result. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Two ways to invoke, lines 30-31) |
-| `BU-P2-060` | In task-first mode, before changing or committing anything the actor inspects `git status`, preserves unrelated pre-existing uncommitted changes, and when committing, commits only the changes belonging to the user's task. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 1, lines 36-38) |
-| `BU-P2-061` | The actor makes the changes the task describes and commits them on a feature branch; if the user is on the repository's default branch, a feature branch must be created first, because the gate validates committed history on a non-default branch. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 2, lines 39-42) |
+| `BU-P6-130` | A validation run can only be launched once the worker has published a readiness marker asserting the exact intent revision, the exact reviewed head commit, and that all three independent review axes (standards, spec, readiness) explicitly passed — a stale head, a mismatched intent revision, or any axis not equal to 'passed' each refuse the launch with its own specific reason. | `reference/sergeant-upstream/bin/sgt-validate` (L236-269) |
+| `BU-P8-082` | A worker may only request the final no-mistakes boundary by writing durable validation-ready evidence (intent_revision, head_sha, and pass/fail for standards/spec/readiness review) and notifying the coordinator; the worker itself is forbidden from running no-mistakes. | `reference/sergeant-upstream/docs/using-sergeant.md` (L312-317 (Final no-mistakes boundary)) |
+| `BU-P8-084` | Before cloning the validation checkout or publishing any launch state, the coordinator must acquire an identity-checked validation-launch reservation for that exact task/repository pair, and concurrent launch attempts fail closed until the recorded owner exits or stale-ownership recovery proves the reservation abandoned. | `reference/sergeant-upstream/docs/using-sergeant.md` (L328-331) |
+| `BU-P6-133` | Validation runs against a code-cloned isolated snapshot, not the worker's live worktree — created via a shared, no-checkout local clone then checked out at the exact reviewed commit, with an owner marker recorded inside the clone's own git directory — so a shipping-gate run can never observe a worktree the worker continues to mutate concurrently. | `reference/sergeant-upstream/bin/sgt-validate` (L829-845, L855-858) |
+| `BU-P6-044` | The isolated validation code snapshot's identity is re-verified against the reviewed commit immediately before invoking the shipping-gate tool — the snapshot must still be at the exact reviewed HEAD and have a clean tree — so validation can never silently run against code that changed after review. | `reference/sergeant-upstream/bin/sgt-validation-worker` (L123-129) |
+
+Also folds the re-homed `repo-release-verification` package as a helper (see "Re-homed from repo-release-verification (A6)" below):
+
+| Unit | Statement | Source |
+|---|---|---|
+| `BU-P6-007` | Before every git push, the drain test suite must run and pass; the push is blocked on failure unless the operator explicitly opts out with git push --no-verify. | `reference/sergeant-upstream/scripts/hooks/pre-push` (L2-11) |
+| `BU-P6-008` | If the tooling required to run the pre-push validation (mise, docker) is unavailable, the hook fails closed with exit 1 and an actionable message, rather than silently skipping validation and letting the push through. | `reference/sergeant-upstream/scripts/hooks/pre-push` (L29-33, L35-39) |
+
+### `30-start-run`
+
+| Unit | Statement | Source |
+|---|---|---|
 | `BU-P2-062` | The actor then validates, passing the user's task text as `--intent` verbatim, enriched with the decisions and tradeoffs made while doing the work. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 3, lines 43-47) |
 | `BU-P2-063` | The work to be validated must already be committed on a branch; the gate validates committed history, not the uncommitted working tree. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Before you start: committed work, lines 54-55) |
 | `BU-P2-064` | The actor must be on a feature branch, not the repository's default branch, before running the pipeline. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Before you start: feature branch, lines 56-56) |
@@ -70,7 +81,9 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P1-070` | Before starting a run: finish and commit on a feature branch, ensure no-mistakes doctor is healthy, and check no-mistakes axi for an already-active matching run — reattach rather than create a duplicate. | `reference/sergeant-upstream/README.md` (README.md L268, start preconditions) |
 | `BU-P1-042` | sgt-validate's default medium profile skips the redundant no-mistakes review and document stages. | `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L154-155) |
 
-### `50-drive-gates`
+Re-rung from a §6.5 deterministic-machinery classification to actor-stage per N1 adjudication A5 — see "Adjudication A5" below.
+
+### `40-drive-gates`
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -94,7 +107,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P1-072` | Do not use --yes; use --skip=<steps> only for stages already proven irrelevant — skipping is not a substitute for checks that have not been performed. | `reference/sergeant-upstream/README.md` (README.md L275) |
 | `BU-P2-103` | In a worked gate example, the actor decides each row by its `action` column — auto-fix findings can be authorized directly, ask-user findings must be escalated — while a terminal state instead shows `outcome: <checks-passed|passed|failed|cancelled>` with no findings table; field names and exact columns can vary by step and version, so the actor must read the actual `findings` header rather than assume a fixed layout. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Gate example / header-stability warning, lines 290-296) |
 
-### `60-route-findings`
+Folds the demoted `60-route-findings` checkpoint (original numbering) as a helper (see "Adjudication A4" below):
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -103,7 +116,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P1-080` | The no-mistakes run is validation-only and must not fix findings; actionable findings are routed into separate, deduplicated owning-repository td tasks with sgt-no-mistakes-finding. | `reference/sergeant-upstream/README.md` (README.md L304) |
 | `BU-P7-065` | Applying a disposition to a no-mistakes finding must route it through the same `td` invocation contract (run-id, head-sha, finding-id, severity, kind, file, line, description, intent) regardless of disposition, and the routing behavior itself (e.g. `--disposition td`) is directly observable in the exact `td` invocation logged. | `reference/sergeant-upstream/tests/sgt-no-mistakes-finding-test.sh` (lines 50-70, 88-90) |
 
-### `70-reconcile-custody`
+### `50-reconcile-custody`
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -115,7 +128,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P2-094` | After synchronization, the actor commits the follow-up on top and re-runs `no-mistakes axi run --intent "..."` with the original user intent, which preserves every prior gate-fix commit regardless of its configured subject. | `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (post-sync commit, lines 195-196) |
 | `BU-P1-079` | Never improvise a reset, stash, force-push, or branch replacement around a blocked sync state. | `reference/sergeant-upstream/README.md` (README.md L300) |
 
-### `80-close-out`
+### `60-close-out`
 
 | Unit | Statement | Source |
 |---|---|---|
@@ -128,14 +141,40 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P1-077` | Stop driving at checks-passed: the PR is ready and no-mistakes monitors it in the background, so do not poll or wait for merge. | `reference/sergeant-upstream/README.md` (README.md L293) |
 | `BU-P1-043` | Remediation that changes HEAD still requires independent rereview before updating the readiness marker, but must not trigger repeated no-mistakes review cycles. | `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L155-157) |
 
-### `90-handover-log`
+Folds the demoted `90-handover-log` checkpoint (original numbering) as a helper, statements already A11-normalized (see "Adjudication A4" below):
 
 | Unit | Statement | Source |
 |---|---|---|
-| `BU-P8-089` | Every ownership transfer is durably appended to an owner-only handover log recording timestamp, reason, repository, prior and new pane, and both identity tuples, and a release token is consumed by the claim that uses it so it can never be replayed by a third pane later. | `reference/sergeant-upstream/docs/using-sergeant.md` (L376-379) |
-| `BU-P7-104` | Coordinator-owned validation must distinguish its own diagnostics from a worker's, and must verify a handed-over coordinator pane's identity before proceeding, so validation ownership (who is allowed to run/approve no-mistakes) is never ambiguous between a worker pane and the coordinator. | `reference/sergeant-upstream/tests/sgt-validate-test.sh` (line 1180) |
+| `BU-P8-089` | Every ownership transfer is durably appended to an owner-only handover log recording timestamp, reason, repository, prior and new session, and both identity tuples, and a release token is consumed by the claim that uses it so it can never be replayed by a third pane later. | `reference/sergeant-upstream/docs/using-sergeant.md` (L376-379) |
+| `BU-P7-104` | Coordinator-owned validation must distinguish its own diagnostics from a worker's, and must verify a handed-over coordinator identity before proceeding, so validation ownership (who is allowed to run/approve no-mistakes) is never ambiguous between a worker and the coordinator. | `reference/sergeant-upstream/tests/sgt-validate-test.sh` (line 1180) |
+
+## Adjudication A4
+
+N1 adjudication A4 (finding N1-BH-02, `reference-corpus/adjudication-round1.md`): every stage whose `CONTEXT.md` justification was only the §6.5 deterministic-machinery boilerplate is demoted by default, folded into the adjacent judgment-bearing stage as a helper invocation. This package had five such stages (original numbering); none carried a real "Additional note" checkpoint argument, so all five are demoted:
+
+- **`00-verify-readiness` — DEMOTED.** No neighbor before it is judgment-bearing until `30-select-intent-transport` (`10-acquire-launch-reservation` and `20-reserve-isolated-snapshot`, its only intervening neighbors, are also demoted below); folds forward into the renumbered `20-select-intent-transport`. `BU-P6-130`, `BU-P8-082` survive, re-homed.
+- **`10-acquire-launch-reservation` — DEMOTED.** Same cascade; folds forward into `20-select-intent-transport`. `BU-P8-084` survives, re-homed. (`BU-P6-129`, originally co-cited here, is re-homed to the workflow-level table per N1 adjudication A10 — see that citation's own note.)
+- **`20-reserve-isolated-snapshot` — DEMOTED.** Its only actor-stage neighbor is `30-select-intent-transport` (original numbering); folds forward into it. `BU-P6-133`, `BU-P6-044` survive, re-homed.
+- **`60-route-findings` — DEMOTED.** Neighbors are `50-drive-gates` (before) and `70-reconcile-custody` (after, original numbering), both judgment-bearing. Folded into `50-drive-gates` (renumbered `40-drive-gates`): routing findings to `td` is the mechanical conclusion of driving every gate to a terminal outcome, not an independently observable checkpoint distinct from that outcome. `BU-P6-023`, `BU-P6-026`, `BU-P1-080`, `BU-P7-065` survive, re-homed.
+- **`90-handover-log` — DEMOTED.** Its only neighbor is `80-close-out` (original numbering, last stage); folds into it (renumbered `60-close-out`), which becomes the workflow's new last stage and inherits the `promote` output disposition `90-handover-log` previously carried. `BU-P8-089`, `BU-P7-104` survive, re-homed.
+
+No stage in this package carried a genuine "Additional note" checkpoint argument surviving §6.3's reimplementation test while classified §6.5 — every demotion above is a clean default case, not a close call.
+
+## Adjudication A5
+
+N1 adjudication A5 (finding N1-BH-04, `reference-corpus/adjudication-round1.md`): confirmed on both halves.
+
+- **Restored `00-check-scope`/`10-do-the-work`.** These two checkpoints (originally intended as `10-check-scope`/`20-do-the-work` per `reference-corpus/synthesis.md` §1's U2 verdict, covering `BU-P2-058`/`059`/`060`/`061`) were previously dissolved into workflow-level citations and package prose rather than materialized as stage directories, specifically to dodge an id collision with `10-acquire-launch-reservation`/`20-reserve-isolated-snapshot`. Adjudication A5 confirmed this was a violation: id collisions are resolved by renaming, never by dissolving an extracted checkpoint. Both are now materialized: `00-check-scope` (`BU-P2-058`, `BU-P2-059` — determine invocation mode, translate a specific user request into pipeline flags) and `10-do-the-work` (`BU-P2-060`, `BU-P2-061` — carry out and commit the task in task-first mode). Since the package was renumbered wholesale to fold five other stages (Adjudication A4 above), the original id collision no longer exists at any numbering; `00`/`10` were free and used directly rather than picking arbitrary alternate numbers.
+- **Re-rung `40-start-run` (now `30-start-run`) to an actor stage.** The original extraction classified it §6.5 deterministic machinery, but its own behavior contract carries real judgment: distinguishing which of two invocation modes applies, discovering and correctly handling an already-active in-flight run (reattach vs. leave-alone vs. never-bypass-via-abort), and composing an intent string rich enough for downstream review to distinguish a deliberate decision from a mistake are not mechanical lookups. See the stage's own `CONTEXT.md` "Additional note" for the full §6.3 reimplementation-test argument.
+- **Redesigned stage list.** With five stages demoted (A4) and two restored (A5) and one re-rung (A5), the package was renumbered `00`/`10`/`20`/.../`60` end to end rather than leaving the pre-adjudication numbering with gaps and a stale collision — see this package's top-level `CONTEXT.md` stage table and "Notes for reviewers" for the resulting coordinator-launched vs. directly-invoked entry-point documentation.
+
+## Re-homed from repo-release-verification (A6)
+
+N1 adjudication A6 (finding N1-BH-06, `reference-corpus/adjudication-round1.md`): the standalone `repo-release-verification` package (candidate **W19**, `reference-corpus/synthesis.md` §1) is demoted — its split from `validate-and-ship` during synthesis was file-shape mirroring (matching the proposal's own worked example by name) and §6.2's workflow test (recognizable trigger, bounded outcome, completion condition, evaluated *against alternatives*) was never actually argued for it. Per its own citation trail (`reference-corpus/provenance-map.md`'s `scripts/hooks/pre-push` row, and `reference-corpus/classification-ledger.md`'s X17 entry, which already named `validate-and-ship` as the concept this source file's naming pointed at), its behavior is re-homed here as a helper rather than resurrected as its own checkpoint:
+
+- `BU-P6-007` and `BU-P6-008` (this repository's own git pre-push hook: the drain suite must pass before every push; missing tooling fails closed) are folded into `20-select-intent-transport` as a helper (see that stage's own CONTEXT.md "Helper: repo-level pre-push gate"). This is a source-repository self-hosting behavior, not itself a checkpoint an actor decides at — every push in this repository is gated by it automatically, workflow-wide — so it is recorded as adjacent machinery at the point committed work first becomes eligible to be launched into validation, rather than claimed as a distinct durable outcome of any one stage.
+- The standalone `draft-workflows/repo-release-verification/` package directory has been removed. The tombstone is recorded in `reference-corpus/provenance-map.md`.
 
 ## Notes
 
-**Synthesis notes:** **U2 verdict** (`reference-corpus/synthesis.md` §1): the §6.3 reimplementation test *does* discriminate cleanly here, but only after the source's flat command list is split by outcome — the things that failed the test and became helpers, not stages, are the individual commands (`axi`, `axi status`, `axi logs`, `axi abort`, `axi sync --check`; BU-P2-101), the output grammar (BU-P2-102), the `--intent-file`/`--intent` flag choice (BU-P1-071), and the branch-sync decision table (BU-P1-078). Two entry variants share this stage list: coordinator-launched (starts at `00`) and directly-invoked (`/no-mistakes`, starts at `40`, with `10-check-scope`/`20-do-the-work` from BU-P2-058/059/060/061 preceding it in task-first mode — not materialized as separate stage directories here to avoid an id collision with `10-acquire-launch-reservation`/`20-reserve-isolated-snapshot`; recorded as a documented alternate entry point, not a distinct workflow).
-
+**Synthesis notes:** **U2 verdict** (`reference-corpus/synthesis.md` §1): the §6.3 reimplementation test *does* discriminate cleanly here, but only after the source's flat command list is split by outcome — the things that failed the test and became helpers, not stages, are the individual commands (`axi`, `axi status`, `axi logs`, `axi abort`, `axi sync --check`; BU-P2-101), the output grammar (BU-P2-102), the `--intent-file`/`--intent` flag choice (BU-P1-071), and the branch-sync decision table (BU-P1-078). Two entry variants share this stage list: coordinator-launched (starts at `20-select-intent-transport`) and directly-invoked (`/no-mistakes`, starts at `00-check-scope`, proceeding through `10-do-the-work` in task-first mode before rejoining the shared pipeline). See "Adjudication A5" above for the numbering history — both stages are now materialized directories, not a documented-only alternate entry point.

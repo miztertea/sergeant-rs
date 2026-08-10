@@ -2,7 +2,7 @@
 kind: workflow
 name: implement
 status: draft
-version: 1
+version: 2
 description: >-
   Implement a piece of work from a spec or ticket set, explicit-invocation-only.
 tags:

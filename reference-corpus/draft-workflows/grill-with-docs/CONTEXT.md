@@ -20,8 +20,7 @@ A plan or design needs interview-style stress-testing that should also produce d
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
 | `00-interview-loop` | actor-stage (§6.4, judgment) | One question at a time, waiting for each answer. |
-| `10-confirm-understanding` | actor-stage (§6.4, judgment) | An explicit user confirmation gate before any action. |
-| `20-capture-decisions` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Decisions landed during the interview are captured as ADRs/glossary entries per domain-modeling conventions. |
+| `10-confirm-understanding` | actor-stage (§6.4, judgment) | An explicit user confirmation gate before any action; decisions landed during the interview are captured as ADRs/glossary entries per domain-modeling conventions. |
 
 ## Relationships to other workflows
 
@@ -31,6 +30,8 @@ A plan or design needs interview-style stress-testing that should also produce d
 ## Notes for reviewers
 
 This is the corpus's cleanest example of workflow composition **without** nesting — representable today by inlining `grilling`'s two stages ahead of the capture step, which is why it does *not* raise an engine gap. Explicit-invocation-only (BU-P3-002).
+
+**N1 adjudication A4:** the former `20-capture-decisions` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-confirm-understanding` as a helper invocation. See `provenance.md`'s "Adjudication A4" section.
 
 ## Provenance
 

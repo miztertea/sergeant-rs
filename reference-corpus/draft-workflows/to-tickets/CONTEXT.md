@@ -21,13 +21,16 @@ The user says "to tickets", "create issues", "create td tasks", "make epics", or
 |---|---|---|
 | `00-load-project-context` | actor-stage (§6.4, judgment) | Project context is loaded. |
 | `10-extract-decisions-and-unknowns` | actor-stage (§6.4, judgment) | An investigation ticket is created only for a genuinely blocking unknown, naming the exact artifact it must produce. |
-| `20-confirm-breakdown` | actor-stage (§6.4, judgment) | Granularity, ownership and blocking edges are confirmed unless immediate publication was requested. |
-| `30-publish` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | New tickets stay open; cross-repo blockers recorded as counterpart ids plus merge order. |
+| `20-confirm-breakdown` | actor-stage (§6.4, judgment) | Granularity, ownership and blocking edges are confirmed unless immediate publication was requested; new tickets stay open, cross-repo blockers recorded as counterpart ids plus merge order. |
 | `40-report-frontier` | actor-stage (§6.4, judgment) | One worker per owning repo is the default; reporting is not authorization to dispatch. |
 
 ## Relationships to other workflows
 
 - `00-load-project-context` delegates to **load-project**.
+
+## Notes for reviewers
+
+**N1 adjudication A4:** the former `30-publish` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `20-confirm-breakdown` as a helper invocation. `40-report-frontier`'s upstream Inputs pointer moves to `20-confirm-breakdown`. No renumbering: `00`, `10`, `20`, `40` remain correctly ordered without `30`. See `provenance.md`'s "Adjudication A4" section.
 
 ## Provenance
 

@@ -20,8 +20,11 @@ A design needs to be turned into a spec-shaped ticket before implementation.
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
 | `00-gather-context` | actor-stage (§6.4, judgment) | Context is synthesized, never gathered by interview. |
-| `10-sketch-seams` | actor-stage (§6.4, judgment) | The fewest new seams at the highest possible seam, confirmed with the user. |
-| `20-write-and-publish` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | A fixed template is published to the tracker with the ready label. |
+| `10-sketch-seams` | actor-stage (§6.4, judgment) | The fewest new seams at the highest possible seam, confirmed with the user; a fixed template is published to the tracker with the ready label. |
+
+## Notes for reviewers
+
+**N1 adjudication A4:** the former `20-write-and-publish` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-sketch-seams` as a helper invocation. See `provenance.md`'s "Adjudication A4" section.
 
 ## Provenance
 

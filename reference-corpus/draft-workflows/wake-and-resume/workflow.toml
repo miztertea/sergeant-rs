@@ -6,4 +6,4 @@
 [workflow]
 name = "wake-and-resume"
 version = "1"
-stages = ["00-validate-condition", "10-evaluate", "20-classify-outcome", "30-resume"]
+stages = ["10-evaluate"]

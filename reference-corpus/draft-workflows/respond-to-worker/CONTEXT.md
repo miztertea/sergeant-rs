@@ -20,17 +20,22 @@ A worker has published an escalation and a human decision exists.
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
 | `00-precondition-check` | actor-stage (§6.4, judgment) | Exact question read, only genuinely missing decisions asked, decision recorded in tracked work, no unconsumed generation already pending. |
-| `10-validate-target` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The target's status is one of the four respondable states and its recorded identity/ownership evidence verifies; anything else refuses. |
-| `20-publish-response` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The response is durably stored (even under an active drain) before any delivery is attempted. |
-| `30-deliver-and-accept` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Bounded readiness gate; on timeout, a nonce-scoped unreachable record plus a recoverable gate — never a fabricated acknowledgement. |
-| `40-apply-and-acknowledge` | actor-stage (§6.4, judgment) | Decision applied once, truthful status restored, applied id/generation/status recorded, then acknowledged from the owning context. |
-| `50-archive-evidence` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Body, generation, applied status and proof archived atomically; the recorded generation is fixed at acknowledgement time. |
-| `60-notify-coordinator` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | The update is classified into exactly one durable event kind and recorded; live transports are optional on top. |
-| `70-relaunch-if-needed` | stage (§6.3, deterministic-machinery candidate — see stage CONTEXT.md) | Convergence attempted through the single finalizer before any refusal; superseded identities preserved as evidence. |
+| `40-apply-and-acknowledge` | actor-stage (§6.4, judgment) | Validate target, publish response, and deliver-and-accept run first (folded helpers); decision applied once, truthful status restored, applied id/generation/status recorded, acknowledged; archive evidence, notify coordinator, and relaunch-if-needed run after (further folded helpers). |
 
-## Notes for reviewers
+## Adjudication note (A4)
 
-**Reading `pane`/`tmux` in cited statements.** The following citations in this package's behavior contracts describe identity, liveness, or ownership checks in terms of old Sergeant's tmux pane: `BU-P6-080`, `BU-P7-041`, `BU-P7-048`, `BU-P7-058`, `BU-P7-059`, `BU-P7-060`. Per obsolete-mechanism clusters M1-M4 (`reference-corpus/synthesis.md` §4) and deviation register D2, this project structurally replaced the pane with headless per-turn processes owned by the daemon and a durable session/execution identity in the journal — there is no tmux pane in this architecture. Read every 'pane identity' / 'pane liveness' / 'pane recycling' phrase in those citations as **the durable execution or session identity this project already journals**, not as an instruction to introduce tmux. The policy (verify identity before acting, never infer liveness from a UI artifact, settle a lease before terminating) is durable; the pane is not.
+N1 adjudication A4 (BH-02) applied the generic de-staging sweep: the six
+extracted stages between and around this package's two judgment-bearing
+stages — `10-validate-target`, `20-publish-response`,
+`30-deliver-and-accept`, `50-archive-evidence`, `60-notify-coordinator`,
+`70-relaunch-if-needed` — carried no argument beyond the §6.5 "candidate
+execute-stage workload" boilerplate. `10`/`20`/`30` folded forward into
+`40-apply-and-acknowledge` as preceding helper invocations; `50`/`60`/`70`
+folded backward into it as following helper invocations (there is no
+judgment-bearing stage after `70` to fold forward into). Stage count
+dropped from 8 to 2; no behavior unit was deleted — see `provenance.md`'s
+"Adjudication A4" section and `40-apply-and-acknowledge/CONTEXT.md`'s
+"Helper invocations" section.
 
 ## Provenance
 

@@ -6,4 +6,4 @@
 [workflow]
 name = "worker-mission"
 version = "1"
-stages = ["00-pin-scope", "10-triage-and-route", "20-implement", "30-independent-review", "40-escalate-or-continue", "50-publish-result"]
+stages = ["10-triage-and-route", "20-implement", "30-independent-review", "40-escalate-or-continue"]

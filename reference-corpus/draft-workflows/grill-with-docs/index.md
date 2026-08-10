@@ -2,7 +2,7 @@
 kind: workflow
 name: grill-with-docs
 status: draft
-version: 1
+version: 2
 description: >-
   Runs the `grilling` interview while using the domain-modeling discipline to capture ADRs/glossary entries as decisions land.
 tags:

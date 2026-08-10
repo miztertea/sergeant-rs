@@ -4,7 +4,7 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../20-create-tickets/output/README.md | L4 | upstream artifact produced by `20-create-tickets` |
+| ../10-map-frontier/output/README.md | L4 | upstream artifact produced by `10-map-frontier` (absorbed the demoted `20-create-tickets` stage — N1 adjudication A4) |
 
 ## Purpose
 

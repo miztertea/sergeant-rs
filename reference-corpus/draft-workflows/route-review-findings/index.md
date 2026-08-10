@@ -2,7 +2,7 @@
 kind: workflow
 name: route-review-findings
 status: draft
-version: 1
+version: 2
 description: >-
   Turn independent review output into tracked work and a gate.
 tags:

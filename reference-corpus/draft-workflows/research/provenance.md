@@ -16,15 +16,14 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | Unit | Statement | Source |
 |---|---|---|
 | `BU-P3-042` | Research must be conducted against primary sources (official docs, source code, specs, first-party APIs) rather than secondary summaries, with every claim traced back to its owning source. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 1, line 10) |
-
-### `10-write-findings`
-
-| Unit | Statement | Source |
-|---|---|---|
-| `BU-P3-043` | The investigation's output is a single Markdown file where every claim carries a source citation. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 2, line 11) |
-| `BU-P3-044` | The findings file is placed according to the repository's existing note-keeping convention, or in a sensible location (with the choice explicitly stated) if no convention exists. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 3, line 12) |
+| `BU-P3-043` (helper invocation, folded from demoted `10-write-findings`) | The investigation's output is a single Markdown file where every claim carries a source citation. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 2, line 11) |
+| `BU-P3-044` (helper invocation, folded from demoted `10-write-findings`) | The findings file is placed according to the repository's existing note-keeping convention, or in a sensible location (with the choice explicitly stated) if no convention exists. | `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 3, line 12) |
 
 ## Notes
 
 **Synthesis notes:** Delegated to a background execution context (BU-P3-041) — that delegation is a *scheduling* property of how research is invoked, not a stage of the procedure itself.
+
+## Adjudication A4
+
+- **`10-write-findings` — DEMOTED.** Its CONTEXT.md carried only the §6.5 deterministic-machinery boilerplate ("candidate execute-stage workload") with no additional checkpoint argument (no "Additional note" section). Per A4's default rule, folded into `00-investigate` as a helper invocation; `BU-P3-043`/`BU-P3-044` and the stage's citations move with it. The stage directory is removed; `00-investigate` absorbs the workflow's terminal `promote` output disposition.
 

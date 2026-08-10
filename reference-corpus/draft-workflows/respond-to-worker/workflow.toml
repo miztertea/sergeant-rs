@@ -6,4 +6,4 @@
 [workflow]
 name = "respond-to-worker"
 version = "1"
-stages = ["00-precondition-check", "10-validate-target", "20-publish-response", "30-deliver-and-accept", "40-apply-and-acknowledge", "50-archive-evidence", "60-notify-coordinator", "70-relaunch-if-needed"]
+stages = ["00-precondition-check", "40-apply-and-acknowledge"]

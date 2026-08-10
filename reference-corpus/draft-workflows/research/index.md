@@ -2,7 +2,7 @@
 kind: workflow
 name: research
 status: draft
-version: 1
+version: 2
 description: >-
   Investigate a question against high-trust primary sources and capture the findings as a Markdown file in the repo.
 tags:
