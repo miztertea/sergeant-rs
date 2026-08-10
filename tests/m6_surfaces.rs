@@ -2349,9 +2349,11 @@ fn the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown() {
 /// a shell script outside the gate is a script whose checks are claims. The
 /// selftest itself needs no instrumented build and no collection run; it
 /// drives `common.sh`'s accounting against a scratch directory of empty
-/// `.profraw` files and asserts the thing that was measurably unenforceable
-/// before: that a stage which destroys an earlier stage's profiles fails.
-/// It used to print "stage ok" and exit 0.
+/// `.profraw` files and asserts the two things that were measurably
+/// unenforceable before: that a stage which destroys an earlier stage's
+/// profiles fails (it used to print "stage ok" and exit 0), and that C4's
+/// committed `profraw_merged` number is the profraw-list's line count rather
+/// than that count glued to the digits in its own path.
 #[test]
 fn the_coverage_harness_grades_its_own_accounting() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

@@ -57,8 +57,7 @@ AFTER_STAMP="$(stat -c %y "$PROFDATA")"
 [ "$AFTER_STAMP" != "$BEFORE_STAMP" ] || cov_fail "the .profdata did not change across the \
 report ($PROFDATA). The merge was skipped and these numbers are the previous run's."
 
-MERGED="$(find "$COV_TARGET_DIR" -maxdepth 1 -name '*-profraw-list' -exec wc -l {} + \
-  | tail -1 | tr -dc '0-9' || true)"
+MERGED="$(cov_profraw_list_lines)"
 {
   printf 'profraw_present\t%s\n' "$PROFRAWS"
   printf 'profraw_merged\t%s\n' "${MERGED:-unknown}"

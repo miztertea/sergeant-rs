@@ -9,13 +9,19 @@
 # to be true when someone tried:
 #
 #   * the profraw accounting computed additions only, so a stage that deleted
-#     every earlier stage's profile still printed "stage ok" and exit 0.
+#     every earlier stage's profile still printed "stage ok" and exit 0;
+#   * C4's committed `profraw_merged` number came from `wc -l | tr -dc '0-9'`,
+#     which glues the line count to any digits in the file's path in the
+#     single-file case — and cargo-llvm-cov 0.8.7 only ever writes one such
+#     file, so the single-file case is the only case.
 #
-# The fix is pinned here rather than by a real collection run, which costs ten
-# minutes and a cold DuckDB build. The cases run against a scratch
+# Both fixes are pinned here rather than by a real collection run, which costs
+# ten minutes and a cold DuckDB build. The cases run against a scratch
 # COV_TARGET_DIR full of empty files with `.profraw` names, with COV_PROFDATA
 # stubbed to `/bin/true` — the mergeability classifier is a separate claim
 # with its own evidence (README measured claim 6) and is not what these cases
+# are about. Deliberately: the scratch dir's path contains digits, because
+# that is what made the C4 idiom wrong.
 #
 # Runs in seconds, needs no instrumented build, and is executed by
 # `tests/m6_surfaces.rs` so the repo's ordinary gate covers it.
@@ -56,6 +62,21 @@ case_no_loss() {
   cov_stage_begin no-loss
   seed_profraws new-1 new-2
   cov_stage_end 2 "the pooling case: nothing before disappeared"
+}
+
+case_list_lines_single() {
+  printf '%s\n' /a.profraw /b.profraw /c.profraw > "$COV_TARGET_DIR/sergeant-rs-profraw-list"
+  cov_profraw_list_lines
+}
+
+case_list_lines_multi() {
+  printf '%s\n' /a.profraw /b.profraw /c.profraw > "$COV_TARGET_DIR/one-profraw-list"
+  printf '%s\n' /d.profraw > "$COV_TARGET_DIR/two-profraw-list"
+  cov_profraw_list_lines
+}
+
+case_list_lines_none() {
+  cov_profraw_list_lines
 }
 
 if [ "${1:-}" = "--case" ]; then
@@ -151,6 +172,23 @@ if [ -e "$TSV/no-loss-profraw-lost.txt" ]; then
 'checked and clean'"
 fi
 say "the pooling case is green and records profraw_lost 0"
+
+# 4. The merged-count idiom, in the shape cargo-llvm-cov 0.8.7 actually
+#    writes: exactly one list file, under a path containing digits.
+run list-lines-single
+[ "$RC" -eq 0 ] || fail "the single-list case errored: $OUT"
+if [ "$OUT" != "3" ]; then
+  fail "one 3-line profraw-list under a path containing digits must count 3, got '$OUT' \
+(the wc|tr idiom returned the line count glued to the path's digits)"
+else
+  say "one profraw-list of 3 lines counts 3, path digits and all"
+fi
+
+run list-lines-multi
+[ "$OUT" = "4" ] || fail "two profraw-lists of 3 and 1 lines must count 4, got '$OUT'"
+run list-lines-none
+[ "$OUT" = "0" ] || fail "no profraw-list at all must count 0, got '$OUT'"
+say "the count sums across list files and is 0 when there are none"
 
 if [ "$FAILURES" -gt 0 ]; then
   printf '\n\033[31mselftest: %s check(s) failed\033[0m\n' "$FAILURES" >&2

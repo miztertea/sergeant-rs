@@ -120,6 +120,23 @@ cov_profraw_mergeable() {
   "$COV_PROFDATA" merge -sparse -o /dev/null "$1" >/dev/null 2>&1
 }
 
+# How many profraw paths cargo-llvm-cov's own merge list(s) name — the
+# provenance number C4 commits beside the report.
+#
+# Not `wc -l … | tail -1 | tr -dc '0-9'`. That idiom reads wc's `total` line,
+# and wc prints one only when it is given two or more files — measured on
+# cargo-llvm-cov 0.8.7, which writes exactly ONE `<workspace>-profraw-list`
+# (report.rs: `target_dir.join(format!("{}-profraw-list", ws.name))`), so the
+# single-file branch is the only branch this harness ever takes. There
+# `tail -1` is `N /abs/path/…-profraw-list` and stripping non-digits glues N
+# to every digit in the path. Summing the per-file line counts is both
+# path-independent and correct for any number of list files.
+cov_profraw_list_lines() {
+  [ -d "$COV_TARGET_DIR" ] || { printf '0\n'; return 0; }
+  find "$COV_TARGET_DIR" -maxdepth 1 -name '*-profraw-list' -print0 2>/dev/null \
+    | xargs -0 -r cat 2>/dev/null | grep -c . || true
+}
+
 # Declare that this stage removes profraws on purpose, with the reason.
 #
 # Exactly one stage does: F2's census passes each open with
