@@ -129,6 +129,37 @@ pub struct StageDefinition {
     pub profile: Option<String>,
 }
 
+/// The executor decision for **one stage of one run**, resolved at plan time
+/// and pinned in `workflow.bound` (§12.5, §13.3, §17.5).
+///
+/// Why it is pinned rather than re-derived at each stage entry: §22.4 requires
+/// that "retry uses the same pinned stage harness/profile/model decision" and
+/// that "restart reconstructs the same decision from the journal". A decision
+/// re-derived at entry time would be re-derived against whatever the registry,
+/// the workspace's `sergeant.toml` and the harness probes say *then* — so a
+/// retry after an operator edited a profile, or a restart after a harness went
+/// unavailable, would silently run a different execution than the one the run
+/// was admitted with. Deciding once, before the Work exists, and journaling the
+/// answer is what makes §17.5's "reject before Work or worktree side effects"
+/// and §12.5's "no silent substitution" the same mechanism.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageBinding {
+    /// The stage this decision belongs to.
+    pub stage_id: String,
+    /// Its position in the workflow's stage order.
+    pub index: usize,
+    /// The executor kind (always `actor` this milestone).
+    #[serde(default)]
+    pub kind: StageKind,
+    /// The harness this stage runs on: a registered, probed-available backend.
+    pub harness: String,
+    /// Which §12.5 tier decided it (`stage_harness` / `work_actor_default`).
+    pub route_source: String,
+    /// The launch profile pinned for this stage, if any (§14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::domain::profile::Profile>,
+}
+
 /// A resolved workflow: ordered stages plus the identity of what produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowDefinition {

@@ -778,6 +778,12 @@ fn run_stage_view(run: &WorkRun) -> Option<Value> {
         "status": stage.status.as_str(),
         "detail": stage.detail,
         "of": run.workflow.as_ref().map(|w| w.stages.len()),
+        // Additive (§20.5, §13.3's "expose current-stage executor details in
+        // API views"). A mixed-harness run whose clients can only see the
+        // Work-level actor default cannot tell an operator which harness is
+        // actually holding the current checkpoint — which is the whole point
+        // of declaring one per stage.
+        "executor": run.stage_binding(&stage.stage_id, stage.index),
     }))
 }
 

@@ -25,7 +25,7 @@ use crate::domain::work::{
 use crate::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
     KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
-    StageRecord, StageStatus, WorkflowDefinition,
+    StageBinding, StageRecord, StageStatus, WorkflowDefinition,
 };
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::journal::JournalError;
@@ -329,6 +329,13 @@ pub struct WorkRun {
     /// Launch profile pinned at bind time (§14 — launch configuration only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    /// The per-stage executor decisions pinned at bind time (§12.5, §17.5).
+    ///
+    /// Empty for a run bound before N3, and for one whose every stage takes
+    /// the Work actor default — the two are the same fact, and `backend` /
+    /// `profile` above carry it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_bindings: Vec<StageBinding>,
 }
 
 impl WorkRun {
@@ -362,6 +369,34 @@ impl WorkRun {
         match &self.execution {
             Some(execution) if reservation.was_launched_as(execution) => None,
             _ => Some(reservation),
+        }
+    }
+
+    /// The pinned executor decision for one stage of this run (§12.5).
+    ///
+    /// Matched on the stage id *and* its index: a workflow may legally repeat
+    /// a harness across stages, but two stages never share a coordinate, and
+    /// resolving by id alone would let a workflow whose author reused an id
+    /// silently borrow another stage's harness.
+    pub fn stage_binding(&self, stage_id: &str, index: usize) -> Option<&StageBinding> {
+        self.stage_bindings
+            .iter()
+            .find(|b| b.stage_id == stage_id && b.index == index)
+    }
+
+    /// The launch profile in force for the stage this run is currently on.
+    ///
+    /// A stage with a pinned binding answers from it — including when the
+    /// answer is "no profile", which for a stage on a harness the Work-level
+    /// profile does not belong to is the only correct answer. Only a run with
+    /// no bindings at all (bound before N3) falls back to the Work profile.
+    pub fn current_stage_profile(&self) -> Option<Profile> {
+        match self
+            .current_stage()
+            .and_then(|s| self.stage_binding(&s.stage_id, s.index))
+        {
+            Some(binding) => binding.profile.clone(),
+            None => self.profile.clone(),
         }
     }
 
@@ -416,6 +451,14 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
                 run.backend = event.payload["backend"].as_str().map(str::to_string);
                 run.route_source = event.payload["route_source"].as_str().map(str::to_string);
                 run.profile = serde_json::from_value(event.payload["profile"].clone()).ok();
+                // Additive (§20.5). A `workflow.bound` journaled before N3's
+                // per-stage selection carries no `stage_bindings`, and an
+                // empty vec is exactly what that meant: every stage runs on
+                // the Work-level actor default, which `backend`/`profile`
+                // above already record.
+                run.stage_bindings =
+                    serde_json::from_value(event.payload["stage_bindings"].clone())
+                        .unwrap_or_default();
             }
         }
         KIND_SURFACE_MATERIALIZING => {

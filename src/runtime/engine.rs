@@ -43,11 +43,12 @@ use crate::domain::work::{
 use crate::domain::workflow::{
     DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
     KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageStatus, WorkflowDefinition, WorkflowError,
+    KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition, StageStatus,
+    WorkflowDefinition, WorkflowError,
 };
 use crate::domain::workspace::{RepositorySpec, Workspace, WorkspaceError};
 use crate::runtime::projection::WorkRun;
-use crate::runtime::router::{Route, RouteError, RouteInputs, route};
+use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage};
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfaceError,
     SurfacePlan, materialize, rematerialize, teardown,
@@ -91,6 +92,10 @@ pub struct StartPlan {
     pub route: Route,
     /// The launch profile, if one was selected.
     pub profile: Option<Profile>,
+    /// One resolved executor decision per stage (§12.5, §17.5's preflight).
+    /// Pinned into `workflow.bound` and read by every later stage entry, so a
+    /// retry and a restart reconstruct the same decision.
+    pub stage_bindings: Vec<StageBinding>,
 }
 
 /// An external effect the engine has committed to and must now perform
@@ -394,17 +399,7 @@ impl Engine {
         let profile = match context.profile {
             None => None,
             Some(name) => {
-                let profile = workspace.profile(name).cloned().ok_or_else(|| {
-                    EngineError::ProfileNotFound {
-                        requested: name.to_string(),
-                        available: workspace
-                            .profiles
-                            .iter()
-                            .map(|p| p.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    }
-                })?;
+                let profile = Self::workspace_profile(&workspace, name)?;
                 if profile.backend != route.backend {
                     return Err(EngineError::ProfileBackendMismatch {
                         profile: profile.name,
@@ -417,13 +412,124 @@ impl Engine {
             }
         };
 
+        // §17.5's whole-workflow preflight, run here — before a Work record
+        // and before a worktree — precisely so an unsatisfiable requirement is
+        // "reject the submission" rather than "a work that dies at stage 2".
+        let stage_bindings = self.bind_stages(&workspace, &workflow, &route, profile.as_ref())?;
+
         Ok(Some(StartPlan {
             workspace,
             repositories,
             workflow,
             route,
             profile,
+            stage_bindings,
         }))
+    }
+
+    /// Resolve every stage's executor before anything exists (§12.5, §17.5).
+    ///
+    /// This is the whole-workflow capability preflight. It walks the pinned
+    /// stage order and, for each stage, answers the two questions §12.5 poses:
+    /// *which harness runs this checkpoint* (an explicit `stage.harness`, else
+    /// the Work actor default, else fail with the available harnesses) and
+    /// *under which profile*. Both answers are checked against the registry as
+    /// it is now — a named harness must be registered **and** probe available
+    /// — so §17.5's "reject before Work or worktree side effects" is a
+    /// property of when this runs, not of a later guard.
+    ///
+    /// The probes it performs are also what makes the reservation phase cheap:
+    /// every harness this run will ever touch has been probed here, outside
+    /// the core lock, so the `prepare` the engine later calls under the lock
+    /// reads a warm cache instead of forking a version check (§22.6's
+    /// "probing a slow external executable"). That dependency is pinned by a
+    /// test rather than left to luck.
+    fn bind_stages(
+        &self,
+        workspace: &Workspace,
+        workflow: &WorkflowDefinition,
+        route: &Route,
+        work_profile: Option<&Profile>,
+    ) -> Result<Vec<StageBinding>, EngineError> {
+        let mut bindings = Vec::with_capacity(workflow.stages.len());
+        for (index, stage) in workflow.stages.iter().enumerate() {
+            let stage_route = route_stage(
+                stage.harness.as_deref(),
+                Some(route.backend.as_str()),
+                &self.backends,
+            )?;
+            let profile = self.stage_profile(workspace, stage, &stage_route, work_profile)?;
+            bindings.push(StageBinding {
+                stage_id: stage.id.clone(),
+                index,
+                kind: stage.kind,
+                harness: stage_route.backend,
+                route_source: stage_route.source.as_str().to_string(),
+                profile,
+            });
+        }
+        Ok(bindings)
+    }
+
+    /// One stage's launch profile: its own `[stage."<id>"] profile`, else the
+    /// Work-level one it inherits — and in both cases the profile must belong
+    /// to the harness this stage actually runs on (§22.4: "stage profile
+    /// belongs to its named harness").
+    ///
+    /// The inherited case is the one worth stating. A Work submitted
+    /// `--profile analysis` (a Claude profile) whose stage 10 declares
+    /// `harness = "codex"` has no honest answer: applying the profile would
+    /// hand Codex a Claude executable and permission mode, and dropping it
+    /// silently would run the stage under configuration the human never chose.
+    /// Both are the substitution §12.5 forbids, so it is refused here — before
+    /// the Work exists — naming the stage, so the fix (`profile` on that
+    /// stage's table) is obvious.
+    fn stage_profile(
+        &self,
+        workspace: &Workspace,
+        stage: &StageDefinition,
+        stage_route: &Route,
+        work_profile: Option<&Profile>,
+    ) -> Result<Option<Profile>, EngineError> {
+        let (profile, tier) = match stage.profile.as_deref() {
+            Some(name) => (
+                Some(Self::workspace_profile(workspace, name)?),
+                format!("stage {:?}", stage.id),
+            ),
+            None => (
+                work_profile.cloned(),
+                format!("inherited by stage {:?}", stage.id),
+            ),
+        };
+        let Some(profile) = profile else {
+            return Ok(None);
+        };
+        if profile.backend != stage_route.backend {
+            return Err(EngineError::ProfileBackendMismatch {
+                profile: profile.name,
+                profile_backend: profile.backend,
+                routed: stage_route.backend.clone(),
+                tier,
+            });
+        }
+        Ok(Some(profile))
+    }
+
+    /// A profile the workspace declares, or §14's "name them consistently"
+    /// error with the names that do exist.
+    fn workspace_profile(workspace: &Workspace, name: &str) -> Result<Profile, EngineError> {
+        workspace
+            .profile(name)
+            .cloned()
+            .ok_or_else(|| EngineError::ProfileNotFound {
+                requested: name.to_string(),
+                available: workspace
+                    .profiles
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })
     }
 
     /// Run §13's chain for a submission that has no repository surface, and
@@ -535,6 +641,10 @@ impl Engine {
                 "route_source": plan.route.source,
                 "profile": plan.profile,
                 "workspace": plan.workspace.name,
+                // §12.5's per-stage decisions, pinned with the procedure they
+                // belong to: the whole executor spec for the run, decided once
+                // and never re-derived (§22.4's retry and restart rows).
+                "stage_bindings": plan.stage_bindings,
             }),
         )?;
         self.transition(
@@ -1258,14 +1368,17 @@ impl Engine {
         let Some(surface) = run.surface.as_ref() else {
             return Ok(false);
         };
+        // Re-supplied from what sergeant journaled, never rebuilt from
+        // defaults: the pin and the profile are the human's decisions about
+        // cost and about permissions — and, since N3, the *stage's* decisions
+        // (§12.5). Re-adopting a stage 10 execution under stage 00's profile
+        // would be the same fabrication, one field further in.
+        let stage_profile = run.current_stage_profile();
         let request = ResumeRequest {
             work_id: work_id.to_string(),
             cwd: surface.execution_cwd(),
-            // Re-supplied from what sergeant journaled, never rebuilt from
-            // defaults: the pin and the profile are the human's decisions
-            // about cost and about permissions.
-            model: run.profile.as_ref().and_then(|p| p.default_model.clone()),
-            profile: run.profile.clone(),
+            model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
+            profile: stage_profile,
         };
         backend
             .resume(&handle_of(execution), &request)
@@ -1365,10 +1478,25 @@ impl Engine {
         let surface = run.surface.clone().ok_or_else(|| EngineError::NoRun {
             work_id: work_id.to_string(),
         })?;
-        let backend_name = run.backend.clone().ok_or_else(|| EngineError::NoRun {
-            work_id: work_id.to_string(),
-        })?;
-        let backend = self.backend_for(work_id, &backend_name)?;
+        // §12.5: the executor is the stage's, not the run's. The decision was
+        // made and journaled at bind time (`StageBinding`), so entering a
+        // stage never re-routes — a retry and a restart replay the same
+        // harness, profile and model the run was admitted with.
+        //
+        // A run bound before N3 has no bindings; its stages are the Work
+        // actor default, which is exactly what `run.backend`/`run.profile`
+        // say. Resolving the fallback here rather than at replay keeps the
+        // projection a pure fold of what the journal actually recorded.
+        let binding = run.stage_binding(&stage.id, index).cloned();
+        let (backend_name, stage_profile) = match &binding {
+            Some(binding) => (binding.harness.clone(), binding.profile.clone()),
+            None => (
+                run.backend.clone().ok_or_else(|| EngineError::NoRun {
+                    work_id: work_id.to_string(),
+                })?,
+                run.profile.clone(),
+            ),
+        };
         let intent = core
             .registry
             .state()
@@ -1384,6 +1512,35 @@ impl Engine {
             json!({"stage_id": stage.id, "index": index, "attempt": attempt}),
         )?;
 
+        // A harness the journal pinned but this daemon does not have is
+        // ambiguity, not a licence to fall back to the Work default: falling
+        // back is the silent substitution §12.5 forbids, and it would run the
+        // stage on a harness its author explicitly did not choose. The
+        // submission preflight (§17.5, `bind_stages`) already refused this
+        // case before the Work existed; reaching it here means the registry
+        // changed under a bound run — a daemon restarted without an adapter —
+        // and the honest answer is still to stop, not to pick a substitute.
+        let backend = match self.backends.get(&backend_name).cloned() {
+            Some(backend) => backend,
+            None => {
+                let detail = format!(
+                    "stage {:?} is pinned to harness {backend_name:?}, which is not registered \
+                     in this daemon (available: {}); sergeant will not substitute another \
+                     harness for a stage that named one",
+                    stage.id,
+                    self.backends.names().join(", "),
+                );
+                self.commit(
+                    core,
+                    work_id,
+                    KIND_STAGE_BLOCKED,
+                    json!({"stage_id": stage.id, "detail": detail}),
+                )?;
+                self.block(core, work_id, "stage harness is unavailable", Some(detail))?;
+                return Ok(Next::Parked);
+            }
+        };
+
         let execution_id = ulid::Ulid::generate().to_string();
         let request = StartRequest {
             work_id: work_id.to_string(),
@@ -1395,8 +1552,10 @@ impl Engine {
             // §12: procedure is data. The stage's CONTEXT.md is carried to
             // the actor verbatim; sergeant never interprets it.
             context: stage.context.clone(),
-            model: run.profile.as_ref().and_then(|p| p.default_model.clone()),
-            profile: run.profile.clone(),
+            // §24.8: the profile carries the model, so the stage's profile
+            // carries the stage's model. There is no per-stage model field.
+            model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
+            profile: stage_profile.clone(),
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -1426,7 +1585,7 @@ impl Engine {
             index,
             attempt,
             stage_kind: stage.kind.as_str().to_string(),
-            profile: run.profile.as_ref().map(|p| p.name.clone()),
+            profile: stage_profile.as_ref().map(|p| p.name.clone()),
             model: request.model.clone(),
         };
         self.commit(

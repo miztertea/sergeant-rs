@@ -666,9 +666,10 @@ async fn t3_full_run_completes_every_stage_and_retires_the_surface() {
     handle.shutdown().await;
 }
 
-/// N3 Outcome 2 (§12.2, §22.3): a `[stage."<id>"]` table's `kind`/`harness`/
-/// `profile` are pinned into `workflow.bound` verbatim, and — because the
-/// engine only ever consults the projection folded from that journaled
+/// N3 Outcomes 2+3 (§12.2, §12.5, §22.3): a `[stage."<id>"]` table's
+/// `kind`/`harness`/`profile` are pinned into `workflow.bound` verbatim, the
+/// named harness is the one that actually executes the stage, and — because
+/// the engine only ever consults the projection folded from that journaled
 /// event, never re-reading `workflow.toml` — an edit to the file after bind
 /// cannot retroactively change what a running Work sees, even mid-run.
 #[tokio::test]
@@ -677,6 +678,12 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     let data = TempDir::new().expect("tempdir");
     let repo = repos.path().join("solo");
     init_repo(&repo);
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+         [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n",
+    )
+    .expect("sergeant.toml");
     write_workflow_with_tables(
         &repo,
         "tagged-tiny",
@@ -688,12 +695,18 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     );
 
     // needs_input on the first stage gives a window, mid-run, to mutate the
-    // workflow's files on disk before the run continues.
-    let (registry, fake) = one_fake([
-        FakeStep::needs_input("continue?"),
-        FakeStep::complete_with("first done"),
-        FakeStep::complete_with("second done"),
-    ]);
+    // workflow's files on disk before the run continues. The two harnesses
+    // are separate registered identities, so which one ran each stage is a
+    // fact the test can read off the backends rather than infer.
+    let alt = FakeBackend::scripted(
+        "alt-harness",
+        [
+            FakeStep::needs_input("continue?"),
+            FakeStep::complete_with("first done"),
+        ],
+    );
+    let (registry, fake) = one_fake([FakeStep::complete_with("second done")]);
+    let registry = registry.with(Arc::new(alt.clone()));
     let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
     let client = http();
 
@@ -756,10 +769,25 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     .await;
     assert_eq!(status, 200, "input rejected: {body}");
     assert_eq!(body["work"]["state"], "completed");
-    let starts = fake.starts();
-    assert_eq!(starts.len(), 2);
+    // §12.5: the tagged stage ran on the harness it named, the untagged one
+    // on the Work actor default, and each start carries its stage's profile.
+    let alt_starts = alt.starts();
+    assert_eq!(alt_starts.len(), 1, "stage 00 runs on its named harness");
+    assert_eq!(alt_starts[0].stage_id, "00-first");
     assert_eq!(
-        starts[1].context, "second stage context",
+        alt_starts[0].profile.as_ref().map(|p| p.name.as_str()),
+        Some("alt-profile"),
+        "the stage's own profile travels with it"
+    );
+    let starts = fake.starts();
+    assert_eq!(
+        starts.len(),
+        1,
+        "the Work default runs only the untagged stage"
+    );
+    assert_eq!(starts[0].stage_id, "10-second");
+    assert_eq!(
+        starts[0].context, "second stage context",
         "a mid-run file edit must not reach a stage not yet entered"
     );
 
@@ -1186,6 +1214,341 @@ async fn t7_routing_precedence_and_structured_failure() {
     assert!(
         list["works"].as_array().expect("works").is_empty(),
         "a routing failure must not create work: {list}"
+    );
+    handle.shutdown().await;
+}
+
+// ------------------------------- §22.4. the per-stage harness routing matrix
+//
+// N3 Outcome 3 (§12.5): "stage harness explicit → else Work actor default via
+// today's routing chain → else fail with options. No silent substitution,
+// stage by stage." The matrix §22.4 requires has eight rows; each is named on
+// the assertion that covers it. Two registered fake harness identities —
+// `fake` and `alt-harness` — make "which harness ran this stage" a fact read
+// off the backends rather than inferred from a payload.
+
+/// A workspace whose `sergeant.toml` declares one profile per harness, and a
+/// three-stage workflow whose stage tables are `tables`.
+fn mixed_harness_repo(repo: &Path, tables: &str) {
+    init_repo(repo);
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        format!(
+            "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n\
+             default_model = \"alt-model-1\"\n\n\
+             [[profile]]\nname = \"default-profile\"\nbackend = \"{FAKE_BACKEND_NAME}\"\n\
+             default_model = \"default-model-1\"\n"
+        ),
+    )
+    .expect("sergeant.toml");
+    write_workflow_with_tables(
+        repo,
+        "mixed",
+        &[
+            ("00-a", "stage a context"),
+            ("10-b", "stage b context"),
+            ("20-a", "stage a again context"),
+        ],
+        tables,
+    );
+}
+
+/// §21.4's verbatim gate item and §22.4's rows 1, 2 and 6: one workflow runs
+/// **A → B → A** across two registered harness identities, the unqualified
+/// stage takes the Work actor default, and the explicit ones override it.
+#[tokio::test]
+async fn t7b_a_mixed_harness_workflow_runs_a_then_b_then_a() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    // Stage 10 is the only one that names a harness; 00 and 20 inherit the
+    // Work actor default. So the run is default → alt → default: A→B→A.
+    mixed_harness_repo(
+        &repo,
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
+    );
+
+    let alt = FakeBackend::new("alt-harness");
+    let (registry, fake) = one_fake([]);
+    let registry = registry.with(Arc::new(alt.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "A then B then A",
+        json!({"workflow": "mixed"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit rejected: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    // Row 6: the interleaving is real, not a payload claim.
+    let default_stages: Vec<String> = fake.starts().iter().map(|s| s.stage_id.clone()).collect();
+    let alt_stages: Vec<String> = alt.starts().iter().map(|s| s.stage_id.clone()).collect();
+    assert_eq!(
+        default_stages,
+        vec!["00-a".to_string(), "20-a".to_string()],
+        "row 1: every unqualified stage runs on the Work actor default"
+    );
+    assert_eq!(
+        alt_stages,
+        vec!["10-b".to_string()],
+        "row 2: an explicit stage harness overrides the Work default"
+    );
+
+    // Row 3: the stage's profile — and therefore its model (§24.8) — belongs
+    // to the harness that stage named.
+    assert_eq!(
+        alt.starts()[0].model.as_deref(),
+        Some("alt-model-1"),
+        "the stage profile's model reaches the stage's harness"
+    );
+    assert!(
+        fake.starts()[0].profile.is_none(),
+        "an unqualified stage with no Work profile carries none"
+    );
+
+    // The decision is pinned in `workflow.bound`, which is what a retry and a
+    // restart replay from.
+    let bound = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
+    let bindings = bound[0].payload["stage_bindings"]
+        .as_array()
+        .expect("stage_bindings")
+        .clone();
+    assert_eq!(bindings.len(), 3);
+    assert_eq!(bindings[0]["harness"], FAKE_BACKEND_NAME);
+    assert_eq!(bindings[0]["route_source"], "work_actor_default");
+    assert_eq!(bindings[1]["harness"], "alt-harness");
+    assert_eq!(bindings[1]["route_source"], "stage_harness");
+    assert_eq!(bindings[1]["profile"]["name"], "alt-profile");
+    assert_eq!(bindings[2]["harness"], FAKE_BACKEND_NAME);
+
+    handle.shutdown().await;
+}
+
+/// §22.4's rows 4 and 5, and §17.5: an explicit stage harness that is
+/// unavailable, unknown, or mismatched with its profile is refused **before
+/// Work or worktree side effects**, and never substituted.
+#[tokio::test]
+async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
+    let client = http();
+
+    // Row 4: registered but probe-unavailable.
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    mixed_harness_repo(
+        &repo,
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\n",
+    );
+    let alt = FakeBackend::new("alt-harness");
+    alt.set_available(false, "alt-harness is not logged in");
+    let (registry, fake) = one_fake([]);
+    let registry = registry.with(Arc::new(alt.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "unavailable stage harness",
+        json!({"workflow": "mixed"}),
+    )
+    .await;
+    assert_eq!(status, 422, "must be refused: {body}");
+    assert_eq!(body["error"]["code"], "backend_unavailable");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("alt-harness is not logged in"),
+        "the probe's own evidence must reach the user: {body}"
+    );
+    // Row 5 and §17.5: nothing was created, nothing was launched, and above
+    // all nothing ran on the *other* registered harness.
+    let list = get(&client, &handle, "/v1/work").await;
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "a stage-harness failure must not create work: {list}"
+    );
+    assert!(
+        fake.starts().is_empty() && alt.starts().is_empty(),
+        "no silent provider substitution"
+    );
+    assert!(
+        !data.path().join("surfaces").exists(),
+        "§17.5: rejected before worktree side effects"
+    );
+    handle.shutdown().await;
+
+    // Row 4, second shape: a harness no daemon here registers.
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    mixed_harness_repo(
+        &repo,
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"codex\"\n",
+    );
+    let (registry, fake) = one_fake([]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "unknown stage harness",
+        json!({"workflow": "mixed"}),
+    )
+    .await;
+    assert_eq!(status, 422, "must be refused: {body}");
+    assert_eq!(body["error"]["code"], "backend_not_found");
+    // The daemon registers the real Claude adapter alongside the scripted
+    // fake, so the options list names both; Codex is descoped (D6) and never
+    // registered, which is exactly why naming it fails.
+    assert_eq!(
+        body["error"]["available_backends"],
+        json!(["claude", FAKE_BACKEND_NAME])
+    );
+    assert!(fake.starts().is_empty(), "no silent provider substitution");
+    let list = get(&client, &handle, "/v1/work").await;
+    assert!(list["works"].as_array().expect("works").is_empty());
+    handle.shutdown().await;
+
+    // Row 3's negative: a stage profile that belongs to a different harness.
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    mixed_harness_repo(
+        &repo,
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\n\
+         profile = \"default-profile\"\n",
+    );
+    let (registry, fake) = one_fake([]);
+    let registry = registry.with(Arc::new(FakeBackend::new("alt-harness")));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "profile belongs elsewhere",
+        json!({"workflow": "mixed"}),
+    )
+    .await;
+    assert_eq!(status, 422, "must be refused: {body}");
+    assert_eq!(body["error"]["code"], "profile_backend_mismatch");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("10-b"),
+        "the offending stage must be named: {body}"
+    );
+    assert!(fake.starts().is_empty());
+    handle.shutdown().await;
+}
+
+/// §22.4's rows 7 and 8: **retry uses the same pinned stage decision**, and a
+/// **restart reconstructs it from the journal** — not from `workflow.toml`,
+/// which by then says something else entirely.
+#[tokio::test]
+async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    mixed_harness_repo(
+        &repo,
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
+    );
+
+    // Stage 00 completes on the default harness; stage 10 fails on alt.
+    let alt = FakeBackend::scripted(
+        "alt-harness",
+        [FakeStep::fail("alt could not finish"), FakeStep::complete()],
+    );
+    let (registry, fake) = one_fake([FakeStep::complete(), FakeStep::complete()]);
+    let registry = registry.with(Arc::new(alt.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "retry the pinned stage",
+        json!({"workflow": "mixed"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit rejected: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "failed", "{body}");
+
+    // The workflow on disk now says something different for that stage. A
+    // decision re-derived at retry time would pick this up; a pinned one
+    // cannot see it.
+    mixed_harness_repo(
+        &repo,
+        format!(
+            "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"{FAKE_BACKEND_NAME}\"\n\
+             profile = \"default-profile\"\n"
+        )
+        .as_str(),
+    );
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    let alt_attempts: Vec<(String, u32, Option<String>)> = alt
+        .starts()
+        .iter()
+        .map(|s| (s.stage_id.clone(), s.attempt, s.model.clone()))
+        .collect();
+    assert_eq!(
+        alt_attempts,
+        vec![
+            ("10-b".to_string(), 1, Some("alt-model-1".to_string())),
+            ("10-b".to_string(), 2, Some("alt-model-1".to_string())),
+        ],
+        "row 7: the retry re-entered the stage on the same pinned harness, \
+         profile and model"
+    );
+    assert_eq!(
+        fake.starts()
+            .iter()
+            .filter(|s| s.stage_id == "10-b")
+            .count(),
+        0,
+        "the edited file must not move a bound stage to another harness"
+    );
+    handle.shutdown().await;
+
+    // Row 8: a fresh daemon over the same journal — which re-reads nothing
+    // from the repository — re-derives the same executor for every stage.
+    let alt = FakeBackend::new("alt-harness");
+    let (registry, _fake) = one_fake([]);
+    let registry = registry.with(Arc::new(alt.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let view = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    let bound = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
+    let bindings = bound[0].payload["stage_bindings"]
+        .as_array()
+        .expect("stage_bindings")
+        .clone();
+    assert_eq!(bindings[1]["harness"], "alt-harness");
+    assert_eq!(bindings[1]["profile"]["default_model"], "alt-model-1");
+    assert_eq!(
+        view["stage"]["executor"]["harness"], FAKE_BACKEND_NAME,
+        "the restarted daemon exposes the current stage's pinned executor: {view}"
     );
     handle.shutdown().await;
 }
