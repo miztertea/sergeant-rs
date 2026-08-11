@@ -51,6 +51,7 @@ const HARVEST_SCHEMA = {
 }
 let allDone = false
 let firstAttempt = true
+let zeroProgressStreak = 0
 for (let attempt = 1; attempt <= 20 && !allDone; attempt++) {
   const h = await agent(`${ACTOR_RULES('20-harvest')}
 This is harvest attempt ${attempt} of a RESUMED run. The stage's references/partition-checkpoint-protocol.md is your law — follow its "On stage entry" rules exactly.
@@ -64,7 +65,8 @@ THEN: if EVERY ledger row is done, advance the stage: ${setup.respond_cmd.replac
   firstAttempt = false
   allDone = h.ledger_all_done
   log(`harvest ${attempt}: +[${h.partitions_done_this_turn.join(', ')}] units=${h.unit_count_now} allDone=${allDone}`)
-  if (h.notes && h.notes.includes('mismatch')) throw new Error('harvest seeding mismatch — orchestrator attention required: ' + h.notes.slice(0, 500))
+  zeroProgressStreak = (h.partitions_done_this_turn.length === 0 && !h.ledger_all_done) ? zeroProgressStreak + 1 : 0
+  if (zeroProgressStreak >= 2) throw new Error('two consecutive harvest attempts made no progress — orchestrator attention required: ' + h.notes.slice(0, 800))
   if (!allDone) {
     const retried = await agent(`Issue exactly one stage retry for the running sergeant-rs work and verify it re-held. Run: ${setup.retry_cmd.replace('WORK_ID', setup.work_id)} — then sgt work show --json (same binary/data-dir) and confirm stage 20-harvest is active/held on needs_input again with a fresh execution. Report the state you saw. Touch nothing else.`,
       { label: `retry:${attempt}`, phase: 'Harvest-loop', model: 'sonnet', effort: 'low', schema: { type: 'object', required: ['reheld', 'state'], properties: { reheld: { type: 'boolean' }, state: { type: 'string' } } } })
