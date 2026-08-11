@@ -35,3 +35,15 @@ are container-relative; re-baseline before N4 budgets are set); re-run
 the opt-in real-Claude contract suite; then the N4 contract — which per
 ruling R-N0-3 cannot be written without the #17/#4 retention ruling, and
 per A-N3-1 requires #44 (journal group commit) to land first.
+
+## Addendum 2026-08-11 — the promotion step (owner catch, post-#43)
+
+The extracted workflow sets (see docs/gauntlet/runs/README.md) are all filed
+as evidence; none flow into `.sergeant/workflows/` as usable workflows. That
+promotion is the program's endgame and is now an explicit Cerberus work item,
+after #46/#47 land: curate `reference-corpus/draft-workflows/` (the 34
+adjudicated packages — the source of record, NOT the generated runs) into a
+runnable library — structure-validate each, run each through the engine on
+the fake backend as its acceptance gate, and ship as the out-of-box workflow
+set. Generated-run packages remain measurement evidence unless individually
+promoted through the same gate.
