@@ -2575,6 +2575,70 @@ mod tests {
         );
     }
 
+    /// A failed group fsync must publish nothing, in the order that makes
+    /// that true — not just leave `open_group_len()` at zero afterward.
+    ///
+    /// Round-2 survivor (invariants-r2:INV-R2-01's mutation C1): reordering
+    /// `Core::flush` to broadcast the group *before* consulting the fsync's
+    /// result —
+    ///
+    /// ```text
+    /// let synced = self.journal.sync();
+    /// let group = std::mem::take(&mut self.open_group);
+    /// for event in group { let _ = self.events_tx.send(event); }
+    /// synced?;                                  // moved here, after the loop
+    /// ```
+    ///
+    /// — is indistinguishable from the real code on the success path: every
+    /// other test in this module only drives that path. It matters only when
+    /// the fsync fails, and `flush`'s own doc comment states the property
+    /// this guards: a failed group publishes nothing at all, because nothing
+    /// outside the core may learn of an event a crash could still take back.
+    /// This test is the one that actually fails the fsync (via
+    /// [`crate::runtime::journal::tests::make_unsyncable_for_tests`], the
+    /// same `O_PATH` injection `journal`'s own poisoning test uses) and
+    /// checks the subscriber's mailbox, not just the group's length —
+    /// `open_group_len() == 0` is equally true whether the events were
+    /// dropped or published-then-dropped, so only `try_recv` tells the two
+    /// apart.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_failed_group_sync_publishes_nothing_not_even_before_returning_the_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+        let mut live = CoreGuard::acquire(&state.core).await.events_tx.subscribe();
+
+        let mut core = CoreGuard::acquire(&state.core).await;
+        for n in 1..=3u32 {
+            core.commit(seeded(n)).expect("commit");
+        }
+        assert_eq!(core.open_group_len(), 3, "the group is open before flush");
+
+        if !crate::runtime::journal::tests::make_unsyncable_for_tests(&mut core.journal) {
+            eprintln!(
+                "SKIPPED-ENV: this host cannot express the O_PATH fsync-failure injection \
+                 (no O_PATH support, or fsync accepts an O_PATH descriptor here)"
+            );
+            return;
+        }
+
+        core.flush()
+            .expect_err("a failed group fsync must return an error");
+        assert_eq!(
+            core.open_group_len(),
+            0,
+            "a failed group is abandoned, not retried on the next hold"
+        );
+        assert!(
+            matches!(live.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "a group whose fsync failed must never reach a live subscriber — \
+             not even by publishing it first and reporting the error after: \
+             an SSE client told about these events would be told about a \
+             fact the crash that just poisoned the journal may have taken \
+             back"
+        );
+    }
+
     /// Guard for the history loop's cursor bookkeeping in `forward_events`
     /// (`last_sent = event.seq`), which nothing else in the suite reaches.
     ///

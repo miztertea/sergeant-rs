@@ -685,9 +685,50 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::event::EventSource;
+
+    /// Swap a journal's segment handle for an `O_PATH` descriptor the kernel
+    /// refuses to `fsync`, so the *next* `sync()` fails while everything
+    /// already written stays on disk and every prior append is otherwise
+    /// untouched.
+    ///
+    /// `pub(crate)`, not private to this module, specifically so `api`'s own
+    /// group-commit tests can inject the same failure over a `Core` without
+    /// duplicating the `O_PATH` trick — and without those tests needing to
+    /// call `sync_data` on an unsyncable descriptor directly, which `m6`'s
+    /// `t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for` would
+    /// correctly flag as a durability syscall outside its accounted blocks.
+    /// Living inside this module's own `mod tests` — one of `t11b`'s named
+    /// exemptions — is what keeps that scan honest instead of widening it.
+    ///
+    /// Returns `false` — the caller's cue to skip loudly (`SKIPPED-ENV`)
+    /// rather than assert nothing — when this host cannot express the
+    /// injection: no `O_PATH` support, or an `fsync` that accepts an
+    /// `O_PATH` descriptor anyway.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn make_unsyncable_for_tests(journal: &mut Journal) -> bool {
+        use std::os::unix::fs::OpenOptionsExt;
+        /// `O_PATH`, as the kernel numbers it on Linux.
+        const O_PATH: i32 = 0o10000000;
+
+        let segment_path = journal
+            .journal_dir
+            .join(segment_file_name(journal.segment_index));
+        let Ok(unsyncable) = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH)
+            .open(&segment_path)
+        else {
+            return false;
+        };
+        if unsyncable.sync_data().is_ok() {
+            return false;
+        }
+        journal.segment_file = unsyncable;
+        true
+    }
 
     fn draft(n: u64) -> EventDraft {
         EventDraft::new(
@@ -1042,10 +1083,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_group_sync_poisons_the_handle() {
-        use std::os::unix::fs::OpenOptionsExt;
-        /// `O_PATH`, as the kernel numbers it on Linux.
-        const O_PATH: i32 = 0o10000000;
-
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut journal = Journal::open(dir.path()).expect("open");
         journal.append(draft(1)).expect("append");
@@ -1056,19 +1093,13 @@ mod tests {
             .join(segment_file_name(journal.segment_index));
         let written = fs::read(&segment_path).expect("read the written segment");
 
-        let Ok(unsyncable) = OpenOptions::new()
-            .read(true)
-            .custom_flags(O_PATH)
-            .open(&segment_path)
-        else {
-            eprintln!("SKIPPED-ENV: this host refuses to open an O_PATH descriptor");
-            return;
-        };
-        if unsyncable.sync_data().is_ok() {
-            eprintln!("SKIPPED-ENV: this host's fsync accepts an O_PATH descriptor");
+        if !make_unsyncable_for_tests(&mut journal) {
+            eprintln!(
+                "SKIPPED-ENV: this host cannot express the O_PATH fsync-failure injection \
+                 (no O_PATH support, or fsync accepts an O_PATH descriptor here)"
+            );
             return;
         }
-        journal.segment_file = unsyncable;
 
         let err = journal.sync().expect_err("the group fsync must fail");
         assert!(
