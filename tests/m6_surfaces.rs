@@ -2340,6 +2340,16 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
             "pub fn perform(&self) -> LaunchOutcome",
         ),
         ("impl PendingSend", "pub fn perform(&self) -> SendOutcome"),
+        // Issue #46's addition. The daemon's completion driver has to ask a
+        // question no request asked — "did that turn end?" — and OBSERVE is an
+        // external effect like any other, so it lands in a performer of its
+        // own rather than in the driver's loop, where a `&mut Core` could
+        // reach it. Widening this list is the deliberate act the test's own
+        // doc comment describes; the settle it feeds re-checks §14.5.
+        (
+            "impl PendingObserve",
+            "pub fn perform(&self) -> ObserveOutcome",
+        ),
     ];
     let mut ranges = Vec::new();
     for (block, signature) in performers {

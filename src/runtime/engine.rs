@@ -274,6 +274,69 @@ pub struct SendOutcome {
     observed: Option<Result<Observation, BackendError>>,
 }
 
+/// An observation of a live execution the engine has decided to take **with
+/// the core lock released** (§14.2's middle phase, applied to OBSERVE alone).
+///
+/// The other two performers observe as the tail of an effect they themselves
+/// caused. This one exists for the case nothing causes: a turn that was still
+/// `InFlight` at launch-settle and finishes later, on its own, with no client
+/// anywhere near the daemon (issue #46 — Run B sat 45 minutes in `active`
+/// after a clean turn end because the only observers were launch-settle,
+/// SEND-settle, restart recovery, and client cranks).
+///
+/// It carries the run coordinate the observation is *about*, and nothing else:
+/// no reservation, because deciding to look at something commits sergeant to
+/// nothing and appends nothing. What makes the result safe to act on is
+/// [`Engine::settle_observe`]'s currency check against this snapshot, not a
+/// durable claim staked before the effect.
+pub struct PendingObserve {
+    work_id: String,
+    execution: ExecutionRecord,
+    stage_id: String,
+    index: usize,
+    attempt: u32,
+    backend: Arc<dyn Backend>,
+}
+
+impl std::fmt::Debug for PendingObserve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingObserve")
+            .field("work_id", &self.work_id)
+            .field("execution_id", &self.execution.execution_id)
+            .field("stage_id", &self.stage_id)
+            .field("attempt", &self.attempt)
+            .finish()
+    }
+}
+
+impl PendingObserve {
+    /// The work this observation is about.
+    pub fn work_id(&self) -> &str {
+        &self.work_id
+    }
+
+    /// The execution being observed.
+    pub fn execution_id(&self) -> &str {
+        &self.execution.execution_id
+    }
+
+    /// Ask the backend where the execution is. **Never while holding the core
+    /// lock**: OBSERVE is an external effect (§22.6, round-2 finding
+    /// N3R2-03 — for the Claude adapter a handle it has no memory of sends it
+    /// walking `/proc` and reading a transcript off disk).
+    pub fn perform(&self) -> ObserveOutcome {
+        ObserveOutcome {
+            observed: self.backend.observe(&handle_of(&self.execution)),
+        }
+    }
+}
+
+/// What [`PendingObserve::perform`] came back with.
+#[derive(Debug)]
+pub struct ObserveOutcome {
+    observed: Result<Observation, BackendError>,
+}
+
 /// A git operation the engine has committed to and must now perform **with
 /// the core lock released** (§14.2's middle phase, applied to §11's surfaces).
 ///
@@ -387,6 +450,13 @@ pub enum Next {
     /// Run this git operation outside the lock, then feed the result back
     /// through [`Engine::settle_surface`].
     Surface(Box<PendingSurface>),
+    /// Take this observation outside the lock, then feed the result back
+    /// through [`Engine::settle_observe`].
+    ///
+    /// Unlike the other three this one is never *returned* by a settle: it is
+    /// only ever handed in by the daemon's completion driver, which is the one
+    /// caller that has to ask a question nobody's request asked.
+    Observe(Box<PendingObserve>),
 }
 
 /// One crank of the engine: everything it committed under this lock hold,
@@ -1034,6 +1104,10 @@ impl Engine {
                 Next::Surface(pending) => {
                     let outcome = pending.perform();
                     step = self.settle_surface(core, pending, outcome)?;
+                }
+                Next::Observe(pending) => {
+                    let outcome = pending.perform();
+                    step = self.settle_observe(core, pending, outcome)?;
                 }
             }
         }
@@ -2378,6 +2452,183 @@ impl Engine {
             None => Next::Parked,
         };
         Ok(Step { next, deferred })
+    }
+
+    /// Every live execution an observation is due on, as effects to perform
+    /// **outside the core lock**.
+    ///
+    /// This is the daemon completion driver's question, asked under the guard
+    /// and answered from durable projection state only: which runs currently
+    /// have a native context whose answer nobody is going to come and ask for?
+    /// It appends nothing and reserves nothing — a poll that finds a turn
+    /// still running must leave the journal exactly as it found it, or a
+    /// cadence becomes a write amplifier.
+    ///
+    /// The filter is the *precondition half* of §14.5's staleness rule, and it
+    /// is deliberately the same predicate [`Engine::observation_is_stale`]
+    /// re-checks after the effect: a run is due an observation when its work
+    /// is `active`, its current stage attempt is `active`, the execution the
+    /// journal records belongs to that attempt, no stop has been requested on
+    /// it, and no reservation of this run is still unsettled (a launch in
+    /// flight has its own settle coming, and observing underneath it would
+    /// race that settle for the same turn).
+    pub fn due_observations(&self, core: &Core) -> Vec<Box<PendingObserve>> {
+        let registry = core.registry.state();
+        let mut due = Vec::new();
+        for (work_id, work) in &registry.works {
+            if work.state != WorkState::Active {
+                continue;
+            }
+            let Some(run) = registry.runs.get(work_id) else {
+                continue;
+            };
+            if run.unsettled_reservation().is_some() {
+                continue;
+            }
+            let Some(execution) = run.execution.as_ref() else {
+                continue;
+            };
+            if execution.stop_requested {
+                continue;
+            }
+            let Some(stage) = run.current_stage() else {
+                continue;
+            };
+            if stage.status != StageStatus::Active
+                || stage.stage_id != execution.stage_id
+                || stage.attempt != execution.attempt
+            {
+                continue;
+            }
+            let Ok(backend) = self.backend_for(work_id, &execution.backend) else {
+                // A run routed to a backend this daemon no longer registers is
+                // recovery's problem, not the driver's: it is exactly the
+                // ambiguity §25 fails closed at restart, and inventing a
+                // disposition from a poll would be the guess §25 forbids.
+                continue;
+            };
+            due.push(Box::new(PendingObserve {
+                work_id: work_id.clone(),
+                execution: execution.clone(),
+                stage_id: stage.stage_id.clone(),
+                index: stage.index,
+                attempt: stage.attempt,
+                backend,
+            }));
+        }
+        due
+    }
+
+    /// §14.2's third phase for a bare OBSERVE: verify the observation still
+    /// describes the run's current attempt, then act on it.
+    ///
+    /// **Why the check cannot be skipped even though nothing was reserved.**
+    /// The lock was open across the observation, and an observation is the one
+    /// input that can *complete a stage*. Between `due_observations` and here
+    /// a cancel may have retired the work, a SEND-settle may have consumed the
+    /// very same turn end, an interrupt may have superseded the execution, or
+    /// a retry may have moved the attempt on. §14.5's rule applies unchanged:
+    /// the late answer is subordinate to durable state. Because the check and
+    /// [`Engine::drive`] run under one lock hold, two observations of one
+    /// finished turn cannot both complete it — the first moves the run and the
+    /// second finds itself stale.
+    ///
+    /// **Nothing is journaled for a stale one, and that is the point.** The
+    /// other two settles record `execution.abandoned` because they performed
+    /// an external effect whose evidence would otherwise vanish — a process
+    /// was spawned, a human's words were delivered. An observation performs
+    /// nothing and leaves nothing behind, so there is no evidence to preserve;
+    /// journaling every superseded poll would put the driver's cadence into
+    /// the trajectory as noise (R1: the event does not need to exist).
+    ///
+    /// **L6 audit.** This opens no new adjacent-append window. The begin phase
+    /// appends nothing at all, so there is no reserve/settle pair to be caught
+    /// between, and every append below is `drive`'s — the same sequence
+    /// `settle_launch` has always produced, whose crash windows are §22.5's
+    /// 5–8 and are pinned there. What the driver *does* newly expose is the
+    /// window before it ever runs: a turn that ended into adapter memory and a
+    /// daemon that dies before the poll. That outcome is not durable and must
+    /// be re-derived at restart, which recovery already does and
+    /// `n19_a_crash_after_the_turn_ended_is_re_derived_at_restart` pins.
+    pub fn settle_observe(
+        &self,
+        core: &mut Core,
+        pending: Box<PendingObserve>,
+        outcome: ObserveOutcome,
+    ) -> Result<Step, EngineError> {
+        let work_id = pending.work_id.clone();
+        if let Some(why) = self.observation_is_stale(core, &pending) {
+            tracing::debug!(
+                work_id = %work_id,
+                execution_id = %pending.execution.execution_id,
+                reason = %why,
+                "discarding an observation the run has moved past"
+            );
+            return Ok(Step::parked());
+        }
+        let mut deferred = Deferred::new();
+        let next = self.drive(core, &work_id, outcome.observed, &mut deferred)?;
+        Ok(Step { next, deferred })
+    }
+
+    /// Why an observation may no longer be applied, or `None` if it may.
+    ///
+    /// [`Engine::reservation_is_stale`]'s checklist for the verb that reserves
+    /// nothing, plus the two conditions that only a *poll* can lose a race to:
+    /// a stop already requested on the execution (a cancel or a completed
+    /// stage got here first) and a reservation opened underneath it (a retry
+    /// or the next stage is already launching).
+    fn observation_is_stale(&self, core: &Core, pending: &PendingObserve) -> Option<String> {
+        let registry = core.registry.state();
+        let Some(work) = registry.works.get(&pending.work_id) else {
+            return Some("the work no longer exists".to_string());
+        };
+        if work.state != WorkState::Active {
+            return Some(format!(
+                "work is {} — an observation taken beforehand cannot move it",
+                work.state
+            ));
+        }
+        let Some(run) = registry.runs.get(&pending.work_id) else {
+            return Some("the run record is gone".to_string());
+        };
+        if run.unsettled_reservation().is_some() {
+            return Some("a launch of this run is still unsettled".to_string());
+        }
+        match run.execution.as_ref() {
+            Some(current) if current.execution_id == pending.execution.execution_id => {
+                if current.stop_requested {
+                    return Some(format!(
+                        "execution {} was already asked to stop",
+                        current.execution_id
+                    ));
+                }
+            }
+            Some(current) => {
+                return Some(format!(
+                    "execution {} was superseded by {}",
+                    pending.execution.execution_id, current.execution_id
+                ));
+            }
+            None => return Some("the run no longer records an execution".to_string()),
+        }
+        match run.current_stage() {
+            Some(stage)
+                if stage.stage_id == pending.stage_id
+                    && stage.index == pending.index
+                    && stage.attempt == pending.attempt
+                    && stage.status == StageStatus::Active => {}
+            Some(stage) => {
+                return Some(format!(
+                    "the run moved on to stage {} attempt {} ({})",
+                    stage.stage_id,
+                    stage.attempt,
+                    stage.status.as_str()
+                ));
+            }
+            None => return Some("the run has no current stage".to_string()),
+        }
+        None
     }
 
     /// Why a delivery's result may no longer be applied, or `None` if it may.

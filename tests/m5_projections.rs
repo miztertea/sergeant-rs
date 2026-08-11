@@ -1838,6 +1838,7 @@ async fn start_claude(data_dir: &Path, telemetry: Option<Arc<Telemetry>>) -> Dae
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
             telemetry,
+            ..DaemonConfig::default()
         },
     )
     .await

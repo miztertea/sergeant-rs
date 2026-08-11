@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::backend::Deferred;
 use crate::daemon::{KIND_BACKEND_PROBED, KIND_DAEMON_STARTED, KIND_DAEMON_STOPPED};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::execution::{
@@ -302,6 +303,16 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
                     core,
                 )
             }
+            EngineNext::Observe(pending) => {
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = state.core.lock().await;
+                (
+                    work_id,
+                    state.engine.settle_observe(&mut core, pending, outcome),
+                    core,
+                )
+            }
         };
         let (work_id, outcome, core) = settled;
         match outcome {
@@ -313,6 +324,82 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
                 tracing::error!(work_id = %work_id, error = %e, "settling an external effect failed");
                 return Some(core);
             }
+        }
+    }
+}
+
+/// How often the completion driver asks live executions where they are.
+///
+/// A turn that ends on its own is the only state change in this daemon that
+/// nothing requests, so it is the only one that needs a clock. 200 ms is
+/// chosen against what the tick actually costs, not against how fast a human
+/// wants a cascade: one `Backend::observe` per *live* execution, which for the
+/// Claude adapter is a mutex and a match over in-memory turn state (issue
+/// #46's own framing — the classification was already right and merely
+/// starved), plus one core-lock hold to enumerate them. A run with no
+/// execution in flight costs the enumeration and nothing else.
+pub const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Settle turns that finish with nobody watching (issue #46).
+///
+/// **The measured defect.** Run B's stage `00-contract` sat `active` for
+/// 45m28s after a clean turn end, and again for 34m58s after an envelope-less
+/// one. Nothing was wrong with the classification — `observe_in_memory`
+/// derives `StageCompleted` for the first shape and `native: Unknown` (→
+/// blocked) for the second, and the adapter's own unit tests pin both. What
+/// was missing is that after launch-settle parked a still-`InFlight` turn,
+/// **no observer ever came back**: the engine observes at launch-settle, at
+/// SEND-settle, at restart recovery, and on client cranks, and a real turn
+/// finishes at none of those instants. The deterministic fake finishes inside
+/// the launch effect, so every test settled at launch and the gap was
+/// structurally invisible to the whole suite.
+///
+/// **Rung note (R2).** This is a loop over the machinery that already exists:
+/// [`Engine::due_observations`] reads the same projection every handler reads,
+/// [`crank`] performs the effect off the lock and settles it exactly as it
+/// does for a client's request, and [`Engine::settle_observe`] re-checks
+/// §14.5 exactly as `settle_launch` does. Lower rungs, checked: R1 — the
+/// daemon cannot skip this, the defect is a measured 45-minute stall; the
+/// notification alternative (the adapter's turn-end reaching the daemon
+/// through the event sink it already writes to) is the *higher* rung and is
+/// not taken, because it would make settling depend on a broadcast delivery
+/// whose loss is silent, and because it would settle only for adapters that
+/// emit that event while this loop is true of every `Backend`.
+///
+/// **What it does not do.** It never observes under the core lock (§22.6:
+/// every observation goes through `crank`, which drops the guard before every
+/// effect), it never journals a poll that found nothing, and it never settles
+/// an observation the run has moved past. It also stops promptly: the daemon's
+/// `closing` watch is checked before every tick and between candidates, so a
+/// shutdown never waits out a full interval, and `start_with` joins this task
+/// before it journals `daemon.stopped` — the driver is the one writer that is
+/// not a request, so it is also the one that has to be told to stop writing.
+pub async fn drive_completions(state: ApiState, interval: Duration) {
+    let mut closing = state.closing.clone();
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = closing.changed() => return,
+        }
+        if *closing.borrow() {
+            return;
+        }
+        let due = {
+            let core = state.core.lock().await;
+            state.engine.due_observations(&core)
+        };
+        for pending in due {
+            if *closing.borrow() {
+                return;
+            }
+            crank(
+                &state,
+                Step {
+                    next: EngineNext::Observe(pending),
+                    deferred: Deferred::new(),
+                },
+            )
+            .await;
         }
     }
 }

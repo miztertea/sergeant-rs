@@ -21,12 +21,15 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{broadcast, oneshot, watch};
 
-use crate::api::{API_REVISION, ApiState, Core, CoreError, router};
+use crate::api::{
+    API_REVISION, ApiState, COMPLETION_POLL_INTERVAL, Core, CoreError, drive_completions, router,
+};
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
@@ -162,6 +165,15 @@ pub struct DaemonConfig {
     /// with no pipeline here the daemon builds no provider, spawns no
     /// exporter task, and subscribes nothing to the event stream.
     pub telemetry: Option<Arc<Telemetry>>,
+    /// How often the completion driver looks for turns that ended on their
+    /// own (issue #46; see [`api::drive_completions`]).
+    ///
+    /// Configurable for the same reason `backends` is: a test that needs to
+    /// stand *inside* the window between a turn ending and the daemon settling
+    /// it has no other way to hold the window open, and the alternative — a
+    /// sleep racing the driver — is the kind of test that passes for the wrong
+    /// reason. Production uses the default.
+    pub completion_poll: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -171,6 +183,7 @@ impl Default for DaemonConfig {
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
             telemetry: None,
+            completion_poll: COMPLETION_POLL_INTERVAL,
         }
     }
 }
@@ -357,6 +370,13 @@ pub async fn start_with(
     }
     let app = router(state.clone());
 
+    // The one writer that is not a request (issue #46): a turn that ends on
+    // its own has no client to crank the engine, so the daemon carries the
+    // observer itself. It is joined at shutdown below rather than merely
+    // dropped, because it commits events and `daemon.stopped` must be the last
+    // one this daemon writes.
+    let completions = tokio::spawn(drive_completions(state.clone(), config.completion_poll));
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let served = tokio::spawn(async move {
         // The daemon lock lives exactly as long as the serve task.
@@ -369,6 +389,11 @@ pub async fn start_with(
         });
         if let Err(e) = serve.await {
             tracing::error!(error = %e, "daemon serve failed");
+        }
+        // The completion driver watches the same `closing` flag the SSE pumps
+        // do, so this waits out at most the crank it is already inside.
+        if let Err(e) = completions.await {
+            tracing::warn!(error = %e, "the completion driver did not finish cleanly");
         }
         // Clean shutdown: journal the stop, then retire the descriptor.
         let mut core = state.core.lock().await;
