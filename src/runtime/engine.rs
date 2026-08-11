@@ -2417,9 +2417,25 @@ impl Engine {
     /// already says — so the driver picks the run back up on its next tick
     /// exactly as it does after a launch. This is done *here*, under the
     /// lock, after the out-of-lock effect, specifically so it opens no window
-    /// for the driver to observe a delivery still in flight (see
+    /// for the *driver* to observe a delivery still in flight (see
     /// [`Engine::begin_input`]'s doc comment on why the flip does not happen
     /// there instead).
+    ///
+    /// **Residual (round-2 finding INV-R2-08).** `KIND_STAGE_INPUT_RECEIVED`
+    /// — `begin_input`'s own append, ahead of this settle — has no reducer
+    /// arm in [`crate::runtime::projection`], so a crash between that append
+    /// and this one leaves an `active` work whose stage still reads
+    /// `NeedsInput`: a shape `due_observations` skips forever on its own.
+    /// This guarantee does not close that window itself — it never runs at
+    /// all if the crash landed first. What closes it is entirely
+    /// `runtime::recovery`'s: restart reconciliation reads the work as
+    /// `active` with no settled delivery to explain the stage's status and
+    /// fails it closed via `reconcile_work`/`classify_restart`, before this
+    /// settle ever gets a chance to run stale. The two are complementary,
+    /// not redundant — INV-1 covers every send that completes normally
+    /// (the common case), recovery covers the one that does not survive to
+    /// completion — and are that way on purpose, but it is worth being
+    /// explicit that this doc comment's promise depends on it.
     pub fn settle_send(
         &self,
         core: &mut Core,
