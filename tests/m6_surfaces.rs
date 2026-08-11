@@ -958,6 +958,182 @@ async fn t2_the_dashboard_serves_real_data_and_is_embedded() {
     assert_eq!(handed.trim(), url, "--open must hand over the same URL");
 }
 
+/// A TUI holding a detail screen for a work the daemon no longer has falls
+/// back to the fleet instead of painting a corpse.
+///
+/// The data dir can be replaced under a running client (a restore, a wiped
+/// scratch dir, a `--data-dir` pointed somewhere else) and the detail screen
+/// is the one part of `App` that keeps asking about a specific id. A refresh
+/// that answered 404 used to be indistinguishable from a refresh that failed:
+/// this arm is why the screen recovers rather than either erroring out or
+/// re-rendering the last body it happened to hold.
+#[tokio::test]
+async fn a_detail_screen_whose_work_vanished_falls_back_to_the_fleet() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("which budget?")]).await;
+    let work_id = submit(&handle, repo.path(), "still here", "tiny").await;
+    let client = client_for(&handle);
+
+    let mut app = App::new();
+    app.detail_id = Some(work_id.clone());
+    app.screen = Screen::Detail;
+    app.refresh(&client).await.expect("first read");
+    assert!(
+        !app.detail_events.is_empty(),
+        "the detail screen starts with a real work's events"
+    );
+
+    // The work the screen is showing is gone; the fleet behind it is not.
+    app.detail_id = Some("01NOSUCHWORKATALL".to_string());
+    app.refresh(&client)
+        .await
+        .expect("a work that vanished is not a client failure");
+
+    assert_eq!(app.screen, Screen::Fleet, "the screen falls back");
+    assert_eq!(app.detail_id, None, "and stops asking about the dead id");
+    assert_eq!(app.detail, Value::Null);
+    assert!(
+        app.detail_events.is_empty(),
+        "nothing of the vanished work is left to paint"
+    );
+    assert!(
+        !app.rows.is_empty(),
+        "the fleet it fell back to is the live one"
+    );
+    assert!(
+        !screen_text(&render(&app)).contains("01NOSUCHWORKATALL"),
+        "and the screen says nothing about the id that is gone"
+    );
+
+    handle.shutdown().await;
+}
+
+/// The work page's two fault answers, which the happy path never reaches.
+///
+/// A dashboard is where a person looks when something is already wrong, so
+/// its own failures have to be legible: a work id that is not there is a 404
+/// carrying the dashboard's chrome (not a bare axum body, and not a 200 page
+/// full of empty sections), and a journal the daemon cannot read is a 500
+/// that *names the fault* — the failure mode this arm exists for is a page
+/// that renders "no transitions recorded" over a read error and tells the
+/// browser a different story than `/v1/events` tells an HTTP client.
+#[tokio::test]
+async fn the_dashboard_answers_a_missing_work_and_an_unreadable_journal_as_faults() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("which budget?")]).await;
+    let work_id = submit(&handle, repo.path(), "readable, then not", "tiny").await;
+
+    // --- a work id that is not there ---------------------------------------
+    let missing = get_text(
+        &format!(
+            "{}/ui/work/01NOSUCHWORKATALL?token={}",
+            handle.endpoint, handle.token
+        ),
+        404,
+    )
+    .await;
+    assert!(
+        missing.contains("no work with id 01NOSUCHWORKATALL"),
+        "the 404 page must name the id that is not there: {missing}"
+    );
+    assert!(
+        missing.contains("dashboard.js") && missing.contains("id=\"ticker\""),
+        "…and still be the dashboard, so the reader can navigate on: {missing}"
+    );
+    assert!(
+        !missing.contains("no transitions recorded"),
+        "a work that does not exist must not be dressed as one with no history: {missing}"
+    );
+
+    // --- a journal the daemon cannot read ----------------------------------
+    //
+    // A well-formed JSON line that is not a well-formed Event, appended in
+    // place: what a torn or bit-flipped append looks like on replay (the
+    // shape m2 uses for the same class).
+    let journal_dir = data.path().join("journal");
+    let mut segments: Vec<_> = std::fs::read_dir(&journal_dir)
+        .expect("journal dir")
+        .filter_map(|entry| {
+            let path = entry.expect("entry").path();
+            (path.extension().is_some_and(|ext| ext == "ndjson")).then_some(path)
+        })
+        .collect();
+    segments.sort();
+    let segment = segments.last().expect("a segment exists").clone();
+    let mut text = std::fs::read_to_string(&segment).expect("read segment");
+    text.push_str("{ \"not\": \"an event\" }\n");
+    std::fs::write(&segment, text).expect("append malformed line");
+
+    let broken = get_text(
+        &format!(
+            "{}/ui/work/{}?token={}",
+            handle.endpoint, work_id, handle.token
+        ),
+        500,
+    )
+    .await;
+    assert!(
+        broken.contains("this work's events could not be read"),
+        "the read failure must be named on the page: {broken}"
+    );
+    assert!(
+        broken.contains("sgt doctor"),
+        "…with the thing to do about it: {broken}"
+    );
+    for green in [
+        "no transitions recorded",
+        "no normalized conversation events yet",
+        "no usage reported by this backend",
+    ] {
+        assert!(
+            !broken.contains(green),
+            "a read failure must never be rendered as an empty section ({green:?}): {broken}"
+        );
+    }
+
+    handle.shutdown().await;
+}
+
+/// `--open`'s failure path (`open_in_browser`): a `$BROWSER` that runs and
+/// exits nonzero must fail the command with the exit status named, not
+/// swallow it — the URL was already printed before the browser was asked to
+/// open it, so a silent failure here would leave the user unsure whether the
+/// pointer they were just given is even good.
+#[test]
+fn web_open_reports_a_browser_that_refuses_to_open_it() {
+    let data = DataDir::new();
+    let output = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("web")
+        .arg("--open")
+        .env("BROWSER", "/bin/false")
+        .output()
+        .expect("run sgt web --open");
+    assert!(
+        !output.status.success(),
+        "a browser opener that refuses must fail the command"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("/bin/false") && stderr.contains("exited with"),
+        "the failure must name the opener and how it failed: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1"),
+        "the dashboard URL must still be printed even though --open failed: {stdout}"
+    );
+}
+
 // ---------------------------------------------------------------- 3. doctor
 
 /// Acceptance 3. Doctor is green on a healthy install, names the failing
@@ -1268,6 +1444,59 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     assert!(
         stdout.contains("remedy:"),
         "human report must carry a remedy"
+    );
+}
+
+/// The journal check's *other* failure arm: `corrupt_journal` above only
+/// ever reaches "replay failed after N events" (a line the replay gets to
+/// and cannot parse). `Journal::replay_data_dir` can also fail before it
+/// reads a single line — the journal directory itself is unusable — and that
+/// is a different branch in `journal_check` with a different message
+/// ("cannot open the journal" vs. "replay failed after…"). A regular file
+/// where `journal/` should be a directory is the dir-as-file trick that
+/// reaches it: `.exists()` is still true (so the check does not take the
+/// fresh-install "no journal yet" branch), but `read_dir` on it fails.
+#[test]
+fn doctor_reports_a_journal_it_cannot_even_open() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(data.path()).expect("data dir");
+    std::fs::write(data.path().join("journal"), b"not a directory").expect("write file");
+
+    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    assert_ne!(
+        code,
+        Some(0),
+        "a journal directory that is a file must fail the install"
+    );
+    let (_, json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let report: Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(report["healthy"], false);
+    let check = named_check(&report, "journal");
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("cannot open the journal")),
+        "this is the open failure, not the replay-failed-partway-through one: {check}"
+    );
+    assert!(
+        check["remedy"].is_string(),
+        "the open failure must name a remedy too: {check}"
+    );
+    assert!(stdout.contains("remedy:"));
+
+    // The check downstream of it declines for the same reason a torn
+    // journal makes it decline: nothing was replayed to build a projection
+    // from.
+    let projection = named_check(&report, "projection");
+    assert_eq!(projection["status"], "warn", "{projection}");
+    assert!(
+        projection["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("not attempted")),
+        "{projection}"
     );
 }
 
@@ -2216,7 +2445,183 @@ fn names_token(source: &str, token: &str) -> bool {
         .any(|word| word == token)
 }
 
+/// The rig's own teardown, pinned: SIGTERM, and the daemon exits by itself.
+///
+/// An instrument nobody has tried is a claim (the m2 reaper test's rule,
+/// applied to this file's rig). The assertion that matters is not "the daemon
+/// is gone" — SIGKILL achieves that too — but *how*: the daemon must receive
+/// SIGTERM, run `run_until_signal`'s shutdown path, and return from `main`,
+/// which is the only exit that runs anything registered to happen at exit.
+/// A rig that reverted to `child.kill()` would leave every assertion in the
+/// suite green while silently dropping this daemon's coverage profile, so the
+/// exit status is read and checked rather than discarded.
+#[test]
+fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let data = DataDir::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let mut spawned = SpawnedDaemon::start(&data, cwd.path(), &[]);
+    let pid = spawned.child.id();
+    assert!(
+        daemon::pid_alive(pid),
+        "the rig must hand back a live daemon, or this test measures nothing"
+    );
+
+    let stop = spawned.stop();
+
+    assert_eq!(
+        stop.signal,
+        StopSignal::Term,
+        "the rig must stop its daemon with SIGTERM and only escalate if the {}s grace runs \
+         out; a SIGKILL here means the polite path was skipped or the daemon slept through it",
+        DAEMON_TERM_GRACE.as_secs()
+    );
+    let status = stop
+        .status
+        .expect("the rig must wait for the daemon it signalled, not leave a zombie");
+    assert_eq!(
+        status.signal(),
+        None,
+        "the daemon must exit on its own after SIGTERM, not die *of* a signal — killed by \
+         {:?} means nothing it registered at exit ran (a coverage profile among them)",
+        status.signal()
+    );
+    assert!(
+        status.success(),
+        "the daemon's SIGTERM shutdown must return from main cleanly: {status:?}"
+    );
+    assert!(
+        !daemon::pid_alive(pid),
+        "after stop() the daemon pid {pid} must be gone"
+    );
+    assert_eq!(
+        spawned.stop(),
+        stop,
+        "stop() must be idempotent: Drop calls it again on the way out"
+    );
+}
+
+/// The same teardown, composed the way the rig's real users get it: `Drop`.
+///
+/// The pin above never executes `Drop` at all — it calls `stop()` first, which
+/// latches `stopped`, so `Drop`'s body is not the thing under test. Measured,
+/// not reasoned about: with `Drop::drop` reverted to the pre-repair
+/// `child.kill(); child.wait()` and `stop()` left intact, that test and the
+/// whole m6 suite still pass. And `Drop` is the *only* teardown the two
+/// production users of this rig have — the embedded-assets probe and doctor's
+/// live-daemon arm both `start()` and never `stop()`. So the part was pinned
+/// and the composition, which is what §6.1's loss site 1 actually rides on,
+/// was not.
+///
+/// This test therefore reads evidence the rig cannot author, because the
+/// *daemon* writes it. Measured on this container with two temp data dirs,
+/// one `kill -TERM` and one `kill -KILL`: after SIGTERM the daemon runs
+/// `run_until_signal`'s shutdown tail — journals `daemon.stopped`, removes
+/// `runtime.json` — and after SIGKILL it journals nothing and leaves the
+/// descriptor behind. `DataDir`'s own `Drop` cannot substitute for this: it
+/// asserts only that no daemon *survived*, and a SIGKILLed daemon has not
+/// survived.
+#[test]
+fn the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown() {
+    let data = DataDir::new();
+    let cwd = TempDir::new().expect("tempdir");
+
+    let pid = {
+        let spawned = SpawnedDaemon::start(&data, cwd.path(), &[]);
+        let pid = spawned.child.id();
+        assert!(
+            daemon::pid_alive(pid),
+            "the rig must hand back a live daemon, or this test measures nothing"
+        );
+        assert!(
+            daemon::descriptor_path(data.path()).exists(),
+            "a serving daemon must have published its descriptor first, or its absence \
+             below would prove nothing"
+        );
+        pid
+        // Scope ends here, and `Drop` is the only teardown that runs — no
+        // `stop()` call, exactly like the rig's two production users.
+    };
+
+    assert!(
+        !daemon::pid_alive(pid),
+        "the dropped rig must not leave daemon pid {pid} running"
+    );
+    assert!(
+        !daemon::descriptor_path(data.path()).exists(),
+        "the dropped daemon must have removed its own runtime.json, which only the \
+         SIGTERM shutdown path does. The descriptor is still there, so the daemon was \
+         killed rather than asked — and a SIGKILLed process flushes nothing at exit, \
+         its coverage profile included (§6.1 loss site 1)"
+    );
+    let stopped = Journal::replay_data_dir(data.path())
+        .expect("replay the journal")
+        .filter_map(Result::ok)
+        .filter(|event| event.kind == daemon::KIND_DAEMON_STOPPED)
+        .count();
+    assert_eq!(
+        stopped,
+        1,
+        "the dropped daemon must have journaled exactly one {} event; {stopped} means \
+         its shutdown path did not run to the end",
+        daemon::KIND_DAEMON_STOPPED
+    );
+}
+
+// -------------------------------------------------- coverage-harness pins
+
+/// `scripts/coverage/` grades the S1 baseline; something has to grade it.
+///
+/// It lives in this suite because this suite already owns the `scripts/`
+/// surface — `t4` runs `scripts/demo.sh` the same way, for the same reason:
+/// a shell script outside the gate is a script whose checks are claims. The
+/// selftest itself needs no instrumented build and no collection run; it
+/// drives `common.sh`'s accounting against a scratch directory of empty
+/// `.profraw` files and asserts the two things that were measurably
+/// unenforceable before: that a stage which destroys an earlier stage's
+/// profiles fails (it used to print "stage ok" and exit 0), and that C4's
+/// committed `profraw_merged` number is the profraw-list's line count rather
+/// than that count glued to the digits in its own path.
+#[test]
+fn the_coverage_harness_grades_its_own_accounting() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/coverage/selftest.sh");
+    assert!(script.exists(), "scripts/coverage/selftest.sh must exist");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/coverage/selftest.sh");
+    assert!(
+        output.status.success(),
+        "the coverage harness's selftest must pass\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ------------------------------------------------------- spawned-daemon rig
+
+/// How the rig's own daemon ended, and what the kernel said about it.
+///
+/// Recorded rather than assumed: the whole point of the polite teardown is
+/// that the daemon gets to run its shutdown path, and "it is gone" is not
+/// evidence that it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonStop {
+    /// The strongest signal the rig had to send.
+    signal: StopSignal,
+    /// What `wait(2)` reported. `None` only if the wait itself failed.
+    status: Option<std::process::ExitStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopSignal {
+    Term,
+    Kill,
+}
 
 /// A `sgt daemon` running as a real child process, from a chosen cwd.
 struct SpawnedDaemon {
@@ -2224,6 +2629,9 @@ struct SpawnedDaemon {
     token: String,
     data_dir: PathBuf,
     child: std::process::Child,
+    /// Set by the first `stop()`, so `Drop` neither repeats it nor waits on
+    /// a child that has already been reaped.
+    stopped: Option<DaemonStop>,
 }
 
 impl SpawnedDaemon {
@@ -2239,9 +2647,11 @@ impl SpawnedDaemon {
 }
 
 impl SpawnedDaemon {
-    // The child is reaped by this type's `Drop`, which kills and waits. The
+    // The child is reaped by this type's `Drop`, which stops and waits. The
     // lint cannot see across that boundary; the timeout path below reaps
-    // explicitly because it never constructs the value that owns the Drop.
+    // explicitly because it never constructs the value that owns the Drop —
+    // and it stays a `kill()`, because a daemon that never published a
+    // descriptor has nothing to shut down politely.
     #[allow(clippy::zombie_processes)]
     fn start_at(data_dir: &Path, cwd: &Path, env: &[(&str, &str)]) -> Self {
         let mut command = Command::new(SGT);
@@ -2265,6 +2675,7 @@ impl SpawnedDaemon {
                     token: descriptor.token,
                     data_dir: data_dir.to_path_buf(),
                     child,
+                    stopped: None,
                 };
             }
             if Instant::now() >= deadline {
@@ -2290,18 +2701,75 @@ impl SpawnedDaemon {
         );
         String::from_utf8_lossy(&output.stdout).to_string()
     }
+
+    /// Stop the daemon the way an operator stops it — SIGTERM, a bounded
+    /// wait, SIGKILL only if the wait runs out — and report which of the two
+    /// it took. Idempotent; `Drop` calls it for tests that do not.
+    ///
+    /// This rig used to open with `child.kill()`, i.e. SIGKILL. The daemon
+    /// died either way and every test stayed green, so the difference was
+    /// invisible from inside the suite — but SIGKILL runs nothing registered
+    /// at exit. Measured on this container: an instrumented process that
+    /// handles SIGTERM and returns from `main` writes its `.profraw`; the
+    /// same process under SIGKILL writes none at all. Both of this rig's
+    /// daemons were therefore contributing nothing to a coverage run, which
+    /// is what §6.1 of the S-series proposal registered as loss site 1.
+    fn stop(&mut self) -> DaemonStop {
+        if let Some(stop) = self.stopped {
+            return stop;
+        }
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(self.child.id().to_string())
+            .status();
+        let deadline = Instant::now() + DAEMON_TERM_GRACE;
+        let stop = loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                break DaemonStop {
+                    signal: StopSignal::Term,
+                    status: Some(status),
+                };
+            }
+            if Instant::now() >= deadline {
+                // The escalation still exists — a rig that could be outlived
+                // by its own daemon would be a worse bug than a lost profile.
+                let _ = self.child.kill();
+                break DaemonStop {
+                    signal: StopSignal::Kill,
+                    status: self.child.wait().ok(),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        self.stopped = Some(stop);
+        stop
+    }
 }
+
+/// How long the rig's daemon gets to shut down on SIGTERM before SIGKILL.
+///
+/// Deliberately the same ten seconds as `support::TERM_GRACE`: two teardown
+/// paths that disagreed about "too slow" would make a slow shutdown look like
+/// a different failure depending on which one ran first.
+const DAEMON_TERM_GRACE: Duration = Duration::from_secs(10);
 
 impl Drop for SpawnedDaemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let stop = self.stop();
+        if stop.signal == StopSignal::Kill {
+            eprintln!(
+                "SpawnedDaemon: the daemon on {:?} ignored SIGTERM for {}s and needed SIGKILL \
+                 — it flushed nothing at exit (coverage profiles included)",
+                self.data_dir,
+                DAEMON_TERM_GRACE.as_secs()
+            );
+        }
     }
 }
 
 /// Reap a guarded data dir's daemons, reporting whether `pid` was among them.
 fn dir_reap_contains(data_dir: &DataDir, pid: u32) -> bool {
-    data_dir.reap().contains(&pid)
+    data_dir.reap().iter().any(|daemon| daemon.pid == pid)
 }
 
 /// The slice of a page between two markers, so an assertion about one section

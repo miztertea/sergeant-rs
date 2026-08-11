@@ -570,6 +570,253 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::event::EventSource;
+
+    fn draft(n: u64) -> EventDraft {
+        EventDraft::new(
+            EventSource::new("daemon", "sergeant"),
+            "tool.completed",
+            serde_json::json!({"n": n}),
+        )
+    }
+
+    /// Issue #30 items 1-2, in-module (no production seam): swap the private
+    /// `segment_file` for a read-only handle on the same path, so the next
+    /// append's `write_all` fails at the OS level (EBADF — the fd was never
+    /// opened for writing) regardless of the test process's own privileges.
+    ///
+    /// Item 2 (the torn-append rollback-then-poison handler, lines ~270-274):
+    /// the same read-only handle also can't be `set_len`-truncated (EINVAL),
+    /// so the failed write's rollback attempt itself fails — and `poisoned`
+    /// is set. The rollback also leaves no torn bytes here, because the
+    /// write's own permission failure occurs before any byte reaches the OS
+    /// buffer — asserted below by comparing the segment's raw bytes before
+    /// and after.
+    ///
+    /// This test pins the arm against *removal* only: with the rollback
+    /// deleted and `poisoned = true` set unconditionally, everything below
+    /// still holds. That the poison is *conditional*, and that the rollback
+    /// is really attempted, is
+    /// [`a_failed_write_whose_rollback_succeeds_rolls_the_segment_back_without_poisoning`]'s
+    /// job — the two are only meaningful as a pair.
+    ///
+    /// Item 1 (the poisoned-handle short-circuit, line ~249): a second
+    /// append after poisoning must be refused immediately with
+    /// `JournalError::Poisoned`, not re-attempt the write.
+    #[test]
+    fn append_event_poisons_the_handle_when_a_failed_writes_rollback_also_fails() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open(dir.path()).expect("open");
+
+        // A real committed line first, so there is a known-good on-disk
+        // state and segment_len to check the "no torn bytes" claim against.
+        journal.append(draft(1)).expect("first append must succeed");
+        let segment_path = dir
+            .path()
+            .join("journal")
+            .join(segment_file_name(journal.segment_index));
+        let bytes_before_failure =
+            fs::read(&segment_path).expect("read segment after the healthy append");
+        let next_before_failure = journal.next_seq();
+
+        journal.segment_file = OpenOptions::new()
+            .read(true)
+            .open(&segment_path)
+            .expect("reopen the segment read-only");
+
+        let err = journal
+            .append(draft(2))
+            .expect_err("write_all must fail on a read-only handle");
+        assert!(
+            matches!(err, JournalError::Io(_)),
+            "expected an io error surfaced from the failed write, got {err:?}"
+        );
+        assert!(
+            journal.poisoned,
+            "a failed write whose rollback (set_len) also fails must poison the handle"
+        );
+        assert_eq!(
+            journal.next_seq(),
+            next_before_failure,
+            "a failed append must not advance next_seq"
+        );
+        let bytes_after_failure =
+            fs::read(&segment_path).expect("read segment after the failed append");
+        assert_eq!(
+            bytes_after_failure, bytes_before_failure,
+            "a failed append must never leave torn bytes behind, rollback or not"
+        );
+
+        // Item 1: the poison latch holds on every further call, refusing
+        // before ever touching the (still) unusable handle.
+        let err2 = journal
+            .append(draft(3))
+            .expect_err("a poisoned handle must refuse further appends");
+        assert!(
+            matches!(err2, JournalError::Poisoned),
+            "expected the poisoned-handle short-circuit, got {err2:?}"
+        );
+        assert_eq!(
+            journal.next_seq(),
+            next_before_failure,
+            "a refused append must not advance next_seq either"
+        );
+    }
+
+    /// Issue #30 item 2, the other direction: a failed write whose rollback
+    /// **succeeds** must roll the torn bytes off the segment and leave the
+    /// handle usable. The poison is the rollback's failure handler, not the
+    /// write's.
+    ///
+    /// The sibling test above cannot see this. Its read-only handle fails
+    /// `write_all` *and* `set_len`, so "poisoned because the rollback failed"
+    /// and "poisoned on every write failure" produce identical observations;
+    /// its no-torn-bytes assertion also holds with the rollback deleted,
+    /// because a read-only write fails before a byte reaches the file. Here
+    /// both halves discriminate: real torn bytes are on disk before the
+    /// failed append, so only an actually-executed `set_len(segment_len)` can
+    /// erase them, and only a *conditional* poison leaves the handle usable.
+    ///
+    /// Getting a writable handle whose writes fail is the whole difficulty.
+    /// `O_DIRECT` is the one portable-ish combination: an unaligned
+    /// `write_all` fails `EINVAL` while `ftruncate`/`fsync` on the same
+    /// descriptor still succeed. **Environment precondition** (a hard
+    /// failure, not a silent skip, for the same reason as m3's immutable-bit
+    /// fixture): `TMPDIR` on a filesystem that supports `O_DIRECT` — ext4,
+    /// xfs and btrfs do; tmpfs does not, and refuses the `open` outright.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn a_failed_write_whose_rollback_succeeds_rolls_the_segment_back_without_poisoning() {
+        use std::os::unix::fs::OpenOptionsExt;
+        /// `O_DIRECT` as the kernel numbers it on the two architectures this
+        /// test is gated to. (`libc` is not a dependency of this crate and
+        /// R-S0-10 forbids adding one for a test.)
+        const O_DIRECT: i32 = 0o0040000;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        // The injection below is only expressible where the kernel/filesystem
+        // actually REFUSES unaligned O_DIRECT writes. tmpfs refuses the open
+        // outright, and some environments (GitHub Actions' runner filesystem —
+        // measured 2026-08-11, CI run 31447702864 on d72c017) accept the
+        // unaligned write. Probe first and skip honestly in both cases rather
+        // than asserting an environment fact this host does not exhibit.
+        {
+            use std::io::Write as _;
+            let probe_path = dir.path().join("odirect-probe");
+            fs::write(&probe_path, b"x").expect("seed the probe file");
+            match OpenOptions::new()
+                .append(true)
+                .custom_flags(O_DIRECT)
+                .open(&probe_path)
+            {
+                Err(_) => {
+                    eprintln!(
+                        "skipping: this filesystem refuses O_DIRECT open \
+                         (tmpfs?); the failure injection is not expressible here"
+                    );
+                    return;
+                }
+                Ok(mut probe) => {
+                    if probe.write_all(b"unaligned").is_ok() {
+                        eprintln!(
+                            "skipping: this filesystem accepts unaligned \
+                             O_DIRECT writes; the failure injection is not \
+                             expressible here"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        let mut journal = Journal::open(dir.path()).expect("open");
+        journal.append(draft(1)).expect("first append must succeed");
+        let segment_path = dir
+            .path()
+            .join("journal")
+            .join(segment_file_name(journal.segment_index));
+        let healthy_bytes = fs::read(&segment_path).expect("read the healthy segment");
+        let healthy_len = journal.segment_len;
+        assert_eq!(healthy_len, healthy_bytes.len() as u64);
+        let next_before_failure = journal.next_seq();
+
+        // Exactly what a torn append leaves behind: bytes past the journal's
+        // recorded length, with no terminating newline. `segment_len` still
+        // names the last acknowledged boundary, which is what the rollback
+        // truncates back to.
+        OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .expect("reopen to tear")
+            .write_all(b"{\"seq\":2,\"tor")
+            .expect("write the torn fragment");
+        assert_ne!(
+            fs::read(&segment_path).expect("read torn segment"),
+            healthy_bytes,
+            "the fixture must really leave a fragment on disk"
+        );
+
+        journal.segment_file = OpenOptions::new()
+            .append(true)
+            .custom_flags(O_DIRECT)
+            .open(&segment_path)
+            .expect(
+                "reopen the segment O_DIRECT — needs a TMPDIR filesystem that \
+                 supports it (see the doc comment)",
+            );
+
+        let err = journal
+            .append(draft(2))
+            .expect_err("an unaligned O_DIRECT write_all must fail");
+        assert!(
+            matches!(err, JournalError::Io(_)),
+            "expected an io error surfaced from the failed write, got {err:?}"
+        );
+        assert!(
+            !journal.poisoned,
+            "a failed write whose rollback succeeded must NOT poison the \
+             handle: the poison is the rollback's failure handler, not the \
+             write's"
+        );
+        assert_eq!(
+            fs::read(&segment_path).expect("read segment after the failed append"),
+            healthy_bytes,
+            "the rollback must have run: set_len(segment_len) is the only \
+             thing that can take the torn fragment back off the segment"
+        );
+        assert_eq!(
+            journal.next_seq(),
+            next_before_failure,
+            "a failed append must not advance next_seq"
+        );
+
+        // Un-poisoned means usable: restore an ordinary handle (the O_DIRECT
+        // one refuses every append, poisoned or not) and the very seq the
+        // failed append was carrying commits normally.
+        journal.segment_file = OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .expect("restore an ordinary handle");
+        let recovered = journal
+            .append(draft(2))
+            .expect("a handle that was never poisoned must still accept appends");
+        assert_eq!(recovered.seq, next_before_failure);
+        let replayed: Vec<u64> = journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event").seq)
+            .collect();
+        assert_eq!(
+            replayed,
+            vec![1, 2],
+            "and the segment replays as two clean events, with no trace of \
+             the fragment the rollback removed"
+        );
+    }
 
     #[test]
     fn segment_creation_past_the_8_digit_namespace_fails_closed() {

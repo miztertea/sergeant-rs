@@ -1,0 +1,18 @@
+# What GitHub's language bar is allowed to count.
+#
+# The repository is a single Rust crate carrying a large committed evidence
+# tree. `reference/` alone (the upstream fork, the spike notes, the workflow
+# archive) outweighs `src/` in bytes, and its shell and Python make the bar
+# report a majority-Shell project — a claim about the repo that is false in
+# every sense a reader means it. linguist-vendored says "committed, but not
+# ours": the files stay tracked and diffable, and stop being counted.
+#
+# `reference-corpus/` and `.sergeant/` are marked ahead of their arrival: they
+# exist on the N-series branch today, and marking them here means the language
+# bar survives that merge unchanged rather than needing a follow-up.
+reference/** linguist-vendored
+reference-corpus/** linguist-vendored
+.sergeant/** linguist-vendored
+
+# Machine-written, reviewed only as a lockfile.
+Cargo.lock linguist-generated

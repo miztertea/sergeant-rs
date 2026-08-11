@@ -1,0 +1,9 @@
+stage	c3-m6_surfaces
+wall_s	15
+profraw_before	57
+profraw_produced	53
+profraw_mergeable	53
+profraw_discarded	0
+profraw_lost	0
+profraw_loss_expected	no
+profraw_total	110

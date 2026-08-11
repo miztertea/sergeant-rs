@@ -675,9 +675,603 @@ fn resource() -> Resource {
         .build()
 }
 
+/// Pipeline shapes and metric readers that exist only for tests, here rather
+/// than in a test module because `daemon.rs`'s own `#[cfg(test)]` module
+/// needs them too and `from_providers` is private to this module. Compiled
+/// out of the daemon entirely.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::trace::BatchSpanProcessor;
+
+    impl Telemetry {
+        /// [`Telemetry::with_exporters`]'s batched twin: finished spans wait
+        /// in the processor's own queue until something flushes it.
+        ///
+        /// The simple processor `with_exporters` builds exports at span end,
+        /// so its `force_flush` is a no-op and a test built on it cannot tell
+        /// whether [`Telemetry::force_flush`] flushed the tracer pipeline at
+        /// all. This one can: unflushed means unexported.
+        pub(crate) fn with_batch_span_exporter(
+            spans: impl SpanExporter + 'static,
+            metrics: impl PushMetricExporter + 'static,
+        ) -> Self {
+            let tracer_provider = SdkTracerProvider::builder()
+                .with_resource(resource())
+                .with_span_processor(BatchSpanProcessor::builder(spans).build())
+                .build();
+            Self::from_providers(tracer_provider, metrics)
+        }
+    }
+
+    /// The largest value a `u64` counter reports across every export batch,
+    /// 0 if the instrument never exported. Reading the actual value (not just
+    /// the instrument's name) is what proves the fold recorded the right
+    /// *count*, not merely that the instrument exists.
+    ///
+    /// The largest, not the sum: a caller driving this from inside a live
+    /// tokio runtime (`#[tokio::test]`) lets the SDK's `PeriodicReader` fire
+    /// its own background collect alongside the test's explicit
+    /// `force_flush`, and every collect of a *cumulative* counter reports the
+    /// total so far — so summing batches double-counts while the maximum is
+    /// the true total however many times collection ran. With a single batch
+    /// the two agree, which is why this one function serves both this
+    /// module's plain `#[test]`s and `daemon.rs`'s `#[tokio::test]`s.
+    pub(crate) fn counter_total(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
+        exporter
+            .get_finished_metrics()
+            .expect("metrics")
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .filter(|metric| metric.name() == name)
+            .map(|metric| match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    sum.data_points().map(|dp| dp.value()).sum::<u64>()
+                }
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::counter_total;
     use super::*;
+    use crate::domain::event::{EventDraft, EventSource};
+    use crate::domain::work::{
+        KIND_WORK_BLOCKED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_STARTED,
+        KIND_WORK_WAITING,
+    };
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+    use serde_json::json;
+
+    /// An event with a work scope, built the same way the journal shapes
+    /// one — the fixture every issue #34 test below folds through `record`.
+    fn ev(seq: u64, work_id: &str, kind: &str, payload: serde_json::Value) -> Event {
+        EventDraft::new(EventSource::new("daemon", "test"), kind, payload)
+            .with_work_id(work_id)
+            .into_event(seq)
+    }
+
+    fn attribute(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    fn exported_metric_names(
+        exporter: &InMemoryMetricExporter,
+    ) -> std::collections::BTreeSet<String> {
+        exporter
+            .get_finished_metrics()
+            .expect("metrics")
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .map(|metric| metric.name().to_string())
+            .collect()
+    }
+
+    /// Issue #34 item 1: `from_config` with an **enabled** config must
+    /// actually reach `Self::otlp` — the baseline only ever exercised the
+    /// disabled short-circuit.
+    ///
+    /// Deliberately *not* a wire test. That `Self::otlp` puts real bytes on
+    /// the configured endpoint is already proven end-to-end by
+    /// `tests/m5_projections.rs`'s
+    /// `otlp_export_reaches_a_collector_listening_on_the_configured_endpoint`
+    /// (with a stronger predicate than a copy here could reuse — its
+    /// `is_trace_post` helper lives in that integration crate). The one line
+    /// left unmeasured is `from_config`'s enabled arm, and a second stand-in
+    /// collector would buy it at the price of a 20 s worst case inside the
+    /// `--lib` target. Turning the arm into `Ok(None)` fails the `expect`
+    /// below, which is the whole falsifiability requirement.
+    #[test]
+    fn from_config_with_an_enabled_config_builds_the_otlp_pipeline() {
+        let config = TelemetryConfig {
+            enabled: true,
+            otlp_endpoint: Some("http://127.0.0.1:1".to_string()),
+        };
+        let telemetry = Telemetry::from_config(&config)
+            .expect("building the pipeline must not require a reachable collector")
+            .expect("an enabled config must build a pipeline via Self::otlp, not return None");
+        // Nothing is recorded, so nothing is ever put on the wire and the
+        // unreachable endpoint costs no time.
+        telemetry.shutdown();
+    }
+
+    /// Issue #34 item 2: `record`'s unparseable-timestamp guard.
+    ///
+    /// The falsifier is the `work.completed` in the middle. With the guard
+    /// in place nothing was ever opened for `w1`, so that event has nothing
+    /// to close and the exporter stays empty. Delete the guard and the
+    /// malformed event opens a `work` span at the epoch (`ts` falls back to
+    /// 0), which the same `work.completed` then closes and exports — a span
+    /// starting in 1970 being exactly the corruption the guard prevents.
+    /// Asserting only "no finished spans" straight after the malformed
+    /// event would prove nothing: a span this fold opens is parked
+    /// unfinished in `FoldState`, and the simple exporter exports at `end`.
+    #[test]
+    fn record_with_an_unparseable_timestamp_is_a_no_op() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans.clone(), metrics);
+
+        let mut odd = ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "x"}}),
+        );
+        odd.timestamp = "not-a-timestamp".to_string();
+        telemetry.record(&odd);
+        telemetry.record(&ev(2, "w1", KIND_WORK_COMPLETED, json!({})));
+        telemetry.force_flush();
+        let after_malformed = spans.get_finished_spans().expect("spans");
+        assert!(
+            after_malformed.is_empty(),
+            "an unparseable timestamp must never open a span, so a later \
+             work.completed has nothing to close: {after_malformed:?}"
+        );
+
+        // A later, well-formed pair proves the guard's early return didn't
+        // corrupt the fold state on its way out.
+        telemetry.record(&ev(
+            3,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "x"}}),
+        ));
+        telemetry.record(&ev(4, "w1", KIND_WORK_COMPLETED, json!({})));
+        telemetry.force_flush();
+        let finished = spans.get_finished_spans().expect("spans");
+        assert_eq!(
+            finished.len(),
+            1,
+            "exactly the one well-formed work span, no ghost from the \
+             malformed event: {finished:?}"
+        );
+        assert_eq!(finished[0].name, "work");
+        assert!(
+            finished[0].start_time > UNIX_EPOCH,
+            "the exported span carries the journal's timestamp, not the \
+             epoch a ts=0 fallback would produce: {:?}",
+            finished[0].start_time
+        );
+    }
+
+    /// Issue #34 item 3: `record_locked`'s malformed-event guards across
+    /// most kinds. Each event below is missing exactly the scoping field its
+    /// handler reads (an absent id, or a reference to a span nothing ever
+    /// opened) and must be skipped without opening, closing, or corrupting
+    /// any span.
+    ///
+    /// Two things make this falsifiable rather than decorative:
+    ///
+    /// * A well-formed `work.submitted` for `w1` runs **before** the batch.
+    ///   Without an open work span to parent to, deleting (say) the
+    ///   `stage_id` guard is masked by the parent-context guard immediately
+    ///   below it, and half the batch becomes unable to tell guard from no
+    ///   guard.
+    /// * The assertions read the **fold state**, not just the exporter. A
+    ///   span this fold wrongly opens is parked unfinished in `FoldState`,
+    ///   and `with_exporters` uses a simple exporter, which exports only at
+    ///   `end` — so `get_finished_spans().is_empty()` cannot fail for *any*
+    ///   opening-side guard, and on its own would leave every one of them
+    ///   unmeasured. The closing-side guards are the ones the empty-exporter
+    ///   assertion does pin.
+    #[test]
+    fn record_locked_guards_across_most_kinds_skip_malformed_events() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans.clone(), metrics);
+
+        // The live parent every opening-side guard below needs in order to
+        // be reachable at all.
+        telemetry.record(&ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "live"}}),
+        ));
+
+        let malformed = vec![
+            // KIND_WORK_SUBMITTED: no "work.id".
+            ev(
+                2,
+                "w-no-id",
+                KIND_WORK_SUBMITTED,
+                json!({"work": {"intent": "x"}}),
+            ),
+            // KIND_STAGE_ENTERED: work_id present, stage_id missing.
+            ev(3, "w1", KIND_STAGE_ENTERED, json!({"attempt": 1})),
+            // KIND_STAGE_ENTERED: stage_id present, but no work span was
+            // ever opened for this work (the parent-context guard).
+            ev(
+                4,
+                "ghost",
+                KIND_STAGE_ENTERED,
+                json!({"stage_id": "00-first", "attempt": 1}),
+            ),
+            // KIND_STAGE_COMPLETED: no work_id on the envelope at all.
+            {
+                let mut e = ev(
+                    5,
+                    "w1",
+                    KIND_STAGE_COMPLETED,
+                    json!({"stage_id": "00-first"}),
+                );
+                e.work_id = None;
+                e
+            },
+            // KIND_STAGE_COMPLETED: work_id present, but no stage is
+            // currently open for it.
+            ev(
+                6,
+                "w1",
+                KIND_STAGE_COMPLETED,
+                json!({"stage_id": "never-entered"}),
+            ),
+            // KIND_EXECUTION_STARTED: no execution_id in the payload.
+            ev(
+                7,
+                "w1",
+                KIND_EXECUTION_STARTED,
+                json!({"execution": {"backend": "fake"}}),
+            ),
+            // KIND_EXECUTION_STARTED: execution_id present, but no work or
+            // stage span is open for this work (the parent-context guard).
+            ev(
+                8,
+                "ghost2",
+                KIND_EXECUTION_STARTED,
+                json!({"execution": {"execution_id": "e-ghost", "backend": "fake"}}),
+            ),
+            // KIND_EXECUTION_STOPPED: no execution scope at all.
+            ev(9, "w1", KIND_EXECUTION_STOPPED, json!({})),
+            // KIND_EXECUTION_STOPPED: execution_id present, never started.
+            ev(
+                10,
+                "w1",
+                KIND_EXECUTION_STOPPED,
+                json!({"execution_id": "e-ghost2"}),
+            ),
+            // KIND_TOOL_REQUESTED: no execution scope on the envelope.
+            ev(
+                11,
+                "w1",
+                KIND_TOOL_REQUESTED,
+                json!({"id": "t1", "name": "Bash"}),
+            ),
+            // KIND_TOOL_REQUESTED: execution scope present, but no
+            // execution span is open under it (the parent-context guard —
+            // the envelope-scope guard above masks it on its own).
+            {
+                let mut e = ev(
+                    12,
+                    "w1",
+                    KIND_TOOL_REQUESTED,
+                    json!({"id": "t2", "name": "Bash"}),
+                );
+                e.execution_id = Some("e-ghost3".to_string());
+                e
+            },
+            // KIND_TOOL_COMPLETED: no execution scope on the envelope.
+            ev(13, "w1", KIND_TOOL_COMPLETED, json!({"tool_use_id": "t1"})),
+        ];
+
+        for event in &malformed {
+            telemetry.record(event);
+        }
+        telemetry.force_flush();
+
+        let state = telemetry.state.lock().expect("telemetry fold state lock");
+        let keys = |spans: &BTreeMap<String, OpenSpan>| {
+            spans.keys().cloned().collect::<Vec<_>>().join(",")
+        };
+        assert_eq!(
+            keys(&state.works),
+            "w1",
+            "no malformed event may open a work span (only the well-formed \
+             prologue's may be open)"
+        );
+        assert_eq!(
+            keys(&state.stages),
+            "",
+            "no malformed event may open a stage span"
+        );
+        assert_eq!(
+            keys(&state.executions),
+            "",
+            "no malformed event may open an execution span"
+        );
+        assert_eq!(
+            keys(&state.tools),
+            "",
+            "no malformed event may open a tool span"
+        );
+        drop(state);
+
+        assert!(
+            spans.get_finished_spans().expect("spans").is_empty(),
+            "and no malformed event may close one either — the prologue's \
+             work span is still open"
+        );
+    }
+
+    /// Issue #34 item 4: a stage re-entered (a retry) while its previous
+    /// attempt's span is still open must close that span as "superseded"
+    /// rather than leak it.
+    #[test]
+    fn a_stage_re_entered_while_still_open_closes_the_previous_one_as_superseded() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans.clone(), metrics);
+
+        telemetry.record(&ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "retry"}}),
+        ));
+        telemetry.record(&ev(
+            2,
+            "w1",
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-first", "attempt": 1}),
+        ));
+        // The retry re-enters the same stage without an intervening outcome
+        // event — the first attempt's span was never closed by anything.
+        telemetry.record(&ev(
+            3,
+            "w1",
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-first", "attempt": 2}),
+        ));
+        telemetry.force_flush();
+
+        let finished = spans.get_finished_spans().expect("spans");
+        let superseded = finished
+            .iter()
+            .find(|s| attribute(s, "sergeant.stage.attempt").as_deref() == Some("1"))
+            .expect("the first attempt's span must have been closed, not leaked");
+        assert_eq!(
+            attribute(superseded, "sergeant.status").as_deref(),
+            Some("superseded"),
+            "a re-entered stage must close its still-open previous attempt as superseded: {superseded:?}"
+        );
+    }
+
+    /// Issue #34 item 5: `KIND_TOOL_COMPLETED`'s `is_error` branch closes the
+    /// tool span with status "error" rather than "ok".
+    #[test]
+    fn a_failed_tool_call_closes_its_span_with_error_status() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans.clone(), metrics);
+
+        telemetry.record(&ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "x"}}),
+        ));
+        telemetry.record(&ev(
+            2,
+            "w1",
+            KIND_WORKFLOW_BOUND,
+            json!({"backend": "fake"}),
+        ));
+        telemetry.record(&ev(
+            3,
+            "w1",
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-first", "attempt": 1}),
+        ));
+        telemetry.record(&ev(
+            4,
+            "w1",
+            KIND_EXECUTION_STARTED,
+            json!({"execution": {"execution_id": "e1", "backend": "fake"}}),
+        ));
+        let mut requested = ev(
+            5,
+            "w1",
+            KIND_TOOL_REQUESTED,
+            json!({"id": "t1", "name": "Bash"}),
+        );
+        requested.execution_id = Some("e1".to_string());
+        telemetry.record(&requested);
+        let mut completed = ev(
+            6,
+            "w1",
+            KIND_TOOL_COMPLETED,
+            json!({"tool_use_id": "t1", "is_error": true}),
+        );
+        completed.execution_id = Some("e1".to_string());
+        telemetry.record(&completed);
+        telemetry.force_flush();
+
+        let finished = spans.get_finished_spans().expect("spans");
+        let tool_span = finished
+            .iter()
+            .find(|s| s.name == "tool.bash")
+            .expect("a tool.bash span");
+        assert_eq!(
+            attribute(tool_span, "sergeant.status").as_deref(),
+            Some("error")
+        );
+    }
+
+    /// Issue #34 item 6: the `needs_input_total` counter block.
+    #[test]
+    fn needs_input_is_counted_when_the_work_needs_input() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans, metrics.clone());
+
+        telemetry.record(&ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "x"}}),
+        ));
+        telemetry.record(&ev(2, "w1", KIND_WORK_NEEDS_INPUT, json!({})));
+        telemetry.force_flush();
+
+        assert_eq!(
+            counter_total(&metrics, "sergeant_needs_input_total"),
+            1,
+            "one work.needs_input event must add exactly one to the counter"
+        );
+    }
+
+    /// Issue #34 item 7: `transition()`'s wait-duration recording, on
+    /// leaving a waiting state.
+    #[test]
+    fn wait_duration_is_recorded_when_a_waiting_work_leaves_that_state() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans, metrics.clone());
+
+        telemetry.record(&ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "x"}}),
+        ));
+        telemetry.record(&ev(2, "w1", KIND_WORK_WAITING, json!({})));
+        telemetry.record(&ev(3, "w1", KIND_WORK_STARTED, json!({"backend": "fake"})));
+        telemetry.force_flush();
+
+        let names = exported_metric_names(&metrics);
+        assert!(
+            names.contains("sergeant_wait_duration_seconds"),
+            "wait_duration must be recorded on leaving a waiting state: {names:?}"
+        );
+    }
+
+    /// Issue #34 item 8: `transition()`'s `backend_failure_total` branch,
+    /// on both a Failed and a Blocked transition.
+    #[test]
+    fn backend_failure_total_records_on_failed_and_blocked_transitions() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans, metrics.clone());
+
+        telemetry.record(&ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "x"}}),
+        ));
+        telemetry.record(&ev(
+            2,
+            "w1",
+            KIND_WORKFLOW_BOUND,
+            json!({"backend": "claude"}),
+        ));
+        telemetry.record(&ev(
+            3,
+            "w1",
+            KIND_WORK_STARTED,
+            json!({"backend": "claude"}),
+        ));
+        telemetry.record(&ev(4, "w1", KIND_WORK_FAILED, json!({})));
+
+        telemetry.record(&ev(
+            5,
+            "w2",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w2", "intent": "x"}}),
+        ));
+        telemetry.record(&ev(
+            6,
+            "w2",
+            KIND_WORKFLOW_BOUND,
+            json!({"backend": "fake"}),
+        ));
+        telemetry.record(&ev(7, "w2", KIND_WORK_STARTED, json!({"backend": "fake"})));
+        telemetry.record(&ev(8, "w2", KIND_WORK_BLOCKED, json!({})));
+        telemetry.force_flush();
+
+        assert_eq!(
+            counter_total(&metrics, "sergeant_backend_failure_total"),
+            2,
+            "one Failed transition and one Blocked transition must add exactly two"
+        );
+    }
+
+    /// Issue #34 item 9: a terminal work transition closes a still-open
+    /// stage span too, not just the work span.
+    #[test]
+    fn a_terminal_work_closes_a_still_open_stage_span_too() {
+        let spans = InMemorySpanExporter::default();
+        let metrics = InMemoryMetricExporter::default();
+        let telemetry = Telemetry::with_exporters(spans.clone(), metrics);
+
+        telemetry.record(&ev(
+            1,
+            "w1",
+            KIND_WORK_SUBMITTED,
+            json!({"work": {"id": "w1", "intent": "x"}}),
+        ));
+        telemetry.record(&ev(
+            2,
+            "w1",
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-first", "attempt": 1}),
+        ));
+        // The work fails while its stage span is still open — no
+        // stage.failed event ever arrives for it.
+        telemetry.record(&ev(3, "w1", KIND_WORK_FAILED, json!({})));
+        telemetry.force_flush();
+
+        let finished = spans.get_finished_spans().expect("spans");
+        let stage = finished
+            .iter()
+            .find(|s| s.name == "stage.00-first")
+            .expect("the still-open stage span must be closed on the terminal transition");
+        assert_eq!(
+            attribute(stage, "sergeant.status").as_deref(),
+            Some("failed")
+        );
+        let work = finished
+            .iter()
+            .find(|s| s.name == "work")
+            .expect("the work span itself closes too");
+        assert_eq!(
+            attribute(work, "sergeant.status").as_deref(),
+            Some("failed")
+        );
+    }
 
     #[test]
     fn export_is_off_unless_switched_on_and_the_switch_is_explicit() {

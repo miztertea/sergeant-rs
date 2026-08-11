@@ -500,4 +500,143 @@ mod tests {
             GraphDelta::default()
         );
     }
+
+    /// An event with no work scope at all (as opposed to `event()`, which
+    /// always sets one) — the shape several of `derive`'s guards fire on.
+    fn event_no_work(seq: u64, kind: &str, payload: serde_json::Value) -> Event {
+        EventDraft::new(EventSource::new("daemon", "test"), kind, payload).into_event(seq)
+    }
+
+    /// Issue #33 item 2: `GraphContext::derive`'s guard family across event
+    /// kinds beyond the one case already pinned above (`execution.started`
+    /// with a malformed `execution` object) — each event below is missing
+    /// exactly the scoping field its handler reads, and must derive an empty
+    /// delta rather than panic or invent a node from absent data.
+    #[test]
+    fn derive_guards_across_kinds_skip_malformed_events_without_panicking() {
+        let mut context = GraphContext::default();
+
+        assert_eq!(
+            context.derive(&event_no_work(
+                1,
+                KIND_WORK_SUBMITTED,
+                json!({"work": {"intent": "orphan"}}),
+            )),
+            GraphDelta::default(),
+            "work.submitted with no work.id must derive nothing"
+        );
+        assert_eq!(
+            context.derive(&event_no_work(
+                2,
+                KIND_WORKFLOW_BOUND,
+                json!({"workflow": {"name": "tiny", "version": "1"}}),
+            )),
+            GraphDelta::default(),
+            "workflow.bound with no work_id must derive nothing"
+        );
+        assert_eq!(
+            // Non-empty bindings on purpose: this arm only emits from
+            // inside the loop over them, so `"bindings": []` would derive
+            // nothing whether or not the work_id guard is there.
+            context.derive(&event_no_work(
+                3,
+                KIND_SURFACE_MATERIALIZED,
+                json!({"surface": {"bindings": [
+                    {"repository": "repo", "source_path": "/src/repo"},
+                ]}}),
+            )),
+            GraphDelta::default(),
+            "surface.materialized with no work_id must derive nothing"
+        );
+        assert_eq!(
+            context.derive(&event(4, "w", KIND_STAGE_ENTERED, json!({"index": 0}))),
+            GraphDelta::default(),
+            "stage.entered with no stage_id must derive nothing"
+        );
+        assert_eq!(
+            context.derive(&event_no_work(
+                5,
+                KIND_EXECUTION_STARTED,
+                json!({"execution": {"execution_id": "e1"}}),
+            )),
+            GraphDelta::default(),
+            "execution.started with no work_id must derive nothing"
+        );
+        assert_eq!(
+            context.derive(&event(
+                6,
+                "w",
+                KIND_CONVERSATION_USER,
+                json!({"text": "hi"})
+            )),
+            GraphDelta::default(),
+            "a conversation event with no execution scope must derive nothing"
+        );
+        assert_eq!(
+            context.derive(&event(
+                7,
+                "w",
+                KIND_TOOL_REQUESTED,
+                json!({"id": "t1", "name": "Bash"}),
+            )),
+            GraphDelta::default(),
+            "tool.requested with no execution scope must derive nothing"
+        );
+        assert_eq!(
+            context.derive(&event(
+                8,
+                "w",
+                KIND_USAGE_UPDATED,
+                json!({"model_usage": {"claude": {}}}),
+            )),
+            GraphDelta::default(),
+            "usage.updated with no execution scope must derive nothing"
+        );
+    }
+
+    /// Issue #33 item 2: `truncate()`'s shortening branch (never exercised —
+    /// no baseline fixture used a message long enough) alongside the
+    /// unchanged and boundary cases.
+    #[test]
+    fn truncate_marks_shortened_text_and_leaves_text_at_the_limit_untouched() {
+        assert_eq!(truncate("short", 80), "short");
+        let exactly_at_limit = "x".repeat(80);
+        assert_eq!(truncate(&exactly_at_limit, 80), exactly_at_limit);
+
+        let long = "x".repeat(100);
+        let shortened = truncate(&long, 80);
+        assert_eq!(shortened.chars().count(), 81, "{shortened}");
+        assert!(shortened.ends_with('…'), "{shortened}");
+        assert!(shortened.starts_with(&"x".repeat(80)), "{shortened}");
+    }
+
+    /// The same shortening branch, exercised end-to-end through `derive` so
+    /// the graph label a real long conversation turn produces is pinned too.
+    #[test]
+    fn a_long_conversation_message_is_truncated_in_its_graph_label() {
+        let mut context = GraphContext::default();
+        let mut message = event(
+            1,
+            "w",
+            KIND_CONVERSATION_USER,
+            json!({"text": "y".repeat(200)}),
+        );
+        message.execution_id = Some("e1".to_string());
+        let delta = context.derive(&message);
+        let node = delta
+            .nodes
+            .iter()
+            .find(|n| n.kind == "message")
+            .expect("a message node");
+        assert!(
+            node.label.ends_with('…'),
+            "a long message must be marked truncated: {}",
+            node.label
+        );
+        assert!(
+            node.label.chars().count() < 200,
+            "the label must be shorter than the untruncated text: {}",
+            node.label
+        );
+    }
 }

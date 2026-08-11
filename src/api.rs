@@ -1858,6 +1858,85 @@ mod tests {
         }
     }
 
+    /// `data:` lines belonging to one SSE frame are joined by a literal `\n`
+    /// (the SSE spec's join rule; the code is lines 1766-1767) — not by bare
+    /// concatenation, which the second half proves: split across a number's
+    /// minus sign and its digit, the two chunks only reassemble into the
+    /// value `-5` when nothing is inserted between them, so a decoder that
+    /// really joins with a newline must fail to parse that split rather than
+    /// silently producing a value nobody sent.
+    #[test]
+    fn decode_frame_coalesces_data_lines_with_a_real_newline() {
+        // An ordinary split, at an object-member boundary, decodes into
+        // exactly the event that boundary was cut from.
+        let frame = "data: {\"schema\":\"sergeant.event/v1\",\"seq\":7,\"id\":\"01H7X8Y9Z\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\ndata: \"kind\":\"test.seeded\",\"payload\":{\"n\":3}}";
+        let event = decode_frame(frame)
+            .expect("a frame whose data: is split across two lines still decodes");
+        assert_eq!(event.seq, 7);
+        assert_eq!(event.id, "01H7X8Y9Z");
+        assert_eq!(event.kind, "test.seeded");
+        assert_eq!(event.payload, json!({"n": 3}));
+
+        // Split at a number's minus sign instead: without the joining
+        // newline, `-` and `5` on separate data: lines read back together as
+        // the valid number -5. The newline this test pins turns that into a
+        // `-` followed by whitespace then `5`, which is not a legal JSON
+        // number.
+        let split_number = "data: {\"schema\":\"sergeant.event/v1\",\"seq\":9,\"id\":\"01NEG\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\"kind\":\"test.seeded\",\"payload\":{\"n\":-\ndata: 5}}";
+        assert_eq!(
+            decode_frame(split_number),
+            None,
+            "the two data: lines must not be concatenated without the newline \
+             the SSE spec requires between them"
+        );
+    }
+
+    /// Comment lines — axum's keep-alive shape (`KeepAlive`, used above) —
+    /// carry no `data:` and must be skipped without ending the frame or
+    /// corrupting the real payload beside them.
+    #[test]
+    fn decode_frame_skips_comment_and_keep_alive_lines() {
+        assert_eq!(
+            decode_frame(": keep-alive"),
+            None,
+            "a frame that is only a comment carries no event"
+        );
+        let single_line = "{\"schema\":\"sergeant.event/v1\",\"seq\":2,\"id\":\"01Z\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\"kind\":\"test.seeded\",\"payload\":{\"n\":2}}";
+        let frame = format!(": keep-alive\ndata: {single_line}");
+        let event = decode_frame(&frame)
+            .expect("a comment line beside a data: line must not swallow the event");
+        assert_eq!(event.seq, 2);
+        assert_eq!(event.id, "01Z");
+    }
+
+    /// The two `stage_label` arms besides "both known" and "nothing at
+    /// all": an index with no known total still reads its one-based
+    /// position, and the absence of an index drops the position segment
+    /// entirely — whether or not a total happens to be present.
+    #[test]
+    fn stage_label_reads_an_index_without_a_total_and_no_index_at_all() {
+        let index_only = json!({"stage_id": "10-implement", "index": 3, "status": "blocked"});
+        assert_eq!(
+            stage_label(&index_only),
+            "10-implement 4 · blocked",
+            "an index without a known total still reads its one-based position"
+        );
+
+        let of_only = json!({"stage_id": "20-test", "of": 5, "status": "queued"});
+        assert_eq!(
+            stage_label(&of_only),
+            "20-test · queued",
+            "no index means no position segment, even when `of` is present"
+        );
+
+        let neither = json!({"stage_id": "20-test", "status": "queued"});
+        assert_eq!(
+            stage_label(&neither),
+            "20-test · queued",
+            "no index and no total: still no position segment"
+        );
+    }
+
     async fn test_state(data_dir: &std::path::Path) -> ApiState {
         let journal = Journal::open(data_dir).expect("open journal");
         let mut registry = work_registry_projection();
@@ -1893,6 +1972,80 @@ mod tests {
             "test.seeded",
             json!({"n": n}),
         )
+    }
+
+    /// Guard for the history loop's cursor bookkeeping in `forward_events`
+    /// (`last_sent = event.seq`), which nothing else in the suite reaches.
+    ///
+    /// That assignment has no effect on what history itself delivers —
+    /// `events_after` is called once, before the loop, so the tail is already
+    /// fixed. It matters in exactly one place: it is the floor a *later*
+    /// refill or dedup starts from. `m2_daemon_api.rs`'s mid-replay resume
+    /// test cannot see it (it reads history frames and disconnects, never
+    /// reaching the live half), and lag cannot be provoked through the real
+    /// HTTP surface without pushing past the daemon's 1024-slot broadcast.
+    /// Driving `forward_events` directly makes it deterministic instead:
+    ///
+    /// 1. a one-slot sink wedges the pump *inside* the history loop, so it
+    ///    has not yet called `live.recv()`;
+    /// 2. twenty commits then overflow the sixteen-slot broadcast, so the
+    ///    subscriber's very first `recv()` is `Lagged` — by the channel's own
+    ///    overwrite contract, not by scheduler luck;
+    /// 3. draining resumes history to its end, and the refill that follows
+    ///    starts from `last_sent`.
+    ///
+    /// One frame per event is `send_sse`'s contract, so an exact frame count
+    /// is an exact "no gap, no repeat": a cursor left one short re-delivers
+    /// the last history frame and this reads 26.
+    #[tokio::test]
+    async fn a_lag_refill_resumes_from_the_last_history_frame_the_pump_actually_sent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        const HISTORY: u32 = 5;
+        const LIVE: u32 = 20; // > the 16-slot broadcast `test_state` builds
+        {
+            let mut core = state.core.lock().await;
+            for n in 1..=HISTORY {
+                core.commit(seeded(n)).expect("commit history");
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+
+        // One frame out: the pump is past `subscribe` and inside the history
+        // loop. It cannot reach `live.recv()` from here — three history
+        // frames remain and the sink holds one — so everything committed
+        // below piles up unread in the broadcast ring.
+        let first = rx.recv().await.expect("the first history frame");
+        assert!(first.is_ok(), "the pump never sends a stream error");
+
+        {
+            let mut core = state.core.lock().await;
+            for n in HISTORY + 1..=HISTORY + LIVE {
+                core.commit(seeded(n)).expect("commit live");
+            }
+        }
+
+        let total = (HISTORY + LIVE) as usize;
+        let mut frames = 1;
+        while frames < total {
+            let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("every committed event must reach the stream")
+                .expect("the pump must not close the stream");
+            assert!(frame.is_ok(), "the pump never sends a stream error");
+            frames += 1;
+        }
+        let extra = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            extra.is_err(),
+            "the lag refill must start after the last history frame the pump \
+             sent, not repeat it: {extra:?}"
+        );
+
+        pump.abort();
     }
 
     /// The TOCTOU this test provokes: `with_analytics` reads `last_seq`,

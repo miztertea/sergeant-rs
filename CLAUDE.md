@@ -34,7 +34,7 @@ Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integ
 
 ## Testing rules specific to this repo
 
-- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m6_surfaces.rs` (218 total + 2 opt-in, per GAUNTLET.md's Bug Sprint 1 entry). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
+- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m6_surfaces.rs` (294 total + 2 opt-in as of S2 close — coverage 94.63% lines by the committed convention, `docs/coverage/baseline-2026-08-10.md`). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
 - A fix without a test that fails when the fix is reverted is not done (LESSONS L7). Every advertised backend capability flag needs a contract test against the installed harness (L8).
 - The Claude adapter's behavior is *measured*, never assumed from docs — exit codes lie, `subtype` lies, model aliases silently substitute (L1). The version gate is pinned in `src/backend/claude.rs`; re-measure on any CLI version bump.
 - After running suites, `pgrep -f "debug/sgt --data-dir"` should find nothing (note: quoting matters — an unquoted pattern matches your own shell).
@@ -43,7 +43,7 @@ Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integ
 
 - **GAUNTLET.md** — append-only ledger: deviation register D1–D8, backlog B1–B3 (deferred findings with named triggers), per-milestone scorecards and adjudication rulings. Append; never rewrite history.
 - **LESSONS.md** — L1–L10, binding on development here. Highest-leverage: measure the claude CLI (L1), point fresh reviewers at the register first (L3), mutation probes only in disposable copies outside the tree (L5), keep fix commits separable from build commits (L10).
-- **docs/gauntlet/contracts/** M0–M6 — the milestone contracts the code was built and reviewed against; `reference/notes/gauntlet-pattern.md` defines the loop, and `reference/gauntlet-workflows.zip` holds the orchestration scripts as run.
+- **docs/gauntlet/contracts/** M0–M6 — the milestone contracts the code was built and reviewed against; `reference/notes/gauntlet-pattern.md` defines the loop **and the binding model spread** (Sonnet executes contracts, Opus judges outcomes, Fable is the one orchestrator seat and never fans out — dated revision 2026-08-10, ruling R-S0-13), and `reference/gauntlet-workflows.zip` holds the M/N orchestration scripts as run (`resources/` holds the S-series ones).
 - Design decisions log their Ponytail rung (R1–R7 ladder in `reference/notes/ideaos-agent-contract.md`).
 - `reference/` is committed evidence, not source — don't edit it to change behavior.
 

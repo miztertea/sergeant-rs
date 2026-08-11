@@ -85,7 +85,38 @@ CONTRACT → BUILD → GATES → BLIND CRITICS → ADVERSARIAL VERIFY → FIX �
 
 ## Model assignment
 
-Capability goes where judgment lives; diversity goes where independence matters.
+**Revised 2026-08-10 (owner direction; supersedes the table below — kept for
+the record). Sonnet by default, escalation by earned need.**
+
+- The default worker is **Sonnet** — extraction, drafting, mechanical fixes,
+  scripted verification, stage acting, running measurements, applying
+  enumerated rulings. The test: if the task has a clear contract, grounded
+  inputs, and a checkable output, Sonnet does it. Most work in a gauntlet
+  loop is exactly that shape, which is why most agents are Sonnet.
+- **Opus** comes in where the task is judgment under breadth — one context
+  weighing many things against each other with no mechanical check to lean
+  on: cross-partition synthesis, blind adversarial review, independent
+  verification of a fixer's claims, and fixes whose correctness turns on
+  architectural understanding rather than a ruling someone already wrote.
+  The tell: if a wrong answer would look plausible and nothing downstream
+  would mechanically catch it, that seat gets Opus.
+- **Fable is one seat, not a tier: the orchestrator.** It holds the whole
+  program in context — contracts, rulings, the ledger, what every workflow
+  is doing and why — and does the things that require that totality:
+  adjudicating conflicting findings, writing contracts and rulings, deciding
+  when a loop should stop iterating and be ruled instead (L4), and catching
+  when the process itself is wrong rather than its output. Fable never fans
+  out; it's never a worker; there are no Fable subagents.
+
+The escalation logic in one line: Sonnet executes contracts, Opus judges
+outcomes, Fable owns the contract-writing and the tie-breaking. Cost follows
+accountability — the expensive contexts are the ones whose mistakes the
+system can't catch mechanically. Cross-model diversity on review seats
+remains an independence measure, not a cost measure ("multiplicity is not
+institutional independence"). Ruling record: R-S0-13 in
+`docs/gauntlet/contracts/S0.md`; first applied in the S1 phase-1 round 2.
+
+*Superseded table (M0–P1 era, for the record):*
 
 | Role | Model | Rationale |
 |---|---|---|
