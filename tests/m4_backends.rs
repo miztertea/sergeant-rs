@@ -6453,6 +6453,222 @@ fn n24_a_launch_for_a_superseded_attempt_does_not_advance_the_current_one() {
     );
 }
 
+// ------------------- §14.5 for OBSERVE: the completion driver's clauses
+//
+// Issue #46 gave the engine a caller nothing else has: a settle that no
+// request asked for. Its observation is taken with the lock open, exactly like
+// a launch's, so §14.5 binds it exactly as it binds `settle_launch` — and,
+// unlike a launch's, it can arrive *repeatedly* for one finished turn, because
+// a cadence keeps asking. `observation_is_stale` is what stands between that
+// and a double-completed stage, a resurrected cancel, or an advanced wrong
+// attempt; these three drive each of those through the journal, exactly as a
+// concurrent request would have left it.
+//
+// The shape is the same in all three: park a run `active` with a live
+// execution (a hanging fake), take the observation the driver would take,
+// finish the turn underneath it, then move durable state on before settling.
+
+/// Park `work_id` on stage `00-only` with a live, hanging execution — the
+/// state a real run sits in while its turn is still going — and return the
+/// observation the completion driver would take of it.
+fn park_with_a_live_turn(
+    engine: &Engine,
+    core: &mut Core,
+    work_id: &str,
+) -> Box<sergeant_rs::runtime::engine::PendingObserve> {
+    let step = engine.begin_retry(core, work_id).expect("begin retry");
+    let pending = advance_to_launch(engine, core, step);
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(core, pending, outcome)
+        .expect("settle launch");
+    step.deferred.wait();
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Active,
+        "the run must be active with a turn in flight, or these tests are \
+         asserting nothing"
+    );
+    let mut due = engine.due_observations(core);
+    assert_eq!(
+        due.len(),
+        1,
+        "a run with a live execution is due an observation: {due:?}"
+    );
+    due.remove(0)
+}
+
+/// §14.5 for OBSERVE, clause 2: an observation taken before a cancel landed
+/// cannot complete the stage of a work that is already terminal.
+///
+/// This is the clause a poll makes reachable through the ordinary API for the
+/// first time. `sgt cancel` is unconditional and lands under the lock; the
+/// driver's observation was taken with that lock open, and `drive` reads only
+/// the run's current stage — it would happily journal `stage.completed` and
+/// `work.completed` on a canceled work.
+#[test]
+fn n28_an_observation_taken_before_a_cancel_cannot_complete_the_stage() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3OBS145A";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let pending = park_with_a_live_turn(&engine, &mut core, work_id);
+    // The turn finishes while the observation is being taken outside the lock.
+    fake.complete_live_executions();
+    let outcome = pending.perform();
+    // …and the human's cancel gets the lock first.
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_CANCELED,
+        json!({"stage_id": "00-only", "detail": "work canceled"}),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_CANCELED,
+        json!({"from": "active"}),
+    );
+    let before = kinds_of(&core, work_id).len();
+
+    let step = engine
+        .settle_observe(&mut core, pending, outcome)
+        .expect("settle observe");
+    step.deferred.wait();
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "no terminal work revived"
+    );
+    assert!(
+        events_of(&core, work_id, "stage.completed").is_empty(),
+        "a canceled stage is not completed by an observation that predates it"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_WORK_COMPLETED).is_empty(),
+        "and the work is certainly not completed"
+    );
+    assert_eq!(
+        kinds_of(&core, work_id).len(),
+        before,
+        "a discarded observation performed no external effect, so it has no \
+         evidence to preserve and journals nothing: {:?}",
+        kinds_of(&core, work_id)
+    );
+}
+
+/// §14.5 for OBSERVE, clause 4: an observation of an attempt the run has moved
+/// past does not advance the current one.
+///
+/// `drive` completes whatever `current_stage()` says, so a late observation of
+/// attempt 2 would be journaled as attempt 3's completion — the same
+/// wrong-attempt failure `n24` pins on the launch side, reached here by a
+/// retry landing while the driver's observation was in flight.
+#[test]
+fn n29_an_observation_of_a_superseded_attempt_does_not_advance_the_current_one() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3OBS145B";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let pending = park_with_a_live_turn(&engine, &mut core, work_id);
+    fake.complete_live_executions();
+    let outcome = pending.perform();
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 3}),
+    );
+
+    let step = engine
+        .settle_observe(&mut core, pending, outcome)
+        .expect("settle observe");
+    step.deferred.wait();
+
+    assert!(
+        events_of(&core, work_id, "stage.completed").is_empty(),
+        "the wrong attempt is never advanced"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-only".to_string(), 3),
+        "and the current attempt is untouched"
+    );
+}
+
+/// §14.5 for OBSERVE, the clause only a *cadence* needs: two observations of
+/// one finished turn complete its stage exactly once.
+///
+/// A driver that keeps asking will see the same `Finished` turn on every tick
+/// until the run moves — the adapter's in-memory outcome does not evaporate
+/// when someone reads it — so "exactly once" cannot rest on the observation
+/// being unrepeatable. It rests on the settle: the first one moves durable
+/// state under the lock, and the second finds itself stale against it.
+#[test]
+fn n30_two_observations_of_one_finished_turn_complete_the_stage_once() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3OBS145C";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let first = park_with_a_live_turn(&engine, &mut core, work_id);
+    // Two ticks that overlap the same turn end: the second candidate is taken
+    // while the first settle has not yet run, which is the ordering a slow
+    // settle produces and the one a driver cannot rule out by construction.
+    let mut second_due = engine.due_observations(&core);
+    assert_eq!(second_due.len(), 1);
+    let second = second_due.remove(0);
+    fake.complete_live_executions();
+    let first_outcome = first.perform();
+    let second_outcome = second.perform();
+
+    let step = engine
+        .settle_observe(&mut core, first, first_outcome)
+        .expect("first settle");
+    drain(&engine, &mut core, step);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed,
+        "the first observation is the one that lands"
+    );
+
+    let step = engine
+        .settle_observe(&mut core, second, second_outcome)
+        .expect("second settle");
+    step.deferred.wait();
+
+    assert_eq!(
+        events_of(&core, work_id, "stage.completed").len(),
+        1,
+        "exactly once: {:?}",
+        kinds_of(&core, work_id)
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_WORK_COMPLETED).len(),
+        1,
+        "and one completion, not two: {:?}",
+        kinds_of(&core, work_id)
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(),
+        1,
+        "a second teardown would re-run git on a retired surface: {:?}",
+        kinds_of(&core, work_id)
+    );
+}
+
 /// §22.5 window 2 again, over a prefix the **engine actually produced**.
 ///
 /// N3-06: the eight window tests build their `execution.reserved` /
