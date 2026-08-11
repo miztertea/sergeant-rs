@@ -44,6 +44,69 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### CERBERUS SESSION CLOSE-OUT — 2026-08-11, first host session: BS2+#44 shipped, library promoted, runs 4 + B2, H0 drafted
+
+**Mission outcome.** First non-container session, everything below on the
+session branch (head PR #51; owner merges). (1) **Environment first
+contact**: `docs/environments/cerberus.md` measured (Docker full matrix
+incl. digest pulls; DAC enforced; open network; O_DIRECT-on-tmpfs delta),
+`scripts/probe-env.sh` shipped (retro item 1; its critic caught 3
+fabricated-fact errors). (2) **L1 fired on 2.1.227**: `post_turn_summary`
+absent on this host (5-probe isolation; auth-method confounder recorded)
+— ask affordance gone, withdrawal path operative, a5 probe-gated.
+(3) **Perf re-baselined** (`docs/perf/baseline-cerberus-2026-08-11.md`):
+burst-50 42.0 works/s, rebuild 54.6k ev/s; #4's RSS shape reproduces
+exactly — code, not environment. (4) **BS2 closed #46/#47**: root cause
+was OBSERVE starvation after turn end (fake turns settle at launch — a
+352-green suite coexisted with a 45-minute stall; one stub parameter,
+`stalls_for`, was the whole difference); fix is a completion driver as a
+fourth pending-effect performer (§22.6 by construction, §14.5 currency
+pins); permission mode became profile config with the skip flag deleted
+outright. (5) **#44 closed**: `CoreGuard` one-door hold boundary, one
+fsync per hold — fdatasync 1157→253 per burst-50, honest reading
+recorded (no throughput delta on this host; the win is O(lock-holds)
+journal cost for N4's volume). Shipping gate PASSED after three
+selective fix rounds (16→3→1 findings; flush-poison-bypass the best
+catch); 379 tests at close. (6) **Run 4 completed end-to-end**: 21/21
+partitions, 1,333 units, 44 draft packages, every citation hash
+re-verified; within-run multi-attempt continuation measured for the
+first time (the protocol's `retry` prescription was never real — #53);
+two fail-closed escalations were genuine (partition-scheme
+non-determinism; a one-file census delta ruled per the frozen
+reference). (7) **Run B2**: the settle driver fired live twice on real
+Claude (autonomous cascades, zero client commands), withdrawal live,
+#47's bypass opt-in exercised; $4.62 spent against a $2.50 guard — see
+L16; #19 stays open. (8) **The promotion library landed**: 34/34
+adjudicated packages curated into `.sergeant/workflows/`, each
+engine-gated; the §9.7 validator gained the `--admitted` mode that made
+promoted packages validatable at all (S12 → warn per D9); library
+critic 11 findings/6 errors, all closed. (9) **Drafts for owner
+adjudication**: retention ruling (R-N0-3's gate), N4 contract, and the
+H0 packet for the vendored harness-adapter research
+(`reference/proposal-harness-adapter-research-v2.md`). Issues filed
+#50/#53/#57; #44/#46/#47 close via trailers when #51 merges.
+
+**Environmental behavior.** Five workflows + support agents, ~16M
+subagent tokens, ~12h wall. Model spread per the same-day revision
+(Sonnet default, Opus judged, no Fable seat needed). Panels earned their
+keep everywhere: BS2 round 1 11/15 confirmed, round 2 15/16, promotion
+6 errors, probe-env 3 — and the pipeline gate three-for-three found
+real defects the panels missed, including in its own fixes (L7 on the
+gate, again). Owner interventions mid-session, all adopted: merge model
+(head PR + sub-PRs), economy ruling (small diffs batch into larger
+panels — gauntlet-pattern revision), "be intelligent about grouping"
+(→ worktree lanes + shared round-2 panel), promotion rerun caution
+(cache-resume discipline held; zero reruns needed). Orchestrator errors,
+recorded not hidden: untracked files left in a builder-owned checkout
+were swept into B1's commit (separability polluted); the harvest
+driver's first two designs encoded unmeasured mechanisms (a keyword
+trip-wire and the protocol's own wrong `retry` verb — the fail-closed
+stops that caught both were the system working); Run B2's guard could
+never fire below single-turn granularity and its cancel came from an
+orphaned collector racing the orchestrator's TaskStop (→ L16, L17).
+
+---
+
 ### ROUND-2 FIXER — #44 close-out follow-through (Cerberus, 2026-08-11)
 
 **Mission outcome. Closed.** Round-2 review of #44 (journal group commit)
