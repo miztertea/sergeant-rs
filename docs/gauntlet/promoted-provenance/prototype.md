@@ -69,3 +69,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 
 **Synthesis notes:** The A/U branch at `20L`/`20U` is the corpus's cleanest evidence for *conditional* procedure. It is representable today as one selection stage (`00-select-branch`) plus mutually-exclusive downstream stages — recorded as grammar pressure for a future conditional-stage schema extension, not an engine gap (the current linear `workflow.toml` requires both stage directories to exist; the non-selected one is a documented no-op for that run).
 
+## Promotion note (docs/icm/promotion-spec-2026-08-11.md §1)
+
+`40-capture`, this package's true closing stage, declares a `promote` output disposition with no finalize step — one of the 30 of 34 N1 packages in that shape, not one of the 3 (`drain-fleet`, `respond-to-worker`, `to-spec`) that name one. Recorded here per the spec's finalize-gap rule rather than silently promoted; disposition on whether this package needs a finalize step is left to human review at merge time, not applied mechanically by this curation act.
+
