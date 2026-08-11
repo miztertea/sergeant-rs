@@ -13,6 +13,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `code-review` | published | [`workflows/code-review/index.md`](workflows/code-review/index.md) |
 | `cross-repo-work` | published | [`workflows/cross-repo-work/index.md`](workflows/cross-repo-work/index.md) |
 | `deepen-module` | published | [`workflows/deepen-module/index.md`](workflows/deepen-module/index.md) |
+| `deliver-external-callback` | published | [`workflows/deliver-external-callback/index.md`](workflows/deliver-external-callback/index.md) |
 | `diagnose-bug` | published | [`workflows/diagnose-bug/index.md`](workflows/diagnose-bug/index.md) |
 | `direct-implementation` | published | [`workflows/direct-implementation/index.md`](workflows/direct-implementation/index.md) |
 | `drain-fleet` | published | [`workflows/drain-fleet/index.md`](workflows/drain-fleet/index.md) |

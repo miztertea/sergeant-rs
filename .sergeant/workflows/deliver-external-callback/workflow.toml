@@ -1,0 +1,16 @@
+# deliver-external-callback — admitted workflow (N1,
+# docs/gauntlet/contracts/N1.md, candidate W17). Durable at-least-once
+# notification to a registered external consumer. Promoted per
+# docs/icm/promotion-spec-2026-08-11.md; full behavior-unit citation trail
+# archived at docs/gauntlet/promoted-provenance/deliver-external-callback.md.
+#
+# One ordinary actor stage (N1 adjudication A4 folded the other three into
+# it as helper invocations — see the archived provenance for the fold and
+# its recorded low-confidence stage-vs-helper placement). Stage order here
+# is authoritative; the directory listing under this workflow's own tree
+# must agree with it.
+
+[workflow]
+name = "deliver-external-callback"
+version = "2"
+stages = ["00-seal"]
