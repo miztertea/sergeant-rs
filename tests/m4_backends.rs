@@ -282,11 +282,7 @@ fn core(data_dir: &Path) -> Core {
         .catch_up(journal.replay().expect("replay"))
         .expect("catch up");
     let (events_tx, _rx) = tokio::sync::broadcast::channel(16);
-    Core {
-        journal,
-        registry,
-        events_tx,
-    }
+    Core::new(journal, registry, events_tx)
 }
 
 fn commit(core: &mut Core, work_id: &str, kind: &str, payload: Value) {

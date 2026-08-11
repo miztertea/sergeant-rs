@@ -28,7 +28,8 @@ use serde_json::json;
 use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::api::{
-    API_REVISION, ApiState, COMPLETION_POLL_INTERVAL, Core, CoreError, drive_completions, router,
+    API_REVISION, ApiState, COMPLETION_POLL_INTERVAL, Core, CoreError, CoreGuard,
+    drive_completions, router,
 };
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
@@ -250,11 +251,7 @@ pub async fn start_with(
     }
 
     let (events_tx, _) = broadcast::channel(1024);
-    let mut core = Core {
-        journal,
-        registry,
-        events_tx,
-    };
+    let mut core = Core::new(journal, registry, events_tx);
 
     // 3. Bind loopback on an ephemeral port before publishing anything.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -369,7 +366,7 @@ pub async fn start_with(
     // §28's export is a fold over the event stream, subscribed here and
     // nowhere else. With export off this task does not exist.
     if let Some(telemetry) = config.telemetry.clone() {
-        let events = state.core.lock().await.events_tx.subscribe();
+        let events = CoreGuard::acquire(&state.core).await.events_tx.subscribe();
         tokio::spawn(export_events(telemetry, events));
     }
     // The Claude adapter's normalized events (§27) flow into the journal
@@ -428,13 +425,19 @@ pub async fn start_with(
             Ok(Ok(())) => {}
         }
         // Clean shutdown: journal the stop, then retire the descriptor.
-        let mut core = state.core.lock().await;
+        let mut core = CoreGuard::acquire(&state.core).await;
         if let Err(e) = core.commit(EventDraft::new(
             EventSource::new("daemon", "sergeant"),
             KIND_DAEMON_STOPPED,
             json!({"pid": std::process::id()}),
         )) {
             tracing::warn!(error = %e, "failed to journal daemon.stopped");
+        }
+        // Close the group here rather than leaving it to the guard's `Drop`,
+        // only so the failure is warned about in the same voice as the append
+        // above; the descriptor must not be retired over an unflushed journal.
+        if let Err(e) = core.flush() {
+            tracing::warn!(error = %e, "failed to fsync the shutdown group commit");
         }
         if let Err(e) = std::fs::remove_file(&descriptor_path) {
             tracing::warn!(error = %e, "failed to remove runtime descriptor");
@@ -536,7 +539,7 @@ fn commit_normalized_events(
     // least-recently-started execution rather than an arbitrary one.
     let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while let Ok(mut draft) = rx.recv() {
-        let Some(core) = core.upgrade() else {
+        let Some(live) = core.upgrade() else {
             tracing::debug!("normalized-event committer stopping: the core is gone");
             return;
         };
@@ -546,7 +549,12 @@ fn commit_normalized_events(
         {
             draft.causation_id = chain.get(key).cloned();
         }
-        let mut core = core.blocking_lock();
+        // One draft per hold, so this thread's "group" is a single event and
+        // its fsync is the same one it always paid. It goes through the guard
+        // anyway (#44): the group boundary is a property of holding the core,
+        // not of who is holding it, and a second door into the core is exactly
+        // what `t11c` exists to prevent.
+        let mut core = CoreGuard::acquire_blocking(&live);
         match core.commit(draft) {
             Ok(event) => {
                 if let Some(key) = key {
@@ -766,11 +774,7 @@ mod tests {
             .catch_up(journal.replay().expect("replay"))
             .expect("catch up");
         let (events_tx, _) = broadcast::channel(16);
-        Core {
-            journal,
-            registry,
-            events_tx,
-        }
+        Core::new(journal, registry, events_tx)
     }
 
     /// Poll the journal (lock-free: [`Journal::replay_data_dir`] only reads

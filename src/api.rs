@@ -75,6 +75,15 @@ pub struct Core {
     pub registry: Projection<WorkRegistry>,
     /// Live event fan-out for SSE subscribers.
     pub events_tx: broadcast::Sender<Event>,
+    /// The **open group**: events written and folded during the current lock
+    /// hold, awaiting the hold's single fsync (#44).
+    ///
+    /// Private, and the only private field here, because it is the one piece
+    /// of `Core` whose invariant a caller could break: an event sitting in
+    /// here is a promise that has not been kept yet. [`Core::flush`] is the
+    /// only thing that empties it, and [`CoreGuard`] is what guarantees
+    /// `flush` runs.
+    open_group: Vec<Event>,
 }
 
 /// Failure while committing an event (journal append or projection fold).
@@ -89,14 +98,72 @@ pub enum CoreError {
 }
 
 impl Core {
-    /// Append one event to the journal (fsynced), fold it into the registry,
-    /// and fan it out to live SSE subscribers. The only mutation path.
+    /// Assemble the core over an open journal and its folded registry.
+    ///
+    /// A constructor rather than a struct literal because the open group must
+    /// start empty and stay the module's business — see [`Core::open_group`].
+    pub fn new(
+        journal: Journal,
+        registry: Projection<WorkRegistry>,
+        events_tx: broadcast::Sender<Event>,
+    ) -> Self {
+        Self {
+            journal,
+            registry,
+            events_tx,
+            open_group: Vec::new(),
+        }
+    }
+
+    /// Append one event to the journal, fold it into the registry, and add it
+    /// to the lock hold's open group. The only mutation path.
+    ///
+    /// **What "committed" means here (#44).** The line is written and the
+    /// projections have moved; the fsync that makes it survive a crash, and
+    /// the fan-out that lets anyone else find out about it, both belong to
+    /// [`Core::flush`] at the end of this lock hold. Nothing outside the core
+    /// can observe the difference, because nothing outside the core runs
+    /// until the hold ends — which is exactly why the group boundary is drawn
+    /// there and not anywhere cheaper. See [`CoreGuard`].
     pub fn commit(&mut self, draft: EventDraft) -> Result<Event, CoreError> {
         let event = self.journal.append(draft)?;
         self.registry.apply(&event)?;
-        // No live subscriber is not an error.
-        let _ = self.events_tx.send(event.clone());
+        self.open_group.push(event.clone());
         Ok(event)
+    }
+
+    /// Close the open group: one fsync for everything this lock hold
+    /// appended, then fan those events out to live SSE subscribers.
+    ///
+    /// Ordering is the point. The fsync comes first, so **no subscriber, no
+    /// HTTP response and no external effect can ever be caused by an event
+    /// that a crash would take back** — the property that lets the group
+    /// boundary be invisible from outside. A failed fsync therefore publishes
+    /// nothing at all: the journal poisons itself (see [`Journal::sync`]), the
+    /// error goes to the caller, and the events are dropped unannounced
+    /// rather than announced unrecoverably.
+    ///
+    /// Free when the group is empty, so a read-only hold costs nothing.
+    pub fn flush(&mut self) -> Result<(), CoreError> {
+        if self.open_group.is_empty() {
+            return Ok(());
+        }
+        let synced = self.journal.sync();
+        // Taken unconditionally: a group that failed to sync is not retried
+        // on the next hold, it is abandoned along with the poisoned handle.
+        let group = std::mem::take(&mut self.open_group);
+        synced?;
+        for event in group {
+            // No live subscriber is not an error.
+            let _ = self.events_tx.send(event);
+        }
+        Ok(())
+    }
+
+    /// How many events the current lock hold has appended and not yet
+    /// published. Zero everywhere outside a hold that is mid-commit.
+    pub fn open_group_len(&self) -> usize {
+        self.open_group.len()
     }
 
     /// Every journaled event with `seq > after`, in seq order.
@@ -122,6 +189,136 @@ impl Core {
             }
         }
         Ok(events)
+    }
+}
+
+/// The only way to hold the core lock — and therefore the group-commit
+/// boundary (#44).
+///
+/// A hold ends here: whatever the hold appended is fsynced once, in one
+/// syscall, and only then published. Every other way of taking the mutex is
+/// banned by `m6`'s
+/// `t11c_every_core_lock_hold_ends_in_the_group_commit_guard`, because the
+/// boundary is only worth anything if there is no second door.
+///
+/// # Why the boundary is here and not per append
+///
+/// A submit appends six events in its first hold and the two-phase boundary
+/// added two more per work (`docs/perf/n3-two-phase-boundary-2026-08-10.md`);
+/// at one fsync each, on a single-writer path, that volume *is* the cost.
+/// Sharing the fsync is legal precisely because **nothing outside the core
+/// runs during a hold**: the mutex is held, no response has been rendered, no
+/// SSE frame sent, and §22.6 already forbids performing any external effect
+/// under the guard. So the set of things that could have been caused by an
+/// event is empty until the hold ends — and at the instant it ends, every one
+/// of the hold's events is durable, exactly as it was before this change.
+///
+/// # L6 adjacent-append analysis (the mandatory one)
+///
+/// L6's hazard is a crash between two causally-linked appends. Group commit
+/// makes that gap cheaper, so it must not make it *newer*. It does not, and
+/// the argument is about reachable states rather than about probabilities:
+///
+/// - **Before.** Per-append fsync guarantees a floor (everything acknowledged
+///   is durable) but no ceiling — the OS is free to have written more. After
+///   a crash the segment holds *some byte prefix* of what was written, with a
+///   possibly torn final line. Crashing between `stage.entered` and
+///   `execution.reserved` was always reachable; that is why §22.5 enumerates
+///   both sides of that pair as separate injection windows.
+/// - **After.** A crash mid-group, or after the group's last append and
+///   before its fsync, leaves… *some byte prefix* of what was written, with a
+///   possibly torn final line. The floor drops to the previous group
+///   boundary; the **set of reachable on-disk states is unchanged**, because
+///   it was already "any byte prefix".
+/// - **Therefore** no recovery obligation is new. Every prefix a grouped
+///   crash can produce is one a per-append crash could already produce, and
+///   the existing machinery is what handles it: [`Journal::open`]'s
+///   `recover_tail` quarantines the torn final line and truncates to the last
+///   complete one, replay validates seq continuity, the projection is rebuilt
+///   from what survived, and `runtime::recovery` fails closed on the
+///   resulting ambiguity. What changed is the *distribution* over those
+///   states, not the set — and a distribution is not something recovery is
+///   allowed to depend on.
+///
+/// Proven, not asserted: `m4`'s
+/// `n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_handles`
+/// writes the six events a submit's first hold appends, never closes the
+/// group, and then truncates that journal at **every** byte offset a crash
+/// could stop at — each one must reopen, replay to an exact prefix, rebuild
+/// and reconcile fail-closed. `m4`'s `n10`–`n12` remain the §22.5 windows
+/// themselves, unchanged and still passing, because the events and their
+/// order are untouched — and n32's final case is byte-for-byte n11's. No
+/// compound event was introduced, no event was removed, and no crash window
+/// was deleted — A-N3-1's rejection of the compound-event alternative is
+/// undisturbed.
+///
+/// # Failure
+///
+/// `Drop` cannot report, so the reportable path is [`CoreGuard::flush`],
+/// which handlers call explicitly where an error can still become a response.
+/// `Drop` is the backstop for every other hold: it flushes, and on failure
+/// logs against a journal that has already poisoned itself, so the daemon
+/// refuses further appends rather than continuing over an unknown durability
+/// state.
+pub struct CoreGuard<'a> {
+    inner: tokio::sync::MutexGuard<'a, Core>,
+}
+
+impl<'a> CoreGuard<'a> {
+    /// Take the core lock (async — the request path).
+    pub async fn acquire(core: &'a tokio::sync::Mutex<Core>) -> Self {
+        Self {
+            inner: core.lock().await,
+        }
+    }
+
+    /// Take the core lock from a plain thread.
+    ///
+    /// Only the adapter's normalized-event committer thread is entitled to
+    /// this: it is a std thread by construction (see `daemon::journaling_sink`
+    /// for why), which is what makes `blocking_lock` correct there and a
+    /// runtime-panicking bug anywhere else.
+    pub fn acquire_blocking(core: &'a tokio::sync::Mutex<Core>) -> Self {
+        Self {
+            inner: core.blocking_lock(),
+        }
+    }
+
+    /// Close the group early, with the failure reportable.
+    ///
+    /// Idempotent: the group is empty afterwards, so the `Drop` backstop finds
+    /// nothing to do. Call this at the end of a hold that appended something
+    /// and can still turn an error into a response.
+    pub fn flush(&mut self) -> Result<(), CoreError> {
+        self.inner.flush()
+    }
+}
+
+impl std::ops::Deref for CoreGuard<'_> {
+    type Target = Core;
+    fn deref(&self) -> &Core {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for CoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Core {
+        &mut self.inner
+    }
+}
+
+impl Drop for CoreGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.inner.flush() {
+            // The journal poisoned itself on the way out of `sync`, so this
+            // is a report, not a decision: every later append is already
+            // refused and the daemon is failing closed.
+            tracing::error!(
+                %error,
+                "the core-lock hold's group commit failed; the journal is \
+                 poisoned and further appends are refused"
+            );
+        }
     }
 }
 
@@ -245,9 +442,9 @@ async fn blocking<T>(f: impl FnOnce() -> T) -> T {
 /// completion wait, which are the only places §22.6 cares about — in one place
 /// each, so there is no arm that can be missed and no arm whose drop is
 /// decoration.
-async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'_, Core>> {
+async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
     let mut step = step;
-    let mut held: Option<tokio::sync::MutexGuard<'_, Core>> = None;
+    let mut held: Option<CoreGuard<'_>> = None;
     loop {
         let Step { next, deferred } = step;
         if deferred.is_pending() {
@@ -276,7 +473,7 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
             EngineNext::Launch(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = state.core.lock().await;
+                let mut core = CoreGuard::acquire(&state.core).await;
                 (
                     work_id,
                     state.engine.settle_launch(&mut core, pending, outcome),
@@ -286,7 +483,7 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
             EngineNext::Send(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = state.core.lock().await;
+                let mut core = CoreGuard::acquire(&state.core).await;
                 (
                     work_id,
                     state.engine.settle_send(&mut core, pending, outcome),
@@ -296,7 +493,7 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
             EngineNext::Surface(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = state.core.lock().await;
+                let mut core = CoreGuard::acquire(&state.core).await;
                 (
                     work_id,
                     state.engine.settle_surface(&mut core, pending, outcome),
@@ -306,7 +503,7 @@ async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'
             EngineNext::Observe(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = state.core.lock().await;
+                let mut core = CoreGuard::acquire(&state.core).await;
                 (
                     work_id,
                     state.engine.settle_observe(&mut core, pending, outcome),
@@ -385,7 +582,7 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
             return;
         }
         let due = {
-            let core = state.core.lock().await;
+            let core = CoreGuard::acquire(&state.core).await;
             state.engine.due_observations(&core)
         };
         for pending in due {
@@ -405,13 +602,10 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
 }
 
 /// Take the guard [`crank`] handed back, or acquire one if it kept none.
-async fn relock<'a>(
-    state: &'a ApiState,
-    held: Option<tokio::sync::MutexGuard<'a, Core>>,
-) -> tokio::sync::MutexGuard<'a, Core> {
+async fn relock<'a>(state: &'a ApiState, held: Option<CoreGuard<'a>>) -> CoreGuard<'a> {
     match held {
         Some(guard) => guard,
-        None => state.core.lock().await,
+        None => CoreGuard::acquire(&state.core).await,
     }
 }
 
@@ -583,7 +777,7 @@ fn system_body(state: &ApiState, journal_head: u64) -> Value {
 
 /// `GET /v1/system` — version, API revision, data dir, journal head.
 async fn system_info(State(state): State<ApiState>) -> Json<Value> {
-    let head = state.core.lock().await.registry.last_seq();
+    let head = CoreGuard::acquire(&state.core).await.registry.last_seq();
     Json(system_body(&state, head))
 }
 
@@ -675,6 +869,16 @@ fn record_and_respond(
         draft = draft.with_work_id(id);
     }
     if let Err(e) = core.commit(draft) {
+        return internal_error(e);
+    }
+    // Every command handler ends here, so this is the one place where a
+    // command's whole journal record — its work events and the outcome that
+    // makes it replayable — becomes durable, and the one place where a failed
+    // group commit can still be answered with a 500 instead of only logged
+    // (#44). Without it the `CoreGuard` backstop would flush the same events
+    // moments later, after the client had already been told the command
+    // succeeded.
+    if let Err(e) = core.flush() {
         return internal_error(e);
     }
     (status, Json(result)).into_response()
@@ -774,7 +978,7 @@ async fn submit_work(
         )
     };
 
-    let mut core = state.core.lock().await;
+    let mut core = CoreGuard::acquire(&state.core).await;
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
@@ -886,6 +1090,12 @@ async fn submit_work(
                 );
             }
         };
+        // Same boundary as the arms below, one indent shallower: everything
+        // `begin_start` journaled is made durable before the guard drops and
+        // `git worktree add` / the harness launch run (#44).
+        if let Err(e) = core.flush() {
+            return internal_error(e);
+        }
         drop(core);
         core = relock(&state, crank(&state, step).await).await;
     }
@@ -985,14 +1195,14 @@ fn fleet_body(core: &Core) -> Value {
 
 /// `GET /v1/work` — list all work (ULID key order = submission order).
 async fn list_work(State(state): State<ApiState>) -> Response {
-    let core = state.core.lock().await;
+    let core = CoreGuard::acquire(&state.core).await;
     Json(fleet_body(&core)).into_response()
 }
 
 /// `GET /v1/work/{id}` — one work record, with its stage, surface and
 /// execution state (the M3 contract's `work show` surface).
 async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
-    let core = state.core.lock().await;
+    let core = CoreGuard::acquire(&state.core).await;
     match core.registry.state().works.get(&id) {
         Some(_) => Json(work_view(&core, &id)).into_response(),
         None => error_response(
@@ -1026,7 +1236,7 @@ async fn cancel_work(
     if let Err(resp) = parse_command_id(&req.command_id) {
         return *resp;
     }
-    let mut core = state.core.lock().await;
+    let mut core = CoreGuard::acquire(&state.core).await;
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
@@ -1088,9 +1298,17 @@ async fn cancel_work(
         .begin_retire_run(&mut core, &id, "work canceled")
     {
         Ok(step) => {
+            // The authoritative half is journaled; make it durable before
+            // the guard is dropped and the external effect runs (#44). A
+            // group commit that fails here is still reportable — after this
+            // point the client's command has been accepted and the only
+            // honest answer is a log line.
+            if let Err(e) = core.flush() {
+                return internal_error(e);
+            }
             drop(core);
             crank(&state, step).await;
-            core = state.core.lock().await;
+            core = CoreGuard::acquire(&state.core).await;
         }
         Err(e) => tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed"),
     }
@@ -1125,7 +1343,7 @@ async fn work_input(
     if let Err(resp) = parse_command_id(&req.command_id) {
         return *resp;
     }
-    let mut core = state.core.lock().await;
+    let mut core = CoreGuard::acquire(&state.core).await;
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
@@ -1143,6 +1361,14 @@ async fn work_input(
     let engine = state.engine.clone();
     match engine.begin_input(&mut core, &id, &req.input) {
         Ok(step) => {
+            // The authoritative half is journaled; make it durable before
+            // the guard is dropped and the external effect runs (#44). A
+            // group commit that fails here is still reportable — after this
+            // point the client's command has been accepted and the only
+            // honest answer is a log line.
+            if let Err(e) = core.flush() {
+                return internal_error(e);
+            }
             drop(core);
             let mut core = relock(&state, crank(&state, step).await).await;
             let result = work_view(&core, &id);
@@ -1188,7 +1414,7 @@ async fn work_retry(
     if let Err(resp) = parse_command_id(&req.command_id) {
         return *resp;
     }
-    let mut core = state.core.lock().await;
+    let mut core = CoreGuard::acquire(&state.core).await;
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
@@ -1206,6 +1432,14 @@ async fn work_retry(
     let engine = state.engine.clone();
     match engine.begin_retry(&mut core, &id) {
         Ok(step) => {
+            // The authoritative half is journaled; make it durable before
+            // the guard is dropped and the external effect runs (#44). A
+            // group commit that fails here is still reportable — after this
+            // point the client's command has been accepted and the only
+            // honest answer is a log line.
+            if let Err(e) = core.flush() {
+                return internal_error(e);
+            }
             drop(core);
             let mut core = relock(&state, crank(&state, step).await).await;
             let result = work_view(&core, &id);
@@ -1270,7 +1504,7 @@ async fn with_analytics<T>(
     // was fetched against.
     let mut analytics = loop {
         let from = state.analytics.lock().await.last_seq();
-        let pending = match state.core.lock().await.events_after(from) {
+        let pending = match CoreGuard::acquire(&state.core).await.events_after(from) {
             Ok(events) => events,
             Err(e) => return Err(projection_unavailable(e)),
         };
@@ -1313,7 +1547,7 @@ fn projection_unavailable(e: impl std::fmt::Display) -> Response {
 /// it a derivation rather than an opinion.
 async fn work_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     {
-        let core = state.core.lock().await;
+        let core = CoreGuard::acquire(&state.core).await;
         if !core.registry.state().works.contains_key(&id) {
             return error_response(
                 StatusCode::NOT_FOUND,
@@ -1409,7 +1643,7 @@ async fn event_history(
         Ok(q) => q,
         Err(resp) => return *resp,
     };
-    let core = state.core.lock().await;
+    let core = CoreGuard::acquire(&state.core).await;
     match core.events_after(query.from) {
         Ok(events) => Json(events_body(events, &query)).into_response(),
         Err(e) => internal_error(e),
@@ -1492,12 +1726,12 @@ async fn forward_events(
 ) {
     // Subscribe before reading history so nothing can fall in the gap.
     let mut live = {
-        let core = state.core.lock().await;
+        let core = CoreGuard::acquire(&state.core).await;
         core.events_tx.subscribe()
     };
     let mut last_sent = from;
     let history = {
-        let core = state.core.lock().await;
+        let core = CoreGuard::acquire(&state.core).await;
         core.events_after(last_sent)
     };
     match history {
@@ -1529,7 +1763,7 @@ async fn forward_events(
                 // Fell behind the broadcast buffer: refill from the journal,
                 // which always has everything.
                 let refill = {
-                    let core = state.core.lock().await;
+                    let core = CoreGuard::acquire(&state.core).await;
                     core.events_after(last_sent)
                 };
                 match refill {
@@ -1657,20 +1891,20 @@ impl ApiViews {
 
     /// The `GET /v1/system` body.
     pub async fn system(&self) -> Value {
-        let head = self.0.core.lock().await.registry.last_seq();
+        let head = CoreGuard::acquire(&self.0.core).await.registry.last_seq();
         system_body(&self.0, head)
     }
 
     /// The `GET /v1/work` body.
     pub async fn fleet(&self) -> Value {
-        let core = self.0.core.lock().await;
+        let core = CoreGuard::acquire(&self.0.core).await;
         fleet_body(&core)
     }
 
     /// The `GET /v1/work/{id}` body, or `None` for an unknown work (the 404
     /// the endpoint would answer with).
     pub async fn work(&self, id: &str) -> Option<Value> {
-        let core = self.0.core.lock().await;
+        let core = CoreGuard::acquire(&self.0.core).await;
         core.registry
             .state()
             .works
@@ -1691,7 +1925,7 @@ impl ApiViews {
             work_id: Some(work_id.to_string()),
             limit: Some(limit),
         };
-        let core = self.0.core.lock().await;
+        let core = CoreGuard::acquire(&self.0.core).await;
         match core.events_after(0) {
             Ok(events) => Ok(events_body(events, &query)),
             Err(e) => Err(error_body("internal", e.to_string())),
@@ -2233,11 +2467,7 @@ mod tests {
             .catch_up(journal.replay().expect("replay"))
             .expect("catch up registry");
         let (events_tx, _) = broadcast::channel(16);
-        let core = Core {
-            journal,
-            registry,
-            events_tx,
-        };
+        let core = Core::new(journal, registry, events_tx);
         let analytics = Analytics::rebuild(data_dir, core.journal.replay().expect("replay"))
             .expect("rebuild analytics");
         let (_closing_tx, closing_rx) = watch::channel(false);
@@ -2294,7 +2524,7 @@ mod tests {
         const HISTORY: u32 = 5;
         const LIVE: u32 = 20; // > the 16-slot broadcast `test_state` builds
         {
-            let mut core = state.core.lock().await;
+            let mut core = CoreGuard::acquire(&state.core).await;
             for n in 1..=HISTORY {
                 core.commit(seeded(n)).expect("commit history");
             }
@@ -2311,7 +2541,7 @@ mod tests {
         assert!(first.is_ok(), "the pump never sends a stream error");
 
         {
-            let mut core = state.core.lock().await;
+            let mut core = CoreGuard::acquire(&state.core).await;
             for n in HISTORY + 1..=HISTORY + LIVE {
                 core.commit(seeded(n)).expect("commit live");
             }
@@ -2355,14 +2585,12 @@ mod tests {
         // Seed three events and catch the projection up to them, so
         // `last_seq` starts at 3.
         {
-            let mut core = state.core.lock().await;
+            let mut core = CoreGuard::acquire(&state.core).await;
             for n in 1..=3u32 {
                 core.commit(seeded(n)).expect("commit");
             }
         }
-        let pending = state
-            .core
-            .lock()
+        let pending = CoreGuard::acquire(&state.core)
             .await
             .events_after(0)
             .expect("events_after");
@@ -2376,7 +2604,7 @@ mod tests {
         // Two more events arrive — the "work submission" racing the
         // analytics requests below.
         {
-            let mut core = state.core.lock().await;
+            let mut core = CoreGuard::acquire(&state.core).await;
             for n in 4..=5u32 {
                 core.commit(seeded(n)).expect("commit");
             }
@@ -2387,7 +2615,7 @@ mod tests {
         // (both uncontended locks resolve without yielding, so it reaches
         // exactly that point on its first poll) when the concurrent
         // failure below runs.
-        let core_guard = state.core.lock().await;
+        let core_guard = CoreGuard::acquire(&state.core).await;
 
         let state_a = state.clone();
         let task_a =

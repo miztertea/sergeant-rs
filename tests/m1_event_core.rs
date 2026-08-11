@@ -171,10 +171,10 @@ fn crash_tail_recovery() {
     // Exactly one segment-data fsync accounted per acknowledged append.
     // Honest scope (contract Unknowns): `fsync_count` is a counter the
     // implementation maintains — its coupling to the real `sync_data` call
-    // lives in `write_and_sync`'s single derived expression, not in anything
-    // this assertion can observe; OS-level durability is unverifiable from
-    // inside the process. The failure half of the guarantee is covered
-    // behaviorally by this test's crash-recovery assertions above.
+    // lives in `sync_now`'s single derived expression, not in anything this
+    // assertion can observe; OS-level durability is unverifiable from inside
+    // the process. The failure half of the guarantee is covered behaviorally
+    // by this test's crash-recovery assertions above.
     assert_eq!(journal.fsync_count(), fsyncs_before + 1);
 }
 

@@ -2509,34 +2509,39 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
     }
 }
 
-/// The journal's append path issues exactly the one fsync it accounts for.
+/// The journal's commit path issues exactly the one fsync it accounts for.
 ///
 /// A-N3-1's whole cost story is per-event fsyncs — the two-phase boundary
 /// added two per work, that is the 25% the budget was amended over, and #44's
-/// fix is one fsync per lock hold instead of one per event. So "an extra fsync
-/// per append" is *the* named throughput regression, and round-2 finding
-/// N3R2-04 showed the throughput guard could not see it: on this container an
-/// fsync costs ~0.08 ms, so a second one per append is ~5% of a submit —
-/// inside the noise of any floor that does not flake (measured: 38.2 → 36.8
-/// works/s at burst 25).
+/// fix (landed) is one fsync per lock hold instead of one per event. So "an
+/// extra fsync per append" is *the* named throughput regression, and round-2
+/// finding N3R2-04 showed the throughput guard could not see it: on that
+/// container an fsync costs ~0.08 ms, so a second one per append is ~5% of a
+/// submit — inside the noise of any floor that does not flake (measured: 38.2
+/// → 36.8 works/s at burst 25).
 ///
 /// Timing is the wrong instrument for it; counting is the right one, and
 /// `Journal::fsync_count` already exists for that. But the counter is derived
 /// from *one* `sync_data` call, so a second durability syscall beside it is
 /// invisible to the counter as well — which is exactly the mutation the
 /// finding used. This closes both: every `sync_data`/`sync_all` in the module
-/// must live in a named block, and `write_and_sync` — the only one on the
-/// acknowledged-append path — must contain exactly one, the accounted one.
+/// must live in a named block, and `sync_now` — the only one on the
+/// group-commit path — must contain exactly one, the accounted one.
 ///
-/// m1's `crash_tail…` tests assert the counter's value per append; this
-/// asserts the counter is the whole truth about what the append path syncs.
+/// Post-#44 this test is doing *more* work than before, not less: with the
+/// fsync moved out of `append_event`, an fsync smuggled back into the append
+/// path would restore the per-event cost the whole change exists to remove,
+/// and the block list below is what makes that un-smugglable.
+///
+/// m1's `crash_tail…` tests assert the counter's value per group; this
+/// asserts the counter is the whole truth about what the journal syncs.
 #[test]
 fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
     let source = code_only(&read_source("runtime/journal.rs"));
     // Where a durability syscall may appear, and why.
     let allowed = [
-        // The accounted per-append sync.
-        "fn write_and_sync",
+        // The accounted group-commit sync (#44).
+        "fn sync_now",
         // The rollback after a failed append: re-syncs a truncated segment so
         // a torn tail cannot be concatenated onto. Not an acknowledged append.
         "pub fn append_event",
@@ -2544,6 +2549,16 @@ fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
         // new segment survive its own creation. Neither is on the hot path.
         "fn recover_tail",
         "fn sync_dir",
+        // The best-effort close of a group whose handle is going away. Not on
+        // any acknowledged path — the daemon's groups are closed by
+        // `CoreGuard`, and this only exists so a dropped handle is not a
+        // second, silent way to lose a written line.
+        "impl Drop for Journal",
+        // The module's own `#[cfg(test)]` block. It is not the production
+        // path and it is where the fault-injection probes live — one of them
+        // has to call `sync_data` on a deliberately unsyncable descriptor to
+        // find out whether this host can express the injection at all.
+        "mod tests",
     ];
     let ranges: Vec<(usize, usize)> = allowed
         .iter()
@@ -2568,21 +2583,82 @@ fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
         }
     }
 
-    // And the append path syncs once, through the expression that counts it.
+    // And the group-commit path syncs once, through the expression that
+    // counts it.
     let (start, end) = ranges[0];
     let body = &source[start..end];
     let syncs = body.matches(".sync_data(").count() + body.matches(".sync_all(").count();
     assert_eq!(
         syncs, 1,
-        "`write_and_sync` must issue exactly one durability syscall — a second \
-         one is an fsync per append that `fsync_count` cannot see and no \
-         throughput floor on a fast filesystem can feel: {body}"
+        "`sync_now` must issue exactly one durability syscall — a second one \
+         is an fsync per group that `fsync_count` cannot see and no throughput \
+         floor on a fast filesystem can feel: {body}"
     );
     assert!(
         body.contains("self.fsync_count += self.segment_file.sync_data()"),
         "the one sync must be the counted one, so the counter cannot drift \
          from the syscall: {body}"
     );
+}
+
+/// Every core-lock hold goes through the one guard that closes its group
+/// (#44).
+///
+/// The group commit is only a durability contract if there is exactly one
+/// door into the core: a hold taken with a bare `core.lock()` would append
+/// events into `Core`'s open group and then release the mutex without
+/// fsyncing or publishing them — they would sit there until some *later*,
+/// unrelated hold happened to flush them, which is silent delayed durability
+/// and a genuinely worse failure than the per-append fsync this replaced.
+///
+/// `CoreGuard::drop` cannot be forgotten; *acquiring the mutex another way*
+/// can. So the rule is structural, like t5 and t11 beside it: the strings
+/// `core.lock(` and `core.blocking_lock(` may appear only inside the two
+/// `CoreGuard` constructors. Anything else — production code, a handler
+/// added later, a test fixture — fails here with the call site printed.
+#[test]
+fn t11c_every_core_lock_hold_ends_in_the_group_commit_guard() {
+    // Every module that can see the core at all. `web.rs`/`tui.rs`/`cli.rs`
+    // are listed not because they hold it today but because t5 exists to
+    // stop them starting: if one ever does, it must do it through the guard.
+    for module in [
+        "api.rs",
+        "daemon.rs",
+        "web.rs",
+        "tui.rs",
+        "cli.rs",
+        "telemetry.rs",
+    ] {
+        let source = code_only(&read_source(module));
+        let allowed: Vec<(usize, usize)> = ["pub async fn acquire", "pub fn acquire_blocking"]
+            .iter()
+            .filter_map(|block| {
+                let start = source.find(block)?;
+                Some((start, block_end(&source, start)))
+            })
+            .collect();
+        if module == "api.rs" {
+            assert_eq!(
+                allowed.len(),
+                2,
+                "api.rs must declare both `CoreGuard` constructors — they are \
+                 the only sanctioned way to take the core lock"
+            );
+        }
+        for door in ["core.lock(", "core.blocking_lock("] {
+            for (index, _) in source.match_indices(door) {
+                assert!(
+                    allowed
+                        .iter()
+                        .any(|(start, end)| index > *start && index < *end),
+                    "src/{module} takes the core lock outside `CoreGuard`, so \
+                     that hold's appends are never fsynced or published at the \
+                     end of it (#44), near: {:?}",
+                    &source[index.saturating_sub(140)..(index + 60).min(source.len())]
+                );
+            }
+        }
+    }
 }
 
 /// The end of the `{ … }` block that starts at or after `from`.
