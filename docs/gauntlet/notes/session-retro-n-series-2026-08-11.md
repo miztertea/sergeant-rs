@@ -98,8 +98,15 @@ the session still got caught assuming the friendly direction).
 
 ## Disposition
 
-L15 appended to LESSONS.md. Items 1–2 are Cerberus-appropriate (the probe
-script belongs in the first Cerberus session where the facts differ);
-item 4's SESSIONS.md is deferred until a second concurrent session next
-exists. No CLAUDE.md edits here beyond what PR #48 already landed — the
-ops section is the right home and this note is its evidence trail.
+L15 appended to LESSONS.md. Owner refinement (2026-08-11, same session):
+items 1–2 conflated **environment facts** (per-host, measured — allowance,
+proxy, uid, capabilities) with **repo invariants** (target size, build
+times — true everywhere). The fleet ahead — Cerberus, Hades, MacBook, the
+GH runner — makes that distinction structural: `docs/environments/` now
+holds one dated, evidence-cited fact file per environment
+(`claude-code-cloud.md` and `github-runner.md` seeded from this program's
+measurements; each new host earns its file by measurement on first
+contact), CLAUDE.md keeps only invariants plus the pointer, and the future
+`scripts/probe-env.sh` emits the facts table for whatever host it runs on.
+Item 4's SESSIONS.md is deferred until a second concurrent session next
+exists.

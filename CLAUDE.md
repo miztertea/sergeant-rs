@@ -56,6 +56,10 @@ Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integ
 
 Remote containers do not ship with no-mistakes — install it at session start. The release installer (`curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh`) 403s through this environment's proxy (release-API fetches are blocked); the working path is source build, the M1 precedent: `git clone --depth 1 https://github.com/kunchenguid/no-mistakes && go build -o ~/.cargo/bin/no-mistakes ./cmd/no-mistakes` (Go is preinstalled). Note the built version in the ledger entry that first uses it (M-series pinned v1.47.0; drift is a fact to record, not a blocker). If the gate genuinely cannot run, the fallback regime is R-S0-1 (orchestrator-verified gates + hygiene sweep), recorded per milestone — never silence.
 
+## Environments
+
+Repo invariants live in this file; **per-host facts live in `docs/environments/`** (one dated, evidence-cited file per environment — cloud container, GH runner, and each new host on first contact). Never assume another environment's facts apply: measure, then record there. Fixtures asserting environment facts probe-gate per the testing rules above.
+
 ## Remote-container operations
 
 These sessions run in ephemeral containers that reset without warning (three resets in one S-series day; a reset also wipes installed tools and `target/`, costing a ~10-min cold DuckDB rebuild):
