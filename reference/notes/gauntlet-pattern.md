@@ -175,6 +175,15 @@ most seats stay Sonnet.
   (parts-vs-composition, unfalsifiable assertions — L13); and one
   worktree at a time respects the disk budget where per-builder probe
   trees do not. Self-probing is retired.
+- **Small diffs batch into the next larger panel** (revision 2026-08-11,
+  owner direction, Cerberus session): R-S0-12 means every executable diff
+  gets multi-axis review — it does not mean every diff gets its own
+  gauntlet. A dedicated builder→panel→fixer loop spun up for one small
+  file is waste; instead the diff rides the next larger loop's panel
+  round as an added axis/scope item (first instance: `scripts/probe-env.sh`
+  built by a single Sonnet seat, reviewed inside BS2's round 2 rather
+  than by its own Opus panel). The review still happens; the ceremony
+  doesn't multiply.
 - **Parallel builders in one checkout** (revision 2026-08-11, from S2
   wave 1's near-misses): concurrent builders get exclusive, named file
   surfaces and never touch outside them, even transiently — no unscoped
