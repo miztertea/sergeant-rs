@@ -10,7 +10,7 @@ drift on OS/tool updates; re-measure on suspicion and date any change.
 | DAC / permission-bit fixtures | **enforced** (chmod 000 read fails EACCES) — opposite of the root container; permission-bit fault fixtures work here | session probe 2026-08-11 |
 | `CAP_LINUX_IMMUTABLE` | not available without sudo (`chattr +i` → EPERM); same shape as the GH runner | session probe 2026-08-11 |
 | `IS_SANDBOX=1` | **not required** (exists only to work around the root refusal) | gate.sh portability commit c585589 analysis |
-| Disk | 935 GB LVM/ext4 root, ~864 GB free at first contact; no user quota tooling installed (`quota` absent) | `df -h`, 2026-08-11 |
+| Disk | 935 GB LVM/ext4 root, ~864 GB free at first contact; `quota`/`repquota` absent, `xfs_quota` present (xfsprogs ships it regardless of fs; root fs is ext4 so it is inert here) | `df -h` + probe-env cross-check, 2026-08-11 |
 | Cores / kernel | 20 cores; Linux 7.0.0-29-generic | `nproc`, `uname -r`, 2026-08-11 |
 | /tmp | tmpfs, 16 GB; **O_DIRECT open SUCCEEDS on tmpfs here** (kernel 7.0) — differs from the cloud container where tmpfs refused it | python O_DIRECT probe, 2026-08-11 |
 | O_DIRECT on ext4 (home fs) | open succeeds | python O_DIRECT probe, 2026-08-11 |
