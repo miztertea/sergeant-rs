@@ -2761,6 +2761,86 @@ mod tests {
         );
     }
 
+    /// TH-4 (BS2 test-honesty finding): the sibling test above only proves
+    /// the *delivery* half of `STDERR_DRAIN_BUDGET` — a sender that sends
+    /// within the wait. Commit 39971e6 justifies the budget as bounded
+    /// specifically so a descendant that leaks the stderr pipe (holds the
+    /// write end open, never writes, never lets it close) cannot turn "no
+    /// stderr" into "no turn outcome" — i.e. the read must give up and
+    /// default to empty, not block forever. A sender that is kept alive but
+    /// never sends and never drops is exactly that leaked-descendant shape;
+    /// mutating `recv_timeout(STDERR_DRAIN_BUDGET)` to an unbounded `recv()`
+    /// makes this test hang instead of complete.
+    #[test]
+    fn a_stderr_sender_that_never_sends_does_not_block_the_turn_outcome() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backend = ClaudeBackend::new(ClaudeConfig::new(dir.path()));
+        let emitted = Arc::new(Mutex::new(Vec::<EventDraft>::new()));
+        let sink_events = Arc::clone(&emitted);
+        backend.set_event_sink(Arc::new(move |draft| {
+            sink_events.lock().expect("sink lock").push(draft);
+        }));
+        backend
+            .state
+            .lock()
+            .expect("adapter state lock")
+            .executions
+            .insert("e-stderr-never".to_string(), test_execution(None));
+
+        let mut child = Command::new("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn true");
+        let stdout = child.stdout.take().expect("piped stdout");
+        // `tx` is deliberately held alive (never sent on, never dropped)
+        // across `reader.run` below — simulating a descendant that leaked
+        // the stderr pipe's write end open without ever writing to it. A
+        // dropped sender would make `recv_timeout` return `Disconnected`
+        // instantly, which proves nothing about the bound; a live, silent
+        // sender is the only shape that actually exercises the timeout arm.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        let reader = TurnReader {
+            backend_state: Arc::clone(&backend.state),
+            ask_grammar: Arc::clone(&backend.ask_grammar),
+            sink: backend.sink.lock().expect("sink lock").clone(),
+            data_dir: dir.path().to_path_buf(),
+            execution_id: "e-stderr-never".to_string(),
+            work_id: "w-stderr-never".to_string(),
+            session_id: "s-stderr-never".to_string(),
+            model: None,
+            child: Arc::new(Mutex::new(child)),
+            stderr_rx: Some(rx),
+        };
+        let started = std::time::Instant::now();
+        reader.run(stdout);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= STDERR_DRAIN_BUDGET,
+            "a silent-but-live sender must be waited out for the full budget \
+             ({STDERR_DRAIN_BUDGET:?}), not returned early: took {elapsed:?}"
+        );
+        assert!(
+            elapsed < STDERR_DRAIN_BUDGET * 3,
+            "the wait must actually be bounded by the budget, not merely \
+             coincidentally slow: took {elapsed:?}"
+        );
+
+        let events = emitted.lock().expect("sink lock");
+        let ended = events
+            .iter()
+            .find(|e| e.kind == "conversation.turn.ended")
+            .expect("every turn ends with this event");
+        assert_eq!(
+            ended.payload["stderr"], "",
+            "no stderr ever arrived, so the field must default to empty rather \
+             than the turn outcome hanging on it: {}",
+            ended.payload
+        );
+        // Held alive (see above) through every assertion; dropped only now
+        // that `reader.run` has already returned.
+        drop(tx);
+    }
+
     fn test_execution(model: Option<&str>) -> ClaudeExecution {
         ClaudeExecution {
             session_id: "s".to_string(),
