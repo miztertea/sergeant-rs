@@ -1,0 +1,26 @@
+{
+  "columns": [
+    "work_id",
+    "turns",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "total_cost_usd"
+  ],
+  "projection": {
+    "last_seq": 103
+  },
+  "query": "token_totals_per_work",
+  "question": "How many tokens (and how much cost) has each work consumed?",
+  "rows": [
+    [
+      "01KZRMCDSH0VCERG7R778SQT2H",
+      1,
+      160,
+      29831,
+      1221251,
+      4.310701999999999
+    ]
+  ],
+  "sql": "SELECT work_id, COUNT(*) AS turns, COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, COALESCE(SUM(total_cost_usd), 0) AS total_cost_usd FROM \"usage\" GROUP BY work_id ORDER BY work_id"
+}
