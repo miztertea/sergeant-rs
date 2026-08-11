@@ -56,6 +56,21 @@ Boundary rules R-NS-1..5 as drafted, plus:
 
 ## The waves (dispositions applied)
 
+**REVISED 2026-08-11 (same day, owner direction — problem-first
+re-sequencing): the thematic waves below are superseded by the layered
+MVP plan in `docs/gauntlet/notes/mvp-bucketing-2026-08-11.md`** — core →
+adapters (Claude + Docker) → CLI → stabilize/measure/cover → content
+(AGENTS.md/skills/workflows) → ship to colleagues; P2-JOURNAL and
+T-series are post-MVP enhancers that gate on the MVP and never block
+it. New rulings absorbed there: the estate manifest as keystone
+(`sergeant.toml` estate sections, pin-at-bind, three pens one file),
+the adapter-boundary rule (core semantics never defined by adapter
+flags — the `--setting-sources` de-leak), cost demoted to adapter
+capability with the turn-count envelope core-owned, E3 dissolved by
+R-NS-6, and the cheap-now rule (small enabling code lands in MVP even
+when not direct-MVP). The wave text below stands as the argument
+record.
+
 - **Wave 0 — legibility & safety** (falsifiers of the loop): output
   pointer at terminal state + `promote` disposition executing (E6 as
   corrected — output is retained today, not surfaced), `sgt work
