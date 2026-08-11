@@ -705,6 +705,35 @@ fn recorded_turn() -> String {
     lines.into_iter().map(|line| format!("{line}\n")).collect()
 }
 
+/// [`recorded_turn`], but with an actor-authored question spliced in where
+/// the recorded `post_turn_summary` carries an empty `needs_action` — the
+/// same shape `an_actor_authored_question_parks_the_stage_rather_than_completing_it`
+/// pins in isolation (`src/backend/claude.rs`), reproduced here at the
+/// stream-json level a stub's stdout actually is, for the daemon-level tests
+/// that need a real needs-input round trip to reach `Engine::begin_input`
+/// and `Engine::settle_send` through the real API.
+fn recorded_turn_with_ask(question: &str) -> String {
+    let mut lines: Vec<&str> = RECORDED_TURN.lines().filter(|l| !l.is_empty()).collect();
+    let envelope = lines.pop().expect("the result envelope is the last line");
+    let summary = json!({
+        "type": "system",
+        "subtype": "post_turn_summary",
+        "status_category": "blocked",
+        "needs_action": question,
+    })
+    .to_string();
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&summary);
+    out.push('\n');
+    out.push_str(envelope);
+    out.push('\n');
+    out
+}
+
 /// The substitution envelope, **derived** from the recorded one by three
 /// named edits (`tests/fixtures/README.md` documents each). Not a recording:
 /// print-mode substitution cannot be provoked on an entitled account, and the
@@ -1167,6 +1196,26 @@ async fn submit_over_api(
         .expect("json")
 }
 
+/// `POST /v1/work/{id}/input` (`work.respond`) — the one client mutation
+/// that answers a parked ask. Returns once the delivery's own settle
+/// completes (`Engine::settle_send`), not once the resumed turn finishes.
+async fn respond_over_api(
+    http: &reqwest::Client,
+    handle: &daemon::DaemonHandle,
+    work_id: &str,
+    input: &str,
+) -> Value {
+    http.post(format!("{}/v1/work/{work_id}/input", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid(), "input": input}))
+        .send()
+        .await
+        .expect("respond")
+        .json()
+        .await
+        .expect("json")
+}
+
 /// `GET /v1/work/{id}` — a read, never a crank.
 async fn show_over_api(http: &reqwest::Client, handle: &daemon::DaemonHandle, id: &str) -> Value {
     http.get(format!("{}/v1/work/{id}", handle.endpoint))
@@ -1299,6 +1348,20 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     assert!(
         kinds.contains(&"conversation.turn.ended"),
         "the turn really ran: {kinds:?}"
+    );
+    // TH-5 (BS2 test-honesty finding): the driver's own docs promise a poll
+    // that finds a turn still `Running` journals nothing — only `contains`
+    // assertions existed to check that, which a driver appending one event
+    // per tick would still satisfy. The stall is `STALL_SECONDS` over a
+    // 200ms default cadence, so a per-tick leak would add roughly ten extra
+    // events; this run's whole trajectory (submit through the cascaded
+    // launch) is nowhere near that many.
+    assert!(
+        events.len() < 25,
+        "the completion driver's poll cadence must not enter the trajectory \
+         as noise — got {} events for one settled turn and one cascade: \
+         {kinds:?}",
+        events.len()
     );
     let completed: Vec<&Event> = events
         .iter()
@@ -1531,6 +1594,279 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
         reason.contains("resumable"),
         "the operator must be told the conversation survived: {reason}"
     );
+    assert!(
+        !events.iter().any(|e| e.kind == "work.failed"),
+        "never silently failed"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == "stage.completed"),
+        "and never completed from evidence the daemon does not have"
+    );
+
+    restarted.shutdown().await;
+}
+
+/// INV-1 (BS2, issue #46's second seam): a real turn resumed by `respond`
+/// that finishes **after** its own SEND-settle completes its stage and
+/// cascades into the next one, with no client call after the answer.
+///
+/// Before this fix, `Engine::begin_input` never re-armed the stage record's
+/// status — it stayed `NeedsInput` across the whole resumed turn — so
+/// `due_observations` (which requires `StageStatus::Active`) permanently
+/// skipped the run and the answered turn's own completion was never
+/// observed by anything. This is the exact shape one seam over from
+/// [`a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_client_crank`]:
+/// the launch path was fixed there; this is the respond path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_crank() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    init_repo(repo.path());
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
+        .stalls_for(STALL_SECONDS);
+
+    let handle = start_with_stub(data.path(), &stub).await;
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "ask me first").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    // 1. The actor's question parks the work — settled by the completion
+    // driver, not by launch-settle (the stub stalls first).
+    let parked = poll_work_until(
+        &http,
+        &handle,
+        &work_id,
+        "the actor's question parked it",
+        |shown| shown["work"]["state"] == "needs_input",
+    )
+    .await;
+    assert_eq!(parked["stage"]["stage_id"], "00-prepare");
+    assert_eq!(parked["stage"]["status"], "needs_input");
+    assert_eq!(parked["stage"]["detail"], "postgres or sqlite?");
+
+    // Swap the stub's script for the *next* invocation only: a clean,
+    // no-ask completion, so the resumed turn — like every real turn — ends
+    // well after this respond's own settle has returned.
+    stub.replays(&recorded_turn());
+
+    // 2. Answer it. The response must reflect the delivery's own settle
+    // (stage live again, same stage, same work still active) — not the
+    // resumed turn's eventual outcome, which the stub has not even started
+    // emitting yet (it is still inside its `stalls_for` sleep).
+    let responded = respond_over_api(&http, &handle, &work_id, "postgres").await;
+    assert_eq!(
+        responded["work"]["state"], "active",
+        "answering resumes the work immediately, regardless of how long the \
+         resumed turn itself takes: {responded}"
+    );
+    assert_eq!(responded["stage"]["stage_id"], "00-prepare");
+    assert_eq!(
+        responded["stage"]["status"], "active",
+        "the stage must be live again right after the answer settles, or the \
+         completion driver has nothing to poll (INV-1): {responded}"
+    );
+
+    // 3. …and then the daemon settles the resumed turn on its own, with
+    // nothing but reads from here.
+    let cascaded = poll_work_until(
+        &http,
+        &handle,
+        &work_id,
+        "the resumed turn's stage cascaded",
+        |shown| shown["stage"]["index"].as_u64().unwrap_or(0) > 0,
+    )
+    .await;
+    assert_eq!(cascaded["stage"]["stage_id"], "10-implement");
+    assert_eq!(cascaded["work"]["state"], "active");
+
+    let events = events_over_api(&http, &handle, &work_id).await;
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        kinds
+            .iter()
+            .filter(|k| **k == "conversation.turn.ended")
+            .count()
+            >= 2,
+        "both the asking turn and the resumed one must have really run: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"stage.resumed"),
+        "the durable marker that re-armed the stage for the driver must be \
+         in the journal: {kinds:?}"
+    );
+    // TH-5's bound (see the sibling launch-path test), sized up for the two
+    // stalled turns this run drives instead of one.
+    assert!(
+        events.len() < 40,
+        "the completion driver's poll cadence must not enter the trajectory \
+         as noise — got {} events for two settled turns and one cascade: \
+         {kinds:?}",
+        events.len()
+    );
+    let completed: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == "stage.completed" && e.payload["stage_id"] == "00-prepare")
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly once, from the resumed turn's own settle: {kinds:?}"
+    );
+    let started_for_prepare: Vec<&Event> = events
+        .iter()
+        .filter(|e| {
+            e.kind == "execution.started" && e.payload["execution"]["stage_id"] == "00-prepare"
+        })
+        .collect();
+    assert_eq!(
+        started_for_prepare.len(),
+        1,
+        "answering an ask continues the same execution; it must not start a \
+         second one for the same stage: {kinds:?}"
+    );
+    // Three launches total: the ask, the resumed turn, and the next stage's.
+    let launches = stub.wait_for_launches(3);
+    assert_eq!(
+        launches.len(),
+        3,
+        "the next stage's turn must have been launched by the daemon"
+    );
+
+    // 4. The only client mutations in this whole run are the submit and the
+    // one answer — the cascade itself is the driver's.
+    assert_eq!(
+        client_mutations(&events),
+        vec![
+            "command.accepted:work.submit".to_string(),
+            "command.accepted:work.respond".to_string(),
+        ],
+        "nothing else here cranked the engine by hand"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Outcome 3 / L6, the respond-path sibling of
+/// [`a_crash_after_the_turn_ended_is_re_derived_at_restart`]: the daemon
+/// dies while a *resumed* turn is still running, before either the turn
+/// ends or the completion driver could settle it. Restart must re-derive
+/// the outcome, never leave the work stuck `active` forever — the same
+/// ladder, one seam over.
+///
+/// **Why this window is stood in differently from its launch-path sibling.**
+/// That test holds the window open with an hour's driver cadence, which
+/// works because the *first* observation (launch-settle's own, synchronous)
+/// already needs nothing from the driver. Here the same trick would also
+/// starve the ask itself — the ask's own turn outlives launch-settle just
+/// as every real turn does, and reaching `needs_input` at all requires the
+/// driver to actually run. So this test runs the driver at its normal
+/// cadence to reach `needs_input` and deliver the answer, then shuts the
+/// daemon down **immediately** after `respond` returns, with no wait of any
+/// kind: the resumed turn is stub-armed to sleep for a full
+/// `STALL_SECONDS` before it emits a single byte, and shutdown completes
+/// in low milliseconds, so the daemon is provably gone long before the
+/// resumed turn could have ended — never mind been settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    let home = TempDir::new().expect("claude home");
+    init_repo(repo.path());
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
+        .stalls_for(STALL_SECONDS);
+
+    let handle = start_with_stub(data.path(), &stub).await;
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "crash me during a respond").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    poll_work_until(
+        &http,
+        &handle,
+        &work_id,
+        "the actor's question parked it",
+        |shown| shown["work"]["state"] == "needs_input",
+    )
+    .await;
+
+    // The resumed turn is armed to sleep `STALL_SECONDS` before it emits
+    // anything — the same fixture, still in place. Answering it and
+    // shutting down immediately, with no poll and no sleep in between,
+    // stands inside the window by construction: at most a few milliseconds
+    // elapse here, nowhere near enough for the stub's sleep to have ended.
+    let responded = respond_over_api(&http, &handle, &work_id, "postgres").await;
+    assert_eq!(
+        responded["stage"]["status"], "active",
+        "the answer must settle immediately, well before the resumed turn \
+         itself finishes: {responded}"
+    );
+    let native_id_before = responded["execution"]["native_id"]
+        .as_str()
+        .expect("the execution names its conversation")
+        .to_string();
+
+    handle.shutdown().await;
+
+    let events: Vec<Event> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.work_id.as_deref() == Some(work_id.as_str()))
+        .collect();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "conversation.turn.ended")
+            .count(),
+        1,
+        "only the asking turn may have ended — the resumed one must not \
+         have, or this test proves nothing about a crash *during* it: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"stage.completed") && !kinds.contains(&"stage.blocked"),
+        "and certainly nothing settled it: {kinds:?}"
+    );
+    let session_id = native_id_before;
+
+    let project = home.path().join("projects").join("-work-surface");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
+
+    let mut claude = ClaudeConfig::new(data.path());
+    claude.executable = stub.path.clone();
+    claude.claude_home = Some(home.path().to_path_buf());
+    let restarted = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new()),
+            default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
+            claude: Some(claude),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("restart");
+
+    let after = show_over_api(&http, &restarted, &work_id).await;
+    assert_ne!(
+        after["work"]["state"], "active",
+        "a resumed turn that ended into a dead daemon's memory must never \
+         come back `active`: {after}"
+    );
+    assert_eq!(
+        after["work"]["state"], "blocked",
+        "§25's ladder: resumable conversation, unknown turn outcome → \
+         blocked with the evidence, retryable: {after}"
+    );
+    let events = events_over_api(&http, &restarted, &work_id).await;
     assert!(
         !events.iter().any(|e| e.kind == "work.failed"),
         "never silently failed"

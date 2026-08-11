@@ -43,8 +43,8 @@ use crate::domain::work::{
 use crate::domain::workflow::{
     DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
     KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition, StageStatus,
-    WorkflowDefinition, WorkflowError,
+    KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
+    StageStatus, WorkflowDefinition, WorkflowError,
 };
 use crate::domain::workspace::{RepositorySpec, Workspace, WorkspaceError};
 use crate::runtime::projection::WorkRun;
@@ -201,6 +201,13 @@ impl From<Result<ExecutionHandle, BackendError>> for LaunchOutcome {
 pub struct PendingSend {
     work_id: String,
     stage_id: String,
+    /// The stage attempt this delivery was reserved against (§14.5's
+    /// currency check for SEND, mirroring [`PendingObserve`] and
+    /// [`ExecutionReservation`]): a delivery whose stage has since moved to
+    /// a different index or attempt is stale even if the execution id
+    /// happens to still match.
+    index: usize,
+    attempt: u32,
     execution: ExecutionRecord,
     backend: Arc<dyn Backend>,
     input: String,
@@ -1141,10 +1148,12 @@ impl Engine {
             });
         }
         let run = self.run(core, work_id)?;
-        let stage_id = run
-            .current_stage()
-            .map(|s| s.stage_id.clone())
-            .unwrap_or_default();
+        let current = run.current_stage().ok_or_else(|| EngineError::NoRun {
+            work_id: work_id.to_string(),
+        })?;
+        let stage_id = current.stage_id.clone();
+        let index = current.index;
+        let attempt = current.attempt;
         let execution = run.execution.clone().ok_or_else(|| EngineError::NoRun {
             work_id: work_id.to_string(),
         })?;
@@ -1168,10 +1177,20 @@ impl Engine {
         // under the guard. The two appends above are the authoritative half
         // and stay here — the answer is durable before anything is spawned, so
         // a crash in the window loses the turn, never the human's words.
+        //
+        // The stage record itself is **not** flipped back to `Active` here
+        // (INV-4, BS2): that would happen before the delivery has actually
+        // reached the backend, and the completion driver's `due_observations`
+        // requires only `StageStatus::Active` to poll a run — it would race
+        // this very delivery for the same turn. `Engine::settle_send` does
+        // the flip instead, after the effect, atomically with applying
+        // whatever the delivery's own observation already says (§14.5).
         Ok(Step {
             next: Next::Send(Box::new(PendingSend {
                 work_id: work_id.to_string(),
                 stage_id,
+                index,
+                attempt,
                 execution,
                 backend,
                 input: input.to_string(),
@@ -2386,6 +2405,21 @@ impl Engine {
     /// evidence it is — including whether the harness actually took it — so
     /// the trajectory shows a human's words reaching a context whose work had
     /// already moved on, rather than showing nothing at all.
+    ///
+    /// **INV-1 (issue #46's second seam).** A delivery whose turn is still
+    /// running when this settles (the common case — `send` returns at spawn,
+    /// long before the turn ends) used to leave the stage `NeedsInput`
+    /// forever: the completion driver's `due_observations` only ever polls a
+    /// stage whose status is `Active`, and nothing else was going to observe
+    /// a turn nobody asked for. Once the delivery is confirmed live (not
+    /// stale, not an error), `KIND_STAGE_RESUMED` is committed unconditionally
+    /// — before `drive` acts on whatever the delivery's own observation
+    /// already says — so the driver picks the run back up on its next tick
+    /// exactly as it does after a launch. This is done *here*, under the
+    /// lock, after the out-of-lock effect, specifically so it opens no window
+    /// for the driver to observe a delivery still in flight (see
+    /// [`Engine::begin_input`]'s doc comment on why the flip does not happen
+    /// there instead).
     pub fn settle_send(
         &self,
         core: &mut Core,
@@ -2428,6 +2462,20 @@ impl Engine {
             self.block(core, &work_id, &format!("cannot deliver input: {e}"), None)?;
             return Ok(Step::parked());
         }
+        // The delivery genuinely reached the backend and is not stale: the
+        // stage is live again. Committed unconditionally, before `drive`,
+        // regardless of what the accompanying observation turns out to say —
+        // see this function's doc comment (INV-1).
+        self.commit(
+            core,
+            &work_id,
+            KIND_STAGE_RESUMED,
+            json!({
+                "stage_id": pending.stage_id,
+                "index": pending.index,
+                "attempt": pending.attempt,
+            }),
+        )?;
         if reattached {
             // §15 RESUME happened on this path, so the trajectory says so —
             // the same fact `execution.reconciled` records at restart, in the
@@ -2549,7 +2597,7 @@ impl Engine {
     /// window before it ever runs: a turn that ended into adapter memory and a
     /// daemon that dies before the poll. That outcome is not durable and must
     /// be re-derived at restart, which recovery already does and
-    /// `n19_a_crash_after_the_turn_ended_is_re_derived_at_restart` pins.
+    /// `a_crash_after_the_turn_ended_is_re_derived_at_restart` (m4) pins.
     pub fn settle_observe(
         &self,
         core: &mut Core,
@@ -2635,8 +2683,19 @@ impl Engine {
     ///
     /// [`Engine::reservation_is_stale`]'s rule, for the verb that has no
     /// reservation: the Work still exists, it is still `active` (the
-    /// `work.resumed` this delivery was committed with put it there), and the
-    /// run's current execution is still the one the input was handed to.
+    /// `work.resumed` this delivery was committed with put it there), the
+    /// run's current execution is still the one the input was handed to, and
+    /// (INV-4, BS2) the current stage is still the same coordinate this
+    /// delivery was reserved against — matching [`Engine::observation_is_stale`]
+    /// and [`Engine::reservation_is_stale`], which both check stage
+    /// identity, not execution identity alone. Nothing reachable today can
+    /// change the stage coordinate while leaving the execution id unchanged
+    /// (a stage advance always reserves a new execution), so this clause is
+    /// currently redundant with the execution check above it — kept as the
+    /// explicit currency check §14.5 asks every settle to make, and as the
+    /// guard against a future change that reuses an execution id across a
+    /// stage boundary silently reopening the race this function's sibling
+    /// [`Engine::settle_send`] was written to avoid.
     fn delivery_is_stale(&self, core: &Core, pending: &PendingSend) -> Option<String> {
         let registry = core.registry.state();
         let Some(work) = registry.works.get(&pending.work_id) else {
@@ -2648,18 +2707,33 @@ impl Engine {
                 work.state
             ));
         }
-        match registry
-            .runs
-            .get(&pending.work_id)
-            .and_then(|r| r.execution.as_ref())
-        {
-            Some(current) if current.execution_id == pending.execution.execution_id => None,
-            Some(current) => Some(format!(
-                "execution {} was superseded by {}",
-                pending.execution.execution_id, current.execution_id
-            )),
-            None => Some("the run no longer records an execution".to_string()),
+        let Some(run) = registry.runs.get(&pending.work_id) else {
+            return Some("the run record is gone".to_string());
+        };
+        match run.execution.as_ref() {
+            Some(current) if current.execution_id == pending.execution.execution_id => {}
+            Some(current) => {
+                return Some(format!(
+                    "execution {} was superseded by {}",
+                    pending.execution.execution_id, current.execution_id
+                ));
+            }
+            None => return Some("the run no longer records an execution".to_string()),
         }
+        match run.current_stage() {
+            Some(stage)
+                if stage.stage_id == pending.stage_id
+                    && stage.index == pending.index
+                    && stage.attempt == pending.attempt => {}
+            Some(stage) => {
+                return Some(format!(
+                    "the run moved on to stage {} attempt {}",
+                    stage.stage_id, stage.attempt
+                ));
+            }
+            None => return Some("the run has no current stage".to_string()),
+        }
+        None
     }
 
     /// Why a launch's result may no longer be applied, or `None` if it may.

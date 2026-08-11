@@ -72,6 +72,14 @@ pub const KIND_STAGE_WAITING: &str = "stage.waiting";
 pub const KIND_STAGE_NEEDS_INPUT: &str = "stage.needs_input";
 /// Event kind: input for a waiting stage arrived.
 pub const KIND_STAGE_INPUT_RECEIVED: &str = "stage.input_received";
+/// Event kind: a stage that was `needs_input` is live again — its delivery
+/// (`stage.input_received`'s SEND) reached the backend and the stage attempt
+/// resumed under the same execution, no new attempt (BS2 / issue #46's
+/// second seam). Committed only after the out-of-lock delivery settles, so
+/// the completion driver's `due_observations` (which requires
+/// `StageStatus::Active`) never has a window to observe a delivery still in
+/// flight — see `Engine::settle_send`.
+pub const KIND_STAGE_RESUMED: &str = "stage.resumed";
 /// Event kind: a stage is blocked.
 pub const KIND_STAGE_BLOCKED: &str = "stage.blocked";
 /// Event kind: a stage failed.
