@@ -36,11 +36,7 @@ pub(crate) mod testing {
             .catch_up(journal.replay().expect("replay"))
             .expect("catch up");
         let (events_tx, _rx) = tokio::sync::broadcast::channel(16);
-        Core {
-            journal,
-            registry,
-            events_tx,
-        }
+        Core::new(journal, registry, events_tx)
     }
 
     /// Append one event for `work_id`, as the daemon's engine would.

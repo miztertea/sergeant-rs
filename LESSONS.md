@@ -6,6 +6,32 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L17 — Stopping a coordinator does not stop its dispatched effects
+
+Cerberus session, 2026-08-11: the orchestrator stopped a workflow whose
+watcher had died early, precisely to prevent its collector from killing a
+live real-Claude run — and the already-dispatched collector's cancel
+landed anyway, ending the run at $4.62. Stop/kill of an orchestration
+layer is not quiescence of its in-flight agents; their external effects
+(engine commands, commits, cancels) land after the stop. Rule: after
+stopping any coordinator, verify the state you cared about by evidence
+(journal, process table) before assuming it is protected — and design
+run-ending effects to be idempotent or currency-checked, because a
+raced cancel is indistinguishable from an authorized one in the record.
+This is work-state ≠ process-state applied to our own orchestration.
+
+## L16 — A spend guard can only fire at the ledger's granularity
+
+Cerberus Run B2, 2026-08-11: a $2.50 budget guard polling `usage.updated`
+could never have fired before $4.62, because usage lands once per turn
+and turn 2 alone cost $3.21 — the guard's floor is the largest single
+effect, not the polling interval. Rule: size any budget bound to
+whole-effect costs (a guard at $X only bounds spend at $X + one maximal
+turn), state that arithmetic when recording the bound, and treat
+"tighter guard" proposals that ignore effect granularity as unmeasured
+claims. General form beyond money: any watchdog over an append-only
+record fires at that record's grain, never finer.
+
 ## L15 — A claim transmitted to another agent must carry its evidence or be labeled hypothesis
 
 N-series close-out, 2026-08-11: the orchestrator told the Run B operator

@@ -92,7 +92,7 @@ sgt analytics blocked_time_per_work  # answer one of them
 sgt doctor
 ```
 
-Checks git, the `claude` CLI (presence and version gate), the data directory, the journal (full validating replay), the analytics projection, and the daemon — in that order, so a fault is reported under the right name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon (every other command does), because it's diagnosing the installation, not priming it.
+Checks git, the `claude` CLI (presence and version gate), the data directory, the journal (full validating replay), the analytics projection, the daemon, and the effective permission mode each declared profile launches with — in that order, so a fault is reported under the right name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon (every other command does), because it's diagnosing the installation, not priming it.
 
 ## Workflows
 
@@ -109,7 +109,7 @@ A workflow is a directory, not code: a `workflow.toml` naming ordered stages, an
 └── ...
 ```
 
-Route to it explicitly (`sgt run "..." --workflow <name>`), or leave `--workflow` off and `sgt` uses the workspace's own `software-change` workflow if the repo has one, falling back to the built-in default otherwise. Backends are selected per work item (`--backend claude|fake`) or by named routing profiles in `sergeant.toml`.
+Route to it explicitly (`sgt run "..." --workflow <name>`), or leave `--workflow` off and `sgt` uses the workspace's own `software-change` workflow if the repo has one, falling back to the built-in default otherwise. Backends are selected per work item (`--backend claude|fake`) or by named routing profiles in `sergeant.toml`. A profile can also pin the permission mode Claude turns launch with (`permission_mode = "acceptEdits"` in the profile's `options` table, using the CLI's own `--permission-mode` vocabulary); with no mode set, `sgt` passes no permission flag at all — never a silent bypass — and `sgt doctor` reports each profile's effective mode.
 
 This repository dogfoods its own convention under `.sergeant/`: `.sergeant/index.md` catalogs every published workflow, and [`repo-to-icm`](.sergeant/workflows/repo-to-icm/) — a ten-stage workflow that converts a repository's scattered procedural knowledge (skills, agent instructions, scripts, docs) into reviewable draft workflow packages — is the worked example. Read its [`index.md`](.sergeant/workflows/repo-to-icm/index.md) and [`CONTEXT.md`](.sergeant/workflows/repo-to-icm/CONTEXT.md) for how a real multi-stage workflow is laid out, and see `AGENTS.md` for how an agent operating in this repo is expected to discover and follow one.
 
@@ -135,7 +135,7 @@ This is a clean-room Rust successor to [callmeradical/sergeant](https://github.c
 
 ## Status
 
-**P0 (the full vertical slice above) is complete** — 218 tests + 2 opt-in live-Claude, zero leaked daemons across the suite. **P1 performance baselining is done**: the full load/stress matrix ran against the release binary and is written up in [`docs/perf/baseline-2026-08-10.md`](docs/perf/baseline-2026-08-10.md), with findings tracked as GitHub issues. The **N-series** (ICM workflows, per-stage harnesses, Docker execute stages) is in progress — see [GAUNTLET.md](GAUNTLET.md)'s N0–N2 entries for what's landed so far, including the `repo-to-icm` workflow linked above. The prototype was built end-to-end by a multi-agent gauntlet loop (bounded contracts, blind critic panels, adversarial verification); the complete development record — including every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md), and the method in [reference/notes/gauntlet-pattern.md](reference/notes/gauntlet-pattern.md).
+**P0 (the full vertical slice above) is complete** — 218 tests + 2 opt-in live-Claude, zero leaked daemons across the suite. **P1 performance baselining is done**: the full load/stress matrix ran against the release binary and is written up in [`docs/perf/baseline-2026-08-10.md`](docs/perf/baseline-2026-08-10.md), with findings tracked as GitHub issues. The **N-series** (ICM workflows, per-stage harnesses, Docker execute stages) is in progress — see [GAUNTLET.md](GAUNTLET.md)'s N-series entries for what's landed so far, including the `repo-to-icm` workflow linked above. The prototype was built end-to-end by a multi-agent gauntlet loop (bounded contracts, blind critic panels, adversarial verification); the complete development record — including every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md), and the method in [reference/notes/gauntlet-pattern.md](reference/notes/gauntlet-pattern.md).
 
 ## Developing
 

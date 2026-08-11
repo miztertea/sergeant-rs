@@ -12,8 +12,10 @@ Rules:
   (run ID, journal path, command output). An undated fact is a rumor.
 - Sessions **re-measure cheaply on wake** where a probe exists rather than
   trusting a stale file; the file records the last measurement, not eternal
-  truth. (A future `scripts/probe-env.sh` should emit this file's facts
-  table for the host it runs on — see the N-series retro, item 1.)
+  truth. Run `scripts/probe-env.sh` once at session start on any host and
+  paste its table into that host's file here before doing anything else
+  (see the N-series retro, item 1) — it emits exactly this format, dated,
+  never a blank or assumed cell.
 - Test fixtures asserting environment facts must **probe-gate** (skip
   loudly where the fact doesn't hold) — the two-environment matrix in
   CLAUDE.md is the root-container/GH-runner instance of this general rule;

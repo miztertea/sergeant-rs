@@ -1,0 +1,22 @@
+# validate-and-ship — admitted workflow (N1 reference corpus,
+# docs/gauntlet/contracts/N1.md; candidate W18,
+# reference-corpus/synthesis.md §1). The single final shipping boundary:
+# validate a committed change through the pipeline to a terminal outcome,
+# routing every finding, without the validating actor ever editing the
+# code. Promoted per docs/icm/promotion-spec-2026-08-11.md; full
+# behavior-unit citation trail archived at
+# docs/gauntlet/promoted-provenance/validate-and-ship.md.
+#
+# Seven ordinary actor stages (N1 adjudication A4 folded three
+# demoted checkpoints into 20-select-intent-transport and one each into
+# 40-drive-gates/60-close-out; adjudication A5 restored 00-check-scope/
+# 10-do-the-work and re-rung 30-start-run to actor-stage; adjudication A6
+# re-homed repo-release-verification into 20-select-intent-transport — see
+# the archived provenance for the full fold record). Stage order here is
+# authoritative; the directory listing under this workflow's own tree
+# must agree with it lexically (docs/icm/convention.md §1 rule 4).
+
+[workflow]
+name = "validate-and-ship"
+version = "2"
+stages = ["00-check-scope", "10-do-the-work", "20-select-intent-transport", "30-start-run", "40-drive-gates", "50-reconcile-custody", "60-close-out"]

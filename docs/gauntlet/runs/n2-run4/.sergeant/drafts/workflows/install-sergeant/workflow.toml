@@ -1,0 +1,9 @@
+# install-sergeant — draft workflow candidate materialized by repo-to-icm's
+# 60-draft stage (N2 run, 21-partition corpus). status: draft in
+# index.md; this package has not been promoted to .sergeant/workflows/.
+# See provenance.md for the behavior_id evidence backing each stage.
+
+[workflow]
+name = "install-sergeant"
+version = "1"
+stages = ["01-verify-prerequisites", "02-install-symlinks", "03-uninstall-symlinks", "04-update-checkout"]

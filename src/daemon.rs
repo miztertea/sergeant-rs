@@ -21,12 +21,16 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{broadcast, oneshot, watch};
 
-use crate::api::{API_REVISION, ApiState, Core, CoreError, router};
+use crate::api::{
+    API_REVISION, ApiState, COMPLETION_POLL_INTERVAL, Core, CoreError, CoreGuard,
+    drive_completions, router,
+};
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
@@ -119,6 +123,15 @@ pub enum DaemonError {
     },
 }
 
+/// How long shutdown waits for the completion driver to leave whatever it is
+/// inside before journaling `daemon.stopped` and going.
+///
+/// Half of m6's SIGTERM grace: long enough that the ordinary case (one poll
+/// interval, or one crank over in-memory observations) always finishes inside
+/// it, short enough that a daemon whose driver is stuck in someone else's git
+/// checkout still exits on its own rather than being escalated to SIGKILL.
+const DRIVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Handle to a running in-process daemon. Dropping it does NOT stop the
 /// daemon; call [`DaemonHandle::shutdown`] for a clean stop (journals
 /// `daemon.stopped`, removes the descriptor).
@@ -162,6 +175,15 @@ pub struct DaemonConfig {
     /// with no pipeline here the daemon builds no provider, spawns no
     /// exporter task, and subscribes nothing to the event stream.
     pub telemetry: Option<Arc<Telemetry>>,
+    /// How often the completion driver looks for turns that ended on their
+    /// own (issue #46; see [`api::drive_completions`]).
+    ///
+    /// Configurable for the same reason `backends` is: a test that needs to
+    /// stand *inside* the window between a turn ending and the daemon settling
+    /// it has no other way to hold the window open, and the alternative — a
+    /// sleep racing the driver — is the kind of test that passes for the wrong
+    /// reason. Production uses the default.
+    pub completion_poll: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -171,6 +193,7 @@ impl Default for DaemonConfig {
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
             telemetry: None,
+            completion_poll: COMPLETION_POLL_INTERVAL,
         }
     }
 }
@@ -228,11 +251,7 @@ pub async fn start_with(
     }
 
     let (events_tx, _) = broadcast::channel(1024);
-    let mut core = Core {
-        journal,
-        registry,
-        events_tx,
-    };
+    let mut core = Core::new(journal, registry, events_tx);
 
     // 3. Bind loopback on an ephemeral port before publishing anything.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -244,6 +263,15 @@ pub async fn start_with(
         KIND_DAEMON_STARTED,
         json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "endpoint": endpoint}),
     ))?;
+    // `core` is bare here — no `CoreGuard`, because nothing else can see it
+    // yet — so nothing makes this durable but an explicit flush (invariants
+    // round 2, INV-R2-01). Startup is the one path that performs unbounded,
+    // irreversible external effects (backend probes below, and recovery's
+    // `git worktree remove` / harness relaunch further down) with no client
+    // and no guard to fsync on drop; flushing after every commit that
+    // precedes such an effect keeps the "durable before it could have been
+    // observed" property `CoreGuard` gives every other path.
+    core.flush()?;
 
     // 4b. Register the real adapter alongside whatever the config supplied
     // (tests hand in scripted fakes; they keep them). It is added here, not
@@ -294,16 +322,26 @@ pub async fn start_with(
             }),
         ))?;
     }
+    // Same reasoning as the daemon.started flush above: durable before
+    // recovery starts acting on it (INV-R2-01).
+    core.flush()?;
 
     // 4c. Reconcile work believed in flight *before* serving (§25): no
     // request may observe — or act on — a work whose prior ownership has not
-    // yet been settled.
+    // yet been settled. `reconcile` itself flushes after each work it
+    // touches, so its own effects (a `git worktree remove`, a relaunched
+    // harness) are never left unsynced while unbounded — see its doc.
     let engine = Arc::new(Engine::new(
         backends,
         config.default_backend.clone(),
         data_dir,
     ));
     let reconciled = recovery::reconcile(&engine, &mut core)?;
+    // Backstop, not load-bearing: `reconcile` already leaves nothing open on
+    // its own account, but a future edit there that forgets a flush must not
+    // be able to publish the descriptor over an unsynced group. Free when
+    // the group is already empty.
+    core.flush()?;
     if !reconciled.resumed.is_empty()
         || !reconciled.blocked.is_empty()
         || !reconciled.surfaces_retired.is_empty()
@@ -347,7 +385,7 @@ pub async fn start_with(
     // §28's export is a fold over the event stream, subscribed here and
     // nowhere else. With export off this task does not exist.
     if let Some(telemetry) = config.telemetry.clone() {
-        let events = state.core.lock().await.events_tx.subscribe();
+        let events = CoreGuard::acquire(&state.core).await.events_tx.subscribe();
         tokio::spawn(export_events(telemetry, events));
     }
     // The Claude adapter's normalized events (§27) flow into the journal
@@ -356,6 +394,13 @@ pub async fn start_with(
         claude.set_event_sink(journaling_sink(state.core.clone()));
     }
     let app = router(state.clone());
+
+    // The one writer that is not a request (issue #46): a turn that ends on
+    // its own has no client to crank the engine, so the daemon carries the
+    // observer itself. It is joined at shutdown below rather than merely
+    // dropped, because it commits events and `daemon.stopped` must be the last
+    // one this daemon writes.
+    let completions = tokio::spawn(drive_completions(state.clone(), config.completion_poll));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let served = tokio::spawn(async move {
@@ -370,14 +415,48 @@ pub async fn start_with(
         if let Err(e) = serve.await {
             tracing::error!(error = %e, "daemon serve failed");
         }
+        // The completion driver watches the same `closing` flag the SSE pumps
+        // do, so this normally waits out one 200 ms tick and nothing else.
+        //
+        // Bounded, though, because the driver is the one writer that can be
+        // *inside an external effect* when the signal arrives: a cascade it
+        // started may be spawning a harness or running `git worktree remove`
+        // on a checkout this daemon does not own and cannot bound. Waiting
+        // that out unbounded would put an arbitrary repository's size on the
+        // shutdown path — and m6's rig pins that a SIGTERMed daemon exits
+        // within its grace and *by itself*, so a slow teardown would turn into
+        // a SIGKILL and lose everything registered to run at exit.
+        //
+        // The trade the bound makes, stated rather than hidden: past it, the
+        // driver's crank may commit an event after `daemon.stopped`. That is
+        // the property the adapter's normalized-event committer thread already
+        // has (see `journaling_sink`), the journal is append-only and
+        // crash-tolerant per append, and `daemon.stopped` is a lifecycle
+        // record that nothing reconciles against — whereas a daemon that will
+        // not die is a lock nobody can take.
+        match tokio::time::timeout(DRIVER_SHUTDOWN_GRACE, completions).await {
+            Ok(Err(e)) => tracing::warn!(error = %e, "the completion driver panicked"),
+            Err(_) => tracing::warn!(
+                grace = ?DRIVER_SHUTDOWN_GRACE,
+                "the completion driver was still inside an external effect at shutdown; \
+                 stopping anyway"
+            ),
+            Ok(Ok(())) => {}
+        }
         // Clean shutdown: journal the stop, then retire the descriptor.
-        let mut core = state.core.lock().await;
+        let mut core = CoreGuard::acquire(&state.core).await;
         if let Err(e) = core.commit(EventDraft::new(
             EventSource::new("daemon", "sergeant"),
             KIND_DAEMON_STOPPED,
             json!({"pid": std::process::id()}),
         )) {
             tracing::warn!(error = %e, "failed to journal daemon.stopped");
+        }
+        // Close the group here rather than leaving it to the guard's `Drop`,
+        // only so the failure is warned about in the same voice as the append
+        // above; the descriptor must not be retired over an unflushed journal.
+        if let Err(e) = core.flush() {
+            tracing::warn!(error = %e, "failed to fsync the shutdown group commit");
         }
         if let Err(e) = std::fs::remove_file(&descriptor_path) {
             tracing::warn!(error = %e, "failed to remove runtime descriptor");
@@ -479,7 +558,7 @@ fn commit_normalized_events(
     // least-recently-started execution rather than an arbitrary one.
     let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while let Ok(mut draft) = rx.recv() {
-        let Some(core) = core.upgrade() else {
+        let Some(live) = core.upgrade() else {
             tracing::debug!("normalized-event committer stopping: the core is gone");
             return;
         };
@@ -489,7 +568,12 @@ fn commit_normalized_events(
         {
             draft.causation_id = chain.get(key).cloned();
         }
-        let mut core = core.blocking_lock();
+        // One draft per hold, so this thread's "group" is a single event and
+        // its fsync is the same one it always paid. It goes through the guard
+        // anyway (#44): the group boundary is a property of holding the core,
+        // not of who is holding it, and a second door into the core is exactly
+        // what `t11c` exists to prevent.
+        let mut core = CoreGuard::acquire_blocking(&live);
         match core.commit(draft) {
             Ok(event) => {
                 if let Some(key) = key {
@@ -537,6 +621,24 @@ async fn export_events(
 /// This is the one place §28 export is configured from the environment, and
 /// [`TelemetryConfig::from_env`] answers "off" unless explicitly switched on.
 pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
+    // **Handlers first, before anything makes this daemon reachable.**
+    //
+    // Publishing the runtime descriptor is what tells the world "there is a
+    // daemon here"; clients and test rigs alike wait for exactly that file and
+    // then start acting. Until a SIGTERM handler is installed, SIGTERM's
+    // default disposition applies and the process is simply terminated —
+    // nothing journals `daemon.stopped`, the descriptor is left pointing at a
+    // dead pid, and nothing registered at exit runs. Installing after
+    // `start_with` left that window open from the descriptor write to here.
+    //
+    // Measured, 2026-08-11 (Cerberus): m6's
+    // `the_spawned_daemon_rig_stops_its_daemon_with_sigterm` failed with
+    // `status.signal() == Some(15)` — killed *by* the signal — on run 3 of 40
+    // m6 runs executed against a concurrently running suite. The rig returns
+    // the instant the descriptor appears and signals immediately, so it lands
+    // in that window whenever the scheduler lets it. The window predates the
+    // completion driver, and the driver's spawn is more work inside it.
+    let mut shutdown = ShutdownSignals::install();
     let telemetry_config = TelemetryConfig::from_env();
     let telemetry = Telemetry::from_config(&telemetry_config)?.map(Arc::new);
     if telemetry.is_some() {
@@ -554,7 +656,7 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
     )
     .await?;
     tracing::info!(endpoint = %handle.endpoint, data_dir = %data_dir.display(), "daemon serving");
-    wait_for_shutdown_signal().await;
+    shutdown.recv().await;
     tracing::info!("shutdown signal received");
     handle.shutdown().await;
     if let Some(telemetry) = telemetry {
@@ -563,26 +665,82 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// Resolve on SIGINT (Ctrl-C) or, on Unix, SIGTERM.
-async fn wait_for_shutdown_signal() {
+/// Installed shutdown-signal handlers: SIGINT (Ctrl-C) and, on Unix, SIGTERM.
+///
+/// Split from the waiting so the *installation* can happen before the daemon
+/// publishes anything — see [`run_until_signal`]'s first lines for the
+/// measurement that made the ordering load-bearing. Constructing this
+/// registers the handlers; delivery is queued from that moment, so a signal
+/// that arrives during startup is still delivered to [`Self::recv`] later
+/// rather than terminating the process.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(term) => term,
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            // Both explicitly, rather than leaning on `ctrl_c()`: that helper
+            // registers SIGINT when its future is first polled, which is the
+            // very thing this type exists to move earlier.
+            //
+            // Each registration is kept independently. Tokio's Unix signal
+            // registration is process-global and is not undone when the
+            // `Signal` is dropped, so discarding a successfully registered
+            // stream because the *other* one failed would leave that signal
+            // consumed by tokio's handler with nothing receiving it — a
+            // daemon unkillable by exactly the signal that did register.
+            let take = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(stream) => Some(stream),
                 Err(e) => {
-                    tracing::error!(error = %e, "cannot install SIGTERM handler");
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
+                    tracing::error!(
+                        error = ?e,
+                        signal = name,
+                        "cannot install shutdown signal handler"
+                    );
+                    None
                 }
             };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            Self {
+                interrupt: take(SignalKind::interrupt(), "SIGINT"),
+                terminate: take(SignalKind::terminate(), "SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
+
+    /// Resolve on the first shutdown signal delivered since installation.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+                return;
+            }
+            // A signal whose registration failed keeps its default
+            // disposition (terminate the process), so waiting only on the
+            // stream that exists loses nothing.
+            (Some(interrupt), None) => {
+                let _ = interrupt.recv().await;
+                return;
+            }
+            (None, Some(terminate)) => {
+                let _ = terminate.recv().await;
+                return;
+            }
+            (None, None) => {}
+        }
         let _ = tokio::signal::ctrl_c().await;
     }
 }
@@ -658,11 +816,7 @@ mod tests {
             .catch_up(journal.replay().expect("replay"))
             .expect("catch up");
         let (events_tx, _) = broadcast::channel(16);
-        Core {
-            journal,
-            registry,
-            events_tx,
-        }
+        Core::new(journal, registry, events_tx)
     }
 
     /// Poll the journal (lock-free: [`Journal::replay_data_dir`] only reads

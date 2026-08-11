@@ -24,8 +24,8 @@ use crate::domain::work::{
 };
 use crate::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
-    KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
-    StageBinding, StageRecord, StageStatus, WorkflowDefinition,
+    KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_STAGE_WAITING,
+    KIND_WORKFLOW_BOUND, StageBinding, StageRecord, StageStatus, WorkflowDefinition,
 };
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::journal::JournalError;
@@ -530,6 +530,25 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
                     stage.status = status;
                     stage.detail = detail;
                 }
+            }
+        }
+        KIND_STAGE_RESUMED => {
+            // BS2 / issue #46's second seam: a `needs_input` stage whose
+            // answer was delivered is live again, under the same attempt —
+            // not a new one, so (unlike `KIND_STAGE_ENTERED`) this updates
+            // the existing record in place rather than pushing a new one.
+            // This is what makes the stage due for the completion driver's
+            // `due_observations` again (it requires `StageStatus::Active`).
+            if let (Some(work_id), Some(stage_id)) =
+                (event.work_id.as_ref(), event.payload["stage_id"].as_str())
+                && let Some(stage) = state
+                    .runs
+                    .entry(work_id.clone())
+                    .or_default()
+                    .last_stage_mut(stage_id)
+            {
+                stage.status = StageStatus::Active;
+                stage.detail = None;
             }
         }
         KIND_EXECUTION_RESERVED => {

@@ -1,0 +1,16 @@
+# respond-to-worker — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# candidate W10). A blocked/needs-input/waiting/orphaned worker is durably
+# given exactly one decision, applies it exactly once, and returns to
+# forward progress. Promoted per docs/icm/promotion-spec-2026-08-11.md;
+# full behavior-unit citation trail archived at
+# docs/gauntlet/promoted-provenance/respond-to-worker.md.
+#
+# Two ordinary actor stages (N1 adjudication A4 folded six deterministic
+# helper stages into 40-apply-and-acknowledge; see the archived provenance
+# for the full fold record). Stage order here is authoritative; the
+# directory listing under this workflow's own tree must agree with it.
+
+[workflow]
+name = "respond-to-worker"
+version = "2"
+stages = ["00-precondition-check", "40-apply-and-acknowledge"]

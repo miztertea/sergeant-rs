@@ -93,6 +93,9 @@ use sergeant_rs::runtime::surface::{
     work_branch,
 };
 
+/// The reaping data-dir guard, for the tests here that run a daemon.
+mod support;
+
 // ---------------------------------------------------------------- helpers
 
 fn ulid() -> String {
@@ -279,11 +282,7 @@ fn core(data_dir: &Path) -> Core {
         .catch_up(journal.replay().expect("replay"))
         .expect("catch up");
     let (events_tx, _rx) = tokio::sync::broadcast::channel(16);
-    Core {
-        journal,
-        registry,
-        events_tx,
-    }
+    Core::new(journal, registry, events_tx)
 }
 
 fn commit(core: &mut Core, work_id: &str, kind: &str, payload: Value) {
@@ -445,6 +444,19 @@ struct StubClaude {
     /// While this file exists, a turn invocation `exec`s a long sleep after
     /// replaying — a turn that is genuinely still in flight.
     hang: PathBuf,
+    /// While this file exists, a turn invocation parks **before** emitting
+    /// anything until [`StubClaude::release_turn`] creates the release
+    /// marker (consumed per turn) — a turn whose process outlives
+    /// launch-settle and then finishes on its own (issue #46), gated on an
+    /// event rather than a wall-clock sleep so a loaded runner cannot let
+    /// the turn end early.
+    stall: PathBuf,
+    /// One-shot release marker for a parked turn; see `stall`.
+    release: PathBuf,
+    /// While this file exists, its contents go to the turn's stderr.
+    stderr: PathBuf,
+    /// While this file exists, the turn exits with the code it holds.
+    exit_code: PathBuf,
 }
 
 /// One recorded launch of [`StubClaude`].
@@ -479,6 +491,10 @@ impl StubClaude {
         let record = dir.join("claude-launches.txt");
         let replay = dir.join("claude-replay.jsonl");
         let hang = dir.join("claude-hang");
+        let stall = dir.join("claude-stall");
+        let release = dir.join("claude-release");
+        let stderr = dir.join("claude-stderr");
+        let exit_code = dir.join("claude-exit-code");
         let help = help_flags.join(" ");
         let env_lines: String = RECORDED_ENV
             .iter()
@@ -495,13 +511,24 @@ impl StubClaude {
                    printf 'cwd %s\\n' \"$(pwd)\";\n      \
                    printf 'stdin %s\\n' \"$(cat | tr '\\n' '|')\";\n      \
                    printf 'end\\n'; }} >> \"{record}\"\n    \
+                 if [ -f \"{stall}\" ]; then\n      \
+                   i=0\n      \
+                   while [ ! -f \"{release}\" ] && [ \"$i\" -lt 200 ]; do sleep 0.1; i=$((i+1)); done\n      \
+                   rm -f \"{release}\"\n    \
+                 fi\n    \
                  if [ -f \"{replay}\" ]; then cat \"{replay}\"; fi\n    \
+                 if [ -f \"{stderr}\" ]; then cat \"{stderr}\" >&2; fi\n    \
                  if [ -f \"{hang}\" ]; then exec sleep 30; fi\n    \
+                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n    \
                  exit 0;;\n\
              esac\n",
             record = record.display(),
             replay = replay.display(),
             hang = hang.display(),
+            stall = stall.display(),
+            release = release.display(),
+            stderr = stderr.display(),
+            exit_code = exit_code.display(),
         );
         std::fs::write(&path, script).expect("write stub");
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
@@ -512,6 +539,10 @@ impl StubClaude {
             record,
             replay,
             hang,
+            stall,
+            release,
+            stderr,
+            exit_code,
         };
         stub.wait_until_executable();
         stub
@@ -561,6 +592,51 @@ impl StubClaude {
     /// A stub that passes the probe with every required flag.
     fn passing(dir: &Path) -> Self {
         Self::new(dir, "2.1.226 (Claude Code)", ALL_FLAGS)
+    }
+
+    /// Make every turn invocation park before it emits a byte until
+    /// [`Self::release_turn`] fires, so the turn's process is provably still
+    /// alive — and its stdout still open — when launch-settle (or
+    /// SEND-settle) takes its observation, no matter how loaded the machine
+    /// is.
+    ///
+    /// This is the shape of every *real* turn and of no test before issue #46:
+    /// the fake backend finishes inside the launch effect, and the stub
+    /// replayed its whole transcript and exited before the adapter had
+    /// finished recording the launch, so the suite only ever settled turns
+    /// that were already over. A turn that outlives launch-settle is the one
+    /// Run B measured, and the only one that can be left `active` forever.
+    /// An earlier version parked with a fixed 2 s `sleep`, which raced the
+    /// settle it was supposed to outlast on a loaded 2-core runner (BS2R-05);
+    /// the gate makes the ordering an event, not a bet. A parked turn that is
+    /// never released proceeds on its own after ~20 s — inside
+    /// `SETTLE_BUDGET`, so a test bug degrades to the old wall-clock shape
+    /// instead of hanging the suite.
+    fn stalls_until_released(&self) -> &Self {
+        std::fs::write(&self.stall, b"gate\n").expect("write stall marker");
+        self
+    }
+
+    /// Let the currently parked turn proceed: one-shot, consumed by the turn
+    /// invocation that sees it, so the next gated turn parks again.
+    fn release_turn(&self) {
+        std::fs::write(&self.release, b"go\n").expect("write release marker");
+    }
+
+    /// Make every turn invocation write `text` to stderr.
+    fn writes_stderr(&self, text: &str) -> &Self {
+        std::fs::write(&self.stderr, text).expect("write stderr fixture");
+        self
+    }
+
+    /// Make every turn invocation exit with `code`.
+    ///
+    /// Recorded for fidelity to the shape being reproduced, not because the
+    /// adapter reads it: L1's first finding is that this CLI's exit codes lie,
+    /// and `TurnReader` classifies from the stream and never from the status.
+    fn exits_with(&self, code: i32) -> &Self {
+        std::fs::write(&self.exit_code, code.to_string()).expect("write exit code");
+        self
     }
 
     /// Make turn invocations replay `transcript` on stdout.
@@ -651,6 +727,35 @@ fn recorded_turn() -> String {
     lines.into_iter().map(|line| format!("{line}\n")).collect()
 }
 
+/// [`recorded_turn`], but with an actor-authored question spliced in where
+/// the recorded `post_turn_summary` carries an empty `needs_action` — the
+/// same shape `an_actor_authored_question_parks_the_stage_rather_than_completing_it`
+/// pins in isolation (`src/backend/claude.rs`), reproduced here at the
+/// stream-json level a stub's stdout actually is, for the daemon-level tests
+/// that need a real needs-input round trip to reach `Engine::begin_input`
+/// and `Engine::settle_send` through the real API.
+fn recorded_turn_with_ask(question: &str) -> String {
+    let mut lines: Vec<&str> = RECORDED_TURN.lines().filter(|l| !l.is_empty()).collect();
+    let envelope = lines.pop().expect("the result envelope is the last line");
+    let summary = json!({
+        "type": "system",
+        "subtype": "post_turn_summary",
+        "status_category": "blocked",
+        "needs_action": question,
+    })
+    .to_string();
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&summary);
+    out.push('\n');
+    out.push_str(envelope);
+    out.push('\n');
+    out
+}
+
 /// The substitution envelope, **derived** from the recorded one by three
 /// named edits (`tests/fixtures/README.md` documents each). Not a recording:
 /// print-mode substitution cannot be provoked on an entitled account, and the
@@ -679,7 +784,6 @@ const ALL_FLAGS: &[&str] = &[
     "--setting-sources",
     "--model",
     "--permission-mode",
-    "--dangerously-skip-permissions",
 ];
 
 fn start_request(
@@ -1031,6 +1135,829 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
     );
 }
 
+// --------------------- issue #46: a turn that ends after launch-settle
+//
+// Run B's measured defect, reproduced as contract tests and then pinned. Both
+// attempts ended their turn and then sat `active` — 45m28s after a clean
+// envelope, 34m58s after an envelope-less root refusal — because the only
+// observers this daemon had were launch-settle, SEND-settle, restart recovery
+// and a client crank, and a real turn finishes at none of those instants.
+//
+// What makes these tests different from every earlier one in this file is one
+// line: `stub.stalls_until_released()`. Without it the stub replays and exits
+// before the adapter has finished recording the launch, so launch-settle
+// observes an already-finished turn and the whole seam is invisible — which is
+// exactly why a suite of 352 tests was green while the product stalled for 45
+// minutes. Each test releases the gate only after the settle it needs to
+// outlast has provably happened (the settle's own HTTP response is in hand),
+// so the window is held open by ordering, not by a wall-clock sleep.
+//
+// Neither test makes a mutating client call after the submit, and each one
+// asserts that from the journal (`command.accepted` is journaled per accepted
+// mutation, so "exactly one, the submit" is checkable rather than a claim
+// about how the test was written). Polling a read view for the transition is
+// allowed; causing it with a POST is the thing being ruled out.
+
+/// How long the driven-turn tests wait for the daemon to settle a turn that
+/// ended on its own. The driver's cadence is 200 ms and a released turn ends
+/// within a replay's runtime, so this covers a loaded machine (and the ~20 s
+/// self-release of a gate a buggy test forgot to open) while a genuinely
+/// stuck stage still fails the test rather than the suite's patience.
+const SETTLE_BUDGET: Duration = Duration::from_secs(30);
+
+/// Start a daemon whose only backend is the real Claude adapter over `stub`.
+async fn start_with_stub(data_dir: &Path, stub: &StubClaude) -> daemon::DaemonHandle {
+    start_with_stub_polling(data_dir, stub, DaemonConfig::default().completion_poll).await
+}
+
+/// [`start_with_stub`] with the completion driver's cadence chosen by the
+/// caller — the only way to stand *inside* the window between a turn ending
+/// and the daemon settling it.
+async fn start_with_stub_polling(
+    data_dir: &Path,
+    stub: &StubClaude,
+    completion_poll: Duration,
+) -> daemon::DaemonHandle {
+    let mut claude = ClaudeConfig::new(data_dir);
+    claude.executable = stub.path.clone();
+    daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new()),
+            default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
+            claude: Some(claude),
+            completion_poll,
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
+}
+
+/// Submit one work through the real API and return its `work_view` body.
+async fn submit_over_api(
+    http: &reqwest::Client,
+    handle: &daemon::DaemonHandle,
+    cwd: &Path,
+    intent: &str,
+) -> Value {
+    http.post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": intent,
+            "origin": {"client": "cli", "cwd": cwd},
+        }))
+        .send()
+        .await
+        .expect("submit")
+        .json()
+        .await
+        .expect("json")
+}
+
+/// `POST /v1/work/{id}/input` (`work.respond`) — the one client mutation
+/// that answers a parked ask. Returns once the delivery's own settle
+/// completes (`Engine::settle_send`), not once the resumed turn finishes.
+async fn respond_over_api(
+    http: &reqwest::Client,
+    handle: &daemon::DaemonHandle,
+    work_id: &str,
+    input: &str,
+) -> Value {
+    http.post(format!("{}/v1/work/{work_id}/input", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid(), "input": input}))
+        .send()
+        .await
+        .expect("respond")
+        .json()
+        .await
+        .expect("json")
+}
+
+/// `GET /v1/work/{id}` — a read, never a crank.
+async fn show_over_api(http: &reqwest::Client, handle: &daemon::DaemonHandle, id: &str) -> Value {
+    http.get(format!("{}/v1/work/{id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show")
+        .json()
+        .await
+        .expect("json")
+}
+
+/// Every journaled event for `work_id`, read back through `GET /v1/events`.
+async fn events_over_api(
+    http: &reqwest::Client,
+    handle: &daemon::DaemonHandle,
+    work_id: &str,
+) -> Vec<Event> {
+    let body: Value = http
+        .get(format!("{}/v1/events", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .query(&[("work_id", work_id)])
+        .send()
+        .await
+        .expect("events")
+        .json()
+        .await
+        .expect("json");
+    body["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|e| serde_json::from_value(e.clone()).expect("event"))
+        .collect()
+}
+
+/// Poll the read view until `done` accepts it, or fail with the last body.
+async fn poll_work_until(
+    http: &reqwest::Client,
+    handle: &daemon::DaemonHandle,
+    work_id: &str,
+    what: &str,
+    done: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + SETTLE_BUDGET;
+    loop {
+        let shown = show_over_api(http, handle, work_id).await;
+        if done(&shown) {
+            return shown;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what} never happened within {SETTLE_BUDGET:?} — this is issue #46's stall: {shown}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// How many mutations a client has asked this daemon to perform on `work_id`.
+fn client_mutations(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| e.kind == "command.accepted" || e.kind == "command.rejected")
+        .map(|e| {
+            format!(
+                "{}:{}",
+                e.kind,
+                e.payload["operation"].as_str().unwrap_or("?")
+            )
+        })
+        .collect()
+}
+
+/// Issue #46, Run B attempt 2: a real turn that finishes **after**
+/// launch-settle completes its stage and cascades into the next one, with no
+/// client call in between.
+///
+/// The stub replays the recorded 2.1.226 transcript — clean `result`
+/// envelope, `post_turn_summary` with an empty `needs_action`, no model pin —
+/// which is byte-for-byte the shape whose derivation `observe_envelope`'s own
+/// unit test pins as `StageCompleted`, and which live sat `active` for 45
+/// minutes. The classification was never the bug; being asked was.
+///
+/// Three things are asserted, and the middle one is the test:
+///
+/// 1. the turn really did outlive launch-settle (the submit answered with the
+///    stage `active`, so the observation that settled it cannot be the one the
+///    launch took);
+/// 2. the stage completed and stage 1 was entered **and launched**, so the
+///    cascade is the engine's and not a client's;
+/// 3. the journal records exactly one accepted command for this work — the
+///    submit — so nothing in this test cranked the engine by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_client_crank() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    init_repo(repo.path());
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn()).stalls_until_released();
+
+    let handle = start_with_stub(data.path(), &stub).await;
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "settle me by yourself").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    // 1. The launch's own observation could not have been the settling one:
+    // the response is rendered after the crank parked, and the turn is still
+    // parked at the stub's release gate.
+    assert_eq!(
+        submitted["work"]["state"], "active",
+        "the turn must still be in flight at launch-settle, or this test is \
+         measuring the old already-finished-stub path: {submitted}"
+    );
+    assert_eq!(submitted["stage"]["stage_id"], "00-prepare");
+    assert_eq!(submitted["stage"]["status"], "active");
+
+    // 2. Let the turn end, and the daemon settles it with nothing but reads
+    // from here.
+    stub.release_turn();
+    let cascaded = poll_work_until(&http, &handle, &work_id, "the stage cascaded", |shown| {
+        shown["stage"]["index"].as_u64().unwrap_or(0) > 0
+    })
+    .await;
+    assert_eq!(cascaded["stage"]["stage_id"], "10-implement");
+    assert_eq!(cascaded["work"]["state"], "active");
+
+    // Wait for the cascade's launch to finish landing: `execution.started`
+    // is committed after the out-of-lock spawn returns, and the adapter's
+    // committer thread journals `conversation.user` from its own hold, so
+    // neither is guaranteed durable at the instant the work view shows the
+    // new stage. Turn 1's tail must have landed too: the reader marks the
+    // turn `Finished` in adapter memory *before* emitting
+    // `conversation.turn.ended`/`usage.updated`, so the driver can settle
+    // and cascade while those two are still in the committer channel — the
+    // quiet point requires all four markers. The cascaded turn itself is
+    // parked at the (unreleased) gate and cannot emit a byte, and the
+    // committer channel is FIFO, so nothing of turn 1's can trail past its
+    // own `usage.updated`.
+    let deadline = Instant::now() + SETTLE_BUDGET;
+    let events = loop {
+        let events = events_over_api(&http, &handle, &work_id).await;
+        let cascade_started = events.iter().any(|e| {
+            e.kind == "execution.started" && e.payload["execution"]["stage_id"] == "10-implement"
+        });
+        let user_turns = events
+            .iter()
+            .filter(|e| e.kind == "conversation.user")
+            .count();
+        let turn_tail_landed = events.iter().any(|e| e.kind == "conversation.turn.ended")
+            && events.iter().any(|e| e.kind == "usage.updated");
+        if cascade_started && user_turns >= 2 && turn_tail_landed {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cascade's launch never finished landing in the journal: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        kinds.contains(&"conversation.turn.ended"),
+        "the turn really ran: {kinds:?}"
+    );
+    // TH-5 (BS2 test-honesty finding): the driver's own docs promise a poll
+    // that finds a turn still `Running` journals nothing — only `contains`
+    // assertions existed to check that, which a driver appending one event
+    // per tick would still satisfy. The sharp check is the quiet window: the
+    // cascaded turn stays parked at the gate while the driver polls its
+    // `Running` execution at the 200ms default cadence, so holding the
+    // window open for ~5 ticks and re-reading must find the journal exactly
+    // as long as before — a per-tick leak grows it every tick, and load only
+    // adds ticks, never hides them (BS2R2-01).
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let after_quiet = events_over_api(&http, &handle, &work_id).await;
+    assert_eq!(
+        events.len(),
+        after_quiet.len(),
+        "the completion driver polled a `Running` execution across the quiet \
+         window and must journal nothing for it: {:?}",
+        after_quiet.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    // Coarse trajectory sanity on top of the sharp check above.
+    assert!(
+        events.len() < 25,
+        "the completion driver's poll cadence must not enter the trajectory \
+         as noise — got {} events for one settled turn and one cascade: \
+         {kinds:?}",
+        events.len()
+    );
+    let completed: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == "stage.completed" && e.payload["stage_id"] == "00-prepare")
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly once: a settled turn completes its stage one time, and a \
+         second observation of it must find itself stale (§14.5): {kinds:?}"
+    );
+    // The cascade launched: stage 1 has its own execution, so the driver drove
+    // the crank all the way through the next stage's launch rather than
+    // journaling a transition nothing acts on.
+    let second_launch = stub.wait_for_launches(2);
+    assert_eq!(
+        second_launch.len(),
+        2,
+        "the next stage's turn must have been launched by the daemon"
+    );
+
+    // 3. Nothing here cranked the engine by hand.
+    assert_eq!(
+        client_mutations(&events),
+        vec!["command.accepted:work.submit".to_string()],
+        "the only client mutation in this run is the submit itself"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Issue #46, Run B attempt 1: a turn that dies **without a result envelope**
+/// after launch-settle lands the stage `blocked`, with the CLI's stderr in the
+/// evidence, inside the same no-client-crank bound.
+///
+/// This is the fail-closed half, and it is the half a poll could most easily
+/// get wrong: `observe_in_memory` classifies an envelope-less finished turn as
+/// `native: Unknown` with the stderr in its evidence, and §25's rule is that
+/// Unknown blocks. Live, nothing ever asked, so the stage sat `active` for
+/// 34m58s over a CLI that had already refused to start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    init_repo(repo.path());
+    // Attempt 1's verbatim refusal, from `docs/gauntlet/runs/runB/run-manifest.md`.
+    let refusal = "--dangerously-skip-permissions cannot be used with root/sudo privileges for \
+         security reasons\n";
+    let stub = StubClaude::passing(data.path());
+    // No replay file at all: the CLI refused before it wrote a byte of
+    // stream-json, which is why attempt 1's `conversation.turn.ended` carried
+    // `raw: null` and `result_envelope: false`.
+    stub.stalls_until_released()
+        .writes_stderr(refusal)
+        .exits_with(1);
+
+    let handle = start_with_stub(data.path(), &stub).await;
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "refuse me by yourself").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    assert_eq!(
+        submitted["work"]["state"], "active",
+        "the refusal must land after launch-settle: {submitted}"
+    );
+    stub.release_turn();
+
+    let blocked = poll_work_until(&http, &handle, &work_id, "the stage blocked", |shown| {
+        shown["work"]["state"] == "blocked"
+    })
+    .await;
+    assert_eq!(blocked["stage"]["stage_id"], "00-prepare");
+    assert_eq!(blocked["stage"]["status"], "blocked");
+
+    let events = events_over_api(&http, &handle, &work_id).await;
+    let evidence: String = events
+        .iter()
+        .filter(|e| e.kind == "work.blocked" || e.kind == "stage.blocked")
+        .map(|e| e.payload.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        evidence.contains("without a result envelope"),
+        "the block must say what the adapter could not classify: {evidence}"
+    );
+    assert!(
+        evidence.contains("root/sudo privileges"),
+        "the CLI's own stderr is the evidence an operator acts on, and it must \
+         reach the journal: {evidence}"
+    );
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        !kinds.contains(&"stage.completed"),
+        "an unclassifiable turn must never complete a stage: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"work.failed"),
+        "ambiguity blocks (retryable); it does not fail: {kinds:?}"
+    );
+    assert_eq!(
+        client_mutations(&events),
+        vec!["command.accepted:work.submit".to_string()],
+        "the only client mutation in this run is the submit itself"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Issue #46's crash window (L6, §22.5's style over an engine-produced
+/// prefix): the daemon dies after `conversation.turn.ended` is journaled and
+/// **before** the completion driver settles it — the outcome exists only in
+/// the dead daemon's memory. Restart must re-derive, never leave the work
+/// `active` forever.
+///
+/// The window is held open rather than raced for: the first daemon's
+/// completion driver is given an hour's cadence, so its first tick provably
+/// never arrives and the journal reaches exactly the prefix a crash in that
+/// instant leaves — `execution.started`, the turn's normalized events,
+/// `conversation.turn.ended`, `usage.updated`, and no stage transition. The
+/// test asserts that prefix before restarting, which is what makes the second
+/// half a statement about recovery and not about timing.
+///
+/// One fidelity note, stated rather than papered over: the first daemon is
+/// stopped through its own shutdown path, not SIGKILLed, so the journal also
+/// carries a `daemon.stopped` a real crash would not have written. Nothing in
+/// reconciliation reads that event — it reconciles work believed in flight —
+/// and the property under test is identical either way, because what dies with
+/// the daemon is the adapter's in-memory `TurnState`, which was never durable.
+///
+/// §25's ladder then does the work: the second daemon's adapter has no memory
+/// of this execution, the session's transcript is on disk, no turn process is
+/// alive, so the conversation is re-adopted and the work fails closed to
+/// `blocked` with resumable evidence — retryable, never silently failed, and
+/// above all never still `active`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    let home = TempDir::new().expect("claude home");
+    init_repo(repo.path());
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn()).stalls_until_released();
+
+    // An hour's cadence: the first tick never arrives, so the window between
+    // the turn ending and the daemon settling it stays open for the whole run.
+    let handle = start_with_stub_polling(data.path(), &stub, Duration::from_secs(3600)).await;
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "crash on me").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    // The submit's response is in hand, so launch-settle has taken its
+    // observation of an in-flight turn; now let the turn end.
+    stub.release_turn();
+
+    // Stand inside the window: the turn has ended and been journaled, and
+    // nothing has acted on it.
+    let deadline = Instant::now() + SETTLE_BUDGET;
+    let ended = loop {
+        let events = events_over_api(&http, &handle, &work_id).await;
+        if events.iter().any(|e| e.kind == "conversation.turn.ended") {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stub's turn never ended: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let kinds: Vec<&str> = ended.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        !kinds.contains(&"stage.completed") && !kinds.contains(&"stage.blocked"),
+        "the crash window requires an unsettled turn end; this daemon settled \
+         it first, so the test proves nothing: {kinds:?}"
+    );
+    let stalled = show_over_api(&http, &handle, &work_id).await;
+    assert_eq!(
+        stalled["work"]["state"], "active",
+        "this *is* Run B's stall, induced on purpose: {stalled}"
+    );
+    let session_id = stalled["execution"]["native_id"]
+        .as_str()
+        .expect("the execution names its conversation")
+        .to_string();
+
+    handle.shutdown().await;
+
+    // The world the crash left: the conversation's durable transcript, and no
+    // turn process. (`~/.claude` is the CLI's, not sergeant's; the stub does
+    // not write one, so the restart's evidence is fabricated exactly as
+    // acceptance 4a fabricates it.)
+    let project = home.path().join("projects").join("-work-surface");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
+
+    let mut claude = ClaudeConfig::new(data.path());
+    claude.executable = stub.path.clone();
+    claude.claude_home = Some(home.path().to_path_buf());
+    let restarted = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new()),
+            default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
+            claude: Some(claude),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("restart");
+
+    let after = show_over_api(&http, &restarted, &work_id).await;
+    assert_ne!(
+        after["work"]["state"], "active",
+        "a work whose turn ended into a dead daemon's memory must never come \
+         back `active` — that is the 45-minute stall with a restart in the \
+         middle of it: {after}"
+    );
+    assert_eq!(
+        after["work"]["state"], "blocked",
+        "§25's ladder: resumable conversation, unknown turn outcome → blocked \
+         with the evidence, retryable: {after}"
+    );
+    let events = events_over_api(&http, &restarted, &work_id).await;
+    let blocked = events
+        .iter()
+        .find(|e| e.kind == "work.blocked")
+        .expect("work.blocked");
+    let reason = blocked.payload["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("resumable"),
+        "the operator must be told the conversation survived: {reason}"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == "work.failed"),
+        "never silently failed"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == "stage.completed"),
+        "and never completed from evidence the daemon does not have"
+    );
+
+    restarted.shutdown().await;
+}
+
+/// INV-1 (BS2, issue #46's second seam): a real turn resumed by `respond`
+/// that finishes **after** its own SEND-settle completes its stage and
+/// cascades into the next one, with no client call after the answer.
+///
+/// Before this fix, `Engine::begin_input` never re-armed the stage record's
+/// status — it stayed `NeedsInput` across the whole resumed turn — so
+/// `due_observations` (which requires `StageStatus::Active`) permanently
+/// skipped the run and the answered turn's own completion was never
+/// observed by anything. This is the exact shape one seam over from
+/// [`a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_client_crank`]:
+/// the launch path was fixed there; this is the respond path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_crank() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    init_repo(repo.path());
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
+        .stalls_until_released();
+
+    let handle = start_with_stub(data.path(), &stub).await;
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "ask me first").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    // The submit's response is in hand, so launch-settle already observed the
+    // asking turn in flight; release it so the driver can park the ask.
+    stub.release_turn();
+
+    // 1. The actor's question parks the work — settled by the completion
+    // driver, not by launch-settle (the stub was gated across the launch).
+    let parked = poll_work_until(
+        &http,
+        &handle,
+        &work_id,
+        "the actor's question parked it",
+        |shown| shown["work"]["state"] == "needs_input",
+    )
+    .await;
+    assert_eq!(parked["stage"]["stage_id"], "00-prepare");
+    assert_eq!(parked["stage"]["status"], "needs_input");
+    assert_eq!(parked["stage"]["detail"], "postgres or sqlite?");
+
+    // Swap the stub's script for the *next* invocation only: a clean,
+    // no-ask completion, so the resumed turn — like every real turn — ends
+    // well after this respond's own settle has returned.
+    stub.replays(&recorded_turn());
+
+    // 2. Answer it. The response must reflect the delivery's own settle
+    // (stage live again, same stage, same work still active) — not the
+    // resumed turn's eventual outcome, which the stub has not even started
+    // emitting yet (it is parked at the release gate, re-armed because the
+    // release is consumed per turn).
+    let responded = respond_over_api(&http, &handle, &work_id, "postgres").await;
+    assert_eq!(
+        responded["work"]["state"], "active",
+        "answering resumes the work immediately, regardless of how long the \
+         resumed turn itself takes: {responded}"
+    );
+    assert_eq!(responded["stage"]["stage_id"], "00-prepare");
+    assert_eq!(
+        responded["stage"]["status"], "active",
+        "the stage must be live again right after the answer settles, or the \
+         completion driver has nothing to poll (INV-1): {responded}"
+    );
+
+    // 3. Let the resumed turn end, and the daemon settles it on its own,
+    // with nothing but reads from here.
+    stub.release_turn();
+    let cascaded = poll_work_until(
+        &http,
+        &handle,
+        &work_id,
+        "the resumed turn's stage cascaded",
+        |shown| shown["stage"]["index"].as_u64().unwrap_or(0) > 0,
+    )
+    .await;
+    assert_eq!(cascaded["stage"]["stage_id"], "10-implement");
+    assert_eq!(cascaded["work"]["state"], "active");
+
+    let events = events_over_api(&http, &handle, &work_id).await;
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        kinds
+            .iter()
+            .filter(|k| **k == "conversation.turn.ended")
+            .count()
+            >= 2,
+        "both the asking turn and the resumed one must have really run: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"stage.resumed"),
+        "the durable marker that re-armed the stage for the driver must be \
+         in the journal: {kinds:?}"
+    );
+    // TH-5's bound (see the sibling launch-path test), sized up for the two
+    // stalled turns this run drives instead of one.
+    assert!(
+        events.len() < 40,
+        "the completion driver's poll cadence must not enter the trajectory \
+         as noise — got {} events for two settled turns and one cascade: \
+         {kinds:?}",
+        events.len()
+    );
+    let completed: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == "stage.completed" && e.payload["stage_id"] == "00-prepare")
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly once, from the resumed turn's own settle: {kinds:?}"
+    );
+    let started_for_prepare: Vec<&Event> = events
+        .iter()
+        .filter(|e| {
+            e.kind == "execution.started" && e.payload["execution"]["stage_id"] == "00-prepare"
+        })
+        .collect();
+    assert_eq!(
+        started_for_prepare.len(),
+        1,
+        "answering an ask continues the same execution; it must not start a \
+         second one for the same stage: {kinds:?}"
+    );
+    // Three launches total: the ask, the resumed turn, and the next stage's.
+    let launches = stub.wait_for_launches(3);
+    assert_eq!(
+        launches.len(),
+        3,
+        "the next stage's turn must have been launched by the daemon"
+    );
+
+    // 4. The only client mutations in this whole run are the submit and the
+    // one answer — the cascade itself is the driver's.
+    assert_eq!(
+        client_mutations(&events),
+        vec![
+            "command.accepted:work.submit".to_string(),
+            "command.accepted:work.respond".to_string(),
+        ],
+        "nothing else here cranked the engine by hand"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Outcome 3 / L6, the respond-path sibling of
+/// [`a_crash_after_the_turn_ended_is_re_derived_at_restart`]: the daemon
+/// dies while a *resumed* turn is still running, before either the turn
+/// ends or the completion driver could settle it. Restart must re-derive
+/// the outcome, never leave the work stuck `active` forever — the same
+/// ladder, one seam over.
+///
+/// **Why this window is stood in differently from its launch-path sibling.**
+/// That test holds the window open with an hour's driver cadence, which
+/// works because the *first* observation (launch-settle's own, synchronous)
+/// already needs nothing from the driver. Here the same trick would also
+/// starve the ask itself — the ask's own turn outlives launch-settle just
+/// as every real turn does, and reaching `needs_input` at all requires the
+/// driver to actually run. So this test runs the driver at its normal
+/// cadence to reach `needs_input` and deliver the answer, then shuts the
+/// daemon down **immediately** after `respond` returns: the resumed turn is
+/// parked at the stub's release gate, which this test never opens, so the
+/// resumed turn cannot emit a byte — never mind end, never mind be settled —
+/// before the gate's ~20 s self-release, an order of magnitude past the
+/// daemon's own 5 s shutdown grace. (An earlier version leaned on a fixed
+/// 2 s stall outlasting respond→shutdown, which a loaded runner plus a
+/// driver settle inside the shutdown grace could beat — BS2R-08.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    let home = TempDir::new().expect("claude home");
+    init_repo(repo.path());
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
+        .stalls_until_released();
+
+    let handle = start_with_stub(data.path(), &stub).await;
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "crash me during a respond").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    stub.release_turn();
+
+    poll_work_until(
+        &http,
+        &handle,
+        &work_id,
+        "the actor's question parked it",
+        |shown| shown["work"]["state"] == "needs_input",
+    )
+    .await;
+
+    // The resumed turn parks at the release gate — the same fixture, still
+    // armed, and its one-shot release was consumed by the asking turn.
+    // Nothing ever opens it again, so the resumed turn cannot emit a byte
+    // before the shutdown below finishes: the window is held open by
+    // construction, not by outrunning a sleep.
+    let responded = respond_over_api(&http, &handle, &work_id, "postgres").await;
+    assert_eq!(
+        responded["stage"]["status"], "active",
+        "the answer must settle immediately, well before the resumed turn \
+         itself finishes: {responded}"
+    );
+    let native_id_before = responded["execution"]["native_id"]
+        .as_str()
+        .expect("the execution names its conversation")
+        .to_string();
+
+    handle.shutdown().await;
+
+    let events: Vec<Event> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.work_id.as_deref() == Some(work_id.as_str()))
+        .collect();
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "conversation.turn.ended")
+            .count(),
+        1,
+        "only the asking turn may have ended — the resumed one must not \
+         have, or this test proves nothing about a crash *during* it: {kinds:?}"
+    );
+    assert!(
+        !kinds.contains(&"stage.completed") && !kinds.contains(&"stage.blocked"),
+        "and certainly nothing settled it: {kinds:?}"
+    );
+    let session_id = native_id_before;
+
+    let project = home.path().join("projects").join("-work-surface");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
+
+    let mut claude = ClaudeConfig::new(data.path());
+    claude.executable = stub.path.clone();
+    claude.claude_home = Some(home.path().to_path_buf());
+    let restarted = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new()),
+            default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
+            claude: Some(claude),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("restart");
+
+    let after = show_over_api(&http, &restarted, &work_id).await;
+    assert_ne!(
+        after["work"]["state"], "active",
+        "a resumed turn that ended into a dead daemon's memory must never \
+         come back `active`: {after}"
+    );
+    assert_eq!(
+        after["work"]["state"], "blocked",
+        "§25's ladder: resumable conversation, unknown turn outcome → \
+         blocked with the evidence, retryable: {after}"
+    );
+    let events = events_over_api(&http, &restarted, &work_id).await;
+    assert!(
+        !events.iter().any(|e| e.kind == "work.failed"),
+        "never silently failed"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind == "stage.completed"),
+        "and never completed from evidence the daemon does not have"
+    );
+
+    restarted.shutdown().await;
+}
+
 /// The capability/version probe is *recorded at backend registration* (M4
 /// contract), not only surfaced inside a later refusal: the daemon journals
 /// one `backend.probed` event per registered backend, carrying what the
@@ -1214,8 +2141,9 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
     );
     assert_eq!(first.value_of("--model"), Some("haiku"));
     assert!(
-        first.has("--dangerously-skip-permissions"),
-        "the no-profile default (L2's production default): {:?}",
+        !first.has("--dangerously-skip-permissions") && !first.has("--permission-mode"),
+        "the no-profile default (#47): no permission flag at all — the CLI's \
+         own unflagged default, never a silent --dangerously-skip-permissions: {:?}",
         first.argv
     );
     assert_eq!(
@@ -1301,6 +2229,94 @@ fn a_profile_is_launch_configuration_carried_to_the_claude_adapter() {
         launch.argv
     );
     assert_eq!(launch.env["CLAUDE_CONFIG_DIR"], "/tmp/claude-work-home");
+}
+
+/// #47: `bypassPermissions` only ever reaches argv when a profile names it
+/// explicitly, and when it does it rides `--permission-mode` — never the
+/// old unconditional `--dangerously-skip-permissions`.
+#[test]
+fn bypass_permissions_requires_explicit_profile_opt_in() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-bypass", dir.path(), "explicit opt-in", None);
+    request.profile = Some(Profile {
+        name: "yolo".to_string(),
+        backend: CLAUDE_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: [(
+            "permission_mode".to_string(),
+            "bypassPermissions".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(1);
+    let launch = &launches[0];
+    assert_eq!(
+        launch.value_of("--permission-mode"),
+        Some("bypassPermissions"),
+        "explicit opt-in rides --permission-mode: {:?}",
+        launch.argv
+    );
+    assert!(
+        !launch.has("--dangerously-skip-permissions"),
+        "the retired flag must never reappear: {:?}",
+        launch.argv
+    );
+}
+
+/// #47: an unrecognized `permission_mode` is refused at the launch boundary
+/// too (defense in depth alongside the profile-load check in
+/// `domain::workspace`), for a `Profile` built directly rather than parsed
+/// from a `sergeant.toml` — the shape every test in this file (and any
+/// future non-file caller) uses.
+#[test]
+fn an_unknown_permission_mode_fails_closed_at_launch_rather_than_reaching_argv() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-bad-mode", dir.path(), "typo'd mode", None);
+    request.profile = Some(Profile {
+        name: "typo".to_string(),
+        backend: CLAUDE_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: [("permission_mode".to_string(), "yolo".to_string())]
+            .into_iter()
+            .collect(),
+    });
+    let err = backend
+        .start(&request)
+        .expect_err("an unknown mode must be refused");
+    assert!(
+        err.to_string().contains("yolo"),
+        "the diagnostic must name the offending value: {err}"
+    );
+    assert!(
+        stub.launches().is_empty(),
+        "a doomed launch must not spawn the CLI at all: {:?}",
+        stub.launches()
+    );
+    assert!(
+        backend.tracked_executions().is_empty(),
+        "a refused launch must leave no phantom execution: {:?}",
+        backend.tracked_executions()
+    );
 }
 
 /// RESUME re-adopts a conversation with the launch configuration the caller
@@ -4275,6 +5291,12 @@ fn drain(engine: &Engine, core: &mut Core, step: Step) {
                     .settle_surface(core, pending, outcome)
                     .expect("settle surface");
             }
+            Next::Observe(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_observe(core, pending, outcome)
+                    .expect("settle observe");
+            }
         }
     }
 }
@@ -4295,6 +5317,12 @@ fn advance_to_launch(engine: &Engine, core: &mut Core, step: Step) -> Box<Pendin
                 step = engine
                     .settle_send(core, pending, outcome)
                     .expect("settle send");
+            }
+            Next::Observe(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_observe(core, pending, outcome)
+                    .expect("settle observe");
             }
             Next::Parked => panic!("the crank parked before it reached a launch"),
         }
@@ -5094,8 +6122,27 @@ fn n27_the_ask_claim_is_withdrawn_when_the_stream_stops_carrying_its_evidence() 
 /// L8's rule is that an advertised verb without a contract test against the
 /// installed harness is an unmeasured claim. This is that test for `ask`: one
 /// haiku turn told it cannot proceed without a decision, driven through the
-/// real adapter, must come back as `NeedsInput` authored by the actor — not as
-/// a completed stage whose summary happens to end in a question mark.
+/// real adapter.
+///
+/// **Probe-gated per disposition 2**
+/// (`docs/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md`):
+/// the ask affordance (`system/post_turn_summary`) was measured present on
+/// 2.1.226 in the cloud container and measured **absent** on this host/
+/// account's 2.1.227 — conditional on something outside the version string
+/// (account/server-side gating, not isolated). Guessing either shape from the
+/// version would be exactly what L1 forbids, so this test reads its own
+/// driven turn's evidence instead of assuming:
+///
+/// - the transcript carried `post_turn_summary` → the 2.1.226 contract
+///   applies: assert the `NeedsInput` mapping.
+/// - the transcript carried none → the adapter's own runtime withdrawal path
+///   (INV-N3-06) is what should have fired instead: assert
+///   `Capabilities::ask` lowered and `conversation.turn.grammar_unmeasured`
+///   journaled, and skip the mapping assertion loudly (`SKIPPED-ENV`) rather
+///   than silently.
+///
+/// Both arms are measured claims about *this run's* transcript; neither
+/// guesses.
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored"]
 fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
@@ -5107,6 +6154,16 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
     let mut config = ClaudeConfig::new(data.path());
     config.env.insert("IS_SANDBOX".to_string(), "1".to_string());
     let backend = ClaudeBackend::new(config);
+
+    // A sink to read the adapter's own evidence about which arm fired,
+    // rather than inferring it from the signal alone: the withdrawal event
+    // is the measured fact this test discriminates on (disposition 2).
+    let emitted: Arc<std::sync::Mutex<Vec<EventDraft>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&emitted);
+    backend.set_event_sink(Arc::new(move |draft| {
+        sink_events.lock().expect("sink lock").push(draft);
+    }));
 
     let request = StartRequest {
         work_id: "01N3LIVEASK".to_string(),
@@ -5134,6 +6191,66 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
     };
     backend.stop(&handle).expect("stop").wait();
 
+    let withdrawn: Vec<EventDraft> = emitted
+        .lock()
+        .expect("sink lock")
+        .iter()
+        .filter(|e| e.kind == "conversation.turn.grammar_unmeasured")
+        .cloned()
+        .collect();
+
+    if !withdrawn.is_empty() {
+        // Disposition 2, arm 2: no post_turn_summary line in this driven
+        // turn's transcript — the withdrawal is the measured, correct
+        // behavior here, not a defect and not evidence the NeedsInput
+        // mapping still holds on this host/account.
+        eprintln!(
+            "SKIPPED-ENV: a5's NeedsInput-mapping assertion — this host/account's claude CLI \
+             emitted no post_turn_summary line for this driven turn (see \
+             docs/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md); the \
+             adapter's runtime withdrawal path fired instead, which is what this arm asserts."
+        );
+        assert_eq!(
+            withdrawn.len(),
+            1,
+            "the withdrawal is journaled once, not once per turn: {withdrawn:?}"
+        );
+        assert_eq!(withdrawn[0].payload["capability"], "ask");
+        assert!(
+            !backend.capabilities().ask,
+            "a capability whose evidence is absent must not stay advertised (L1, L8): {:?}",
+            backend.capabilities()
+        );
+        // Round-2 finding TH-R2-02: everything checked above is entailed by
+        // the branch condition itself (one AtomicBool feeds both the
+        // withdrawal emission and `capabilities().ask`), so this arm was not
+        // actually falsifiable against a parser regression — if the adapter
+        // stopped *recognising* a `post_turn_summary` line that was really
+        // there, this arm would still pass and print SKIPPED-ENV instead of
+        // failing. Fetch the archived transcript independently, the same way
+        // `bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mode`
+        // verifies its own claim against the raw bytes rather than the
+        // adapter's classification of them, and assert the line really is
+        // absent.
+        let raw_ref = withdrawn[0].payload["raw"]
+            .as_str()
+            .expect("the withdrawal carries the raw blob ref it withdrew over");
+        let store = BlobStore::open(data.path()).expect("blob store");
+        let blob = store
+            .get(&BlobRef::from_str(raw_ref).expect("valid ref"))
+            .expect("the transcript this withdrawal cites must be archived");
+        let text = String::from_utf8_lossy(&blob);
+        assert!(
+            !text.contains("post_turn_summary"),
+            "the adapter withdrew `ask` claiming no post_turn_summary line, but the \
+             archived transcript it cited contains one — this is the parser regression \
+             this arm exists to catch, not an environment fact: {text}"
+        );
+        return;
+    }
+
+    // Disposition 2, arm 1: the line was there — the 2.1.226 contract
+    // applies to this run.
     match &observation.signal {
         BackendSignal::NeedsInput { prompt, asked_by } => {
             assert_eq!(
@@ -5148,12 +6265,107 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
             eprintln!("measured actor ask: {prompt}");
         }
         other => panic!(
-            "2.1.226 no longer maps an end-of-turn question to needs_input: {other:?} \
-             (evidence: {:?}). Re-measure and, if the affordance is gone, lower \
-             Capabilities::ask to false rather than guessing from prose (L1/L8).",
+            "post_turn_summary was present in this turn's transcript, so the 2.1.226 \
+             mapping must apply, but it did not: {other:?} (evidence: {:?}). Re-measure \
+             (L1/L8).",
             observation.evidence
         ),
     }
+}
+
+/// #47, opt-in, spends real tokens: what a *default*-mode headless turn can
+/// and cannot do, measured rather than assumed (L1). One haiku turn, no
+/// profile — so no `--permission-mode` flag reaches argv at all, #47's new
+/// default — told to write a file.
+///
+/// **Measured 2026-08-11 on Cerberus (claude 2.1.227, uid 1001, no
+/// `IS_SANDBOX` set — irrelevant to this path since no permission flag is
+/// sent):** a `Write` tool use under the bare default is refused —
+/// `system/permission_denied` on stdout, the tool result comes back
+/// `is_error:true` — and the turn still ends cleanly (`native: Exited`,
+/// no hang on an interactive prompt headless mode has no TTY to answer).
+/// Pinned here so a CLI or account change that starts silently granting
+/// writes under the unflagged default — a security regression, not a
+/// feature — fails this test rather than going unnoticed.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored"]
+fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mode() {
+    if !claude_live_enabled(
+        "bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mode",
+    ) {
+        return;
+    }
+    let data = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    // Deliberately the bare adapter config: no profile at all, so #47's
+    // default applies — no --permission-mode flag on the launch.
+    let backend = ClaudeBackend::new(ClaudeConfig::new(data.path()));
+    let shared = Arc::new(tokio::sync::Mutex::new(core(data.path())));
+    backend.set_event_sink(journaling_sink(shared.clone()));
+
+    let request = StartRequest {
+        work_id: "01BS2DEFAULTMODE".to_string(),
+        execution_id: ulid(),
+        stage_id: "00-default-mode".to_string(),
+        attempt: 1,
+        cwd: cwd.path().to_path_buf(),
+        intent: "Write a marker file.".to_string(),
+        context: "Create a file named ok.txt in the current directory containing exactly OK \
+                  and nothing else. Then stop; do not do anything else."
+            .to_string(),
+        model: Some("claude-haiku-4-5-20251001".to_string()),
+        profile: None,
+    };
+    let handle = backend.start(&request).expect("start");
+    let observation = wait_settled(&backend, &handle, Duration::from_secs(180));
+
+    assert_eq!(
+        observation.native,
+        NativeState::Exited,
+        "a denied write must still end the turn cleanly, not hang on an unanswerable \
+         interactive prompt: {observation:?}"
+    );
+    assert!(
+        !cwd.path().join("ok.txt").exists(),
+        "the bare default must not grant a write with no --permission-mode flag \
+         (measured consequence, #47): {:?}",
+        std::fs::read_dir(cwd.path())
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+
+    // The archived raw transcript is the adapter's own evidence for the
+    // denial, not just this test's absence-of-file inference.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let usage = loop {
+        let found = {
+            let core = shared.blocking_lock();
+            all_events(&core).into_iter().find(|e| {
+                e.execution_id.as_deref() == Some(request.execution_id.as_str())
+                    && e.kind == "usage.updated"
+            })
+        };
+        if let Some(event) = found {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "usage.updated was never journaled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let raw_ref = usage.payload["raw"]
+        .as_str()
+        .expect("raw blob ref journaled");
+    let store = BlobStore::open(data.path()).expect("blob store");
+    let blob = store
+        .get(&BlobRef::from_str(raw_ref).expect("valid ref"))
+        .expect("raw transcript archived");
+    let text = String::from_utf8_lossy(&blob);
+    assert!(
+        text.contains("permission_denied"),
+        "the measured default-mode consequence is a permission refusal, not a silent \
+         grant: {text}"
+    );
 }
 
 // ------------------------- §22.5. the crash-injection matrix (issue #20)
@@ -5928,6 +7140,389 @@ fn n24_a_launch_for_a_superseded_attempt_does_not_advance_the_current_one() {
     );
 }
 
+// ------------------- §14.5 for OBSERVE: the completion driver's clauses
+//
+// Issue #46 gave the engine a caller nothing else has: a settle that no
+// request asked for. Its observation is taken with the lock open, exactly like
+// a launch's, so §14.5 binds it exactly as it binds `settle_launch` — and,
+// unlike a launch's, it can arrive *repeatedly* for one finished turn, because
+// a cadence keeps asking. `observation_is_stale` is what stands between that
+// and a double-completed stage, a resurrected cancel, or an advanced wrong
+// attempt; these three drive each of those through the journal, exactly as a
+// concurrent request would have left it.
+//
+// The shape is the same in all three: park a run `active` with a live
+// execution (a hanging fake), take the observation the driver would take,
+// finish the turn underneath it, then move durable state on before settling.
+
+/// Park `work_id` on stage `00-only` with a live, hanging execution — the
+/// state a real run sits in while its turn is still going — and return the
+/// observation the completion driver would take of it.
+fn park_with_a_live_turn(
+    engine: &Engine,
+    core: &mut Core,
+    work_id: &str,
+) -> Box<sergeant_rs::runtime::engine::PendingObserve> {
+    let step = engine.begin_retry(core, work_id).expect("begin retry");
+    let pending = advance_to_launch(engine, core, step);
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(core, pending, outcome)
+        .expect("settle launch");
+    step.deferred.wait();
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Active,
+        "the run must be active with a turn in flight, or these tests are \
+         asserting nothing"
+    );
+    let mut due = engine.due_observations(core);
+    assert_eq!(
+        due.len(),
+        1,
+        "a run with a live execution is due an observation: {due:?}"
+    );
+    due.remove(0)
+}
+
+/// §14.5 for OBSERVE, clause by clause: a late observation is subordinate to
+/// **every** kind of superseding decision, not just the one the happy path
+/// happens to produce.
+///
+/// `observation_is_stale` has five clauses and, probed one at a time, all five
+/// survived the suite (M8–M11, 2026-08-11) while only the stage clause was
+/// actually being exercised — the same N3-03/N3-04 shape `reservation_is_stale`
+/// was caught in, and the same answer: each superseding decision is driven
+/// through the journal in isolation, so that deleting *its* clause is what
+/// fails, rather than some other clause catching the case by accident.
+///
+/// Every row leaves the other four clauses satisfied. Each is a state the
+/// journal can hold: the first is a crash between `work.canceled` and the
+/// `stage.canceled` that follows it in `begin_retire_run`; the rest are the
+/// concurrent-decision shapes `n23`'s comment describes, which the next
+/// executor — a container whose completion arrives whenever it arrives — makes
+/// ordinary.
+///
+/// The uniform assertion is that the journal did not grow: a discarded
+/// observation performed no external effect, so it has no evidence to
+/// preserve, and a driver that journaled one per tick would write its own
+/// cadence into the trajectory.
+#[test]
+fn n28_a_late_observation_is_subordinate_to_every_superseding_decision() {
+    // (label, the decision that lands while the observation is outside the
+    // lock, the clause it must be caught by)
+    type Decision = fn(&mut Core, &str, &str);
+    let cases: [(&str, Decision); 5] = [
+        ("the work went terminal", |core, work_id, _current| {
+            commit(core, work_id, KIND_WORK_CANCELED, json!({"from": "active"}));
+        }),
+        (
+            "another execution became the run's",
+            |core, work_id, _current| {
+                commit(
+                    core,
+                    work_id,
+                    KIND_EXECUTION_STARTED,
+                    json!({"execution": {
+                        "execution_id": "01N3OBSSUPER",
+                        "backend": FAKE_BACKEND_NAME,
+                        "native_id": "fake-session-01N3OBSSUPER",
+                        "stage_id": "00-only",
+                        "attempt": 2,
+                        "stop_requested": false,
+                    }}),
+                );
+            },
+        ),
+        (
+            "the execution was asked to stop",
+            |core, work_id, current| {
+                commit(
+                    core,
+                    work_id,
+                    KIND_EXECUTION_STOPPED,
+                    json!({
+                        "execution_id": current,
+                        "backend": FAKE_BACKEND_NAME,
+                        "reason": "canceled",
+                        "outcome": {"requested": true},
+                    }),
+                );
+            },
+        ),
+        (
+            "a launch of this run is in flight",
+            |core, work_id, _current| {
+                commit(
+                    core,
+                    work_id,
+                    KIND_EXECUTION_RESERVED,
+                    json!({"reservation": {
+                        "execution_id": "01N3OBSRESERVED",
+                        "backend": FAKE_BACKEND_NAME,
+                        "native_id": "fake-session-01N3OBSRESERVED",
+                        "stage_id": "00-only",
+                        "index": 0,
+                        "attempt": 2,
+                        "stage_kind": "actor",
+                    }}),
+                );
+            },
+        ),
+        ("the stage left `active`", |core, work_id, _current| {
+            commit(
+                core,
+                work_id,
+                KIND_STAGE_CANCELED,
+                json!({"stage_id": "00-only", "detail": "work canceled"}),
+            );
+        }),
+    ];
+
+    for (label, supersede) in cases {
+        let data = TempDir::new().expect("tempdir");
+        let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+        let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+        let engine = Engine::new(Arc::new(registry), None, data.path());
+        let mut core = core(data.path());
+        let work_id = "01N3OBS145A";
+        journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+        let pending = park_with_a_live_turn(&engine, &mut core, work_id);
+        // The row above names the current execution by id where it has to; the
+        // engine allocated it, so read it back rather than guessing.
+        let current = pending.execution_id().to_string();
+        // The turn finishes while the observation is outside the lock…
+        fake.complete_live_executions();
+        let outcome = pending.perform();
+        // …and the superseding decision gets the lock first.
+        supersede(&mut core, work_id, &current);
+
+        let before = kinds_of(&core, work_id).len();
+        let step = engine
+            .settle_observe(&mut core, pending, outcome)
+            .expect("settle observe");
+        step.deferred.wait();
+
+        assert!(
+            events_of(&core, work_id, "stage.completed").is_empty(),
+            "{label}: a late observation must not complete the stage"
+        );
+        assert!(
+            events_of(&core, work_id, KIND_WORK_COMPLETED).is_empty(),
+            "{label}: and must certainly not complete the work"
+        );
+        assert_eq!(
+            kinds_of(&core, work_id).len(),
+            before,
+            "{label}: a discarded observation journals nothing: {:?}",
+            kinds_of(&core, work_id)
+        );
+    }
+}
+
+/// §14.5 for OBSERVE, clause 4: an observation of an attempt the run has moved
+/// past does not advance the current one.
+///
+/// `drive` completes whatever `current_stage()` says, so a late observation of
+/// attempt 2 would be journaled as attempt 3's completion — the same
+/// wrong-attempt failure `n24` pins on the launch side, reached here by a
+/// retry landing while the driver's observation was in flight.
+#[test]
+fn n29_an_observation_of_a_superseded_attempt_does_not_advance_the_current_one() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3OBS145B";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let pending = park_with_a_live_turn(&engine, &mut core, work_id);
+    fake.complete_live_executions();
+    let outcome = pending.perform();
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 3}),
+    );
+
+    let step = engine
+        .settle_observe(&mut core, pending, outcome)
+        .expect("settle observe");
+    step.deferred.wait();
+
+    assert!(
+        events_of(&core, work_id, "stage.completed").is_empty(),
+        "the wrong attempt is never advanced"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-only".to_string(), 3),
+        "and the current attempt is untouched"
+    );
+}
+
+/// §14.5 for OBSERVE, the clause only a *cadence* needs: two observations of
+/// one finished turn complete its stage exactly once.
+///
+/// A driver that keeps asking will see the same `Finished` turn on every tick
+/// until the run moves — the adapter's in-memory outcome does not evaporate
+/// when someone reads it — so "exactly once" cannot rest on the observation
+/// being unrepeatable. It rests on the settle: the first one moves durable
+/// state under the lock, and the second finds itself stale against it.
+#[test]
+fn n30_two_observations_of_one_finished_turn_complete_the_stage_once() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3OBS145C";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let first = park_with_a_live_turn(&engine, &mut core, work_id);
+    // Two ticks that overlap the same turn end: the second candidate is taken
+    // while the first settle has not yet run, which is the ordering a slow
+    // settle produces and the one a driver cannot rule out by construction.
+    let mut second_due = engine.due_observations(&core);
+    assert_eq!(second_due.len(), 1);
+    let second = second_due.remove(0);
+    fake.complete_live_executions();
+    let first_outcome = first.perform();
+    let second_outcome = second.perform();
+
+    let step = engine
+        .settle_observe(&mut core, first, first_outcome)
+        .expect("first settle");
+    drain(&engine, &mut core, step);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed,
+        "the first observation is the one that lands"
+    );
+
+    let step = engine
+        .settle_observe(&mut core, second, second_outcome)
+        .expect("second settle");
+    step.deferred.wait();
+
+    assert_eq!(
+        events_of(&core, work_id, "stage.completed").len(),
+        1,
+        "exactly once: {:?}",
+        kinds_of(&core, work_id)
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_WORK_COMPLETED).len(),
+        1,
+        "and one completion, not two: {:?}",
+        kinds_of(&core, work_id)
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(),
+        1,
+        "a second teardown would re-run git on a retired surface: {:?}",
+        kinds_of(&core, work_id)
+    );
+}
+
+/// The completion driver asks only about runs that could still be answered.
+///
+/// `due_observations` is an *enumeration*, and every clause in it is also
+/// re-checked by `observation_is_stale` at the settle — so deleting any of
+/// them leaves the suite green while changing something real: the driver would
+/// walk the daemon's whole history every 200 ms, taking an OBSERVE per
+/// terminal work forever, and taking one *underneath a launch that has not
+/// settled yet* — the one interleaving where two settles are racing for the
+/// same turn rather than one finding itself stale after the other.
+/// Mutation-probed: all four clauses survived the whole suite (M4–M7,
+/// 2026-08-11), which is L7's definition of unpinned.
+///
+/// The states below are all reachable, and three of them are crash residue
+/// rather than steady state — which is exactly why the filter cannot be
+/// "whatever the engine happens to produce on the happy path".
+#[test]
+fn n31_the_driver_only_asks_about_runs_that_could_still_be_answered() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+
+    // The one that is due: active work, active stage, a live execution.
+    journal_active_run(&mut core, "01N3DUELIVE", FAKE_BACKEND_NAME, "fake-live");
+
+    // Terminal work. Its execution record does not go away when it is
+    // canceled, so without the work-state clause this row is polled forever.
+    journal_active_run(&mut core, "01N3DUEGONE", FAKE_BACKEND_NAME, "fake-gone");
+    commit(
+        &mut core,
+        "01N3DUEGONE",
+        KIND_WORK_CANCELED,
+        json!({"from": "active"}),
+    );
+
+    // Crash residue: `stage.blocked` landed and `work.blocked` did not, so the
+    // work still reads `active` while its stage is parked on a decision. The
+    // stage is where the parked-ness lives, and the driver must read it.
+    journal_active_run(&mut core, "01N3DUEPARK", FAKE_BACKEND_NAME, "fake-park");
+    commit(
+        &mut core,
+        "01N3DUEPARK",
+        KIND_STAGE_BLOCKED,
+        json!({"stage_id": "00-only", "detail": "parked without its work event"}),
+    );
+
+    // Already asked to stop: the outcome of this execution is no longer the
+    // thing that decides the stage, and observing it would act on a turn
+    // sergeant has already retired.
+    journal_active_run(&mut core, "01N3DUESTOP", FAKE_BACKEND_NAME, "fake-stop");
+    commit(
+        &mut core,
+        "01N3DUESTOP",
+        KIND_EXECUTION_STOPPED,
+        json!({
+            "execution_id": "exec-01N3DUESTOP",
+            "backend": FAKE_BACKEND_NAME,
+            "reason": "stage completed",
+            "outcome": {"requested": true},
+        }),
+    );
+
+    // A launch in flight for this same stage attempt: `settle_launch` owns the
+    // observation of it and is about to take one. A second observer here is
+    // two settles racing for one turn instead of one being late.
+    journal_active_run(&mut core, "01N3DUELAUN", FAKE_BACKEND_NAME, "fake-laun");
+    commit(
+        &mut core,
+        "01N3DUELAUN",
+        KIND_EXECUTION_RESERVED,
+        json!({"reservation": {
+            "execution_id": "01N3DUELAUNSUPER",
+            "backend": FAKE_BACKEND_NAME,
+            "native_id": "fake-session-01N3DUELAUNSUPER",
+            "stage_id": "00-only",
+            "index": 0,
+            "attempt": 1,
+            "stage_kind": "actor",
+        }}),
+    );
+
+    let due: Vec<String> = engine
+        .due_observations(&core)
+        .iter()
+        .map(|p| p.work_id().to_string())
+        .collect();
+    assert_eq!(
+        due,
+        vec!["01N3DUELIVE".to_string()],
+        "only a run whose live execution nobody else is settling is due an \
+         observation"
+    );
+}
+
 /// §22.5 window 2 again, over a prefix the **engine actually produced**.
 ///
 /// N3-06: the eight window tests build their `execution.reserved` /
@@ -6108,4 +7703,181 @@ fn n27b_waiting_a_deferred_runs_each_completion_exactly_once() {
     // asserting, so a regression that double-fires is actually caught.
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+// ------------------------- §22.5 × #44. group commit's L6 obligation
+//
+// Group commit (issue #44) makes a whole authoritative lock hold share one
+// fsync. L6's question is what a crash does to the gaps that opens: between
+// two grouped appends, and after the group's last append but before its single
+// fsync. The answer this test establishes is a *subset* claim, not a
+// probability one —
+//
+//   per-append fsync guaranteed a floor (everything acknowledged is durable)
+//   but never a ceiling: the OS was always free to have written more, so the
+//   on-disk state after a crash was always "some byte prefix of what was
+//   written, possibly torn at the end". Group commit lowers the floor. It
+//   cannot widen that set, because the set was already every byte prefix.
+//
+// — and therefore no recovery obligation is new. Rather than argue it, the
+// test enumerates it: every byte offset a crash could stop at, over a
+// hand-built journal in the §22.5 fixture shape (see `journal_two_stage_prefix`
+// and the matrix above it), must reopen, replay, rebuild and reconcile into a
+// legal fail-closed state. `n26` keeps each *event's* payload honest against
+// what the engine actually writes; this keeps the *prefixes* honest.
+//
+// **What the six-event group is, and is not (round-2 finding TH-R2-01).** It
+// is a hand-built worst case, not the literal contents of any one production
+// hold: `submit_work`'s real first hold appends two events
+// (`work.submitted`, `surface.materializing`) and flushes; the settle hold
+// that follows appends five more (`surface.materialized`, `workflow.bound`,
+// `work.started`, `stage.entered`, `execution.reserved`, in that order —
+// note `surface.materialized` precedes `workflow.bound`, the reverse of this
+// fixture's order). This test's group instead concatenates a whole
+// `journal_two_stage_prefix` plus a bare `execution.reserved` into one
+// never-flushed hold specifically so the byte-prefix sweep below exercises a
+// group at least as large as anything group commit produces today — the
+// claim is a *bound*, not a *reproduction*. `n26` is what keeps each event's
+// own shape honest; nothing here claims the six ever land in one hold
+// together outside this fixture.
+
+/// Every prefix a crash inside one grouped lock hold can leave is a prefix the
+/// existing torn-tail/segment recovery already handles.
+///
+/// Guard map: the `open_group_len`/`fsync_count` assertions fail if `Core`
+/// stops grouping (per-append fsync restored) or if `commit` publishes early;
+/// the prefix loop fails if `recover_tail`'s quarantine, replay's seq
+/// validation, or `reconcile`'s fail-closed disposition stops covering a
+/// mid-group cut. Deleting `recover_tail`'s truncation, for instance, makes
+/// every mid-line offset a `Malformed` open and panics here.
+#[test]
+fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_handles() {
+    let source = TempDir::new().expect("tempdir");
+    let work_id = "01N3GRP";
+
+    // 1. Write a hand-built, worst-case-sized group — bigger than any single
+    //    production hold appends today (see the module comment above) — and
+    //    never close it: the state a crash mid-hold finds.
+    let bytes = {
+        let mut core = core(source.path());
+        journal_two_stage_prefix(&mut core, work_id, source.path());
+        commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_RESERVED,
+            reservation_payload("01N3GRPEXEC"),
+        );
+        assert_eq!(
+            core.open_group_len(),
+            6,
+            "six events appended under one hold: a hand-built bound at least \
+             as large as any group #44 actually produces (see the module \
+             comment above — no single production hold writes this exact set)"
+        );
+        assert_eq!(
+            core.journal.fsync_count(),
+            0,
+            "and not one of them has been fsynced yet — otherwise the \
+             prefixes enumerated below are not the ones a crash can produce"
+        );
+        std::fs::read(source.path().join("journal").join("00000001.ndjson"))
+            .expect("the group's bytes are on disk before any fsync")
+    };
+    assert!(
+        bytes.len() > 1000,
+        "a realistic group, not a toy: {}",
+        bytes.len()
+    );
+
+    // Where a complete line ends. A prefix cut at or past one of these
+    // recovers that many events; anything between two of them is a torn tail.
+    let line_ends: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+        .map(|(index, _)| index + 1)
+        .collect();
+    assert_eq!(line_ends.len(), 6, "six complete lines");
+
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, source.path());
+
+    let mut torn_prefixes = 0usize;
+    for cut in 0..=bytes.len() {
+        let dir = source.path().join(format!("crash-at-{cut}"));
+        std::fs::create_dir_all(dir.join("journal")).expect("journal dir");
+        std::fs::write(dir.join("journal").join("00000001.ndjson"), &bytes[..cut])
+            .expect("write the prefix a crash at this byte would leave");
+
+        // `Journal::open` is the recovery: quarantine a torn tail, truncate to
+        // the last complete line, replay-validate the chain. A panic here is
+        // the whole failure mode this test exists to exclude.
+        let mut core = core(&dir);
+
+        let complete = line_ends.iter().filter(|end| **end <= cut).count() as u64;
+        if complete < cut as u64 && !line_ends.contains(&cut) && cut > 0 {
+            torn_prefixes += 1;
+        }
+        let seqs: Vec<u64> = core
+            .journal
+            .replay()
+            .expect("replay a recovered prefix")
+            .map(|e| e.expect("no malformed line may survive recovery").seq)
+            .collect();
+        assert_eq!(
+            seqs,
+            (1..=complete).collect::<Vec<_>>(),
+            "a crash at byte {cut} must leave exactly the complete lines \
+             before it, in order — never a gap, never a fragment"
+        );
+
+        // And the daemon that comes back up must converge, fail-closed, on
+        // every one of them.
+        let report = recovery::reconcile(&engine, &mut core)
+            .expect("reconcile must converge on every reachable prefix");
+        let state = core.registry.state().works.get(work_id).map(|w| w.state);
+        match complete {
+            0 => assert!(state.is_none(), "no work exists before its first line"),
+            _ => assert!(
+                matches!(state, Some(WorkState::Pending) | Some(WorkState::Blocked)),
+                "a prefix of {complete} events must recover to a state the \
+                 journal proves, never an invented one: {state:?}"
+            ),
+        }
+        assert!(
+            report.resumed.is_empty(),
+            "nothing in this group is resumable evidence, so nothing may be \
+             resumed from a prefix of it (cut {cut})"
+        );
+        assert!(
+            fake.starts().is_empty(),
+            "no prefix may start an external effect (cut {cut})"
+        );
+        std::fs::remove_dir_all(&dir).expect("keep the fixture tree bounded");
+    }
+    assert!(
+        torn_prefixes > 0,
+        "the enumeration must actually include torn tails, not only clean \
+         line boundaries"
+    );
+
+    // The full group is byte-for-byte window 2's prefix, so the whole
+    // enumeration ends exactly where `n11` already stands: the identity is
+    // kept, the reservation is abandoned, nothing is started.
+    let dir = source.path().join("crash-at-none");
+    std::fs::create_dir_all(dir.join("journal")).expect("journal dir");
+    std::fs::write(dir.join("journal").join("00000001.ndjson"), &bytes).expect("write");
+    let mut core = core(&dir);
+    recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains("fake-session-01N3GRPEXEC"),
+        "the owned identity must survive a group that was never fsynced but \
+         was written whole: {evidence}"
+    );
 }

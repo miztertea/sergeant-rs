@@ -19,6 +19,7 @@
 //! credential layer by not having one, not by lint.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,134 @@ pub struct Profile {
     /// Backend-specific runtime options.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, String>,
+}
+
+/// The `permission_mode` option key inside [`Profile::options`] (#47).
+pub const PERMISSION_MODE_OPTION: &str = "permission_mode";
+
+/// The claude CLI's own `--permission-mode` vocabulary, as far as this
+/// adapter passes it through (§14, #47). Nothing here is invented: each
+/// variant is one value the CLI accepts for `--permission-mode`, plus
+/// [`PermissionMode::Default`] — an explicit way to ask for the CLI's own
+/// unflagged default, distinct from leaving the option unset.
+///
+/// This is a closed set on purpose. Passing an unrecognized string straight
+/// through to the CLI would trade a structured, load-time refusal for
+/// whatever the CLI itself does with a bad `--permission-mode` value — a
+/// harness-specific and unmeasured failure mode. Refusing here, at profile
+/// load, means the CLI's own argument parser never has to be the thing that
+/// catches a typo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    /// No `--permission-mode` flag at all — the CLI's own default, chosen
+    /// explicitly rather than left unspecified.
+    Default,
+    /// `--permission-mode acceptEdits`.
+    AcceptEdits,
+    /// `--permission-mode bypassPermissions`. Never the adapter's own
+    /// default — a profile must name this explicitly (#47).
+    BypassPermissions,
+    /// `--permission-mode dontAsk`.
+    DontAsk,
+    /// `--permission-mode plan`.
+    Plan,
+}
+
+impl PermissionMode {
+    /// Parse one of the five vocabulary strings, case-sensitive (the CLI's
+    /// own casing — `acceptEdits`, not `acceptedits` or `accept-edits`).
+    pub fn parse(raw: &str) -> Result<Self, UnknownPermissionMode> {
+        match raw {
+            "default" => Ok(Self::Default),
+            "acceptEdits" => Ok(Self::AcceptEdits),
+            "bypassPermissions" => Ok(Self::BypassPermissions),
+            "dontAsk" => Ok(Self::DontAsk),
+            "plan" => Ok(Self::Plan),
+            other => Err(UnknownPermissionMode {
+                value: other.to_string(),
+            }),
+        }
+    }
+
+    /// The CLI argv this mode contributes: nothing for [`Self::Default`]
+    /// (the CLI's own unflagged behavior), `--permission-mode <value>`
+    /// otherwise.
+    pub fn cli_args(self) -> Vec<String> {
+        match self {
+            Self::Default => Vec::new(),
+            other => vec![
+                "--permission-mode".to_string(),
+                other.as_cli_value().to_string(),
+            ],
+        }
+    }
+
+    /// The literal value this mode passes to `--permission-mode`, for
+    /// display (doctor, error messages) even though [`Self::Default`] never
+    /// reaches argv.
+    pub fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::BypassPermissions => "bypassPermissions",
+            Self::DontAsk => "dontAsk",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+/// The five values [`PermissionMode::parse`] accepts, for error messages.
+pub const PERMISSION_MODE_VALUES: &[&str] = &[
+    "default",
+    "acceptEdits",
+    "bypassPermissions",
+    "dontAsk",
+    "plan",
+];
+
+/// A profile named a `permission_mode` this build does not recognize.
+///
+/// Deliberately fails closed rather than passing the raw string through to
+/// the CLI: an unrecognized `--permission-mode` value is the CLI's problem to
+/// diagnose, at token-spending launch time, in a place the operator may not
+/// even see (a daemon's own stderr). Catching it at profile load turns that
+/// into a same-second, no-cost refusal that names the profile and the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownPermissionMode {
+    /// The value that did not match any of [`PERMISSION_MODE_VALUES`].
+    pub value: String,
+}
+
+impl fmt::Display for UnknownPermissionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown permission_mode {:?}; expected one of: {}",
+            self.value,
+            PERMISSION_MODE_VALUES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownPermissionMode {}
+
+impl Profile {
+    /// This profile's validated `permission_mode` (#47).
+    ///
+    /// `Ok(None)` means the option is simply absent — unspecified, which the
+    /// adapter treats identically to `Ok(Some(PermissionMode::Default))`:
+    /// no `--permission-mode` flag, never a silent
+    /// `--dangerously-skip-permissions`. The two are kept distinct here
+    /// (rather than collapsing "unset" into `Default` at this layer) so a
+    /// caller that cares about the difference — doctor, reporting whether a
+    /// profile made a choice at all — still can.
+    pub fn permission_mode(&self) -> Result<Option<PermissionMode>, UnknownPermissionMode> {
+        match self.options.get(PERMISSION_MODE_OPTION) {
+            None => Ok(None),
+            Some(raw) => PermissionMode::parse(raw).map(Some),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -79,5 +208,104 @@ mod tests {
             err.to_string().contains("api_key"),
             "the diagnostic must name the refused field: {err}"
         );
+    }
+
+    /// #47: unspecified and each of the five vocabulary strings all resolve
+    /// distinctly, and an unrecognized value fails closed rather than riding
+    /// through to the CLI unchecked.
+    #[test]
+    fn permission_mode_is_the_closed_cli_vocabulary_or_a_structured_refusal() {
+        let unspecified = Profile {
+            name: "n".to_string(),
+            backend: "claude".to_string(),
+            executable: None,
+            config_home: None,
+            env: BTreeMap::new(),
+            default_model: None,
+            options: BTreeMap::new(),
+        };
+        assert_eq!(
+            unspecified
+                .permission_mode()
+                .expect("unset is not an error"),
+            None,
+            "unspecified must not silently become a mode"
+        );
+
+        for (raw, expected) in [
+            ("default", PermissionMode::Default),
+            ("acceptEdits", PermissionMode::AcceptEdits),
+            ("bypassPermissions", PermissionMode::BypassPermissions),
+            ("dontAsk", PermissionMode::DontAsk),
+            ("plan", PermissionMode::Plan),
+        ] {
+            let mut profile = unspecified.clone();
+            profile
+                .options
+                .insert(PERMISSION_MODE_OPTION.to_string(), raw.to_string());
+            assert_eq!(
+                profile.permission_mode().expect("a listed value parses"),
+                Some(expected),
+                "{raw:?} must parse as {expected:?}"
+            );
+        }
+
+        // Default's argv is empty — it is the CLI's own unflagged behavior,
+        // chosen explicitly — while every other mode carries the flag with
+        // its own literal value. All five are asserted, not a subset: a
+        // typo in any one of `AcceptEdits`/`DontAsk`/`Plan`'s literal would
+        // reach the real CLI unmeasured otherwise (probe-confirmed: only
+        // `Default` and `BypassPermissions` were pinned here before).
+        for (mode, cli_value, expected_argv) in [
+            (PermissionMode::Default, "default", Vec::<&str>::new()),
+            (
+                PermissionMode::AcceptEdits,
+                "acceptEdits",
+                vec!["--permission-mode", "acceptEdits"],
+            ),
+            (
+                PermissionMode::BypassPermissions,
+                "bypassPermissions",
+                vec!["--permission-mode", "bypassPermissions"],
+            ),
+            (
+                PermissionMode::DontAsk,
+                "dontAsk",
+                vec!["--permission-mode", "dontAsk"],
+            ),
+            (
+                PermissionMode::Plan,
+                "plan",
+                vec!["--permission-mode", "plan"],
+            ),
+        ] {
+            assert_eq!(mode.as_cli_value(), cli_value, "{mode:?}'s display value");
+            assert_eq!(
+                mode.cli_args(),
+                expected_argv
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+                "{mode:?}'s argv"
+            );
+        }
+
+        let mut bad = unspecified;
+        bad.options
+            .insert(PERMISSION_MODE_OPTION.to_string(), "yolo".to_string());
+        let err = bad
+            .permission_mode()
+            .expect_err("an unrecognized value must be refused");
+        assert_eq!(err.value, "yolo");
+        assert!(
+            err.to_string().contains("yolo"),
+            "the diagnostic must name the offending value: {err}"
+        );
+        for known in PERMISSION_MODE_VALUES {
+            assert!(
+                err.to_string().contains(known),
+                "the diagnostic must list the valid vocabulary ({known}): {err}"
+            );
+        }
     }
 }

@@ -1,9 +1,0 @@
-# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
-# Not admitted: lives under .sergeant/drafts/workflows/ per
-# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
-# distinct, human-reviewed act.
-
-[workflow]
-name = "prototype"
-version = "1"
-stages = ["00-select-branch", "10-record-question", "20L-build-logic", "20U-build-variants", "30-hand-off", "40-capture"]

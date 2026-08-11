@@ -1,0 +1,15 @@
+# implement — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# candidate W23). Implements a piece of work from a spec or ticket set,
+# explicit-invocation-only (BU-P2-051). Promoted per
+# docs/icm/promotion-spec-2026-08-11.md; full behavior-unit citation trail
+# archived at docs/gauntlet/promoted-provenance/implement.md.
+#
+# Two ordinary actor stages (delegates to tdd at 10-implement-with-tdd and
+# to code-review at 30-review — both already promoted). Stage order here
+# is authoritative; the directory listing under this workflow's own tree
+# must agree with it.
+
+[workflow]
+name = "implement"
+version = "2"
+stages = ["10-implement-with-tdd", "30-review"]

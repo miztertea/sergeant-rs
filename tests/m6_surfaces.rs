@@ -1165,7 +1165,8 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "data_dir",
             "journal",
             "projection",
-            "daemon"
+            "daemon",
+            "permission_mode"
         ],
         "the --json check list and its order are the stable part of this contract"
     );
@@ -1447,6 +1448,69 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
 }
 
+/// TH-2 (BS2 test-honesty finding): t3 above pins the `permission_mode`
+/// check's *name*, its position, `status == ok` and a non-empty `detail` —
+/// but it runs doctor from a repo with no `sergeant.toml`, so the
+/// profile-reporting branch of `permission_mode_check` never executes and
+/// nothing ever reads what `detail` actually says. A doctor that reported a
+/// constant ("unspecified -> no flag") for every profile regardless of its
+/// real `permission_mode` passed the whole suite before this test existed.
+/// This drives doctor from a workspace with two profiles — one unspecified,
+/// one `plan` — and asserts the detail names both profiles and their real
+/// effective modes (#47's surfacing half).
+#[test]
+fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    init_repo(workspace.path());
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[workspace]\nname = \"w\"\n\n\
+         [[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+         [[profile]]\nname = \"quiet\"\nbackend = \"claude\"\n\n\
+         [[profile]]\nname = \"careful\"\nbackend = \"claude\"\n\
+         [profile.options]\npermission_mode = \"plan\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (code, stdout, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude)],
+        false,
+    );
+    assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "permission_mode");
+    assert_eq!(check["status"], "ok", "{check}");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("quiet") && detail.contains("careful"),
+        "the detail must name every profile, not just count them: {detail}"
+    );
+    assert!(
+        detail.contains("careful=plan"),
+        "the profile with an explicit mode must report that mode's real CLI value: {detail}"
+    );
+    assert!(
+        detail.contains("quiet=unspecified"),
+        "the unspecified profile must be reported as unspecified/no-flag, \
+         never silently folded into a mode it never chose: {detail}"
+    );
+    assert!(
+        !detail.contains("quiet=plan") && !detail.contains("careful=unspecified"),
+        "the two profiles' effective modes must not be swapped or constant-folded: {detail}"
+    );
+}
+
 /// The journal check's *other* failure arm: `corrupt_journal` above only
 /// ever reaches "replay failed after N events" (a line the replay gets to
 /// and cannot parse). `Journal::replay_data_dir` can also fail before it
@@ -1609,7 +1673,31 @@ fn named_check<'a>(report: &'a Value, name: &str) -> &'a Value {
 }
 
 fn doctor(data_dir: &Path, env: &[(&str, &str)], as_json: bool) -> (Option<i32>, String, String) {
+    doctor_in_opt(None, data_dir, env, as_json)
+}
+
+/// [`doctor`], run with the subprocess's cwd set to `workspace` — the only
+/// way to drive `permission_mode_check`'s profile-reporting branch, which
+/// reads `Workspace::discover(&std::env::current_dir())`.
+fn doctor_in(
+    workspace: &Path,
+    data_dir: &Path,
+    env: &[(&str, &str)],
+    as_json: bool,
+) -> (Option<i32>, String, String) {
+    doctor_in_opt(Some(workspace), data_dir, env, as_json)
+}
+
+fn doctor_in_opt(
+    workspace: Option<&Path>,
+    data_dir: &Path,
+    env: &[(&str, &str)],
+    as_json: bool,
+) -> (Option<i32>, String, String) {
     let mut command = Command::new(SGT);
+    if let Some(workspace) = workspace {
+        command.current_dir(workspace);
+    }
     command.arg("--data-dir").arg(data_dir);
     if as_json {
         command.arg("--json");
@@ -2340,6 +2428,16 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
             "pub fn perform(&self) -> LaunchOutcome",
         ),
         ("impl PendingSend", "pub fn perform(&self) -> SendOutcome"),
+        // Issue #46's addition. The daemon's completion driver has to ask a
+        // question no request asked — "did that turn end?" — and OBSERVE is an
+        // external effect like any other, so it lands in a performer of its
+        // own rather than in the driver's loop, where a `&mut Core` could
+        // reach it. Widening this list is the deliberate act the test's own
+        // doc comment describes; the settle it feeds re-checks §14.5.
+        (
+            "impl PendingObserve",
+            "pub fn perform(&self) -> ObserveOutcome",
+        ),
     ];
     let mut ranges = Vec::new();
     for (block, signature) in performers {
@@ -2379,6 +2477,31 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
         ranges.push((start, block_end(&source, start)));
     }
 
+    // Round-2 finding INV-R2-02: `backend.stop()` is a real external effect —
+    // a synchronous kill + reap on the Claude adapter (`ClaudeBackend::stop`
+    // is `self.interrupt(handle)?.wait()`) — and unlike everything else on
+    // this list, it runs under the *request-path* guard too, not only in a
+    // single-owner context. That is not new here: issue #14/B3 already
+    // reviewed and kept it there deliberately (only the adapter's
+    // transcript-archive tail is deferred out from under the lock; the STOP
+    // request and its outcome commit are not), and `api::cancel_work`'s own
+    // comment says so ("The STOP request and the teardown land under this
+    // guard"). What #44 changed is the durability ordering behind that
+    // decision: the kill now precedes the flush that makes
+    // `execution.stopped`/`execution.abandoned` durable, where before group
+    // commit every commit was durable the instant it landed — so a crash
+    // between the kill and the flush can leave a killed or orphaned native
+    // context with no journal record. This is a known, accepted exemption,
+    // not an unreviewed one — named here rather than left invisible to this
+    // test. See `CoreGuard`'s doc for the durability guarantee stated
+    // honestly against it.
+    for stop_under_the_request_guard in ["fn stop_execution", "pub fn settle_launch"] {
+        let start = source
+            .find(stop_under_the_request_guard)
+            .unwrap_or_else(|| panic!("engine.rs must declare `{stop_under_the_request_guard}`"));
+        ranges.push((start, block_end(&source, start)));
+    }
+
     for effect in [
         "materialize(",
         "rematerialize(",
@@ -2387,6 +2510,8 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
         "backend.send(",
         "backend.observe(",
         "backend.resume(",
+        "backend.stop(",
+        "backend.interrupt(",
         "pending.perform(",
     ] {
         for (index, _) in source.match_indices(effect) {
@@ -2411,34 +2536,39 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
     }
 }
 
-/// The journal's append path issues exactly the one fsync it accounts for.
+/// The journal's commit path issues exactly the one fsync it accounts for.
 ///
 /// A-N3-1's whole cost story is per-event fsyncs — the two-phase boundary
 /// added two per work, that is the 25% the budget was amended over, and #44's
-/// fix is one fsync per lock hold instead of one per event. So "an extra fsync
-/// per append" is *the* named throughput regression, and round-2 finding
-/// N3R2-04 showed the throughput guard could not see it: on this container an
-/// fsync costs ~0.08 ms, so a second one per append is ~5% of a submit —
-/// inside the noise of any floor that does not flake (measured: 38.2 → 36.8
-/// works/s at burst 25).
+/// fix (landed) is one fsync per lock hold instead of one per event. So "an
+/// extra fsync per append" is *the* named throughput regression, and round-2
+/// finding N3R2-04 showed the throughput guard could not see it: on that
+/// container an fsync costs ~0.08 ms, so a second one per append is ~5% of a
+/// submit — inside the noise of any floor that does not flake (measured: 38.2
+/// → 36.8 works/s at burst 25).
 ///
 /// Timing is the wrong instrument for it; counting is the right one, and
 /// `Journal::fsync_count` already exists for that. But the counter is derived
 /// from *one* `sync_data` call, so a second durability syscall beside it is
 /// invisible to the counter as well — which is exactly the mutation the
 /// finding used. This closes both: every `sync_data`/`sync_all` in the module
-/// must live in a named block, and `write_and_sync` — the only one on the
-/// acknowledged-append path — must contain exactly one, the accounted one.
+/// must live in a named block, and `sync_now` — the only one on the
+/// group-commit path — must contain exactly one, the accounted one.
 ///
-/// m1's `crash_tail…` tests assert the counter's value per append; this
-/// asserts the counter is the whole truth about what the append path syncs.
+/// Post-#44 this test is doing *more* work than before, not less: with the
+/// fsync moved out of `append_event`, an fsync smuggled back into the append
+/// path would restore the per-event cost the whole change exists to remove,
+/// and the block list below is what makes that un-smugglable.
+///
+/// m1's `crash_tail…` tests assert the counter's value per group; this
+/// asserts the counter is the whole truth about what the journal syncs.
 #[test]
 fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
     let source = code_only(&read_source("runtime/journal.rs"));
     // Where a durability syscall may appear, and why.
     let allowed = [
-        // The accounted per-append sync.
-        "fn write_and_sync",
+        // The accounted group-commit sync (#44).
+        "fn sync_now",
         // The rollback after a failed append: re-syncs a truncated segment so
         // a torn tail cannot be concatenated onto. Not an acknowledged append.
         "pub fn append_event",
@@ -2446,6 +2576,16 @@ fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
         // new segment survive its own creation. Neither is on the hot path.
         "fn recover_tail",
         "fn sync_dir",
+        // The best-effort close of a group whose handle is going away. Not on
+        // any acknowledged path — the daemon's groups are closed by
+        // `CoreGuard`, and this only exists so a dropped handle is not a
+        // second, silent way to lose a written line.
+        "impl Drop for Journal",
+        // The module's own `#[cfg(test)]` block. It is not the production
+        // path and it is where the fault-injection probes live — one of them
+        // has to call `sync_data` on a deliberately unsyncable descriptor to
+        // find out whether this host can express the injection at all.
+        "mod tests",
     ];
     let ranges: Vec<(usize, usize)> = allowed
         .iter()
@@ -2470,21 +2610,187 @@ fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
         }
     }
 
-    // And the append path syncs once, through the expression that counts it.
+    // And the group-commit path syncs once, through the expression that
+    // counts it.
     let (start, end) = ranges[0];
     let body = &source[start..end];
     let syncs = body.matches(".sync_data(").count() + body.matches(".sync_all(").count();
     assert_eq!(
         syncs, 1,
-        "`write_and_sync` must issue exactly one durability syscall — a second \
-         one is an fsync per append that `fsync_count` cannot see and no \
-         throughput floor on a fast filesystem can feel: {body}"
+        "`sync_now` must issue exactly one durability syscall — a second one \
+         is an fsync per group that `fsync_count` cannot see and no throughput \
+         floor on a fast filesystem can feel: {body}"
     );
     assert!(
         body.contains("self.fsync_count += self.segment_file.sync_data()"),
         "the one sync must be the counted one, so the counter cannot drift \
          from the syscall: {body}"
     );
+}
+
+/// Every core-lock hold goes through the one guard that closes its group
+/// (#44).
+///
+/// The group commit is only a durability contract if there is exactly one
+/// door into the core: a hold taken with a bare `core.lock()` would append
+/// events into `Core`'s open group and then release the mutex without
+/// fsyncing or publishing them — they would sit there until some *later*,
+/// unrelated hold happened to flush them, which is silent delayed durability
+/// and a genuinely worse failure than the per-append fsync this replaced.
+///
+/// `CoreGuard::drop` cannot be forgotten; *acquiring the mutex another way*
+/// can. So the rule is structural, like t5 and t11 beside it: a `tokio::sync::Mutex`
+/// hold on the core — spelled `core.lock(`, `.blocking_lock(`, `.try_lock(`,
+/// `.lock_owned(`, `.try_lock_owned(` or `.blocking_lock_owned(` — may appear
+/// only inside the two `CoreGuard` constructors. Anything else — production
+/// code, a handler added later, a test fixture — fails here with the call
+/// site printed.
+///
+/// Round-2 findings INV-R2-04/TH-R2-04 closed two of this test's three
+/// coverage gaps: it now walks every file under `src/` (not a fixed list of
+/// six) and checks every lock-taking spelling `tokio::sync::Mutex` exposes,
+/// not just the two group-commit itself uses. The third — a receiver renamed
+/// away from `core` losing coverage entirely — is closed for the one shape
+/// that exists in this tree today: `daemon.rs` upgrades the sink's `Weak`
+/// reference into a local it calls `live` before acquiring through it
+/// (`let Some(live) = core.upgrade()`), so a bare `live.lock()` there would
+/// otherwise be invisible; every identifier bound from `core.upgrade()` is
+/// derived below and scanned as its own receiver, in the same file, for
+/// exactly that reason. A rename introduced *elsewhere* in a future edit
+/// (a new `Weak<Mutex<Core>>` clone under some other name, reached some
+/// other way) is still outside what a textual scan can promise — the honest
+/// residual, not a hidden one.
+#[test]
+fn t11c_every_core_lock_hold_ends_in_the_group_commit_guard() {
+    let door_methods = [
+        ".lock(",
+        ".blocking_lock(",
+        ".try_lock(",
+        ".lock_owned(",
+        ".try_lock_owned(",
+        ".blocking_lock_owned(",
+    ];
+
+    let mut checked_api_rs = false;
+    for path in all_src_files() {
+        let module = path
+            .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .expect("under src/")
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let source = code_only(&std::fs::read_to_string(&path).expect("read source"));
+
+        let allowed: Vec<(usize, usize)> = ["pub async fn acquire", "pub fn acquire_blocking"]
+            .iter()
+            .filter_map(|block| {
+                let start = source.find(block)?;
+                Some((start, block_end(&source, start)))
+            })
+            .collect();
+        if module == "api.rs" {
+            assert_eq!(
+                allowed.len(),
+                2,
+                "api.rs must declare both `CoreGuard` constructors — they are \
+                 the only sanctioned way to take the core lock"
+            );
+            checked_api_rs = true;
+        }
+
+        // Every receiver that could hold the *core*'s mutex: the field/local
+        // literally named `core`, plus anything bound straight off
+        // `core.upgrade()` (the `Weak<Mutex<Core>>` the sink thread holds —
+        // see `daemon::journaling_sink`) under whatever name that binding
+        // gave it.
+        let mut receivers = vec!["core".to_string()];
+        for (index, _) in source.match_indices("core.upgrade()") {
+            let prefix = &source[..index];
+            let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line = &prefix[line_start..];
+            if let Some(let_at) = line.rfind("let ") {
+                let binder = line[let_at + 4..].trim();
+                // `let Some(name) = core.upgrade()` or `let name = core.upgrade()`.
+                let ident: String = binder
+                    .trim_start_matches("Some(")
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !ident.is_empty() && !receivers.contains(&ident) {
+                    receivers.push(ident);
+                }
+            }
+        }
+
+        for receiver in &receivers {
+            for method in door_methods {
+                let door = format!("{receiver}{method}");
+                for (index, _) in source.match_indices(door.as_str()) {
+                    // A bare method call (`.lock(`) must not also match a
+                    // qualified one already counted (`core.lock(` inside a
+                    // longer receiver expression) — require a non-identifier
+                    // boundary immediately before the receiver name.
+                    let boundary_at = index;
+                    let preceded_by_ident = source[..boundary_at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if preceded_by_ident {
+                        continue;
+                    }
+                    assert!(
+                        allowed
+                            .iter()
+                            .any(|(start, end)| index > *start && index < *end),
+                        "src/{module} takes the core lock outside `CoreGuard` \
+                         (via `{door}`), so that hold's appends are never \
+                         fsynced or published at the end of it (#44), near: {:?}",
+                        char_boundary_snippet(&source, index)
+                    );
+                }
+            }
+        }
+    }
+    assert!(checked_api_rs, "the walk must have reached src/api.rs");
+}
+
+/// A ~200-byte window of `source` around `index`, snapped to char
+/// boundaries — `source[a..b]` panics if either `a` or `b` lands inside a
+/// multi-byte character (this codebase's doc comments use `§` freely), which
+/// would turn a real violation this test caught into an unrelated slicing
+/// panic instead of the assertion failure that names the call site.
+fn char_boundary_snippet(source: &str, index: usize) -> &str {
+    let target_start = index.saturating_sub(140);
+    let start = source
+        .char_indices()
+        .rev()
+        .find(|&(i, _)| i <= target_start)
+        .map_or(0, |(i, _)| i);
+    let target_end = (index + 60).min(source.len());
+    let end = source
+        .char_indices()
+        .find(|&(i, _)| i >= target_end)
+        .map_or(source.len(), |(i, _)| i);
+    &source[start..end]
+}
+
+/// Every `.rs` file under `src/`, recursively.
+fn all_src_files() -> Vec<PathBuf> {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 /// The end of the `{ … }` block that starts at or after `from`.
@@ -2772,6 +3078,58 @@ fn the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown() {
         "the dropped daemon must have journaled exactly one {} event; {stopped} means \
          its shutdown path did not run to the end",
         daemon::KIND_DAEMON_STOPPED
+    );
+}
+
+/// The daemon installs its shutdown-signal handlers **before** anything makes
+/// it reachable.
+///
+/// The two tests above both rest on "SIGTERM makes the daemon run its shutdown
+/// path", and that is only true once a handler exists: until then SIGTERM's
+/// default disposition applies and the kernel simply terminates the process —
+/// no `daemon.stopped`, a descriptor left pointing at a dead pid, nothing
+/// registered at exit run. `SpawnedDaemon::start` returns the instant the
+/// descriptor appears and its callers signal immediately, so every instruction
+/// between the descriptor write and the handler install is a window they can
+/// land in.
+///
+/// Measured, 2026-08-11 (Cerberus): the SIGTERM pin above failed with
+/// `status.signal() == Some(15)` on run 3 of 40 m6 runs executed against a
+/// concurrently running suite — killed *by* the signal, which is the exact
+/// failure the window produces. It is not a rig bug and no amount of retrying
+/// in the rig would fix it; the ordering is the fix.
+///
+/// Structural rather than behavioural on purpose. The behavioural witness is
+/// the flake itself, which is ~2.5% per run and therefore cannot be a gate;
+/// this reads the ordering directly, so a future edit that moves the install
+/// back after `start_with` fails here, deterministically, with the reason.
+#[test]
+fn the_daemon_installs_its_signal_handlers_before_it_publishes_anything() {
+    let source = code_only(&read_source("daemon.rs"));
+    let start = source
+        .find("pub async fn run_until_signal")
+        .expect("daemon.rs must declare `run_until_signal`");
+    let body = &source[start..block_end(&source, start)];
+    let install = body
+        .find("ShutdownSignals::install()")
+        .expect("run_until_signal must install its signal handlers");
+    let serving = body
+        .find("start_with(")
+        .expect("run_until_signal must start the daemon");
+    assert!(
+        install < serving,
+        "run_until_signal installs its shutdown handlers at byte {install} of its body \
+         and calls start_with at {serving}: every instruction in between is a window in \
+         which SIGTERM kills this daemon outright instead of shutting it down — and \
+         `start_with` publishes the runtime descriptor, which is precisely the thing \
+         clients wait for before they signal"
+    );
+    // …and the install must be the real registration, not a future nobody has
+    // polled: `ctrl_c()` registers SIGINT on first poll, which would put the
+    // handler back after the descriptor however early the call site sits.
+    assert!(
+        source.contains("SignalKind::interrupt()") && source.contains("SignalKind::terminate()"),
+        "both signals must be registered explicitly at install time"
     );
 }
 

@@ -1,0 +1,18 @@
+# to-tickets — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# candidate W32). Breaks a plan, spec, investigation, findings register,
+# PR, or conversation into dependency-aware tracer-bullet work.
+#
+# Four ordinary actor stages (N1 adjudication A4 demoted and folded the
+# original `30-publish` into `20-confirm-breakdown` as a helper invocation;
+# no renumbering). Stage order here is authoritative; the directory
+# listing under this workflow's own tree MUST agree with it lexically
+# (docs/icm/convention.md §1 rule 4).
+#
+# Curated for promotion per docs/icm/promotion-spec-2026-08-11.md; the full
+# stage-to-behavior-unit citation trail is archived at
+# docs/gauntlet/promoted-provenance/to-tickets.md.
+
+[workflow]
+name = "to-tickets"
+version = "2"
+stages = ["00-load-project-context", "10-extract-decisions-and-unknowns", "20-confirm-breakdown", "40-report-frontier"]

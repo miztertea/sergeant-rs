@@ -1,0 +1,9 @@
+# direct-mode — draft workflow candidate materialized by repo-to-icm's
+# 60-draft stage (N2 run, 21-partition corpus). status: draft in
+# index.md; this package has not been promoted to .sergeant/workflows/.
+# See provenance.md for the behavior_id evidence backing each stage.
+
+[workflow]
+name = "direct-mode"
+version = "1"
+stages = ["01-pre-edit-context-load", "02-implement", "03-validate-and-review", "04-deliver"]

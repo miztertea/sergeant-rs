@@ -1,0 +1,16 @@
+# monitor-fleet — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# candidate W13). Observes fleet state without mutating it: a bounded,
+# versioned, strictly read-only snapshot plus a per-worker liveness
+# evaluation, interpreted by the workflow's single actor stage (folds the
+# snapshot and liveness computations in as helper invocations per N1
+# adjudication A4). Promoted per docs/icm/promotion-spec-2026-08-11.md;
+# full behavior-unit citation trail archived at
+# docs/gauntlet/promoted-provenance/monitor-fleet.md.
+#
+# One ordinary actor stage. Stage order here is authoritative; the
+# directory listing under this workflow's own tree must agree with it.
+
+[workflow]
+name = "monitor-fleet"
+version = "2"
+stages = ["00-observe-and-interpret"]

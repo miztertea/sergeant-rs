@@ -316,9 +316,21 @@ impl Telemetry {
         }
     }
 
-    /// Record how long one journal append took (§28's
+    /// Record how long one journal append's *write* took (§28's
     /// `journal_append_seconds`). Called from the journal's append observer,
     /// which is the only place that timing exists.
+    ///
+    /// **Narrowed by #44, undocumented here until round-2 finding
+    /// INV-R2-05.** Before group commit this was write-plus-fsync — the
+    /// whole cost of making one event durable. Since #44 the fsync moved to
+    /// [`crate::runtime::journal::Journal::sync`] and is shared across a
+    /// whole lock hold's group, so it belongs to no single append and this
+    /// histogram no longer includes it (see the honest note on
+    /// [`crate::runtime::journal::AppendObserver`]). The instrument name is
+    /// unchanged, so a dashboard or SLO built on it shifted meaning — and
+    /// cheaper — on the same day, without a rename. Nothing in §28 replaced
+    /// the visibility that was lost: no instrument here measures the group
+    /// fsync itself, which is now the daemon's only durability syscall.
     pub fn record_journal_append(&self, elapsed: Duration) {
         self.instruments
             .journal_append

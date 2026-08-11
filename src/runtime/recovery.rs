@@ -174,11 +174,16 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
 
     let mut report = ReconcileReport::default();
     for work_id in in_flight {
-        match engine.reconcile_work(core, &work_id) {
+        let outcome = engine.reconcile_work(core, &work_id);
+        flush_after_reconciling(core, &work_id);
+        match outcome {
             Ok(ReconcileDisposition::Resumed) => report.resumed.push(work_id),
             Ok(ReconcileDisposition::Ambiguous) => report.blocked.push(work_id),
             Err(e) => {
                 block_on_reconcile_error(engine, core, &work_id, &e);
+                // The block above is itself a commit; flush it too rather
+                // than leaving it for the next work's flush to cover.
+                flush_after_reconciling(core, &work_id);
                 report.blocked.push(work_id);
             }
         }
@@ -187,6 +192,7 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
         if let Err(e) = engine.reconcile_crashed_start(core, &work_id) {
             block_on_reconcile_error(engine, core, &work_id, &e);
         }
+        flush_after_reconciling(core, &work_id);
         report.blocked.push(work_id);
     }
     // Isolated like every other work's reconciliation, and for a smaller
@@ -201,7 +207,9 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
     // possibly-live external identity is the more urgent of the two, and a
     // teardown that fails must not stop it happening.
     for work_id in stranded_reservations {
-        match engine.reconcile_terminal_reservation(core, &work_id) {
+        let outcome = engine.reconcile_terminal_reservation(core, &work_id);
+        flush_after_reconciling(core, &work_id);
+        match outcome {
             Ok(true) => report.reservations_retired.push(work_id),
             Ok(false) => {}
             Err(e) => tracing::warn!(
@@ -212,7 +220,9 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
         }
     }
     for work_id in stranded_surfaces {
-        match engine.reconcile_terminal_surface(core, &work_id) {
+        let outcome = engine.reconcile_terminal_surface(core, &work_id);
+        flush_after_reconciling(core, &work_id);
+        match outcome {
             Ok(true) => report.surfaces_retired.push(work_id),
             Ok(false) => {}
             Err(e) => tracing::warn!(
@@ -223,6 +233,38 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
         }
     }
     Ok(report)
+}
+
+/// Close the open group after one work's reconciliation, best-effort
+/// (invariants round 2, INV-R2-01).
+///
+/// Startup runs with a bare [`Core`] — no [`crate::api::CoreGuard`], because
+/// nothing else can see it yet — so nothing durable happens on its own
+/// between commits. Each of the loops above performs unbounded, irreversible
+/// external effects per work (`pending.perform()`'s `git worktree remove`,
+/// [`Engine::run_inline`]'s relaunch) interleaved with the commits that
+/// describe them; without a flush after every work, a crash mid-reconcile
+/// could leave those effects undone *and* unrecorded, letting a later
+/// restart repeat them. Flushing per work, rather than once at the end,
+/// keeps each work's crash window no wider than a single reconciliation —
+/// exactly the width every other path in this daemon already gets from
+/// `CoreGuard`.
+///
+/// Best-effort and non-propagating like the rest of this per-work loop
+/// (§25's contract: one work's trouble must not stop the others). A flush
+/// failure means the journal has poisoned itself ([`crate::runtime::journal::Journal::sync`]),
+/// so every following commit — for this work or the next — will fail the
+/// same way and surface through its own error path; there is nothing this
+/// call can do beyond reporting it.
+fn flush_after_reconciling(core: &mut Core, work_id: &str) {
+    if let Err(e) = core.flush() {
+        tracing::error!(
+            work_id,
+            error = %e,
+            "failed to flush the journal after reconciling this work at startup; \
+             the journal is likely poisoned and further recovery is unreliable"
+        );
+    }
 }
 
 /// Fail one work closed after its own reconciliation errored, without
@@ -401,6 +443,90 @@ mod tests {
         assert_eq!(stage_blocked[0]["detail"], "no execution to reconcile");
         let blocked = events(&core, work_id, KIND_WORK_BLOCKED);
         assert_eq!(blocked[0]["reason"], "no execution to reconcile");
+    }
+
+    /// INV-R2-01. `reconcile` runs with a bare [`Core`] — no [`crate::api::CoreGuard`]
+    /// — so nothing outside `reconcile` itself can make its commits durable.
+    /// This pins that `reconcile` does not rely on a caller to flush: after
+    /// it returns, the open group is empty and at least one fsync actually
+    /// ran, for both the work that reconciled cleanly (an ambiguous
+    /// classification, `intact`) and the one whose own reconciliation
+    /// errored (`broken`, which takes the `block_on_reconcile_error` path).
+    /// Reverting the per-work `flush_after_reconciling` calls in `reconcile`
+    /// leaves the group open and fails this test without touching anything
+    /// else — every other assertion in this file still holds, because an
+    /// unflushed group changes nothing about what got folded into the
+    /// registry, only what is durable and published.
+    #[test]
+    fn reconcile_flushes_after_every_work_so_nothing_it_touches_is_left_unsynced() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let engine = Engine::new(Arc::new(BackendRegistry::new()), None, dir.path());
+
+        let broken = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let intact = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+
+        // `broken`: active with no run record — `reconcile_work` errors and
+        // takes the `block_on_reconcile_error` path.
+        testing::submit(&mut core, broken, "active but runless");
+        testing::commit(&mut core, broken, KIND_WORK_STARTED, json!({}));
+
+        // `intact`: an ordinary in-flight work whose backend is gone —
+        // reconciles to `Ambiguous` without erroring.
+        testing::submit(&mut core, intact, "active with a run");
+        testing::commit(
+            &mut core,
+            intact,
+            KIND_WORKFLOW_BOUND,
+            json!({
+                "workflow": {"name": "tiny", "version": "1", "source": "test",
+                             "stages": [{"id": "00-first", "context": "c"}]},
+                "backend": "vanished",
+            }),
+        );
+        testing::commit(
+            &mut core,
+            intact,
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-first", "index": 0, "attempt": 1}),
+        );
+        testing::commit(
+            &mut core,
+            intact,
+            KIND_EXECUTION_STARTED,
+            json!({"execution": {
+                "execution_id": "e1",
+                "backend": "vanished",
+                "native_id": "n1",
+                "stage_id": "00-first",
+                "attempt": 1,
+                "stop_requested": false,
+            }}),
+        );
+        testing::commit(&mut core, intact, KIND_WORK_STARTED, json!({}));
+
+        // `testing::commit` (used above to build the fixture) never flushes
+        // — it is `Core::commit` alone, exactly like the daemon's own bare
+        // `core.commit(...)` calls before `reconcile` runs. So nothing has
+        // synced yet; the baseline is captured for a stronger assertion
+        // below (that reconcile's flushing is not a no-op it stumbled into).
+        let fsyncs_before = core.journal.fsync_count();
+
+        let report = reconcile(&engine, &mut core).expect("recovery must not abort");
+        assert_eq!(report.blocked, vec![broken.to_string(), intact.to_string()]);
+
+        assert_eq!(
+            core.open_group_len(),
+            0,
+            "reconcile must leave nothing open behind it — every commit it \
+             made, across every work it touched, must already be durable \
+             and published by the time it returns"
+        );
+        assert!(
+            core.journal.fsync_count() > fsyncs_before,
+            "reconcile must have actually synced, not merely left the group \
+             empty by coincidence"
+        );
     }
 
     /// Payloads of one work's events of one kind, in journal order.

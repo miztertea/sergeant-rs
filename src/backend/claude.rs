@@ -65,13 +65,28 @@
 //! to the §15 trait and the engine's append order, which is more than this
 //! milestone's contract asks for. Recorded rather than claimed closed.
 //!
-//! Root constraint (measured): `--dangerously-skip-permissions` is refused
-//! outright under root/sudo — `--dangerously-skip-permissions cannot be
-//! used with root/sudo privileges for security reasons`, exit 1 — unless
-//! the environment sets `IS_SANDBOX=1`. The adapter does not set that
-//! variable itself; the operator opts in via profile env or daemon
-//! environment, because silently bypassing the CLI's own refusal would be
-//! this adapter making a security decision that belongs to the human.
+//! Root constraint (measured, historical): `--dangerously-skip-permissions`
+//! is refused outright under root/sudo — `--dangerously-skip-permissions
+//! cannot be used with root/sudo privileges for security reasons`, exit 1 —
+//! unless the environment sets `IS_SANDBOX=1`. This adapter no longer emits
+//! that flag at all (#47): it is recorded here because the refusal's stderr
+//! shape is still what an envelope-less dead turn's evidence can look like
+//! (`docs/gauntlet/runs/runB/run-manifest.md`, attempt 1), not because the
+//! adapter still sends the flag.
+//!
+//! **Permission mode is profile configuration (#47).** `permission_mode` in
+//! a profile's `options` passes through as the CLI's own `--permission-mode`
+//! vocabulary (`default` | `acceptEdits` | `bypassPermissions` | `dontAsk` |
+//! `plan` — [`crate::domain::profile::PermissionMode`]), validated at
+//! profile load so an unrecognized string never reaches argv. Unspecified —
+//! no `permission_mode` option at all — means **no permission flag on the
+//! launch at all**, the CLI's own unflagged default; measured live via the
+//! opt-in `bs2_default_mode_headless_turn_cannot_write_without_an_explicit_
+//! permission_mode` test (`tests/m4_backends.rs`) rather than assumed.
+//! `bypassPermissions` requires a profile to name it explicitly: sending
+//! `--dangerously-skip-permissions` unconditionally, as this adapter used
+//! to, made a security decision belong to the adapter instead of the human
+//! who writes the profile.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -113,7 +128,6 @@ pub const REQUIRED_FLAGS: &[&str] = &[
     "--setting-sources",
     "--model",
     "--permission-mode",
-    "--dangerously-skip-permissions",
 ];
 
 /// Environment variable naming the `claude` executable to use.
@@ -716,7 +730,15 @@ impl ClaudeBackend {
     /// re-adopted execution cannot end up launching under different rules
     /// than the one it re-adopts — in particular, cannot silently escalate
     /// past a profile-pinned `--permission-mode`.
-    fn launch_config(&self, profile: Option<&Profile>) -> LaunchConfig {
+    ///
+    /// #47: the permission mode is validated here too (defense in depth
+    /// alongside the profile-load check in
+    /// [`crate::domain::workspace::Workspace::from_config`]) — a `Profile`
+    /// can reach this adapter without ever having passed through a
+    /// `sergeant.toml` parse (built directly by a test, or by a future
+    /// caller), so the launch boundary itself must still refuse an
+    /// unrecognized mode rather than pass the raw string to the CLI.
+    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
         let executable = profile
             .and_then(|p| p.executable.clone())
             .unwrap_or_else(|| self.config.executable.clone());
@@ -732,17 +754,22 @@ impl ClaudeBackend {
                 );
             }
         }
-        // Permission mode is profile-pinned; the default is L2's production
-        // default. Root refusal + IS_SANDBOX constraint: module docs.
-        let permission_args = match profile.and_then(|p| p.options.get("permission_mode")) {
-            Some(mode) => vec!["--permission-mode".to_string(), mode.clone()],
-            None => vec!["--dangerously-skip-permissions".to_string()],
+        // Permission mode is profile-pinned. Unspecified -> no flag at all
+        // (the CLI's own default); `bypassPermissions` only ever reaches
+        // argv when a profile names it (module docs, #47).
+        let permission_args = match profile {
+            Some(profile) => profile
+                .permission_mode()
+                .map_err(|e| self.err_failed(format!("profile {:?}: {e}", profile.name)))?
+                .unwrap_or(crate::domain::profile::PermissionMode::Default)
+                .cli_args(),
+            None => Vec::new(),
         };
-        LaunchConfig {
+        Ok(LaunchConfig {
             executable,
             env,
             permission_args,
-        }
+        })
     }
 
     /// Execution ids this adapter currently holds state for.
@@ -898,15 +925,25 @@ impl ClaudeBackend {
                 let _ = stdin.write_all(stdin_prompt.as_bytes());
             }
         });
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
-        if let Some(mut stderr) = stderr {
-            let stderr_buf = Arc::clone(&stderr_buf);
+        // stderr is *delivered*, not deposited in a buffer someone snapshots.
+        //
+        // Both pipes reach EOF at the same instant — the turn process exits —
+        // so a stdout reader that closes and immediately reads a shared stderr
+        // buffer is racing the thread that fills it. Measured on this host
+        // while pinning issue #46's attempt-1 shape: an envelope-less turn's
+        // stderr was intermittently empty in the journal, which loses the one
+        // thing the operator has to act on (Run B attempt 1's whole content
+        // was a stderr line and no stream-json at all). A channel makes the
+        // handoff a synchronization instead of a hope.
+        let stderr_rx = stderr.map(|mut stderr| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
             std::thread::spawn(move || {
                 let mut text = String::new();
                 let _ = stderr.read_to_string(&mut text);
-                *stderr_buf.lock().expect("stderr buffer lock") = text;
+                let _ = tx.send(text);
             });
-        }
+            rx
+        });
 
         let child = Arc::new(Mutex::new(child));
         {
@@ -936,7 +973,7 @@ impl ClaudeBackend {
             session_id,
             model,
             child,
-            stderr_buf,
+            stderr_rx,
         };
         let reader = std::thread::spawn(move || reader.run(stdout));
         // Recorded after the spawn, and deliberately not fatal if the
@@ -965,8 +1002,21 @@ struct TurnReader {
     session_id: String,
     model: Option<String>,
     child: Arc<Mutex<Child>>,
-    stderr_buf: Arc<Mutex<String>>,
+    /// The turn's stderr, delivered once the reading thread hits EOF. `None`
+    /// when the spawn produced no stderr pipe at all.
+    stderr_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
+
+/// How long the turn reader waits for stderr after the turn's process has
+/// been reaped.
+///
+/// The wait is normally instantaneous — the pipe closed when the process did,
+/// so the reading thread is already at EOF — and this bound exists only for
+/// the pathological case that could otherwise stall a turn's outcome forever:
+/// a descendant of the turn that inherited stderr and outlived its parent.
+/// Losing the evidence is bad; never recording the turn's outcome is issue
+/// #46 again, so the ambiguity is bounded rather than waited out.
+const STDERR_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl TurnReader {
     fn run(self, stdout: std::process::ChildStdout) {
@@ -999,7 +1049,16 @@ impl TurnReader {
             }
         };
 
-        let stderr = self.stderr_buf.lock().expect("stderr buffer lock").clone();
+        // The child is reaped, so its end of the stderr pipe is closed and the
+        // reading thread is at (or microseconds from) EOF. Waiting for its
+        // delivery is what makes the evidence deterministic; the budget is
+        // what keeps a leaked descendant from turning "no stderr" into "no
+        // outcome".
+        let stderr = self
+            .stderr_rx
+            .as_ref()
+            .and_then(|rx| rx.recv_timeout(STDERR_DRAIN_BUDGET).ok())
+            .unwrap_or_default();
         let mut state = self
             .backend_state
             .lock()
@@ -1337,7 +1396,7 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref());
+        } = self.launch_config(request.profile.as_ref())?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -1492,13 +1551,13 @@ impl Backend for ClaudeBackend {
     /// Launch configuration comes from the [`ResumeRequest`] the caller
     /// rebuilt from the journal, through the same resolution START uses —
     /// never from defaults. Fabricating it here is what a fail-*open* resume
-    /// looks like: it would silently replace a profile's `--permission-mode`
-    /// with `--dangerously-skip-permissions` (a security decision that
-    /// belongs to the human, as the module docs say of the root refusal),
-    /// drop the model pin so every later turn verified as "unpinned" while
-    /// the work's journal still records a pin, and journal normalized events
-    /// under an empty work id. A pin the caller does not re-supply is
-    /// genuinely absent — reported as unpinned, which is then true.
+    /// looks like: it would silently drop a profile's pinned
+    /// `--permission-mode` back to no-profile behavior (a security decision
+    /// that belongs to the human, as the module docs say of #47), drop the
+    /// model pin so every later turn verified as "unpinned" while the work's
+    /// journal still records a pin, and journal normalized events under an
+    /// empty work id. A pin the caller does not re-supply is genuinely
+    /// absent — reported as unpinned, which is then true.
     fn resume(
         &self,
         handle: &ExecutionHandle,
@@ -1552,7 +1611,7 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref());
+        } = self.launch_config(request.profile.as_ref())?;
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             // Another thread adopted it while this one gathered evidence.
@@ -2574,7 +2633,7 @@ mod tests {
                     .spawn()
                     .expect("spawn true"),
             )),
-            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stderr_rx: None,
         };
         let outcome = TurnOutcome {
             envelope: Some(json!({"type": "result", "is_error": false, "result": "done"})),
@@ -2608,6 +2667,199 @@ mod tests {
             notices[0].payload["expected"],
             format!("system/{POST_TURN_SUMMARY_SUBTYPE}")
         );
+    }
+
+    /// A turn's stderr is **waited for**, never snapshotted (issue #46's
+    /// attempt-1 shape).
+    ///
+    /// Both of a turn's pipes reach EOF at the same instant — the process
+    /// exits — so a reader that closes stdout and immediately reads a shared
+    /// stderr buffer wins that race only by luck. Measured while pinning Run B
+    /// attempt 1 through the daemon: the journal's `conversation.turn.ended`
+    /// intermittently carried `stderr: ""` for the one turn shape whose *only*
+    /// evidence is that line, because the CLI refused before writing a byte of
+    /// stream-json. Losing it leaves the operator a block with no cause.
+    ///
+    /// The 300 ms below is that race widened to something a test can see: the
+    /// process (`true`) is gone before the delivery arrives, so a snapshot
+    /// taken at stdout EOF reads `""` and a delivery reads the refusal. Both
+    /// halves are asserted — the journaled event *and* the observation the
+    /// engine blocks on — because they are two different readers of the same
+    /// field.
+    #[test]
+    fn a_turns_stderr_is_waited_for_rather_than_snapshotted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backend = ClaudeBackend::new(ClaudeConfig::new(dir.path()));
+        let emitted = Arc::new(Mutex::new(Vec::<EventDraft>::new()));
+        let sink_events = Arc::clone(&emitted);
+        backend.set_event_sink(Arc::new(move |draft| {
+            sink_events.lock().expect("sink lock").push(draft);
+        }));
+        backend
+            .state
+            .lock()
+            .expect("adapter state lock")
+            .executions
+            .insert("e-stderr".to_string(), test_execution(None));
+
+        let mut child = Command::new("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn true");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = tx.send(
+                "--dangerously-skip-permissions cannot be used with root/sudo privileges\n"
+                    .to_string(),
+            );
+        });
+        let reader = TurnReader {
+            backend_state: Arc::clone(&backend.state),
+            ask_grammar: Arc::clone(&backend.ask_grammar),
+            sink: backend.sink.lock().expect("sink lock").clone(),
+            data_dir: dir.path().to_path_buf(),
+            execution_id: "e-stderr".to_string(),
+            work_id: "w-stderr".to_string(),
+            session_id: "s-stderr".to_string(),
+            model: None,
+            child: Arc::new(Mutex::new(child)),
+            stderr_rx: Some(rx),
+        };
+        reader.run(stdout);
+
+        let events = emitted.lock().expect("sink lock");
+        let ended = events
+            .iter()
+            .find(|e| e.kind == "conversation.turn.ended")
+            .expect("every turn ends with this event");
+        assert_eq!(ended.payload["result_envelope"], false);
+        assert!(
+            ended.payload["stderr"]
+                .as_str()
+                .is_some_and(|s| s.contains("root/sudo")),
+            "the CLI's own refusal must reach the journal rather than an empty \
+             string it lost a race to: {}",
+            ended.payload
+        );
+
+        let state = backend.state.lock().expect("adapter state lock");
+        let observation = observe_in_memory(&state.executions["e-stderr"]);
+        assert_eq!(
+            observation.native,
+            NativeState::Unknown,
+            "an envelope-less turn is ambiguity, and ambiguity fails closed"
+        );
+        assert!(
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|e| e.contains("root/sudo")),
+            "…and the evidence the engine blocks with carries the same stderr: \
+             {observation:?}"
+        );
+    }
+
+    /// TH-4 (BS2 test-honesty finding): the sibling test above only proves
+    /// the *delivery* half of `STDERR_DRAIN_BUDGET` — a sender that sends
+    /// within the wait. Commit 39971e6 justifies the budget as bounded
+    /// specifically so a descendant that leaks the stderr pipe (holds the
+    /// write end open, never writes, never lets it close) cannot turn "no
+    /// stderr" into "no turn outcome" — i.e. the read must give up and
+    /// default to empty, not block forever. A sender that is kept alive but
+    /// never sends and never drops is exactly that leaked-descendant shape;
+    /// mutating `recv_timeout(STDERR_DRAIN_BUDGET)` to an unbounded `recv()`
+    /// makes this test hang instead of complete.
+    #[test]
+    fn a_stderr_sender_that_never_sends_does_not_block_the_turn_outcome() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backend = ClaudeBackend::new(ClaudeConfig::new(dir.path()));
+        let emitted = Arc::new(Mutex::new(Vec::<EventDraft>::new()));
+        let sink_events = Arc::clone(&emitted);
+        backend.set_event_sink(Arc::new(move |draft| {
+            sink_events.lock().expect("sink lock").push(draft);
+        }));
+        backend
+            .state
+            .lock()
+            .expect("adapter state lock")
+            .executions
+            .insert("e-stderr-never".to_string(), test_execution(None));
+
+        let mut child = Command::new("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn true");
+        let stdout = child.stdout.take().expect("piped stdout");
+        // `tx` is deliberately held alive (never sent on, never dropped)
+        // across `reader.run` below — simulating a descendant that leaked
+        // the stderr pipe's write end open without ever writing to it. A
+        // dropped sender would make `recv_timeout` return `Disconnected`
+        // instantly, which proves nothing about the bound; a live, silent
+        // sender is the only shape that actually exercises the timeout arm.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        let reader = TurnReader {
+            backend_state: Arc::clone(&backend.state),
+            ask_grammar: Arc::clone(&backend.ask_grammar),
+            sink: backend.sink.lock().expect("sink lock").clone(),
+            data_dir: dir.path().to_path_buf(),
+            execution_id: "e-stderr-never".to_string(),
+            work_id: "w-stderr-never".to_string(),
+            session_id: "s-stderr-never".to_string(),
+            model: None,
+            child: Arc::new(Mutex::new(child)),
+            stderr_rx: Some(rx),
+        };
+        // Round-2 finding TH-R2-05: `reader.run` used to be called directly,
+        // in-thread. That leaves the bounded-half assertion below unable to
+        // fail cleanly against the one mutation it exists to catch —
+        // `recv_timeout(STDERR_DRAIN_BUDGET)` turned into an unbounded
+        // `recv()` — because the test harness has no per-test timeout, and
+        // an infinite block just hangs the run rather than failing it. Doing
+        // the read on its own thread and bounding *this* thread's wait with
+        // `recv_timeout` turns that hang back into an ordinary, named
+        // assertion failure.
+        let started = std::time::Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            reader.run(stdout);
+            let _ = done_tx.send(());
+        });
+        let watchdog = STDERR_DRAIN_BUDGET * 6;
+        if done_rx.recv_timeout(watchdog).is_err() {
+            panic!(
+                "reader.run did not return within {watchdog:?} — STDERR_DRAIN_BUDGET's \
+                 bound was not enforced (e.g. `recv_timeout` mutated to an unbounded \
+                 `recv()`), which used to hang this test forever instead of failing it"
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= STDERR_DRAIN_BUDGET,
+            "a silent-but-live sender must be waited out for the full budget \
+             ({STDERR_DRAIN_BUDGET:?}), not returned early: took {elapsed:?}"
+        );
+        assert!(
+            elapsed < STDERR_DRAIN_BUDGET * 3,
+            "the wait must actually be bounded by the budget, not merely \
+             coincidentally slow: took {elapsed:?}"
+        );
+
+        let events = emitted.lock().expect("sink lock");
+        let ended = events
+            .iter()
+            .find(|e| e.kind == "conversation.turn.ended")
+            .expect("every turn ends with this event");
+        assert_eq!(
+            ended.payload["stderr"], "",
+            "no stderr ever arrived, so the field must default to empty rather \
+             than the turn outcome hanging on it: {}",
+            ended.payload
+        );
+        // Held alive (see above) through every assertion; dropped only now
+        // that `reader.run` has already returned.
+        drop(tx);
     }
 
     fn test_execution(model: Option<&str>) -> ClaudeExecution {
