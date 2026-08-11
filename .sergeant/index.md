@@ -16,7 +16,9 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `deliver-external-callback` | published | [`workflows/deliver-external-callback/index.md`](workflows/deliver-external-callback/index.md) |
 | `diagnose-bug` | published | [`workflows/diagnose-bug/index.md`](workflows/diagnose-bug/index.md) |
 | `direct-implementation` | published | [`workflows/direct-implementation/index.md`](workflows/direct-implementation/index.md) |
+| `dispatch` | published | [`workflows/dispatch/index.md`](workflows/dispatch/index.md) |
 | `drain-fleet` | published | [`workflows/drain-fleet/index.md`](workflows/drain-fleet/index.md) |
+| `implement` | published | [`workflows/implement/index.md`](workflows/implement/index.md) |
 | `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
 | `monitor-fleet` | published | [`workflows/monitor-fleet/index.md`](workflows/monitor-fleet/index.md) |
 | `project-graph` | published | [`workflows/project-graph/index.md`](workflows/project-graph/index.md) |
@@ -30,7 +32,9 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
 | `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 | `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
+| `validate-and-ship` | published | [`workflows/validate-and-ship/index.md`](workflows/validate-and-ship/index.md) |
 | `vet-external-skill` | published | [`workflows/vet-external-skill/index.md`](workflows/vet-external-skill/index.md) |
+| `wiki-digest` | published | [`workflows/wiki-digest/index.md`](workflows/wiki-digest/index.md) |
 
 `.sergeant/drafts/workflows/` holds generated, human-reviewable candidates —
 never admitted procedure, never listed here (`docs/icm/convention.md` §2).

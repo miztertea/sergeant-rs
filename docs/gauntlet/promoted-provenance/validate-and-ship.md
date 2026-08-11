@@ -179,3 +179,11 @@ N1 adjudication A6 (finding N1-BH-06, `reference-corpus/adjudication-round1.md`)
 ## Notes
 
 **Synthesis notes:** **U2 verdict** (`reference-corpus/synthesis.md` §1): the §6.3 reimplementation test *does* discriminate cleanly here, but only after the source's flat command list is split by outcome — the things that failed the test and became helpers, not stages, are the individual commands (`axi`, `axi status`, `axi logs`, `axi abort`, `axi sync --check`; BU-P2-101), the output grammar (BU-P2-102), the `--intent-file`/`--intent` flag choice (BU-P1-071), and the branch-sync decision table (BU-P1-078). Two entry variants share this stage list: coordinator-launched (starts at `20-select-intent-transport`) and directly-invoked (`/no-mistakes`, starts at `00-check-scope`, proceeding through `10-do-the-work` in task-first mode before rejoining the shared pipeline). See "Adjudication A5" above for the numbering history — both stages are now materialized directories, not a documented-only alternate entry point.
+
+**Curation note (promotion, `docs/icm/promotion-spec-2026-08-11.md` §1):**
+`60-close-out`, this package's true closing stage, declares a
+`promote`-dispositioned output with no finalize step — one of the 30 N1
+drafts in that bucket, not one of the 3 (`drain-fleet`, `respond-to-worker`,
+`to-spec`) that name one. D9 (`docs/icm/convention.md` §1a, "Open
+questions") does not block promotion on this; disposition here is applied
+by human review at merge time for this package, not mechanically.
