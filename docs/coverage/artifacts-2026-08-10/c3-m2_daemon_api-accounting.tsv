@@ -1,5 +1,5 @@
 stage	c3-m2_daemon_api
-wall_s	15
+wall_s	13
 profraw_before	15
 profraw_produced	42
 profraw_mergeable	42

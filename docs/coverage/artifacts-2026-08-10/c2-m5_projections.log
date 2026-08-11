@@ -1,12 +1,12 @@
 
-[1m== stage c2-m5_projections — 2026-08-10T22:13:27Z[0m
-   disk: 13 GB free (floor 10 GB)
+[1m== stage c2-m5_projections — 2026-08-10T23:55:43Z[0m
+   disk: 11 GB free (floor 10 GB)
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
    profraw before: 9
    $ cargo llvm-cov --no-report --test m5_projections
 info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
    Compiling sergeant-rs v0.1.0 (/home/user/sergeant-rs)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.56s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.55s
      Running tests/m5_projections.rs (target/llvm-cov-target/debug/deps/m5_projections-7feffc30a1438f0c)
 
 running 17 tests
@@ -28,7 +28,7 @@ test t5_disabled_export_runs_no_exporter_machinery ... ok
 test t6_the_daemon_answers_three_section_22_questions ... ok
 test rebuild_latency_on_a_realistic_journal_is_measured ... ok
 
-test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.71s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.80s
 
    profraw produced=6 mergeable=6 discarded=0 lost=0
    hygiene: leaked daemons [] /tmp entries 4

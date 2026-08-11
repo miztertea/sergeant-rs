@@ -1,11 +1,11 @@
 
-[1m== stage c2-m5_projections — 2026-08-10T16:44:59Z[0m
-   disk: 17 GB free (floor 10 GB)
+[1m== stage c2-m5_projections — 2026-08-10T23:58:31Z[0m
+   disk: 11 GB free (floor 10 GB)
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
    profraw before: 9
    $ cargo llvm-cov --no-report --test m5_projections
 info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.28s
      Running tests/m5_projections.rs (target/llvm-cov-target/debug/deps/m5_projections-7feffc30a1438f0c)
 
 running 17 tests
@@ -27,8 +27,8 @@ test t4_deleting_the_projections_directory_loses_nothing ... ok
 test t6_the_daemon_answers_three_section_22_questions ... ok
 test rebuild_latency_on_a_realistic_journal_is_measured ... ok
 
-test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.84s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.65s
 
    profraw produced=6 mergeable=6 discarded=0 lost=0
-   hygiene: leaked daemons [] /tmp entries 0
+   hygiene: leaked daemons [] /tmp entries 4
    stage c2-m5_projections ok

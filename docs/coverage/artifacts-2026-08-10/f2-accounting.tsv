@@ -1,9 +1,9 @@
 stage	f2
-wall_s	132
-profraw_before	94
-profraw_produced	90
-profraw_mergeable	90
+wall_s	159
+profraw_before	110
+profraw_produced	110
+profraw_mergeable	110
 profraw_discarded	0
-profraw_lost	90
+profraw_lost	110
 profraw_loss_expected	each census pass opens with cargo llvm-cov clean --profraw-only, so the baseline's profdata is not polluted by census runs (R-S0-6)
-profraw_total	94
+profraw_total	110

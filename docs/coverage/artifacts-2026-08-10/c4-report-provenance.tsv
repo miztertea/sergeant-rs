@@ -1,8 +1,8 @@
 profraw_present	110
 profraw_merged	110
 profdata	/home/user/sergeant-rs/target/llvm-cov-target/sergeant-rs.profdata
-profdata_bytes	365024
-lcov_bytes	441200
-lcov_sha256	7c0f4a2a40cd91051ccb58c01a5d7063fac0cd4418738f4a27dcd3a10f34bfd1
+profdata_bytes	377824
+lcov_bytes	456623
+lcov_sha256	39f38fb2e8ecd93fc753bb7eaafcbacfa7a901cb9563347168f1761b3a0acf1c
 lcov_path	/home/user/sergeant-rs/target/llvm-cov-reports/lcov.info
 html_path	/home/user/sergeant-rs/target/llvm-cov-reports/html/index.html

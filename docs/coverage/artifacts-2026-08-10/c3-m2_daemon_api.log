@@ -1,12 +1,12 @@
 
-[1m== stage c3-m2_daemon_api — 2026-08-10T22:13:41Z[0m
-   disk: 13 GB free (floor 10 GB)
+[1m== stage c3-m2_daemon_api — 2026-08-10T23:55:55Z[0m
+   disk: 11 GB free (floor 10 GB)
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
    profraw before: 15
    $ cargo llvm-cov --no-report --test m2_daemon_api
 info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
    Compiling sergeant-rs v0.1.0 (/home/user/sergeant-rs)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.09s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.28s
      Running tests/m2_daemon_api.rs (target/llvm-cov-target/debug/deps/m2_daemon_api-8830e02b6cb16b5b)
 
 running 32 tests
@@ -16,34 +16,34 @@ test crash_between_mutation_and_command_record_still_replays ... ok
 test input_and_retry_duplicate_command_id_replays_the_recorded_outcome ... ok
 test duplicate_cancel_command_id_replays_the_recorded_outcome ... ok
 test input_and_retry_reject_malformed_bodies_and_invalid_command_ids ... ok
-test malformed_bodies_command_ids_and_resume_headers_are_structured_errors ... ok
 test input_on_a_needs_input_state_with_no_run_is_a_404_no_run ... ok
+test malformed_bodies_command_ids_and_resume_headers_are_structured_errors ... ok
 test concurrent_stale_replacement_leaves_the_surviving_daemon_discoverable ... ok
 test malformed_query_string_is_a_structured_error ... ok
 test retry_on_a_retryable_state_with_no_run_is_a_404_no_run ... ok
 test rejected_submit_is_journaled_and_replayed ... ok
 test retry_reenters_the_stage_and_fails_closed_when_the_backend_cannot_start ... ok
-test retry_success_prints_the_human_readable_line ... ok
 test sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_damage ... ok
+test retry_success_prints_the_human_readable_line ... ok
 test resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home ... ok
-test sse_resume_after_a_disconnect_mid_history_replay_yields_exactly_the_remaining_tail ... ok
 test shutdown_completes_with_a_live_sse_client_attached ... ok
 test stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed ... ok
-test t2_bearer_token_gates_v1_routes ... ok
+test sse_resume_after_a_disconnect_mid_history_replay_yields_exactly_the_remaining_tail ... ok
 test t1_descriptor_lifecycle_and_healthz ... ok
+test t2_bearer_token_gates_v1_routes ... ok
 test t5_cancel_semantics_and_state_machine ... ok
 test t5b_daemon_refuses_an_illegal_transition_and_appends_no_state_event ... ok
 test t3_submit_lists_pending_journals_and_survives_restart ... ok
 test t4_duplicate_command_id_is_byte_identical_even_across_restart ... ok
 test t6_sse_live_tail_and_resume_from_seq ... ok
 test t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed ... ok
-test t7b_cli_status_show_and_cancel_through_the_binary ... ok
 test t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete ... ok
-test the_data_dir_guard_reaps_the_daemon_a_client_command_spawns ... ok
+test t7b_cli_status_show_and_cancel_through_the_binary ... ok
 test unknown_route_and_wrong_method_answer_structured_json ... ok
+test the_data_dir_guard_reaps_the_daemon_a_client_command_spawns ... ok
 test work_list_human_form_prints_the_empty_and_populated_branches ... ok
 
-test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.46s
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.49s
 
    profraw produced=42 mergeable=42 discarded=0 lost=0
    hygiene: leaked daemons [] /tmp entries 4

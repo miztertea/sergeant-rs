@@ -1,16 +1,16 @@
 
-[1m== stage c4 — 2026-08-10T22:14:11Z[0m
-   disk: 13 GB free (floor 10 GB)
+[1m== stage c4 — 2026-08-10T23:56:24Z[0m
+   disk: 11 GB free (floor 10 GB)
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
    profraw before: 110
    profraws to merge: 110
    $ cargo llvm-cov report --summary-only
 Filename                      Regions    Missed Regions     Cover   Functions  Missed Functions  Executed       Lines      Missed Lines     Cover    Branches   Missed Branches     Cover
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-api.rs                           1836               103    94.39%         154                 3    98.05%        1154                56    95.15%           0                 0         -
-backend/claude.rs                1681               107    93.63%          93                 9    90.32%        1277                83    93.50%           0                 0         -
+api.rs                           1836                99    94.61%         154                 3    98.05%        1154                55    95.23%           0                 0         -
+backend/claude.rs                1681               106    93.69%          93                 9    90.32%        1277                82    93.58%           0                 0         -
 backend/fake.rs                   780                 7    99.10%          54                 1    98.15%         473                 2    99.58%           0                 0         -
-backend/mod.rs                     57                 8    85.96%           9                 0   100.00%          48                 8    83.33%           0                 0         -
+backend/mod.rs                     57                 0   100.00%           9                 0   100.00%          48                 0   100.00%           0                 0         -
 cli.rs                            976                78    92.01%          61                 8    86.89%         647                43    93.35%           0                 0         -
 daemon.rs                         812                51    93.72%          49                 2    95.92%         471                20    95.75%           0                 0         -
 domain/event.rs                   291                 7    97.59%          12                 0   100.00%         156                 0   100.00%           0                 0         -
@@ -22,7 +22,7 @@ domain/workspace.rs               415                14    96.63%          24   
 main.rs                             3                 0   100.00%           1                 0   100.00%           3                 0   100.00%           0                 0         -
 runtime/analytics.rs             1457               101    93.07%          66                 4    93.94%         866                44    94.92%           0                 0         -
 runtime/blob.rs                   116                 4    96.55%           9                 0   100.00%          67                 1    98.51%           0                 0         -
-runtime/engine.rs                1257               158    87.43%          56                13    76.79%         857               117    86.35%           0                 0         -
+runtime/engine.rs                1823               146    91.99%          79                15    81.01%        1290               108    91.63%           0                 0         -
 runtime/fsutil.rs                 302                14    95.36%          16                 1    93.75%         140                 3    97.86%           0                 0         -
 runtime/git.rs                     72                 0   100.00%           7                 0   100.00%          47                 0   100.00%           0                 0         -
 runtime/graph.rs                  696                17    97.56%          21                 1    95.24%         391                11    97.19%           0                 0         -
@@ -33,10 +33,10 @@ runtime/recovery.rs               335                18    94.63%          19   
 runtime/router.rs                 226                 6    97.35%          13                 1    92.31%         176                 3    98.30%           0                 0         -
 runtime/surface.rs                701                34    95.15%          28                 6    78.57%         398                20    94.97%           0                 0         -
 telemetry.rs                     1349                44    96.74%          72                 4    94.44%         787                31    96.06%           0                 0         -
-tui.rs                           1508               200    86.74%          94                 6    93.62%         883               124    85.96%           0                 0         -
-web.rs                            752               110    85.37%          33                 2    93.94%         403                67    83.37%           0                 0         -
+tui.rs                           1702               158    90.72%         101                 6    94.06%         974                91    90.66%           0                 0         -
+web.rs                            872                58    93.35%          35                 0   100.00%         480                38    92.08%           0                 0         -
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-TOTAL                           17339              1202    93.07%         981                68    93.07%       10766               691    93.58%           0                 0         -
+TOTAL                           18219              1083    94.06%        1013                68    93.29%       11367               610    94.63%           0                 0         -
    $ cargo llvm-cov report --lcov --output-path /home/user/sergeant-rs/target/llvm-cov-reports/lcov.info
 
     Finished report saved to /home/user/sergeant-rs/target/llvm-cov-reports/lcov.info

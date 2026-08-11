@@ -1,0 +1,73 @@
+# The S-series coverage lane (proposal §10, rulings R-S0-3/R-S0-9).
+#
+# Non-blocking by design: manual dispatch + weekly schedule, never a PR
+# trigger, never a required check. The number this lane produces is the
+# program's number because it runs the SAME committed stage scripts as the
+# baseline (R-S0-3) — a green run means the convention's gate holds, a red
+# run is a signal to look, not a blocked PR.
+#
+# Gate: --fail-under-lines 90, set BELOW the S2 close-out measurement
+# (94.63% lines at dc0d447, 2026-08-10 — the close-out section of
+# docs/coverage/baseline-2026-08-10.md) per the spread policy: routine
+# drift never blocks work; a real regression through 90 does. Re-set it
+# against future re-measurements, never silently.
+#
+# COV_ARTIFACTS points at runner.temp (R-S0-12 review finding 1): the
+# committed docs/coverage/artifacts-2026-08-10/ tree is frozen evidence
+# carrying the dev container's toolchain fingerprint — measuring into it
+# would trip the drift guard on every CI run and dirty the checkout.
+name: coverage
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    # Cold instrumented DuckDB (~500 C++ TUs) is unmeasured on 2-core
+    # runners; the 4-core dev-container estimate was 15-25 min. Wide
+    # margin on purpose (review finding 4).
+    timeout-minutes: 120
+    env:
+      COV_ARTIFACTS: ${{ runner.temp }}/coverage-artifacts
+    steps:
+      - uses: actions/checkout@v4
+      - name: reclaim runner disk (the stage scripts enforce a 10 GB floor)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: target/llvm-cov-target
+      - name: measure (the committed convention, stages C0-C4)
+        run: |
+          # A cache hit restores last week's profraws; pooled stale profiles
+          # are a silently wrong number (review finding 2). Clean first.
+          cargo llvm-cov clean --profraw-only || true
+          bash scripts/coverage/c0-show-env.sh
+          bash scripts/coverage/c1-lib.sh
+          bash scripts/coverage/c2-suites.sh
+          bash scripts/coverage/c3-spawning-suites.sh
+          bash scripts/coverage/c4-report.sh
+      - name: gate and summarize
+        run: |
+          # Capture first so a genuine gate trip still emits a complete
+          # summary block before the step fails (review finding 6).
+          set +e
+          cargo llvm-cov report --summary-only --fail-under-lines 90 > /tmp/cov-summary.txt 2>&1
+          GATE_RC=$?
+          set -e
+          {
+            echo '## Coverage (S-series convention, gate 90 lines)'
+            echo '```'
+            cat /tmp/cov-summary.txt
+            echo '```'
+            echo '_Headline includes #[cfg(test)] code (~18% of src lines) — see docs/coverage/baseline-2026-08-10.md for the caveat and the known-losses register._'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$GATE_RC"

@@ -1,19 +1,19 @@
 
-[1m== stage c2-m4_backends — 2026-08-10T16:44:47Z[0m
-   disk: 17 GB free (floor 10 GB)
+[1m== stage c2-m4_backends — 2026-08-10T23:58:19Z[0m
+   disk: 11 GB free (floor 10 GB)
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
    profraw before: 2
    $ cargo llvm-cov --no-report --test m4_backends
 info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.32s
      Running tests/m4_backends.rs (target/llvm-cov-target/debug/deps/m4_backends-b388c1e5312edfdc)
 
-running 44 tests
+running 45 tests
 test a1_real_claude_session_identity_survives_turns_and_restart ... ignored, opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored
 test a3_real_claude_interrupt_leaves_the_conversation_resumable ... ignored, opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored
 test a2_substitution_is_detected_from_the_recorded_envelope ... ok
-test a2_provider_qualified_pin_is_rejected_preflight ... ok
 test a4_a_crash_between_spawn_and_execution_started_blocks_the_work ... ok
+test a2_provider_qualified_pin_is_rejected_preflight ... ok
 test a4_a_crash_inside_the_reconcile_append_window_rederives_on_restart ... ok
 test a4_reconcile_does_not_ask_a_backend_that_cannot_resume ... ok
 test a4_reconcile_reattaches_a_resumable_execution_before_it_classifies ... ok
@@ -44,18 +44,19 @@ test an_in_flight_turn_is_killed_by_interrupt_and_reported_as_resumable ... ok
 test resume_refuses_a_pin_that_could_never_be_honored ... ok
 test d2_the_launch_grammar_is_session_pinned_then_resumed ... ok
 test stop_kills_a_turn_that_is_still_running ... ok
-test r6_client_disconnect_mid_run_has_no_consequence ... ok
 test resume_launches_later_turns_under_the_re_supplied_configuration ... ok
+test the_backend_contracts_wire_vocabulary_is_pinned_variant_by_variant ... ok
+test r6_client_disconnect_mid_run_has_no_consequence ... ok
 test the_journaling_sink_chains_causation_within_an_execution ... ok
 test the_live_gate_skips_on_both_of_the_contracts_conditions ... ok
 test the_capability_probe_is_journaled_at_registration ... ok
 test send_refuses_a_second_turn_while_one_is_in_flight ... ok
-test the_sinks_causation_chain_is_bounded ... ok
 test the_real_adapter_journals_from_the_daemon_request_path ... ok
+test the_sinks_causation_chain_is_bounded ... ok
 test stop_latches_and_a_stopped_execution_refuses_input ... ok
 
-test result: ok. 42 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.14s
+test result: ok. 43 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 3.13s
 
    profraw produced=1 mergeable=1 discarded=0 lost=0
-   hygiene: leaked daemons [] /tmp entries 0
+   hygiene: leaked daemons [] /tmp entries 4
    stage c2-m4_backends ok

@@ -1,37 +1,41 @@
 
-[1m== stage c3-m6_surfaces — 2026-08-10T16:43:49Z[0m
-   disk: 17 GB free (floor 10 GB)
+[1m== stage c3-m6_surfaces — 2026-08-10T23:57:12Z[0m
+   disk: 11 GB free (floor 10 GB)
    toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
-   profraw before: 45
+   profraw before: 57
    $ cargo llvm-cov --no-report --test m6_surfaces
 info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
      Running tests/m6_surfaces.rs (target/llvm-cov-target/debug/deps/m6_surfaces-0c9fa9e14b33fe2a)
 
-running 18 tests
-test t1_the_tui_has_no_private_shortcut ... ok
+running 22 tests
+test doctor_reports_a_journal_it_cannot_even_open ... ok
 test t1_bare_sgt_opens_the_tui_as_a_client ... ok
+test t1_the_tui_has_no_private_shortcut ... ok
+test a_detail_screen_whose_work_vanished_falls_back_to_the_fleet ... ok
 test t1_the_events_endpoint_filters_and_tails_by_work ... ok
 test t1_the_tui_renders_and_drives_the_fleet_over_the_api ... ok
-test t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob ... ok
 test t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it ... ok
+test t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob ... ok
 test t4_the_demo_and_the_client_name_the_same_timeout_knob ... ok
-test t4_a_client_that_applies_the_knob_is_quiet_about_it ... ok
+http://127.0.0.1:34127/ui?token=01KZQ1QWQXTRJAJ4QY3M2Y6JVH01KZQ1QWQX9CQT5SZB6CVVJA5T
+the token is in that URL — it is a secret; loopback only, and it changes every time the daemon restarts
+test t2_the_dashboard_serves_real_data_and_is_embedded ... ok
 test t5_the_tui_and_the_dashboard_are_clients_like_any_other ... ok
 test t5b_the_structural_scan_sees_every_spelling_of_a_path ... ok
 test t6_the_sse_vocabulary_is_stated_once_and_stays_complete ... ok
-http://127.0.0.1:45971/ui?token=01KZP8YB24T7C7H4VAXS70W70901KZP8YB24XQ8EMCVP1T4SMQQN
-the token is in that URL — it is a secret; loopback only, and it changes every time the daemon restarts
-test t2_the_dashboard_serves_real_data_and_is_embedded ... ok
+test t4_a_client_that_applies_the_knob_is_quiet_about_it ... ok
 test t3_doctor_names_every_fault_and_its_remedy ... ok
+test the_dashboard_answers_a_missing_work_and_an_unreadable_journal_as_faults ... ok
 test the_coverage_harness_grades_its_own_accounting ... ok
 test the_tui_stack_is_ratatui_with_crossterm_reached_through_it ... ok
 test the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown ... ok
 test the_spawned_daemon_rig_stops_its_daemon_with_sigterm ... ok
+test web_open_reports_a_browser_that_refuses_to_open_it ... ok
 test t4_the_section_39_demo_runs_and_its_evidence_resolves ... ok
 
-test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.77s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.95s
 
-   profraw produced=49 mergeable=49 discarded=0 lost=0
-   hygiene: leaked daemons [] /tmp entries 0
+   profraw produced=53 mergeable=53 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 4
    stage c3-m6_surfaces ok

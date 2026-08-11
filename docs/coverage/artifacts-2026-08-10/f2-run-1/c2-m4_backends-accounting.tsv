@@ -1,5 +1,5 @@
 stage	c2-m4_backends
-wall_s	3
+wall_s	4
 profraw_before	2
 profraw_produced	1
 profraw_mergeable	1

@@ -43,6 +43,63 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### S2 — Stabilization (2026-08-10/11)
+
+**Mission outcome: contract met, gate regime green.** All twelve coverage
+issues resolved — ten by `Fixes` trailer (#30/#32–#35/#37–#41), two closed
+at adjudication with recorded reasons (#31: the fsutil non-WouldBlock arm
+is unreachable without a seam — measured: the suite runs as root so DAC
+tricks silently pass, and Linux equates EAGAIN with EWOULDBLOCK; #36:
+`EngineError::Core`→500 is reachable only by infrastructure fault; the
+proposed `segment_max_bytes` seam declined at R1). Three waves, +73
+falsifiable tests (221→**294** + 2 opt-in), every pin carrying *executed*
+mutation evidence. Coverage by the committed convention: **91.43 →
+94.63% lines** (+3.20), regions 90.89→94.06, functions 91.95→93.29, at
+close-out tip `dc0d447`. Close-out census: F1 10/10 uninstrumented, F2
+3/3 instrumented, zero failures. The CI lane
+(`.github/workflows/coverage.yml`) landed after an R-S0-12 review whose
+error finding was structural — the drift guard would have failed every CI
+run against the committed dev-container fingerprint — plus a
+cache-contamination hazard (stale pooled profraws: a silently wrong
+number, doctrine 4's exact case); all five amendments applied. Gate:
+`--fail-under-lines 90`, 4.63 below measured, per the spread policy.
+Wave-3's blind auditor also produced the close-out residual register —
+eight declined-with-reason entries appended to the baseline doc, none
+silent. One R-S0-7 escalation filed: **#45** (m6 dropped-daemon flake
+under load, recurred across two independent sessions; failure shape —
+dead pid, surviving descriptor — is possibly the #26 startup-window
+class, product-adjacent).
+
+**Environmental behavior.** Three wave workflows + one resume + a config
+reviewer, ~3.4M subagent tokens. The instrument protocol *evolved
+mid-program and the evolution is the finding*: wave 1 (10 agents, 1.34M)
+ran self-probing builders and its panel caught two unfalsifiable tests
+green-against-broken-guards plus an L5 deviation and a placeholder
+self-report — so wave 2 (7 agents; original run + 100k-token cache-resume
+after a container restart recovered five orphaned fixer commits with zero
+rework, the M2/M3 precedent) replaced self-probes with builder guard maps
+executed by one independent batched prober (37 mutations, 32 kills, 6
+survivors — including a mislabeled guard the prober re-sited by probing
+both candidates). Wave 3 (3 agents, 440k): Opus auditor + prober (31/28/3)
++ fixer; survivors closed by in-place assertion strengthening, each
+mutation re-executed. The wave-2 builders' empirical escalations
+(root-DAC bypass, EAGAIN≡EWOULDBLOCK, O_APPEND defeating post-start
+sabotage) are recorded environment facts for every future test author.
+Owner interventions this milestone: issue↔PR linkage discipline (trailers
++ per-wave PR-body accounting, adopted).
+
+**Adjudication rulings.** (1) #31/#36 sub-items closed-with-reason on
+builder-measured evidence; seams declined. (2) The guard-map/independent-
+prober protocol is the S-series standard from wave 2 on (L13
+operationalized as design). (3) #45 escalated on R-S0-7's recurrence rule
+rather than waved off as noise — the failure shape is product-adjacent.
+(4) The CI lane's review verdict (amend-first) applied in full; the lane
+measures into `runner.temp`, never the frozen evidence tree. (5) Gate 90
+recorded in the baseline close-out section; the S1-era "88 against 91.43"
+recommendation is superseded there, visibly.
+
+---
+
 ### S1 — Coverage Baseline (2026-08-10)
 
 **Mission outcome: contract met, gate regime green.** Measured baseline at
