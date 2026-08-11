@@ -168,13 +168,16 @@ fn crash_tail_recovery() {
         .append(draft("tick", None))
         .expect("append after recovery");
     assert_eq!(e4.seq, 4);
-    // Exactly one segment-data fsync accounted per acknowledged append.
+    // The fsync is the group's, not the append's (#44): writing the line
+    // costs no durability syscall, closing the group costs exactly one.
     // Honest scope (contract Unknowns): `fsync_count` is a counter the
     // implementation maintains — its coupling to the real `sync_data` call
     // lives in `sync_now`'s single derived expression, not in anything this
     // assertion can observe; OS-level durability is unverifiable from inside
     // the process. The failure half of the guarantee is covered behaviorally
     // by this test's crash-recovery assertions above.
+    assert_eq!(journal.fsync_count(), fsyncs_before);
+    journal.sync().expect("group commit");
     assert_eq!(journal.fsync_count(), fsyncs_before + 1);
 }
 

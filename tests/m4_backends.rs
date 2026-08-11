@@ -7596,3 +7596,162 @@ fn n27b_waiting_a_deferred_runs_each_completion_exactly_once() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+// ------------------------- §22.5 × #44. group commit's L6 obligation
+//
+// Group commit (issue #44) makes a whole authoritative lock hold share one
+// fsync. L6's question is what a crash does to the gaps that opens: between
+// two grouped appends, and after the group's last append but before its single
+// fsync. The answer this test establishes is a *subset* claim, not a
+// probability one —
+//
+//   per-append fsync guaranteed a floor (everything acknowledged is durable)
+//   but never a ceiling: the OS was always free to have written more, so the
+//   on-disk state after a crash was always "some byte prefix of what was
+//   written, possibly torn at the end". Group commit lowers the floor. It
+//   cannot widen that set, because the set was already every byte prefix.
+//
+// — and therefore no recovery obligation is new. Rather than argue it, the
+// test enumerates it: every byte offset a crash could stop at, over the exact
+// journal a real grouped hold writes, must reopen, replay, rebuild and
+// reconcile into a legal fail-closed state. `n26` keeps the fixture honest
+// against what the engine actually writes; this keeps the *prefixes* honest.
+
+/// Every prefix a crash inside one grouped lock hold can leave is a prefix the
+/// existing torn-tail/segment recovery already handles.
+///
+/// Guard map: the `open_group_len`/`fsync_count` assertions fail if `Core`
+/// stops grouping (per-append fsync restored) or if `commit` publishes early;
+/// the prefix loop fails if `recover_tail`'s quarantine, replay's seq
+/// validation, or `reconcile`'s fail-closed disposition stops covering a
+/// mid-group cut. Deleting `recover_tail`'s truncation, for instance, makes
+/// every mid-line offset a `Malformed` open and panics here.
+#[test]
+fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_handles() {
+    let source = TempDir::new().expect("tempdir");
+    let work_id = "01N3GRP";
+
+    // 1. Write exactly what a submit's first authoritative hold writes, and
+    //    never close the group — the state a crash mid-hold finds.
+    let bytes = {
+        let mut core = core(source.path());
+        journal_two_stage_prefix(&mut core, work_id, source.path());
+        commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_RESERVED,
+            reservation_payload("01N3GRPEXEC"),
+        );
+        assert_eq!(
+            core.open_group_len(),
+            6,
+            "six events appended under one hold: this is the group whose \
+             single fsync #44 is about"
+        );
+        assert_eq!(
+            core.journal.fsync_count(),
+            0,
+            "and not one of them has been fsynced yet — otherwise the \
+             prefixes enumerated below are not the ones a crash can produce"
+        );
+        std::fs::read(source.path().join("journal").join("00000001.ndjson"))
+            .expect("the group's bytes are on disk before any fsync")
+    };
+    assert!(
+        bytes.len() > 1000,
+        "a realistic group, not a toy: {}",
+        bytes.len()
+    );
+
+    // Where a complete line ends. A prefix cut at or past one of these
+    // recovers that many events; anything between two of them is a torn tail.
+    let line_ends: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| **b == b'\n')
+        .map(|(index, _)| index + 1)
+        .collect();
+    assert_eq!(line_ends.len(), 6, "six complete lines");
+
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, source.path());
+
+    let mut torn_prefixes = 0usize;
+    for cut in 0..=bytes.len() {
+        let dir = source.path().join(format!("crash-at-{cut}"));
+        std::fs::create_dir_all(dir.join("journal")).expect("journal dir");
+        std::fs::write(dir.join("journal").join("00000001.ndjson"), &bytes[..cut])
+            .expect("write the prefix a crash at this byte would leave");
+
+        // `Journal::open` is the recovery: quarantine a torn tail, truncate to
+        // the last complete line, replay-validate the chain. A panic here is
+        // the whole failure mode this test exists to exclude.
+        let mut core = core(&dir);
+
+        let complete = line_ends.iter().filter(|end| **end <= cut).count() as u64;
+        if complete < cut as u64 && !line_ends.contains(&cut) && cut > 0 {
+            torn_prefixes += 1;
+        }
+        let seqs: Vec<u64> = core
+            .journal
+            .replay()
+            .expect("replay a recovered prefix")
+            .map(|e| e.expect("no malformed line may survive recovery").seq)
+            .collect();
+        assert_eq!(
+            seqs,
+            (1..=complete).collect::<Vec<_>>(),
+            "a crash at byte {cut} must leave exactly the complete lines \
+             before it, in order — never a gap, never a fragment"
+        );
+
+        // And the daemon that comes back up must converge, fail-closed, on
+        // every one of them.
+        let report = recovery::reconcile(&engine, &mut core)
+            .expect("reconcile must converge on every reachable prefix");
+        let state = core.registry.state().works.get(work_id).map(|w| w.state);
+        match complete {
+            0 => assert!(state.is_none(), "no work exists before its first line"),
+            _ => assert!(
+                matches!(state, Some(WorkState::Pending) | Some(WorkState::Blocked)),
+                "a prefix of {complete} events must recover to a state the \
+                 journal proves, never an invented one: {state:?}"
+            ),
+        }
+        assert!(
+            report.resumed.is_empty(),
+            "nothing in this group is resumable evidence, so nothing may be \
+             resumed from a prefix of it (cut {cut})"
+        );
+        assert!(
+            fake.starts().is_empty(),
+            "no prefix may start an external effect (cut {cut})"
+        );
+        std::fs::remove_dir_all(&dir).expect("keep the fixture tree bounded");
+    }
+    assert!(
+        torn_prefixes > 0,
+        "the enumeration must actually include torn tails, not only clean \
+         line boundaries"
+    );
+
+    // The full group is byte-for-byte window 2's prefix, so the whole
+    // enumeration ends exactly where `n11` already stands: the identity is
+    // kept, the reservation is abandoned, nothing is started.
+    let dir = source.path().join("crash-at-none");
+    std::fs::create_dir_all(dir.join("journal")).expect("journal dir");
+    std::fs::write(dir.join("journal").join("00000001.ndjson"), &bytes).expect("write");
+    let mut core = core(&dir);
+    recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains("fake-session-01N3GRPEXEC"),
+        "the owned identity must survive a group that was never fsynced but \
+         was written whole: {evidence}"
+    );
+}

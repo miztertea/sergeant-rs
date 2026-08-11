@@ -337,7 +337,7 @@ impl Journal {
         let mut line = serde_json::to_vec(event).map_err(JournalError::Serialize)?;
         line.push(b'\n');
         let started = self.append_observer.as_ref().map(|_| Instant::now());
-        if let Err(err) = self.write_and_sync(&line) {
+        if let Err(err) = self.segment_file.write_all(&line) {
             // A failed write_all can leave torn, un-terminated bytes in the
             // segment while the handle stays otherwise usable; a later
             // acknowledged append would then concatenate onto the fragment and
@@ -375,18 +375,6 @@ impl Journal {
     /// on it is the same as any metric callback: cheap and infallible.
     pub fn set_append_observer(&mut self, observer: AppendObserver) {
         self.append_observer = Some(observer);
-    }
-
-    /// Write one line and close its group immediately.
-    ///
-    /// The group boundary this commit introduces is drawn by [`CoreGuard`],
-    /// but the fsync has not moved onto it yet: every append still syncs
-    /// itself, so this commit changes structure and nothing else. Issue #44's
-    /// actual change is the next commit, which deletes the `sync_now` call
-    /// below and lets the group's close pay for the whole group.
-    fn write_and_sync(&mut self, line: &[u8]) -> std::io::Result<()> {
-        self.segment_file.write_all(line)?;
-        self.sync_now()
     }
 
     /// Issue the one accounted durability syscall and close the group.
@@ -945,6 +933,173 @@ mod tests {
             "and the segment replays as two clean events, with no trace of \
              the fragment the rollback removed"
         );
+    }
+
+    /// Issue #44's primitive, stated as an equation: N appends between two
+    /// syncs cost **one** fsync, not N — and the events are all there.
+    ///
+    /// Mutation that must kill it: restoring the fsync inside `append_event`
+    /// (whatever it is spelled) makes `fsync_count()` 5 instead of 1.
+    #[test]
+    fn a_group_of_appends_costs_exactly_one_fsync() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open(dir.path()).expect("open");
+
+        for n in 1..=5 {
+            journal.append(draft(n)).expect("append");
+        }
+        assert_eq!(
+            journal.fsync_count(),
+            0,
+            "an open group has not been synced yet: the fsync belongs to the \
+             group's close, not to any one append"
+        );
+        assert!(
+            journal.is_dirty(),
+            "five written lines, none of them synced"
+        );
+
+        // Written is visible even before the group closes — every in-process
+        // reader replays the same five events.
+        let seqs: Vec<u64> = journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event").seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+
+        journal.sync().expect("group commit");
+        assert_eq!(
+            journal.fsync_count(),
+            1,
+            "one group, one fsync — this is the whole of #44"
+        );
+        assert!(!journal.is_dirty());
+
+        // A second sync with nothing written is free, so a read-only lock
+        // hold costs no syscall at all.
+        journal.sync().expect("idempotent");
+        assert_eq!(journal.fsync_count(), 1);
+    }
+
+    /// A rotation is a group boundary: the segment being left behind is
+    /// synced before the handle moves on, because `dirty` describes
+    /// `segment_file` and that handle is about to be replaced.
+    ///
+    /// Mutation that must kill it: deleting `self.sync()?` from
+    /// `rotate_if_needed` leaves `fsync_count()` at 0 with the first segment's
+    /// lines never covered by any fsync.
+    #[test]
+    fn rotation_closes_the_open_group_on_the_segment_it_leaves() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Rotate after the first line, so append #2 crosses the boundary.
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+
+        journal.append(draft(1)).expect("first append");
+        assert_eq!(journal.segment_index, 1);
+        assert_eq!(journal.fsync_count(), 0, "still one open group");
+
+        journal
+            .append(draft(2))
+            .expect("append across the rotation");
+        assert_eq!(journal.segment_index, 2, "the fixture must really rotate");
+        assert_eq!(
+            journal.fsync_count(),
+            1,
+            "the group open on segment 1 must be closed by the rotation, not \
+             left for a sync that would land on segment 2"
+        );
+
+        journal.sync().expect("close the group on segment 2");
+        assert_eq!(journal.fsync_count(), 2);
+        let seqs: Vec<u64> = journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event").seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    /// A failed **group** fsync poisons the handle, where a failed *write* is
+    /// merely rolled back.
+    ///
+    /// The asymmetry is the design: at write time nothing has been told about
+    /// the line, so undoing it is honest; at group-sync time every event in
+    /// the group is already folded into the in-memory projections the daemon's
+    /// next decision reads, so undoing it on disk would leave those
+    /// projections describing a history the journal does not have. Fail closed
+    /// instead.
+    ///
+    /// Injection: an `O_PATH` descriptor. The kernel refuses `fsync` on one
+    /// with `EBADF` while the `Journal` is otherwise intact — and unlike the
+    /// read-only-handle trick used above, it does not also break the write, so
+    /// the group being poisoned is a group that was genuinely written.
+    /// Probe-gated (a host whose `fsync` accepts it cannot express this).
+    ///
+    /// Mutation that must kill it: dropping `self.poisoned = true` from
+    /// `sync`'s error arm lets the next append proceed onto a journal whose
+    /// durability just failed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_group_sync_poisons_the_handle() {
+        use std::os::unix::fs::OpenOptionsExt;
+        /// `O_PATH`, as the kernel numbers it on Linux.
+        const O_PATH: i32 = 0o10000000;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open(dir.path()).expect("open");
+        journal.append(draft(1)).expect("append");
+        journal.append(draft(2)).expect("append");
+        let segment_path = dir
+            .path()
+            .join("journal")
+            .join(segment_file_name(journal.segment_index));
+        let written = fs::read(&segment_path).expect("read the written segment");
+
+        let Ok(unsyncable) = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH)
+            .open(&segment_path)
+        else {
+            eprintln!("SKIPPED-ENV: this host refuses to open an O_PATH descriptor");
+            return;
+        };
+        if unsyncable.sync_data().is_ok() {
+            eprintln!("SKIPPED-ENV: this host's fsync accepts an O_PATH descriptor");
+            return;
+        }
+        journal.segment_file = unsyncable;
+
+        let err = journal.sync().expect_err("the group fsync must fail");
+        assert!(
+            matches!(err, JournalError::Io(_)),
+            "expected the io error the failed fsync returned, got {err:?}"
+        );
+        assert!(
+            journal.poisoned,
+            "a failed group fsync must fail closed: the group's events are \
+             already in the projections and cannot be rolled back"
+        );
+        assert_eq!(
+            fs::read(&segment_path).expect("read segment"),
+            written,
+            "failing closed means changing nothing on disk, not truncating a \
+             group the projections already believe in"
+        );
+
+        let err = journal
+            .append(draft(3))
+            .expect_err("a poisoned handle must refuse further appends");
+        assert!(matches!(err, JournalError::Poisoned), "got {err:?}");
+        let err = journal.sync().expect_err("and refuse further syncs");
+        assert!(matches!(err, JournalError::Poisoned), "got {err:?}");
+
+        // Restore a real handle so `Drop`'s best-effort sync has something
+        // valid to close over (the poison latch skips it either way).
+        journal.segment_file = OpenOptions::new()
+            .append(true)
+            .open(&segment_path)
+            .expect("restore");
     }
 
     #[test]

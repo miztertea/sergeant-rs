@@ -2493,6 +2493,65 @@ mod tests {
         )
     }
 
+    /// The group commit, end to end (#44): one lock hold, N appends, **one**
+    /// fsync, and nothing published until the hold closes.
+    ///
+    /// Three separate regressions die here, which is why the assertions are
+    /// interleaved with the hold rather than taken after it:
+    ///
+    /// - `Core::commit` fsyncing per event again — the counter reads 6;
+    /// - `Core::commit` broadcasting per event again — the subscriber has
+    ///   frames while the hold is still open, i.e. an SSE client could learn
+    ///   about an event a crash would take back;
+    /// - `CoreGuard::drop` not flushing — the counter never leaves 0 and the
+    ///   six events are never published at all.
+    #[tokio::test]
+    async fn one_lock_hold_costs_one_fsync_and_publishes_only_when_it_ends() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+        let mut live = CoreGuard::acquire(&state.core).await.events_tx.subscribe();
+
+        {
+            let mut core = CoreGuard::acquire(&state.core).await;
+            for n in 1..=6u32 {
+                core.commit(seeded(n)).expect("commit");
+            }
+            assert_eq!(
+                core.journal.fsync_count(),
+                0,
+                "six appends under one hold must not have cost six fsyncs — \
+                 the fsync belongs to the hold, not to the append"
+            );
+            assert_eq!(core.open_group_len(), 6, "the group is still open");
+            assert!(
+                matches!(live.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+                "nothing may be published before it is durable: a subscriber \
+                 that sees an event mid-group can be told about a fact the \
+                 next instant's crash removes"
+            );
+        }
+
+        let core = CoreGuard::acquire(&state.core).await;
+        assert_eq!(
+            core.journal.fsync_count(),
+            1,
+            "closing the hold costs exactly one fsync for all six"
+        );
+        assert_eq!(core.open_group_len(), 0, "and leaves nothing open");
+        drop(core);
+
+        let mut published = Vec::new();
+        while let Ok(event) = live.try_recv() {
+            published.push(event.seq);
+        }
+        assert_eq!(
+            published,
+            vec![1, 2, 3, 4, 5, 6],
+            "every event of the group is published, in order, once the group \
+             is durable"
+        );
+    }
+
     /// Guard for the history loop's cursor bookkeeping in `forward_events`
     /// (`last_sent = event.seq`), which nothing else in the suite reaches.
     ///
