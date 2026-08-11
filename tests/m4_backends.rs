@@ -6669,6 +6669,101 @@ fn n30_two_observations_of_one_finished_turn_complete_the_stage_once() {
     );
 }
 
+/// The completion driver asks only about runs that could still be answered.
+///
+/// `due_observations` is an *enumeration*, and every clause in it is also
+/// re-checked by `observation_is_stale` at the settle — so deleting any of
+/// them leaves the suite green while changing something real: the driver would
+/// walk the daemon's whole history every 200 ms, taking an OBSERVE per
+/// terminal work forever, and taking one *underneath a launch that has not
+/// settled yet* — the one interleaving where two settles are racing for the
+/// same turn rather than one finding itself stale after the other.
+/// Mutation-probed: all four clauses survived the whole suite (M4–M7,
+/// 2026-08-11), which is L7's definition of unpinned.
+///
+/// The states below are all reachable, and three of them are crash residue
+/// rather than steady state — which is exactly why the filter cannot be
+/// "whatever the engine happens to produce on the happy path".
+#[test]
+fn n31_the_driver_only_asks_about_runs_that_could_still_be_answered() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+
+    // The one that is due: active work, active stage, a live execution.
+    journal_active_run(&mut core, "01N3DUELIVE", FAKE_BACKEND_NAME, "fake-live");
+
+    // Terminal work. Its execution record does not go away when it is
+    // canceled, so without the work-state clause this row is polled forever.
+    journal_active_run(&mut core, "01N3DUEGONE", FAKE_BACKEND_NAME, "fake-gone");
+    commit(
+        &mut core,
+        "01N3DUEGONE",
+        KIND_WORK_CANCELED,
+        json!({"from": "active"}),
+    );
+
+    // Crash residue: `stage.blocked` landed and `work.blocked` did not, so the
+    // work still reads `active` while its stage is parked on a decision. The
+    // stage is where the parked-ness lives, and the driver must read it.
+    journal_active_run(&mut core, "01N3DUEPARK", FAKE_BACKEND_NAME, "fake-park");
+    commit(
+        &mut core,
+        "01N3DUEPARK",
+        KIND_STAGE_BLOCKED,
+        json!({"stage_id": "00-only", "detail": "parked without its work event"}),
+    );
+
+    // Already asked to stop: the outcome of this execution is no longer the
+    // thing that decides the stage, and observing it would act on a turn
+    // sergeant has already retired.
+    journal_active_run(&mut core, "01N3DUESTOP", FAKE_BACKEND_NAME, "fake-stop");
+    commit(
+        &mut core,
+        "01N3DUESTOP",
+        KIND_EXECUTION_STOPPED,
+        json!({
+            "execution_id": "exec-01N3DUESTOP",
+            "backend": FAKE_BACKEND_NAME,
+            "reason": "stage completed",
+            "outcome": {"requested": true},
+        }),
+    );
+
+    // A launch in flight for this same stage attempt: `settle_launch` owns the
+    // observation of it and is about to take one. A second observer here is
+    // two settles racing for one turn instead of one being late.
+    journal_active_run(&mut core, "01N3DUELAUN", FAKE_BACKEND_NAME, "fake-laun");
+    commit(
+        &mut core,
+        "01N3DUELAUN",
+        KIND_EXECUTION_RESERVED,
+        json!({"reservation": {
+            "execution_id": "01N3DUELAUNSUPER",
+            "backend": FAKE_BACKEND_NAME,
+            "native_id": "fake-session-01N3DUELAUNSUPER",
+            "stage_id": "00-only",
+            "index": 0,
+            "attempt": 1,
+            "stage_kind": "actor",
+        }}),
+    );
+
+    let due: Vec<String> = engine
+        .due_observations(&core)
+        .iter()
+        .map(|p| p.work_id().to_string())
+        .collect();
+    assert_eq!(
+        due,
+        vec!["01N3DUELIVE".to_string()],
+        "only a run whose live execution nobody else is settling is due an \
+         observation"
+    );
+}
+
 /// §22.5 window 2 again, over a prefix the **engine actually produced**.
 ///
 /// N3-06: the eight window tests build their `execution.reserved` /
