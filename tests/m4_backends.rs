@@ -6138,6 +6138,31 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
             "a capability whose evidence is absent must not stay advertised (L1, L8): {:?}",
             backend.capabilities()
         );
+        // Round-2 finding TH-R2-02: everything checked above is entailed by
+        // the branch condition itself (one AtomicBool feeds both the
+        // withdrawal emission and `capabilities().ask`), so this arm was not
+        // actually falsifiable against a parser regression — if the adapter
+        // stopped *recognising* a `post_turn_summary` line that was really
+        // there, this arm would still pass and print SKIPPED-ENV instead of
+        // failing. Fetch the archived transcript independently, the same way
+        // `bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mode`
+        // verifies its own claim against the raw bytes rather than the
+        // adapter's classification of them, and assert the line really is
+        // absent.
+        let raw_ref = withdrawn[0].payload["raw"]
+            .as_str()
+            .expect("the withdrawal carries the raw blob ref it withdrew over");
+        let store = BlobStore::open(data.path()).expect("blob store");
+        let blob = store
+            .get(&BlobRef::from_str(raw_ref).expect("valid ref"))
+            .expect("the transcript this withdrawal cites must be archived");
+        let text = String::from_utf8_lossy(&blob);
+        assert!(
+            !text.contains("post_turn_summary"),
+            "the adapter withdrew `ask` claiming no post_turn_summary line, but the \
+             archived transcript it cited contains one — this is the parser regression \
+             this arm exists to catch, not an environment fact: {text}"
+        );
         return;
     }
 
