@@ -71,3 +71,38 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 
 - **`00-show-attention` — DEMOTED.** Its CONTEXT.md carried only the §6.5 deterministic-machinery boilerplate ("candidate execute-stage workload") with no additional checkpoint argument (no "Additional note" section). Per A4's default rule, folded into `10-gather-context` as a helper invocation; `BU-P3-062`/`BU-P3-063`/`BU-P3-064` and the stage's citations move with it. The stage directory is removed. No renumbering needed: the remaining ordinals `10-50` are already in correct order without a leading `00`.
 
+## Promotion note (`docs/icm/promotion-spec-2026-08-11.md`)
+
+`50-apply-outcome`, this package's true (and only) closing stage, declares
+a `promote` output disposition with no finalize step — one of the 30 of 34
+N1 packages in that shape, not one of the 3 (`drain-fleet`,
+`respond-to-worker`, `to-spec`) that name one. Recorded here per the
+spec's finalize-gap rule rather than silently promoted; disposition is
+left to human review at merge time, not applied mechanically by this
+curation act.
+
+**NEEDS-JUDGMENT resolution (§5):** this package's classification rests on
+two signals, both confirmed rather than re-adjudicated. (1) `## Delegation`
+in `40-grill-if-underspecified/CONTEXT.md` names **grilling** as the
+target that produces this stage's outcome; `grilling` is present in this
+library under `.sergeant/workflows/grilling/` at the time of this
+promotion, so the reference resolves. Because `grilling`'s own G5 case
+(re-enterable `needs_input` interview loop) lives inside `grilling`, not
+inside any of `triage`'s own five stages, `triage` inherits that
+caveat only by composition through delegation — it is not a second, live
+G5 case of `triage`'s own, and the "needs a scripted or real-backend
+acceptance pass before trusted" obligation attaches to `grilling`'s own
+promotion record, not repeated as a gate requirement here. (2) The
+`## Notes` section above (and `CONTEXT.md`'s "Notes for reviewers")
+separately records that BU-P3-060's non-linear transition graph
+(needs-triage fanning out to needs-info/ready-for-agent/ready-for-human/
+wontfix, looping, maintainer override at any point) was considered for an
+engine-gap claim by the source extractor and the claim was **rejected,
+not left open** — each transition is packaged as a fresh stage invocation,
+not a control-flow construct the engine must own. This is distinct from
+`grilling`'s live G5 and is not re-litigated here; it is carried across
+unedited as the adjudicated call it already is. §3's engine-acceptance
+gate exercised `triage`'s own five stages as ordinary sequential
+completions (none of which is itself a `needs_input` stage), so the clean
+gate pass is full mechanical confirmation of `triage`'s own packaging.
+
