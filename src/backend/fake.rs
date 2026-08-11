@@ -997,6 +997,104 @@ mod tests {
         );
     }
 
+    /// Every §37 grammar verb parses to its matching [`FakeStep`], both with
+    /// a `:detail` and (where the grammar allows it) bare — `parse_script`'s
+    /// full dispatch table, not a sample of it.
+    #[test]
+    fn parse_script_dispatches_every_verb_with_and_without_detail() {
+        let steps = parse_script(
+            "complete;complete:done;needs_input:who?;waiting:reason;\
+             blocked:why;fail:oops;hang",
+        );
+        assert_eq!(
+            steps,
+            vec![
+                FakeStep::complete(),
+                FakeStep::complete_with("done"),
+                FakeStep::needs_input("who?"),
+                FakeStep::waiting("reason"),
+                FakeStep::blocked("why"),
+                FakeStep::fail("oops"),
+                FakeStep::hang(),
+            ]
+        );
+    }
+
+    /// Whitespace around `;` and `:` is trimmed, empty segments (a leading,
+    /// trailing, or doubled `;`) are dropped rather than producing a bogus
+    /// step, and an unknown verb — bare or with a `:detail` — is ignored
+    /// rather than silently mistaken for a known one (documented at
+    /// [`FakeBackend::from_env`]: "a typo must not quietly change what the
+    /// demo demonstrates").
+    #[test]
+    fn parse_script_trims_whitespace_drops_empty_segments_and_ignores_unknown_verbs() {
+        let steps =
+            parse_script("  complete:done  ; ; unknown:whatever ; needs_input: who? ; typo ;  ");
+        assert_eq!(
+            steps,
+            vec![
+                FakeStep::complete_with("done"),
+                FakeStep::needs_input("who?")
+            ]
+        );
+    }
+
+    /// The empty script parses to no steps at all — the degenerate case a
+    /// `SGT_FAKE_SCRIPT=""` or an unset variable produces.
+    #[test]
+    fn parse_script_of_an_empty_string_is_no_steps() {
+        assert_eq!(parse_script(""), Vec::new());
+        assert_eq!(parse_script("   ; ;  "), Vec::new());
+    }
+
+    /// scripts/perf/README.md ("What the fake script means"): the parsed
+    /// steps are one global FIFO shared by the whole backend, not a queue
+    /// per execution — one step consumed per START and one per SEND, in
+    /// parse order, regardless of which execution asks. This is the
+    /// perf harness's documented, measured behavior spec for the backend
+    /// this test module is scoped to, so it is pinned here directly rather
+    /// than only indirectly through the shell harness.
+    #[test]
+    fn parsed_steps_are_one_global_fifo_shared_across_executions_and_sends() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            parse_script("needs_input:q1;needs_input:q2;complete:done"),
+        );
+        // START for two different executions draws two different steps from
+        // the same queue — the second START does not restart at the front.
+        let e1 = fake.start(&request("e1")).expect("start pops q1");
+        let e2 = fake.start(&request("e2")).expect("start pops q2");
+        assert_eq!(
+            fake.observe(&e1).expect("observe").signal,
+            BackendSignal::needs_input("q1")
+        );
+        assert_eq!(
+            fake.observe(&e2).expect("observe").signal,
+            BackendSignal::needs_input("q2")
+        );
+
+        // SEND draws from that same shared queue too: the next scripted step
+        // goes to whichever execution's SEND asks next, here e1's, even
+        // though e2 was the one still holding an unresolved `needs_input`.
+        fake.send(&e1, "answer").expect("send pops the last step");
+        assert_eq!(
+            fake.observe(&e1).expect("observe").signal,
+            BackendSignal::StageCompleted {
+                summary: Some("done".to_string())
+            }
+        );
+
+        // The script is now exhausted; e2's own SEND falls through to the
+        // documented default (§37: "a script that runs out completes every
+        // stage after it") rather than reusing or blocking on e1's step.
+        fake.send(&e2, "answer")
+            .expect("send falls through to the default");
+        assert_eq!(
+            fake.observe(&e2).expect("observe").signal,
+            BackendSignal::StageCompleted { summary: None }
+        );
+    }
+
     /// §15's capability flags are advertised, and an unsupported capability is
     /// advertised as `false` rather than emulated — checked against what the
     /// verbs actually do, which is the only way a flag can be wrong.

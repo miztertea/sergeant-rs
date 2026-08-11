@@ -1,0 +1,44 @@
+
+[1m== stage c2-m3_execution — 2026-08-10T23:58:23Z[0m
+   disk: 11 GB free (floor 10 GB)
+   toolchain: 1.94.1 / cargo-llvm-cov 0.8.7
+   profraw before: 3
+   $ cargo llvm-cov --no-report --test m3_execution
+info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.33s
+     Running tests/m3_execution.rs (target/llvm-cov-target/debug/deps/m3_execution-9e953f60016505b6)
+
+running 27 tests
+test a_backend_that_cannot_start_the_next_stage_blocks_with_the_stage_named ... ok
+test a_crash_inside_the_submit_window_fails_closed_with_the_git_evidence ... ok
+test a_backend_that_cannot_observe_its_execution_fails_the_work_closed ... ok
+test a_dirty_worktree_is_retained_and_recorded_at_teardown ... ok
+test a_malformed_workspace_file_fails_closed ... ok
+test a_profile_that_names_another_backend_is_refused_with_the_tier_that_routed ... ok
+test a_profile_is_launch_configuration_carried_to_the_backend ... ok
+test a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could ... ok
+test a_submission_with_no_workspace_is_captured_but_still_routed ... ok
+test a_workflow_name_that_escapes_the_workflows_directory_is_refused_at_submit ... ok
+test a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journaled ... ok
+test an_unknown_native_state_blocks_even_when_the_signal_says_completed ... ok
+test cancelling_a_blocked_work_retires_the_stage_it_was_parked_in ... ok
+test cancelling_a_failed_work_does_not_rewrite_the_stage_failure ... ok
+test cli_respond_and_retry_through_the_binary ... ok
+test input_for_a_forgotten_execution_blocks_with_the_stage_named ... ok
+test retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone ... ok
+test t1_zero_config_submit_materializes_a_real_worktree ... ok
+test native_liveness_never_decides_work_state_in_either_direction ... ok
+test t3_full_run_completes_every_stage_and_retires_the_surface ... ok
+test t4_needs_input_parks_the_run_and_input_resumes_it ... ok
+test t2_multi_repo_workspace_binds_one_worktree_per_repository ... ok
+test t7_routing_precedence_and_structured_failure ... ok
+test t5_failure_records_the_reason_and_retry_re_enters_the_stage ... ok
+test waiting_and_blocked_park_the_work_and_retry_re_enters ... ok
+test t6_cancel_mid_stage_leaves_no_zombie_work_state ... ok
+test t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.11s
+
+   profraw produced=6 mergeable=6 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 4
+   stage c2-m3_execution ok

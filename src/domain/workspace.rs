@@ -522,4 +522,43 @@ mod tests {
             .expect_err("unknown repository");
         assert!(err.contains("api, web"), "got {err}");
     }
+
+    /// `sergeant.toml` declaring no `[[repository]]` entries at all is
+    /// refused rather than accepted as a workspace with nothing to act on.
+    #[test]
+    fn a_workspace_config_with_no_repositories_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        let err = parse(root, "[workspace]\nname = \"empty\"\n")
+            .expect_err("no repositories at all must be refused");
+        assert!(
+            matches!(&err, WorkspaceError::NoRepositories { file } if file.ends_with(WORKSPACE_FILE)),
+            "expected NoRepositories naming the config file, got {err}"
+        );
+    }
+
+    /// Two `[[profile]]` entries with the same name are ambiguous under
+    /// `--profile <name>`: refused at parse time rather than silently letting
+    /// the later one shadow the earlier.
+    #[test]
+    fn two_profiles_may_not_share_a_name() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        let err = parse(
+            root,
+            "[workspace]\nname = \"w\"\n\n\
+             [[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
+             [[profile]]\nname = \"same\"\nbackend = \"claude\"\n",
+        )
+        .expect_err("a repeated profile name must be refused");
+        assert!(
+            matches!(&err, WorkspaceError::DuplicateProfile { name, .. } if name == "same"),
+            "got {err}"
+        );
+    }
 }

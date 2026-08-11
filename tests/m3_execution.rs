@@ -2219,6 +2219,245 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     handle.shutdown().await;
 }
 
+/// Retry's re-attachment falls back to a fresh branch cut from the recorded
+/// base SHA when the branch teardown was supposed to have retained is gone —
+/// deleted by something outside sergeant between the failed attempt and the
+/// retry. §12 promises retry as the one door back out of `failed`, and that
+/// promise must hold even when the "durable" half of a torn-down surface
+/// (the branch) has itself vanished out from under it.
+#[tokio::test]
+async fn retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    let base_sha = init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([
+        FakeStep::fail("boom"),
+        FakeStep::complete(),
+        FakeStep::complete(),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "branch vanishes before retry",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "failed");
+
+    let branch = format!("sergeant/{work_id}");
+    assert!(
+        branch_exists(&repo, &branch),
+        "teardown must retain the branch on failure"
+    );
+
+    // Something outside sergeant deletes the branch teardown was supposed
+    // to have kept — a stray cleanup, an operator, a rebase.
+    git(&repo, &["branch", "-D", &branch]);
+    assert!(!branch_exists(&repo, &branch));
+
+    // …and the repository moves on, so the two candidate start points for
+    // the rebuilt worktree are *different commits*. Without this the
+    // fixture's `main` still points at `base_sha` (one commit from
+    // `init_repo`, an uncommitted workflow, a failed attempt that committed
+    // nothing), and "cut from the recorded base SHA" would be
+    // indistinguishable from "cut from whatever the default branch happens
+    // to point at now" — the head_sha assertion below would hold either way.
+    std::fs::write(repo.join("DRIFT.md"), "main moved on\n").expect("write drift file");
+    git(&repo, &["add", "DRIFT.md"]);
+    git(
+        &repo,
+        &["commit", "-m", "main moves on after the failed attempt"],
+    );
+    let main_tip = git(&repo, &["rev-parse", "HEAD"]);
+    assert_ne!(
+        main_tip, base_sha,
+        "the fixture must leave main ahead of the recorded base SHA"
+    );
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "retry must not fail just because the retained branch is gone: {body}"
+    );
+    assert_eq!(body["work"]["state"], "completed");
+
+    // The branch is back — recreated by the fallback, not merely reused.
+    assert!(
+        branch_exists(&repo, &branch),
+        "rematerialize must recreate the branch retry needs"
+    );
+
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let rematerialized: Vec<&Event> = materialized
+        .iter()
+        .filter(|e| e.payload["rematerialized"] == true)
+        .collect();
+    assert_eq!(
+        rematerialized.len(),
+        1,
+        "retry must record the rematerialization: {materialized:?}"
+    );
+    let binding = &rematerialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(
+        binding["base_sha"], base_sha,
+        "provenance is unchanged by the fallback"
+    );
+    assert_eq!(
+        binding["head_sha"], base_sha,
+        "with no branch left to preserve, the rebuilt worktree starts \
+         exactly at the recorded base SHA — not at {main_tip}, where the \
+         repository's default branch has since moved to"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Clears an `chattr +i` immutable bit however the test that set it leaves.
+///
+/// The immutable directory lives inside a `TempDir`, and `TempDir::drop`
+/// *swallows* removal errors — so a panicking assertion between setting the
+/// bit and clearing it would leave a directory behind that not even root can
+/// `rm` until someone runs `chattr -i` by hand. A straight-line clear only
+/// runs on the happy path; a `Drop` runs on the unwinding one too. Same
+/// shape as `m2_daemon_api.rs`'s `ReapOnDrop`.
+#[cfg(target_os = "linux")]
+struct ClearImmutableOnDrop(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl Drop for ClearImmutableOnDrop {
+    fn drop(&mut self) {
+        // Best-effort by construction: a `Drop` that panics during an
+        // unwind aborts the process, which would hide the real failure.
+        let _ = Command::new("chattr").arg("-i").arg(&self.0).status();
+    }
+}
+
+/// Teardown's own `RetainedError` disposition: a worktree Git itself
+/// refuses to remove, distinct from a dirty one it declines to touch.
+///
+/// `chattr +i` marks the worktree directory immutable at the filesystem
+/// level rather than merely unwritable by permission bits — this daemon
+/// (and this test suite) runs as root, for whom an ordinary permission bit
+/// is not an obstacle, but the immutable attribute blocks deletion
+/// regardless of privilege. `git status --porcelain` still succeeds (reads
+/// are unaffected), so teardown proceeds to the removal itself and only
+/// that fails, giving `RetainedError` — not `RetainedDirty` — with Git's
+/// own diagnostic, and the same evidence journaled.
+///
+/// **Environment precondition** (deliberately a hard failure, not a silent
+/// skip — this is the only test covering the `RetainedError` disposition, so
+/// an environment that cannot run it must say so rather than quietly drop
+/// the coverage): `chattr` on `PATH`, `TMPDIR` on a filesystem that honours
+/// `FS_IMMUTABLE_FL` (ext4/xfs/btrfs do; tmpfs and overlayfs do not), and
+/// `CAP_LINUX_IMMUTABLE`. `#[cfg(target_os = "linux")]` gates the OS only;
+/// the setup assertion below reports the other three.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journaled() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "git cannot delete this worktree",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // The worktree stays clean; only Git's own removal is blocked. The
+    // guard is armed *before* the bit is set, so every path out of this
+    // test from here on clears it (see `ClearImmutableOnDrop`); arming it
+    // for a `chattr` that then fails costs one no-op `chattr -i`.
+    let _immutable = ClearImmutableOnDrop(worktree.clone());
+    // The fixture asserts an environment fact: this process may set
+    // FS_IMMUTABLE_FL (CAP_LINUX_IMMUTABLE, honoured by the TMPDIR
+    // filesystem). GitHub Actions' runner user lacks the capability
+    // (measured 2026-08-11, CI run 31448175583: "Operation not permitted").
+    // Where the fact does not hold the injection is inexpressible — skip
+    // honestly rather than panicking over the host's capability set.
+    let chattr = Command::new("chattr")
+        .args(["+i", worktree.to_str().expect("utf8 path")])
+        .status();
+    match chattr {
+        Err(_) => {
+            eprintln!(
+                "skipping: chattr is not on PATH; the immutable-bit fixture is not expressible here"
+            );
+            return;
+        }
+        Ok(status) if !status.success() => {
+            eprintln!(
+                "skipping: chattr +i refused (missing CAP_LINUX_IMMUTABLE or \
+                 filesystem support); the immutable-bit fixture is not \
+                 expressible here"
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    let report = &torn[0].payload["report"];
+    assert_eq!(
+        report["clean"], false,
+        "a removal Git refuses is not a clean teardown"
+    );
+    assert_eq!(report["bindings"][0]["disposition"], "retained_error");
+    assert!(
+        report["bindings"][0]["detail"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "Git's own diagnostic must be recorded, not swallowed: {report}"
+    );
+    assert!(
+        worktree.is_dir(),
+        "a worktree Git refused to remove must survive teardown"
+    );
+
+    handle.shutdown().await;
+    // `_immutable` drops here — after `shutdown`, before the `TempDir`s
+    // declared above it — clearing the bit so their teardown can reclaim
+    // the worktree.
+}
+
 /// Cancelling a work parked in `blocked` retires the stage it was parked in.
 /// The stage coordinate is orthogonal to work state (§10), which is exactly
 /// why it has to be retired explicitly: a canceled work whose stage still
@@ -2657,6 +2896,72 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     .await;
     assert_eq!(status, 422);
     assert_eq!(body["error"]["code"], "profile_not_found");
+    handle.shutdown().await;
+}
+
+/// §14 against §13: a profile that launches a different backend than routing
+/// resolved to is refused, and the refusal names the tier that made the
+/// choice.
+///
+/// The two ways this could quietly go wrong are the two §13 forbids: running
+/// the profile's backend (silently overruling the route) or running the
+/// routed backend with a profile configured for another (a permission mode
+/// and a model pin meant for a different harness). Nothing pinned it: the
+/// profile that exists in this suite agrees with its route, so the check
+/// could be deleted and every test would still pass. Routing here is the
+/// last tier — no explicit backend, no workspace default — because that is
+/// the tier a user is least likely to have in mind when naming a profile.
+#[tokio::test]
+async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_routed() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+
+    let data = TempDir::new().expect("tempdir");
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+         [[profile]]\nname = \"elsewhere\"\nbackend = \"codex\"\n\
+         default_model = \"gpt-nonexistent\"\n",
+    )
+    .expect("sergeant.toml");
+
+    // No explicit backend and no workspace default: the daemon's global
+    // default routes this, which is tier four.
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "a profile for a backend this work is not routed to",
+        json!({"profile": "elsewhere"}),
+    )
+    .await;
+
+    assert_eq!(status, 422, "the mismatch must be refused: {body}");
+    assert_eq!(body["error"]["code"], "profile_backend_mismatch");
+    let message = body["error"]["message"].as_str().expect("message");
+    for named in ["elsewhere", "codex", FAKE_BACKEND_NAME, "global_default"] {
+        assert!(
+            message.contains(named),
+            "the refusal must name {named:?} so the user can fix either side: {message}"
+        );
+    }
+
+    // Refused before anything ran: no execution, and no work to inspect.
+    assert!(
+        fake.starts().is_empty(),
+        "a refused submission must not launch the routed backend either, got {:?}",
+        fake.starts()
+    );
+    let list = get(&client, &handle, "/v1/work").await;
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "nothing was accepted: {list}"
+    );
+
     handle.shutdown().await;
 }
 

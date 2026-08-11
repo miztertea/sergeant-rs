@@ -1,0 +1,70 @@
+name: Coverage gap
+description: A behavior the test suite never exercises, found by a measured coverage run.
+title: "[coverage] "
+labels: ["coverage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A coverage finding is an **unexercised behavior**, not a line range. "`recovery.rs`
+        lines 412–478 are red" is a measurement; "a daemon restart with two ambiguous
+        sessions never runs the fail-closed branch" is a finding. Lines are the evidence,
+        the behavior is the claim — file it the second way round.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Unexercised behavior
+      description: What the code does that no test makes it do. Name the module and the condition that would reach it.
+      placeholder: e.g. `runtime/journal.rs` — a segment whose final line is a torn write is never read back by any test, so the truncate-and-resume path runs only in production.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: The regions/lines reported uncovered, from which report, at which commit. Quote the `scripts/coverage/` stage that produced them — a number produced any other way is not this program's number (R-S0-3).
+      render: text
+      placeholder: |
+        baseline: docs/coverage/baseline-<date>.md, commit <sha>
+        stage:    scripts/coverage/c2-suites.sh
+        regions:  src/runtime/journal.rs 412-478 (0 executions), 501-509 (0 executions)
+    validations:
+      required: true
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      description: Why the behavior is unexercised. This decides who takes it and whether it is a test gap at all.
+      options:
+        - untested error path — reachable, plausible, nothing drives it
+        - dead code candidate — no production caller found
+        - race window — needs concurrency or a crash point to reach
+        - missing fixture — reachable only with a harness/environment we do not have
+        - artifact of instrument — the instrument cannot see it (subprocess, live-CLI-only, static-scan test)
+    validations:
+      required: true
+  - type: textarea
+    id: test-shape
+    attributes:
+      label: Suggested test shape
+      description: What a test that closes this would have to do — the setup, the trigger, the assertion. Enough that someone else can judge the cost before taking it.
+      placeholder: >-
+        e.g. in m1 — append two events, truncate the segment mid-line, reopen the journal,
+        assert the projection rebuilds to the last whole event and the torn tail is reported.
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Commit / version
+      placeholder: git SHA the coverage run was taken at
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        **Not filable here** (settled rulings — argue the ruling is wrong, do not re-notice the
+        gap): the snapshot-load / `SnapshotBeyondJournal` path (backlog B1, dormant by design),
+        `Analytics::table_rows` (M5 ruling 3, kept as the acceptance instrument), and the
+        live-CLI-only regions of `src/backend/claude.rs`, which are handed to the N-series'
+        real-Claude measurement rather than filed (R-N0-6).

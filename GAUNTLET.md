@@ -80,6 +80,149 @@ every round-2/gate pass found something real the prior pass missed.
 
 ---
 
+### S2 — Stabilization (2026-08-10/11)
+
+**Mission outcome: contract met, gate regime green.** All twelve coverage
+issues resolved — ten by `Fixes` trailer (#30/#32–#35/#37–#41), two closed
+at adjudication with recorded reasons (#31: the fsutil non-WouldBlock arm
+is unreachable without a seam — measured: the suite runs as root so DAC
+tricks silently pass, and Linux equates EAGAIN with EWOULDBLOCK; #36:
+`EngineError::Core`→500 is reachable only by infrastructure fault; the
+proposed `segment_max_bytes` seam declined at R1). Three waves, +73
+falsifiable tests (221→**294** + 2 opt-in), every pin carrying *executed*
+mutation evidence. Coverage by the committed convention: **91.43 →
+94.63% lines** (+3.20), regions 90.89→94.06, functions 91.95→93.29, at
+close-out tip `dc0d447`. Close-out census: F1 10/10 uninstrumented, F2
+3/3 instrumented, zero failures. The CI lane
+(`.github/workflows/coverage.yml`) landed after an R-S0-12 review whose
+error finding was structural — the drift guard would have failed every CI
+run against the committed dev-container fingerprint — plus a
+cache-contamination hazard (stale pooled profraws: a silently wrong
+number, doctrine 4's exact case); all five amendments applied. Gate:
+`--fail-under-lines 90`, 4.63 below measured, per the spread policy.
+Wave-3's blind auditor also produced the close-out residual register —
+eight declined-with-reason entries appended to the baseline doc, none
+silent. One R-S0-7 escalation filed: **#45** (m6 dropped-daemon flake
+under load, recurred across two independent sessions; failure shape —
+dead pid, surviving descriptor — is possibly the #26 startup-window
+class, product-adjacent).
+
+**Environmental behavior.** Three wave workflows + one resume + a config
+reviewer, ~3.4M subagent tokens. The instrument protocol *evolved
+mid-program and the evolution is the finding*: wave 1 (10 agents, 1.34M)
+ran self-probing builders and its panel caught two unfalsifiable tests
+green-against-broken-guards plus an L5 deviation and a placeholder
+self-report — so wave 2 (7 agents; original run + 100k-token cache-resume
+after a container restart recovered five orphaned fixer commits with zero
+rework, the M2/M3 precedent) replaced self-probes with builder guard maps
+executed by one independent batched prober (37 mutations, 32 kills, 6
+survivors — including a mislabeled guard the prober re-sited by probing
+both candidates). Wave 3 (3 agents, 440k): Opus auditor + prober (31/28/3)
++ fixer; survivors closed by in-place assertion strengthening, each
+mutation re-executed. The wave-2 builders' empirical escalations
+(root-DAC bypass, EAGAIN≡EWOULDBLOCK, O_APPEND defeating post-start
+sabotage) are recorded environment facts for every future test author.
+Owner interventions this milestone: issue↔PR linkage discipline (trailers
++ per-wave PR-body accounting, adopted).
+
+**Adjudication rulings.** (1) #31/#36 sub-items closed-with-reason on
+builder-measured evidence; seams declined. (2) The guard-map/independent-
+prober protocol is the S-series standard from wave 2 on (L13
+operationalized as design). (3) #45 escalated on R-S0-7's recurrence rule
+rather than waved off as noise — the failure shape is product-adjacent.
+(4) The CI lane's review verdict (amend-first) applied in full; the lane
+measures into `runner.temp`, never the frozen evidence tree. (5) Gate 90
+recorded in the baseline close-out section; the S1-era "88 against 91.43"
+recommendation is superseded there, visibly.
+
+---
+
+### S1 — Coverage Baseline (2026-08-10)
+
+**Mission outcome: contract met, gate regime green.** Measured baseline at
+`dc77de9`: **91.43% lines / 90.89% regions / 91.95% functions**, 94/94
+profraws merged, zero lost — with the `#[cfg(test)]`-inflation caveat
+(18.0% of `src/` lines) stated before the number everywhere it appears.
+Phase 1 shipped the instrument in eleven separable commits: three teardown
+repairs (SpawnedDaemon SIGTERM-first, reaper TERM-vs-KILL reporting,
+demo.sh fail-closed verify-gone), repo hygiene (`.gitattributes` fixing
+the majority-Shell language bar, pycache ignores), the CI double-run
+trigger fix, the coverage-gap issue template, and the `scripts/coverage/`
+harness embedding the R-S0-3 convention with ten measured tool behaviors.
+Phase 2 ran C0–C4 + the two-arm census strictly sequentially against the
+frozen SHA: F1 10/10 uninstrumented green, F2 3/3 instrumented green — the
+M3-era flake class did not reappear. Phase 3: 63 analyzer candidates → 51
+confirmed by batched adversarial refutation → **12 issues #30–#41**
+(deduped, capped, behavior-named per R-S0-11); 12 refuted with recorded
+reasons; residuals (engine.rs function coverage, instrument artifacts)
+recorded-not-chased in `docs/coverage/baseline-2026-08-10.md`. Suite
+221 + 2 opt-in; every stage's hygiene sweep clean; disk floor never
+approached.
+
+**Environmental behavior.** Four workflows + one direct challenger,
+~2.2M subagent tokens total: phase-1 builder (1 Opus agent, 294k, 173 tool
+uses — measured tool semantics into the harness README, found one flake
+under hand-applied contention, recorded 0/7 unreproduced per R-S0-7);
+lean round 2 (8 agents: Sonnet spec-fidelity + Opus test-honesty +
+Opus invariants/simplicity + batched refuters + fixer, 855k) — **11
+findings, 7 confirmed incl. 1 error**: the SpawnedDaemon pin tested
+`stop()` while `Drop`, the only path real users take, reverted clean —
+Bug Sprint 1's parts-vs-composition shape, caught by fresh eyes after the
+builder's self-probe passed (the empirical case for R-S0-12); fixer closed
+all 7 in five separable commits pinned by daemon-authored evidence
+(descriptor removed, `daemon.stopped` journaled). Analysis gauntlet (10
+agents: 5 Sonnet analyzers + 5 batched Opus refuters, 927k) refuted 12 of
+63 candidates, several as instrument artifacts (Debug-impl derive
+requirements; line-layout artifacts on wrapped `?`). Owner interventions
+shaped the process three times mid-milestone — proper-gauntlet challenge
+(→ R-S0-12), doc-surface correction (→ model spread revised into
+gauntlet-pattern.md, CLAUDE.md refers), evidence-over-memory (→ L12) —
+all recorded as rulings/lessons, none silent.
+
+**Adjudication rulings.** (1) Round-2 error fixed with composition pins on
+daemon-authored evidence, not reaper self-reports. (2) The harness's
+profraw accounting gained a fail-on-unaccounted-loss check (R-S0-6's
+natural reading); F2's legitimate cleans are declared, not exempted.
+(3) engine.rs's refuted candidates stand as residuals for S2 intake below
+the issue cap — the number is recorded, the gap list is not padded.
+(4) Real-Claude live-path regions handed to N2 per R-N0-6, named in the
+baseline. (5) S2 gate recommendation: `--fail-under-lines 88` (nim-proxy
+spread below measured 91.43), to be re-set against S2's own close.
+
+---
+
+### S0 — S-Series Kickoff Adjudication (2026-08-10)
+
+**Mission outcome: contract met — adjudication-only, zero code delta.**
+The S-series proposal (coverage baseline → test-only stabilization →
+non-blocking CI lane; owner directions: prototyping speed over ceremony,
+minor-blocking fixes roll in, breaking changes discussed, S-naming,
+workflow `.js` in `resources/`, autonomous run) was challenged by one
+fresh Opus panel: 35 findings, 9 error / 17 warning / 9 info (6
+verified-credit), all ruled; proposal amended in place before the S1
+contract was drawn. Rulings R-S0-1..11 in `docs/gauntlet/contracts/S0.md`;
+challenge dispositions in `docs/gauntlet/notes/s0-adjudication.md`.
+Post-launch addenda from owner challenges: **R-S0-12** (code is code —
+any executable diff takes the full multi-axis loop; the P1-PERF
+single-builder exemption covers only phases that write no code) and
+**R-S0-13** (model spread: Sonnet executes contracts, Opus judges
+outcomes, Fable is the one orchestrator seat and never fans out —
+supersedes the M-era model table, revised into gauntlet-pattern.md dated).
+
+**Environmental behavior.** One challenger (132k tokens, ~13 min) whose
+headline error (A1: m3/m5 misclassified as subprocess-free) corrected the
+orchestrator's own pre-proposal assessment on line-cited evidence. Two
+challenger claims about cargo-llvm-cov defaults were deliberately not
+adopted — held as Unknowns for the S1 builder to measure (L1 at the tool
+boundary), and both measurements later proved load-bearing (the
+`#[cfg(test)]` inclusion and the stale-report hazard). The orchestrator's
+process errors this milestone (single-builder launch; doctrine copied
+instead of referred; edit target from memory) were owner-caught and are
+now R-S0-12 + LESSONS L12/L13 — the loop's protection against a wrong
+orchestrator is the same as against wrong code: fresh eyes and the record.
+
+---
+
 ### N2 — 2026-08-10, actor-only repo-to-icm: built, run, blind-measured
 
 **Mission outcome: contract met — the workflow exists, ran through the real

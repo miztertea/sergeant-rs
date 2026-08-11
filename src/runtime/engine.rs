@@ -2789,4 +2789,617 @@ mod tests {
             "and the work is still exactly where it was"
         );
     }
+
+    /// Every `EngineError`'s wire code, in one table.
+    ///
+    /// `code()` is the vocabulary `/v1` answers with and the thing a client
+    /// branches on; `api.rs` maps it to a status. The paths that raise most
+    /// of these variants assert on the human message instead, so a variant
+    /// whose code silently changed — or a new variant folded into a
+    /// neighbour's arm — would reach clients unnoticed.
+    #[test]
+    fn every_engine_error_answers_with_its_wire_code() {
+        let cases: Vec<(EngineError, &str)> = vec![
+            (
+                WorkspaceError::Io {
+                    path: "/nowhere/sergeant.toml".to_string(),
+                    source: std::io::Error::other("unreadable"),
+                }
+                .into(),
+                "workspace_error",
+            ),
+            (
+                WorkflowError::NotFound {
+                    name: "nope".to_string(),
+                    searched: "/nowhere".to_string(),
+                }
+                .into(),
+                "workflow_error",
+            ),
+            (
+                RouteError::NoSelection {
+                    available: vec!["fake".to_string()],
+                }
+                .into(),
+                "no_backend_selected",
+            ),
+            // All three routing failures, not one of them: `Route` is the
+            // only arm that delegates instead of naming a constant, so a
+            // single row would let the delegation be replaced by whichever
+            // code that row happens to want.
+            (
+                RouteError::NotFound {
+                    requested: "ghost".to_string(),
+                    tier: crate::runtime::router::RouteSource::Explicit,
+                    available: vec!["fake".to_string()],
+                }
+                .into(),
+                "backend_not_found",
+            ),
+            (
+                RouteError::Unavailable {
+                    requested: "claude".to_string(),
+                    tier: crate::runtime::router::RouteSource::GlobalDefault,
+                    detail: "no CLI on PATH".to_string(),
+                    available: vec!["fake".to_string()],
+                }
+                .into(),
+                "backend_unavailable",
+            ),
+            (SurfaceError::NoRepositories.into(), "surface_error"),
+            (
+                BackendError::Unavailable {
+                    backend: "fake".to_string(),
+                    detail: "not here".to_string(),
+                }
+                .into(),
+                "backend_error",
+            ),
+            (
+                CoreError::Projection(crate::runtime::projection::ProjectionError::SeqMismatch {
+                    expected: 2,
+                    found: 5,
+                })
+                .into(),
+                "internal",
+            ),
+            (
+                EngineError::RepositorySelection("no such repository".to_string()),
+                "unknown_repository",
+            ),
+            (
+                EngineError::ProfileNotFound {
+                    requested: "nope".to_string(),
+                    available: "enterprise".to_string(),
+                },
+                "profile_not_found",
+            ),
+            (
+                EngineError::ProfileBackendMismatch {
+                    profile: "enterprise".to_string(),
+                    profile_backend: "codex".to_string(),
+                    routed: "fake".to_string(),
+                    tier: "global_default".to_string(),
+                },
+                "profile_backend_mismatch",
+            ),
+            (
+                EngineError::IllegalTransition {
+                    work_id: "01W".to_string(),
+                    from: WorkState::Completed,
+                    to: WorkState::Active,
+                },
+                "illegal_transition",
+            ),
+            (
+                EngineError::NotAwaitingInput {
+                    work_id: "01W".to_string(),
+                    state: WorkState::Active,
+                },
+                "not_awaiting_input",
+            ),
+            (
+                EngineError::NotRetryable {
+                    work_id: "01W".to_string(),
+                    state: WorkState::Completed,
+                },
+                "not_retryable",
+            ),
+            (
+                EngineError::NoRun {
+                    work_id: "01W".to_string(),
+                },
+                "no_run",
+            ),
+            (
+                EngineError::BackendMissing {
+                    work_id: "01W".to_string(),
+                    backend: "ghost".to_string(),
+                },
+                "backend_missing",
+            ),
+            (
+                EngineError::NoSuchStage {
+                    work_id: "01W".to_string(),
+                    index: 9,
+                },
+                "no_such_stage",
+            ),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (error, code) in &cases {
+            assert_eq!(&error.code(), code, "wrong code for {error}");
+            assert!(
+                seen.insert(*code),
+                "two variants share the code {code:?}, which collapses two \
+                 client-visible outcomes into one"
+            );
+        }
+
+        // §13's option list travels with routing failures and with nothing
+        // else: a client can only offer a choice where there was one.
+        let routing: EngineError = RouteError::NotFound {
+            requested: "ghost".to_string(),
+            tier: crate::runtime::router::RouteSource::Explicit,
+            available: vec!["fake".to_string()],
+        }
+        .into();
+        assert_eq!(
+            routing.available_backends(),
+            Some(&["fake".to_string()][..]),
+            "a routing failure must name what could have been asked for"
+        );
+        for (error, _) in &cases {
+            if matches!(error, EngineError::Route(_)) {
+                continue;
+            }
+            assert!(
+                error.available_backends().is_none(),
+                "{error} is not a routing failure and must not offer options"
+            );
+        }
+    }
+
+    /// A surface that cannot be materialized blocks the work; it does not
+    /// fail the call.
+    ///
+    /// `Engine::start` runs after the Work exists, so returning an error here
+    /// would leave an accepted work in `pending` that nothing ever picks up.
+    /// The partial-failure arm (earlier repositories torn down) is pinned by
+    /// the m3 suite; this is its sibling — materialization that fails
+    /// outright, before any repository was touched.
+    #[test]
+    fn a_surface_that_cannot_be_materialized_blocks_the_work_rather_than_failing_the_call() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let engine = engine(dir.path());
+        let work_id = "01NOSURFACE";
+        testing::submit(&mut core, work_id, "cannot be materialized");
+        let work = core.registry.state().works[work_id].clone();
+
+        // No repositories: `materialize` refuses outright — a surface with no
+        // worktrees could never execute anything — and nothing was created,
+        // so there is no teardown report to record.
+        let plan = StartPlan {
+            workspace: Workspace {
+                name: "solo".to_string(),
+                root: dir.path().to_path_buf(),
+                repositories: Vec::new(),
+                default_backend: None,
+                default_workflow: None,
+                profiles: Vec::new(),
+                config_path: None,
+            },
+            repositories: Vec::new(),
+            workflow: WorkflowDefinition {
+                name: "tiny".to_string(),
+                version: "1".to_string(),
+                source: "test".to_string(),
+                stages: Vec::new(),
+                content_hash: String::new(),
+            },
+            route: Route {
+                backend: FAKE_BACKEND_NAME.to_string(),
+                source: crate::runtime::router::RouteSource::GlobalDefault,
+            },
+            profile: None,
+            // N3 (§12.5): one binding per stage, and this plan has no stages.
+            stage_bindings: Vec::new(),
+        };
+
+        engine
+            .start(&mut core, &work, &plan)
+            .expect("a materialization failure is not the caller's error");
+
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Blocked,
+            "an accepted work whose surface failed must fail closed, never \
+             stay pending"
+        );
+        let events: Vec<_> = core
+            .journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .collect();
+        let blocked = events
+            .iter()
+            .find(|e| e.kind == KIND_WORK_BLOCKED)
+            .expect("the work is blocked with a reason");
+        assert!(
+            blocked.payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("cannot materialize work surface"),
+            "the reason must name the failure: {}",
+            blocked.payload
+        );
+        assert!(
+            blocked.payload["evidence"].is_null(),
+            "nothing was created, so there is no teardown report to attach: {}",
+            blocked.payload
+        );
+        assert!(
+            events.iter().any(|e| e.kind == KIND_SURFACE_MATERIALIZING),
+            "the intent to materialize is journaled before git is touched"
+        );
+        for kind in [
+            KIND_SURFACE_TORN_DOWN,
+            KIND_WORKFLOW_BOUND,
+            KIND_WORK_STARTED,
+        ] {
+            assert!(
+                !events.iter().any(|e| e.kind == kind),
+                "a surface that never existed must not produce {kind}"
+            );
+        }
+
+        // Retry is the one door out of `blocked`, and this work has nothing
+        // behind it: no stage was ever entered, so the answer is the
+        // structured `no_run` the API turns into a 404 — never a panic on an
+        // absent stage, and never a second attempt at a surface nobody has
+        // fixed yet.
+        let error = engine
+            .retry(&mut core, work_id)
+            .expect_err("there is no stage to re-enter");
+        assert_eq!(error.code(), "no_run");
+        // The same answer, from the other side: a verb against a work id this
+        // daemon has never seen.
+        let error = engine
+            .retry(&mut core, "01NEVERSUBMITTED")
+            .expect_err("an unknown work cannot be retried");
+        assert_eq!(error.code(), "no_run");
+    }
+
+    /// A run whose backend this daemon no longer registers is named, not
+    /// guessed at.
+    ///
+    /// The journal outlives any one daemon's registry — a data dir opened by
+    /// a build that dropped an adapter, or started without it — and the run
+    /// records the backend by name. Driving such a run must fail with the
+    /// name it cannot find.
+    #[test]
+    fn a_run_routed_to_an_unregistered_backend_is_named_not_guessed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let engine = engine(dir.path());
+        let work_id = "01GHOSTBACKEND";
+        testing::submit(&mut core, work_id, "routed to a backend that is gone");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORKFLOW_BOUND,
+            json!({
+                "workflow": {"name": "tiny", "version": "1", "source": "test",
+                             "stages": [{"id": "00-only", "context": "c"}]},
+                "backend": "ghost",
+            }),
+        );
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+        );
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_STARTED,
+            json!({"execution": {
+                "execution_id": "exec-ghost",
+                "backend": "ghost",
+                "stage_id": "00-only",
+                "attempt": 1,
+                "stop_requested": false,
+            }}),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+        let error = engine
+            .resume(&mut core, work_id)
+            .expect_err("a missing backend cannot be driven");
+        assert_eq!(error.code(), "backend_missing");
+        assert!(
+            error.to_string().contains("ghost"),
+            "the diagnostic must name the backend the run wants: {error}"
+        );
+    }
+
+    /// The §10 transition table is consulted *before* the append, and its
+    /// three refusals are all silent-corruption risks if they stop working.
+    #[test]
+    fn the_transition_table_is_consulted_before_anything_is_appended() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let engine = engine(dir.path());
+        let work_id = "01TRANSITIONS";
+        testing::submit(&mut core, work_id, "transition me");
+        let after_submit = core.journal.next_seq();
+
+        // A kind that maps to no work state is a bug in the caller, refused
+        // rather than appended as a transition to nowhere.
+        let error = engine
+            .transition(&mut core, work_id, KIND_STAGE_ENTERED, json!({}))
+            .expect_err("a stage event is not a work transition");
+        assert_eq!(error.code(), "illegal_transition");
+
+        // Same state in, same state out: no event, no churn.
+        engine
+            .transition(&mut core, work_id, KIND_WORK_STARTED, json!({}))
+            .expect("pending -> active");
+        engine
+            .transition(&mut core, work_id, KIND_WORK_STARTED, json!({}))
+            .expect("active -> active is not an error");
+        let after_start = core.journal.next_seq();
+
+        // And a transition the table forbids fails before the append.
+        engine
+            .transition(&mut core, work_id, KIND_WORK_COMPLETED, json!({}))
+            .expect("active -> completed");
+        let after_completion = core.journal.next_seq();
+        let error = engine
+            .transition(&mut core, work_id, KIND_WORK_STARTED, json!({}))
+            .expect_err("completed is terminal");
+        assert_eq!(error.code(), "illegal_transition");
+        assert!(
+            error.to_string().contains("completed -> active"),
+            "the refusal must name both ends: {error}"
+        );
+
+        assert_eq!(
+            after_start - after_submit,
+            1,
+            "the second start must append nothing"
+        );
+        assert_eq!(
+            core.journal.next_seq(),
+            after_completion,
+            "a refused transition must leave the journal exactly as it was"
+        );
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Completed
+        );
+    }
+
+    /// A daemon that died between `stage.entered` and `execution.started`
+    /// leaves a run with a stage and no execution (L6's adjacent-append
+    /// window, on the one sequence that cannot be compounded — the append
+    /// has to precede the process). Driving that prefix is a no-op: there is
+    /// nothing to observe, and inventing a conclusion about a stage no
+    /// backend ever accepted is exactly what §25 forbids.
+    #[test]
+    fn driving_a_run_whose_execution_never_landed_is_a_no_op() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let engine = engine(dir.path());
+        let work_id = "01NOEXECUTION";
+        testing::submit(&mut core, work_id, "crashed before the execution landed");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORKFLOW_BOUND,
+            json!({
+                "workflow": {"name": "tiny", "version": "1", "source": "test",
+                             "stages": [{"id": "00-only", "context": "c"}]},
+                "backend": FAKE_BACKEND_NAME,
+            }),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+        );
+        let head = core.journal.next_seq();
+
+        engine.resume(&mut core, work_id).expect("nothing to drive");
+
+        assert_eq!(
+            core.journal.next_seq(),
+            head,
+            "a run with no execution must not be driven anywhere"
+        );
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Active,
+            "and the work stays where recovery can still find it"
+        );
+    }
+
+    /// An adapter that does not advertise RESUME is never asked to, and an
+    /// adapter that cannot classify its native context fails the work closed.
+    ///
+    /// Both halves are §15/§25 promises the two shipped adapters cannot
+    /// exercise: the fake and the Claude adapter both advertise `resume`, and
+    /// neither can be made to answer `unknown` at reconcile time without a
+    /// production seam. So this pins them against a backend that is exactly
+    /// what §15 allows — capabilities absent, not emulated. If the capability
+    /// check disappeared, a restart would call an unsupported verb on every
+    /// such adapter and turn its refusal into the work's evidence.
+    #[test]
+    fn reconcile_never_calls_an_unadvertised_resume_and_fails_closed_on_unknown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::backend::{Capabilities, Completion, NativeEvent, ProbeReport, RuntimeScope};
+
+        #[derive(Debug, Default)]
+        struct Inscrutable {
+            resume_calls: AtomicUsize,
+        }
+
+        impl Backend for Inscrutable {
+            fn name(&self) -> &str {
+                "inscrutable"
+            }
+            fn capabilities(&self) -> Capabilities {
+                // Everything absent — §15's "unsupported means unsupported".
+                Capabilities::default()
+            }
+            fn runtime_scope(&self) -> RuntimeScope {
+                RuntimeScope::PerExecution
+            }
+            fn probe(&self) -> ProbeReport {
+                ProbeReport {
+                    available: true,
+                    detail: None,
+                }
+            }
+            // N3 split START into PREPARE + LAUNCH (§14.3); this test never
+            // starts an execution, so both halves stay unreachable.
+            fn prepare(&self, _: &StartRequest) -> Result<PreparedExecution, BackendError> {
+                unreachable!("this test never prepares an execution")
+            }
+            fn launch(&self, _: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+                unreachable!("this test never launches an execution")
+            }
+            fn send(&self, _: &ExecutionHandle, _: &str) -> Result<(), BackendError> {
+                unreachable!("this test never sends")
+            }
+            fn observe(&self, _: &ExecutionHandle) -> Result<Observation, BackendError> {
+                Ok(Observation {
+                    native: NativeState::Unknown,
+                    signal: BackendSignal::Running,
+                    evidence: None,
+                })
+            }
+            fn interrupt(&self, _: &ExecutionHandle) -> Result<Completion, BackendError> {
+                Ok(Completion::immediate())
+            }
+            fn resume(&self, _: &ExecutionHandle, _: &ResumeRequest) -> Result<(), BackendError> {
+                self.resume_calls.fetch_add(1, Ordering::SeqCst);
+                Err(BackendError::Unsupported {
+                    backend: "inscrutable".to_string(),
+                    verb: "resume".to_string(),
+                    detail: "this adapter never advertised it".to_string(),
+                })
+            }
+            fn history(&self, _: &ExecutionHandle) -> Result<Vec<NativeEvent>, BackendError> {
+                unreachable!("this test never reads history")
+            }
+            fn stop(&self, _: &ExecutionHandle) -> Result<Completion, BackendError> {
+                Ok(Completion::immediate())
+            }
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let backend = Arc::new(Inscrutable::default());
+        let engine = Engine::new(
+            Arc::new(BackendRegistry::new().with(backend.clone())),
+            None,
+            dir.path(),
+        );
+
+        let work_id = "01INSCRUTABLE";
+        testing::submit(
+            &mut core,
+            work_id,
+            "reconciled by an adapter that cannot say",
+        );
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORKFLOW_BOUND,
+            json!({
+                "workflow": {"name": "tiny", "version": "1", "source": "test",
+                             "stages": [{"id": "00-only", "context": "c"}]},
+                "backend": "inscrutable",
+            }),
+        );
+        // A surface *is* recorded, so the decline below can only be about the
+        // missing capability — never about having nowhere to reattach into.
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            json!({"surface": {
+                "work_id": work_id,
+                "root": dir.path(),
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": dir.path(),
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": dir.path(),
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }}),
+        );
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+        );
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_STARTED,
+            json!({"execution": {
+                "execution_id": "exec-inscrutable",
+                "backend": "inscrutable",
+                "stage_id": "00-only",
+                "attempt": 1,
+                "stop_requested": false,
+            }}),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+        let disposition = engine
+            .reconcile_work(&mut core, work_id)
+            .expect("reconciliation itself does not fail");
+
+        assert_eq!(disposition, ReconcileDisposition::Ambiguous);
+        assert_eq!(
+            backend.resume_calls.load(Ordering::SeqCst),
+            0,
+            "a backend that does not advertise RESUME must not be asked to"
+        );
+        let reconciled = core
+            .journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .find(|e| e.kind == KIND_EXECUTION_RECONCILED)
+            .expect("the decision is journaled");
+        assert_eq!(
+            reconciled.payload["reattached"], false,
+            "and the record says so, rather than implying ownership: {}",
+            reconciled.payload
+        );
+        assert_eq!(
+            reconciled.payload["evidence"], "backend reports unknown native state",
+            "an adapter that offers no evidence still gets a stated reason: {}",
+            reconciled.payload
+        );
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Blocked,
+            "§25: ambiguity fails closed"
+        );
+    }
 }

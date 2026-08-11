@@ -1,0 +1,8 @@
+arm	instrumented
+requested	3
+completed	3
+ceiling_s	14400
+total_s	158
+control_mean_s	40
+instrumented_mean_s	52
+ratio	1.29

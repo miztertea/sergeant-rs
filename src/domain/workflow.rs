@@ -1095,4 +1095,81 @@ mod tests {
         let reorder = WorkflowDefinition::load_dir(&reordered).expect("resolve reorder");
         assert_ne!(baseline.content_hash, reorder.content_hash);
     }
+
+    /// A descriptor's `name` field must match the directory it lives in — the
+    /// directory name is otherwise never checked against anything, so a copy
+    /// of one workflow directory into another (with the old `name` left
+    /// behind) would silently claim the new directory's identity.
+    #[test]
+    fn a_declared_name_that_does_not_match_its_directory_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "actual-dir-name");
+        std::fs::create_dir_all(wf.join("00-only")).expect("stage dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"declared-other-name\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+        )
+        .expect("descriptor");
+        std::fs::write(wf.join("00-only").join(CONTEXT_FILE), "do the thing")
+            .expect("stage context");
+
+        let err = WorkflowDefinition::load_dir(&wf).expect_err("mismatched name must be refused");
+        match err {
+            WorkflowError::NameMismatch {
+                declared,
+                directory,
+                ..
+            } => {
+                assert_eq!(declared, "declared-other-name");
+                assert_eq!(directory, "actual-dir-name");
+            }
+            other => panic!("expected NameMismatch, got {other}"),
+        }
+    }
+
+    /// A workflow with no stages could never make progress, so it is refused
+    /// at load time rather than accepted as a run nothing can advance.
+    #[test]
+    fn a_workflow_declaring_no_stages_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "empty");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"empty\"\nversion = \"1\"\nstages = []\n",
+        )
+        .expect("descriptor");
+
+        let err =
+            WorkflowDefinition::load_dir(&wf).expect_err("an empty stage list must be refused");
+        assert!(
+            matches!(&err, WorkflowError::NoStages { path } if path.contains(WORKFLOW_FILE)),
+            "expected NoStages naming the descriptor, got {err}"
+        );
+    }
+
+    /// A stage id repeated in the declared order is refused before any
+    /// per-stage directory or `CONTEXT.md` is even looked at: two attempts at
+    /// the same id would otherwise be indistinguishable in the engine.
+    #[test]
+    fn a_stage_id_declared_twice_is_refused() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "dupe");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"dupe\"\nversion = \"1\"\nstages = [\"00-only\", \"00-only\"]\n",
+        )
+        .expect("descriptor");
+
+        let err = WorkflowDefinition::load_dir(&wf)
+            .expect_err("a stage id declared twice must be refused");
+        assert!(
+            matches!(&err, WorkflowError::DuplicateStage { stage, .. } if stage == "00-only"),
+            "expected DuplicateStage naming the repeated id, got {err}"
+        );
+    }
 }

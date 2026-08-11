@@ -1554,4 +1554,195 @@ mod tests {
             .expect("select");
         assert_eq!(rows, vec![vec![Value::Null]]);
     }
+
+    /// An event with no work scope at all (as opposed to `event()`, which
+    /// always sets one) — the shape several §33 guards actually fire on.
+    fn event_no_work(seq: u64, kind: &str, payload: Value) -> Event {
+        EventDraft::new(EventSource::new("daemon", "test"), kind, payload).into_event(seq)
+    }
+
+    /// Issue #33 item 1: `Analytics::apply`'s malformed/incomplete-event
+    /// guards, never fired in the baseline, across every kind that has one.
+    /// Each of these is missing exactly the field its handler reads back out
+    /// — `catch_up` (§20's forward-compatibility contract) must skip the row
+    /// rather than panic or write a partial one.
+    #[test]
+    fn malformed_events_across_kinds_are_skipped_not_panicked() {
+        let mut malformed = vec![
+            // KIND_WORK_SUBMITTED: no "work.id" in the payload.
+            event_no_work(
+                1,
+                KIND_WORK_SUBMITTED,
+                json!({"work": {"intent": "orphan"}}),
+            ),
+            // KIND_WORKFLOW_BOUND: work_id names a work never submitted, so
+            // it is absent from `rows.work` (the issue's own example).
+            event(
+                2,
+                "ghost-work",
+                KIND_WORKFLOW_BOUND,
+                json!({"backend": "fake"}),
+            ),
+            // KIND_SURFACE_MATERIALIZED / TORN_DOWN: no work_id on the
+            // envelope at all. The bindings are deliberately non-empty and
+            // name a real repository: both handlers only write from inside
+            // the loop over them, so with `"bindings": []` the arm would
+            // write nothing whether or not the work_id guard is there and
+            // the repositories assertion below could not tell the two apart.
+            event_no_work(
+                3,
+                KIND_SURFACE_MATERIALIZED,
+                json!({"surface": {"bindings": [
+                    {"repository": "repo", "source_path": "/src/repo", "work_branch": "sgt/w1"},
+                ]}}),
+            ),
+            event_no_work(
+                4,
+                KIND_SURFACE_TORN_DOWN,
+                json!({"report": {"bindings": [
+                    {"repository": "repo", "disposition": "kept"},
+                ]}}),
+            ),
+            // KIND_STAGE_ENTERED: work_id present, stage_id missing.
+            event(5, "w1", KIND_STAGE_ENTERED, json!({"index": 0})),
+            // KIND_STAGE_COMPLETED: stage_id names a stage never entered, so
+            // no attempt can be found for it.
+            event(
+                6,
+                "w1",
+                KIND_STAGE_COMPLETED,
+                json!({"stage_id": "never-entered"}),
+            ),
+            // KIND_EXECUTION_STARTED: no execution_id in the payload.
+            event(
+                7,
+                "w1",
+                KIND_EXECUTION_STARTED,
+                json!({"execution": {"backend": "fake"}}),
+            ),
+            // KIND_EXECUTION_STOPPED: no execution_id, and an unknown one.
+            event(8, "w1", KIND_EXECUTION_STOPPED, json!({})),
+            event(
+                9,
+                "w1",
+                KIND_EXECUTION_STOPPED,
+                json!({"execution_id": "ghost-exec"}),
+            ),
+            // KIND_EXECUTION_RECONCILED: no execution_id, and an unknown one.
+            event(
+                10,
+                "w1",
+                KIND_EXECUTION_RECONCILED,
+                json!({"disposition": "resumed"}),
+            ),
+            event(
+                11,
+                "w1",
+                KIND_EXECUTION_RECONCILED,
+                json!({"execution_id": "ghost-exec", "disposition": "resumed"}),
+            ),
+            // KIND_TOOL_REQUESTED: no execution scope on the envelope.
+            event(
+                12,
+                "w1",
+                KIND_TOOL_REQUESTED,
+                json!({"id": "t1", "name": "Bash"}),
+            ),
+        ];
+        // KIND_TOOL_COMPLETED: execution scope present, tool_use_id absent.
+        let mut tool_completed = event(13, "w1", KIND_TOOL_COMPLETED, json!({}));
+        tool_completed.execution_id = Some("e1".to_string());
+        malformed.push(tool_completed);
+
+        let total = malformed.len() as i64;
+        let mut analytics = Analytics::in_memory(events(malformed)).expect("projection");
+        let counts: BTreeMap<String, i64> = analytics
+            .table_counts()
+            .expect("counts")
+            .into_iter()
+            .collect();
+        for table in ["work", "stages", "executions", "tool_calls", "repositories"] {
+            assert_eq!(
+                counts[table], 0,
+                "{table} should be untouched by malformed events: {counts:?}"
+            );
+        }
+        assert_eq!(
+            counts["events"], total,
+            "every malformed event is still appended to the raw log, never dropped"
+        );
+    }
+
+    /// Issue #33 item 1: `KIND_EXECUTION_RECONCILED`'s handler — the whole
+    /// arm never ran in the baseline — actually updates the matching row's
+    /// disposition on a real reconcile.
+    #[test]
+    fn execution_reconciled_records_the_disposition_on_the_matching_row() {
+        let started = event(
+            1,
+            "w1",
+            KIND_EXECUTION_STARTED,
+            json!({"execution": {
+                "execution_id": "e1", "backend": "fake", "native_id": "n1",
+                "stage_id": "00-first", "attempt": 1, "stop_requested": false,
+            }}),
+        );
+        let reconciled = event(
+            2,
+            "w1",
+            KIND_EXECUTION_RECONCILED,
+            json!({"execution_id": "e1", "disposition": "resumed"}),
+        );
+        let mut analytics =
+            Analytics::in_memory(events(vec![started, reconciled])).expect("projection");
+        analytics.materialize().expect("materialize");
+        let (_, rows) = analytics
+            .select(
+                "SELECT reconcile_disposition FROM executions WHERE execution_id = 'e1'",
+                duckdb::params![],
+            )
+            .expect("select");
+        assert_eq!(rows, vec![vec![Value::String("resumed".to_string())]]);
+    }
+
+    /// Issue #33's dead-code note: `Analytics`'s manual `Debug` impl is
+    /// decided keep-with-caller rather than dropped, which means it needs an
+    /// actual caller so it is not an unmeasured claim — this is it.
+    #[test]
+    fn the_debug_impl_names_the_projection_by_path_and_last_seq() {
+        let analytics = Analytics::in_memory(events(vec![submitted(1, "w1")])).expect("projection");
+        let debug = format!("{analytics:?}");
+        assert!(debug.starts_with("Analytics {"), "{debug}");
+        // Both halves the name promises: the path is the whole reason the
+        // manual impl exists, so asserting only `last_seq` would leave the
+        // interesting field unmeasured.
+        assert!(debug.contains("path: \":memory:\""), "{debug}");
+        assert!(debug.contains("last_seq: 1"), "{debug}");
+    }
+
+    /// Issue #31 item 4: `remove_if_present`'s `Err(e)` pass-through for a
+    /// non-`NotFound` removal failure. This suite can run as root, where a
+    /// read-only-parent-dir trick is not enforced (verified empirically:
+    /// `chmod 555` on a directory does not stop root from unlinking inside
+    /// it), so the probe uses a type mismatch `unlink` refuses
+    /// unconditionally instead: passing a *directory* fails with
+    /// `ErrorKind::IsADirectory`, not `NotFound`, regardless of privilege.
+    #[test]
+    fn remove_if_present_surfaces_a_non_not_found_removal_failure() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let victim = dir.path().join("not-actually-a-file.duckdb.wal");
+        std::fs::create_dir_all(&victim).expect("place a directory at the removal target");
+
+        let err =
+            remove_if_present(&victim).expect_err("removing a directory via remove_file must fail");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "a path that exists (as a directory) must not be reported as missing: {err}"
+        );
+        assert!(
+            victim.is_dir(),
+            "the non-NotFound failure must leave it untouched"
+        );
+    }
 }
