@@ -107,7 +107,7 @@ daemon_pid() {
 no-mistakes daemon status >/dev/null 2>&1 || start_daemon
 pid="$(daemon_pid)"
 if [ -z "$pid" ] || ! daemon_env_ok "$pid"; then
-  no-mistakes daemon stop
+  no-mistakes daemon stop || true
   start_daemon
   pid="$(daemon_pid)"
   [ -n "$pid" ] || { echo "gate.sh: no readable pid in $NO_MISTAKES_HOME/daemon.pid after restart" >&2; exit 1; }

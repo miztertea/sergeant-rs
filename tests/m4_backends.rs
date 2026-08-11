@@ -1365,7 +1365,32 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     assert_eq!(cascaded["stage"]["stage_id"], "10-implement");
     assert_eq!(cascaded["work"]["state"], "active");
 
-    let events = events_over_api(&http, &handle, &work_id).await;
+    // Wait for the cascade's launch to finish landing: `execution.started`
+    // is committed after the out-of-lock spawn returns, and the adapter's
+    // committer thread journals `conversation.user` from its own hold, so
+    // neither is guaranteed durable at the instant the work view shows the
+    // new stage. Both markers present is the quiet point — the cascaded turn
+    // itself is parked at the (unreleased) gate and cannot emit a byte.
+    let deadline = Instant::now() + SETTLE_BUDGET;
+    let events = loop {
+        let events = events_over_api(&http, &handle, &work_id).await;
+        let cascade_started = events.iter().any(|e| {
+            e.kind == "execution.started" && e.payload["execution"]["stage_id"] == "10-implement"
+        });
+        let user_turns = events
+            .iter()
+            .filter(|e| e.kind == "conversation.user")
+            .count();
+        if cascade_started && user_turns >= 2 {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cascade's launch never finished landing in the journal: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert!(
         kinds.contains(&"conversation.turn.ended"),
@@ -1374,11 +1399,22 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     // TH-5 (BS2 test-honesty finding): the driver's own docs promise a poll
     // that finds a turn still `Running` journals nothing — only `contains`
     // assertions existed to check that, which a driver appending one event
-    // per tick would still satisfy. The cascaded stage's turn is still parked
-    // at the (unreleased) gate here, so the driver has been polling a
-    // `Running` execution at its 200ms cadence since the cascade; a per-tick
-    // leak would blow this bound while this run's whole trajectory (submit
-    // through the cascaded launch) stays nowhere near it.
+    // per tick would still satisfy. The sharp check is the quiet window: the
+    // cascaded turn stays parked at the gate while the driver polls its
+    // `Running` execution at the 200ms default cadence, so holding the
+    // window open for ~5 ticks and re-reading must find the journal exactly
+    // as long as before — a per-tick leak grows it every tick, and load only
+    // adds ticks, never hides them (BS2R2-01).
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let after_quiet = events_over_api(&http, &handle, &work_id).await;
+    assert_eq!(
+        events.len(),
+        after_quiet.len(),
+        "the completion driver polled a `Running` execution across the quiet \
+         window and must journal nothing for it: {:?}",
+        after_quiet.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    // Coarse trajectory sanity on top of the sharp check above.
     assert!(
         events.len() < 25,
         "the completion driver's poll cadence must not enter the trajectory \
@@ -1800,10 +1836,10 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
 /// daemon down **immediately** after `respond` returns: the resumed turn is
 /// parked at the stub's release gate, which this test never opens, so the
 /// resumed turn cannot emit a byte — never mind end, never mind be settled —
-/// while this daemon lives, however long shutdown takes. (An earlier version
-/// leaned on a fixed 2 s stall outlasting respond→shutdown, which a loaded
-/// runner plus a driver settle inside the shutdown grace could beat —
-/// BS2R-08.)
+/// before the gate's ~20 s self-release, an order of magnitude past the
+/// daemon's own 5 s shutdown grace. (An earlier version leaned on a fixed
+/// 2 s stall outlasting respond→shutdown, which a loaded runner plus a
+/// driver settle inside the shutdown grace could beat — BS2R-08.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
     let data = support::DataDir::new();
