@@ -6,6 +6,23 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L14 — Binding rules live where sessions actually look; one document deep is half-applied
+
+S-series retrospective, 2026-08-11: every process error the owner caught
+had the same shape — the governing rule existed but lived below CLAUDE.md
+(the loop's applicability in gauntlet-pattern.md; the living-vs-frozen
+split implicit in reference/notes' own revision convention; the
+Fixes-trailer discipline in one Bug Sprint sentence), while CLAUDE.md
+carried things that go stale (test counts, register ranges, embedded
+coverage numbers) and warnings without their escape (the self-matching
+pgrep, named twice, bit twice anyway). Rules: promote applicability rules
+and safe incantations INTO CLAUDE.md; demote volatile numbers OUT of it
+(refer to the ledger/baseline); a warning that names a trap must name the
+escape. Same-day corollary from the CI lane's shakedown: environment
+facts measured in one environment (root container) are hypotheses in the
+next (non-root runner) — record the environment matrix beside the tests
+that depend on it.
+
 ## L13 — A builder's probe of its own pin is evidence, never verification
 
 S1 phase 1: launched as a single self-probing builder under a stretched

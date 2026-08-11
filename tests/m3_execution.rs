@@ -2358,16 +2358,45 @@ impl Drop for ClearImmutableOnDrop {
 /// that fails, giving `RetainedError` — not `RetainedDirty` — with Git's
 /// own diagnostic, and the same evidence journaled.
 ///
-/// **Environment precondition** (deliberately a hard failure, not a silent
-/// skip — this is the only test covering the `RetainedError` disposition, so
-/// an environment that cannot run it must say so rather than quietly drop
-/// the coverage): `chattr` on `PATH`, `TMPDIR` on a filesystem that honours
-/// `FS_IMMUTABLE_FL` (ext4/xfs/btrfs do; tmpfs and overlayfs do not), and
-/// `CAP_LINUX_IMMUTABLE`. `#[cfg(target_os = "linux")]` gates the OS only;
-/// the setup assertion below reports the other three.
+/// **Environment precondition**, two shapes (same policy as the journal
+/// O_DIRECT fixture's probe above; S-series coverage-lane runs
+/// 31448824808/31452115043 measured both): `chattr` missing from `PATH`
+/// stays a hard failure — locally fixable. An environment where
+/// `chattr +i` itself fails — no `CAP_LINUX_IMMUTABLE` (GitHub's non-root
+/// hosted runners) or a filesystem blind to `FS_IMMUTABLE_FL` (tmpfs,
+/// overlayfs) — cannot arm this fixture at all and no hosted-runner user
+/// can change that, so that shape is a LOUD probe-gated skip at the top,
+/// before any daemon state exists. This is the only test covering the
+/// `RetainedError` disposition; the skip prints itself rather than
+/// quietly dropping the coverage, and the fault path still executes fully
+/// everywhere the census and mutation probes run (root + ext4).
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journaled() {
+    // Probe the environment's immutable-bit support on a scratch dir before
+    // building any daemon state. chattr-on-PATH failures stay hard below.
+    {
+        let probe = TempDir::new().expect("probe tempdir");
+        let probe_dir = probe.path().join("immutable-probe");
+        std::fs::create_dir(&probe_dir).expect("create probe dir");
+        let armed = Command::new("chattr")
+            .args(["+i", probe_dir.to_str().expect("utf8 path")])
+            .status()
+            .expect("chattr must be on PATH for this fixture (see the doc comment)");
+        let _ = Command::new("chattr")
+            .args(["-i", probe_dir.to_str().expect("utf8 path")])
+            .status();
+        if !armed.success() {
+            eprintln!(
+                "skipping: chattr +i failed on this environment (no \
+                 CAP_LINUX_IMMUTABLE or an FS_IMMUTABLE_FL-blind filesystem \
+                 — hosted-runner shape); the RetainedError fixture cannot be \
+                 armed here — see the test's doc comment"
+            );
+            return;
+        }
+    }
+
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
     let repo = repos.path().join("solo");

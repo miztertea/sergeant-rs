@@ -151,13 +151,33 @@ institutional independence"). Ruling record: R-S0-13 in
   orchestrator afterward. A verifier that mutates the thing it verifies to
   reach a verdict has stopped verifying; its batch is quarantined and
   re-adjudicated. This is the anti-capture boundary applied to our own loop.
+- **Independent probe execution** (revision 2026-08-11, from S2 wave 2's
+  measured result): builders do not execute their own mutation probes.
+  Each builder returns a *guard map* — per new test, the exact mutation
+  that should kill it — and ONE independent prober (an Opus seat: blind
+  adversarial verification) executes the whole wave's map batched in a
+  single disposable worktree, plus probes of its own devising for the
+  compositions no map listed. Probe survivors enter the fix round as
+  executed evidence, not refutable claims. Why: S1's round 2 and S2's
+  probes each caught pins a builder's self-probe had passed
+  (parts-vs-composition, unfalsifiable assertions — L13); and one
+  worktree at a time respects the disk budget where per-builder probe
+  trees do not. Self-probing is retired.
+- **Parallel builders in one checkout** (revision 2026-08-11, from S2
+  wave 1's near-misses): concurrent builders get exclusive, named file
+  surfaces and never touch outside them, even transiently — no unscoped
+  `cargo fmt` (use `--check` only), shared support modules are
+  escalation-only, and the cargo lock serializing their test runs is
+  normal, never a reason to create alternate target dirs. Builders that
+  mutate shared state get worktree isolation or sequential scheduling
+  instead.
 
 ## The scripts as run
 
-`reference/gauntlet-workflows.zip` holds all twelve orchestration scripts
-exactly as executed, one per workflow invocation: the seven milestone
-gauntlets (`m0-bootstrap` … `m6-clients`) and the five lean follow-up
-rounds (`m2`–`m6-round2-lean`). They are the concrete instantiation of
-this pattern — schemas, axis briefs, hygiene preambles, model/effort
-assignments, and the economy revisions are all visible in the diffs
-between successive milestones' scripts.
+Every orchestration script, exactly as executed, one file per workflow
+invocation, lives under `resources/` in per-series folders (migration
+2026-08-11; formerly `reference/gauntlet-workflows.zip` — extracted in
+full, the zip retired because plain files make the between-milestone
+diffs visible, which is where the economy revisions and protocol changes
+actually live). Schemas, axis briefs, hygiene preambles, and model/effort
+assignments are all in the scripts themselves.
