@@ -44,6 +44,49 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### #44 — journal group commit (Cerberus, 2026-08-11)
+
+**Mission outcome. Closed.** A-N3-1's filed follow-up landed on its own
+trigger ("before the N4 contract ships"). One fsync per authoritative
+core-lock hold instead of one per event: `Journal` splits write from sync,
+`Core` carries the hold's open group, and `CoreGuard` — now the only way to
+take the core mutex — closes it. Two commits, deliberately separable
+(L10): `269179a` is the structural half and changes no durability at all;
+`2be980c` moves the fsync and carries the L6 analysis. Gates green
+(fmt/clippy/377 tests + 4 opt-in ignored), demo green, no daemon leaks.
+
+**Measured.** `strace -c` on the S1 burst-50 daemon: **1157 → 253
+fdatasync** for the same 900 events, i.e. ~23 → ~5 fsyncs per work.
+Throughput 43.13 → 44.62 works/s mean of 3 (+3.5%, inside the spread),
+p50 unchanged, 18.0 events/work on both sides. Evidence and the honest
+negative in `docs/perf/n3-group-commit-2026-08-11.md`: **this measurement
+does not claim the N3 regression was recovered on Cerberus** — an fsync
+costs ~13 µs on this host, so there was no wall clock in it to win. The
+result that matters is that journal cost per work became O(lock holds)
+rather than O(events), which is exactly what the pre-N4 trigger was about.
+
+**What was not traded.** No compound event, no event-count change, no
+crash window deleted; A-N3-1's rejection of the
+`stage.entered`+`execution.reserved` merge stands untouched and `n10`–`n12`
+pass unchanged. The L6 obligation was discharged as a *subset* claim — per
+append fsync always left "some byte prefix, possibly torn", so grouping
+lowers the floor without widening the reachable set — and proven by `n32`,
+which truncates a real six-event grouped hold at every byte offset a crash
+could stop at (~1400) and requires each to reopen, replay to an exact
+prefix, and reconcile fail-closed. Its last case is byte-for-byte `n11`'s.
+
+**Environmental behavior.** Single-agent build under the orchestrator's
+scope note, not a full panel — recorded as such. Six mutation probes run in
+a disposable git worktree with its own `CARGO_TARGET_DIR` (L5, and CLAUDE.md's
+shared-cache hazard): per-append fsync restored, `CoreGuard::drop` neutered,
+rotation's group close deleted, `sync`'s poison deleted, a bare `core.lock()`
+reintroduced, `recover_tail`'s truncation deleted — **all six killed**, by
+the named guards. One process note worth keeping: the first probe round was
+invalid and looked clean, because `git checkout -- src tests` in a worktree
+detached at the *previous* commit silently reverted the change under test
+along with the mutation. A mutation probe must be run against a committed
+base, or "survived" means "was never applied".
+
 ### N-SERIES CONTAINER CLOSE-OUT — 2026-08-11, v2 measured, Run B, Cerberus handoff
 
 **Mission outcome.** Generator v2 blind-measured (run 3, 2.2M tokens):
