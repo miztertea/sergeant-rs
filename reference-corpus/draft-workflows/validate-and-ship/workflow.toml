@@ -1,0 +1,9 @@
+# Draft workflow — N1 reference corpus (docs/gauntlet/contracts/N1.md).
+# Not admitted: lives under .sergeant/drafts/workflows/ per
+# docs/icm/convention.md §2. Promotion to .sergeant/workflows/ is a
+# distinct, human-reviewed act.
+
+[workflow]
+name = "validate-and-ship"
+version = "2"
+stages = ["00-check-scope", "10-do-the-work", "20-select-intent-transport", "30-start-run", "40-drive-gates", "50-reconcile-custody", "60-close-out"]

@@ -39,6 +39,20 @@ decision turns on exact wording (a rule's scope, a template's boundary, an
 edit target), read the governing text in-session at decision time. The
 owner caught all three; the fix each time was one Read.
 
+## L11 — A hash without its preimage convention is not evidence
+
+N1: the corpus's strongest rule — "a quote_hash that does not verify against
+the cited locator is invention, rejected at lint" — was unenforceable by
+construction: the record stored only the hash, and no document said what
+span gets hashed (whole line? paragraph? trimmed?). 106 of 966 units failed
+reproduction indistinguishably from invention, and the failure surfaced only
+when a reviewer tried to actually run the check (finding R3-02). Fix:
+specify the derivation (sha256 over the exact contiguous byte span, no
+normalization) and record the preimage (`quote` field) beside the hash.
+General form: an integrity rule binds only when its verification procedure
+is executable by a stranger; publish the convention with the first hash, not
+after the first audit.
+
 ## L10 — A squashed milestone commit defeats the revert-probe audit
 
 M6 round 2: checkpoint commit 69cb52e folded the entire build plus all 13
