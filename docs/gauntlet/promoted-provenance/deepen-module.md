@@ -35,3 +35,11 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P4-020` | After deepening a module, delete the old unit tests that targeted the now-merged shallow modules rather than keeping them alongside new interface-level tests. | `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` (Testing strategy, L34) |
 | `BU-P4-021` | Tests written against a deepened module must assert on observable outcomes through the interface, not on internal state, so they survive internal refactors; a test that must change when the implementation changes is testing past the interface. | `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` (Testing strategy, L37) |
 
+**Curation note (promotion, `docs/icm/promotion-spec-2026-08-11.md` §1):**
+`20-test-at-new-interface`, this package's true closing stage, declares a
+`promote`-dispositioned output with no finalize step — one of the 30 N1
+drafts in that bucket, not one of the 3 (`drain-fleet`, `respond-to-worker`,
+`to-spec`) that name one. D9 (`docs/icm/convention.md` §1a, "Open
+questions") does not block promotion on this; disposition here is applied
+by human review at merge time for this package, not mechanically.
+
