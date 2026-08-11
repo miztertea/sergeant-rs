@@ -163,3 +163,32 @@ Stage count: 12 extracted → 6 surviving. No behavior unit was deleted; all uni
 
 **Synthesis notes:** Reviewers flagged this as the corpus's largest single cluster (63 units, 12 stages) — see `reference-corpus/synthesis.md` §8 note 1: either it is genuinely one procedure with twelve checkpoints, or it should split at `70-launch-and-record` into a plan-and-validate workflow and a launch-fleet workflow. Recorded as an open question for the classification ledger, not resolved here.
 
+## Promotion note (docs/icm/promotion-spec-2026-08-11.md §1, §5)
+
+**Finalize gap.** This package's true closing stage, per `workflow.toml`'s
+own stage order, is `90-reconcile-fleet`; its `output/README.md` declares
+a `promote` disposition with no finalize step — one of the 30 of 34 N1
+drafts in that shape, not one of the 3 (`drain-fleet`, `respond-to-worker`,
+`to-spec`) that name one. This package's own sole "finalize" text
+(`80-monitor`'s notification-action-lease-settlement behavior contract
+item, `BU-P6-113`) settles a per-worker exit lease, not a workflow-level
+finalize step, and does not sit at the true closing stage regardless — the
+spec's own §1 flags this exact package as the corpus's one case where a
+"finalize" mention appears at a non-closing stage (`80-monitor`) rather
+than at `90-reconcile-fleet`. Recorded here per the spec's finalize-gap
+rule rather than silently promoted; disposition on whether this package
+needs a finalize step is left to human review at merge time, not applied
+mechanically by this curation act.
+
+**Three-package dependency verified.** This package's NEEDS-JUDGMENT
+classification (spec §5) turns on the engine-gap note at `80-monitor`
+(`BU-P5-074`'s `--deps` recording-vs-enforcement split, folded into
+engine-gap G2's split acceptance test per `reference-corpus/synthesis.md`
+§5 — read and understood, not edited, per the spec's forbidden-list rule)
+plus two named `## Delegation` targets: `drain-fleet` (`15-check-admission`)
+and `respond-to-worker` (`80-monitor`). Both were confirmed present and
+already `status: published` in this library's `.sergeant/workflows/` tree
+at promotion time, before this package was promoted — satisfying the
+spec's naming rule (§4) that a delegation target must never be a dangling
+reference. No delegation target name was renamed or altered.
+
