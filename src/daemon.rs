@@ -675,7 +675,9 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
 /// rather than terminating the process.
 struct ShutdownSignals {
     #[cfg(unix)]
-    unix: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
 }
 
 impl ShutdownSignals {
@@ -686,21 +688,28 @@ impl ShutdownSignals {
             // Both explicitly, rather than leaning on `ctrl_c()`: that helper
             // registers SIGINT when its future is first polled, which is the
             // very thing this type exists to move earlier.
-            let unix = match (
-                signal(SignalKind::interrupt()),
-                signal(SignalKind::terminate()),
-            ) {
-                (Ok(interrupt), Ok(terminate)) => Some((interrupt, terminate)),
-                (interrupt, terminate) => {
-                    let e = interrupt.err().or(terminate.err());
+            //
+            // Each registration is kept independently. Tokio's Unix signal
+            // registration is process-global and is not undone when the
+            // `Signal` is dropped, so discarding a successfully registered
+            // stream because the *other* one failed would leave that signal
+            // consumed by tokio's handler with nothing receiving it — a
+            // daemon unkillable by exactly the signal that did register.
+            let take = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(stream) => Some(stream),
+                Err(e) => {
                     tracing::error!(
                         error = ?e,
-                        "cannot install shutdown signal handlers; falling back to ctrl_c"
+                        signal = name,
+                        "cannot install shutdown signal handler"
                     );
                     None
                 }
             };
-            Self { unix }
+            Self {
+                interrupt: take(SignalKind::interrupt(), "SIGINT"),
+                terminate: take(SignalKind::terminate(), "SIGTERM"),
+            }
         }
         #[cfg(not(unix))]
         {
@@ -711,12 +720,26 @@ impl ShutdownSignals {
     /// Resolve on the first shutdown signal delivered since installation.
     async fn recv(&mut self) {
         #[cfg(unix)]
-        if let Some((interrupt, terminate)) = self.unix.as_mut() {
-            tokio::select! {
-                _ = interrupt.recv() => {}
-                _ = terminate.recv() => {}
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+                return;
             }
-            return;
+            // A signal whose registration failed keeps its default
+            // disposition (terminate the process), so waiting only on the
+            // stream that exists loses nothing.
+            (Some(interrupt), None) => {
+                let _ = interrupt.recv().await;
+                return;
+            }
+            (None, Some(terminate)) => {
+                let _ = terminate.recv().await;
+                return;
+            }
+            (None, None) => {}
         }
         let _ = tokio::signal::ctrl_c().await;
     }

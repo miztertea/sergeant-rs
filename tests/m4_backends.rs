@@ -444,10 +444,15 @@ struct StubClaude {
     /// While this file exists, a turn invocation `exec`s a long sleep after
     /// replaying — a turn that is genuinely still in flight.
     hang: PathBuf,
-    /// While this file exists, a turn invocation sleeps for the number of
-    /// seconds it holds **before** emitting anything — a turn whose process
-    /// outlives launch-settle and then finishes on its own (issue #46).
+    /// While this file exists, a turn invocation parks **before** emitting
+    /// anything until [`StubClaude::release_turn`] creates the release
+    /// marker (consumed per turn) — a turn whose process outlives
+    /// launch-settle and then finishes on its own (issue #46), gated on an
+    /// event rather than a wall-clock sleep so a loaded runner cannot let
+    /// the turn end early.
     stall: PathBuf,
+    /// One-shot release marker for a parked turn; see `stall`.
+    release: PathBuf,
     /// While this file exists, its contents go to the turn's stderr.
     stderr: PathBuf,
     /// While this file exists, the turn exits with the code it holds.
@@ -487,6 +492,7 @@ impl StubClaude {
         let replay = dir.join("claude-replay.jsonl");
         let hang = dir.join("claude-hang");
         let stall = dir.join("claude-stall");
+        let release = dir.join("claude-release");
         let stderr = dir.join("claude-stderr");
         let exit_code = dir.join("claude-exit-code");
         let help = help_flags.join(" ");
@@ -505,7 +511,11 @@ impl StubClaude {
                    printf 'cwd %s\\n' \"$(pwd)\";\n      \
                    printf 'stdin %s\\n' \"$(cat | tr '\\n' '|')\";\n      \
                    printf 'end\\n'; }} >> \"{record}\"\n    \
-                 if [ -f \"{stall}\" ]; then sleep \"$(cat \"{stall}\")\"; fi\n    \
+                 if [ -f \"{stall}\" ]; then\n      \
+                   i=0\n      \
+                   while [ ! -f \"{release}\" ] && [ \"$i\" -lt 200 ]; do sleep 0.1; i=$((i+1)); done\n      \
+                   rm -f \"{release}\"\n    \
+                 fi\n    \
                  if [ -f \"{replay}\" ]; then cat \"{replay}\"; fi\n    \
                  if [ -f \"{stderr}\" ]; then cat \"{stderr}\" >&2; fi\n    \
                  if [ -f \"{hang}\" ]; then exec sleep 30; fi\n    \
@@ -516,6 +526,7 @@ impl StubClaude {
             replay = replay.display(),
             hang = hang.display(),
             stall = stall.display(),
+            release = release.display(),
             stderr = stderr.display(),
             exit_code = exit_code.display(),
         );
@@ -529,6 +540,7 @@ impl StubClaude {
             replay,
             hang,
             stall,
+            release,
             stderr,
             exit_code,
         };
@@ -582,9 +594,11 @@ impl StubClaude {
         Self::new(dir, "2.1.226 (Claude Code)", ALL_FLAGS)
     }
 
-    /// Make every turn invocation sleep `seconds` before it emits a byte, so
-    /// the turn's process is still alive — and its stdout still open — when
-    /// launch-settle takes its observation.
+    /// Make every turn invocation park before it emits a byte until
+    /// [`Self::release_turn`] fires, so the turn's process is provably still
+    /// alive — and its stdout still open — when launch-settle (or
+    /// SEND-settle) takes its observation, no matter how loaded the machine
+    /// is.
     ///
     /// This is the shape of every *real* turn and of no test before issue #46:
     /// the fake backend finishes inside the launch effect, and the stub
@@ -592,9 +606,21 @@ impl StubClaude {
     /// finished recording the launch, so the suite only ever settled turns
     /// that were already over. A turn that outlives launch-settle is the one
     /// Run B measured, and the only one that can be left `active` forever.
-    fn stalls_for(&self, seconds: &str) -> &Self {
-        std::fs::write(&self.stall, seconds).expect("write stall marker");
+    /// An earlier version parked with a fixed 2 s `sleep`, which raced the
+    /// settle it was supposed to outlast on a loaded 2-core runner (BS2R-05);
+    /// the gate makes the ordering an event, not a bet. A parked turn that is
+    /// never released proceeds on its own after ~20 s — inside
+    /// `SETTLE_BUDGET`, so a test bug degrades to the old wall-clock shape
+    /// instead of hanging the suite.
+    fn stalls_until_released(&self) -> &Self {
+        std::fs::write(&self.stall, b"gate\n").expect("write stall marker");
         self
+    }
+
+    /// Let the currently parked turn proceed: one-shot, consumed by the turn
+    /// invocation that sees it, so the next gated turn parks again.
+    fn release_turn(&self) {
+        std::fs::write(&self.release, b"go\n").expect("write release marker");
     }
 
     /// Make every turn invocation write `text` to stderr.
@@ -1118,10 +1144,13 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
 // and a client crank, and a real turn finishes at none of those instants.
 //
 // What makes these tests different from every earlier one in this file is one
-// line: `stub.stalls_for(...)`. Without it the stub replays and exits before
-// the adapter has finished recording the launch, so launch-settle observes an
-// already-finished turn and the whole seam is invisible — which is exactly why
-// a suite of 352 tests was green while the product stalled for 45 minutes.
+// line: `stub.stalls_until_released()`. Without it the stub replays and exits
+// before the adapter has finished recording the launch, so launch-settle
+// observes an already-finished turn and the whole seam is invisible — which is
+// exactly why a suite of 352 tests was green while the product stalled for 45
+// minutes. Each test releases the gate only after the settle it needs to
+// outlast has provably happened (the settle's own HTTP response is in hand),
+// so the window is held open by ordering, not by a wall-clock sleep.
 //
 // Neither test makes a mutating client call after the submit, and each one
 // asserts that from the journal (`command.accepted` is journaled per accepted
@@ -1130,16 +1159,11 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
 // allowed; causing it with a POST is the thing being ruled out.
 
 /// How long the driven-turn tests wait for the daemon to settle a turn that
-/// ended on its own. The driver's cadence is 200 ms and the stub stalls for
-/// 2 s, so this is ~4× the honest budget — long enough not to flake on a
-/// loaded machine, short enough that a genuinely stuck stage fails the test
-/// rather than the suite's patience.
+/// ended on its own. The driver's cadence is 200 ms and a released turn ends
+/// within a replay's runtime, so this covers a loaded machine (and the ~20 s
+/// self-release of a gate a buggy test forgot to open) while a genuinely
+/// stuck stage still fails the test rather than the suite's patience.
 const SETTLE_BUDGET: Duration = Duration::from_secs(30);
-
-/// Seconds a driven-turn stub stalls before emitting anything, as the shell
-/// `sleep` argument. Long enough that launch-settle provably observes an
-/// in-flight turn: the stub and the settle both start at the spawn.
-const STALL_SECONDS: &str = "2";
 
 /// Start a daemon whose only backend is the real Claude adapter over `stub`.
 async fn start_with_stub(data_dir: &Path, stub: &StubClaude) -> daemon::DaemonHandle {
@@ -1310,7 +1334,7 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     let repo = TempDir::new().expect("repo");
     init_repo(repo.path());
     let stub = StubClaude::passing(data.path());
-    stub.replays(&recorded_turn()).stalls_for(STALL_SECONDS);
+    stub.replays(&recorded_turn()).stalls_until_released();
 
     let handle = start_with_stub(data.path(), &stub).await;
     let http = reqwest::Client::new();
@@ -1322,7 +1346,7 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
 
     // 1. The launch's own observation could not have been the settling one:
     // the response is rendered after the crank parked, and the turn is still
-    // sleeping inside its `sleep`.
+    // parked at the stub's release gate.
     assert_eq!(
         submitted["work"]["state"], "active",
         "the turn must still be in flight at launch-settle, or this test is \
@@ -1331,7 +1355,9 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     assert_eq!(submitted["stage"]["stage_id"], "00-prepare");
     assert_eq!(submitted["stage"]["status"], "active");
 
-    // 2. …and then the daemon settles it, with nothing but reads from here.
+    // 2. Let the turn end, and the daemon settles it with nothing but reads
+    // from here.
+    stub.release_turn();
     let cascaded = poll_work_until(&http, &handle, &work_id, "the stage cascaded", |shown| {
         shown["stage"]["index"].as_u64().unwrap_or(0) > 0
     })
@@ -1348,10 +1374,11 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     // TH-5 (BS2 test-honesty finding): the driver's own docs promise a poll
     // that finds a turn still `Running` journals nothing — only `contains`
     // assertions existed to check that, which a driver appending one event
-    // per tick would still satisfy. The stall is `STALL_SECONDS` over a
-    // 200ms default cadence, so a per-tick leak would add roughly ten extra
-    // events; this run's whole trajectory (submit through the cascaded
-    // launch) is nowhere near that many.
+    // per tick would still satisfy. The cascaded stage's turn is still parked
+    // at the (unreleased) gate here, so the driver has been polling a
+    // `Running` execution at its 200ms cadence since the cascade; a per-tick
+    // leak would blow this bound while this run's whole trajectory (submit
+    // through the cascaded launch) stays nowhere near it.
     assert!(
         events.len() < 25,
         "the completion driver's poll cadence must not enter the trajectory \
@@ -1410,7 +1437,7 @@ async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr()
     // No replay file at all: the CLI refused before it wrote a byte of
     // stream-json, which is why attempt 1's `conversation.turn.ended` carried
     // `raw: null` and `result_envelope: false`.
-    stub.stalls_for(STALL_SECONDS)
+    stub.stalls_until_released()
         .writes_stderr(refusal)
         .exits_with(1);
 
@@ -1425,6 +1452,7 @@ async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr()
         submitted["work"]["state"], "active",
         "the refusal must land after launch-settle: {submitted}"
     );
+    stub.release_turn();
 
     let blocked = poll_work_until(&http, &handle, &work_id, "the stage blocked", |shown| {
         shown["work"]["state"] == "blocked"
@@ -1500,7 +1528,7 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
     let home = TempDir::new().expect("claude home");
     init_repo(repo.path());
     let stub = StubClaude::passing(data.path());
-    stub.replays(&recorded_turn()).stalls_for(STALL_SECONDS);
+    stub.replays(&recorded_turn()).stalls_until_released();
 
     // An hour's cadence: the first tick never arrives, so the window between
     // the turn ending and the daemon settling it stays open for the whole run.
@@ -1511,6 +1539,9 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
         .as_str()
         .expect("work id")
         .to_string();
+    // The submit's response is in hand, so launch-settle has taken its
+    // observation of an in-flight turn; now let the turn end.
+    stub.release_turn();
 
     // Stand inside the window: the turn has ended and been journaled, and
     // nothing has acted on it.
@@ -1620,7 +1651,7 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
     init_repo(repo.path());
     let stub = StubClaude::passing(data.path());
     stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
-        .stalls_for(STALL_SECONDS);
+        .stalls_until_released();
 
     let handle = start_with_stub(data.path(), &stub).await;
     let http = reqwest::Client::new();
@@ -1629,9 +1660,12 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
         .as_str()
         .expect("work id")
         .to_string();
+    // The submit's response is in hand, so launch-settle already observed the
+    // asking turn in flight; release it so the driver can park the ask.
+    stub.release_turn();
 
     // 1. The actor's question parks the work — settled by the completion
-    // driver, not by launch-settle (the stub stalls first).
+    // driver, not by launch-settle (the stub was gated across the launch).
     let parked = poll_work_until(
         &http,
         &handle,
@@ -1652,7 +1686,8 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
     // 2. Answer it. The response must reflect the delivery's own settle
     // (stage live again, same stage, same work still active) — not the
     // resumed turn's eventual outcome, which the stub has not even started
-    // emitting yet (it is still inside its `stalls_for` sleep).
+    // emitting yet (it is parked at the release gate, re-armed because the
+    // release is consumed per turn).
     let responded = respond_over_api(&http, &handle, &work_id, "postgres").await;
     assert_eq!(
         responded["work"]["state"], "active",
@@ -1666,8 +1701,9 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
          completion driver has nothing to poll (INV-1): {responded}"
     );
 
-    // 3. …and then the daemon settles the resumed turn on its own, with
-    // nothing but reads from here.
+    // 3. Let the resumed turn end, and the daemon settles it on its own,
+    // with nothing but reads from here.
+    stub.release_turn();
     let cascaded = poll_work_until(
         &http,
         &handle,
@@ -1761,11 +1797,13 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
 /// as every real turn does, and reaching `needs_input` at all requires the
 /// driver to actually run. So this test runs the driver at its normal
 /// cadence to reach `needs_input` and deliver the answer, then shuts the
-/// daemon down **immediately** after `respond` returns, with no wait of any
-/// kind: the resumed turn is stub-armed to sleep for a full
-/// `STALL_SECONDS` before it emits a single byte, and shutdown completes
-/// in low milliseconds, so the daemon is provably gone long before the
-/// resumed turn could have ended — never mind been settled.
+/// daemon down **immediately** after `respond` returns: the resumed turn is
+/// parked at the stub's release gate, which this test never opens, so the
+/// resumed turn cannot emit a byte — never mind end, never mind be settled —
+/// while this daemon lives, however long shutdown takes. (An earlier version
+/// leaned on a fixed 2 s stall outlasting respond→shutdown, which a loaded
+/// runner plus a driver settle inside the shutdown grace could beat —
+/// BS2R-08.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
     let data = support::DataDir::new();
@@ -1774,7 +1812,7 @@ async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
     init_repo(repo.path());
     let stub = StubClaude::passing(data.path());
     stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
-        .stalls_for(STALL_SECONDS);
+        .stalls_until_released();
 
     let handle = start_with_stub(data.path(), &stub).await;
     let http = reqwest::Client::new();
@@ -1783,6 +1821,7 @@ async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
         .as_str()
         .expect("work id")
         .to_string();
+    stub.release_turn();
 
     poll_work_until(
         &http,
@@ -1793,11 +1832,11 @@ async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
     )
     .await;
 
-    // The resumed turn is armed to sleep `STALL_SECONDS` before it emits
-    // anything — the same fixture, still in place. Answering it and
-    // shutting down immediately, with no poll and no sleep in between,
-    // stands inside the window by construction: at most a few milliseconds
-    // elapse here, nowhere near enough for the stub's sleep to have ended.
+    // The resumed turn parks at the release gate — the same fixture, still
+    // armed, and its one-shot release was consumed by the asking turn.
+    // Nothing ever opens it again, so the resumed turn cannot emit a byte
+    // before the shutdown below finishes: the window is held open by
+    // construction, not by outrunning a sleep.
     let responded = respond_over_api(&http, &handle, &work_id, "postgres").await;
     assert_eq!(
         responded["stage"]["status"], "active",

@@ -61,6 +61,10 @@ wait_for_pid_file() {
 }
 
 start_daemon() {
+  # A stale daemon.pid from a previous daemon would satisfy
+  # wait_for_pid_file before the new daemon writes its own; the freshly
+  # written file is the readiness signal, so clear the old one first.
+  rm -f "$NO_MISTAKES_HOME/daemon.pid"
   if is_root; then
     IS_SANDBOX=1 CARGO_TARGET_DIR="$CARGO_TARGET_DIR" no-mistakes daemon start
   else
@@ -76,6 +80,7 @@ start_daemon() {
     else
       systemctl --user set-environment CARGO_TARGET_DIR="$CARGO_TARGET_DIR"
     fi
+    rm -f "$NO_MISTAKES_HOME/daemon.pid"
     systemctl --user restart "$unit"
   fi
   wait_for_pid_file
@@ -90,8 +95,28 @@ daemon_env_ok() {
   return 0
 }
 
+# Empty stdout (rather than a pipefail abort) when the pid file is missing,
+# empty, or not in the expected shape.
+daemon_pid() {
+  local pid_file="$NO_MISTAKES_HOME/daemon.pid"
+  [ -s "$pid_file" ] || return 0
+  { grep -oE '"pid":[0-9]+' "$pid_file" 2>/dev/null || true; } | cut -d: -f2 | head -n1
+  return 0
+}
+
 no-mistakes daemon status >/dev/null 2>&1 || start_daemon
-pid=$(grep -oE '"pid":[0-9]+' "$NO_MISTAKES_HOME/daemon.pid" | cut -d: -f2)
-daemon_env_ok "$pid" || { no-mistakes daemon stop; start_daemon; }
+pid="$(daemon_pid)"
+if [ -z "$pid" ] || ! daemon_env_ok "$pid"; then
+  no-mistakes daemon stop
+  start_daemon
+  pid="$(daemon_pid)"
+  [ -n "$pid" ] || { echo "gate.sh: no readable pid in $NO_MISTAKES_HOME/daemon.pid after restart" >&2; exit 1; }
+  daemon_env_ok "$pid" || {
+    wanted="CARGO_TARGET_DIR"
+    is_root && wanted="CARGO_TARGET_DIR and IS_SANDBOX"
+    echo "gate.sh: daemon (pid $pid) still missing $wanted in its env after restart - check how its supervisor sets env before running the gate" >&2
+    exit 1
+  }
+fi
 
 exec no-mistakes axi run --intent "$intent" --skip push,pr,ci "$@"

@@ -154,11 +154,13 @@ impl Core {
     /// serve them on the next hold, from a journal that has since refused
     /// further appends. "Unannounced" describes the live SSE push only.
     ///
-    /// Free when the group is empty, so a read-only hold costs nothing.
+    /// Free when the group is empty, so a read-only hold costs nothing —
+    /// but `sync` is still consulted, never short-circuited: a poisoned
+    /// journal must surface from *every* flush, or a caller that flushes an
+    /// empty group as a durability backstop (`daemon::start_with`'s
+    /// pre-publish `core.flush()?`) would read `Ok` over a handle that
+    /// refuses all further appends.
     pub fn flush(&mut self) -> Result<(), CoreError> {
-        if self.open_group.is_empty() {
-            return Ok(());
-        }
         let synced = self.journal.sync();
         // Taken unconditionally: a group that failed to sync is not retried
         // on the next hold, it is abandoned along with the poisoned handle.

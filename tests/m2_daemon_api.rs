@@ -3173,7 +3173,10 @@ async fn t11d_a_stalled_completion_driver_does_not_hold_shutdown_open() {
     let elapsed = match outcome {
         Ok(joined) => joined.expect("shutdown task"),
         Err(_) => {
-            let _ = shutdown.await;
+            // Bounded like the wait it drains (02f825a's rule: bound the
+            // test's own wait too) — if the release did not cure the hang,
+            // the suite must still reach this panic rather than hang itself.
+            let _ = tokio::time::timeout(SHUTDOWN_BUDGET, shutdown).await;
             panic!(
                 "the daemon was still shutting down after {SHUTDOWN_BUDGET:?} with the \
                  completion driver parked inside an OBSERVE — shutdown is waiting on an \
@@ -3256,7 +3259,7 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
     let elapsed = match outcome {
         Ok(joined) => joined.expect("shutdown task"),
         Err(_) => {
-            let _ = shutdown.await;
+            let _ = tokio::time::timeout(SHUTDOWN_BUDGET, shutdown).await;
             panic!(
                 "the daemon was still shutting down after {SHUTDOWN_BUDGET:?} even \
                  with the driver's observe released and reprogrammed to complete"

@@ -158,8 +158,8 @@ EOF
 chmod +x "$d/chattr"
 PATH="$d" bash "$TARGET" >/dev/null 2>/dev/null
 calls="$(wc -l <"$log" | tr -d ' ')"
-if [ "$calls" -lt 2 ]; then
-  fail "W2 (chattr -i fails): expected at least 2 chattr calls (inline attempt + trap retry), got $calls"
+if [ "$calls" -lt 3 ]; then
+  fail "W2 (chattr -i fails): expected at least 3 chattr calls (+i, failing inline -i, trap retry -i), got $calls"
 else
   pass "W2 (chattr -i fails): EXIT trap retried cleanup ($calls chattr calls)"
 fi

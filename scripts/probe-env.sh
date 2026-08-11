@@ -550,10 +550,11 @@ hostname_val="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo unknown-hos
 
 if [ "$is_ci" -eq 1 ]; then
   paste_target="github-runner"
-elif [ "$is_docker_container" -eq 1 ]; then
-  paste_target="claude-code-cloud"
 else
   paste_target="$hostname_val"
+  if [ "$is_docker_container" -eq 1 ]; then
+    add_note "Container evidence present, but container evidence alone cannot name the host (one file per environment): the paste-destination hint below falls back to this host's hostname. If this session is the known Claude Code cloud container, the destination is docs/environments/claude-code-cloud.md; any other containerized host gets its own file on first contact."
+  fi
 fi
 
 printf 'Facts measured %s on host "%s"\n\n' "$PROBE_DATE" "$hostname_val"
