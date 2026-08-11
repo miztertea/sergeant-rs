@@ -1,14 +1,27 @@
 # Estate manifest design — capture of in-session decisions, 2026-08-11
 
-Transcribed from the owner grill; input to the MVP-1 contract. Under
-review — the four-reviewer pipeline attacks this alongside the
-bucketing plan.
+Transcribed from the owner grill; input to the MVP-1 contract. **v2 same
+day:** read against `src/` by the review pipeline. Corrections carry
+**[v2]** with a cite and their rationale in the bucketing plan's
+dispositions; the owner's decisions stand except one ESCALATED fork.
 
 ## Shape
 
 Extends the estate root's `sergeant.toml` (reuse the discovered config
 file, R1): `[estate]` (name, `data_dir` defaulting `.sergeant/data`),
-`[profile.*]` (existing), `[[repo]]` entries, `[group.*]` tables.
+`[[profile]]` (existing; **[v2]** array-of-tables per `workspace.rs:179`,
+unchanged here — the earlier `[profile.*]` shorthand was wrong),
+`[[repo]]` entries, `[group.<name>]` tables.
+
+**[v2] The migration is a decision, not a free extension.**
+`WorkspaceFile` is `deny_unknown_fields` over exactly
+`workspace`/`repository`/`profile` (`workspace.rs:172-198`), so this
+design's own vocabulary is a hard `Malformed` today. Working position:
+the new tables are the estate vocabulary, `[workspace]`/`[[repository]]`
+stay accepted as the legacy single-repo shape, both resolving into
+`Workspace`, and mixing them fails closed naming both. **ESCALATED** —
+rename-with-refusal vs. coexistence is the owner's call, and MVP-1 cannot
+name serde fields until it is made.
 
 Per `[[repo]]`: `name` (mount at `repos/<name>`), `origin`
 (populate/verify only — canonical clone locations are not sergeant's
@@ -19,10 +32,28 @@ worktree; suppress = the old `--setting-sources` behavior for foreign
 repos — the adapter TRANSLATES this policy, never defines it),
 `brief` (one orientation line, AI-facing string value).
 
+**[v2]** None of the four exist, and two are more than fields.
+`RepositorySpec` is `{name, path}` (`workspace.rs:33-39`) and a declared
+non-repo fails closed `RepositoryNotFound` (`:274-281`) — so
+populate-from-`origin` is new code, and fail-closed stays the behavior
+when `origin` is absent. `base` has no plumbing: `materialize_one` cuts
+unconditionally from `HEAD` (`surface.rs:340`) and must learn to resolve
+a ref, HEAD when absent. And `instructions` cannot
+be per-repo as written: one `--setting-sources` flag rides one `Command`
+per turn (`claude.rs:874-881`) while multi-repo work executes at the
+shared surface root, in no worktree (`surface.rs:152-161`). Rule:
+`instructions` resolves per-Work at bind; disagreeing repos fail closed
+naming them and the remedy. What `local` translates to is **unmeasured**
+— L1 binds, so MVP-2 measures it before the semantics are fixed.
+
 Per `[group.<name>]`: `repos` list (members must be declared repos,
 fail closed with remedy) + optional `brief`. Consumption:
 `sgt run "..." --group <name>` expands to the group's repos as Work
-scope.
+scope — **[v2] provisional**, not settled: NORTH-STAR.md:116-118 still
+lists cross-repo Work "unimplemented and uncontracted" pending the
+group-expansion ruling MVP-1 owes. Until then membership needs no new
+surface: `--repo` is repeatable (`cli.rs:75-77`), so a harness reading
+`[group.*]` expands it itself.
 
 Field rule: **structure is for the binary, string values are for the
 AI, comments are for the human.** The binary never parses prose.
@@ -40,14 +71,27 @@ as its feedback loop. TUI later = the same verbs with a screen.
 ## Read semantics
 
 Read at discrete moments only — daemon start, work submission (bind
-time), on-demand (doctor/list). No hot reload, no daemon-resident
-cache; the file is tiny, read fresh per operation. Torn-read defense in
-three layers: sgt's pens write atomically; strict fail-closed parse is
-the tripwire for foreign pens (refused operation names the defect,
-retry after save); **pin-at-bind** caps the blast radius — a Work's
-binding snapshots the manifest policy it launched under (the
-workflow.bound precedent), so mid-flight edits affect the next Work,
-never a running one.
+time), on-demand (doctor/list). No hot reload, no daemon-resident cache;
+the file is tiny, read fresh per operation. **[v2]** But discovery never
+reaches the estate root from inside a member repo: `Workspace::discover`
+anchors on `git rev-parse --show-toplevel` and reads `sergeant.toml` only
+there (`workspace.rs:206-231`), and `--show-toplevel` never crosses an
+inner `.git`. Estate discovery therefore walks upward from cwd *past* git
+boundaries for a `sergeant.toml` carrying `[estate]`, keeping the
+git-toplevel path as the zero-config single-repo fallback; #22 owns the
+fixtures.
+
+Torn-read defense in three layers: sgt's pens write atomically; strict
+fail-closed parse is the tripwire for foreign pens (refused operation
+names the defect, retry after save); **pin-at-bind** caps the blast
+radius — a Work's binding snapshots the manifest policy it launched
+under, so mid-flight edits affect the next Work, never a running one.
+**[v2]** That *extends* the `workflow.bound` precedent, it does not reuse
+it: the payload pins `Profile` and `stage_bindings` whole but the
+workspace only as a bare `plan.workspace.name` string
+(`engine.rs:1044-1051`), so per-repo policy means widening it to the
+resolved `Vec<RepositorySpec>` — new fields in an immutable event,
+additive-only thereafter.
 
 ## Wrongness contract
 

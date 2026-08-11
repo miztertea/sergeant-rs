@@ -66,10 +66,12 @@ it. New rulings absorbed there: the estate manifest as keystone
 (`sergeant.toml` estate sections, pin-at-bind, three pens one file),
 the adapter-boundary rule (core semantics never defined by adapter
 flags — the `--setting-sources` de-leak), cost demoted to adapter
-capability with the turn-count envelope core-owned, E3 dissolved by
-R-NS-6, and the cheap-now rule (small enabling code lands in MVP even
-when not direct-MVP). The wave text below stands as the argument
-record.
+capability with the turn-count envelope core-owned, E3's WORKFLOW-IF-E3
+category dissolved by R-NS-6 **while its submit-time capability preflight
+survives as an MVP-1 item** (v2 correction, same day — the blanket "E3
+dissolved" was absorbing a live cheap item), and the cheap-now rule
+(small enabling code lands in MVP even when not direct-MVP). The wave
+text below stands as the argument record.
 
 - **Wave 0 — legibility & safety** (falsifiers of the loop): output
   pointer at terminal state + `promote` disposition executing (E6 as
