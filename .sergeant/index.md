@@ -16,9 +16,11 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `drain-fleet` | published | [`workflows/drain-fleet/index.md`](workflows/drain-fleet/index.md) |
 | `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
 | `project-graph` | published | [`workflows/project-graph/index.md`](workflows/project-graph/index.md) |
+| `reconcile-and-cleanup-fleet` | published | [`workflows/reconcile-and-cleanup-fleet/index.md`](workflows/reconcile-and-cleanup-fleet/index.md) |
 | `recover-stalled-worker` | published | [`workflows/recover-stalled-worker/index.md`](workflows/recover-stalled-worker/index.md) |
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
+| `respond-to-worker` | published | [`workflows/respond-to-worker/index.md`](workflows/respond-to-worker/index.md) |
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
 
 `.sergeant/drafts/workflows/` holds generated, human-reviewable candidates —
