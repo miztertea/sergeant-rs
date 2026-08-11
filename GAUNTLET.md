@@ -44,6 +44,183 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### ROUND-2 FIXER — #44 close-out follow-through (Cerberus, 2026-08-11)
+
+**Mission outcome. Closed.** Round-2 review of #44 (journal group commit)
+returned 15 CONFIRMED findings (0 PLAUSIBLE) across two axes —
+`invariants-r2` (INV-R2-01/02/04–09) and `test-honesty-r2` (TH-R2-01–07) —
+plus one adversarial-verify survivor (mutation C1: reordering `Core::flush`
+to broadcast the group before consulting the fsync's own result). Every
+confirmed finding is closed below, each with a test that fails when its fix
+is reverted (L7) or, for the two purely-positive confirmations, re-verified
+rather than left unactioned. The survivor is closed with a dedicated test,
+mutation-killed in a disposable worktree with its own `CARGO_TARGET_DIR`
+(L5), removed after.
+
+**INV-R2-01 (error) — startup had no durability boundary.** `daemon.rs`'s
+startup ran with a bare `Core` — no `CoreGuard`, so nothing flushed —
+across `daemon.started`, every `backend.probed`, and the whole of
+`recovery::reconcile`, while that last one performs unbounded external
+effects (`git worktree remove`, harness relaunch). Fixed: `core.flush()`
+after `daemon.started`, again after the backend-probe loop, and
+`recovery::reconcile` now flushes after every work it touches (isolated
+per-work, matching its existing per-work error isolation) plus a backstop
+flush before the descriptor is published. Pinned by
+`runtime::recovery::tests::reconcile_flushes_after_every_work_so_nothing_it_touches_is_left_unsynced`
+— reverting the per-work flush calls fails it (`open_group_len() == 12`
+instead of `0`), verified by mutation in-tree and restored.
+
+**INV-R2-02 (warning) — `CoreGuard`'s "no external effect under the guard"
+claim was false.** `backend.stop()` — a synchronous kill+reap — runs under
+the request-path guard at two sites (`stop_execution`, `settle_launch`'s
+stale-reservation arm), a pre-existing, reviewed exemption (issue #14/B3)
+that `t11`'s effect enumeration never named and `CoreGuard`'s own doc
+contradicted. Fixed: `CoreGuard`'s doc now states the exemption and what
+#44 changed about it (the kill can now precede the durability of the event
+recording it); `t11` now scans `backend.stop(`/`backend.interrupt(` too,
+with `stop_execution`/`settle_launch` named as the reviewed exception
+rather than silently passing. `t11` still green; the exemption is visible
+instead of invisible.
+
+**INV-R2-04 / TH-R2-04 (warning, same defect) — `t11c`'s "every module"
+claim covered six hardcoded files out of 31, two lock spellings out of six,
+and no receiver-renaming.** Rewrote `t11c` to walk every `.rs` file under
+`src/` (`all_src_files`), scan all six `tokio::sync::Mutex` lock-taking
+spellings, and additionally track any identifier bound from
+`core.upgrade()` (closing the concrete gap `daemon.rs`'s `let Some(live) =
+core.upgrade()` demonstrated) as its own receiver. Mutation-verified in
+place: an injected `core.try_lock()` in `engine.rs` — a file the old
+six-file list would never have scanned — is caught by the new walk and
+missed if reverted to the list. Also fixed a latent non-char-boundary panic
+in the assertion's own error-snippet slicing (`§` in nearby doc comments),
+found while exercising this path.
+
+**INV-R2-05 (info) — the `journal_append_seconds` metric silently
+narrowed.** `Telemetry::record_journal_append`'s doc now states the #44
+narrowing explicitly (write-only, no fsync) and that no §28 instrument
+replaced the lost visibility into the group fsync — matching the honesty
+`journal.rs`'s own `AppendObserver` doc already had. Documentation-only;
+no new instrument added in this pass.
+
+**INV-R2-06 (info) — `Core::flush`'s "dropped unannounced" claim was
+unscoped.** Doc now states plainly that "unannounced" means the broadcast
+channel only — `write_all` and the registry fold already happened before a
+group fsync can fail, so every read-only endpoint (`events_after`, SSE
+history/refill, analytics catch-up, every projection-backed view) still
+serves a failed group's events from a journal that has since poisoned
+itself.
+
+**INV-R2-07 (info) — #44's raw perf artifacts were never durable.**
+`docs/perf/n3-group-commit-2026-08-11.md` cited six JSON summaries and two
+strace outputs "under the session scratchpad"; confirmed gone (no matching
+files anywhere in this checkout, none ever committed) — a session
+scratchpad does not survive a container reset, let alone a new session.
+Corrected in place: the transcribed table is now stated as the only
+surviving evidence, with a going-forward rule (commit raw harness output
+under `docs/perf/` next to the note that cites it).
+
+**INV-R2-08 (info) — `settle_send`'s INV-1 guarantee has an unstated
+dependency.** `KIND_STAGE_INPUT_RECEIVED` has no projection reducer arm, so
+a crash between `begin_input`'s append and `settle_send` leaves a stage
+`due_observations` would skip forever on its own; INV-1 only closes that
+window when `settle_send` gets to run at all. Added a **Residual** doc
+paragraph on `settle_send` making explicit that the crash-before-settle
+case is closed by `runtime::recovery`'s fail-closed reconciliation, not by
+this guarantee — complementary, not redundant, and worth saying so.
+
+**INV-R2-09 (info) — verified negative, and one stale per-host fact found
+while checking it.** `REQUIRED_FLAGS` no longer names
+`--dangerously-skip-permissions`, and nothing (tests, `permission_mode_check`,
+`launch_config`) still assumes it — confirmed, nothing to change in code.
+`docs/environments/cerberus.md`'s uid-1001 viability row still asserted in
+the present tense that the flag is "carried" by the adapter's launch
+grammar; corrected in place with a dated note pointing at #47 (`06fb6e8`).
+
+**TH-R2-01 (warning) — n32's "six events a submit's first hold appends"
+claim was false.** The real first hold appends two events
+(`work.submitted`, `surface.materializing`); the five-event settle hold
+that follows is a separate hold, with `surface.materialized` *before*
+`workflow.bound` — the reverse of n32's fixture order. n32's group is a
+hand-built worst-case bound, not a reproduction of any single production
+hold. Restated honestly (the offered lower-risk fix, not the
+producer-derive rewrite) in `tests/m4_backends.rs` (module comment above
+n32 plus its assertion messages) and `src/api.rs` (`CoreGuard`'s cost
+justification and the L6 proof paragraph). **This ledger's own #44 entry
+below is not rewritten — append-only — but its "n32, which truncates a real
+six-event grouped hold" phrase should be read against this correction.**
+
+**TH-R2-02 (warning) — a5's SKIPPED-ENV arm was not falsifiable.** Two of
+its three assertions were tautologies entailed by the same `AtomicBool`
+that gates the withdrawal event's emission, and the discriminator between
+"withdraw" and "map to NeedsInput" was the adapter code under test — a
+parser regression that stopped recognising a present `post_turn_summary`
+line would have silently passed as an environment fact. Fixed: the arm now
+fetches the archived transcript via `BlobStore` (the same independent-
+evidence pattern `bs2`'s `permission_denied` check already uses) and
+asserts the line really is absent, not just unclassified.
+
+**TH-R2-03 (warning) — the CLAUDE.md suite-count line went stale again,
+inside the very round that reviewed the diff that staled it.** Round 1's
+fix (64fbdf9) set 371; #44's two commits added 6 tests without touching
+that line. Updated to 379 (measured post-round-2-fixer: 163 lib + 14 + 41 +
+33 + 84 + 17 + 27 across the six suites, +2 for this round's own new
+tests), with a note recording the re-staling as a small lesson in itself.
+
+**TH-R2-05 (info) — the STDERR_DRAIN_BUDGET guard's mutation kills by
+hanging forever, not failing.** `a_stderr_sender_that_never_sends_...` used
+to call `reader.run` in-thread; mutating its `recv_timeout` to an unbounded
+`recv()` blocked the test harness forever (no per-test timeout). Fixed:
+`reader.run` now runs on its own thread, and the test bounds *its own* wait
+with `recv_timeout(STDERR_DRAIN_BUDGET * 6)`, panicking with a named
+message on timeout. Mutation-verified: the same mutation now fails in ~30s
+with a clear panic instead of hanging; reverted and re-confirmed green.
+
+**TH-R2-06 / TH-R2-07 (info) — positive confirmations, no defect.** Both
+findings verified existing work (the settle-seam tests' timing rigor;
+TH-2/TH-3/#44's crash-injection fixture honesty) and found it sound. No
+code change; re-verified green under every change this round made
+(`cargo test`, full suite, 0 failures).
+
+**Survivor — mutation C1 (`Core::flush` publish-before-sync reorder).**
+Reordering `flush` to broadcast the group before checking whether the
+group's own fsync succeeded is indistinguishable from the real code on
+every existing test's path (all of them drive success only) and matters
+only when the fsync fails — exactly the case `flush`'s own doc comment
+promises against. Closed with
+`api::tests::a_failed_group_sync_publishes_nothing_not_even_before_returning_the_error`,
+which injects a real fsync failure (the `O_PATH` trick `journal`'s own
+poisoning test already uses, promoted to a shared, `pub(crate)`
+`journal::tests::make_unsyncable_for_tests` so it stays inside `t11b`'s
+`mod tests` exemption rather than needing a new one) and asserts the live
+subscriber's mailbox is empty, not just that `open_group_len()` reads zero
+— the length is equally zero whether the events were dropped or
+published-then-dropped, so only the mailbox tells the two apart.
+Mutation-killed in a disposable copy under the session scratchpad with its
+own `CARGO_TARGET_DIR` (L5), confirmed failing, restored, and removed
+after.
+
+**Gates.** `cargo fmt --check && cargo clippy --all-targets -- -D warnings
+&& cargo test`: all three green. 379 passed + 4 opt-in ignored (0 failed),
+up from 377 + 4 at #44's own close. Leak check
+(`pgrep -af "sergeant-rs/target/debug/sgt [-]-data-dir"`) empty.
+Orchestrator-verified per R-S0-1 (no-mistakes gate not re-run this pass);
+hygiene sweep clean.
+
+**Environmental behavior.** Single-agent fixer pass, not a full panel —
+recorded as such, matching this series' established convention for
+follow-through passes. The formal SURVIVORS-section mutation (`Core::flush`
+reorder, C1) ran in a disposable copy outside the tree with its own
+`CARGO_TARGET_DIR`, per L5's letter, confirmed failing and then removed.
+Three other red/green checks in this pass — the new `reconcile` per-work
+flush test, the `t11c` `src/`-walk widening, and the `STDERR_DRAIN_BUDGET`
+watchdog — were each mutated and restored in place in the main checkout
+(single-file edit, immediate revert, `git status` clean before continuing)
+rather than copied out: these are a builder's own TDD-style confirmation of
+a fix just written (L13's distinction — self-probe, not a panel's
+adversarial mutation run against someone else's diff), not the
+adversarial-verify pass L5 is scoped to. Fixture directories removed after
+use.
+
 ### #44 — journal group commit (Cerberus, 2026-08-11)
 
 **Mission outcome. Closed.** A-N3-1's filed follow-up landed on its own
