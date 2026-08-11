@@ -139,9 +139,20 @@ impl Core {
     /// HTTP response and no external effect can ever be caused by an event
     /// that a crash would take back** — the property that lets the group
     /// boundary be invisible from outside. A failed fsync therefore publishes
-    /// nothing at all: the journal poisons itself (see [`Journal::sync`]), the
-    /// error goes to the caller, and the events are dropped unannounced
-    /// rather than announced unrecoverably.
+    /// nothing to `events_tx` at all: the journal poisons itself (see
+    /// [`Journal::sync`]), the error goes to the caller, and the group is
+    /// dropped unannounced on the broadcast channel rather than announced
+    /// unrecoverably.
+    ///
+    /// **Scoped to the broadcast, not the whole API surface (round-2 finding
+    /// INV-R2-06).** By the time `sync` fails, `write_all` already put the
+    /// lines on disk and [`Core::commit`] already folded them into
+    /// `registry` — poisoning happens *after* both. So a failed group still
+    /// leaves its events visible to every read-only path: `events_after`
+    /// (`GET /v1/events`, the SSE history/refill and the analytics catch-up)
+    /// and every projection-backed endpoint (`show_work` and friends) will
+    /// serve them on the next hold, from a journal that has since refused
+    /// further appends. "Unannounced" describes the live SSE push only.
     ///
     /// Free when the group is empty, so a read-only hold costs nothing.
     pub fn flush(&mut self) -> Result<(), CoreError> {
