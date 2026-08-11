@@ -6498,68 +6498,140 @@ fn park_with_a_live_turn(
     due.remove(0)
 }
 
-/// §14.5 for OBSERVE, clause 2: an observation taken before a cancel landed
-/// cannot complete the stage of a work that is already terminal.
+/// §14.5 for OBSERVE, clause by clause: a late observation is subordinate to
+/// **every** kind of superseding decision, not just the one the happy path
+/// happens to produce.
 ///
-/// This is the clause a poll makes reachable through the ordinary API for the
-/// first time. `sgt cancel` is unconditional and lands under the lock; the
-/// driver's observation was taken with that lock open, and `drive` reads only
-/// the run's current stage — it would happily journal `stage.completed` and
-/// `work.completed` on a canceled work.
+/// `observation_is_stale` has five clauses and, probed one at a time, all five
+/// survived the suite (M8–M11, 2026-08-11) while only the stage clause was
+/// actually being exercised — the same N3-03/N3-04 shape `reservation_is_stale`
+/// was caught in, and the same answer: each superseding decision is driven
+/// through the journal in isolation, so that deleting *its* clause is what
+/// fails, rather than some other clause catching the case by accident.
+///
+/// Every row leaves the other four clauses satisfied. Each is a state the
+/// journal can hold: the first is a crash between `work.canceled` and the
+/// `stage.canceled` that follows it in `begin_retire_run`; the rest are the
+/// concurrent-decision shapes `n23`'s comment describes, which the next
+/// executor — a container whose completion arrives whenever it arrives — makes
+/// ordinary.
+///
+/// The uniform assertion is that the journal did not grow: a discarded
+/// observation performed no external effect, so it has no evidence to
+/// preserve, and a driver that journaled one per tick would write its own
+/// cadence into the trajectory.
 #[test]
-fn n28_an_observation_taken_before_a_cancel_cannot_complete_the_stage() {
-    let data = TempDir::new().expect("tempdir");
-    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
-    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
-    let engine = Engine::new(Arc::new(registry), None, data.path());
-    let mut core = core(data.path());
-    let work_id = "01N3OBS145A";
-    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+fn n28_a_late_observation_is_subordinate_to_every_superseding_decision() {
+    // (label, the decision that lands while the observation is outside the
+    // lock, the clause it must be caught by)
+    type Decision = fn(&mut Core, &str, &str);
+    let cases: [(&str, Decision); 5] = [
+        ("the work went terminal", |core, work_id, _current| {
+            commit(core, work_id, KIND_WORK_CANCELED, json!({"from": "active"}));
+        }),
+        (
+            "another execution became the run's",
+            |core, work_id, _current| {
+                commit(
+                    core,
+                    work_id,
+                    KIND_EXECUTION_STARTED,
+                    json!({"execution": {
+                        "execution_id": "01N3OBSSUPER",
+                        "backend": FAKE_BACKEND_NAME,
+                        "native_id": "fake-session-01N3OBSSUPER",
+                        "stage_id": "00-only",
+                        "attempt": 2,
+                        "stop_requested": false,
+                    }}),
+                );
+            },
+        ),
+        (
+            "the execution was asked to stop",
+            |core, work_id, current| {
+                commit(
+                    core,
+                    work_id,
+                    KIND_EXECUTION_STOPPED,
+                    json!({
+                        "execution_id": current,
+                        "backend": FAKE_BACKEND_NAME,
+                        "reason": "canceled",
+                        "outcome": {"requested": true},
+                    }),
+                );
+            },
+        ),
+        (
+            "a launch of this run is in flight",
+            |core, work_id, _current| {
+                commit(
+                    core,
+                    work_id,
+                    KIND_EXECUTION_RESERVED,
+                    json!({"reservation": {
+                        "execution_id": "01N3OBSRESERVED",
+                        "backend": FAKE_BACKEND_NAME,
+                        "native_id": "fake-session-01N3OBSRESERVED",
+                        "stage_id": "00-only",
+                        "index": 0,
+                        "attempt": 2,
+                        "stage_kind": "actor",
+                    }}),
+                );
+            },
+        ),
+        ("the stage left `active`", |core, work_id, _current| {
+            commit(
+                core,
+                work_id,
+                KIND_STAGE_CANCELED,
+                json!({"stage_id": "00-only", "detail": "work canceled"}),
+            );
+        }),
+    ];
 
-    let pending = park_with_a_live_turn(&engine, &mut core, work_id);
-    // The turn finishes while the observation is being taken outside the lock.
-    fake.complete_live_executions();
-    let outcome = pending.perform();
-    // …and the human's cancel gets the lock first.
-    commit(
-        &mut core,
-        work_id,
-        KIND_STAGE_CANCELED,
-        json!({"stage_id": "00-only", "detail": "work canceled"}),
-    );
-    commit(
-        &mut core,
-        work_id,
-        KIND_WORK_CANCELED,
-        json!({"from": "active"}),
-    );
-    let before = kinds_of(&core, work_id).len();
+    for (label, supersede) in cases {
+        let data = TempDir::new().expect("tempdir");
+        let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+        let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+        let engine = Engine::new(Arc::new(registry), None, data.path());
+        let mut core = core(data.path());
+        let work_id = "01N3OBS145A";
+        journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
 
-    let step = engine
-        .settle_observe(&mut core, pending, outcome)
-        .expect("settle observe");
-    step.deferred.wait();
+        let pending = park_with_a_live_turn(&engine, &mut core, work_id);
+        // The row above names the current execution by id where it has to; the
+        // engine allocated it, so read it back rather than guessing.
+        let current = pending.execution_id().to_string();
+        // The turn finishes while the observation is outside the lock…
+        fake.complete_live_executions();
+        let outcome = pending.perform();
+        // …and the superseding decision gets the lock first.
+        supersede(&mut core, work_id, &current);
 
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Canceled,
-        "no terminal work revived"
-    );
-    assert!(
-        events_of(&core, work_id, "stage.completed").is_empty(),
-        "a canceled stage is not completed by an observation that predates it"
-    );
-    assert!(
-        events_of(&core, work_id, KIND_WORK_COMPLETED).is_empty(),
-        "and the work is certainly not completed"
-    );
-    assert_eq!(
-        kinds_of(&core, work_id).len(),
-        before,
-        "a discarded observation performed no external effect, so it has no \
-         evidence to preserve and journals nothing: {:?}",
-        kinds_of(&core, work_id)
-    );
+        let before = kinds_of(&core, work_id).len();
+        let step = engine
+            .settle_observe(&mut core, pending, outcome)
+            .expect("settle observe");
+        step.deferred.wait();
+
+        assert!(
+            events_of(&core, work_id, "stage.completed").is_empty(),
+            "{label}: a late observation must not complete the stage"
+        );
+        assert!(
+            events_of(&core, work_id, KIND_WORK_COMPLETED).is_empty(),
+            "{label}: and must certainly not complete the work"
+        );
+        assert_eq!(
+            kinds_of(&core, work_id).len(),
+            before,
+            "{label}: a discarded observation journals nothing: {:?}",
+            kinds_of(&core, work_id)
+        );
+    }
 }
 
 /// §14.5 for OBSERVE, clause 4: an observation of an attempt the run has moved
