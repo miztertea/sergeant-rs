@@ -21,3 +21,7 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 Original stages: `00-parse-and-sanitize`, `10-retain-artifact`, `20-route-each`, `30-publish-or-clear-gate`. The first three carried only the §6.5 deterministic-machinery boilerplate as their extraction justification — none had an "Additional note" checkpoint argument — so per A4's default rule all three demote.
 
 **Decision:** `00-parse-and-sanitize`, `10-retain-artifact`, and `20-route-each` are demoted and folded as helper invocations into `30-publish-or-clear-gate`, which was already this package's only "Judgment required" (§6.4) stage and is renamed `00-publish-or-clear-gate` (now the workflow's sole stage). No stage in this package required the §6.3 case-by-case reimplementation test — none of the demoted three carried an Additional note argument to weigh. The behavior units are not deleted — see `00-publish-or-clear-gate/CONTEXT.md`'s "Helpers (folded per N1 adjudication A4)" section.
+
+## Promotion note (docs/icm/promotion-spec-2026-08-11.md §1)
+
+This package's sole stage, `00-publish-or-clear-gate`, declares a `promote`-disposition output (`output/README.md`) but the workflow has no finalize step anywhere in its (single-stage) sequence — the D9 working rule ("a workflow that declares any output ends with a deterministic finalize step") is unmet. Recorded per the promotion spec's instruction, not resolved by curation.
