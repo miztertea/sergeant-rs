@@ -94,10 +94,25 @@ this host at this volume."
 
 ## Raw artifacts
 
-Six `s1-burst-summary.json` files (3 before, 3 after) plus the two strace
-summaries, under the session scratchpad. Numbers above are transcribed from
+**Correction, 2026-08-11 (round-2 finding INV-R2-07).** This section
+originally cited the six `s1-burst-summary.json` files (3 before, 3 after)
+plus the two strace summaries as living "under the session scratchpad".
+That location does not survive this environment — CLAUDE.md's
+remote-container section states these containers reset without warning and
+wipe installed tools and `target/`, and a scratchpad path is session-scoped
+on top of that — so by the next session the artifacts were already gone,
+and confirmed gone when checked for this correction: no matching files exist
+anywhere under this checkout, and none were ever committed. L11's rule is
+that an integrity claim binds only when its verification procedure is
+executable by a stranger; citing an ephemeral path failed that silently.
+**The transcribed table above is therefore the only surviving evidence for
+this measurement** — a stranger cannot re-derive it from raw data, only
+re-run the harness and compare. Numbers above were transcribed from
 `b50_throughput_per_s`, `b50_lat_p50_ms`, `b50_events_per_work` and
-`hygiene_s1_*`; nothing is estimated.
+`hygiene_s1_*`; nothing was estimated, but nothing here proves that anymore.
+Going forward, raw harness output for a measurement this document depends on
+belongs committed under `docs/perf/` alongside the note that cites it, not
+left in a scratchpad.
 
 **Instrument caveat, inherited.** The baseline document's Anomalies section
 records that the harness's self-reported `commit` field is a live `git
