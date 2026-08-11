@@ -1,0 +1,83 @@
+{
+  "backend": "claude",
+  "execution": {
+    "attempt": 1,
+    "backend": "claude",
+    "execution_id": "01KZRMCDX0H6GX7A4AZ49TS49N",
+    "native_id": "e51566ff-fae2-4564-af01-d18938c390dd",
+    "stage_id": "00-investigate",
+    "stop_requested": true
+  },
+  "reservation": null,
+  "route_source": "explicit",
+  "stage": {
+    "attempt": 1,
+    "detail": "Research complete. The findings artifact is written to **`docs/gauntlet/notes/journal-cold-segment-compression-research-2026-08-11.md`** — placed per the repo's evident convention (`docs/gauntlet/notes/<topic>-<date>.md`, next to the ruling it serves). The workflow's declared `output/README.md` is not materialized on this surface (only `research-subject` exists), so I fell back to the convention-based placement clause and stated that choice in the artifact itself.\n\n**Bottom line: zstd at level 3 via the `zstd` crate is the clear rung-1 choice.** On the real 186 kB captured journal it measured 6.7× compression with ~3 GB/s decompression, and at the 30 s trigger point (~1.64M events ≈ 935 MB of journal) full decompression costs ~0.7 s — about 2.3% of the rebuild budget, using conservative published throughput rather than my faster local numbers. On any storage slower than ~1.2 GB/s the compressed path is actually *faster* end-to-end, since rebuild reads ~139 MB instead of 935 MB.\n\nNotable findings along the way:\n\n- **The ruling's \"~10×\" estimate is optimistic**: real data measured 6.5–7.7× at 186 kB. Ratio should improve at full 8.4 MB segment scale (a synthetic full-size segment showed large window-scale headroom, but I flagged it as an upper bound since it resamples a 71-event pool). The note recommends re-measuring on the N4 1M-event journal the ruling already gates.\n- **gzip is structurally mismatched, despite being the only zero-new-dependency option** (`flate2` 1.1.9 is already in-tree via `libduckdb-sys` and `zip`): DEFLATE's 32 KiB window can't reach cross-event redundancy, so its ratio is pinned at ~4× regardless of segment size while zstd/xz triple theirs at scale.\n- **xz has no case**: it beats zstd -19 by only 3% in ratio on real data but spends ~25% of the 30 s rebuild budget decompressing (~127 MB/s), and carries the CVE-2024-3094 supply-chain history.\n- **Format-fit for replayability is clean**: RFC 8878 gives streaming decode with bounded memory (window ≤ 8 MB), frame concatenation, and a stable standardized format with an independent pure-Rust second decoder (`ruzstd`, decode-complete; its encoder is still immature). Compression doesn't interact with the crash-tail quarantine machinery since only the active segment can have a torn tail.\n- Ranked fallbacks if constraints change: `lz4_flex` for a pure-Rust-only build (~2× worse disk), `flate2` for zero new deps (~4× ratio ceiling, ~10% of rebuild budget).\n\nEvery claim in the artifact is traced — first-party measurements (marked [M] with host/tool versions and method), repo sources by `file:line`, and nine external primary sources (RFC 8878, RFC 1951, zstd/lzbench/lz4_flex/ruzstd project docs, crates.io API, NVD) footnoted with fetch dates.",
+    "executor": {
+      "harness": "claude",
+      "index": 0,
+      "kind": "actor",
+      "profile": {
+        "backend": "claude",
+        "name": "research",
+        "options": {
+          "permission_mode": "bypassPermissions"
+        }
+      },
+      "route_source": "work_actor_default",
+      "stage_id": "00-investigate"
+    },
+    "index": 0,
+    "of": 1,
+    "stage_id": "00-investigate",
+    "status": "completed"
+  },
+  "surface": {
+    "bindings": [
+      {
+        "base_branch": "cerberus/day2-adjudications",
+        "base_sha": "8c0c3ad2f1bc99cb50b54f289b22c4c8b02d0310",
+        "head_sha": "8c0c3ad2f1bc99cb50b54f289b22c4c8b02d0310",
+        "repository": "research-subject",
+        "source_path": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/dogfood/research/subject",
+        "work_branch": "sergeant/01KZRMCDSH0VCERG7R778SQT2H",
+        "worktree_path": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/dogfood/research/data/surfaces/01KZRMCDSH0VCERG7R778SQT2H/research-subject"
+      }
+    ],
+    "root": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/dogfood/research/data/surfaces/01KZRMCDSH0VCERG7R778SQT2H",
+    "work_id": "01KZRMCDSH0VCERG7R778SQT2H"
+  },
+  "teardown": {
+    "bindings": [
+      {
+        "changes": "?? docs/gauntlet/notes/journal-cold-segment-compression-research-2026-08-11.md",
+        "disposition": "retained_dirty",
+        "repository": "research-subject",
+        "work_branch": "sergeant/01KZRMCDSH0VCERG7R778SQT2H",
+        "worktree_path": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/dogfood/research/data/surfaces/01KZRMCDSH0VCERG7R778SQT2H/research-subject"
+      }
+    ],
+    "clean": false,
+    "work_id": "01KZRMCDSH0VCERG7R778SQT2H"
+  },
+  "work": {
+    "backend": "claude",
+    "created_at": "2026-08-11T14:42:18.545Z",
+    "created_by": "cli",
+    "id": "01KZRMCDSH0VCERG7R778SQT2H",
+    "intent": "Research journal cold-segment compression options for the retention ruling's amended Rule C ladder (docs/gauntlet/notes/retention-design-ruling-draft-2026-08-11.md): zstd vs alternatives for append-only NDJSON segments that must remain replayable, Rust crate landscape, decompress-on-rebuild cost estimates against the measured 54.6k events/s rebuild rate. Produce the research artifact this workflow declares.",
+    "origin_client": "cli",
+    "profile": "research",
+    "state": "completed",
+    "workflow": "research",
+    "workspace": "research-subject"
+  },
+  "workflow": {
+    "name": "research",
+    "source": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/dogfood/research/subject/.sergeant/workflows/research",
+    "stages": [
+      "00-investigate"
+    ],
+    "version": "2"
+  }
+}
