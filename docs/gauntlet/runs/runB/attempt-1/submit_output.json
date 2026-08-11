@@ -1,0 +1,72 @@
+{
+  "backend": "claude",
+  "execution": {
+    "attempt": 1,
+    "backend": "claude",
+    "execution_id": "01KZQCE5BMDNRT1FXFPGQ3EGBP",
+    "native_id": "e8ba2ef7-16a0-45c1-9edb-34bae2e52721",
+    "stage_id": "00-contract",
+    "stop_requested": false
+  },
+  "reservation": null,
+  "route_source": "explicit",
+  "stage": {
+    "attempt": 1,
+    "detail": null,
+    "executor": {
+      "harness": "claude",
+      "index": 0,
+      "kind": "actor",
+      "route_source": "work_actor_default",
+      "stage_id": "00-contract"
+    },
+    "index": 0,
+    "of": 10,
+    "stage_id": "00-contract",
+    "status": "active"
+  },
+  "surface": {
+    "bindings": [
+      {
+        "base_branch": "master",
+        "base_sha": "54ed8243f880fc8b073d86e1ef89765b6590bc1b",
+        "head_sha": "54ed8243f880fc8b073d86e1ef89765b6590bc1b",
+        "repository": "subject",
+        "source_path": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/subject",
+        "work_branch": "sergeant/01KZQCE59PSJKQZY0K8RFDH84H",
+        "worktree_path": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/data/surfaces/01KZQCE59PSJKQZY0K8RFDH84H/subject"
+      }
+    ],
+    "root": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/data/surfaces/01KZQCE59PSJKQZY0K8RFDH84H",
+    "work_id": "01KZQCE59PSJKQZY0K8RFDH84H"
+  },
+  "teardown": null,
+  "work": {
+    "backend": "claude",
+    "created_at": "2026-08-11T03:04:12.342Z",
+    "created_by": "cli",
+    "id": "01KZQCE59PSJKQZY0K8RFDH84H",
+    "intent": "Decompose ONLY these two scopes of the repository subtree reference/sergeant-upstream — (1) the root operating instructions (AGENTS.md, README.md) and (2) the bin/ fleet dispatch partition — pinned per reference/UPSTREAM.md at upstream SHA f430cfd4f90174a98adbd7abebbece6303817929, into draft ICM workflows per .sergeant/workflows/repo-to-icm. This is a bounded measurement run: treat all other partitions as out of scope by contract.",
+    "origin_client": "cli",
+    "state": "active",
+    "workflow": "repo-to-icm",
+    "workspace": "subject"
+  },
+  "workflow": {
+    "name": "repo-to-icm",
+    "source": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/subject/.sergeant/workflows/repo-to-icm",
+    "stages": [
+      "00-contract",
+      "10-inventory",
+      "20-harvest",
+      "30-normalize",
+      "40-classify",
+      "50-synthesize",
+      "60-draft",
+      "70-lint",
+      "80-adversarial-review",
+      "90-reconcile"
+    ],
+    "version": "2"
+  }
+}
