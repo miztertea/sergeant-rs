@@ -6,6 +6,22 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L19 — A governing document is an executable diff for the program: it takes the loop
+
+Cerberus day 2, 2026-08-11: the orchestrator authored the MVP bucketing
+— the document that supersedes the North Star's waves and sequences all
+future work — directly from owner conversation, with zero fresh eyes.
+The owner caught it ("did I miss your subagent reviews?"); the
+owner-shaped pipeline (4 Sonnet critics → Opus writer → sanity pass)
+then found 31 findings including 14 errors — among them a design error
+(the turn envelope missing `send`-spawned turns) that would have shipped
+into the MVP-1 contract. R-S0-12 says code is code; this is its planning
+corollary: a document that directs what gets built is executable through
+the program that obeys it, and orchestrator+owner agreement is a
+builder's self-probe (L13), not review. Every governing artifact —
+plans, contracts, north stars — gets fresh-context review before it
+governs.
+
 ## L18 — R1's "already exists" includes the product you are building **[world-delta]**
 
 Cerberus day 2, 2026-08-11: the promoted library carried a whole family
