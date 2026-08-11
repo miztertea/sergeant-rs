@@ -898,15 +898,25 @@ impl ClaudeBackend {
                 let _ = stdin.write_all(stdin_prompt.as_bytes());
             }
         });
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
-        if let Some(mut stderr) = stderr {
-            let stderr_buf = Arc::clone(&stderr_buf);
+        // stderr is *delivered*, not deposited in a buffer someone snapshots.
+        //
+        // Both pipes reach EOF at the same instant — the turn process exits —
+        // so a stdout reader that closes and immediately reads a shared stderr
+        // buffer is racing the thread that fills it. Measured on this host
+        // while pinning issue #46's attempt-1 shape: an envelope-less turn's
+        // stderr was intermittently empty in the journal, which loses the one
+        // thing the operator has to act on (Run B attempt 1's whole content
+        // was a stderr line and no stream-json at all). A channel makes the
+        // handoff a synchronization instead of a hope.
+        let stderr_rx = stderr.map(|mut stderr| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
             std::thread::spawn(move || {
                 let mut text = String::new();
                 let _ = stderr.read_to_string(&mut text);
-                *stderr_buf.lock().expect("stderr buffer lock") = text;
+                let _ = tx.send(text);
             });
-        }
+            rx
+        });
 
         let child = Arc::new(Mutex::new(child));
         {
@@ -936,7 +946,7 @@ impl ClaudeBackend {
             session_id,
             model,
             child,
-            stderr_buf,
+            stderr_rx,
         };
         let reader = std::thread::spawn(move || reader.run(stdout));
         // Recorded after the spawn, and deliberately not fatal if the
@@ -965,8 +975,21 @@ struct TurnReader {
     session_id: String,
     model: Option<String>,
     child: Arc<Mutex<Child>>,
-    stderr_buf: Arc<Mutex<String>>,
+    /// The turn's stderr, delivered once the reading thread hits EOF. `None`
+    /// when the spawn produced no stderr pipe at all.
+    stderr_rx: Option<std::sync::mpsc::Receiver<String>>,
 }
+
+/// How long the turn reader waits for stderr after the turn's process has
+/// been reaped.
+///
+/// The wait is normally instantaneous — the pipe closed when the process did,
+/// so the reading thread is already at EOF — and this bound exists only for
+/// the pathological case that could otherwise stall a turn's outcome forever:
+/// a descendant of the turn that inherited stderr and outlived its parent.
+/// Losing the evidence is bad; never recording the turn's outcome is issue
+/// #46 again, so the ambiguity is bounded rather than waited out.
+const STDERR_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl TurnReader {
     fn run(self, stdout: std::process::ChildStdout) {
@@ -999,7 +1022,16 @@ impl TurnReader {
             }
         };
 
-        let stderr = self.stderr_buf.lock().expect("stderr buffer lock").clone();
+        // The child is reaped, so its end of the stderr pipe is closed and the
+        // reading thread is at (or microseconds from) EOF. Waiting for its
+        // delivery is what makes the evidence deterministic; the budget is
+        // what keeps a leaked descendant from turning "no stderr" into "no
+        // outcome".
+        let stderr = self
+            .stderr_rx
+            .as_ref()
+            .and_then(|rx| rx.recv_timeout(STDERR_DRAIN_BUDGET).ok())
+            .unwrap_or_default();
         let mut state = self
             .backend_state
             .lock()
@@ -2574,7 +2606,7 @@ mod tests {
                     .spawn()
                     .expect("spawn true"),
             )),
-            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stderr_rx: None,
         };
         let outcome = TurnOutcome {
             envelope: Some(json!({"type": "result", "is_error": false, "result": "done"})),
@@ -2607,6 +2639,98 @@ mod tests {
         assert_eq!(
             notices[0].payload["expected"],
             format!("system/{POST_TURN_SUMMARY_SUBTYPE}")
+        );
+    }
+
+    /// A turn's stderr is **waited for**, never snapshotted (issue #46's
+    /// attempt-1 shape).
+    ///
+    /// Both of a turn's pipes reach EOF at the same instant — the process
+    /// exits — so a reader that closes stdout and immediately reads a shared
+    /// stderr buffer wins that race only by luck. Measured while pinning Run B
+    /// attempt 1 through the daemon: the journal's `conversation.turn.ended`
+    /// intermittently carried `stderr: ""` for the one turn shape whose *only*
+    /// evidence is that line, because the CLI refused before writing a byte of
+    /// stream-json. Losing it leaves the operator a block with no cause.
+    ///
+    /// The 300 ms below is that race widened to something a test can see: the
+    /// process (`true`) is gone before the delivery arrives, so a snapshot
+    /// taken at stdout EOF reads `""` and a delivery reads the refusal. Both
+    /// halves are asserted — the journaled event *and* the observation the
+    /// engine blocks on — because they are two different readers of the same
+    /// field.
+    #[test]
+    fn a_turns_stderr_is_waited_for_rather_than_snapshotted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backend = ClaudeBackend::new(ClaudeConfig::new(dir.path()));
+        let emitted = Arc::new(Mutex::new(Vec::<EventDraft>::new()));
+        let sink_events = Arc::clone(&emitted);
+        backend.set_event_sink(Arc::new(move |draft| {
+            sink_events.lock().expect("sink lock").push(draft);
+        }));
+        backend
+            .state
+            .lock()
+            .expect("adapter state lock")
+            .executions
+            .insert("e-stderr".to_string(), test_execution(None));
+
+        let mut child = Command::new("true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn true");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = tx.send(
+                "--dangerously-skip-permissions cannot be used with root/sudo privileges\n"
+                    .to_string(),
+            );
+        });
+        let reader = TurnReader {
+            backend_state: Arc::clone(&backend.state),
+            ask_grammar: Arc::clone(&backend.ask_grammar),
+            sink: backend.sink.lock().expect("sink lock").clone(),
+            data_dir: dir.path().to_path_buf(),
+            execution_id: "e-stderr".to_string(),
+            work_id: "w-stderr".to_string(),
+            session_id: "s-stderr".to_string(),
+            model: None,
+            child: Arc::new(Mutex::new(child)),
+            stderr_rx: Some(rx),
+        };
+        reader.run(stdout);
+
+        let events = emitted.lock().expect("sink lock");
+        let ended = events
+            .iter()
+            .find(|e| e.kind == "conversation.turn.ended")
+            .expect("every turn ends with this event");
+        assert_eq!(ended.payload["result_envelope"], false);
+        assert!(
+            ended.payload["stderr"]
+                .as_str()
+                .is_some_and(|s| s.contains("root/sudo")),
+            "the CLI's own refusal must reach the journal rather than an empty \
+             string it lost a race to: {}",
+            ended.payload
+        );
+
+        let state = backend.state.lock().expect("adapter state lock");
+        let observation = observe_in_memory(&state.executions["e-stderr"]);
+        assert_eq!(
+            observation.native,
+            NativeState::Unknown,
+            "an envelope-less turn is ambiguity, and ambiguity fails closed"
+        );
+        assert!(
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|e| e.contains("root/sudo")),
+            "…and the evidence the engine blocks with carries the same stderr: \
+             {observation:?}"
         );
     }
 
