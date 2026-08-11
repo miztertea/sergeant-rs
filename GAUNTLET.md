@@ -44,6 +44,37 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### N-SERIES CONTAINER CLOSE-OUT — 2026-08-11, v2 measured, Run B, Cerberus handoff
+
+**Mission outcome.** Generator v2 blind-measured (run 3, 2.2M tokens):
+**§22.2 MET** — inverts run 2's verdict; recall ≥56.9% in-scope (v1 47.3%),
+precision 312/312 at full population, all 3 in-scope v1 silent misses
+captured, helper skew collapsed, [S12] closed, review axis found 5/5-real
+findings, checkpoint ledger proven resumable (15/21 partitions honestly
+pending — Cerberus driver-loop work). v2 delta report: "a genuine
+generational improvement, and causally so." Run B (real-Claude, bounded,
+$0.68 usage recorded): one genuine 13-turn actor run produced a correct
+artifact and three defects — the root refusal of the hardcoded skip flag
+(#47), the envelope-less stuck-active seam (#46), and #46's second case:
+a live-vs-test discrepancy where observe_envelope's unit-tested
+StageCompleted derivation never lands as a settled signal. GP-2 never
+fired (correctly — no ask). **#19 stays open, Cerberus-bound**: adapter
+evidence, not a completed soak. PR #48 (S-series retro) merged into the
+branch: resources/ replaces the zip, CLAUDE.md promotions, the
+convergent-evolution probe-gate restoration.
+
+**Environmental behavior.** The Run B operator twice outperformed its
+orchestrator: it declined a credential-copy instruction in favor of the
+documented IS_SANDBOX=1 fix, and refuted the orchestrator's CONTEXT.md
+stall diagnosis by reading the actual file (L12 applied by a subagent to
+its coordinator — the loop's protection running in both directions, L9).
+Both recorded in the run manifest, plus its own polling spelling bug
+honestly reported. Cerberus first acts:
+docs/gauntlet/notes/v2-measurement-and-migration-plan.md; #44 and
+#46/#47 precede the N4 contract alongside R-N0-3's retention ruling.
+
+---
+
 ### N3 — 2026-08-10/11, executor-aware stages + two-phase boundary + GP-2 ask
 
 **Mission outcome: contract met; shipping gate passed; closes #14 (B3's
