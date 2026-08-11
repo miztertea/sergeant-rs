@@ -60,6 +60,8 @@ Remote containers do not ship with no-mistakes — install it at session start. 
 
 Repo invariants live in this file; **per-host facts live in `docs/environments/`** (one dated, evidence-cited file per environment — cloud container, GH runner, and each new host on first contact). Never assume another environment's facts apply: measure, then record there. Fixtures asserting environment facts probe-gate per the testing rules above.
 
+Run `scripts/probe-env.sh` once at session start on **any** host, before doing anything else — it measures uid/DAC/CAP_LINUX_IMMUTABLE, disk and writable-allowance, O_DIRECT alignment behavior (open AND unaligned-write, the two-valued fact the journal's fault-injection fixtures actually branch on), network/proxy posture, Docker, and the claude/cargo/rustc toolchain, and prints them as a dated markdown table in the exact `docs/environments/` format — paste its output into that host's file. It never exits nonzero for an absent tool or negative result (only for its own bug); regression coverage lives in `scripts/probe-env-selftest.sh`, run with `bash scripts/probe-env-selftest.sh`.
+
 ## Remote-container operations
 
 These sessions run in ephemeral containers that reset without warning (three resets in one S-series day; a reset also wipes installed tools and `target/`, costing a ~10-min cold DuckDB rebuild):
