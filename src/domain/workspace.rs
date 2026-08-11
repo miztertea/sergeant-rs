@@ -149,6 +149,18 @@ pub enum WorkspaceError {
         /// The repeated name.
         name: String,
     },
+    /// A profile's `permission_mode` option is not one of the CLI's own
+    /// vocabulary (#47). Refused at parse time, before any launch attempts
+    /// to pass the raw string through to the CLI.
+    #[error("{file} declares profile {profile:?} with {source}")]
+    InvalidPermissionMode {
+        /// Config file that declared it.
+        file: String,
+        /// The profile naming the bad value.
+        profile: String,
+        /// The underlying vocabulary mismatch.
+        source: crate::domain::profile::UnknownPermissionMode,
+    },
     /// `sergeant.toml` declares no repositories at all.
     #[error("{file} declares no repositories")]
     NoRepositories {
@@ -289,6 +301,16 @@ impl Workspace {
                 return Err(WorkspaceError::DuplicateProfile {
                     file,
                     name: profile.name.clone(),
+                });
+            }
+            // #47: an unrecognized permission_mode is refused here, at
+            // config load, rather than surfacing later as an unmeasured CLI
+            // argument failure at launch time.
+            if let Err(source) = profile.permission_mode() {
+                return Err(WorkspaceError::InvalidPermissionMode {
+                    file,
+                    profile: profile.name.clone(),
+                    source,
                 });
             }
         }
@@ -559,6 +581,50 @@ mod tests {
         assert!(
             matches!(&err, WorkspaceError::DuplicateProfile { name, .. } if name == "same"),
             "got {err}"
+        );
+    }
+
+    /// #47: a `permission_mode` outside the CLI's own vocabulary is refused
+    /// at config load, before any launch could pass it through unchecked.
+    #[test]
+    fn a_profile_with_an_unknown_permission_mode_is_refused_at_load() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        let err = parse(
+            root,
+            "[workspace]\nname = \"w\"\n\n\
+             [[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[profile]]\nname = \"reckless\"\nbackend = \"claude\"\n\
+             [profile.options]\npermission_mode = \"yolo\"\n",
+        )
+        .expect_err("an unrecognized permission_mode must be refused");
+        match &err {
+            WorkspaceError::InvalidPermissionMode {
+                profile, source, ..
+            } => {
+                assert_eq!(profile, "reckless");
+                assert_eq!(source.value, "yolo");
+            }
+            other => panic!("expected InvalidPermissionMode, got {other}"),
+        }
+
+        // The five vocabulary values, plus unspecified, all still parse.
+        let workspace = parse(
+            root,
+            "[workspace]\nname = \"w\"\n\n\
+             [[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[profile]]\nname = \"careful\"\nbackend = \"claude\"\n\
+             [profile.options]\npermission_mode = \"plan\"\n",
+        )
+        .expect("a listed permission_mode value parses");
+        assert_eq!(
+            workspace.profiles[0]
+                .permission_mode()
+                .expect("validated at load")
+                .map(|m| m.as_cli_value()),
+            Some("plan")
         );
     }
 }

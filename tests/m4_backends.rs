@@ -733,7 +733,6 @@ const ALL_FLAGS: &[&str] = &[
     "--setting-sources",
     "--model",
     "--permission-mode",
-    "--dangerously-skip-permissions",
 ];
 
 fn start_request(
@@ -1727,8 +1726,9 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
     );
     assert_eq!(first.value_of("--model"), Some("haiku"));
     assert!(
-        first.has("--dangerously-skip-permissions"),
-        "the no-profile default (L2's production default): {:?}",
+        !first.has("--dangerously-skip-permissions") && !first.has("--permission-mode"),
+        "the no-profile default (#47): no permission flag at all — the CLI's \
+         own unflagged default, never a silent --dangerously-skip-permissions: {:?}",
         first.argv
     );
     assert_eq!(
@@ -1814,6 +1814,94 @@ fn a_profile_is_launch_configuration_carried_to_the_claude_adapter() {
         launch.argv
     );
     assert_eq!(launch.env["CLAUDE_CONFIG_DIR"], "/tmp/claude-work-home");
+}
+
+/// #47: `bypassPermissions` only ever reaches argv when a profile names it
+/// explicitly, and when it does it rides `--permission-mode` — never the
+/// old unconditional `--dangerously-skip-permissions`.
+#[test]
+fn bypass_permissions_requires_explicit_profile_opt_in() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-bypass", dir.path(), "explicit opt-in", None);
+    request.profile = Some(Profile {
+        name: "yolo".to_string(),
+        backend: CLAUDE_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: [(
+            "permission_mode".to_string(),
+            "bypassPermissions".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(1);
+    let launch = &launches[0];
+    assert_eq!(
+        launch.value_of("--permission-mode"),
+        Some("bypassPermissions"),
+        "explicit opt-in rides --permission-mode: {:?}",
+        launch.argv
+    );
+    assert!(
+        !launch.has("--dangerously-skip-permissions"),
+        "the retired flag must never reappear: {:?}",
+        launch.argv
+    );
+}
+
+/// #47: an unrecognized `permission_mode` is refused at the launch boundary
+/// too (defense in depth alongside the profile-load check in
+/// `domain::workspace`), for a `Profile` built directly rather than parsed
+/// from a `sergeant.toml` — the shape every test in this file (and any
+/// future non-file caller) uses.
+#[test]
+fn an_unknown_permission_mode_fails_closed_at_launch_rather_than_reaching_argv() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-bad-mode", dir.path(), "typo'd mode", None);
+    request.profile = Some(Profile {
+        name: "typo".to_string(),
+        backend: CLAUDE_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: [("permission_mode".to_string(), "yolo".to_string())]
+            .into_iter()
+            .collect(),
+    });
+    let err = backend
+        .start(&request)
+        .expect_err("an unknown mode must be refused");
+    assert!(
+        err.to_string().contains("yolo"),
+        "the diagnostic must name the offending value: {err}"
+    );
+    assert!(
+        stub.launches().is_empty(),
+        "a doomed launch must not spawn the CLI at all: {:?}",
+        stub.launches()
+    );
+    assert!(
+        backend.tracked_executions().is_empty(),
+        "a refused launch must leave no phantom execution: {:?}",
+        backend.tracked_executions()
+    );
 }
 
 /// RESUME re-adopts a conversation with the launch configuration the caller
@@ -5679,6 +5767,101 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
             observation.evidence
         ),
     }
+}
+
+/// #47, opt-in, spends real tokens: what a *default*-mode headless turn can
+/// and cannot do, measured rather than assumed (L1). One haiku turn, no
+/// profile — so no `--permission-mode` flag reaches argv at all, #47's new
+/// default — told to write a file.
+///
+/// **Measured 2026-08-11 on Cerberus (claude 2.1.227, uid 1001, no
+/// `IS_SANDBOX` set — irrelevant to this path since no permission flag is
+/// sent):** a `Write` tool use under the bare default is refused —
+/// `system/permission_denied` on stdout, the tool result comes back
+/// `is_error:true` — and the turn still ends cleanly (`native: Exited`,
+/// no hang on an interactive prompt headless mode has no TTY to answer).
+/// Pinned here so a CLI or account change that starts silently granting
+/// writes under the unflagged default — a security regression, not a
+/// feature — fails this test rather than going unnoticed.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored"]
+fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mode() {
+    if !claude_live_enabled(
+        "bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mode",
+    ) {
+        return;
+    }
+    let data = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    // Deliberately the bare adapter config: no profile at all, so #47's
+    // default applies — no --permission-mode flag on the launch.
+    let backend = ClaudeBackend::new(ClaudeConfig::new(data.path()));
+    let shared = Arc::new(tokio::sync::Mutex::new(core(data.path())));
+    backend.set_event_sink(journaling_sink(shared.clone()));
+
+    let request = StartRequest {
+        work_id: "01BS2DEFAULTMODE".to_string(),
+        execution_id: ulid(),
+        stage_id: "00-default-mode".to_string(),
+        attempt: 1,
+        cwd: cwd.path().to_path_buf(),
+        intent: "Write a marker file.".to_string(),
+        context: "Create a file named ok.txt in the current directory containing exactly OK \
+                  and nothing else. Then stop; do not do anything else."
+            .to_string(),
+        model: Some("claude-haiku-4-5-20251001".to_string()),
+        profile: None,
+    };
+    let handle = backend.start(&request).expect("start");
+    let observation = wait_settled(&backend, &handle, Duration::from_secs(180));
+
+    assert_eq!(
+        observation.native,
+        NativeState::Exited,
+        "a denied write must still end the turn cleanly, not hang on an unanswerable \
+         interactive prompt: {observation:?}"
+    );
+    assert!(
+        !cwd.path().join("ok.txt").exists(),
+        "the bare default must not grant a write with no --permission-mode flag \
+         (measured consequence, #47): {:?}",
+        std::fs::read_dir(cwd.path())
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+
+    // The archived raw transcript is the adapter's own evidence for the
+    // denial, not just this test's absence-of-file inference.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let usage = loop {
+        let found = {
+            let core = shared.blocking_lock();
+            all_events(&core).into_iter().find(|e| {
+                e.execution_id.as_deref() == Some(request.execution_id.as_str())
+                    && e.kind == "usage.updated"
+            })
+        };
+        if let Some(event) = found {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "usage.updated was never journaled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let raw_ref = usage.payload["raw"]
+        .as_str()
+        .expect("raw blob ref journaled");
+    let store = BlobStore::open(data.path()).expect("blob store");
+    let blob = store
+        .get(&BlobRef::from_str(raw_ref).expect("valid ref"))
+        .expect("raw transcript archived");
+    let text = String::from_utf8_lossy(&blob);
+    assert!(
+        text.contains("permission_denied"),
+        "the measured default-mode consequence is a permission refusal, not a silent \
+         grant: {text}"
+    );
 }
 
 // ------------------------- §22.5. the crash-injection matrix (issue #20)

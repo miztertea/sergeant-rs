@@ -1165,7 +1165,8 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "data_dir",
             "journal",
             "projection",
-            "daemon"
+            "daemon",
+            "permission_mode"
         ],
         "the --json check list and its order are the stable part of this contract"
     );

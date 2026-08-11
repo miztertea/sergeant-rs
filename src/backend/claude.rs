@@ -65,13 +65,28 @@
 //! to the §15 trait and the engine's append order, which is more than this
 //! milestone's contract asks for. Recorded rather than claimed closed.
 //!
-//! Root constraint (measured): `--dangerously-skip-permissions` is refused
-//! outright under root/sudo — `--dangerously-skip-permissions cannot be
-//! used with root/sudo privileges for security reasons`, exit 1 — unless
-//! the environment sets `IS_SANDBOX=1`. The adapter does not set that
-//! variable itself; the operator opts in via profile env or daemon
-//! environment, because silently bypassing the CLI's own refusal would be
-//! this adapter making a security decision that belongs to the human.
+//! Root constraint (measured, historical): `--dangerously-skip-permissions`
+//! is refused outright under root/sudo — `--dangerously-skip-permissions
+//! cannot be used with root/sudo privileges for security reasons`, exit 1 —
+//! unless the environment sets `IS_SANDBOX=1`. This adapter no longer emits
+//! that flag at all (#47): it is recorded here because the refusal's stderr
+//! shape is still what an envelope-less dead turn's evidence can look like
+//! (`docs/gauntlet/runs/runB/run-manifest.md`, attempt 1), not because the
+//! adapter still sends the flag.
+//!
+//! **Permission mode is profile configuration (#47).** `permission_mode` in
+//! a profile's `options` passes through as the CLI's own `--permission-mode`
+//! vocabulary (`default` | `acceptEdits` | `bypassPermissions` | `dontAsk` |
+//! `plan` — [`crate::domain::profile::PermissionMode`]), validated at
+//! profile load so an unrecognized string never reaches argv. Unspecified —
+//! no `permission_mode` option at all — means **no permission flag on the
+//! launch at all**, the CLI's own unflagged default; measured live via the
+//! opt-in `bs2_default_mode_headless_turn_cannot_write_without_an_explicit_
+//! permission_mode` test (`tests/m4_backends.rs`) rather than assumed.
+//! `bypassPermissions` requires a profile to name it explicitly: sending
+//! `--dangerously-skip-permissions` unconditionally, as this adapter used
+//! to, made a security decision belong to the adapter instead of the human
+//! who writes the profile.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -113,7 +128,6 @@ pub const REQUIRED_FLAGS: &[&str] = &[
     "--setting-sources",
     "--model",
     "--permission-mode",
-    "--dangerously-skip-permissions",
 ];
 
 /// Environment variable naming the `claude` executable to use.
@@ -716,7 +730,15 @@ impl ClaudeBackend {
     /// re-adopted execution cannot end up launching under different rules
     /// than the one it re-adopts — in particular, cannot silently escalate
     /// past a profile-pinned `--permission-mode`.
-    fn launch_config(&self, profile: Option<&Profile>) -> LaunchConfig {
+    ///
+    /// #47: the permission mode is validated here too (defense in depth
+    /// alongside the profile-load check in
+    /// [`crate::domain::workspace::Workspace::from_config`]) — a `Profile`
+    /// can reach this adapter without ever having passed through a
+    /// `sergeant.toml` parse (built directly by a test, or by a future
+    /// caller), so the launch boundary itself must still refuse an
+    /// unrecognized mode rather than pass the raw string to the CLI.
+    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
         let executable = profile
             .and_then(|p| p.executable.clone())
             .unwrap_or_else(|| self.config.executable.clone());
@@ -732,17 +754,22 @@ impl ClaudeBackend {
                 );
             }
         }
-        // Permission mode is profile-pinned; the default is L2's production
-        // default. Root refusal + IS_SANDBOX constraint: module docs.
-        let permission_args = match profile.and_then(|p| p.options.get("permission_mode")) {
-            Some(mode) => vec!["--permission-mode".to_string(), mode.clone()],
-            None => vec!["--dangerously-skip-permissions".to_string()],
+        // Permission mode is profile-pinned. Unspecified -> no flag at all
+        // (the CLI's own default); `bypassPermissions` only ever reaches
+        // argv when a profile names it (module docs, #47).
+        let permission_args = match profile {
+            Some(profile) => profile
+                .permission_mode()
+                .map_err(|e| self.err_failed(format!("profile {:?}: {e}", profile.name)))?
+                .unwrap_or(crate::domain::profile::PermissionMode::Default)
+                .cli_args(),
+            None => Vec::new(),
         };
-        LaunchConfig {
+        Ok(LaunchConfig {
             executable,
             env,
             permission_args,
-        }
+        })
     }
 
     /// Execution ids this adapter currently holds state for.
@@ -1369,7 +1396,7 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref());
+        } = self.launch_config(request.profile.as_ref())?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -1524,13 +1551,13 @@ impl Backend for ClaudeBackend {
     /// Launch configuration comes from the [`ResumeRequest`] the caller
     /// rebuilt from the journal, through the same resolution START uses —
     /// never from defaults. Fabricating it here is what a fail-*open* resume
-    /// looks like: it would silently replace a profile's `--permission-mode`
-    /// with `--dangerously-skip-permissions` (a security decision that
-    /// belongs to the human, as the module docs say of the root refusal),
-    /// drop the model pin so every later turn verified as "unpinned" while
-    /// the work's journal still records a pin, and journal normalized events
-    /// under an empty work id. A pin the caller does not re-supply is
-    /// genuinely absent — reported as unpinned, which is then true.
+    /// looks like: it would silently drop a profile's pinned
+    /// `--permission-mode` back to no-profile behavior (a security decision
+    /// that belongs to the human, as the module docs say of #47), drop the
+    /// model pin so every later turn verified as "unpinned" while the work's
+    /// journal still records a pin, and journal normalized events under an
+    /// empty work id. A pin the caller does not re-supply is genuinely
+    /// absent — reported as unpinned, which is then true.
     fn resume(
         &self,
         handle: &ExecutionHandle,
@@ -1584,7 +1611,7 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref());
+        } = self.launch_config(request.profile.as_ref())?;
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             // Another thread adopted it while this one gathered evidence.

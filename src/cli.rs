@@ -890,9 +890,67 @@ mod doctor {
         checks.push(journal_check);
         checks.push(projection_check(data_dir, journal_ok));
         checks.push(daemon_check(data_dir).await);
+        checks.push(permission_mode_check());
         Report {
             data_dir: data_dir.to_path_buf(),
             checks,
+        }
+    }
+
+    /// §31, #47: the effective `--permission-mode` behavior each declared
+    /// profile launches with — the same question `a_profile_is_launch_
+    /// configuration_carried_to_the_claude_adapter` pins in code, surfaced
+    /// where an operator reading `sgt doctor` will actually see it.
+    ///
+    /// Workspace discovery, not the data dir: profiles live in
+    /// `sergeant.toml` at the repository the doctor is *run from*, which is
+    /// also why a malformed `permission_mode` here reads as this check's own
+    /// failure rather than a mysterious daemon-side refusal later — #47's
+    /// fail-closed load already ran by the time this string is built.
+    fn permission_mode_check() -> Check {
+        use crate::domain::workspace::{Workspace, WorkspaceError};
+
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                return Check::warn(
+                    "permission_mode",
+                    format!("cannot read the current directory: {e}"),
+                    "run `sgt doctor` from inside the workspace whose profiles you want reported",
+                );
+            }
+        };
+        match Workspace::discover(&cwd) {
+            Ok(workspace) if workspace.profiles.is_empty() => Check::ok(
+                "permission_mode",
+                "no profiles declared — every execution launches with no --permission-mode \
+                 flag at all (the CLI's own default)",
+            ),
+            Ok(workspace) => {
+                let modes: Vec<String> = workspace
+                    .profiles
+                    .iter()
+                    .map(|p| {
+                        // Already validated at load (#47): from_config would
+                        // have refused the workspace before this ran.
+                        let effective = match p.permission_mode().ok().flatten() {
+                            Some(mode) => mode.as_cli_value().to_string(),
+                            None => "unspecified -> no flag (CLI default)".to_string(),
+                        };
+                        format!("{}={effective}", p.name)
+                    })
+                    .collect();
+                Check::ok("permission_mode", modes.join(", "))
+            }
+            Err(WorkspaceError::NotARepository { .. }) => Check::ok(
+                "permission_mode",
+                "not inside a workspace — nothing to report",
+            ),
+            Err(e) => Check::warn(
+                "permission_mode",
+                format!("cannot read this workspace's profiles: {e}"),
+                "fix sergeant.toml at the location the error names",
+            ),
         }
     }
 
