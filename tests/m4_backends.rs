@@ -5707,8 +5707,27 @@ fn n27_the_ask_claim_is_withdrawn_when_the_stream_stops_carrying_its_evidence() 
 /// L8's rule is that an advertised verb without a contract test against the
 /// installed harness is an unmeasured claim. This is that test for `ask`: one
 /// haiku turn told it cannot proceed without a decision, driven through the
-/// real adapter, must come back as `NeedsInput` authored by the actor — not as
-/// a completed stage whose summary happens to end in a question mark.
+/// real adapter.
+///
+/// **Probe-gated per disposition 2**
+/// (`docs/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md`):
+/// the ask affordance (`system/post_turn_summary`) was measured present on
+/// 2.1.226 in the cloud container and measured **absent** on this host/
+/// account's 2.1.227 — conditional on something outside the version string
+/// (account/server-side gating, not isolated). Guessing either shape from the
+/// version would be exactly what L1 forbids, so this test reads its own
+/// driven turn's evidence instead of assuming:
+///
+/// - the transcript carried `post_turn_summary` → the 2.1.226 contract
+///   applies: assert the `NeedsInput` mapping.
+/// - the transcript carried none → the adapter's own runtime withdrawal path
+///   (INV-N3-06) is what should have fired instead: assert
+///   `Capabilities::ask` lowered and `conversation.turn.grammar_unmeasured`
+///   journaled, and skip the mapping assertion loudly (`SKIPPED-ENV`) rather
+///   than silently.
+///
+/// Both arms are measured claims about *this run's* transcript; neither
+/// guesses.
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored"]
 fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
@@ -5720,6 +5739,16 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
     let mut config = ClaudeConfig::new(data.path());
     config.env.insert("IS_SANDBOX".to_string(), "1".to_string());
     let backend = ClaudeBackend::new(config);
+
+    // A sink to read the adapter's own evidence about which arm fired,
+    // rather than inferring it from the signal alone: the withdrawal event
+    // is the measured fact this test discriminates on (disposition 2).
+    let emitted: Arc<std::sync::Mutex<Vec<EventDraft>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&emitted);
+    backend.set_event_sink(Arc::new(move |draft| {
+        sink_events.lock().expect("sink lock").push(draft);
+    }));
 
     let request = StartRequest {
         work_id: "01N3LIVEASK".to_string(),
@@ -5747,6 +5776,41 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
     };
     backend.stop(&handle).expect("stop").wait();
 
+    let withdrawn: Vec<EventDraft> = emitted
+        .lock()
+        .expect("sink lock")
+        .iter()
+        .filter(|e| e.kind == "conversation.turn.grammar_unmeasured")
+        .cloned()
+        .collect();
+
+    if !withdrawn.is_empty() {
+        // Disposition 2, arm 2: no post_turn_summary line in this driven
+        // turn's transcript — the withdrawal is the measured, correct
+        // behavior here, not a defect and not evidence the NeedsInput
+        // mapping still holds on this host/account.
+        eprintln!(
+            "SKIPPED-ENV: a5's NeedsInput-mapping assertion — this host/account's claude CLI \
+             emitted no post_turn_summary line for this driven turn (see \
+             docs/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md); the \
+             adapter's runtime withdrawal path fired instead, which is what this arm asserts."
+        );
+        assert_eq!(
+            withdrawn.len(),
+            1,
+            "the withdrawal is journaled once, not once per turn: {withdrawn:?}"
+        );
+        assert_eq!(withdrawn[0].payload["capability"], "ask");
+        assert!(
+            !backend.capabilities().ask,
+            "a capability whose evidence is absent must not stay advertised (L1, L8): {:?}",
+            backend.capabilities()
+        );
+        return;
+    }
+
+    // Disposition 2, arm 1: the line was there — the 2.1.226 contract
+    // applies to this run.
     match &observation.signal {
         BackendSignal::NeedsInput { prompt, asked_by } => {
             assert_eq!(
@@ -5761,9 +5825,9 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
             eprintln!("measured actor ask: {prompt}");
         }
         other => panic!(
-            "2.1.226 no longer maps an end-of-turn question to needs_input: {other:?} \
-             (evidence: {:?}). Re-measure and, if the affordance is gone, lower \
-             Capabilities::ask to false rather than guessing from prose (L1/L8).",
+            "post_turn_summary was present in this turn's transcript, so the 2.1.226 \
+             mapping must apply, but it did not: {other:?} (evidence: {:?}). Re-measure \
+             (L1/L8).",
             observation.evidence
         ),
     }
