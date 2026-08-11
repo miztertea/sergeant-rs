@@ -43,6 +43,32 @@
   clone-is-distro it folds into the canonical file as the
   working-on-sergeant section, or moves to a doc AGENTS.md references —
   the contract picks, the symlink ruling stands either way.)
+- **U-R5 — the backlog is queued intents (owner ruling, with the
+  ownership boundary explicit).** sergeant-rs grows one minimal domain
+  concept: durable, ordered, human-triaged intents staged ahead of
+  execution. A backlog item IS an intent under the same structured
+  contract as a Work's (U-R6); findings from reviews/gates route into it
+  as queued intents with full-causal-context identity keys (upstream
+  lesson 4 — never short labels); promotion to a Work is always an
+  EXPLICIT act (`sgt run` consuming the queued intent, provenance
+  journal-linked); "draining the backlog" is promote-in-order, driveable
+  by a human or harness loop. The dev flow we already run — proposal →
+  review/arbitrate → accept → (plan → execute → review) → finish — is
+  the same shape: backlog = proposal stage; triage = arbitrate; Work =
+  the parenthesis. **What sergeant-rs OWNS: durable staging, the intent
+  contract, ordering, dedup identity, provenance, promote-to-work. What
+  it does NOT own: prioritization judgment (human/harness), automatic
+  scheduling (the G1 wake-condition primitive stays deferred; promotion
+  never fires on its own), and project-management semantics (no epics,
+  sprints, assignees — sergeant is not a PM tool).** This bounds the
+  work-definition question the owner flagged; anything beyond this
+  surface needs its own adjudication.
+- **U-R6 — structured intent contract adopted (shape, not ceremony).**
+  Work intent gains upstream's 8-section-style structure (scope, repos,
+  acceptance, exclusions...) as a schema; the journal's immutability
+  already provides integrity, so upstream's re-hash-before-every-action
+  ceremony is not ported. Queued backlog items display as structured
+  intents — the queue is readable as "what would run."
 - **U-R3 — self-hosting starts now.** Development work that fits a
   surviving workflow runs as a sergeant work from here on (research,
   diagnose-bug, code-review, validate-and-ship lanes); multi-agent
