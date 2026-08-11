@@ -1,0 +1,19 @@
+# wake-and-resume — admitted workflow (N1 reference corpus,
+# docs/gauntlet/contracts/N1.md; candidate W14,
+# reference-corpus/synthesis.md §1). Resumes a waiting worker when its
+# durable wake condition is met. Promoted per
+# docs/icm/promotion-spec-2026-08-11.md; the full behavior-unit citation
+# trail is archived at docs/gauntlet/promoted-provenance/wake-and-resume.md.
+#
+# One ordinary actor stage (10-evaluate) — no engine change. Stage order
+# here is authoritative; the directory listing under this workflow's own
+# tree MUST agree with it lexically (docs/icm/convention.md §1 rule 4).
+# NOTE: this stage is the corpus's direct source of engine-gap G1 (durable
+# wait/wake re-evaluation scheduling with no live billed process) — see
+# CONTEXT.md and provenance for the accepted, unresolved gap; curation
+# does not resolve it, only packages the stage that names it.
+
+[workflow]
+name = "wake-and-resume"
+version = "2"
+stages = ["10-evaluate"]

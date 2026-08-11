@@ -44,3 +44,43 @@ Applying the reference-corpus's N1 round-1 adjudication (`reference-corpus/adjud
 
 Stage count: 4 extracted → 1 surviving. No behavior unit was deleted; all citations above remain cited, under `10-evaluate`'s own contract or its "Helper invocations" section (see that stage's `CONTEXT.md`).
 
+## NEEDS-JUDGMENT resolution (`docs/icm/promotion-spec-2026-08-11.md` §5)
+
+This package classifies NEEDS-JUDGMENT solely because its sole surviving
+stage, `10-evaluate`, is the corpus's own direct source of engine-gap
+**G1** — durable wait/wake re-evaluation scheduling with no live billed
+process (`reference-corpus/engine-pressure.md` §"G1", rank 1;
+`reference-corpus/synthesis.md` §5). Unlike the corpus's two G5 cases
+(`grilling`, `sergeant-setup`'s `30-project-interview`), G1 is not about
+this stage's own within-run behavior pausing on `needs_input` — it is
+about what re-invokes this stage *later*, across a wait, which is outside
+what any single `sgt run` (scripted or not) can exercise. Concretely: this
+stage's own contract is to validate the condition, evaluate it once,
+classify the outcome, and resume the worker on a met outcome — an
+ordinary, single-pass actor stage the unscripted §3 engine-acceptance gate
+below exercises completely and honestly. What the engine does not yet own
+is *deciding when to call this stage again* for an unmet/still-waiting
+outcome (periodic, jittered, without a live process) — that scheduler is
+external today (`reference/sergeant-upstream/bin/sgt-wake`'s own
+invocation model), which is exactly what G1 says and exactly why it
+"survives" as an accepted, unresolved gap rather than being treated as a
+defect in this stage's packaged content.
+
+No package content required re-authoring to resolve this: the stage's own
+"Additional note" (`10-evaluate/CONTEXT.md`) already states the gap
+precisely, and G1's survives verdict is frozen record this curation act
+does not edit, per the promotion spec's forbidden list. The resolution is
+this verification note (this package's durable outcome depends on an
+external re-trigger by design, not by omission) plus running the ordinary
+§3 gate below, which validates exactly the single-pass evaluate-then-
+resume behavior this stage actually owns.
+
+## Promotion note (`docs/icm/promotion-spec-2026-08-11.md` §1)
+
+This package declares a `promote` output disposition
+(`10-evaluate/output/README.md`) at its true closing (and only) stage with
+no finalize step — one of the 30 of 34 N1 packages in that shape, not one
+of the 3 (`drain-fleet`, `respond-to-worker`, `to-spec`) that name one.
+Recorded here per the spec's finalize-gap rule rather than silently
+promoted; disposition is left to human review at merge time, not applied
+mechanically by this curation act.
