@@ -6,6 +6,23 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L15 — A claim transmitted to another agent must carry its evidence or be labeled hypothesis
+
+N-series close-out, 2026-08-11: the orchestrator told the Run B operator
+that the workflow's CONTEXT.md instructed `sgt respond` — remembered from
+authoring *different* prompts, never read. The operator read the file,
+found the claim false, and reported the real defect (a live-vs-test signal
+discrepancy, #46) instead of the transmitted fiction. L12's transmission
+corollary: the receiving agent cannot tell your verified facts from your
+confident guesses, and a coordinator's wrong "fact" arrives wearing
+authority it didn't earn. Rule: instructions to other agents state, for
+each factual claim, the evidence read in-session (file, journal line, run
+ID) — or say "hypothesis, verify before acting on it." The same wake's
+mirror image: the operator declined the orchestrator's credential-copy
+instruction in favor of the documented safer fix — subagent skepticism of
+the coordinator is the loop's protection running upward (L9's other half),
+and it must stay licensed.
+
 ## L14 — Binding rules live where sessions actually look; one document deep is half-applied
 
 S-series retrospective, 2026-08-11: every process error the owner caught
