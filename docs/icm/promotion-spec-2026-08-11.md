@@ -273,6 +273,24 @@ Practical consequence: promote the 34 as one name-preserving batch, or, if
 promoting incrementally, promote a delegation *target* no later than the
 package that names it, so no window has a dangling reference.
 
+**Ordering-window record (Cerberus promotion-fixer pass, 2026-08-11, F5).**
+This rule was broken once during incremental promotion: `cross-repo-work`
+landed (58e368f) two commits before its `## Delegation` target `dispatch`
+(24cbccf), leaving a transient window with a dangling reference. Mitigated
+at the time it happened — `cross-repo-work`'s own `index.md` at 58e368f
+makes no "published in this library" claim about `dispatch` (unlike
+`dispatch`'s and `worker-mission`'s own `index.md`, which do assert target
+presence and are correct) — and closed as of `dispatch`'s own promotion
+two commits later. All 10 delegating packages' `## Delegation` targets were
+re-checked against the final 35-directory listing at HEAD (2026-08-11) and
+every bold-named target resolves; the only unmatched tokens in any
+`## Delegation` section are the English words "whichever"/"chosen"/
+"selected", not package names. No further action: the defect was a
+transient window in committed history, already self-corrected by the time
+promotion completed, and does not exist at HEAD. Recorded rather than left
+unremarked, since the class of mistake — batch-promoting with delegation
+fan-out — recurs for any future incremental promotion pass.
+
 ---
 
 ## 5. Classification of all 34 packages
