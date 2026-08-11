@@ -2477,6 +2477,31 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
         ranges.push((start, block_end(&source, start)));
     }
 
+    // Round-2 finding INV-R2-02: `backend.stop()` is a real external effect —
+    // a synchronous kill + reap on the Claude adapter (`ClaudeBackend::stop`
+    // is `self.interrupt(handle)?.wait()`) — and unlike everything else on
+    // this list, it runs under the *request-path* guard too, not only in a
+    // single-owner context. That is not new here: issue #14/B3 already
+    // reviewed and kept it there deliberately (only the adapter's
+    // transcript-archive tail is deferred out from under the lock; the STOP
+    // request and its outcome commit are not), and `api::cancel_work`'s own
+    // comment says so ("The STOP request and the teardown land under this
+    // guard"). What #44 changed is the durability ordering behind that
+    // decision: the kill now precedes the flush that makes
+    // `execution.stopped`/`execution.abandoned` durable, where before group
+    // commit every commit was durable the instant it landed — so a crash
+    // between the kill and the flush can leave a killed or orphaned native
+    // context with no journal record. This is a known, accepted exemption,
+    // not an unreviewed one — named here rather than left invisible to this
+    // test. See `CoreGuard`'s doc for the durability guarantee stated
+    // honestly against it.
+    for stop_under_the_request_guard in ["fn stop_execution", "pub fn settle_launch"] {
+        let start = source
+            .find(stop_under_the_request_guard)
+            .unwrap_or_else(|| panic!("engine.rs must declare `{stop_under_the_request_guard}`"));
+        ranges.push((start, block_end(&source, start)));
+    }
+
     for effect in [
         "materialize(",
         "rematerialize(",
@@ -2485,6 +2510,8 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
         "backend.send(",
         "backend.observe(",
         "backend.resume(",
+        "backend.stop(",
+        "backend.interrupt(",
         "pending.perform(",
     ] {
         for (index, _) in source.match_indices(effect) {

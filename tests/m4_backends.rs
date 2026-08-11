@@ -7612,10 +7612,26 @@ fn n27b_waiting_a_deferred_runs_each_completion_exactly_once() {
 //   cannot widen that set, because the set was already every byte prefix.
 //
 // — and therefore no recovery obligation is new. Rather than argue it, the
-// test enumerates it: every byte offset a crash could stop at, over the exact
-// journal a real grouped hold writes, must reopen, replay, rebuild and
-// reconcile into a legal fail-closed state. `n26` keeps the fixture honest
-// against what the engine actually writes; this keeps the *prefixes* honest.
+// test enumerates it: every byte offset a crash could stop at, over a
+// hand-built journal in the §22.5 fixture shape (see `journal_two_stage_prefix`
+// and the matrix above it), must reopen, replay, rebuild and reconcile into a
+// legal fail-closed state. `n26` keeps each *event's* payload honest against
+// what the engine actually writes; this keeps the *prefixes* honest.
+//
+// **What the six-event group is, and is not (round-2 finding TH-R2-01).** It
+// is a hand-built worst case, not the literal contents of any one production
+// hold: `submit_work`'s real first hold appends two events
+// (`work.submitted`, `surface.materializing`) and flushes; the settle hold
+// that follows appends five more (`surface.materialized`, `workflow.bound`,
+// `work.started`, `stage.entered`, `execution.reserved`, in that order —
+// note `surface.materialized` precedes `workflow.bound`, the reverse of this
+// fixture's order). This test's group instead concatenates a whole
+// `journal_two_stage_prefix` plus a bare `execution.reserved` into one
+// never-flushed hold specifically so the byte-prefix sweep below exercises a
+// group at least as large as anything group commit produces today — the
+// claim is a *bound*, not a *reproduction*. `n26` is what keeps each event's
+// own shape honest; nothing here claims the six ever land in one hold
+// together outside this fixture.
 
 /// Every prefix a crash inside one grouped lock hold can leave is a prefix the
 /// existing torn-tail/segment recovery already handles.
@@ -7631,8 +7647,9 @@ fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_han
     let source = TempDir::new().expect("tempdir");
     let work_id = "01N3GRP";
 
-    // 1. Write exactly what a submit's first authoritative hold writes, and
-    //    never close the group — the state a crash mid-hold finds.
+    // 1. Write a hand-built, worst-case-sized group — bigger than any single
+    //    production hold appends today (see the module comment above) — and
+    //    never close it: the state a crash mid-hold finds.
     let bytes = {
         let mut core = core(source.path());
         journal_two_stage_prefix(&mut core, work_id, source.path());
@@ -7645,8 +7662,9 @@ fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_han
         assert_eq!(
             core.open_group_len(),
             6,
-            "six events appended under one hold: this is the group whose \
-             single fsync #44 is about"
+            "six events appended under one hold: a hand-built bound at least \
+             as large as any group #44 actually produces (see the module \
+             comment above — no single production hold writes this exact set)"
         );
         assert_eq!(
             core.journal.fsync_count(),

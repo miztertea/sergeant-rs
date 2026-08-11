@@ -214,15 +214,25 @@ impl Core {
 ///
 /// # Why the boundary is here and not per append
 ///
-/// A submit appends six events in its first hold and the two-phase boundary
-/// added two more per work (`docs/perf/n3-two-phase-boundary-2026-08-10.md`);
-/// at one fsync each, on a single-writer path, that volume *is* the cost.
-/// Sharing the fsync is legal precisely because **nothing outside the core
-/// runs during a hold**: the mutex is held, no response has been rendered, no
-/// SSE frame sent, and §22.6 already forbids performing any external effect
-/// under the guard. So the set of things that could have been caused by an
-/// event is empty until the hold ends — and at the instant it ends, every one
-/// of the hold's events is durable, exactly as it was before this change.
+/// A submit's first hold appends two events (`work.submitted`,
+/// `surface.materializing`); the settle hold that follows appends five more
+/// (`surface.materialized`, `workflow.bound`, `work.started`,
+/// `stage.entered`, `execution.reserved`) — several holds per work, not one,
+/// and the two-phase boundary added two of those events per work
+/// (`docs/perf/n3-two-phase-boundary-2026-08-10.md`); at one fsync each, on a
+/// single-writer path, that volume *is* the cost. Sharing the fsync is legal
+/// because **almost nothing outside the core runs during a hold**: the mutex
+/// is held, no response has been rendered, no SSE frame sent, and §22.6
+/// forbids performing an external effect under the guard for every path but
+/// one. The one exception is `backend.stop()` — a reviewed, pre-existing
+/// exemption (issue #14/B3), not a gap this change opened; see
+/// `runtime::engine::Engine::stop_execution` and `settle_launch` for what it
+/// costs group commit specifically (a kill can now precede the durability of
+/// the event that records it) and `m6`'s `t11_external_effects_live_only_in_the_out_of_lock_performers`
+/// for where it is named. For every other event, the set of things that
+/// could have been caused by it is empty until the hold ends — and at the
+/// instant the hold ends, every one of its events is durable, exactly as it
+/// was before this change.
 ///
 /// # L6 adjacent-append analysis (the mandatory one)
 ///
@@ -253,8 +263,10 @@ impl Core {
 ///
 /// Proven, not asserted: `m4`'s
 /// `n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_handles`
-/// writes the six events a submit's first hold appends, never closes the
-/// group, and then truncates that journal at **every** byte offset a crash
+/// writes a hand-built, worst-case-sized group of six events — at least as
+/// large as any single hold group commit produces today, though not the
+/// literal contents of one (see that test's module comment) — never closes
+/// the group, and then truncates that journal at **every** byte offset a crash
 /// could stop at — each one must reopen, replay to an exact prefix, rebuild
 /// and reconcile fail-closed. `m4`'s `n10`–`n12` remain the §22.5 windows
 /// themselves, unchanged and still passing, because the events and their
