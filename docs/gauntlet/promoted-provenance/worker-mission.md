@@ -58,3 +58,33 @@ Stage count: 6 extracted → 4 surviving. No behavior unit was deleted; `BU-P7-0
 
 `BU-P5-150` (vertical-slice discipline, `20-implement`), `BU-P5-151` (remediation loop, `30-independent-review`/`20-implement`), `BU-P5-152` (commit/PR/CI/review-thread/dependency-order delivery, `40-escalate-or-continue`), and `BU-P5-153` (td decision logging and `td review` timing, `40-escalate-or-continue`) are the four remaining rows of the same ordered dispatch worker-contract list that `BU-P5-075`–`BU-P5-089` already belong to. Per record-shapes.md §3's one-unit-one-stage rule and this package's own established pattern for that range (see `dispatch/80-monitor/CONTEXT.md`'s "render brief" helper), these four units are cited once, in `dispatch/provenance.md`'s `60-render-brief` section (content `dispatch` *authors* into the brief), not duplicated here. This package is the content's *executor* — the stage each unit's parenthetical above names is where a worker actually carries out that contract item during a mission — but the binding citation stays with the authoring package.
 
+## Promotion note (docs/icm/promotion-spec-2026-08-11.md §1, §5)
+
+**Finalize gap.** This package's true closing stage, per `workflow.toml`'s
+own stage order, is `40-escalate-or-continue`; its `output/README.md`
+declares a `promote` disposition (inherited from the folded
+`50-publish-result`) with no finalize step — one of the 30 of 34 N1 drafts
+in that shape, not one of the 3 (`drain-fleet`, `respond-to-worker`,
+`to-spec`) that name one. D9 (`docs/icm/convention.md` §1a, "Open
+questions") does not block promotion on this; disposition here is applied
+by human review at merge time for this package, not mechanically.
+
+**Five-way delegation and engine-gap G6 verified (§5 NEEDS-JUDGMENT
+resolution).** This package's classification turns on `20-implement`
+delegating dynamically to whichever of **diagnose-bug, prototype, tdd,
+implement, or deepen-module** was selected at `10-triage-and-route` — the
+widest fan-out in the corpus — plus `10-triage-and-route`'s own
+"Additional note" citing engine-gap **G6** (child-procedure invocation
+with its own checkpoints; `reference-corpus/synthesis.md` §5) as live,
+surviving-partial pressure. Both were read and understood, not edited or
+resolved, per the spec's forbidden-list rule (G6's note and verdict are
+adjudicated record, not a curation decision). At promotion time
+(2026-08-11) all five named delegation targets were confirmed present
+under `.sergeant/workflows/` with `status: published` before this package
+was promoted, satisfying the naming rule (§4) that a delegation target
+must never be a dangling reference. No delegation target name, stage
+boundary, behavior-unit citation, or engine-gap note was touched to reach
+this resolution — this is a presence confirmation only, the minimal-
+packaging way the spec's own framing calls for; nothing here required
+re-authoring adjudicated content.
+
