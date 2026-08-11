@@ -18,6 +18,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `direct-implementation` | published | [`workflows/direct-implementation/index.md`](workflows/direct-implementation/index.md) |
 | `dispatch` | published | [`workflows/dispatch/index.md`](workflows/dispatch/index.md) |
 | `drain-fleet` | published | [`workflows/drain-fleet/index.md`](workflows/drain-fleet/index.md) |
+| `grilling` | published | [`workflows/grilling/index.md`](workflows/grilling/index.md) |
 | `grill-with-docs` | published | [`workflows/grill-with-docs/index.md`](workflows/grill-with-docs/index.md) |
 | `implement` | published | [`workflows/implement/index.md`](workflows/implement/index.md) |
 | `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
@@ -32,6 +33,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `respond-to-worker` | published | [`workflows/respond-to-worker/index.md`](workflows/respond-to-worker/index.md) |
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
 | `sergeant-help` | published | [`workflows/sergeant-help/index.md`](workflows/sergeant-help/index.md) |
+| `sergeant-setup` | published | [`workflows/sergeant-setup/index.md`](workflows/sergeant-setup/index.md) |
 | `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 | `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
 | `to-tickets` | published | [`workflows/to-tickets/index.md`](workflows/to-tickets/index.md) |
