@@ -59,3 +59,38 @@ Applying the reference-corpus's N1 round-1 adjudication (`reference-corpus/adjud
 
 Stage count: 6 extracted → 3 surviving. No behavior unit was deleted; all units cited under the three folded stages remain cited, now under `40-escalate-on-second-attempt`'s "Helper invocations" section (see that stage's `CONTEXT.md`). `BU-P6-071` is cited both at `40-escalate-on-second-attempt`'s own checkpoint and within the folded `10-preflight` content — the same fact serving both the gating and escalation halves of one invariant, not duplicated evidence.
 
+## Curation note (promotion gate-record correction, 2026-08-11)
+
+**Correcting a misattributed commit message, not a content defect.** This
+package's promotion commit, f086b4b, carries a commit message that is a
+verbatim copy of the earlier `deepen-module` promotion (0dd4352) — subject,
+packaging description, and engine-acceptance gate evidence all describe
+`deepen-module`, not `recover-stalled-worker`. The file diff in f086b4b is
+correct (git mv into `.sergeant/workflows/recover-stalled-worker/`,
+`index.md` status flip, `workflow.toml` header rewrite, this file archived
+verbatim) — only the message text is wrong, leaving this package with no
+honest gate record anywhere on the branch. This note is that record,
+written after re-running the spec's own procedure rather than after
+editing history (f086b4b is not reworded/rebased — the branch has commits
+after it that would all need rewriting, and the defect is fully explained
+by an honest correction here instead).
+
+Engine-acceptance gate (`docs/icm/promotion-spec-2026-08-11.md` §3) run
+2026-08-11 against `/home/miztertea/sergeant-runb/target/debug/sgt`, in a
+package-private scratch subject repo and data dir, `SGT_FAKE_SCRIPT`
+unset: `work.state == "completed"`; one `workflow.bound` whose
+`stage_bindings` matched `workflow.toml`'s three stages
+(`00-collect-signals`, `40-escalate-on-second-attempt`,
+`50-escalate-undocumented`) in order; matching `stage.entered`/
+`stage.completed` pairs in that same order; one terminal `work.completed`
+with `stages == 3`; three distinct `execution_id`s
+(`01KZREN7Q3MJF226MVBAV8EQM2`, `01KZREN7Q4GE8TXJEB22FJX0J0`,
+`01KZREN7Q4G95M3MR2F1TTYYWB`). Daemon stopped and pgrep-confirmed gone
+before teardown. `recover-stalled-worker` is one of the spec §5
+STRAIGHTFORWARD 20 (no engine-gap or Delegation signal in its
+`CONTEXT.md`). Per the spec §1 D9 observation, its closing stage
+(`50-escalate-undocumented`) declares a `promote`-dispositioned output
+with no finalize step named — not a promotion blocker, recorded here for
+the same reason every other STRAIGHTFORWARD package's gap is recorded
+(and already noted at that stage's own `output/README.md`).
+
