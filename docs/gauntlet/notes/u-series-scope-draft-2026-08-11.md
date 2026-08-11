@@ -10,13 +10,19 @@
 - **U-R2 — nothing of ours lives at `~/`.** The estate is self-contained:
   tracked (AGENTS.md, skills, workflows, estate/repos manifest, helpers);
   in-estate but gitignored machine-local truth (`.sergeant/data/` —
-  journal, blobs, surfaces, daemon.lock — and the `repos/` mounts, each
-  an independent clone). The current `~/.local/share/sergeant` XDG
-  default (src/cli.rs:225) is an unexamined M-era habit: U flips the
-  default to estate-root-resolved `.sergeant/data/` with
-  `SGT_DATA_DIR`/`--data-dir` as overrides. Upstream's `~/.config`
-  registry and `~/Dev` conventions were never implemented and are not
-  adopted.
+  journal, blobs, surfaces, daemon.lock — and the `repos/` entries). The
+  current `~/.local/share/sergeant` XDG default (src/cli.rs:225) is an
+  unexamined M-era habit: U flips the default to estate-root-resolved
+  `.sergeant/data/` with `SGT_DATA_DIR`/`--data-dir` as overrides.
+  **Amended after owner pushback (same grill): `repos/` is a WORKING
+  SET, not a dev_root.** Upstream's `~/Dev` (the permanent home of all
+  clones) is a different concept sergeant neither adopts nor replaces —
+  where canonical clones live is not sergeant's business. `repos/` is
+  the estate's mount point for repos actively being worked on; an entry
+  may be a full clone, a worktree of a clone elsewhere, or a symlink —
+  sgt requires only that `repos/<name>` is a git repo it can cut work
+  surfaces from. The estate manifest declares the expected entries;
+  `sgt init`/doctor verify or populate them.
 - **U-R3 — self-hosting starts now.** Development work that fits a
   surviving workflow runs as a sergeant work from here on (research,
   diagnose-bug, code-review, validate-and-ship lanes); multi-agent
