@@ -41,3 +41,23 @@ N1 adjudication A4 (finding N1-BH-02, `reference-corpus/adjudication-round1.md`)
 
 **Synthesis notes:** Explicit-invocation-only (BU-P2-051) — this workflow must never be auto-loaded merely because the task looks like implementation; its cross-harness mirror is BU-P3-004.
 
+## Curation note (promotion gate-record completion, 2026-08-11)
+
+`implement`'s promotion commit (68f2765) recorded packaging and the
+NEEDS-JUDGMENT delegation check (delegates to `tdd` at
+`10-implement-with-tdd` and `code-review` at `30-review`, both already
+promoted) but no engine-acceptance gate evidence. This note completes the
+record: `docs/icm/promotion-spec-2026-08-11.md` §3's procedure, run
+2026-08-11 against `/home/miztertea/sergeant-runb/target/debug/sgt` in a
+package-private scratch subject repo and data dir, `SGT_FAKE_SCRIPT`
+unset — `work.state == "completed"`; one `workflow.bound` whose
+`stage_bindings` matched `workflow.toml`'s two stages
+(`10-implement-with-tdd`, `30-review`) in order; matching
+`stage.entered`/`stage.completed` pairs in that order; one terminal
+`work.completed` with `stages == 2`; two distinct `execution_id`s
+(`01KZREP5204GGQEKQ8PETEAA6E`, `01KZREP5207VQ48SJDV29V5SRP`). Daemon
+stopped and pgrep-confirmed gone before teardown. Per spec §1's D9
+observation, the closing stage (`30-review`) declares a `promote`-
+dispositioned output with no finalize step named — not a promotion
+blocker, recorded here rather than left implicit.
+
