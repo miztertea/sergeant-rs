@@ -60,3 +60,34 @@ Original stages: `01-load-context`, `02-check-queue`, `03-choose-mode`, `04-reco
 
 **Decision:** each demoted stage folds forward, as a helper invocation, into the judgment-bearing stage it directly precedes in the original sequence: `02-check-queue` → `03-choose-mode`, `04-reconcile-state` → `05-confirm-decisions`, `07-monitor` → `08-handle-decisions`. No stage in this package required the §6.3 case-by-case reimplementation test — none of the three demoted stages carried an Additional note argument to weigh. The behavior units are not deleted — see each surviving stage's "Helpers (folded per N1 adjudication A4)" section. Stage count drops from 9 to 6: `01-load-context`, `03-choose-mode`, `05-confirm-decisions`, `06-execute`, `08-handle-decisions`, `09-reconcile-deliver`.
 
+## Promotion note (docs/icm/promotion-spec-2026-08-11.md §1, §5)
+
+**Finalize gap.** This package's true closing stage, per `workflow.toml`'s
+own stage order, is `09-reconcile-deliver`; its `output/README.md` declares
+a `promote` disposition with no finalize step — one of the 30 of 34 N1
+drafts in that shape, not one of the 3 (`drain-fleet`, `respond-to-worker`,
+`to-spec`) that name one. Recorded here per the spec's finalize-gap rule
+rather than silently promoted; disposition on whether this package needs a
+finalize step is left to human review at merge time, not applied
+mechanically by this curation act.
+
+**Delegation-target dependency verified (§5 NEEDS-JUDGMENT resolution).**
+This package's classification turns on being the corpus's router:
+`01-load-context` delegates to `load-project`, and `06-execute` delegates
+to whichever of `direct-implementation`/`dispatch` is chosen at this
+package's own `03-choose-mode` — the widest named-alternative fan after
+`worker-mission`, and per the spec's own text "all named targets must
+exist for the routing to mean anything." At promotion time (2026-08-11)
+all three named targets were confirmed present under `.sergeant/workflows/`
+with `status: published`: `load-project` fully committed and published;
+`direct-implementation` and `dispatch` present with `status: published` in
+this session's working tree, promoted concurrently by other curators in
+the same batch (not yet landed in this branch's history at the moment of
+this check, but structurally present and name-exact, satisfying the
+naming rule in §4). No delegation target name was renamed, re-cited, or
+otherwise altered — this is a presence confirmation only, resolved the
+minimal-packaging way per the spec's own framing (curation declines to
+promote only when re-authoring adjudicated content is genuinely required,
+which this is not: no stage prose, behavior-unit citation, or delegation
+name was touched to reach this resolution).
+
