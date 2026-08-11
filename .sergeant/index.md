@@ -18,6 +18,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `monitor-fleet` | published | [`workflows/monitor-fleet/index.md`](workflows/monitor-fleet/index.md) |
 | `project-graph` | published | [`workflows/project-graph/index.md`](workflows/project-graph/index.md) |
 | `prototype` | published | [`workflows/prototype/index.md`](workflows/prototype/index.md) |
+| `reconcile-and-cleanup-fleet` | published | [`workflows/reconcile-and-cleanup-fleet/index.md`](workflows/reconcile-and-cleanup-fleet/index.md) |
 | `recover-stalled-worker` | published | [`workflows/recover-stalled-worker/index.md`](workflows/recover-stalled-worker/index.md) |
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
