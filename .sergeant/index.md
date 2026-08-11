@@ -21,9 +21,10 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `recover-stalled-worker` | published | [`workflows/recover-stalled-worker/index.md`](workflows/recover-stalled-worker/index.md) |
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
+| `resolving-merge-conflicts` | published | [`workflows/resolving-merge-conflicts/index.md`](workflows/resolving-merge-conflicts/index.md) |
 | `respond-to-worker` | published | [`workflows/respond-to-worker/index.md`](workflows/respond-to-worker/index.md) |
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
-| `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
+| `vet-external-skill` | published | [`workflows/vet-external-skill/index.md`](workflows/vet-external-skill/index.md) |
 
 `.sergeant/drafts/workflows/` holds generated, human-reviewable candidates —
 never admitted procedure, never listed here (`docs/icm/convention.md` §2).
