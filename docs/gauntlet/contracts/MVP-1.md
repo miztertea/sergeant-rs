@@ -1,4 +1,4 @@
-# MVP-1 — CORE — **DRAFT, not adjudicated**
+# MVP-1 — CORE — **ADJUDICATED (delegated authority per the owner's standing Go, 2026-08-11; R-MVP1-2 held with the NORTH-STAR amendment recorded; owner overrules by exception), not adjudicated**
 
 **Owner adjudication gate: no build until adjudicated.** Every ruling here is a
 hypothesis with provenance — argue it wrong with evidence, do not ratify it. Two

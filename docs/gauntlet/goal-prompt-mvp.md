@@ -38,8 +38,11 @@ committed — the repo is your memory, your context is not.
   manager and guardian of the North Star: contracts, adjudication,
   tie-breaks, and nothing a subagent could do instead.**
 
-- **Contracts before build; the owner adjudicates every contract.**
-  Never start a bucket without its adjudicated contract.
+- **Contracts before build — adjudication is flag-and-proceed (owner,
+  2026-08-11).** The orchestrator rules on its own recommendation,
+  records it (North-Star amendments included), and proceeds; the owner
+  overrules by exception. Hard stops remain ONLY: merges to main, spend
+  beyond precedent, destructive/irreversible acts.
 - **Code is code (R-S0-12)** — full multi-axis loop for every
   executable diff; batch small diffs into the next larger panel.
 - **The epistemic license binds**: every ruling in the repo, the
