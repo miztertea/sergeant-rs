@@ -44,6 +44,62 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### CERBERUS DAY 2 — 2026-08-11, direction: North Star adjudicated, MVP plan triple-reviewed, goal prompt cut
+
+**Mission outcome.** Adjudication day, zero engine code. (1) Retention
+ruling ADJUDICATED (Rule A → later re-homed standalone to MVP-1 by
+owner amendment; Rule C amended compress-first, rebuild-time trigger
+binding). (2) Owner rulings landed as method: execution-surface
+taxonomy (convention §2a + bucket 4 absorbed-by-engine), the epistemic
+license (every ruling is a hypothesis; encoded in the north-star
+workflow), the adapter-boundary rule (core semantics never defined by
+adapter flags — the `--setting-sources` de-leak), estate model
+(clone-is-distro, repos/ working set not dev_root, nothing at `~/`,
+manifest as keystone with three-pens/pin-at-bind semantics). (3) The
+dogfood gauntlet ($5.29 of $25): settle driver ran two workflows
+end-to-end unattended; research produced a load-bearing artifact
+(zstd 6.5–7.7× measured, correcting the ruling draft's ~10×); grilling
+measured structurally unable to hold on this host; E1–E7 ranked;
+verdict "the library didn't fail the assignment — the assignment's
+final exam had never been administered." (4) Library re-triaged twice
+(23/35 stand; respond-to-worker retires to docs as shipped `sgt
+respond`; dispatch mechanics absorbed) — L18 minted: R1's "already
+exists" includes the product you are building. (5) Upstream settled:
+36-script logical function map (8-function honest delta; td answered —
+journal absorbs queue-dedup, td-memory dies, standing backlog is the
+residue), 12-lesson issues/PR mining (fail-closed-no-exit-door the live
+risk; #205 injection class audited clean here). (6) **NORTH-STAR.md**:
+4 blind seats → synthesis → 3 steelmanned challengers → dispositions →
+owner rulings (R-NS-6 execution≠dialogue dissolved the interactive
+fork; surfaces add usability never functionality). (7) MVP plan cut by
+the owner's layer ladder, then **triple-reviewed** (4-critic pipeline →
+Opus writer re-verifying every cite → sanity pass; 31 findings, 29
+applied — best catch: the turn envelope at PREPARE/LAUNCH-only misses
+`send`-spawned turns; plus the outside Codex seat's self-hosting
+surfaces contradiction → data_dir/surfaces_root split owed in MVP-1).
+Escalations ruled: Rule A standalone, schema rename-with-refusal,
+execute subject cheap-fast-frequent. (8) P2-JOURNAL vendored + slotted
+post-MVP; P2-vs-T-minimal demoted to a pilot ruling. (9)
+`docs/gauntlet/goal-prompt-mvp.md` cut — the standing mission brief.
+PRs: #58 (day-2 head PR, everything above).
+
+**Environmental behavior.** Grill-with-docs method run live all day
+(one question at a time, captures committed as decisions landed) — the
+owner corrected the orchestrator repeatedly and the corrections were
+the day's highest-value inputs: the fleet-domain overreach, the
+dev_root/repos conflation, "you're agreeing not analyzing" (which
+produced the four-crack self-audit), and the missed-review catch (the
+orchestrator authored the governing plan with zero fresh eyes — the
+owner-shaped 4→1→1 pipeline then found 14 errors in it, base rate
+vindicated again). Orchestrator's own R-H0-2 recommendation overturned
+by its own workflow's evidence and the overturn upheld. ~2.5M subagent
+tokens across north-star + review pipelines + classifiers. The
+epistemic license and the owner's "take my rulings with a grain of
+salt" are now durable method text — subagent seats are briefed that
+ratifying the record is failing the brief.
+
+---
+
 ### CERBERUS SESSION CLOSE-OUT — 2026-08-11, first host session: BS2+#44 shipped, library promoted, runs 4 + B2, H0 drafted
 
 **Mission outcome.** First non-container session, everything below on the
