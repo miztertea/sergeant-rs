@@ -1448,6 +1448,69 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
 }
 
+/// TH-2 (BS2 test-honesty finding): t3 above pins the `permission_mode`
+/// check's *name*, its position, `status == ok` and a non-empty `detail` —
+/// but it runs doctor from a repo with no `sergeant.toml`, so the
+/// profile-reporting branch of `permission_mode_check` never executes and
+/// nothing ever reads what `detail` actually says. A doctor that reported a
+/// constant ("unspecified -> no flag") for every profile regardless of its
+/// real `permission_mode` passed the whole suite before this test existed.
+/// This drives doctor from a workspace with two profiles — one unspecified,
+/// one `plan` — and asserts the detail names both profiles and their real
+/// effective modes (#47's surfacing half).
+#[test]
+fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    init_repo(workspace.path());
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[workspace]\nname = \"w\"\n\n\
+         [[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+         [[profile]]\nname = \"quiet\"\nbackend = \"claude\"\n\n\
+         [[profile]]\nname = \"careful\"\nbackend = \"claude\"\n\
+         [profile.options]\npermission_mode = \"plan\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (code, stdout, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude)],
+        false,
+    );
+    assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "permission_mode");
+    assert_eq!(check["status"], "ok", "{check}");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("quiet") && detail.contains("careful"),
+        "the detail must name every profile, not just count them: {detail}"
+    );
+    assert!(
+        detail.contains("careful=plan"),
+        "the profile with an explicit mode must report that mode's real CLI value: {detail}"
+    );
+    assert!(
+        detail.contains("quiet=unspecified"),
+        "the unspecified profile must be reported as unspecified/no-flag, \
+         never silently folded into a mode it never chose: {detail}"
+    );
+    assert!(
+        !detail.contains("quiet=plan") && !detail.contains("careful=unspecified"),
+        "the two profiles' effective modes must not be swapped or constant-folded: {detail}"
+    );
+}
+
 /// The journal check's *other* failure arm: `corrupt_journal` above only
 /// ever reaches "replay failed after N events" (a line the replay gets to
 /// and cannot parse). `Journal::replay_data_dir` can also fail before it
@@ -1610,7 +1673,31 @@ fn named_check<'a>(report: &'a Value, name: &str) -> &'a Value {
 }
 
 fn doctor(data_dir: &Path, env: &[(&str, &str)], as_json: bool) -> (Option<i32>, String, String) {
+    doctor_in_opt(None, data_dir, env, as_json)
+}
+
+/// [`doctor`], run with the subprocess's cwd set to `workspace` — the only
+/// way to drive `permission_mode_check`'s profile-reporting branch, which
+/// reads `Workspace::discover(&std::env::current_dir())`.
+fn doctor_in(
+    workspace: &Path,
+    data_dir: &Path,
+    env: &[(&str, &str)],
+    as_json: bool,
+) -> (Option<i32>, String, String) {
+    doctor_in_opt(Some(workspace), data_dir, env, as_json)
+}
+
+fn doctor_in_opt(
+    workspace: Option<&Path>,
+    data_dir: &Path,
+    env: &[(&str, &str)],
+    as_json: bool,
+) -> (Option<i32>, String, String) {
     let mut command = Command::new(SGT);
+    if let Some(workspace) = workspace {
+        command.current_dir(workspace);
+    }
     command.arg("--data-dir").arg(data_dir);
     if as_json {
         command.arg("--json");
