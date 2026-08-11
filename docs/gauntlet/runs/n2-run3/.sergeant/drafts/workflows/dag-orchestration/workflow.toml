@@ -1,0 +1,4 @@
+[workflow]
+name = "dag-orchestration"
+version = "1"
+stages = ["01-stage-dependency-gate"]

@@ -1,0 +1,4 @@
+[workflow]
+name = "installation-and-setup"
+version = "1"
+stages = ["01-dependency-check"]

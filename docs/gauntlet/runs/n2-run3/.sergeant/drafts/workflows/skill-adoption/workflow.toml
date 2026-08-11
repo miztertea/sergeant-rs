@@ -1,0 +1,4 @@
+[workflow]
+name = "skill-adoption"
+version = "1"
+stages = []

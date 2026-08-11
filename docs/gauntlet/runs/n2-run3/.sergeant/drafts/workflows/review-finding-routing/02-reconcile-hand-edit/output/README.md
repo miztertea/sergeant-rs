@@ -1,0 +1,7 @@
+# Output -- `02-reconcile-hand-edit`
+
+Layer 4 (per-run artifact), for this candidate's *own future runs* -- not this `repo-to-icm` run's artifact, and not populated here (`../../../../../workflows/repo-to-icm/60-draft/references/draft-package-template.md` "What never happens"; `docs/icm/convention.md` §1a rule 4).
+
+**Expected artifact (draft inference from `BU-0101`, subject to promotion review):** a durable record of this stage's outcome -- the human-edited content is preserved (not overwritten) and flagged for human reconciliation.
+
+**Disposition:** `evidence` -- this stage is this candidate's terminal checkpoint; its record is kept as accountability evidence, not consumed by a further local stage.
