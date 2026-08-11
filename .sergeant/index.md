@@ -25,6 +25,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `resolving-merge-conflicts` | published | [`workflows/resolving-merge-conflicts/index.md`](workflows/resolving-merge-conflicts/index.md) |
 | `respond-to-worker` | published | [`workflows/respond-to-worker/index.md`](workflows/respond-to-worker/index.md) |
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
+| `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
 | `vet-external-skill` | published | [`workflows/vet-external-skill/index.md`](workflows/vet-external-skill/index.md) |
 
 `.sergeant/drafts/workflows/` holds generated, human-reviewable candidates —
