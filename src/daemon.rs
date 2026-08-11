@@ -122,6 +122,15 @@ pub enum DaemonError {
     },
 }
 
+/// How long shutdown waits for the completion driver to leave whatever it is
+/// inside before journaling `daemon.stopped` and going.
+///
+/// Half of m6's SIGTERM grace: long enough that the ordinary case (one poll
+/// interval, or one crank over in-memory observations) always finishes inside
+/// it, short enough that a daemon whose driver is stuck in someone else's git
+/// checkout still exits on its own rather than being escalated to SIGKILL.
+const DRIVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Handle to a running in-process daemon. Dropping it does NOT stop the
 /// daemon; call [`DaemonHandle::shutdown`] for a clean stop (journals
 /// `daemon.stopped`, removes the descriptor).
@@ -391,9 +400,32 @@ pub async fn start_with(
             tracing::error!(error = %e, "daemon serve failed");
         }
         // The completion driver watches the same `closing` flag the SSE pumps
-        // do, so this waits out at most the crank it is already inside.
-        if let Err(e) = completions.await {
-            tracing::warn!(error = %e, "the completion driver did not finish cleanly");
+        // do, so this normally waits out one 200 ms tick and nothing else.
+        //
+        // Bounded, though, because the driver is the one writer that can be
+        // *inside an external effect* when the signal arrives: a cascade it
+        // started may be spawning a harness or running `git worktree remove`
+        // on a checkout this daemon does not own and cannot bound. Waiting
+        // that out unbounded would put an arbitrary repository's size on the
+        // shutdown path — and m6's rig pins that a SIGTERMed daemon exits
+        // within its grace and *by itself*, so a slow teardown would turn into
+        // a SIGKILL and lose everything registered to run at exit.
+        //
+        // The trade the bound makes, stated rather than hidden: past it, the
+        // driver's crank may commit an event after `daemon.stopped`. That is
+        // the property the adapter's normalized-event committer thread already
+        // has (see `journaling_sink`), the journal is append-only and
+        // crash-tolerant per append, and `daemon.stopped` is a lifecycle
+        // record that nothing reconciles against — whereas a daemon that will
+        // not die is a lock nobody can take.
+        match tokio::time::timeout(DRIVER_SHUTDOWN_GRACE, completions).await {
+            Ok(Err(e)) => tracing::warn!(error = %e, "the completion driver panicked"),
+            Err(_) => tracing::warn!(
+                grace = ?DRIVER_SHUTDOWN_GRACE,
+                "the completion driver was still inside an external effect at shutdown; \
+                 stopping anyway"
+            ),
+            Ok(Ok(())) => {}
         }
         // Clean shutdown: journal the stop, then retire the descriptor.
         let mut core = state.core.lock().await;
