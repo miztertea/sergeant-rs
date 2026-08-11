@@ -30,8 +30,6 @@ jobs:
     # runners; the 4-core dev-container estimate was 15-25 min. Wide
     # margin on purpose (review finding 4).
     timeout-minutes: 120
-    env:
-      COV_ARTIFACTS: ${{ runner.temp }}/coverage-artifacts
     steps:
       - uses: actions/checkout@v4
       - name: reclaim runner disk (the stage scripts enforce a 10 GB floor)
@@ -47,6 +45,10 @@ jobs:
           cache-directories: target/llvm-cov-target
       - name: measure (the committed convention, stages C0-C4)
         run: |
+          # runner.temp is unavailable in job-level env (422 on dispatch);
+          # RUNNER_TEMP is the same path as a plain default variable.
+          export COV_ARTIFACTS="$RUNNER_TEMP/coverage-artifacts"
+          mkdir -p "$COV_ARTIFACTS"
           # A cache hit restores last week's profraws; pooled stale profiles
           # are a silently wrong number (review finding 2). Clean first.
           cargo llvm-cov clean --profraw-only || true
