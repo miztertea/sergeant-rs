@@ -116,3 +116,5 @@ Original stages: `00-detect-prerequisites`, `05-file-capability-gaps`, `10-insta
 
 **Standing constraints** (`BU-P5-004`, `BU-P5-005`, `BU-P7-036`, `BU-P5-006`): Write only to Sergeant-owned paths. Never write to other tools' config surfaces. Never auto-initialize external tools without explicit consent. These apply across every stage of this workflow, not to one checkpoint — they belong in this workflow's `_config/` (Layer 3), not in any single stage's Inputs table.
 
+**Promotion note (`docs/icm/promotion-spec-2026-08-11.md` §1, added at archiving, not part of the N1 adjudication above):** this package's true closing stage per `workflow.toml`'s own stage order is `70-optional-capabilities` (absorbs `90-completion-summary` per A4), which declares an `evidence` output and names no finalize step (no `scripts/finalize.py` or equivalent) — one of the 30 of 34 corpus packages in that shape, per the promotion spec's D9 observation; disposition is left to human review at merge time, not resolved here.
+
