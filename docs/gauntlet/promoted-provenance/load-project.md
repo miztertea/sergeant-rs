@@ -71,3 +71,25 @@ Original stages ended in `30-sync-repositories` and `40-report-state`.
 
 **Demoted/merged candidates:** `list-projects` (BU-P6-010/011), `project-status` (BU-P6-012), `project-sync` (BU-P6-013/014), and `project-task-list` (BU-P6-035) were each extracted as standalone workflows by one partition (P6) but are command surfaces, not procedures with a bounded outcome and completion condition (§6.2) — folded into this workflow's stages instead. See synthesis.md conflict X11.
 
+## Curation note (promotion gate-record completion, 2026-08-11)
+
+`load-project`'s promotion commit (e187c72) asserted that an
+engine-acceptance gate ran ("run separately against a private scratch
+subject repo and data dir with the sgt binary from sergeant-runb") but
+recorded none of promotion-spec §3's five required assertions and no
+daemon-stop confirmation. This note completes the record with a fresh run:
+`docs/icm/promotion-spec-2026-08-11.md` §3's procedure, run 2026-08-11
+against `/home/miztertea/sergeant-runb/target/debug/sgt` in a
+package-private scratch subject repo and data dir, `SGT_FAKE_SCRIPT`
+unset — `work.state == "completed"`; one `workflow.bound` whose
+`stage_bindings` matched `workflow.toml`'s three stages
+(`00-resolve-project-name`, `10-resolve-context`, `20-register-or-edit`)
+in order; matching `stage.entered`/`stage.completed` pairs in that order;
+one terminal `work.completed` with `stages == 3`; three distinct
+`execution_id`s (`01KZREPRKD2F82A224XK4CXFMH`, `01KZREPRKDH04Q5WPRVHHDTTTJ`,
+`01KZREPRKEF146YF6FQE6D412E`). Daemon stopped and pgrep-confirmed gone
+before teardown. Per spec §1's D9 observation, the closing stage
+(`20-register-or-edit`) declares an `evidence`-dispositioned output with
+no finalize step named — not a promotion blocker, recorded here rather
+than left implicit.
+
