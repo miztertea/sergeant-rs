@@ -116,6 +116,18 @@ remains an independence measure, not a cost measure ("multiplicity is not
 institutional independence"). Ruling record: R-S0-13 in
 `docs/gauntlet/contracts/S0.md`; first applied in the S1 phase-1 round 2.
 
+**Revision 2026-08-11 (owner direction, Cerberus handoff): Fable subagent
+seats are permitted when earned.** The escalation ladder stays Sonnet →
+Opus by earned need, and now extends one rung further: a Fable subagent
+seat where even Opus-grade judgment has measurably fallen short, on the
+same earned-need test. Separate context is the independence measure —
+a Fable critic grading Fable-orchestrated work is legal because blindness
+comes from fresh context, not model lineage (this narrows R-S0-13's
+"never fans out; there are no Fable subagents" clause, which had encoded
+cost discipline as an absolute). Unchanged: the orchestrator remains one
+seat holding program totality, is never a worker in its own loop, and
+most seats stay Sonnet.
+
 *Superseded table (M0–P1 era, for the record):*
 
 | Role | Model | Rationale |
