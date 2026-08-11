@@ -263,6 +263,15 @@ pub async fn start_with(
         KIND_DAEMON_STARTED,
         json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "endpoint": endpoint}),
     ))?;
+    // `core` is bare here — no `CoreGuard`, because nothing else can see it
+    // yet — so nothing makes this durable but an explicit flush (invariants
+    // round 2, INV-R2-01). Startup is the one path that performs unbounded,
+    // irreversible external effects (backend probes below, and recovery's
+    // `git worktree remove` / harness relaunch further down) with no client
+    // and no guard to fsync on drop; flushing after every commit that
+    // precedes such an effect keeps the "durable before it could have been
+    // observed" property `CoreGuard` gives every other path.
+    core.flush()?;
 
     // 4b. Register the real adapter alongside whatever the config supplied
     // (tests hand in scripted fakes; they keep them). It is added here, not
@@ -313,16 +322,26 @@ pub async fn start_with(
             }),
         ))?;
     }
+    // Same reasoning as the daemon.started flush above: durable before
+    // recovery starts acting on it (INV-R2-01).
+    core.flush()?;
 
     // 4c. Reconcile work believed in flight *before* serving (§25): no
     // request may observe — or act on — a work whose prior ownership has not
-    // yet been settled.
+    // yet been settled. `reconcile` itself flushes after each work it
+    // touches, so its own effects (a `git worktree remove`, a relaunched
+    // harness) are never left unsynced while unbounded — see its doc.
     let engine = Arc::new(Engine::new(
         backends,
         config.default_backend.clone(),
         data_dir,
     ));
     let reconciled = recovery::reconcile(&engine, &mut core)?;
+    // Backstop, not load-bearing: `reconcile` already leaves nothing open on
+    // its own account, but a future edit there that forgets a flush must not
+    // be able to publish the descriptor over an unsynced group. Free when
+    // the group is already empty.
+    core.flush()?;
     if !reconciled.resumed.is_empty()
         || !reconciled.blocked.is_empty()
         || !reconciled.surfaces_retired.is_empty()
