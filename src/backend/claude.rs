@@ -2811,8 +2811,29 @@ mod tests {
             child: Arc::new(Mutex::new(child)),
             stderr_rx: Some(rx),
         };
+        // Round-2 finding TH-R2-05: `reader.run` used to be called directly,
+        // in-thread. That leaves the bounded-half assertion below unable to
+        // fail cleanly against the one mutation it exists to catch —
+        // `recv_timeout(STDERR_DRAIN_BUDGET)` turned into an unbounded
+        // `recv()` — because the test harness has no per-test timeout, and
+        // an infinite block just hangs the run rather than failing it. Doing
+        // the read on its own thread and bounding *this* thread's wait with
+        // `recv_timeout` turns that hang back into an ordinary, named
+        // assertion failure.
         let started = std::time::Instant::now();
-        reader.run(stdout);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            reader.run(stdout);
+            let _ = done_tx.send(());
+        });
+        let watchdog = STDERR_DRAIN_BUDGET * 6;
+        if done_rx.recv_timeout(watchdog).is_err() {
+            panic!(
+                "reader.run did not return within {watchdog:?} — STDERR_DRAIN_BUDGET's \
+                 bound was not enforced (e.g. `recv_timeout` mutated to an unbounded \
+                 `recv()`), which used to hang this test forever instead of failing it"
+            );
+        }
         let elapsed = started.elapsed();
         assert!(
             elapsed >= STDERR_DRAIN_BUDGET,
