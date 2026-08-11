@@ -251,15 +251,44 @@ mod tests {
         }
 
         // Default's argv is empty — it is the CLI's own unflagged behavior,
-        // chosen explicitly — while every other mode carries the flag.
-        assert!(PermissionMode::Default.cli_args().is_empty());
-        assert_eq!(
-            PermissionMode::BypassPermissions.cli_args(),
-            vec![
-                "--permission-mode".to_string(),
-                "bypassPermissions".to_string()
-            ]
-        );
+        // chosen explicitly — while every other mode carries the flag with
+        // its own literal value. All five are asserted, not a subset: a
+        // typo in any one of `AcceptEdits`/`DontAsk`/`Plan`'s literal would
+        // reach the real CLI unmeasured otherwise (probe-confirmed: only
+        // `Default` and `BypassPermissions` were pinned here before).
+        for (mode, cli_value, expected_argv) in [
+            (PermissionMode::Default, "default", Vec::<&str>::new()),
+            (
+                PermissionMode::AcceptEdits,
+                "acceptEdits",
+                vec!["--permission-mode", "acceptEdits"],
+            ),
+            (
+                PermissionMode::BypassPermissions,
+                "bypassPermissions",
+                vec!["--permission-mode", "bypassPermissions"],
+            ),
+            (
+                PermissionMode::DontAsk,
+                "dontAsk",
+                vec!["--permission-mode", "dontAsk"],
+            ),
+            (
+                PermissionMode::Plan,
+                "plan",
+                vec!["--permission-mode", "plan"],
+            ),
+        ] {
+            assert_eq!(mode.as_cli_value(), cli_value, "{mode:?}'s display value");
+            assert_eq!(
+                mode.cli_args(),
+                expected_argv
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+                "{mode:?}'s argv"
+            );
+        }
 
         let mut bad = unspecified;
         bad.options
