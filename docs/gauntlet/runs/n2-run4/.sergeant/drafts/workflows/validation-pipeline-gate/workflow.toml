@@ -1,0 +1,9 @@
+# validation-pipeline-gate — draft workflow candidate materialized by repo-to-icm's
+# 60-draft stage (N2 run, 21-partition corpus). status: draft in
+# index.md; this package has not been promoted to .sergeant/workflows/.
+# See provenance.md for the behavior_id evidence backing each stage.
+
+[workflow]
+name = "validation-pipeline-gate"
+version = "1"
+stages = ["01-launch-validation-run", "02-drive-gate-findings", "03-recover-from-interrupted-run", "04-declare-readiness", "05-acquire-launch-reservation", "06-choose-intent-transport", "07-transfer-ownership", "08-rollback-on-launch-failure", "09-verify-intent-consistency", "10-reset-retryable-state", "11-create-isolated-snapshot", "12-check-coordinator-liveness", "13-publish-worker-readiness-handshake", "14-monitor-active-run"]

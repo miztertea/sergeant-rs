@@ -1,0 +1,9 @@
+# sergeant-setup — draft workflow candidate materialized by repo-to-icm's
+# 60-draft stage (N2 run, 21-partition corpus). status: draft in
+# index.md; this package has not been promoted to .sergeant/workflows/.
+# See provenance.md for the behavior_id evidence backing each stage.
+
+[workflow]
+name = "sergeant-setup"
+version = "1"
+stages = ["01-run-checklist", "02-phase1-detect-prerequisites", "03-phase2-install-checkout", "04-phase3-global-config", "05-phase4-new-project-interview", "06-phase5-repair-project-yaml", "07-phase6-verify-installation", "08-phase7-task-tracker-init", "09-phase8-treehouse-init", "10-phase9-graphify-init"]
