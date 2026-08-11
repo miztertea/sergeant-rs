@@ -34,6 +34,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
 | `sergeant-help` | published | [`workflows/sergeant-help/index.md`](workflows/sergeant-help/index.md) |
 | `sergeant-setup` | published | [`workflows/sergeant-setup/index.md`](workflows/sergeant-setup/index.md) |
+| `task-intake-and-route` | published | [`workflows/task-intake-and-route/index.md`](workflows/task-intake-and-route/index.md) |
 | `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 | `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
 | `to-tickets` | published | [`workflows/to-tickets/index.md`](workflows/to-tickets/index.md) |
