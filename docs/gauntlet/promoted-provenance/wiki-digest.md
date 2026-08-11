@@ -44,3 +44,7 @@ This is the sweep's clearest illustration of finding N1-BH-02: a linear script p
 ## Notes
 
 **Synthesis notes:** P5's `wiki` and P6's `wiki-daily-digest` are the same procedure (conflict X9b) and are folded together here.
+
+## Promotion note (docs/icm/promotion-spec-2026-08-11.md §1)
+
+This package declares a `promote` output disposition (`00-inspect-preview/output/README.md`) with no finalize step at its closing (and only) stage — one of the 30 of 34 N1 packages in that shape, not one of the 3 (`drain-fleet`, `respond-to-worker`, `to-spec`) that name one. Recorded here per the spec's finalize-gap rule rather than silently promoted; disposition on whether this package needs a finalize step is left to human review at merge time, not applied mechanically by this curation act.
