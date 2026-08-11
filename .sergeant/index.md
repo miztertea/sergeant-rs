@@ -23,6 +23,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
 | `respond-to-worker` | published | [`workflows/respond-to-worker/index.md`](workflows/respond-to-worker/index.md) |
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
+| `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 
 `.sergeant/drafts/workflows/` holds generated, human-reviewable candidates —
 never admitted procedure, never listed here (`docs/icm/convention.md` §2).
