@@ -10,7 +10,15 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 
 | Workflow | Status | Index |
 |---|---|---|
+| `code-review` | published | [`workflows/code-review/index.md`](workflows/code-review/index.md) |
+| `deepen-module` | published | [`workflows/deepen-module/index.md`](workflows/deepen-module/index.md) |
+| `diagnose-bug` | published | [`workflows/diagnose-bug/index.md`](workflows/diagnose-bug/index.md) |
+| `drain-fleet` | published | [`workflows/drain-fleet/index.md`](workflows/drain-fleet/index.md) |
+| `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
+| `recover-stalled-worker` | published | [`workflows/recover-stalled-worker/index.md`](workflows/recover-stalled-worker/index.md) |
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
+| `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
+| `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
 
 `.sergeant/drafts/workflows/` holds generated, human-reviewable candidates —
 never admitted procedure, never listed here (`docs/icm/convention.md` §2).

@@ -1,0 +1,18 @@
+# drain-fleet — admitted workflow (N1 reference corpus,
+# docs/gauntlet/contracts/N1.md; candidate W12,
+# reference-corpus/synthesis.md §1). A cooperative, bounded,
+# non-destructive admission block: refuse new work without terminating
+# anything already running.
+#
+# One actor stage (§6.4, judgment); N1 adjudication A4 folded four
+# deterministic-machinery stages (00-set-drain, 10-await-convergence,
+# 20-worker-side-checkpoint, 40-undrain) into it as ordered helper
+# invocations — no engine change, no behavior unit dropped. Promoted per
+# docs/icm/promotion-spec-2026-08-11.md; behavior-unit citations and the
+# full adjudication record are archived at
+# docs/gauntlet/promoted-provenance/drain-fleet.md.
+
+[workflow]
+name = "drain-fleet"
+version = "2"
+stages = ["30-force-stop"]
