@@ -111,15 +111,15 @@ text below stands as the argument record.
   reconstructed tmux-era supervision; the settled D7/B1/#131-class
   machinery.
 
-## Gaps the record must close (owned by the waves above)
+## Gaps the record must close (owned by the MVP plan's buckets)
 
 Install path, Work-vs-inline routing judgment (OS-owned), per-repo
 instruction contract, the recursion proof (self-hosting measured, not
 pledged), cross-repo Work spanning estate entries (the central value
-claim — currently unimplemented and uncontracted; Wave 1 must produce
-its design ruling), soak evidence (#19), fake-backend timing fidelity,
-unsupervised-run safety envelope, backlog dedup scheme, estate trust
-model.
+claim — currently unimplemented and uncontracted; MVP-1's
+group-expansion ruling must produce its design), soak evidence (#19),
+fake-backend timing fidelity, unsupervised-run safety envelope, backlog
+dedup scheme, estate trust model.
 
 ## Rulings index
 

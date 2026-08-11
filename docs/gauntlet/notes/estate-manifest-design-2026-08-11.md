@@ -49,7 +49,7 @@ naming them and the remedy. What `local` translates to is **unmeasured**
 Per `[group.<name>]`: `repos` list (members must be declared repos,
 fail closed with remedy) + optional `brief`. Consumption:
 `sgt run "..." --group <name>` expands to the group's repos as Work
-scope — **[v2] provisional**, not settled: NORTH-STAR.md:116-118 still
+scope — **[v2] provisional**, not settled: NORTH-STAR.md's gaps section
 lists cross-repo Work "unimplemented and uncontracted" pending the
 group-expansion ruling MVP-1 owes. Until then membership needs no new
 surface: `--repo` is repeatable (`cli.rs:75-77`), so a harness reading
