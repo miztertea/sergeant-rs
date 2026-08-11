@@ -18,6 +18,7 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `direct-implementation` | published | [`workflows/direct-implementation/index.md`](workflows/direct-implementation/index.md) |
 | `dispatch` | published | [`workflows/dispatch/index.md`](workflows/dispatch/index.md) |
 | `drain-fleet` | published | [`workflows/drain-fleet/index.md`](workflows/drain-fleet/index.md) |
+| `grill-with-docs` | published | [`workflows/grill-with-docs/index.md`](workflows/grill-with-docs/index.md) |
 | `implement` | published | [`workflows/implement/index.md`](workflows/implement/index.md) |
 | `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
 | `monitor-fleet` | published | [`workflows/monitor-fleet/index.md`](workflows/monitor-fleet/index.md) |

@@ -61,3 +61,5 @@ N1 adjudication A4 (finding N1-BH-02, `reference-corpus/adjudication-round1.md`)
 
 **Standing constraints** (`BU-P1-016`, `BU-P1-007`, `BU-P1-107`, `BU-P8-055`): Direct-mode work always uses a feature branch and always opens a PR — never a direct push to the default branch. Direct mode requires an explicit user request and a single owning repository; it is not a way to avoid dispatch when the outcome genuinely spans repositories.
 
+**Promotion note (`docs/icm/promotion-spec-2026-08-11.md` §1):** the closing stage `06-pr-and-merge` declares a `promote`-disposition output (see its `output/README.md`) but this workflow, as authored, names no `scripts/finalize.py` or other deterministic finalize step at that stage — one of the 30 drafts D9 flags as an open, not-resolved question rather than a promotion blocker; disposition left to human review at merge time, per the spec.
+
