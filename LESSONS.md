@@ -6,6 +6,23 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L18 — R1's "already exists" includes the product you are building **[world-delta]**
+
+Cerberus day 2, 2026-08-11: the promoted library carried a whole family
+of packages (dispatch, respond-to-worker, wake-and-resume, the fleet
+suite) that re-describe what sergeant-rs itself does — upstream's manual
+protocols for the era before the daemon existed. Every classification
+pass had run the Ponytail ladder *within* artifacts (N1's A4 demoted 71
+over-staged items) while never placing the engine's own capability
+surface on the R1 shelf, so "does the binary already do this?" was
+never asked. A corpus decomposed from a predecessor must be rung
+against the successor's existing surface, and the successor keeps
+growing — the comparison list is a moving target that every future
+pass re-derives from the product, never from memory. The owner caught
+it from one package description; the fix (convention §2a bucket 4) cost
+a paragraph. The 10M-token library build did not catch it at any of
+its five review gates because no gate's brief included the engine.
+
 ## L17 — Stopping a coordinator does not stop its dispatched effects
 
 Cerberus session, 2026-08-11: the orchestrator stopped a workflow whose

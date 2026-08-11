@@ -249,6 +249,20 @@ class) remain workflows ONLY where the engine can hold their checkpoints
 open for a human (the E3 design item); until then their packages must
 say so.
 
+**4. Absorbed-by-engine (owner ruling, 2026-08-11, second amendment).**
+Before any of the three buckets above, every candidate passes the R1
+rung check *against the current product*: does sergeant-rs already do
+this? A package whose behavior the engine has subsumed (dispatch's
+work/worktree/brief/intent mechanics = `sgt run` + surfaces + journal;
+respond-to-worker = `sgt respond`; wake-and-resume = recovery + the
+settle driver) is neither workflow nor verb-to-build — it becomes
+engine documentation or retires with provenance preserved. The N1
+classification missed this class structurally: the Ponytail ladder was
+applied within packages (A4) but the engine itself was never on the R1
+shelf as existing functionality, because the corpus's subject predated
+the engine. Every future classification pass lists the engine's
+capability surface beside the candidates.
+
 ## 3. `AGENTS.md`: the small constitution
 
 `AGENTS.md` teaches a harness how to enter the Sergeant system and resolve
