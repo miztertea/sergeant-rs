@@ -2785,6 +2785,58 @@ fn the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown() {
     );
 }
 
+/// The daemon installs its shutdown-signal handlers **before** anything makes
+/// it reachable.
+///
+/// The two tests above both rest on "SIGTERM makes the daemon run its shutdown
+/// path", and that is only true once a handler exists: until then SIGTERM's
+/// default disposition applies and the kernel simply terminates the process —
+/// no `daemon.stopped`, a descriptor left pointing at a dead pid, nothing
+/// registered at exit run. `SpawnedDaemon::start` returns the instant the
+/// descriptor appears and its callers signal immediately, so every instruction
+/// between the descriptor write and the handler install is a window they can
+/// land in.
+///
+/// Measured, 2026-08-11 (Cerberus): the SIGTERM pin above failed with
+/// `status.signal() == Some(15)` on run 3 of 40 m6 runs executed against a
+/// concurrently running suite — killed *by* the signal, which is the exact
+/// failure the window produces. It is not a rig bug and no amount of retrying
+/// in the rig would fix it; the ordering is the fix.
+///
+/// Structural rather than behavioural on purpose. The behavioural witness is
+/// the flake itself, which is ~2.5% per run and therefore cannot be a gate;
+/// this reads the ordering directly, so a future edit that moves the install
+/// back after `start_with` fails here, deterministically, with the reason.
+#[test]
+fn the_daemon_installs_its_signal_handlers_before_it_publishes_anything() {
+    let source = code_only(&read_source("daemon.rs"));
+    let start = source
+        .find("pub async fn run_until_signal")
+        .expect("daemon.rs must declare `run_until_signal`");
+    let body = &source[start..block_end(&source, start)];
+    let install = body
+        .find("ShutdownSignals::install()")
+        .expect("run_until_signal must install its signal handlers");
+    let serving = body
+        .find("start_with(")
+        .expect("run_until_signal must start the daemon");
+    assert!(
+        install < serving,
+        "run_until_signal installs its shutdown handlers at byte {install} of its body \
+         and calls start_with at {serving}: every instruction in between is a window in \
+         which SIGTERM kills this daemon outright instead of shutting it down — and \
+         `start_with` publishes the runtime descriptor, which is precisely the thing \
+         clients wait for before they signal"
+    );
+    // …and the install must be the real registration, not a future nobody has
+    // polled: `ctrl_c()` registers SIGINT on first poll, which would put the
+    // handler back after the descriptor however early the call site sits.
+    assert!(
+        source.contains("SignalKind::interrupt()") && source.contains("SignalKind::terminate()"),
+        "both signals must be registered explicitly at install time"
+    );
+}
+
 // -------------------------------------------------- coverage-harness pins
 
 /// `scripts/coverage/` grades the S1 baseline; something has to grade it.

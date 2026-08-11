@@ -594,6 +594,24 @@ async fn export_events(
 /// This is the one place §28 export is configured from the environment, and
 /// [`TelemetryConfig::from_env`] answers "off" unless explicitly switched on.
 pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
+    // **Handlers first, before anything makes this daemon reachable.**
+    //
+    // Publishing the runtime descriptor is what tells the world "there is a
+    // daemon here"; clients and test rigs alike wait for exactly that file and
+    // then start acting. Until a SIGTERM handler is installed, SIGTERM's
+    // default disposition applies and the process is simply terminated —
+    // nothing journals `daemon.stopped`, the descriptor is left pointing at a
+    // dead pid, and nothing registered at exit runs. Installing after
+    // `start_with` left that window open from the descriptor write to here.
+    //
+    // Measured, 2026-08-11 (Cerberus): m6's
+    // `the_spawned_daemon_rig_stops_its_daemon_with_sigterm` failed with
+    // `status.signal() == Some(15)` — killed *by* the signal — on run 3 of 40
+    // m6 runs executed against a concurrently running suite. The rig returns
+    // the instant the descriptor appears and signals immediately, so it lands
+    // in that window whenever the scheduler lets it. The window predates the
+    // completion driver, and the driver's spawn is more work inside it.
+    let mut shutdown = ShutdownSignals::install();
     let telemetry_config = TelemetryConfig::from_env();
     let telemetry = Telemetry::from_config(&telemetry_config)?.map(Arc::new);
     if telemetry.is_some() {
@@ -611,7 +629,7 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
     )
     .await?;
     tracing::info!(endpoint = %handle.endpoint, data_dir = %data_dir.display(), "daemon serving");
-    wait_for_shutdown_signal().await;
+    shutdown.recv().await;
     tracing::info!("shutdown signal received");
     handle.shutdown().await;
     if let Some(telemetry) = telemetry {
@@ -620,26 +638,59 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
     Ok(())
 }
 
-/// Resolve on SIGINT (Ctrl-C) or, on Unix, SIGTERM.
-async fn wait_for_shutdown_signal() {
+/// Installed shutdown-signal handlers: SIGINT (Ctrl-C) and, on Unix, SIGTERM.
+///
+/// Split from the waiting so the *installation* can happen before the daemon
+/// publishes anything — see [`run_until_signal`]'s first lines for the
+/// measurement that made the ordering load-bearing. Constructing this
+/// registers the handlers; delivery is queued from that moment, so a signal
+/// that arrives during startup is still delivered to [`Self::recv`] later
+/// rather than terminating the process.
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(term) => term,
-                Err(e) => {
-                    tracing::error!(error = %e, "cannot install SIGTERM handler");
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
+    unix: Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+}
+
+impl ShutdownSignals {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            // Both explicitly, rather than leaning on `ctrl_c()`: that helper
+            // registers SIGINT when its future is first polled, which is the
+            // very thing this type exists to move earlier.
+            let unix = match (
+                signal(SignalKind::interrupt()),
+                signal(SignalKind::terminate()),
+            ) {
+                (Ok(interrupt), Ok(terminate)) => Some((interrupt, terminate)),
+                (interrupt, terminate) => {
+                    let e = interrupt.err().or(terminate.err());
+                    tracing::error!(
+                        error = ?e,
+                        "cannot install shutdown signal handlers; falling back to ctrl_c"
+                    );
+                    None
                 }
             };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            Self { unix }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
+
+    /// Resolve on the first shutdown signal delivered since installation.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        if let Some((interrupt, terminate)) = self.unix.as_mut() {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
         let _ = tokio::signal::ctrl_c().await;
     }
 }
