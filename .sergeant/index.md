@@ -11,8 +11,10 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | Workflow | Status | Index |
 |---|---|---|
 | `code-review` | published | [`workflows/code-review/index.md`](workflows/code-review/index.md) |
+| `cross-repo-work` | published | [`workflows/cross-repo-work/index.md`](workflows/cross-repo-work/index.md) |
 | `deepen-module` | published | [`workflows/deepen-module/index.md`](workflows/deepen-module/index.md) |
 | `diagnose-bug` | published | [`workflows/diagnose-bug/index.md`](workflows/diagnose-bug/index.md) |
+| `direct-implementation` | published | [`workflows/direct-implementation/index.md`](workflows/direct-implementation/index.md) |
 | `drain-fleet` | published | [`workflows/drain-fleet/index.md`](workflows/drain-fleet/index.md) |
 | `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
 | `monitor-fleet` | published | [`workflows/monitor-fleet/index.md`](workflows/monitor-fleet/index.md) |
@@ -25,8 +27,8 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `resolving-merge-conflicts` | published | [`workflows/resolving-merge-conflicts/index.md`](workflows/resolving-merge-conflicts/index.md) |
 | `respond-to-worker` | published | [`workflows/respond-to-worker/index.md`](workflows/respond-to-worker/index.md) |
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
+| `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 | `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
-| `vet-external-skill` | published | [`workflows/vet-external-skill/index.md`](workflows/vet-external-skill/index.md) |
 
 `.sergeant/drafts/workflows/` holds generated, human-reviewable candidates —
 never admitted procedure, never listed here (`docs/icm/convention.md` §2).
