@@ -1,5 +1,29 @@
 # U-series scope draft — 2026-08-11
 
+## Adjudicated during the grill (owner rulings, 2026-08-11)
+
+- **U-R1 — the clone IS the distro.** The sergeant-rs development repo
+  doubles as the AgentOS estate root for now (upstream doctrine: "the
+  cloned repo is the distro"); clean-distro extraction becomes a named
+  later milestone once the OS layer stabilizes. Once the core is built,
+  most development IS skills/workflows/helpers — content, not code.
+- **U-R2 — nothing of ours lives at `~/`.** The estate is self-contained:
+  tracked (AGENTS.md, skills, workflows, estate/repos manifest, helpers);
+  in-estate but gitignored machine-local truth (`.sergeant/data/` —
+  journal, blobs, surfaces, daemon.lock — and the `repos/` mounts, each
+  an independent clone). The current `~/.local/share/sergeant` XDG
+  default (src/cli.rs:225) is an unexamined M-era habit: U flips the
+  default to estate-root-resolved `.sergeant/data/` with
+  `SGT_DATA_DIR`/`--data-dir` as overrides. Upstream's `~/.config`
+  registry and `~/Dev` conventions were never implemented and are not
+  adopted.
+- **U-R3 — self-hosting starts now.** Development work that fits a
+  surviving workflow runs as a sergeant work from here on (research,
+  diagnose-bug, code-review, validate-and-ship lanes); multi-agent
+  gauntlet fan-outs stay harness-side until the composition question
+  earns an answer (N2's adjudicated non-gap stands). Friction found
+  while self-hosting feeds the E-list.
+
 Draft for owner adjudication, not a contract. Consolidates today's two
 Cerberus deliverables — the execution-surface re-triage
 (`docs/icm/retriage-2026-08-11.md`) plus the absorbed-by-engine sweep run
