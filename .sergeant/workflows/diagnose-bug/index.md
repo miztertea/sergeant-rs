@@ -1,0 +1,24 @@
+---
+kind: workflow
+name: diagnose-bug
+status: published
+version: 1
+description: >-
+  Reproduce, isolate, prove, remediate and verify a defect.
+tags:
+  - debugging
+  - defect
+  - investigation
+---
+
+# Diagnose Bug
+
+Six-stage actor-only workflow (N1 reference corpus,
+`docs/gauntlet/contracts/N1.md`, candidate **W20**) that reproduces,
+isolates, proves, remediates and verifies a defect. Use when: "Diagnose"/
+"debug this", or something reported broken, throwing, failing, slow.
+
+See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
+pinned stage order. Curated for promotion per
+`docs/icm/promotion-spec-2026-08-11.md`; the full behavior-unit citations
+live in the archived `docs/gauntlet/promoted-provenance/diagnose-bug.md`.

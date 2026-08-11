@@ -15,8 +15,8 @@ citation discipline is `../_config/evidence-policy.md`'s job to state and
 966-unit-corpus-scale hash verification is out of scope for a per-package
 structural pass).
 
-TWO MODES
----------
+THREE MODES
+-----------
     python3 validate-structure.py
         Validates THIS workflow's own tree (the parent of `scripts/`) —
         an ADMITTED package: index.md status must be `published`, and the
@@ -29,6 +29,19 @@ TWO MODES
         `.sergeant/drafts/workflows/<candidate>/`. index.md status must be
         `draft`, the tree must live under `.sergeant/drafts/workflows/`,
         and (draft-only) every workflow/stage must carry provenance.
+
+    python3 validate-structure.py --admitted PATH
+        Validates the workflow package at PATH as an ADMITTED package —
+        added so a curator can structure-validate any already-promoted
+        package under `.sergeant/workflows/<name>/`, not only this
+        workflow's own tree (originally the only admitted-mode target;
+        promotion-spec-2026-08-11.md's curators had no admitted-by-path
+        mode to run, which is why "structure-validate each" was done by
+        direct scan instead of this tool — see that spec's own F6 record).
+        Same checks as the no-arg form (S1/S7/S14 in admitted framing);
+        S15 (finalize-evidence-guard) only runs when PATH actually ships
+        its own `scripts/finalize.py` — most promoted packages correctly
+        have none (promotion-spec §1 item 7) and are not penalized for it.
 
 Independent of which single tree is named above, this script also runs one
 repository-wide check — "no draft is accidentally placed in
@@ -58,10 +71,10 @@ CHECKS (§9.7, "The initial validator ... should check")
   S11 a stage `output/README.md` that declares an expected artifact also
       declares a disposition for it (docs/icm/convention.md §1a, D9:
       "every declared output carries a disposition")
-  S12 if any stage declares an output artifact, the workflow's closing
-      stage's own CONTEXT.md names a finalize step (docs/icm/convention.md
-      §1a, D9: "a workflow that declares any output ends with a
-      deterministic finalize step")
+  S12 (WARNING, not fatal — see below) if any stage declares an output
+      artifact, the workflow's closing stage's own CONTEXT.md names a
+      finalize step (docs/icm/convention.md §1a, D9: "a workflow that
+      declares any output ends with a deterministic finalize step")
   S13 `version` is a bare integer (never a quoted string) in both
       `index.md` front matter and `workflow.toml`, and the two agree
       (record-shapes.md §1: "a monotonically increasing integer")
@@ -74,9 +87,14 @@ CHECKS (§9.7, "The initial validator ... should check")
       meaningful for this workflow's own tree, since drafts never carry a
       `finalize.py` of their own.
 
-Exit 0 iff clean. Stdlib only, except S15, which shells out to `git` inside
-a temp directory (never this checkout) via
-`scripts/test-finalize-evidence-guard.py`.
+Exit 0 iff no ERRORS (S12 is a WARNING: convention.md §1a lists D9 under
+"Open questions (recorded, not resolved)", not its numbered Rules, and
+promotion-spec-2026-08-11.md §1 rules explicitly that D9 "is not, on the
+convention's own text, a promotion blocker" — so this validator surfaces
+S12 for human review without failing the gate on it, matching S8/S14/S15's
+existing precedent of not applying every check in every mode uniformly).
+Stdlib only, except S15, which shells out to `git` inside a temp directory
+(never this checkout) via `scripts/test-finalize-evidence-guard.py`.
 """
 
 import os
@@ -94,9 +112,13 @@ FRONTMATTER_RE = re.compile(r"^---\n(.*?\n)---\n", re.DOTALL)
 class Lint:
     def __init__(self):
         self.errors = []
+        self.warnings = []
 
     def fail(self, code, msg):
         self.errors.append(f"[{code}] {msg}")
+
+    def warn(self, code, msg):
+        self.warnings.append(f"[{code}] {msg}")
 
 
 def find_repo_root(start):
@@ -447,10 +469,15 @@ def check_dispositions(lint, pkg_dir, pkg_name, stages):
 
 
 def check_finalize_step(lint, pkg_dir, pkg_name, stages):
-    """S12: if any stage declares an output artifact, the workflow's
-    closing (last-in-order) stage's own CONTEXT.md MUST name a finalize
-    step (docs/icm/convention.md §1a, D9: "a workflow that declares any
-    output ends with a deterministic finalize step"). This only checks
+    """S12 (WARNING, not fatal): if any stage declares an output artifact,
+    the workflow's closing (last-in-order) stage's own CONTEXT.md SHOULD
+    name a finalize step (docs/icm/convention.md §1a, D9: "a workflow that
+    declares any output ends with a deterministic finalize step"). D9 sits
+    under convention.md §1a's "Open questions (recorded, not resolved)"
+    heading, not its numbered Rules, so this is reported via `lint.warn`
+    (surfaced, does not fail the gate) rather than `lint.fail` — hard-
+    failing an explicitly-unresolved question would make this validator
+    stricter than the convention it validates against. This only checks
     that a finalize step is *named*, not that it runs correctly — the
     actor's own judgment governs the helper's result (convention.md §5)."""
     if not stages:
@@ -472,7 +499,7 @@ def check_finalize_step(lint, pkg_dir, pkg_name, stages):
     with open(last_context, encoding="utf-8") as f:
         text = f.read()
     if "finalize" not in text.lower():
-        lint.fail("S12", f"{pkg_name}: outputs are declared but the closing stage `{last_stage}` names no finalize step (docs/icm/convention.md §1a, D9)")
+        lint.warn("S12", f"{pkg_name}: outputs are declared but the closing stage `{last_stage}` names no finalize step (docs/icm/convention.md §1a, D9 — open question, not a blocker per promotion-spec-2026-08-11.md §1)")
 
 
 def check_root_catalog(lint, pkg_name, repo_root, mode):
@@ -493,17 +520,26 @@ def check_root_catalog(lint, pkg_name, repo_root, mode):
 
 
 def check_finalize_evidence_guard(lint, pkg_dir, pkg_name, mode):
-    """S15 (admitted mode only): `scripts/finalize.py`'s evidence-
-    preservation guard (GP-5b) is proven, not assumed — run
+    """S15 (admitted mode only, and only when the package ships its own
+    `scripts/finalize.py`): `scripts/finalize.py`'s evidence-preservation
+    guard (GP-5b) is proven, not assumed — run
     `scripts/test-finalize-evidence-guard.py` (a disposable git-sandbox
     test, touches nothing under `pkg_dir`) and fail lint if it does not
     exit 0. Skipped for draft candidates: a generated package never carries
-    its own `finalize.py`, so there is nothing this check could exercise."""
+    its own `finalize.py`, so there is nothing this check could exercise.
+    Also skipped for an admitted package that legitimately has no
+    `scripts/finalize.py` of its own (promotion-spec-2026-08-11.md §1 item
+    7: scripts/ is carried across only where a draft already had one, never
+    speculatively added) — this check is only meaningful where a finalize
+    helper actually exists to verify, which today is `repo-to-icm` alone."""
     if mode != "admitted":
+        return
+    finalize_script = os.path.join(pkg_dir, "scripts", "finalize.py")
+    if not os.path.isfile(finalize_script):
         return
     test_script = os.path.join(pkg_dir, "scripts", "test-finalize-evidence-guard.py")
     if not os.path.isfile(test_script):
-        lint.fail("S15", f"{pkg_name}: scripts/test-finalize-evidence-guard.py not found — the evidence-preservation guard (GP-5b) is unverified")
+        lint.fail("S15", f"{pkg_name}: scripts/finalize.py exists but scripts/test-finalize-evidence-guard.py not found — the evidence-preservation guard (GP-5b) is unverified")
         return
     try:
         r = subprocess.run(
@@ -640,15 +676,21 @@ def validate(pkg_dir, mode, repo_root, lint):
 
 
 def main():
-    if len(sys.argv) > 2:
-        print("usage: validate-structure.py [PATH]", file=sys.stderr)
+    argv = sys.argv[1:]
+    admitted_flag = "--admitted" in argv
+    positional = [a for a in argv if a != "--admitted"]
+    if len(positional) > 1:
+        print("usage: validate-structure.py [--admitted] [PATH]", file=sys.stderr)
         return 2
 
     lint = Lint()
 
-    if len(sys.argv) == 2:
-        target = os.path.abspath(sys.argv[1])
-        mode = "draft"
+    if positional:
+        target = os.path.abspath(positional[0])
+        # PATH with --admitted validates an already-promoted package as
+        # admitted (see THREE MODES above); PATH alone is the original
+        # generated-draft mode.
+        mode = "admitted" if admitted_flag else "draft"
     else:
         target = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         mode = "admitted"
@@ -665,6 +707,12 @@ def main():
     print(f"validated: {target}  (mode={mode})")
     print(f"engine-gap records checked: {n_gap}")
     print()
+
+    if lint.warnings:
+        print(f"WARN: {len(lint.warnings)} non-blocking finding(s)\n")
+        for w in lint.warnings:
+            print(" -", w)
+        print()
 
     if lint.errors:
         print(f"FAIL: {len(lint.errors)} defect(s) found\n")

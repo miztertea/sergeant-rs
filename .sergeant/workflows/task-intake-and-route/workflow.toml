@@ -1,0 +1,19 @@
+# task-intake-and-route — admitted workflow (N1, docs/gauntlet/contracts/
+# N1.md; candidate W5, reference-corpus/synthesis.md §1). The standing
+# entry procedure every task passes through before any implementation
+# workflow starts: it turns a user request into a chosen, scoped execution
+# mode.
+#
+# Six actor stages. N1 adjudication A4 folded the original nine
+# (mirroring AGENTS.md's nine numbered steps) down to six: 02-check-queue,
+# 04-reconcile-state, and 07-monitor demote and fold forward as helper
+# invocations into 03-choose-mode, 05-confirm-decisions, and
+# 08-handle-decisions respectively. Full behavior-unit citations and the
+# adjudication record now live at
+# docs/gauntlet/promoted-provenance/task-intake-and-route.md
+# (docs/icm/promotion-spec-2026-08-11.md).
+
+[workflow]
+name = "task-intake-and-route"
+version = "2"
+stages = ["01-load-context", "03-choose-mode", "05-confirm-decisions", "06-execute", "08-handle-decisions", "09-reconcile-deliver"]

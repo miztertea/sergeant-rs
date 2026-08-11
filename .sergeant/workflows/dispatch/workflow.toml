@@ -1,0 +1,20 @@
+# dispatch — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# candidate W8). Given a project, a brief or tracked task, and a
+# repository set, produces one durable task with an isolated work surface,
+# a rendered mission brief, and a running agent per repository — with
+# every side effect validated and gated before the next repository's
+# dispatch begins. Promoted per docs/icm/promotion-spec-2026-08-11.md;
+# full behavior-unit citation trail archived at
+# docs/gauntlet/promoted-provenance/dispatch.md.
+#
+# Six ordinary actor stages (N1 adjudication A4 folded six deterministic
+# helper stages into 15-check-admission and 80-monitor; see the archived
+# provenance for the full fold record). `15-check-admission` delegates to
+# drain-fleet; `80-monitor` delegates to respond-to-worker (both already
+# published in this library). Stage order here is authoritative; the
+# directory listing under this workflow's own tree must agree with it.
+
+[workflow]
+name = "dispatch"
+version = "2"
+stages = ["00-check-queue-and-plan", "05-classify-risk", "15-check-admission", "20-prepare-intent", "80-monitor", "90-reconcile-fleet"]
