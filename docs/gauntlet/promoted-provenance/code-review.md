@@ -43,6 +43,13 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P2-017` | The aggregated report ends with a one-line summary of total findings per axis and the worst issue within each axis, without picking one overall winner across axes. | `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (Step 5: Aggregate, lines 80-80) |
 | `BU-P2-018` | The two-axis design exists because a change can pass one axis and fail the other (standards-compliant but spec-wrong, or spec-correct but convention-breaking), and reporting them separately stops either axis from masking the other's failure. | `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (Why two axes, lines 84-87) |
 
+**Curation note (promotion, 2026-08-11):** `40-aggregate` is this workflow's
+true closing stage and declares a `promote` output (its `output/README.md`)
+with no finalize step — one of the 30 corpus packages in that shape per
+`docs/icm/promotion-spec-2026-08-11.md` §1's D9 observation. Not a
+promotion blocker (D9 is an open question, not a numbered rule); recorded
+here rather than silently laundered, disposition left to human review.
+
 ## Notes
 
 **Synthesis notes:** The two-axis separation is the durable design point (BU-P2-018), not the sub-agent mechanism that happens to isolate the two reviews from each other.
