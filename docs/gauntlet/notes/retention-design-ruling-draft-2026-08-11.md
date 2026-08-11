@@ -1,12 +1,17 @@
-# Retention design ruling — DRAFT for owner adjudication (R-N0-3's gate)
+# Retention design ruling — ADJUDICATED 2026-08-11 (R-N0-3's gate satisfied)
 
-Status: **draft, not adjudicated.** R-N0-3 forbids writing the N4 contract
-without a retention design ruling on #17 (journal/blob/DuckDB growth) and
-#4 (terminal-work RSS). This is that ruling, proposed; the owner accepts,
-amends, or rejects each rule before N4 is drawn. Written on Cerberus
-2026-08-11 against #17/#4's measured record (P1-PERF 2026-08-10) — the
-Cerberus perf re-baseline was in flight when drafting began; its numbers
-land beside the container's in the final version if they move a bound.
+Status: **adjudicated.** Owner rulings 2026-08-11 (same-day session,
+recorded verbatim in intent): Rule A accepted; Rule B accepted with the
+measurement-vehicle clarification and the fake-backend fidelity review
+queued to the H-series (H0 packet); Rule C accepted AS AMENDED below —
+the rebuild-time trigger is the binding one, the design ladder when it
+fires is compress-cold-segments-first (R2) before any snapshot machinery
+(R7), and the 20 GiB disk figure is demoted to a blob-store backstop
+(measured arithmetic: at ~549 B/event the journal needs ~39M events to
+reach 20 GiB; run 4 — the largest run ever — wrote 186 kB; the realistic
+disk driver is blobs, not journal text). R-N0-3's precondition on the N4
+contract is hereby met. Original draft text below, amended in place where
+the rulings changed it.
 
 The shape R-N0-3 licenses: a ruling may be "measured budget X, GC deferred
 again with trigger Y" — silence is the only illegal state. Each rule below
@@ -39,7 +44,13 @@ Execute stages (N4's addition) stream arbitrary logs into the blob store —
 
 - N4's own contract tests **measure** per-execute-stage blob cost under a
   1 GiB log capture (the §22.8 budget already binds peak RSS; this adds
-  the disk-cost measurement beside it).
+  the disk-cost measurement beside it). **Adjudication clarification:**
+  the measurement vehicle is the real local Docker engine with a
+  Sergeant-built probe image (deterministic, token-free), NOT the fake
+  backend — the fake stands in for actor stages only. The same exchange
+  surfaced that the fake backend's fidelity gap (it settles turns at
+  launch — the blindness that hid #46) needs its own review; queued in
+  the H0 packet.
 - `sgt doctor` grows the disk-pressure check #17 itself asks for (#23
   folded in here, its trigger fired): data-dir size, blob-store share,
   free-space headroom, growth since last daemon start. Visibility, not
@@ -52,7 +63,20 @@ Execute stages (N4's addition) stream arbitrary logs into the blob store —
   mark-sweep from journal refs; nothing in N4 may make that harder
   (acceptance: no blob written without a journal ref that names it).
 
-## Rule C — journal segment archival: deferred; its real prerequisite is B1's dormant snapshot design (R1 defer, trigger re-armed)
+## Rule C — journal segment archival: deferred (AMENDED at adjudication: rebuild-time trigger binding; compress-first ladder; 20 GiB → blob backstop)
+
+**Owner amendment 2026-08-11:** the binding trigger is measured
+rebuild-on-start exceeding 30 s (at Cerberus's 54.6k events/s that is
+~1.6M events — reachable; the 20 GiB journal figure is not, at ~39M
+events, and is demoted to a blob-store backstop under Rule B). When the
+trigger fires, the design contract's ladder is pre-committed: (1)
+compress cold segments in place (R2 — segments already rotate at
+~8.4 MB; text compresses ~10×; replay decompresses; no identity-binding
+machinery), and only if compression cannot hold the line, (2) the
+snapshot/truncate design (R7, B1's dormant machinery, which stays
+dormant until then). Original draft rationale follows.
+
+### (original draft text)
 
 Segments interleave works, so archiving "old" segments while rebuild-on-
 start replays the full journal is a contradiction — segment retirement

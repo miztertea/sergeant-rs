@@ -58,6 +58,16 @@ withdrawal) already proved two of its generic requirements live.
   capability lifecycle vocabulary; it is L1/L8 formalized and matches
   the runtime-withdrawal machinery the adapter already has.
 
+- **R-H0-7 (added at the retention adjudication, owner-raised): fake
+  backend fidelity review.** The in-process fake settles turns inside
+  the launch effect — the exact blindness that hid #46 for a 352-test
+  suite — and models none of the shapes the research says are coming
+  (deferred turn end, persistent sessions, event-driven arrival, typed
+  interactions). Ruling to make: the H-series contract that lands
+  backend contract v2 must extend the fake backend to script those
+  shapes (deferred-finish at minimum), so the deterministic suite can
+  express the failure modes the real harnesses actually have.
+
 ## The admission suite (skeleton for the first H contract)
 
 Per candidate transport, in cost order: (1) token-free surface scan
