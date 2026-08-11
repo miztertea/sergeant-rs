@@ -1369,8 +1369,14 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     // is committed after the out-of-lock spawn returns, and the adapter's
     // committer thread journals `conversation.user` from its own hold, so
     // neither is guaranteed durable at the instant the work view shows the
-    // new stage. Both markers present is the quiet point — the cascaded turn
-    // itself is parked at the (unreleased) gate and cannot emit a byte.
+    // new stage. Turn 1's tail must have landed too: the reader marks the
+    // turn `Finished` in adapter memory *before* emitting
+    // `conversation.turn.ended`/`usage.updated`, so the driver can settle
+    // and cascade while those two are still in the committer channel — the
+    // quiet point requires all four markers. The cascaded turn itself is
+    // parked at the (unreleased) gate and cannot emit a byte, and the
+    // committer channel is FIFO, so nothing of turn 1's can trail past its
+    // own `usage.updated`.
     let deadline = Instant::now() + SETTLE_BUDGET;
     let events = loop {
         let events = events_over_api(&http, &handle, &work_id).await;
@@ -1381,7 +1387,9 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
             .iter()
             .filter(|e| e.kind == "conversation.user")
             .count();
-        if cascade_started && user_turns >= 2 {
+        let turn_tail_landed = events.iter().any(|e| e.kind == "conversation.turn.ended")
+            && events.iter().any(|e| e.kind == "usage.updated");
+        if cascade_started && user_turns >= 2 && turn_tail_landed {
             break events;
         }
         assert!(
