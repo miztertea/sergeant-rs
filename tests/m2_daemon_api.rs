@@ -3194,6 +3194,97 @@ async fn t11d_a_stalled_completion_driver_does_not_hold_shutdown_open() {
     );
 }
 
+/// INV-3 / probe-survivor finding (BS2): t11d above pins that a stalled
+/// driver does not hold shutdown open and that `daemon.stopped` still gets
+/// written — but it never lets the driver actually *finish* anything, so
+/// moving the bounded join to *after* `daemon.stopped` (defeating the
+/// ordering `src/daemon.rs`'s comment argues for) would still pass it. This
+/// releases the gate with the execution reprogrammed to complete, so the
+/// driver has real work to finish inside the grace window, and asserts
+/// `daemon.stopped` is the last event this daemon wrote — not merely that it
+/// exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
+    const SHUTDOWN_BUDGET: Duration = Duration::from_secs(9);
+
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3DRIVERFINISH";
+    seed_blocked_run(dir.path(), work_id);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+
+    fake.hold_observes();
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_observes(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(
+        parked,
+        "the completion driver never reached the observe gate — this test \
+         needs it stalled to mean anything"
+    );
+
+    // Unlike t11d: reprogram the execution to complete *before* releasing —
+    // so the observe the driver is parked inside, once released, hands back
+    // a real completion for it to settle, not another `Running` park.
+    fake.complete_live_executions();
+
+    let mut shutdown = tokio::spawn(async move {
+        let started = Instant::now();
+        handle.shutdown().await;
+        started.elapsed()
+    });
+    // Give the driver's held observe a moment to actually be the thing
+    // shutdown is waiting on before releasing it, matching t11d's ordering.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fake.release_observes();
+    let outcome = tokio::time::timeout(SHUTDOWN_BUDGET, &mut shutdown).await;
+    let elapsed = match outcome {
+        Ok(joined) => joined.expect("shutdown task"),
+        Err(_) => {
+            let _ = shutdown.await;
+            panic!(
+                "the daemon was still shutting down after {SHUTDOWN_BUDGET:?} even \
+                 with the driver's observe released and reprogrammed to complete"
+            );
+        }
+    };
+    eprintln!("driver completed a stage during shutdown: took {elapsed:?}");
+
+    let events = journal_events(dir.path());
+    let last = events.last().expect("at least one event");
+    assert_eq!(
+        last.kind,
+        "daemon.stopped",
+        "`daemon.stopped` must be the last event this daemon writes — a \
+         driver settle that finishes inside the shutdown grace must land \
+         before it, never after: {:?}",
+        events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "stage.completed" || e.kind == "work.completed"),
+        "the driver must have actually finished the stage it was parked in, \
+         or this test proves nothing about ordering: {:?}",
+        events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+}
+
 // ------------------------------------- the throughput floor, as a guard
 //
 // N3-10: adjudication A-N3-1 amended the burst-50 floor to ">=24 works/s with
