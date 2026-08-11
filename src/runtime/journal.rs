@@ -697,6 +697,42 @@ mod tests {
         const O_DIRECT: i32 = 0o0040000;
 
         let dir = tempfile::TempDir::new().expect("tempdir");
+
+        // The injection below is only expressible where the kernel/filesystem
+        // actually REFUSES unaligned O_DIRECT writes. tmpfs refuses the open
+        // outright, and some environments (GitHub Actions' runner filesystem —
+        // measured 2026-08-11, CI run 31447702864 on d72c017) accept the
+        // unaligned write. Probe first and skip honestly in both cases rather
+        // than asserting an environment fact this host does not exhibit.
+        {
+            use std::io::Write as _;
+            let probe_path = dir.path().join("odirect-probe");
+            fs::write(&probe_path, b"x").expect("seed the probe file");
+            match OpenOptions::new()
+                .append(true)
+                .custom_flags(O_DIRECT)
+                .open(&probe_path)
+            {
+                Err(_) => {
+                    eprintln!(
+                        "skipping: this filesystem refuses O_DIRECT open \
+                         (tmpfs?); the failure injection is not expressible here"
+                    );
+                    return;
+                }
+                Ok(mut probe) => {
+                    if probe.write_all(b"unaligned").is_ok() {
+                        eprintln!(
+                            "skipping: this filesystem accepts unaligned \
+                             O_DIRECT writes; the failure injection is not \
+                             expressible here"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
         let mut journal = Journal::open(dir.path()).expect("open");
         journal.append(draft(1)).expect("first append must succeed");
         let segment_path = dir
