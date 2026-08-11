@@ -2639,24 +2639,47 @@ fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
 /// and a genuinely worse failure than the per-append fsync this replaced.
 ///
 /// `CoreGuard::drop` cannot be forgotten; *acquiring the mutex another way*
-/// can. So the rule is structural, like t5 and t11 beside it: the strings
-/// `core.lock(` and `core.blocking_lock(` may appear only inside the two
-/// `CoreGuard` constructors. Anything else — production code, a handler
-/// added later, a test fixture — fails here with the call site printed.
+/// can. So the rule is structural, like t5 and t11 beside it: a `tokio::sync::Mutex`
+/// hold on the core — spelled `core.lock(`, `.blocking_lock(`, `.try_lock(`,
+/// `.lock_owned(`, `.try_lock_owned(` or `.blocking_lock_owned(` — may appear
+/// only inside the two `CoreGuard` constructors. Anything else — production
+/// code, a handler added later, a test fixture — fails here with the call
+/// site printed.
+///
+/// Round-2 findings INV-R2-04/TH-R2-04 closed two of this test's three
+/// coverage gaps: it now walks every file under `src/` (not a fixed list of
+/// six) and checks every lock-taking spelling `tokio::sync::Mutex` exposes,
+/// not just the two group-commit itself uses. The third — a receiver renamed
+/// away from `core` losing coverage entirely — is closed for the one shape
+/// that exists in this tree today: `daemon.rs` upgrades the sink's `Weak`
+/// reference into a local it calls `live` before acquiring through it
+/// (`let Some(live) = core.upgrade()`), so a bare `live.lock()` there would
+/// otherwise be invisible; every identifier bound from `core.upgrade()` is
+/// derived below and scanned as its own receiver, in the same file, for
+/// exactly that reason. A rename introduced *elsewhere* in a future edit
+/// (a new `Weak<Mutex<Core>>` clone under some other name, reached some
+/// other way) is still outside what a textual scan can promise — the honest
+/// residual, not a hidden one.
 #[test]
 fn t11c_every_core_lock_hold_ends_in_the_group_commit_guard() {
-    // Every module that can see the core at all. `web.rs`/`tui.rs`/`cli.rs`
-    // are listed not because they hold it today but because t5 exists to
-    // stop them starting: if one ever does, it must do it through the guard.
-    for module in [
-        "api.rs",
-        "daemon.rs",
-        "web.rs",
-        "tui.rs",
-        "cli.rs",
-        "telemetry.rs",
-    ] {
-        let source = code_only(&read_source(module));
+    let door_methods = [
+        ".lock(",
+        ".blocking_lock(",
+        ".try_lock(",
+        ".lock_owned(",
+        ".try_lock_owned(",
+        ".blocking_lock_owned(",
+    ];
+
+    let mut checked_api_rs = false;
+    for path in all_src_files() {
+        let module = path
+            .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .expect("under src/")
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let source = code_only(&std::fs::read_to_string(&path).expect("read source"));
+
         let allowed: Vec<(usize, usize)> = ["pub async fn acquire", "pub fn acquire_blocking"]
             .iter()
             .filter_map(|block| {
@@ -2671,21 +2694,103 @@ fn t11c_every_core_lock_hold_ends_in_the_group_commit_guard() {
                 "api.rs must declare both `CoreGuard` constructors — they are \
                  the only sanctioned way to take the core lock"
             );
+            checked_api_rs = true;
         }
-        for door in ["core.lock(", "core.blocking_lock("] {
-            for (index, _) in source.match_indices(door) {
-                assert!(
-                    allowed
-                        .iter()
-                        .any(|(start, end)| index > *start && index < *end),
-                    "src/{module} takes the core lock outside `CoreGuard`, so \
-                     that hold's appends are never fsynced or published at the \
-                     end of it (#44), near: {:?}",
-                    &source[index.saturating_sub(140)..(index + 60).min(source.len())]
-                );
+
+        // Every receiver that could hold the *core*'s mutex: the field/local
+        // literally named `core`, plus anything bound straight off
+        // `core.upgrade()` (the `Weak<Mutex<Core>>` the sink thread holds —
+        // see `daemon::journaling_sink`) under whatever name that binding
+        // gave it.
+        let mut receivers = vec!["core".to_string()];
+        for (index, _) in source.match_indices("core.upgrade()") {
+            let prefix = &source[..index];
+            let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line = &prefix[line_start..];
+            if let Some(let_at) = line.rfind("let ") {
+                let binder = line[let_at + 4..].trim();
+                // `let Some(name) = core.upgrade()` or `let name = core.upgrade()`.
+                let ident: String = binder
+                    .trim_start_matches("Some(")
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !ident.is_empty() && !receivers.contains(&ident) {
+                    receivers.push(ident);
+                }
+            }
+        }
+
+        for receiver in &receivers {
+            for method in door_methods {
+                let door = format!("{receiver}{method}");
+                for (index, _) in source.match_indices(door.as_str()) {
+                    // A bare method call (`.lock(`) must not also match a
+                    // qualified one already counted (`core.lock(` inside a
+                    // longer receiver expression) — require a non-identifier
+                    // boundary immediately before the receiver name.
+                    let boundary_at = index;
+                    let preceded_by_ident = source[..boundary_at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if preceded_by_ident {
+                        continue;
+                    }
+                    assert!(
+                        allowed
+                            .iter()
+                            .any(|(start, end)| index > *start && index < *end),
+                        "src/{module} takes the core lock outside `CoreGuard` \
+                         (via `{door}`), so that hold's appends are never \
+                         fsynced or published at the end of it (#44), near: {:?}",
+                        char_boundary_snippet(&source, index)
+                    );
+                }
             }
         }
     }
+    assert!(checked_api_rs, "the walk must have reached src/api.rs");
+}
+
+/// A ~200-byte window of `source` around `index`, snapped to char
+/// boundaries — `source[a..b]` panics if either `a` or `b` lands inside a
+/// multi-byte character (this codebase's doc comments use `§` freely), which
+/// would turn a real violation this test caught into an unrelated slicing
+/// panic instead of the assertion failure that names the call site.
+fn char_boundary_snippet(source: &str, index: usize) -> &str {
+    let target_start = index.saturating_sub(140);
+    let start = source
+        .char_indices()
+        .rev()
+        .find(|&(i, _)| i <= target_start)
+        .map_or(0, |(i, _)| i);
+    let target_end = (index + 60).min(source.len());
+    let end = source
+        .char_indices()
+        .find(|&(i, _)| i >= target_end)
+        .map_or(source.len(), |(i, _)| i);
+    &source[start..end]
+}
+
+/// Every `.rs` file under `src/`, recursively.
+fn all_src_files() -> Vec<PathBuf> {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 /// The end of the `{ … }` block that starts at or after `from`.
