@@ -220,6 +220,35 @@ Rules:
    correct — correctness does not substitute for review (proposal §9.6,
    §9.1: "It does not publish workflows").
 
+## 2a. The execution-surface test (owner ruling, 2026-08-11)
+
+Added after the first dogfood gauntlet measured the conflation: the §6
+publication ladder sorts invariants from procedures from machinery, but
+never asked **who drives**. Before anything is admitted as a workflow, it
+passes the three-way test:
+
+1. **Workflow** — receives an *intent*, runs multi-stage with declared
+   inputs/outputs, requires judgment at its checkpoints, and is driven
+   end-to-end by sergeant. The test: "would a human type
+   `sgt run '<intent>' --workflow X`?" If the package cannot absorb an
+   intent — if it does the same thing every time — it is not a workflow.
+2. **CLI surface** — a deterministic operation on sergeant's own state
+   (fleet status, cleanup, graph, resolution). The "judgment" test: if
+   the judgment is just reading sgt state and acting mechanically, it is
+   a `sgt` verb (or TUI affordance — see
+   `reference/proposal-tui-t-series.md`), not a workflow. Candidates are
+   reconciled against existing product surface before anything is built.
+3. **Operator skill** — instructions that teach the interactive harness
+   (Claude Code in the deployment flow: clone → `sgt init` → launch
+   Claude) how to operate sergeant well. These live at the skills/
+   `AGENTS.md` layer the harness loads — sergeant never drives them.
+
+A package that fails the workflow test is not deleted — it is re-homed
+to the surface it actually belongs to. Interactive workflows (grilling-
+class) remain workflows ONLY where the engine can hold their checkpoints
+open for a human (the E3 design item); until then their packages must
+say so.
+
 ## 3. `AGENTS.md`: the small constitution
 
 `AGENTS.md` teaches a harness how to enter the Sergeant system and resolve

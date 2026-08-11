@@ -23,6 +23,12 @@ drift on OS/tool updates; re-measure on suspicion and date any change.
 | Rust toolchain | cargo/rustc 1.97.1 in `~/.cargo/bin` — **not on non-interactive shells' default PATH**; prefix `PATH="$HOME/.cargo/bin:$PATH"` in scripts | `which cargo` miss + explicit path check, 2026-08-11 |
 | Build deps | gcc/g++/make/pkg-config present; `cmake` absent (bundled DuckDB builds without it — warm build verified) | `which` probe + green `cargo build`, 2026-08-11 |
 
+**Host convention — the inbox (owner-declared 2026-08-11):** `~/inbox/`
+on this host is where the owner drops files for the repo (proposals,
+research). A file is deleted from the inbox once accepted/vendored into
+the repo — the inbox holds ONLY not-yet-accepted material. Check it on
+wake.
+
 Repo invariants (target size, build times, test counts) intentionally NOT
 here — they live in CLAUDE.md. Sibling files: `claude-code-cloud.md`,
 `github-runner.md`.
