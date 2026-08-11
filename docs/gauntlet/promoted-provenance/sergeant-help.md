@@ -44,3 +44,6 @@ Routed here at N1 verifier round 2 (finding V3): `BU-P1-136` is AGENTS.md's own 
 
 No changes. All three stages (`00-classify-and-locate`, `10-resolve-source-conflicts`, `20-answer-or-hand-off`) were classified "Judgment required" (§6.4) at extraction; none carries a "Deterministic-machinery candidate" (§6.5) heading anywhere in this package, so no stage is in scope for A4's default-demote or case-by-case reimplementation test. Stage count unchanged at 3.
 
+## Promotion note (docs/icm/promotion-spec-2026-08-11.md §1)
+
+This package declares a `promote` output disposition (`20-answer-or-hand-off/output/README.md`) with no finalize step at its closing stage — one of the 30 of 34 N1 packages in that shape, not one of the 3 (`drain-fleet`, `respond-to-worker`, `to-spec`) that name one. Recorded here per the spec's finalize-gap rule rather than silently promoted; disposition on whether this package needs a finalize step is left to human review at merge time, not applied mechanically by this curation act.

@@ -31,8 +31,10 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 | `resolving-merge-conflicts` | published | [`workflows/resolving-merge-conflicts/index.md`](workflows/resolving-merge-conflicts/index.md) |
 | `respond-to-worker` | published | [`workflows/respond-to-worker/index.md`](workflows/respond-to-worker/index.md) |
 | `route-review-findings` | published | [`workflows/route-review-findings/index.md`](workflows/route-review-findings/index.md) |
+| `sergeant-help` | published | [`workflows/sergeant-help/index.md`](workflows/sergeant-help/index.md) |
 | `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 | `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
+| `to-tickets` | published | [`workflows/to-tickets/index.md`](workflows/to-tickets/index.md) |
 | `validate-and-ship` | published | [`workflows/validate-and-ship/index.md`](workflows/validate-and-ship/index.md) |
 | `vet-external-skill` | published | [`workflows/vet-external-skill/index.md`](workflows/vet-external-skill/index.md) |
 | `wiki-digest` | published | [`workflows/wiki-digest/index.md`](workflows/wiki-digest/index.md) |
