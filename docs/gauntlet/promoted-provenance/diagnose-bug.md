@@ -68,6 +68,8 @@ Maps every stage (and every workflow-level citation) to the behavior units that 
 | `BU-P2-048` | Before declaring the diagnosis done, the actor must confirm: the original repro no longer reproduces, the regression test passes (or the seam absence is documented), all `[DEBUG-...]` instrumentation is removed via a prefix grep, throwaway prototypes are deleted or clearly marked, and the correct hypothesis is stated in the commit/PR message for the next debugger. | `reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` (Phase 6: required checklist, lines 128-132) |
 | `BU-P2-049` | After the fix is in, the actor asks what would have prevented the bug; if the answer involves architectural change (no good test seam, tangled callers, hidden coupling) the actor hands off to the `/improve-codebase-architecture` skill with specifics, making the recommendation only after the fix — not before, since more is known by then. | `reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` (Phase 6: architecture handoff, lines 134-134) |
 
+**Curation note (`docs/icm/promotion-spec-2026-08-11.md` §1 finalize gap):** this is the workflow's true closing stage (per `workflow.toml`'s own `stages` order) and its `output/README.md` declares a `promote` disposition, but names no deterministic finalize step (D9, convention §1a open questions) — one of the corpus's 30 packages in that shape. Not a promotion blocker on the convention's own text; recorded here per the spec's curation rule rather than silently laundered.
+
 ## Notes
 
 **Synthesis notes:** Proposal §8.2's "strong low-ambiguity reference workflow" assessment holds — all six stages survive the §6.3 reimplementation test.

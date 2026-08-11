@@ -1,0 +1,13 @@
+# diagnose-bug — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# candidate W20). Reproduce, isolate, prove, remediate and verify a
+# defect. Promoted per docs/icm/promotion-spec-2026-08-11.md; full
+# behavior-unit citation trail archived at
+# docs/gauntlet/promoted-provenance/diagnose-bug.md.
+#
+# Six ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree must agree with it.
+
+[workflow]
+name = "diagnose-bug"
+version = "1"
+stages = ["10-build-feedback-loop", "20-reproduce-and-minimize", "30-hypothesize", "40-instrument", "50-fix-with-regression-test", "60-cleanup-and-postmortem"]
