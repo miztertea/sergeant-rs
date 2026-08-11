@@ -220,3 +220,63 @@ correction.
    `kind = "execute"` stage is a content call. `validate-and-ship`'s
    gate-drive step is the leading candidate and is named as such, not
    decided.
+
+## v3 — escalations resolved + outside-review dispositions (owner rulings, 2026-08-11)
+
+**The three escalations, ruled:** (1) Rule A lands standalone in MVP-1;
+N4's adjudication drops it from that contract's outcome (owner amends
+their own retention ruling). (2) Schema migration: **rename-with-refusal**
+— `[workspace]`→`[estate]`, `[[repository]]`→`[[repo]]`, old vocabulary
+refused with the migration named; no users, nothing to migrate; our own
+fixtures update in the same commit. (3) Execute-stage subject: chosen at
+N4 contract time under the owner's criterion — **the demonstration is
+container-launch + output-passing through an ICM stage, so pick something
+cheap, fast, and runnable constantly** (a validation/lint-class step, not
+the no-mistakes gate-drive, which is too heavy for a soak subject).
+
+**Outside review (Codex, `reference/review-northstar-outside-codex.md`),
+dispositioned — adopted:**
+- **A1 (its sharpest catch): the self-hosting surfaces contradiction.**
+  In-estate data-dir puts self-hosted worktrees inside sergeant-rs's own
+  checkout, which surface materialization refuses by design. Adopted as a
+  named MVP-1 design ruling owed before the data-dir flip: **separate
+  `data_dir` from `surfaces_root`** (its option 1 — journal/blobs stay
+  in-estate; disposable worktrees land outside or sibling), exact shape
+  ruled in the MVP-1 contract.
+- A2: two install personas stated explicitly — colleague path is
+  `cargo install --path . --bin sgt` (cold build honestly >5 min);
+  the five-minute stranger path stays gated post-MVP. Happy path text
+  corrected to stop borrowing the post-MVP surface.
+- A3: the **instruction projection contract** elevated to a first-class
+  MVP acceptance item (which files, composition order for multi-repo,
+  conflict handling, pinned identities at bind, per-adapter translation)
+  under the rule: manifest declares policy; core resolves and pins;
+  adapters translate without redefining.
+- A4: manifest ownership split — **tracked logical topology** (names,
+  relative mounts, origins, groups, instruction policy) vs **gitignored
+  local state** (resolved paths, entry kind, health observations).
+  Three-pens stands as owner-ruled, amended: the harness SHOULD drive
+  the verbs rather than hand-writing the file (AGENTS.md guidance, not
+  a hard rule; sgt remains the validating writer on that path).
+- A5: **minimum fake-backend deferred-finish fidelity pulled to the
+  front of MVP-1** as a precondition for every turn-boundary contract
+  test; the fuller R-H0-7 review stays MVP-2.
+- A6: promote/finalize's four possible meanings acknowledged; the MVP-1
+  contract must define declaration inputs, disposition semantics, owning
+  component, timing vs teardown, and failure behavior before build.
+- A7: **the assembled-product ship gate is MVP-5's exit**: fresh clone,
+  documented install, two repos registered, fresh harness context,
+  intent through AGENTS.md, actor + Docker verify, detach, restart,
+  return via status/show/transcript, find branch + outputs — no hand
+  edits, no journal decoding, no orchestrator rescue.
+- A8: per-bucket self-hosting checkpoints (≥1 MVP-1 change through
+  current sergeant; ≥1 MVP-3 integration through the assembled build;
+  the soak driven via documented surfaces; the final gate from a fresh
+  context). P2 stays "first fully self-hosted *milestone*".
+- A9: P2-vs-T-minimal ordering demoted from frozen to a **post-MVP pilot
+  ruling** decided by colleague-pilot evidence.
+
+**Rejected from the review, with reasons:** its single-writer-only
+manifest doctrine (conflicts with the owner's three-pens ruling;
+resolved as SHOULD-guidance above), and nothing else — the rest either
+restated our record or sharpened it.
