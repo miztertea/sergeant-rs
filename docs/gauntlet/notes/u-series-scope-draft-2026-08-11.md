@@ -23,6 +23,26 @@
   sgt requires only that `repos/<name>` is a git repo it can cut work
   surfaces from. The estate manifest declares the expected entries;
   `sgt init`/doctor verify or populate them.
+- **U-R4 — the core loop and the seats (owner, verbatim intent).**
+  AGENTS.md is the canonical source of truth for the repo: its job is to
+  empower the harness to understand "fix the pagination bug in
+  smith-api" — help the user build the intent, select the workflow, set
+  harness settings, and drive the CLI on the user's behalf, passing
+  messages back and answering them where the user delegates that. The
+  CLI is genuinely dual-audience: `sgt run "..." --workflow ...` typed
+  by a human is a first-class path; needing no harness help is fine.
+  The TUI is the at-your-seat surface for watching and steering running
+  work (the T-series proposal's job). **Fleet is simply all the work
+  sergeant is running** — a view, not a domain object; the drain/cleanup
+  verbs are subordinate conveniences, not a new concept. AGENTS.md
+  drifted from this canonical role somewhere along the way (it became
+  ICM-convention plumbing) — restoring it is a U-series centerpiece, not
+  a doc chore. **Addendum: `CLAUDE.md` becomes a git symlink to
+  `AGENTS.md`** — one canonical content, always. (Design note for the
+  contract: today's CLAUDE.md carries the development rulebook; under
+  clone-is-distro it folds into the canonical file as the
+  working-on-sergeant section, or moves to a doc AGENTS.md references —
+  the contract picks, the symlink ruling stands either way.)
 - **U-R3 — self-hosting starts now.** Development work that fits a
   surviving workflow runs as a sergeant work from here on (research,
   diagnose-bug, code-review, validate-and-ship lanes); multi-agent
