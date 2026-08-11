@@ -31,7 +31,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::daemon::{KIND_BACKEND_PROBED, KIND_DAEMON_STARTED, KIND_DAEMON_STOPPED};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::execution::{
-    KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
+    KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
+    KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
@@ -44,10 +45,10 @@ use crate::domain::workflow::{
     KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
-use crate::runtime::engine::{Engine, EngineError, SubmitContext};
+use crate::runtime::engine::{Engine, EngineError, Next as EngineNext, Step, SubmitContext};
 use crate::runtime::graph::{
-    KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED, KIND_CONVERSATION_USER,
-    KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
+    KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
+    KIND_CONVERSATION_USER, KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry, WorkRun};
@@ -194,6 +195,137 @@ pub fn router(state: ApiState) -> Router {
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .merge(ui)
+}
+
+/// Run one blocking closure without occupying an async worker.
+///
+/// `block_in_place` rather than `spawn_blocking` (R1: the cheaper primitive
+/// that already does the job). Both keep the effect off the async worker;
+/// `spawn_blocking` additionally moves the value to another thread and back,
+/// which costs two task hops per launch — measured at burst 50, that showed up
+/// as a throughput regression against R-N0-4's floor. `block_in_place` hands
+/// the current worker's other tasks to a replacement thread and runs the
+/// closure right here, so the launch costs no migration at all.
+///
+/// It requires a multi-thread runtime; the single-thread fallback runs the
+/// closure inline, which is what a current-thread runtime can do anyway.
+async fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if multi_thread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+/// Turn the engine's crank to a park, **holding no core lock across any
+/// external effect** (§14.2's middle phase, §22.6's budget).
+///
+/// The handler commits its authoritative half under the guard, drops it, and
+/// hands the resulting [`Step`] here. Everything this function blocks on —
+/// the launch itself, and any adapter tail work an earlier crank collected
+/// (issue #14/B3) — happens with the guard released and on a blocking thread,
+/// so another request can take the lock while a harness is spawning or a
+/// transcript is flushing. Each settle re-acquires the lock, re-validates the
+/// reservation against durable state (§14.5), and releases it again.
+///
+/// A `settle_launch` failure is logged and the crank stops. It cannot be
+/// returned to the client, because the client's own command already
+/// succeeded: the reservation is durable and, if the launch got that far, the
+/// journal says so. Recovery re-derives from that record; inventing a failure
+/// response for a command that was accepted would be worse than the log line.
+///
+/// It **returns the guard it is still holding** when the crank ends with the
+/// lock in hand and nothing outstanding, so the caller can render its response
+/// without queueing for the mutex a fourth time. That is not a shortcut around
+/// the boundary: the guard is dropped before every effect and before every
+/// completion wait, which are the only places §22.6 cares about — in one place
+/// each, so there is no arm that can be missed and no arm whose drop is
+/// decoration.
+async fn crank(state: &ApiState, step: Step) -> Option<tokio::sync::MutexGuard<'_, Core>> {
+    let mut step = step;
+    let mut held: Option<tokio::sync::MutexGuard<'_, Core>> = None;
+    loop {
+        let Step { next, deferred } = step;
+        if deferred.is_pending() {
+            drop(held.take()); // never wait on an adapter under the guard
+            blocking(move || deferred.wait()).await;
+        }
+        if matches!(next, EngineNext::Parked) {
+            return held;
+        }
+        // Every remaining arm performs an external effect — a harness spawn, a
+        // `claude -p --resume` turn, a `git worktree add` fork/exec/wait on a
+        // checkout the daemon does not own and cannot bound. So the guard goes
+        // first, once, for all of them (§14.2, §22.6).
+        //
+        // Once, rather than a line per arm: the per-arm drops were three
+        // copies of one invariant, and the copy in the SEND arm could not run
+        // — `provide_input` drops the guard before calling `crank`, and no
+        // settle produces `Next::Send`, so that arm is only ever reached on the
+        // first iteration with nothing held. A line that cannot execute is not
+        // a boundary, whatever its comment says (round-2 finding N3R2-07).
+        // Stated here it executes for every effect, including any later path
+        // that does hand a SEND back from a settle.
+        drop(held.take());
+        let settled = match next {
+            EngineNext::Parked => unreachable!("returned above"),
+            EngineNext::Launch(pending) => {
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = state.core.lock().await;
+                (
+                    work_id,
+                    state.engine.settle_launch(&mut core, pending, outcome),
+                    core,
+                )
+            }
+            EngineNext::Send(pending) => {
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = state.core.lock().await;
+                (
+                    work_id,
+                    state.engine.settle_send(&mut core, pending, outcome),
+                    core,
+                )
+            }
+            EngineNext::Surface(pending) => {
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = state.core.lock().await;
+                (
+                    work_id,
+                    state.engine.settle_surface(&mut core, pending, outcome),
+                    core,
+                )
+            }
+        };
+        let (work_id, outcome, core) = settled;
+        match outcome {
+            Ok(next_step) => {
+                held = Some(core);
+                step = next_step;
+            }
+            Err(e) => {
+                tracing::error!(work_id = %work_id, error = %e, "settling an external effect failed");
+                return Some(core);
+            }
+        }
+    }
+}
+
+/// Take the guard [`crank`] handed back, or acquire one if it kept none.
+async fn relock<'a>(
+    state: &'a ApiState,
+    held: Option<tokio::sync::MutexGuard<'a, Core>>,
+) -> tokio::sync::MutexGuard<'a, Core> {
+    match held {
+        Some(guard) => guard,
+        None => state.core.lock().await,
+    }
 }
 
 /// Structured 404 for routes the router does not know.
@@ -486,7 +618,7 @@ struct SubmitRequest {
 }
 
 /// §13's origin metadata: who is asking, and from where.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct Origin {
     /// Front-end harness name, e.g. `claude`. Drives origin affinity.
     #[serde(default)]
@@ -516,6 +648,45 @@ async fn submit_work(
     if let Err(resp) = parse_command_id(&req.command_id) {
         return *resp;
     }
+    // Planning happens with **no lock held**. It reads the filesystem —
+    // `Workspace::discover` walks up to the git root and parses
+    // `sergeant.toml`, `WorkflowDefinition::resolve` reads every stage's
+    // `CONTEXT.md` — and probes every harness the run will use (§17.5). All of
+    // that is external I/O on paths the daemon does not own, which §22.6 keeps
+    // out from under the core lock; it is also, by construction, side-effect
+    // free, so running it before the guard costs nothing but a re-check.
+    //
+    // The re-check is the price. Two concurrent submissions of the same
+    // `command_id` can now both plan; exactly-once is preserved by taking the
+    // guard afterwards and consulting the recorded outcome there, which is the
+    // same single-writer decision it always was — just made after the reading
+    // rather than around it.
+    let origin = req.origin.clone().unwrap_or_default();
+    let planned = if req.intent.trim().is_empty() {
+        None
+    } else {
+        let engine = state.engine.clone();
+        let backend = req.backend.clone();
+        let workflow = req.workflow.clone();
+        let profile = req.profile.clone();
+        let repositories = req.repositories.clone();
+        let origin_cwd = origin.cwd.clone();
+        let origin_client = origin.client.clone();
+        Some(
+            blocking(move || {
+                engine.plan(&SubmitContext {
+                    cwd: origin_cwd.as_deref(),
+                    origin_client: origin_client.as_deref(),
+                    backend: backend.as_deref(),
+                    workflow: workflow.as_deref(),
+                    profile: profile.as_deref(),
+                    repositories: &repositories,
+                })
+            })
+            .await,
+        )
+    };
+
     let mut core = state.core.lock().await;
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
@@ -558,21 +729,14 @@ async fn submit_work(
         );
     }
 
-    // Plan before creating anything. Workspace topology, workflow content,
-    // routing and profile are all decided here, with no side effects — so a
-    // submission that cannot be routed is rejected with §13's available
-    // options instead of creating work that immediately dies. `Ok(None)`
-    // means the client offered no repository context; the work is accepted
-    // and stays `pending`, exactly as it did before there was an engine.
-    let origin = req.origin.unwrap_or_default();
-    let plan = match state.engine.plan(&SubmitContext {
-        cwd: origin.cwd.as_deref(),
-        origin_client: origin.client.as_deref(),
-        backend: req.backend.as_deref(),
-        workflow: req.workflow.as_deref(),
-        profile: req.profile.as_deref(),
-        repositories: &req.repositories,
-    }) {
+    // The plan decided above, before the guard: workspace topology, workflow
+    // content, routing, profiles and the §17.5 stage preflight, all with no
+    // side effects — so a submission that cannot be routed is rejected with
+    // §13's available options instead of creating work that immediately dies.
+    // `Ok(None)` means the client offered no repository context; the work is
+    // accepted and stays `pending`, exactly as it did before there was an
+    // engine.
+    let plan = match planned.expect("planned whenever the intent is non-empty") {
         Ok(plan) => plan,
         Err(e) => {
             let status = engine_error_status(&e);
@@ -615,19 +779,28 @@ async fn submit_work(
         // The Work is durable now. A start failure cannot un-accept it, so
         // the engine fails it closed to `blocked` with the reason recorded;
         // only an internal failure escapes as an error here.
-        if let Err(e) = state.engine.start(&mut core, &work, &plan) {
-            tracing::error!(work_id = %work_id, error = %e, "starting the run failed");
-            let status = engine_error_status(&e);
-            let result = engine_error_body(&e);
-            return record_and_respond(
-                &mut core,
-                &req.command_id,
-                "work.submit",
-                Some(&work_id),
-                status,
-                result,
-            );
-        }
+        //
+        // Two-phase (§14.2): everything authoritative — surface, binding,
+        // `work.started`, the first stage's `execution.reserved` — lands
+        // under this guard; the harness launch happens after it is dropped.
+        let step = match state.engine.begin_start(&mut core, &work, &plan) {
+            Ok(step) => step,
+            Err(e) => {
+                tracing::error!(work_id = %work_id, error = %e, "starting the run failed");
+                let status = engine_error_status(&e);
+                let result = engine_error_body(&e);
+                return record_and_respond(
+                    &mut core,
+                    &req.command_id,
+                    "work.submit",
+                    Some(&work_id),
+                    status,
+                    result,
+                );
+            }
+        };
+        drop(core);
+        core = relock(&state, crank(&state, step).await).await;
     }
 
     // Answer from the projection, not the request: proves the read path.
@@ -656,6 +829,10 @@ fn work_view(core: &Core, work_id: &str) -> Value {
         "stage": run.and_then(run_stage_view),
         "surface": run.and_then(|r| r.surface.clone()),
         "execution": run.and_then(|r| r.execution.clone()),
+        // Additive (§20.5): a run whose launch phase is in flight, or whose
+        // launch phase a crash left unaccounted for, is a state a client can
+        // now see rather than infer from a gap between events.
+        "reservation": run.and_then(|r| r.reservation.clone()),
         "workflow": run.and_then(|r| r.workflow.as_ref().map(|w| json!({
             "name": w.name,
             "version": w.version,
@@ -679,6 +856,12 @@ fn run_stage_view(run: &WorkRun) -> Option<Value> {
         "status": stage.status.as_str(),
         "detail": stage.detail,
         "of": run.workflow.as_ref().map(|w| w.stages.len()),
+        // Additive (§20.5, §13.3's "expose current-stage executor details in
+        // API views"). A mixed-harness run whose clients can only see the
+        // Work-level actor default cannot tell an operator which harness is
+        // actually holding the current checkpoint — which is the whole point
+        // of declaring one per stage.
+        "executor": run.stage_binding(&stage.stage_id, stage.index),
     }))
 }
 
@@ -810,8 +993,19 @@ async fn cancel_work(
     // Work state changes first, then the run is retired: the cancellation is
     // a fact about the Work, not a request to the backend, and it does not
     // wait for — or depend on — the native context actually dying (§25).
-    if let Err(e) = state.engine.retire_run(&mut core, &id, "work canceled") {
-        tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed");
+    //
+    // The STOP request and the teardown land under this guard; the adapter's
+    // evidence tail (issue #14/B3) is awaited by `crank` after it is dropped.
+    match state
+        .engine
+        .begin_retire_run(&mut core, &id, "work canceled")
+    {
+        Ok(step) => {
+            drop(core);
+            crank(&state, step).await;
+            core = state.core.lock().await;
+        }
+        Err(e) => tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed"),
     }
     let result = work_view(&core, &id);
     record_and_respond(
@@ -860,8 +1054,10 @@ async fn work_input(
         );
     }
     let engine = state.engine.clone();
-    match engine.provide_input(&mut core, &id, &req.input) {
-        Ok(()) => {
+    match engine.begin_input(&mut core, &id, &req.input) {
+        Ok(step) => {
+            drop(core);
+            let mut core = relock(&state, crank(&state, step).await).await;
             let result = work_view(&core, &id);
             record_and_respond(
                 &mut core,
@@ -921,8 +1117,10 @@ async fn work_retry(
         );
     }
     let engine = state.engine.clone();
-    match engine.retry(&mut core, &id) {
-        Ok(()) => {
+    match engine.begin_retry(&mut core, &id) {
+        Ok(step) => {
+            drop(core);
+            let mut core = relock(&state, crank(&state, step).await).await;
             let result = work_view(&core, &id);
             record_and_respond(
                 &mut core,
@@ -1297,14 +1495,17 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_STAGE_BLOCKED,
     KIND_STAGE_FAILED,
     KIND_STAGE_CANCELED,
+    KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED,
     KIND_EXECUTION_STOPPED,
+    KIND_EXECUTION_ABANDONED,
     KIND_EXECUTION_RECONCILED,
     KIND_SURFACE_MATERIALIZING,
     KIND_SURFACE_MATERIALIZED,
     KIND_SURFACE_TORN_DOWN,
     KIND_CONVERSATION_USER,
     KIND_CONVERSATION_ASSISTANT_COMPLETED,
+    KIND_CONVERSATION_ASK,
     KIND_CONVERSATION_TURN_ENDED,
     KIND_TOOL_REQUESTED,
     KIND_TOOL_COMPLETED,

@@ -1,34 +1,25 @@
-# resources/ — S-series workflow scripts
+# resources/ — gauntlet workflow scripts, as launched
 
-Orchestration scripts for the S-series gauntlet, committed as plain `.js`
-as launched (owner direction 2026-08-10). This supersedes the zip-append
-convention (`reference/gauntlet-workflows.zip` remains the M/N-series
-archive). One file per workflow invocation; edits after launch land as new
-commits, never rewrites — the file is the record of what ran.
+The single home for every orchestration script the gauntlet loop has run,
+committed as plain `.js` (owner direction 2026-08-11; supersedes the
+`reference/gauntlet-workflows.zip` archive, whose full contents were
+extracted here at the migration commit — git history retains the zip
+itself). Plain files over an archive because scripts are *method
+evidence*: diffs between successive milestones' scripts are where the
+economy revisions and protocol changes are visible, and a zip hid exactly
+that.
 
-- `s1-instrument-gauntlet.js` — S1 phase 1: instrument repairs + hygiene +
-  harness build (contract: `docs/gauntlet/contracts/S1-COVERAGE.md`).
-- `s1-instrument-round2-lean.js` — S1 phase 1, lean round 2: fresh blind
-  critics over the phase-1 diff (test-honesty independently re-probes every
-  pin), batched refuters, fixer. Added at owner challenge 2026-08-10; the
-  measurement SHA freezes only after this round leaves the tree green.
-- `s1-analysis-gauntlet.js` — S1 phase 2/3 support: per-stage artifact
-  analysis and the batched reproduce-or-refute pass over candidate
-  findings. Phase 2's stage execution itself is orchestrator-run from
-  `scripts/coverage/` (R-S0-4 sequencing), not agent-run.
-- `s2-wave1-gauntlet.js` — S2 wave 1 (contract:
-  `docs/gauntlet/contracts/S2-STABILIZE.md`): four Sonnet builders on
-  disjoint surfaces (fixtures + in-module pokes for #30/#32/#33/#34/#37/
-  #39/#41), then the full loop — two-critic panel, batched refuters,
-  fixer (R-S0-12: code is code, waves included).
-- `s2-wave2-gauntlet.js` — S2 wave 2 (fault injection: #30 remainder,
-  #31/#35/#36/#38/#40, #37's SSE pair). Protocol revision from wave-1
-  lessons: builders return a guard map instead of self-probing; ONE
-  independent Opus prober executes the whole wave's mutations batched in
-  a single disposable worktree (L13 as design, disk-safe), plus probes of
-  its own devising; probe survivors enter the fix round as executed
-  evidence, not refutable claims.
-- `s2-wave3-gauntlet.js` — S2 wave 3 close-out sweep: one Opus blind
-  auditor over the re-measured residual map (declines recorded with
-  reasons, not silence), the independent prober, fixer on survivors.
-  Census, CI lane, and MARK & LOG are orchestrator-run after it.
+Conventions:
+- One file per workflow invocation, committed **as launched**; edits after
+  launch land as new commits, never rewrites.
+- Subfolders by program series. New series add a folder; nothing is
+  renamed retroactively.
+
+- `m-series/` — M0–M6 build gauntlets + lean round-2 scripts (P0, ledger
+  entries M0–M6).
+- `n-series/` — N1 decomposition/closure/fixer, N2 build/run/compare
+  (runs 1–3), N3 wave-1 build + run-3 compare (Programs A/B, PR #27/#43).
+- `s-series/` — S1 instrument + round 2 + analysis, S2 waves 1–3
+  (coverage/stabilization, PR #28). Wave 2 introduced the guard-map /
+  independent-prober protocol now standard in
+  `reference/notes/gauntlet-pattern.md`.

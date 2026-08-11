@@ -44,6 +44,14 @@ pub enum RouteSource {
     WorkspaceDefault,
     /// The daemon's global default.
     GlobalDefault,
+    /// A `[stage."<id>"] harness = …` declaration (§12.2). The highest tier
+    /// there is: the workflow author said this checkpoint needs this harness.
+    StageHarness,
+    /// The Work-level actor default, inherited by a stage that named no
+    /// harness of its own (§12.5's second tier). The Work-level chain above
+    /// already decided *which* backend that is and recorded its own tier;
+    /// this records that the stage took it rather than choosing.
+    WorkActorDefault,
 }
 
 impl RouteSource {
@@ -54,6 +62,8 @@ impl RouteSource {
             RouteSource::OriginAffinity => "origin_affinity",
             RouteSource::WorkspaceDefault => "workspace_default",
             RouteSource::GlobalDefault => "global_default",
+            RouteSource::StageHarness => "stage_harness",
+            RouteSource::WorkActorDefault => "work_actor_default",
         }
     }
 }
@@ -161,8 +171,6 @@ impl std::fmt::Display for RouteSource {
 
 /// Resolve a backend for one submission (§13).
 pub fn route(inputs: &RouteInputs<'_>, registry: &BackendRegistry) -> Result<Route, RouteError> {
-    let available = registry.names();
-
     // Origin affinity contributes a candidate only when the client names a
     // backend sergeant actually knows about (§13's `Terminal → configured
     // default` row). Every other tier is decisive as written.
@@ -170,27 +178,70 @@ pub fn route(inputs: &RouteInputs<'_>, registry: &BackendRegistry) -> Result<Rou
         .origin_client
         .filter(|client| registry.get(client).is_some());
 
-    let tiers = [
-        (RouteSource::Explicit, inputs.explicit),
-        (RouteSource::OriginAffinity, affinity),
-        (RouteSource::WorkspaceDefault, inputs.workspace_default),
-        (RouteSource::GlobalDefault, inputs.global_default),
-    ];
+    resolve_tiers(
+        &[
+            (RouteSource::Explicit, inputs.explicit),
+            (RouteSource::OriginAffinity, affinity),
+            (RouteSource::WorkspaceDefault, inputs.workspace_default),
+            (RouteSource::GlobalDefault, inputs.global_default),
+        ],
+        registry,
+    )
+}
 
+/// Resolve the harness for **one actor stage** (§12.5), given the Work-level
+/// actor default the §13 chain already produced.
+///
+/// ```text
+/// stage.harness explicitly names a harness
+///         ↓
+/// otherwise the Work actor default
+///         ↓
+/// fail with available harnesses
+/// ```
+///
+/// This is [`route`]'s rule applied stage by stage, and it is the same rule
+/// for the same reason: a tier that *names* a harness is decisive. §12.5 says
+/// it in as many words — "if a workflow explicitly requires Claude for review
+/// and Claude is unavailable, Sergeant does not silently use Codex" — so an
+/// explicit stage harness that is unknown or unavailable fails here rather
+/// than falling through to the Work default. Falling through would be exactly
+/// the substitution §13 forbids, wearing a stage-shaped hat.
+pub fn route_stage(
+    stage_harness: Option<&str>,
+    work_actor_default: Option<&str>,
+    registry: &BackendRegistry,
+) -> Result<Route, RouteError> {
+    resolve_tiers(
+        &[
+            (RouteSource::StageHarness, stage_harness),
+            (RouteSource::WorkActorDefault, work_actor_default),
+        ],
+        registry,
+    )
+}
+
+/// The one tier walk both chains use: first tier that names something decides,
+/// and a named backend that is unknown or unavailable fails the whole chain.
+fn resolve_tiers(
+    tiers: &[(RouteSource, Option<&str>)],
+    registry: &BackendRegistry,
+) -> Result<Route, RouteError> {
+    let available = registry.names();
     for (source, requested) in tiers {
         let Some(requested) = requested else { continue };
         let Some(backend) = registry.get(requested) else {
             return Err(RouteError::NotFound {
-                requested: requested.to_string(),
-                tier: source,
+                requested: (*requested).to_string(),
+                tier: *source,
                 available,
             });
         };
         let probe = backend.probe();
         if !probe.available {
             return Err(RouteError::Unavailable {
-                requested: requested.to_string(),
-                tier: source,
+                requested: (*requested).to_string(),
+                tier: *source,
                 detail: probe
                     .detail
                     .unwrap_or_else(|| "backend probe reported unavailable".to_string()),
@@ -198,8 +249,8 @@ pub fn route(inputs: &RouteInputs<'_>, registry: &BackendRegistry) -> Result<Rou
             });
         }
         return Ok(Route {
-            backend: requested.to_string(),
-            source,
+            backend: (*requested).to_string(),
+            source: *source,
         });
     }
     Err(RouteError::NoSelection { available })
@@ -323,6 +374,62 @@ mod tests {
             assert!(err.to_string().contains("claude is not logged in"));
             assert_eq!(err.available(), ["claude".to_string(), "codex".to_string()]);
         }
+    }
+
+    /// §12.5's chain, stage by stage: an explicit stage harness decides, a
+    /// stage that names none inherits the Work actor default, and a stage on
+    /// a harness that is unknown or unavailable fails **without** falling
+    /// through to the default. That last row is the whole point — falling
+    /// through would run a checkpoint the author reserved for Claude on
+    /// whatever else happened to be configured.
+    #[test]
+    fn a_stage_harness_decides_and_never_falls_through_to_the_work_default() {
+        let claude = FakeBackend::new("claude");
+        claude.set_available(false, "claude is not logged in");
+        let registry = BackendRegistry::new()
+            .with(Arc::new(claude))
+            .with(Arc::new(FakeBackend::new("codex")))
+            .with(Arc::new(FakeBackend::new("fake")));
+
+        assert_eq!(
+            route_stage(Some("codex"), Some("fake"), &registry).expect("stage wins"),
+            Route {
+                backend: "codex".to_string(),
+                source: RouteSource::StageHarness
+            }
+        );
+        assert_eq!(
+            route_stage(None, Some("fake"), &registry).expect("inherits the default"),
+            Route {
+                backend: "fake".to_string(),
+                source: RouteSource::WorkActorDefault
+            }
+        );
+
+        let unavailable = route_stage(Some("claude"), Some("codex"), &registry)
+            .expect_err("must not substitute the default for a named stage harness");
+        assert_eq!(unavailable.code(), "backend_unavailable");
+        assert!(unavailable.to_string().contains("claude is not logged in"));
+
+        let unknown = route_stage(Some("opencode"), Some("fake"), &registry)
+            .expect_err("an unregistered stage harness is not a fallback");
+        assert_eq!(unknown.code(), "backend_not_found");
+        assert_eq!(
+            unknown.available(),
+            [
+                "claude".to_string(),
+                "codex".to_string(),
+                "fake".to_string()
+            ]
+        );
+
+        // Neither tier named anything: §13's terminal state, unchanged.
+        assert_eq!(
+            route_stage(None, None, &registry)
+                .expect_err("nothing selected")
+                .code(),
+            "no_backend_selected"
+        );
     }
 
     #[test]

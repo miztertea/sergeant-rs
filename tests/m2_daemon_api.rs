@@ -24,6 +24,7 @@
 //! bodies, command ids and resume headers, the router's own 404/405, and
 //! shutdown with a live SSE tail attached.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
@@ -33,9 +34,10 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use sergeant_rs::backend::BackendRegistry;
-use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend};
+use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle, RuntimeDescriptor};
 use sergeant_rs::domain::event::{EVENT_SCHEMA, Event};
+use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
     KIND_WORK_SUBMITTED, WorkState,
@@ -2369,4 +2371,912 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
         resolved.join("journal").is_dir(),
         "HOME/.local/share/sergeant must be used"
     );
+}
+
+// --------------------------------------------- §22.6 core-lock discipline
+//
+// R-N0-4's newest budget: "no external I/O, process wait, or thread join under
+// the core lock". A negative about a lock cannot be asserted by timing a fast
+// path — it has to be provoked. So these tests park an executor *inside* an
+// external effect, indefinitely, and then ask the daemon to serve unrelated
+// requests. If the lock were held across the effect, they would never answer.
+
+/// How long an unrelated request may take while an executor is parked inside
+/// an external effect.
+///
+/// §22.6 bounds this by "the explicitly allowed journal commit interval",
+/// measured at ~2 ms/event, and the requests below are answered in ~2 ms when
+/// the boundary holds. The budget was one second — ~500× the value the
+/// milestone reports (N3-08), which meant a regression that made independent
+/// requests take 900 ms passed unchanged.
+///
+/// 200 ms instead: two orders of magnitude above the honest cost of a
+/// contended journal commit, and two orders below the failure this exists to
+/// catch. Deliberately not tighter — these suites run in parallel, and a
+/// scheduler hiccup under `cargo test -j` is not the regression being looked
+/// for. It is also now tight enough to catch a *queued* request rather than
+/// only a permanently blocked one: one `git worktree add` on a real monorepo
+/// under the guard would exceed it.
+const INDEPENDENT_REQUEST_BUDGET: Duration = Duration::from_millis(200);
+
+/// Seed a data dir with a run parked in `blocked` on `00-only`, so a `retry`
+/// through the API reserves and launches a second attempt.
+///
+/// Written straight to the journal *before* the daemon starts, because the
+/// daemon owns the data dir exclusively once it has: this is the only honest
+/// way for a test to hand it a starting position.
+fn seed_blocked_run(data_dir: &Path, work_id: &str) {
+    let mut journal = Journal::open(data_dir).expect("open journal");
+    let mut append = |kind: &str, payload: Value| {
+        journal
+            .append(
+                EventDraft::new(EventSource::new("test", "seed"), kind, payload)
+                    .with_work_id(work_id),
+            )
+            .expect("append");
+    };
+    append(
+        "work.submitted",
+        json!({"work": {
+            "id": work_id,
+            "intent": "stall me",
+            "repositories": [],
+            "state": "pending",
+            "created_by": "test",
+            "created_at": "2026-08-10T00:00:00Z",
+        }}),
+    );
+    append(
+        "workflow.bound",
+        json!({
+            "workflow": {"name": "tiny", "version": "1", "source": "test",
+                         "stages": [{"id": "00-only", "context": "c"}]},
+            "backend": FAKE_BACKEND_NAME,
+        }),
+    );
+    append(
+        "surface.materialized",
+        json!({"surface": {
+            "work_id": work_id,
+            "root": data_dir,
+            "bindings": [{
+                "repository": "solo",
+                "source_path": data_dir,
+                "base_branch": "main",
+                "base_sha": "0".repeat(40),
+                "worktree_path": data_dir,
+                "work_branch": format!("sergeant/{work_id}"),
+                "head_sha": "0".repeat(40),
+            }],
+        }}),
+    );
+    append(
+        "stage.entered",
+        json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+    );
+    append("work.started", json!({}));
+    append(
+        "stage.blocked",
+        json!({"stage_id": "00-only", "detail": "seeded"}),
+    );
+    append("work.blocked", json!({"reason": "seeded"}));
+}
+
+/// Start a daemon whose only backend is `fake`, so a test can stall it.
+async fn start_with_fake(data_dir: &Path, fake: &FakeBackend) -> DaemonHandle {
+    daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
+}
+
+/// Issue a request while an executor is stalled and describe what happened.
+///
+/// Deliberately non-panicking: the caller releases the stall and shuts the
+/// daemon down *before* asserting. A test that panics with a request still in
+/// flight leaves graceful shutdown waiting for a response that will never come
+/// — the failure then reads as a hung suite instead of a named budget breach
+/// (measured, while probing this very test).
+async fn timed(
+    label: &str,
+    future: impl Future<Output = Result<reqwest::StatusCode, reqwest::Error>>,
+) -> Result<Duration, String> {
+    let started = Instant::now();
+    match tokio::time::timeout(INDEPENDENT_REQUEST_BUDGET, future).await {
+        Err(_) => Err(format!(
+            "{label} was still unanswered after {INDEPENDENT_REQUEST_BUDGET:?} while an executor \
+             was stalled — the core lock is being held across an external effect (§22.6)"
+        )),
+        Ok(Err(e)) => Err(format!("{label} failed while an executor was stalled: {e}")),
+        Ok(Ok(status)) if !status.is_success() => Err(format!(
+            "{label} answered {status} while an executor was stalled"
+        )),
+        Ok(Ok(_)) => Ok(started.elapsed()),
+    }
+}
+
+/// §22.6: a deliberately stalled **launch** blocks nothing else.
+///
+/// The fake's `launch` parks in a gate — the stand-in for a harness process
+/// spawn, an image pull, a container create — and stays parked until this test
+/// releases it. Meanwhile an unrelated read (`GET /v1/work`) and an unrelated
+/// *mutation* (`POST /v1/work`) both have to complete. They can only do that
+/// if the reservation phase released the core guard before the launch, which
+/// is precisely §14.2's boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t9_a_stalled_launch_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKLAUNCH";
+    seed_blocked_run(dir.path(), work_id);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    fake.hold_launches();
+    let retry = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    // Rendezvous, not a sleep: proceed only once the executor is provably
+    // parked inside the external effect.
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_launches(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake launch never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    // Unwind the stall first, then judge: see `timed`.
+    fake.release_launches();
+    let retried = retry.await.expect("retry task");
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled launch: read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(retried.is_success(), "the stalled retry answered {retried}");
+}
+
+/// §22.6 for the **observation** a launch is followed by.
+///
+/// OBSERVE is the third external effect and the one nothing could park in:
+/// `FakeBackend` had gates for LAUNCH, SEND and the stop completion, and none
+/// for OBSERVE, so "the observation is taken outside the guard" was an
+/// unmeasured claim — setting `observed: None` in both performers, which puts
+/// it back under the lock, left all 269 tests green (round-2 finding
+/// N3R2-03). It is not an idle effect either: for the Claude adapter, a handle
+/// it has no memory of sends it walking `/proc`, and §22.6 lists "reading a
+/// large output stream" beside the process spawn.
+///
+/// Same shape as t9, one effect later: the launch goes through, the
+/// observation that follows it parks indefinitely, and independent requests
+/// must still answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t9b_a_stalled_observation_after_a_launch_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKOBSERVE";
+    seed_blocked_run(dir.path(), work_id);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    // The launch itself is left free: what is under test is the effect on the
+    // far side of it, which is only reachable once the launch has happened.
+    fake.hold_observes();
+    let retry = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_observes(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake observation never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    fake.release_observes();
+    let retried = retry.await.expect("retry task");
+    let observed = fake.observations();
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled observe (launch): read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(retried.is_success(), "the stalled retry answered {retried}");
+    assert!(
+        !observed.is_empty(),
+        "the launch must actually have been followed by an observation"
+    );
+}
+
+/// §22.6 + **issue #14 / backlog B3**: a stalled evidence archive blocks
+/// nothing else either.
+///
+/// B3 recorded the exact shape of this: `ClaudeBackend::stop` joined the
+/// turn's transcript-archive thread while the API handler held the core lock,
+/// so a concurrent request waited out one flush. The fix was named there too —
+/// "a §15 trait-shape change: `stop` returning a join token the caller awaits
+/// after releasing the core guard" — and that is what `Completion`/`Deferred`
+/// are. Here the fake's stop hands back a completion that parks indefinitely;
+/// the cancel that triggered it is still in flight, and an unrelated read must
+/// still answer.
+///
+/// The other half of the promise is checked at the end: the cancel does not
+/// return until its completion has actually run, so STOP's evidence guarantee
+/// survives the move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t10_a_stalled_evidence_archive_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKARCHIVE";
+    seed_blocked_run(dir.path(), work_id);
+
+    // `hang` keeps the retried execution alive, so the cancel below has a
+    // real native context to stop.
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+
+    fake.hold_archives();
+    let cancel = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/cancel"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("cancel request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_archives(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the stop completion never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    // The cancel is still waiting on its own completion — that is B3's
+    // evidence promise, kept outside the guard rather than under it.
+    let cancel_still_waiting = !cancel.is_finished();
+
+    fake.release_archives();
+    let canceled = cancel.await.expect("cancel task");
+    let stops = fake.stop_requests();
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled archive: read {read:?}");
+    read.expect("independent read");
+    assert!(
+        cancel_still_waiting,
+        "the cancel must not report done before the adapter's evidence tail has run"
+    );
+    assert!(canceled.is_success(), "the cancel answered {canceled}");
+    assert_eq!(
+        stops.len(),
+        1,
+        "exactly one stop reached the backend: {stops:?}"
+    );
+}
+
+/// §22.6 for **SEND**, and GP-2's ask through the daemon path (§14.2 applied
+/// to the other verb that creates external work).
+///
+/// `respond` is the resume path of the milestone's own ask primitive, and for
+/// a print-mode harness delivering an answer is the same fork/exec a launch is
+/// — `ClaudeBackend::send` spawns `claude -p --resume` plus three reader
+/// threads. Until the fake could be parked inside SEND there was no instrument
+/// that could tell whether that ran under the guard; now there is, and this is
+/// it. The ask is authored by the *actor* (`FakeStep::ask`) and crosses the
+/// HTTP surface, so the composition of Outcome 4 with Outcome 1 is exercised
+/// on the path the feature actually runs on rather than inline in the engine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11_a_stalled_send_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKSEND";
+    seed_blocked_run(dir.path(), work_id);
+
+    // Retry launches an execution whose actor immediately asks a question;
+    // `hang` keeps the context alive so the answer has somewhere to go.
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [
+            FakeStep::ask("which database should I target?"),
+            FakeStep::hang(),
+        ],
+    );
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+
+    // The actor's authorship reached the journal through the daemon path.
+    let asked: Vec<Value> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == "work.needs_input" && e.work_id.as_deref() == Some(work_id))
+        .map(|e| e.payload)
+        .collect();
+    assert_eq!(asked.len(), 1, "the run must be parked on the actor's ask");
+    assert_eq!(asked[0]["asked_by"], "actor");
+    assert_eq!(asked[0]["prompt"], "which database should I target?");
+
+    fake.hold_sends();
+    let respond = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/input"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid(), "input": "postgres"}))
+                .send()
+                .await
+                .expect("input request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_sends(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake send never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    fake.release_sends();
+    let responded = respond.await.expect("respond task");
+    let delivered = fake.inputs(&fake.starts()[0].execution_id);
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled send: read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(
+        responded.is_success(),
+        "the stalled respond answered {responded}"
+    );
+    assert_eq!(
+        delivered,
+        vec!["postgres".to_string()],
+        "the answer still reached the same execution"
+    );
+}
+
+/// §14.5 for **SEND**: an answer whose delivery lands after a cancel is
+/// recorded as late evidence and moves nothing.
+///
+/// Opening the guard around SEND (t11) opened the window §14.5 exists for:
+/// between `stage.input_received` going durable and the delivery reporting
+/// back, a cancel can retire the run underneath it. The LAUNCH side of that
+/// rule is pinned three times (m4's n3, n23, n24); the SEND side was pinned by
+/// nothing — making `delivery_is_stale` return `None` unconditionally left all
+/// 269 tests green (round-2 finding N3R2-02). Unwired, the late delivery
+/// falls straight into `drive` on a canceled work, which is §22.5's first
+/// prohibition: no terminal Work revived.
+///
+/// Driven through the daemon rather than the engine, because the window only
+/// exists on the path where the guard is actually dropped between the phases:
+/// an inline `provide_input` never lets anyone else in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11b_a_delivery_that_lands_after_a_cancel_does_not_revive_the_work() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LATESEND";
+    seed_blocked_run(dir.path(), work_id);
+
+    // The actor asks; the answer would complete the stage — so if the late
+    // delivery were allowed to drive, it would try to complete a canceled
+    // work, and the journal would say so.
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::ask("postgres or sqlite?"), FakeStep::complete()],
+    );
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+
+    fake.hold_sends();
+    let respond = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/input"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid(), "input": "postgres"}))
+                .send()
+                .await
+                .expect("input request")
+                .status()
+        })
+    };
+
+    // Rendezvous: the delivery is provably in flight, its two appends already
+    // durable, and the guard is open.
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_sends(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake send never reached its gate");
+
+    let canceled = http
+        .post(format!("{}/v1/work/{work_id}/cancel", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("cancel request")
+        .status();
+    assert!(canceled.is_success(), "the cancel answered {canceled}");
+
+    fake.release_sends();
+    let responded = respond.await.expect("respond task");
+    assert!(responded.is_success(), "the respond answered {responded}");
+    let execution_id = fake.starts()[0].execution_id.clone();
+    let delivered = fake.inputs(&execution_id);
+    let view: Value = http
+        .get(format!("{}/v1/work/{work_id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show request")
+        .json()
+        .await
+        .expect("show json");
+    handle.shutdown().await;
+
+    assert_eq!(
+        view["work"]["state"], "canceled",
+        "a late answer must not revive terminal work: {view}"
+    );
+    assert_eq!(
+        delivered,
+        vec!["postgres".to_string()],
+        "the harness did take the words — that is what makes this late, not lost"
+    );
+
+    let events: Vec<(String, Value)> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.work_id.as_deref() == Some(work_id))
+        .map(|e| (e.kind, e.payload))
+        .collect();
+    let kinds: Vec<&str> = events.iter().map(|(k, _)| k.as_str()).collect();
+
+    // It moved nothing. The last word on this work's state is the cancel, and
+    // the stage the answer would have completed stays where the cancel left
+    // it.
+    assert!(
+        !kinds.contains(&"stage.completed"),
+        "the late delivery must not complete the stage: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().rfind(|k| k.starts_with("work.")).copied(),
+        Some("work.canceled"),
+        "no work-state event may follow the cancel: {kinds:?}"
+    );
+
+    // And it is recorded as what it was, not silently dropped: a human's words
+    // reaching a context whose work had already moved on.
+    let abandoned: Vec<&Value> = events
+        .iter()
+        .filter(|(k, _)| k == "execution.abandoned")
+        .map(|(_, p)| p)
+        .collect();
+    let late = abandoned
+        .iter()
+        .find(|p| p["verb"] == "send")
+        .unwrap_or_else(|| panic!("no send abandonment among {abandoned:?}"));
+    assert_eq!(late["reason"], "superseded");
+    assert_eq!(late["delivered"], true);
+    assert_eq!(late["execution_id"], execution_id);
+}
+
+/// §22.6 for the observation a **delivery** is followed by — t9b's other half.
+///
+/// The two performers observe on two different paths, and an instrument that
+/// can only park inside one says nothing about the other; that asymmetry is
+/// how SEND itself survived wave 1 under the guard. So the SEND-side
+/// observation gets its own rendezvous rather than being assumed to follow
+/// from the LAUNCH-side one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t11c_a_stalled_observation_after_a_send_does_not_hold_the_core_lock() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = "01N3LOCKOBSSEND";
+    seed_blocked_run(dir.path(), work_id);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [
+            FakeStep::ask("which database should I target?"),
+            FakeStep::hang(),
+        ],
+    );
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    // Retry first, with observations free: the launch's own observation is
+    // what parks the run on the ask, and t9b covers that one.
+    let status = http
+        .post(format!("{}/v1/work/{work_id}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("retry request")
+        .status();
+    assert!(status.is_success(), "retry answered {status}");
+    let before = fake.observations().len();
+
+    fake.hold_observes();
+    let respond = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let work_id = work_id.to_string();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/input"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid(), "input": "postgres"}))
+                .send()
+                .await
+                .expect("input request")
+                .status()
+        })
+    };
+
+    let parked = {
+        let fake = fake.clone();
+        tokio::task::spawn_blocking(move || fake.await_stalled_observes(1, Duration::from_secs(30)))
+            .await
+            .expect("gate task")
+    };
+    assert!(parked, "the fake observation never reached its gate");
+
+    let read = timed("GET /v1/work", async {
+        http.get(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+    let mutation = timed("POST /v1/work", async {
+        http.post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid(), "intent": "an unrelated submission"}))
+            .send()
+            .await
+            .map(|r| r.status())
+    })
+    .await;
+
+    fake.release_observes();
+    let responded = respond.await.expect("respond task");
+    let after = fake.observations().len();
+    handle.shutdown().await;
+
+    eprintln!("§22.6 stalled observe (send): read {read:?}, mutation {mutation:?}");
+    read.expect("independent read");
+    mutation.expect("independent mutation");
+    assert!(
+        responded.is_success(),
+        "the stalled respond answered {responded}"
+    );
+    assert!(
+        after > before,
+        "the delivery must actually have been followed by an observation \
+         ({before} before, {after} after)"
+    );
+}
+
+// ------------------------------------- the throughput floor, as a guard
+//
+// N3-10: adjudication A-N3-1 amended the burst-50 floor to ">=24 works/s with
+// the control-measured delta documented", against a measurement whose slowest
+// run was 24.2 — about 1% of headroom — and enforcement was a shell script run
+// by hand. Nothing in m1..m6 asserted a throughput floor at all, so a further
+// regression below the amended floor shipped silently.
+
+/// Submission throughput has an automated floor, **on the path the budget was
+/// measured on**.
+///
+/// Round-2 finding N3R2-04: the first version of this posted
+/// `{command_id, intent}` with no `origin.cwd`, which `Engine::plan` answers
+/// with `Ok(None)` — no workspace discovery, no workflow resolution, no
+/// `git worktree add`, no reservation, no launch. It measured 1200 works/s
+/// against a floor of 4 and called that a 6× margin on a 24 works/s budget
+/// measured over the whole submit path. An 86 ms external effect put back
+/// under the submit guard — the measured cost of one `git worktree add` on a
+/// 3.4 MB `.git`, i.e. exactly the regression the failure message named —
+/// dropped the real path to 11.4 works/s and this test still passed.
+///
+/// So it submits what `scripts/perf/s1-burst.sh` submits: `origin.cwd` in a
+/// seeded repository carrying a two-stage workflow, so every accepted call
+/// discovers a workspace, resolves and binds a workflow, materializes a
+/// worktree, reserves an execution and runs the stages. A call's latency is a
+/// work's end-to-end latency, which is what the A-N3-1 number means.
+///
+/// **The floor, and how it is scaled.** A-N3-1's amended budget is ≥24
+/// works/s at burst 50 on a quiet machine. This runs at burst 25 inside a
+/// suite that shares its cores with seven others, so the floor takes a 2×
+/// contention allowance: **12 works/s**. Two measurements make that the
+/// honest number rather than a round one:
+///
+/// - the healthy path here runs 38 works/s idle and 33 works/s with the whole
+///   suite in flight — 2.8× the floor on a loaded host, which is margin
+///   against a scheduler hiccup and not against a regression;
+/// - and the floor is still above the ceiling that the regression class this
+///   exists to catch imposes. Any effect of duration *d* serialized under the
+///   submit guard caps throughput at `1/d` regardless of burst size or host
+///   speed: at the measured 86 ms of a `git worktree add`, that ceiling is
+///   11.6 works/s — below this floor by construction rather than by luck, and
+///   measured at 10.2 works/s when that sleep is actually put back.
+///
+/// The burst is 25 rather than 50 because the guard is bounded by the ceiling
+/// above, not by the burst, and 50 concurrent worktrees on a shared test host
+/// is a lot of disk for no extra signal. When the group-commit fix (#44) lands
+/// and the measurement rises, this floor rises with it.
+///
+/// **What it does not catch, and what does.** A second fsync per journal
+/// append — A-N3-1's own cost story, and #44's target — is ~5% of a submit on
+/// this container's filesystem (38.2 → 36.8 works/s measured), which is inside
+/// the noise of any floor that does not flake. Timing is the wrong instrument
+/// for it and the previous version of this comment claimed otherwise; m6's
+/// `t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for` counts it
+/// instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t12_submission_throughput_has_an_automated_floor() {
+    /// A-N3-1's amended budget, on a quiet machine at burst 50.
+    const BUDGET: f64 = 24.0;
+    /// How much slower a suite sharing its cores with seven others may be.
+    const CONTENTION_ALLOWANCE: f64 = 2.0;
+    /// Works per second the daemon must sustain, whole submit path.
+    const THROUGHPUT_FLOOR: f64 = BUDGET / CONTENTION_ALLOWANCE;
+    const BURST: usize = 25;
+
+    let dir = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    seed_workflow_repo(&repo);
+
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let handle = start_with_fake(dir.path(), &fake).await;
+    let http = client();
+
+    let started = Instant::now();
+    let mut inflight = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let repo = repo.clone();
+        inflight.push(tokio::spawn(async move {
+            let response = http
+                .post(format!("{endpoint}/v1/work"))
+                .bearer_auth(token)
+                .json(&json!({
+                    "command_id": ulid(),
+                    "intent": "throughput floor",
+                    "backend": FAKE_BACKEND_NAME,
+                    "origin": {"client": "cli", "cwd": repo},
+                }))
+                .send()
+                .await
+                .expect("submit");
+            let status = response.status();
+            let body: Value = response.json().await.expect("submit json");
+            (status, body)
+        }));
+    }
+    let mut completed = 0usize;
+    let mut created = 0usize;
+    for task in inflight {
+        let (status, body) = task.await.expect("submit task");
+        if status.is_success() {
+            created += 1;
+            if body["work"]["state"] == "completed" {
+                completed += 1;
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    handle.shutdown().await;
+
+    assert_eq!(created, BURST, "every submission must be accepted");
+    // The whole point is that the measured operation is the whole operation: a
+    // burst that parked in `pending` would be timing the HTTP surface again.
+    assert_eq!(
+        completed, BURST,
+        "every submission must have run its workflow to completion — otherwise \
+         this is not measuring the submit path the budget was measured on"
+    );
+    let rate = BURST as f64 / elapsed.as_secs_f64();
+    eprintln!("burst {BURST} (full submit path): {rate:.1} works/s in {elapsed:?}");
+    assert!(
+        rate >= THROUGHPUT_FLOOR,
+        "submission throughput fell to {rate:.1} works/s at burst {BURST}, below the \
+         {THROUGHPUT_FLOOR} works/s floor — A-N3-1's amended budget of {BUDGET} works/s \
+         at burst 50 (docs/perf/n3-two-phase-boundary-2026-08-10.md) divided by a \
+         {CONTENTION_ALLOWANCE}× allowance for a shared test host. This is the whole \
+         submit path — workspace discovery, workflow bind, `git worktree add`, \
+         reservation, launch — so any external effect of ~80 ms or more put back under \
+         the core lock lands below it, whatever the host speed."
+    );
+}
+
+/// A repository the submit path can actually run in: one commit, and a
+/// two-stage workflow under `.sergeant/workflows/`.
+///
+/// The same shape `scripts/perf/s1-burst.sh` seeds, because a throughput floor
+/// asserted here is only comparable to the budget if it submits the same work.
+fn seed_workflow_repo(repo: &Path) {
+    let workflow = repo.join(".sergeant/workflows/software-change");
+    for stage in ["10-implement", "20-review"] {
+        std::fs::create_dir_all(workflow.join(stage)).expect("stage dir");
+        std::fs::write(
+            workflow.join(stage).join("CONTEXT.md"),
+            format!("Stage {stage} of the throughput fixture.\n"),
+        )
+        .expect("CONTEXT.md");
+    }
+    std::fs::write(
+        workflow.join("workflow.toml"),
+        "[workflow]\nname = \"software-change\"\nversion = \"1\"\n\
+         stages = [\"10-implement\", \"20-review\"]\n",
+    )
+    .expect("workflow.toml");
+    std::fs::write(repo.join("payments.py"), "def settle(payment):\n    pass\n")
+        .expect("source file");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["add", "-A"],
+        vec!["commit", "-qm", "throughput fixture"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "sergeant tests")
+            .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+            .env("GIT_COMMITTER_NAME", "sergeant tests")
+            .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
 }

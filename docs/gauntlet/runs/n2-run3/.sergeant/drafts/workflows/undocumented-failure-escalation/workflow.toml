@@ -1,0 +1,4 @@
+[workflow]
+name = "undocumented-failure-escalation"
+version = "1"
+stages = []

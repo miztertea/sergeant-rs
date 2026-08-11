@@ -2300,6 +2300,212 @@ fn declared_event_kinds() -> Vec<(String, String)> {
     found
 }
 
+/// §22.6, structurally: every external effect the engine performs lives
+/// inside a pending-effect performer, and nowhere a `&mut Core` can reach.
+///
+/// INV-N3-08's finding about the wave-1 verdict was that the instrument could
+/// only park the fake inside LAUNCH and inside a stop `Completion`, so "no
+/// external I/O, process wait or thread join under the core lock" was a claim
+/// about two paths reported as a claim about the lock. Timing tests can only
+/// ever cover the effects someone thought to gate. This one covers the class:
+/// the engine's git and harness calls must appear only in
+/// `PendingSurface::perform`, `PendingLaunch::perform`/`launch` and
+/// `PendingSend::perform`, which take no `Core` and therefore cannot be called
+/// with the guard held by construction.
+///
+/// Like t5's `ApiViews` pin, widening this is meant to be deliberate: moving
+/// an effect back into a `&mut Core` path fails here with the call site named.
+///
+/// Round-2 finding N3R2-03: the enumeration was itself incomplete. OBSERVE
+/// and §15 RESUME are external effects — a handle the Claude adapter has no
+/// memory of sends it walking `/proc`, and §22.6 names "reading a large
+/// output stream" beside the spawn — and both performers were changed to take
+/// their observation outside the guard for exactly that reason. But neither
+/// verb was on this list, so an OBSERVE inside a `&mut Core` function was
+/// invisible here, and one was: `drive` used to fall back to observing itself
+/// whenever a caller handed it no observation. Both verbs are enumerated now,
+/// and every remaining call site is named below as a single-owner path.
+#[test]
+fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
+    let source = code_only(&read_source("runtime/engine.rs"));
+    // The performers, by the exact signatures that make them safe: none of
+    // them can see a `Core`.
+    let performers = [
+        (
+            "impl PendingSurface",
+            "pub fn perform(&self) -> SurfaceOutcome",
+        ),
+        (
+            "impl PendingLaunch",
+            "pub fn perform(&self) -> LaunchOutcome",
+        ),
+        ("impl PendingSend", "pub fn perform(&self) -> SendOutcome"),
+    ];
+    let mut ranges = Vec::new();
+    for (block, signature) in performers {
+        let start = source
+            .find(block)
+            .unwrap_or_else(|| panic!("engine.rs must declare `{block}`"));
+        assert!(
+            source[start..].contains(signature),
+            "`{block}` must expose `{signature}` — the performer's whole safety \
+             property is that it never receives a Core"
+        );
+        ranges.push((start, block_end(&source, start)));
+    }
+    // `PendingLaunch::launch` is the raw effect the two-phase tests drive by
+    // hand; it lives in the same block and is covered by the range above.
+    //
+    // The call sites deliberately outside them, named here rather than left
+    // to be discovered. Every one is a single-owner path: startup recovery,
+    // which runs between journal replay and the first served request, and the
+    // inline drivers recovery and the deterministic tests use, which hold the
+    // only reference to the Core there is (see `run_inline`'s doc comment).
+    // Nothing is queueing behind the guard in any of them, because nothing is
+    // being served. Adding to this list is the deliberate act; adding to it
+    // for a path the daemon serves requests from would be a lie the timing
+    // tests (m2's t9/t9b/t10/t11/t11c) would then catch.
+    for single_owner in [
+        "pub fn reconcile_terminal_surface",
+        "fn run_inline",
+        "pub fn resume(&self",
+        "pub fn reconcile_work",
+        "fn reserved_identity_liveness",
+        "fn reattach",
+    ] {
+        let start = source
+            .find(single_owner)
+            .unwrap_or_else(|| panic!("engine.rs must declare `{single_owner}`"));
+        ranges.push((start, block_end(&source, start)));
+    }
+
+    for effect in [
+        "materialize(",
+        "rematerialize(",
+        "teardown(",
+        "backend.launch(",
+        "backend.send(",
+        "backend.observe(",
+        "backend.resume(",
+        "pending.perform(",
+    ] {
+        for (index, _) in source.match_indices(effect) {
+            // `self.tear_down…`/`…rematerialize` as part of a longer
+            // identifier is a different symbol; require a boundary.
+            let preceded_by_ident = source[..index]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if preceded_by_ident {
+                continue;
+            }
+            assert!(
+                ranges
+                    .iter()
+                    .any(|(start, end)| index > *start && index < *end),
+                "src/runtime/engine.rs calls `{effect}` outside every out-of-lock \
+                 performer, near: {:?}",
+                &source[index.saturating_sub(120)..(index + 60).min(source.len())]
+            );
+        }
+    }
+}
+
+/// The journal's append path issues exactly the one fsync it accounts for.
+///
+/// A-N3-1's whole cost story is per-event fsyncs — the two-phase boundary
+/// added two per work, that is the 25% the budget was amended over, and #44's
+/// fix is one fsync per lock hold instead of one per event. So "an extra fsync
+/// per append" is *the* named throughput regression, and round-2 finding
+/// N3R2-04 showed the throughput guard could not see it: on this container an
+/// fsync costs ~0.08 ms, so a second one per append is ~5% of a submit —
+/// inside the noise of any floor that does not flake (measured: 38.2 → 36.8
+/// works/s at burst 25).
+///
+/// Timing is the wrong instrument for it; counting is the right one, and
+/// `Journal::fsync_count` already exists for that. But the counter is derived
+/// from *one* `sync_data` call, so a second durability syscall beside it is
+/// invisible to the counter as well — which is exactly the mutation the
+/// finding used. This closes both: every `sync_data`/`sync_all` in the module
+/// must live in a named block, and `write_and_sync` — the only one on the
+/// acknowledged-append path — must contain exactly one, the accounted one.
+///
+/// m1's `crash_tail…` tests assert the counter's value per append; this
+/// asserts the counter is the whole truth about what the append path syncs.
+#[test]
+fn t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for() {
+    let source = code_only(&read_source("runtime/journal.rs"));
+    // Where a durability syscall may appear, and why.
+    let allowed = [
+        // The accounted per-append sync.
+        "fn write_and_sync",
+        // The rollback after a failed append: re-syncs a truncated segment so
+        // a torn tail cannot be concatenated onto. Not an acknowledged append.
+        "pub fn append_event",
+        // Startup quarantine of a torn tail, and the dirent sync that makes a
+        // new segment survive its own creation. Neither is on the hot path.
+        "fn recover_tail",
+        "fn sync_dir",
+    ];
+    let ranges: Vec<(usize, usize)> = allowed
+        .iter()
+        .map(|block| {
+            let start = source
+                .find(block)
+                .unwrap_or_else(|| panic!("journal.rs must declare `{block}`"));
+            (start, block_end(&source, start))
+        })
+        .collect();
+
+    for effect in [".sync_data(", ".sync_all("] {
+        for (index, _) in source.match_indices(effect) {
+            assert!(
+                ranges
+                    .iter()
+                    .any(|(start, end)| index > *start && index < *end),
+                "src/runtime/journal.rs calls `{effect}` outside every accounted \
+                 durability site, near: {:?}",
+                &source[index.saturating_sub(120)..(index + 60).min(source.len())]
+            );
+        }
+    }
+
+    // And the append path syncs once, through the expression that counts it.
+    let (start, end) = ranges[0];
+    let body = &source[start..end];
+    let syncs = body.matches(".sync_data(").count() + body.matches(".sync_all(").count();
+    assert_eq!(
+        syncs, 1,
+        "`write_and_sync` must issue exactly one durability syscall — a second \
+         one is an fsync per append that `fsync_count` cannot see and no \
+         throughput floor on a fast filesystem can feel: {body}"
+    );
+    assert!(
+        body.contains("self.fsync_count += self.segment_file.sync_data()"),
+        "the one sync must be the counted one, so the counter cannot drift \
+         from the syscall: {body}"
+    );
+}
+
+/// The end of the `{ … }` block that starts at or after `from`.
+fn block_end(source: &str, from: usize) -> usize {
+    let open = source[from..].find('{').expect("a block") + from;
+    let mut depth = 0usize;
+    for (offset, c) in source[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + offset;
+                }
+            }
+            _ => {}
+        }
+    }
+    source.len()
+}
+
 fn read_source(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src")

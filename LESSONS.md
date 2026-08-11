@@ -6,6 +6,40 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L15 — A claim transmitted to another agent must carry its evidence or be labeled hypothesis
+
+N-series close-out, 2026-08-11: the orchestrator told the Run B operator
+that the workflow's CONTEXT.md instructed `sgt respond` — remembered from
+authoring *different* prompts, never read. The operator read the file,
+found the claim false, and reported the real defect (a live-vs-test signal
+discrepancy, #46) instead of the transmitted fiction. L12's transmission
+corollary: the receiving agent cannot tell your verified facts from your
+confident guesses, and a coordinator's wrong "fact" arrives wearing
+authority it didn't earn. Rule: instructions to other agents state, for
+each factual claim, the evidence read in-session (file, journal line, run
+ID) — or say "hypothesis, verify before acting on it." The same wake's
+mirror image: the operator declined the orchestrator's credential-copy
+instruction in favor of the documented safer fix — subagent skepticism of
+the coordinator is the loop's protection running upward (L9's other half),
+and it must stay licensed.
+
+## L14 — Binding rules live where sessions actually look; one document deep is half-applied
+
+S-series retrospective, 2026-08-11: every process error the owner caught
+had the same shape — the governing rule existed but lived below CLAUDE.md
+(the loop's applicability in gauntlet-pattern.md; the living-vs-frozen
+split implicit in reference/notes' own revision convention; the
+Fixes-trailer discipline in one Bug Sprint sentence), while CLAUDE.md
+carried things that go stale (test counts, register ranges, embedded
+coverage numbers) and warnings without their escape (the self-matching
+pgrep, named twice, bit twice anyway). Rules: promote applicability rules
+and safe incantations INTO CLAUDE.md; demote volatile numbers OUT of it
+(refer to the ledger/baseline); a warning that names a trap must name the
+escape. Same-day corollary from the CI lane's shakedown: environment
+facts measured in one environment (root container) are hypotheses in the
+next (non-root runner) — record the environment matrix beside the tests
+that depend on it.
+
 ## L13 — A builder's probe of its own pin is evidence, never verification
 
 S1 phase 1: launched as a single self-probing builder under a stretched

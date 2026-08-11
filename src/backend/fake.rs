@@ -20,13 +20,14 @@
 //!   is reproducible without a real process.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
 use super::{
-    Backend, BackendError, Capabilities, ExecutionHandle, NativeEvent, NativeState, Observation,
-    ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
+    Backend, BackendError, Capabilities, Completion, ExecutionHandle, NativeEvent, NativeState,
+    Observation, PreparedExecution, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use crate::backend::BackendSignal;
 
@@ -52,6 +53,7 @@ pub fn parse_script(script: &str) -> Vec<FakeStep> {
                 "complete" if detail.is_empty() => Some(FakeStep::complete()),
                 "complete" => Some(FakeStep::complete_with(detail)),
                 "needs_input" => Some(FakeStep::needs_input(detail)),
+                "ask" => Some(FakeStep::ask(detail)),
                 "waiting" => Some(FakeStep::waiting(detail)),
                 "blocked" => Some(FakeStep::blocked(detail)),
                 "fail" => Some(FakeStep::fail(detail)),
@@ -86,11 +88,18 @@ impl FakeStep {
         })
     }
 
-    /// Asks for human input.
+    /// Asks for human input — the *adapter* asking (a gate, a policy stop).
     pub fn needs_input(prompt: &str) -> Self {
-        Self::running(BackendSignal::NeedsInput {
-            prompt: prompt.to_string(),
-        })
+        Self::running(BackendSignal::needs_input(prompt))
+    }
+
+    /// GP-2's ask: the **actor** authored this question and is waiting for a
+    /// human answer on the same execution. Distinct from
+    /// [`FakeStep::needs_input`] in exactly the way the two are distinct in a
+    /// real harness — same park, different author — so a test can prove the
+    /// engine carries the authorship instead of flattening it.
+    pub fn ask(question: &str) -> Self {
+        Self::running(BackendSignal::ask(question))
     }
 
     /// Waits on an external condition.
@@ -141,6 +150,73 @@ impl FakeStep {
     }
 }
 
+/// A place a scripted execution can be made to stall on purpose.
+///
+/// §22.6 asks for instrumentation proving the core lock is not held across an
+/// external effect, and the only way to prove a negative about a lock is to
+/// make the effect take arbitrarily long and watch an *independent* request go
+/// through anyway. A sleep would make the test a race against a clock; a gate
+/// makes it a rendezvous: the test waits until the executor is provably parked
+/// inside the effect, does its independent work, and only then releases.
+#[derive(Debug, Default)]
+struct Gate {
+    inner: Mutex<GateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    held: bool,
+    /// How many callers are parked inside the gate right now.
+    waiting: usize,
+}
+
+impl Gate {
+    /// Close the gate: every later [`Gate::pass`] parks until released.
+    fn hold(&self) {
+        self.inner.lock().expect("gate lock").held = true;
+    }
+
+    /// Open the gate and wake everyone parked in it.
+    fn release(&self) {
+        self.inner.lock().expect("gate lock").held = false;
+        self.changed.notify_all();
+    }
+
+    /// Go through, parking while the gate is closed.
+    fn pass(&self) {
+        let mut state = self.inner.lock().expect("gate lock");
+        state.waiting += 1;
+        self.changed.notify_all();
+        while state.held {
+            state = self.changed.wait(state).expect("gate wait");
+        }
+        state.waiting -= 1;
+        self.changed.notify_all();
+    }
+
+    /// Block until at least `n` callers are parked inside, or the deadline
+    /// passes. Returns whether the rendezvous happened.
+    fn wait_for_waiting(&self, n: usize, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.inner.lock().expect("gate lock");
+        while state.waiting < n {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("gate wait");
+            state = next;
+            if timed_out.timed_out() && state.waiting < n {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[derive(Debug)]
 struct FakeExecution {
     /// The backend's own name for the native context. §25's restart sequence
@@ -156,11 +232,15 @@ struct FakeExecution {
 struct FakeState {
     script: VecDeque<FakeStep>,
     executions: BTreeMap<String, FakeExecution>,
+    /// Contexts this adapter no longer holds in memory but which still exist
+    /// out in the world — see [`FakeBackend::forget_executions`].
+    forgotten: BTreeMap<String, FakeExecution>,
     starts: Vec<StartRequest>,
     stop_requests: Vec<String>,
     interrupt_requests: Vec<String>,
     resume_requests: Vec<(String, ResumeRequest)>,
     observations: Vec<String>,
+    probes: usize,
     available: bool,
     detail: Option<String>,
 }
@@ -176,6 +256,31 @@ pub struct FakeBackend {
     name: String,
     capabilities: Capabilities,
     state: Arc<Mutex<FakeState>>,
+    /// Where LAUNCH can be made to stall (§22.6's "deliberately stalled fake
+    /// executor"). Deliberately *not* inside `state`: a caller parked in the
+    /// gate must not be holding the backend's own lock, or the instrument
+    /// would measure the fake's contention instead of the daemon's.
+    launch_gate: Arc<Gate>,
+    /// Where SEND can be made to stall. SEND is an external effect too — for
+    /// a print-mode harness it is the same fork/exec LAUNCH is — so §22.6's
+    /// instrument has to be able to park inside it, or the budget's verdict
+    /// is a claim about the paths the instrument happens to reach.
+    send_gate: Arc<Gate>,
+    /// Where OBSERVE can be made to stall. OBSERVE is the third external
+    /// effect and the least obviously one: for the Claude adapter a handle it
+    /// has no memory of sends it walking `/proc`, and §22.6 lists "reading a
+    /// large output stream" beside the process spawn. It rides home in
+    /// [`PendingLaunch::perform`](crate::runtime::engine::PendingLaunch::perform)
+    /// and [`PendingSend::perform`](crate::runtime::engine::PendingSend::perform)
+    /// for exactly that reason — and an instrument that cannot park inside it
+    /// cannot say so, which is how an OBSERVE moved back under the guard
+    /// survived wave 1 and wave 2 both.
+    observe_gate: Arc<Gate>,
+    /// Where a STOP [`Completion`] can be made to stall — the fake's stand-in
+    /// for the Claude adapter's transcript-archive join (issue #14/B3).
+    archive_gate: Arc<Gate>,
+    /// Whether STOP/INTERRUPT hand back a deferred completion at all.
+    archive_armed: Arc<Mutex<bool>>,
 }
 
 impl FakeBackend {
@@ -199,19 +304,31 @@ impl FakeBackend {
                 resume: true,
                 model_selection: true,
                 profiles: true,
+                // The fake's "actor" is its script, and a scripted
+                // `FakeStep::ask` is an unambiguous structured record of the
+                // actor authoring a question — which is precisely what the
+                // capability claims. Nothing is inferred from prose.
+                ask: true,
                 ..Capabilities::default()
             },
             state: Arc::new(Mutex::new(FakeState {
                 script: script.into_iter().collect(),
                 executions: BTreeMap::new(),
+                forgotten: BTreeMap::new(),
                 starts: Vec::new(),
                 stop_requests: Vec::new(),
                 interrupt_requests: Vec::new(),
                 resume_requests: Vec::new(),
                 observations: Vec::new(),
+                probes: 0,
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
             })),
+            launch_gate: Arc::new(Gate::default()),
+            send_gate: Arc::new(Gate::default()),
+            observe_gate: Arc::new(Gate::default()),
+            archive_gate: Arc::new(Gate::default()),
+            archive_armed: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -237,6 +354,85 @@ impl FakeBackend {
             Ok(script) => Self::scripted(name, parse_script(&script)),
             Err(_) => Self::new(name),
         }
+    }
+
+    /// Stall every later LAUNCH until [`FakeBackend::release_launches`].
+    ///
+    /// The §22.6 instrument. A launch parked here is an external effect in
+    /// flight; anything the daemon can still answer while it is parked is
+    /// something the core lock was demonstrably not held across.
+    pub fn hold_launches(&self) {
+        self.launch_gate.hold();
+    }
+
+    /// Let stalled launches through.
+    pub fn release_launches(&self) {
+        self.launch_gate.release();
+    }
+
+    /// Block until `n` launches are parked in the gate, or the timeout
+    /// expires. Returns whether the rendezvous happened — a test asserts on
+    /// it rather than sleeping and hoping.
+    pub fn await_stalled_launches(&self, n: usize, timeout: Duration) -> bool {
+        self.launch_gate.wait_for_waiting(n, timeout)
+    }
+
+    /// Stall every later SEND until [`FakeBackend::release_sends`].
+    ///
+    /// The §22.6 instrument for the other verb that creates external work.
+    /// `ClaudeBackend::send` spawns a `claude -p --resume` turn plus its
+    /// reader threads, so a `respond` is as much a process spawn as a launch
+    /// is — and it is the verb GP-2's ask primitive resumes through.
+    pub fn hold_sends(&self) {
+        self.send_gate.hold();
+    }
+
+    /// Let stalled sends through.
+    pub fn release_sends(&self) {
+        self.send_gate.release();
+    }
+
+    /// Block until `n` sends are parked in the gate, or the timeout expires.
+    pub fn await_stalled_sends(&self, n: usize, timeout: Duration) -> bool {
+        self.send_gate.wait_for_waiting(n, timeout)
+    }
+
+    /// Stall every later OBSERVE until [`FakeBackend::release_observes`].
+    ///
+    /// The §22.6 instrument for the third external effect. Both performers
+    /// take their observation before handing the outcome back to the settle
+    /// phase; parking inside it is the only way to tell that apart from an
+    /// observation taken with the guard already re-acquired.
+    pub fn hold_observes(&self) {
+        self.observe_gate.hold();
+    }
+
+    /// Let stalled observations through.
+    pub fn release_observes(&self) {
+        self.observe_gate.release();
+    }
+
+    /// Block until `n` observations are parked in the gate, or time out.
+    pub fn await_stalled_observes(&self, n: usize, timeout: Duration) -> bool {
+        self.observe_gate.wait_for_waiting(n, timeout)
+    }
+
+    /// Make STOP/INTERRUPT hand back a *deferred* [`Completion`] — the fake's
+    /// stand-in for the Claude adapter's transcript archive — and stall it
+    /// until [`FakeBackend::release_archives`].
+    pub fn hold_archives(&self) {
+        *self.archive_armed.lock().expect("archive arm lock") = true;
+        self.archive_gate.hold();
+    }
+
+    /// Let stalled stop/interrupt completions finish.
+    pub fn release_archives(&self) {
+        self.archive_gate.release();
+    }
+
+    /// Block until `n` stop/interrupt completions are parked, or time out.
+    pub fn await_stalled_archives(&self, n: usize, timeout: Duration) -> bool {
+        self.archive_gate.wait_for_waiting(n, timeout)
     }
 
     /// Make PROBE report unavailable (routing must then fail closed).
@@ -267,6 +463,17 @@ impl FakeBackend {
     /// launch configuration" is a property tests assert directly.
     pub fn resume_requests(&self) -> Vec<(String, ResumeRequest)> {
         self.lock().resume_requests.clone()
+    }
+
+    /// How many times PROBE has been asked of this backend.
+    ///
+    /// The real adapters cache their probe after the first call, so *when* the
+    /// first one happens decides whether a later `prepare` under the core lock
+    /// forks `claude --version` or reads a warm cache (§22.6's "probing a slow
+    /// external executable"). That ordering is a property tests assert, not an
+    /// accident of startup.
+    pub fn probe_count(&self) -> usize {
+        self.lock().probes
     }
 
     /// Execution ids OBSERVE was called for, in order.
@@ -303,6 +510,45 @@ impl FakeBackend {
         self.native_state(execution_id) == Some(NativeState::Running)
     }
 
+    /// The running actor authors a question, mid-execution (GP-2).
+    ///
+    /// This is the out-of-band half of the ask primitive: nothing about the
+    /// script decided it, and no engine call produced it — a live execution
+    /// changed what it is saying while the engine was elsewhere, exactly as a
+    /// real actor does when it reaches a decision it cannot make alone. The
+    /// next OBSERVE reports it as [`AskAuthor::Actor`](super::AskAuthor::Actor).
+    ///
+    /// Returns whether the execution was known; an ask against an execution
+    /// this backend never had is refused, not invented.
+    pub fn actor_asks(&self, execution_id: &str, question: &str) -> bool {
+        let mut state = self.lock();
+        match state.executions.get_mut(execution_id) {
+            Some(execution) => {
+                execution.step.signal = BackendSignal::ask(question);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop this adapter's *memory* of every execution while leaving the
+    /// contexts themselves intact — the shape a daemon restart leaves for an
+    /// adapter whose native contexts are durable.
+    ///
+    /// This is the Claude case made scriptable. A restarted `ClaudeBackend`
+    /// has an empty execution table while the conversations it started are
+    /// still on disk: SEND and OBSERVE answer `UnknownExecution`, and §15
+    /// RESUME is the one verb that can bring a context back into the
+    /// adapter's hands. Sharing a `FakeBackend` across a simulated restart
+    /// modelled only the *other* case — an adapter that somehow remembered
+    /// everything — which is why nothing caught a `respond` that could not
+    /// survive one.
+    pub fn forget_executions(&self) {
+        let mut state = self.lock();
+        let remembered = std::mem::take(&mut state.executions);
+        state.forgotten.extend(remembered);
+    }
+
     /// Reprogram every live execution to "the stage finished and the native
     /// context then exited" — the session that completed while the daemon was
     /// down, which is the realistic restart case.
@@ -317,6 +563,16 @@ impl FakeBackend {
                 execution.step = FakeStep::complete().with_native(NativeState::Exited);
             }
         }
+    }
+
+    /// The [`Completion`] STOP/INTERRUPT hand back: nothing to wait for by
+    /// default, and a gated wait once a test has armed the archive stall.
+    fn completion(&self) -> Completion {
+        if !*self.archive_armed.lock().expect("archive arm lock") {
+            return Completion::immediate();
+        }
+        let gate = Arc::clone(&self.archive_gate);
+        Completion::deferred(move || gate.pass())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeState> {
@@ -374,14 +630,44 @@ impl Backend for FakeBackend {
     }
 
     fn probe(&self) -> ProbeReport {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.probes += 1;
         ProbeReport {
             available: state.available,
             detail: state.detail.clone(),
         }
     }
 
-    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
+    /// PREPARE allocates this execution's native identity and nothing else:
+    /// no script step is consumed, no execution table entry appears, and the
+    /// gate is not touched. That is what makes it safe to call under the core
+    /// lock — and what makes the reservation the engine journals a claim
+    /// about an identity that does not exist yet.
+    fn prepare(&self, request: &StartRequest) -> Result<PreparedExecution, BackendError> {
+        let state = self.lock();
+        if !state.available {
+            return Err(BackendError::Unavailable {
+                backend: self.name.clone(),
+                detail: state
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "scripted unavailable".to_string()),
+            });
+        }
+        Ok(PreparedExecution {
+            execution_id: request.execution_id.clone(),
+            native_id: Some(format!("fake-session-{}", request.execution_id)),
+            request: request.clone(),
+        })
+    }
+
+    /// LAUNCH is the external effect — and therefore the one place a test can
+    /// stall this backend (see [`FakeBackend::hold_launches`]). The gate is
+    /// passed *before* the state lock is taken, so a parked launch holds
+    /// nothing at all: it is a stand-in for a process spawn, not for
+    /// contention inside the adapter.
+    fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        self.launch_gate.pass();
         let mut state = self.lock();
         if !state.available {
             return Err(BackendError::Unavailable {
@@ -393,10 +679,13 @@ impl Backend for FakeBackend {
             });
         }
         let step = Self::next_step(&mut state);
-        state.starts.push(request.clone());
-        let native_id = format!("fake-session-{}", request.execution_id);
+        state.starts.push(prepared.request.clone());
+        let native_id = prepared
+            .native_id
+            .clone()
+            .unwrap_or_else(|| format!("fake-session-{}", prepared.execution_id));
         state.executions.insert(
-            request.execution_id.clone(),
+            prepared.execution_id.clone(),
             FakeExecution {
                 native_id: native_id.clone(),
                 step,
@@ -405,12 +694,16 @@ impl Backend for FakeBackend {
             },
         );
         Ok(ExecutionHandle {
-            execution_id: request.execution_id.clone(),
+            execution_id: prepared.execution_id.clone(),
             native_id: Some(native_id),
         })
     }
 
+    /// SEND is an external effect, and therefore gated exactly as LAUNCH is —
+    /// the gate is passed before the state lock, so a parked send holds
+    /// nothing of the backend's own.
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
+        self.send_gate.pass();
         let mut state = self.lock();
         self.resolve(&state, handle)?;
         // Delivering input advances this execution to the next scripted step:
@@ -425,7 +718,11 @@ impl Backend for FakeBackend {
         Ok(())
     }
 
+    /// OBSERVE is an external effect too, and therefore gated exactly as
+    /// LAUNCH and SEND are — the gate is passed before the state lock, so a
+    /// parked observation holds nothing of the backend's own.
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError> {
+        self.observe_gate.pass();
         let mut state = self.lock();
         state.observations.push(handle.execution_id.clone());
         let execution = self.resolve(&state, handle)?;
@@ -444,7 +741,7 @@ impl Backend for FakeBackend {
     /// the execution stays known, its signal survives, and — like the real
     /// adapters — a compliant native context reports its turn process gone
     /// while a hang keeps running.
-    fn interrupt(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
+    fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let mut state = self.lock();
         state.interrupt_requests.push(handle.execution_id.clone());
         self.resolve(&state, handle)?;
@@ -455,12 +752,18 @@ impl Backend for FakeBackend {
         if !execution.step.ignores_stop {
             execution.step.native = NativeState::Exited;
         }
-        Ok(())
+        drop(state);
+        Ok(self.completion())
     }
 
-    /// RESUME re-adopts a known execution; §25's identity rule applies the
-    /// same as everywhere else — a handle without this context's native
-    /// identity is not recognised, it is refused.
+    /// RESUME re-adopts an execution; §25's identity rule applies the same as
+    /// everywhere else — a handle without this context's native identity is
+    /// not recognised, it is refused.
+    ///
+    /// A context this adapter has *forgotten* (see
+    /// [`FakeBackend::forget_executions`]) is exactly what RESUME is for: it
+    /// comes back into the execution table and later SENDs continue it, which
+    /// is the promise `Ok` makes on the real adapter too.
     fn resume(
         &self,
         handle: &ExecutionHandle,
@@ -470,6 +773,18 @@ impl Backend for FakeBackend {
         state
             .resume_requests
             .push((handle.execution_id.clone(), request.clone()));
+        if let Some(forgotten) = state.forgotten.get(&handle.execution_id)
+            && handle.native_id.as_deref() == Some(forgotten.native_id.as_str())
+        {
+            let readopted = state
+                .forgotten
+                .remove(&handle.execution_id)
+                .expect("presence checked above");
+            state
+                .executions
+                .insert(handle.execution_id.clone(), readopted);
+            return Ok(());
+        }
         self.resolve(&state, handle)?;
         Ok(())
     }
@@ -490,7 +805,7 @@ impl Backend for FakeBackend {
             .collect())
     }
 
-    fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
+    fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let mut state = self.lock();
         state.stop_requests.push(handle.execution_id.clone());
         // One identity rule, checked in one place: a handle that has lost its
@@ -507,7 +822,8 @@ impl Backend for FakeBackend {
             execution.step.native = NativeState::Exited;
             execution.step.signal = BackendSignal::Running;
         }
-        Ok(())
+        drop(state);
+        Ok(self.completion())
     }
 }
 
@@ -547,9 +863,7 @@ mod tests {
         );
         assert_eq!(
             fake.observe(&second).expect("observe").signal,
-            BackendSignal::NeedsInput {
-                prompt: "who?".to_string()
-            }
+            BackendSignal::needs_input("who?")
         );
         assert_eq!(
             fake.observe(&third).expect("observe").signal,
@@ -563,8 +877,8 @@ mod tests {
         let hanging = fake.start(&request("hang")).expect("start");
         let compliant = fake.start(&request("ok")).expect("start");
 
-        fake.stop(&hanging).expect("stop");
-        fake.stop(&compliant).expect("stop");
+        fake.stop(&hanging).expect("stop").wait();
+        fake.stop(&compliant).expect("stop").wait();
         assert_eq!(fake.stop_requests(), vec!["hang", "ok"]);
         assert_eq!(
             fake.observe(&hanging).expect("observe").native,
@@ -618,10 +932,10 @@ mod tests {
             for outcome in [
                 fake.observe(&forged).map(|_| ()),
                 fake.send(&forged, "hello"),
-                fake.interrupt(&forged),
+                fake.interrupt(&forged).map(|c| c.wait()),
                 fake.resume(&forged, &ResumeRequest::new("w", PathBuf::from("/tmp"))),
                 fake.history(&forged).map(|_| ()),
-                fake.stop(&forged),
+                fake.stop(&forged).map(|c| c.wait()),
             ] {
                 assert!(
                     matches!(outcome, Err(BackendError::UnknownExecution { .. })),
@@ -655,16 +969,14 @@ mod tests {
         let compliant = fake.start(&request("c")).expect("start");
         let hanging = fake.start(&request("h")).expect("start");
 
-        fake.interrupt(&compliant).expect("interrupt");
-        fake.interrupt(&hanging).expect("interrupt");
+        fake.interrupt(&compliant).expect("interrupt").wait();
+        fake.interrupt(&hanging).expect("interrupt").wait();
         assert_eq!(fake.interrupt_requests(), vec!["c", "h"]);
         let observed = fake.observe(&compliant).expect("observe");
         assert_eq!(observed.native, NativeState::Exited, "the turn died");
         assert_eq!(
             observed.signal,
-            BackendSignal::NeedsInput {
-                prompt: "who?".to_string()
-            },
+            BackendSignal::needs_input("who?"),
             "the conversation's signal survives the interrupt"
         );
         assert_eq!(
@@ -754,15 +1066,11 @@ mod tests {
         let e2 = fake.start(&request("e2")).expect("start pops q2");
         assert_eq!(
             fake.observe(&e1).expect("observe").signal,
-            BackendSignal::NeedsInput {
-                prompt: "q1".to_string()
-            }
+            BackendSignal::needs_input("q1")
         );
         assert_eq!(
             fake.observe(&e2).expect("observe").signal,
-            BackendSignal::NeedsInput {
-                prompt: "q2".to_string()
-            }
+            BackendSignal::needs_input("q2")
         );
 
         // SEND draws from that same shared queue too: the next scripted step

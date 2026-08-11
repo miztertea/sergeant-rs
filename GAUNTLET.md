@@ -38,11 +38,78 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 |---|---|---|---|
 | B1 | M1 adjudication | A foreign snapshot whose `last_seq` is within the journal's range loads undetected (identity binding was removed as beyond-contract machinery) | Snapshots live in the daemon-owned data dir; the threat is operator error, not adversarial. **Revisited at M2 (per checkpoint-gate finding document-1):** the daemon now owns the data dir exclusively (daemon.lock) AND uses full journal replay — no snapshot loading exists in the daemon path at all (builder ruling, R1). B1 is unreachable in production flow; trigger narrowed to "if/when the daemon adopts snapshot loading (likely M5 perf)". **Revisited at M5 (checkpoint round 1):** rebuild-from-journal measured well within budget (bulk-appender fold, ~580x a row-wise-SQL baseline — see `Analytics`'s doc comment in `src/runtime/analytics.rs` and the rebuild bench in `tests/m5_projections.rs`), so rebuild-on-start remains the only population path with no perf case for snapshot loading. B1's trigger still does not fire; still dormant. |
 | B2 | M6 adjudication | Dashboard auth delivers the bearer token in the `sgt web` URL query string (shoulder-surf/history exposure on a shared machine) | Accepted at R1 for the P0: the listener is loopback-only and the token already travels in the printed URL by design; the API refuses query tokens on non-GET/HEAD (CSRF bound), and `/ui` sits behind the same `require_bearer` gate as `/v1`. Post-P0 alternative recorded per the M6 contract: exchange the URL token once for an `HttpOnly; SameSite=Strict` cookie handoff. Trigger: any non-loopback binding or multi-user host. |
-| B3 | P0 final gate | `ClaudeBackend::stop` joins the turn's evidence-archive thread while API handlers hold the core lock, so a concurrent request waits out one transcript flush during a cancel/retry of an in-flight Claude turn | Orchestrator ruling at the final gate (three review rounds converged here): STOP's evidence promise (round-2 fix — the archive is durable before STOP returns) is kept; the lock-hold is rare-path and bounded by one local-disk write; the real fix is a §15 trait-shape change (`stop` returning a join token the caller awaits after releasing the core guard) — R7 machinery, not invented at gate-time without panel coverage. `block_in_place` (d82a6e2) keeps the executor healthy meanwhile; trade-off documented on `stop` itself (d20554d). Trigger: any measured multi-client stall, or the first §15 trait revision for other reasons. |
+| B3 | P0 final gate | `ClaudeBackend::stop` joins the turn's evidence-archive thread while API handlers hold the core lock, so a concurrent request waits out one transcript flush during a cancel/retry of an in-flight Claude turn | Orchestrator ruling at the final gate (three review rounds converged here): STOP's evidence promise (round-2 fix — the archive is durable before STOP returns) is kept; the lock-hold is rare-path and bounded by one local-disk write; the real fix is a §15 trait-shape change (`stop` returning a join token the caller awaits after releasing the core guard) — R7 machinery, not invented at gate-time without panel coverage. `block_in_place` (d82a6e2) keeps the executor healthy meanwhile; trade-off documented on `stop` itself (d20554d). Trigger: any measured multi-client stall, or the first §15 trait revision for other reasons. **CLOSED at N3**: the trigger fired exactly as registered — §14.3's `prepare`/`launch` split is the first §15 trait revision, and B3's own prescribed fix ("`stop` returning a join token the caller awaits after releasing the core guard") is what landed. `stop`/`interrupt` return a `Completion`; the engine collects them into a `Deferred`; `api::crank` drains it after dropping the guard. `block_in_place` removed. Pinned by `tests/m2_daemon_api.rs` t10 — a stalled evidence archive with an independent read answering in ~2 ms — and revert-probed (holding the guard across the drain fails the test in 1 s). Issue #14 closed. |
 
 ---
 
 ## Ledger entries
+
+### N-SERIES CONTAINER CLOSE-OUT — 2026-08-11, v2 measured, Run B, Cerberus handoff
+
+**Mission outcome.** Generator v2 blind-measured (run 3, 2.2M tokens):
+**§22.2 MET** — inverts run 2's verdict; recall ≥56.9% in-scope (v1 47.3%),
+precision 312/312 at full population, all 3 in-scope v1 silent misses
+captured, helper skew collapsed, [S12] closed, review axis found 5/5-real
+findings, checkpoint ledger proven resumable (15/21 partitions honestly
+pending — Cerberus driver-loop work). v2 delta report: "a genuine
+generational improvement, and causally so." Run B (real-Claude, bounded,
+$0.68 usage recorded): one genuine 13-turn actor run produced a correct
+artifact and three defects — the root refusal of the hardcoded skip flag
+(#47), the envelope-less stuck-active seam (#46), and #46's second case:
+a live-vs-test discrepancy where observe_envelope's unit-tested
+StageCompleted derivation never lands as a settled signal. GP-2 never
+fired (correctly — no ask). **#19 stays open, Cerberus-bound**: adapter
+evidence, not a completed soak. PR #48 (S-series retro) merged into the
+branch: resources/ replaces the zip, CLAUDE.md promotions, the
+convergent-evolution probe-gate restoration.
+
+**Environmental behavior.** The Run B operator twice outperformed its
+orchestrator: it declined a credential-copy instruction in favor of the
+documented IS_SANDBOX=1 fix, and refuted the orchestrator's CONTEXT.md
+stall diagnosis by reading the actual file (L12 applied by a subagent to
+its coordinator — the loop's protection running in both directions, L9).
+Both recorded in the run manifest, plus its own polling spelling bug
+honestly reported. Cerberus first acts:
+docs/gauntlet/notes/v2-measurement-and-migration-plan.md; #44 and
+#46/#47 precede the N4 contract alongside R-N0-3's retention ruling.
+
+---
+
+### N3 — 2026-08-10/11, executor-aware stages + two-phase boundary + GP-2 ask
+
+**Mission outcome: contract met; shipping gate passed; closes #14 (B3's
+trigger fired and B3 is closed), #20, #42.** Two-phase external-effect
+boundary (reserve under lock / effect outside / verified settle) across
+START, SEND, and OBSERVE; §15 prepare/launch with join-returning
+stop/interrupt; Claude start-window closed; tagged stage definitions with
+content identity, backward-compatible; per-stage actor selection with
+whole-workflow preflight (§22.4's matrix); GP-2's actor-initiated ask,
+measured on 2.1.226, surviving restart in both directions; §22.5 injection
+matrix bound to engine-written prefixes; §22.6 instruments that can fail.
+**A-N3-1**: burst-50 budget amended to ≥24 works/s — the +2 events/work
+are §22.5-pinned crash windows, not fat; group commit filed as #44 with
+the hard pre-N4 trigger. Gate 276/0, demo green, no leaks. Residuals
+recorded honestly: instruments blind to per-hold regressions <~200 ms
+(perf addendum); the Deferred-Drop backstop leaves a shutdown-race window
+(gate finding, info); git-serialization pin catches 22/23 single runs —
+L7's repeated-run corollary applies.
+
+**Environmental behavior.** One resumed workflow carried the whole loop
+(build→critics→refuters→fixer) + a lean round-2 probe + the pipeline gate:
+B1 Sonnet, B2 Opus (which surfaced the budget breach itself and refused
+the crash-window-deleting fix — upheld), two Opus critics (18 findings,
+18/18 confirmed by refuters — including build-phase errors: Outcome 3
+parsed-but-unrouted; SEND under the lock), Opus fixer (12 commits, 19
+pins), round-2 critic (7 findings, all mutation-demonstrated: the
+unpinned no-substitution fallback, SEND's unpinned §14.5, OBSERVE
+invisible to both instruments, a throughput guard measuring a 230×
+lighter path), round-2 fixer (8 commits — incl. the fsync *accounting*
+instrument where timing was measured inadequate). Pipeline gate found the
+deferred-completion leak on commit failure and, on review, its own fix's
+missing regression test (L7 enforced on the gate itself). Three-for-three:
+every round-2/gate pass found something real the prior pass missed.
+
+---
 
 ### S2 — Stabilization (2026-08-10/11)
 

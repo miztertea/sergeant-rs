@@ -64,13 +64,14 @@ use sergeant_rs::backend::claude::{
 };
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
-    Backend, BackendError, BackendRegistry, BackendSignal, ExecutionHandle, NativeState,
-    ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
+    AskAuthor, Backend, BackendError, BackendRegistry, BackendSignal, Completion, Deferred,
+    ExecutionHandle, NativeState, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, journaling_sink};
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
 use sergeant_rs::domain::execution::{
-    KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
+    KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
+    KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use sergeant_rs::domain::profile::Profile;
 use sergeant_rs::domain::work::{
@@ -78,16 +79,18 @@ use sergeant_rs::domain::work::{
     KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, WorkState,
 };
 use sergeant_rs::domain::workflow::{
-    KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_WORKFLOW_BOUND,
+    KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED,
+    KIND_STAGE_NEEDS_INPUT, KIND_WORKFLOW_BOUND,
 };
 use sergeant_rs::domain::workspace::RepositorySpec;
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
-use sergeant_rs::runtime::engine::Engine;
+use sergeant_rs::runtime::engine::{Engine, Next, PendingLaunch, Step, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::work_registry_projection;
 use sergeant_rs::runtime::recovery;
 use sergeant_rs::runtime::surface::{
-    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN, materialize, work_branch,
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, materialize,
+    work_branch,
 };
 
 // ---------------------------------------------------------------- helpers
@@ -626,6 +629,28 @@ impl StubClaude {
 /// assistant's text, and the result envelope with `modelUsage`.
 const RECORDED_TURN: &str = include_str!("fixtures/claude-2.1.226-turn.jsonl");
 
+/// The recorded `post_turn_summary` line for a turn that asked nothing, from
+/// the N3 ask measurement (`tests/fixtures/README.md` documents its
+/// provenance and why it is a separate file).
+const RECORDED_POST_TURN_SUMMARY: &str =
+    include_str!("fixtures/claude-2.1.226-post-turn-summary-no-ask.jsonl");
+
+/// A *complete* recorded turn: the four kept lines with the measured
+/// `post_turn_summary` spliced in where 2.1.226 emits it — immediately before
+/// the `result` envelope.
+///
+/// The recording omits that line, and a stream without it is a stream saying
+/// "this build has lost the ask grammar", which the adapter now (correctly)
+/// acts on by withdrawing `Capabilities::ask`. A fixture must not make the
+/// CLI look like something it is not, in either direction.
+fn recorded_turn() -> String {
+    let mut lines: Vec<&str> = RECORDED_TURN.lines().filter(|l| !l.is_empty()).collect();
+    let envelope = lines.pop().expect("the result envelope is the last line");
+    lines.push(RECORDED_POST_TURN_SUMMARY.trim());
+    lines.push(envelope);
+    lines.into_iter().map(|line| format!("{line}\n")).collect()
+}
+
 /// The substitution envelope, **derived** from the recorded one by three
 /// named edits (`tests/fixtures/README.md` documents each). Not a recording:
 /// print-mode substitution cannot be provoked on an entitled account, and the
@@ -890,7 +915,7 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
     let repo = TempDir::new().expect("repo");
     init_repo(repo.path());
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut claude = ClaudeConfig::new(data.path());
     claude.executable = stub.path.clone();
 
@@ -1299,7 +1324,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
     std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
 
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.claude_home = Some(home.path().to_path_buf());
     // Not the executable the profile names: the profile's must win here too.
@@ -1394,7 +1419,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
 fn a_recorded_turn_is_normalized_and_archived_verbatim() {
     let data = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     let backend = ClaudeBackend::new(config);
@@ -1461,7 +1486,7 @@ fn a_recorded_turn_is_normalized_and_archived_verbatim() {
         .expect("raw transcript archived");
     assert_eq!(
         String::from_utf8_lossy(&blob),
-        RECORDED_TURN,
+        recorded_turn(),
         "the archive is the stream, byte for byte"
     );
     // And the turn-ended event carries the same ref, so a turn with no
@@ -1544,7 +1569,7 @@ fn an_envelope_less_turn_still_surfaces_its_raw_capture() {
 fn a_failed_raw_archive_is_reported_with_its_reason() {
     let data = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     let backend = ClaudeBackend::new(config);
@@ -1588,7 +1613,7 @@ fn a_failed_raw_archive_is_reported_with_its_reason() {
 fn stop_latches_and_a_stopped_execution_refuses_input() {
     let data = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     let backend = ClaudeBackend::new(config);
@@ -1599,7 +1624,7 @@ fn stop_latches_and_a_stopped_execution_refuses_input() {
     wait_settled(&backend, &handle, Duration::from_secs(10));
     backend.send(&handle, "still welcome").expect("send");
     wait_settled(&backend, &handle, Duration::from_secs(10));
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let err = backend
         .send(&handle, "no longer welcome")
         .expect_err("a stopped execution accepts nothing");
@@ -1650,7 +1675,7 @@ fn an_in_flight_turn_is_killed_by_interrupt_and_reported_as_resumable() {
         "the hanging stub keeps the turn in flight: {in_flight:?}"
     );
 
-    backend.interrupt(&handle).expect("interrupt");
+    backend.interrupt(&handle).expect("interrupt").wait();
     let after = wait_settled(&backend, &handle, Duration::from_secs(10));
     assert_eq!(
         after.native,
@@ -1698,7 +1723,7 @@ fn an_in_flight_turn_is_killed_by_interrupt_and_reported_as_resumable() {
     // directories had accumulated on one container). So: STOP must leave
     // nothing in flight.
     let before = dir_entries(data.path());
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let settled = backend.observe(&handle).expect("observe after stop");
     assert_eq!(
         settled.native,
@@ -1779,11 +1804,11 @@ fn send_refuses_a_second_turn_while_one_is_in_flight() {
     );
 
     // Once the turn settles, the same SEND is accepted.
-    backend.interrupt(&handle).expect("interrupt");
+    backend.interrupt(&handle).expect("interrupt").wait();
     wait_settled(&backend, &handle, Duration::from_secs(10));
     backend.send(&handle, "and another thing").expect("send");
     assert_eq!(stub.wait_for_launches(2).len(), 2);
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
 }
 
 /// STOP kills the turn in flight, not just the ability to send.
@@ -1814,7 +1839,7 @@ fn stop_kills_a_turn_that_is_still_running() {
         NativeState::Running
     );
 
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let after = wait_settled(&backend, &handle, Duration::from_secs(10));
     assert_eq!(
         after.native,
@@ -1839,7 +1864,7 @@ fn a_forged_handle_never_resolves_against_the_claude_adapter() {
     let data = TempDir::new().expect("tempdir");
     let home = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     config.claude_home = Some(home.path().to_path_buf());
@@ -1871,10 +1896,10 @@ fn a_forged_handle_never_resolves_against_the_claude_adapter() {
         for outcome in [
             backend.observe(&forged).map(|_| ()),
             backend.send(&forged, "hello"),
-            backend.interrupt(&forged),
+            backend.interrupt(&forged).map(|c| c.wait()),
             backend.resume(&forged, &ResumeRequest::new("w", data.path())),
             backend.history(&forged).map(|_| ()),
-            backend.stop(&forged),
+            backend.stop(&forged).map(|c| c.wait()),
         ] {
             assert!(
                 matches!(outcome, Err(BackendError::UnknownExecution { .. })),
@@ -1968,7 +1993,7 @@ fn capabilities_match_behaviour_for_every_backend() {
     let data = TempDir::new().expect("tempdir");
     let home = TempDir::new().expect("tempdir");
     let stub = StubClaude::passing(data.path());
-    stub.replays(RECORDED_TURN);
+    stub.replays(&recorded_turn());
     let mut config = ClaudeConfig::new(data.path());
     config.executable = stub.path.clone();
     config.claude_home = Some(home.path().to_path_buf());
@@ -3521,7 +3546,211 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
     );
 }
 
-/// §15's three vocabularies, variant by variant, with `as_str` and the wire
+// ------------------- §14.2 applied to git: the surface effect boundary
+//
+// INV-N3-02: submission held the core mutex across `Workspace::discover`, every
+// stage's `CONTEXT.md` read and three `git` fork/exec/wait cycles per
+// repository; cancel held it across `git worktree remove`; retry across the
+// re-attachment. `git worktree add` on a 3.4 MB `.git` measures 86 ms in this
+// container, and the repository is one the daemon does not own and cannot
+// bound. These pin the phase split the way n1 pins it for the harness: at the
+// moment the authoritative phase returns, the git provably has not run.
+
+/// A workspace plan for `repo`, resolved exactly as a submission would.
+fn plan_for(engine: &Engine, repo: &Path) -> sergeant_rs::runtime::engine::StartPlan {
+    engine
+        .plan(&SubmitContext {
+            cwd: Some(repo),
+            ..SubmitContext::default()
+        })
+        .expect("plan")
+        .expect("a workspace")
+}
+
+/// §14.2 phase 1 for a surface: `begin_start` journals the *intent* to
+/// materialize and hands the git back. No worktree exists yet, and no
+/// `surface.materialized` has been journaled — both of which would be true if
+/// the fork/exec had happened under the caller's lock.
+#[test]
+fn n19_materializing_a_surface_is_an_effect_the_caller_performs() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let mut core = core(data.path());
+    let work_id = "01N3SURFACE1";
+    submit_work(&mut core, work_id, "materialize me");
+    let work = core.registry.state().works[work_id].clone();
+    let plan = plan_for(&engine, &repo);
+
+    let step = engine
+        .begin_start(&mut core, &work, &plan)
+        .expect("begin start");
+    let Next::Surface(pending) = step.next else {
+        panic!("phase 1 must hand the git back to the caller");
+    };
+
+    // The load-bearing negatives: the intent is durable, the effect is not.
+    assert_eq!(
+        kinds_of(&core, work_id),
+        vec![
+            "work.submitted".to_string(),
+            KIND_SURFACE_MATERIALIZING.to_string()
+        ],
+        "nothing past the intent may be journaled by phase 1"
+    );
+    assert!(
+        !data.path().join("surfaces").join(work_id).exists(),
+        "no worktree may exist while the guard is still held"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Pending,
+        "the work does not become active until the surface really exists"
+    );
+
+    // Phase 2 and 3, as the daemon runs them.
+    let outcome = pending.perform();
+    let step = engine
+        .settle_surface(&mut core, pending, outcome)
+        .expect("settle surface");
+    assert!(matches!(step.next, Next::Launch(_)), "then the first stage");
+    assert!(
+        data.path().join("surfaces").join(work_id).exists(),
+        "the surface exists once the effect has run"
+    );
+    let kinds = kinds_of(&core, work_id);
+    assert!(
+        kinds.contains(&KIND_SURFACE_MATERIALIZED.to_string())
+            && kinds.contains(&KIND_WORKFLOW_BOUND.to_string())
+            && kinds.contains(&KIND_WORK_STARTED.to_string()),
+        "and the binding lands with the lock back: {kinds:?}"
+    );
+}
+
+/// The same boundary on the way out: `begin_retire_run` marks the stage,
+/// requests the STOP and hands `git worktree remove` back — the worktree is
+/// still on disk when the authoritative phase returns.
+#[test]
+fn n20_tearing_a_surface_down_is_an_effect_the_caller_performs() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let mut core = core(data.path());
+    let work_id = "01N3SURFACE2";
+    submit_work(&mut core, work_id, "cancel me");
+    let work = core.registry.state().works[work_id].clone();
+    let plan = plan_for(&engine, &repo);
+    engine.start(&mut core, &work, &plan).expect("start");
+    let worktree = core.registry.state().runs[work_id]
+        .surface
+        .as_ref()
+        .expect("surface")
+        .bindings[0]
+        .worktree_path
+        .clone();
+    assert!(worktree.exists(), "the run has a real worktree");
+
+    commit(&mut core, work_id, KIND_WORK_CANCELED, json!({}));
+    let step = engine
+        .begin_retire_run(&mut core, work_id, "work canceled")
+        .expect("begin retire");
+    let Next::Surface(pending) = step.next else {
+        panic!("teardown must be handed back to the caller");
+    };
+    assert!(
+        worktree.exists(),
+        "the removal may not have happened while the guard was held"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).is_empty(),
+        "and nothing may claim it did"
+    );
+
+    let outcome = pending.perform();
+    let step = engine
+        .settle_surface(&mut core, pending, outcome)
+        .expect("settle surface");
+    drain(&engine, &mut core, step);
+    assert!(!worktree.exists(), "the effect removed it");
+    let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1, "and the report is journaled once");
+    assert_eq!(torn[0]["report"]["clean"], true);
+}
+
+/// §14.5 for the surface phase: a cancel that lands while `git worktree add`
+/// is running must not be started over the top of — and the worktrees the git
+/// did create must not be left on disk with no owner.
+#[test]
+fn n21_a_cancel_during_materialization_records_the_surface_and_tears_it_down() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let mut core = core(data.path());
+    let work_id = "01N3SURFACE3";
+    submit_work(&mut core, work_id, "cancel me mid-git");
+    let work = core.registry.state().works[work_id].clone();
+    let plan = plan_for(&engine, &repo);
+
+    let step = engine
+        .begin_start(&mut core, &work, &plan)
+        .expect("begin start");
+    let Next::Surface(pending) = step.next else {
+        panic!("expected the materialize effect");
+    };
+    // The git runs with the guard released — and in that window the human
+    // cancels, which is a decision the journal already holds by the time the
+    // worktrees report back.
+    let outcome = pending.perform();
+    commit(&mut core, work_id, KIND_WORK_CANCELED, json!({}));
+
+    let step = engine
+        .settle_surface(&mut core, pending, outcome)
+        .expect("settle surface");
+    drain(&engine, &mut core, step);
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "a late surface must not revive a work that moved on"
+    );
+    assert!(fake.starts().is_empty(), "and must not start a stage on it");
+    // Nothing owned is lost: the surface git created is journaled, and then
+    // torn down rather than abandoned in the user's repository.
+    assert_eq!(
+        events_of(&core, work_id, KIND_SURFACE_MATERIALIZED).len(),
+        1,
+        "the worktrees that were created are recorded"
+    );
+    let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1, "and removed: {torn:?}");
+    assert!(
+        !data.path().join("surfaces").join(work_id).exists(),
+        "no orphan surface root"
+    );
+}
+
+/// §15's wire vocabularies, variant by variant, with `as_str` and the wire
 /// form checked against each other.
 ///
 /// These names are durable, not diagnostics: `native=exited,
@@ -3532,11 +3761,33 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
 /// touched only one of them would split the vocabulary in two — with every
 /// already-written journal on the far side. Only the reconcile evidence's
 /// two most common values were pinned anywhere before this.
+///
+/// N3 made it four vocabularies rather than three: GP-2's [`AskAuthor`] rides
+/// inside the `needs_input` signal's own wire form, so it is pinned here with
+/// the other three — its `#[serde(default)]` is what lets a payload journaled
+/// before the field existed keep reading back as `adapter`.
 #[test]
 fn the_backend_contracts_wire_vocabulary_is_pinned_variant_by_variant() {
     fn wire<T: serde::Serialize>(value: &T) -> Value {
         serde_json::to_value(value).expect("serialize")
     }
+
+    for (author, name) in [(AskAuthor::Adapter, "adapter"), (AskAuthor::Actor, "actor")] {
+        assert_eq!(author.as_str(), name, "{author:?}");
+        assert_eq!(wire(&author), json!(name), "{author:?} on the wire");
+    }
+    assert_eq!(
+        AskAuthor::default(),
+        AskAuthor::Adapter,
+        "a payload written before `asked_by` existed claims nothing about \
+         authorship, and `adapter` is exactly that claim"
+    );
+    assert_eq!(
+        wire(&BackendSignal::ask("who?"))["asked_by"],
+        json!("actor"),
+        "the actor's own question must be distinguishable on the wire from \
+         the adapter's"
+    );
 
     for (scope, name) in [
         (RuntimeScope::External, "external"),
@@ -3565,12 +3816,7 @@ fn the_backend_contracts_wire_vocabulary_is_pinned_variant_by_variant() {
             },
             "stage_completed",
         ),
-        (
-            BackendSignal::NeedsInput {
-                prompt: "which one?".to_string(),
-            },
-            "needs_input",
-        ),
+        (BackendSignal::needs_input("which one?"), "needs_input"),
         (
             BackendSignal::Waiting {
                 reason: "ci".to_string(),
@@ -3812,7 +4058,7 @@ fn a1_real_claude_session_identity_survives_turns_and_restart() {
     // "retired" is sergeant's decision about this execution, never damage to
     // the native context.
     let transcript = live_transcript_path(&session_id).expect("the durable transcript exists");
-    reborn.stop(&handle).expect("stop");
+    reborn.stop(&handle).expect("stop").wait();
     let refused = reborn
         .send(&handle, "anything")
         .expect_err("a stopped execution accepts nothing");
@@ -3898,7 +4144,7 @@ fn a3_real_claude_interrupt_leaves_the_conversation_resumable() {
         NativeState::Running,
         "the long turn should still be generating when we kill it: {in_flight:?}"
     );
-    backend.interrupt(&handle).expect("interrupt");
+    backend.interrupt(&handle).expect("interrupt").wait();
 
     let after = wait_settled(&backend, &handle, Duration::from_secs(30));
     assert_eq!(after.native, NativeState::Exited);
@@ -3932,9 +4178,1934 @@ fn a3_real_claude_interrupt_leaves_the_conversation_resumable() {
     // §37 again, on the interrupt path: STOP after an INTERRUPT retires the
     // execution (no turn is in flight to kill, which is a no-op and not an
     // error) and the latch holds against further input.
-    backend.stop(&handle).expect("stop");
+    backend.stop(&handle).expect("stop").wait();
     let refused = backend
         .send(&handle, "anything")
         .expect_err("a stopped execution accepts nothing");
     assert!(refused.to_string().contains("stopped"), "{refused}");
+}
+
+// ------------------------------- N3. the two-phase external-effect boundary
+//
+// Proposal §14.2's three phases, and §14.5's rule about what a late result may
+// and may not do. The instrument throughout is the fake backend: `prepare` is
+// pure allocation, `launch` is the external effect, and the tests drive the
+// two halves by hand — which is exactly what the daemon does, with the core
+// lock dropped in between (`api::crank`).
+
+/// A run parked in `blocked` on stage `00-only`, ready for `retry` to reserve
+/// a second attempt. Retry is the cheapest door into the reservation path
+/// that does not need a real workspace on disk.
+fn journal_blocked_run(core: &mut Core, work_id: &str, backend: &str, cwd: &Path) {
+    submit_work(core, work_id, "reserve me a stage");
+    commit(
+        core,
+        work_id,
+        KIND_WORKFLOW_BOUND,
+        json!({
+            "workflow": {"name": "tiny", "version": "1", "source": "test",
+                         "stages": [{"id": "00-only", "context": "c"}]},
+            "backend": backend,
+        }),
+    );
+    journal_surface(core, work_id, cwd);
+    commit(
+        core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+    );
+    commit(core, work_id, KIND_WORK_STARTED, json!({}));
+    commit(
+        core,
+        work_id,
+        KIND_STAGE_BLOCKED,
+        json!({"stage_id": "00-only", "detail": "parked for the test"}),
+    );
+    commit(
+        core,
+        work_id,
+        KIND_WORK_BLOCKED,
+        json!({"reason": "parked"}),
+    );
+}
+
+/// The kinds one work journaled, in order — the cheapest way to assert that
+/// a *sequence* holds, which is what a two-phase boundary is.
+fn kinds_of(core: &Core, work_id: &str) -> Vec<String> {
+    core.journal
+        .replay()
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.work_id.as_deref() == Some(work_id))
+        .map(|e| e.kind)
+        .collect()
+}
+
+/// Crank a [`Step`] the way the daemon does — performing every external
+/// effect outside any lock — until it hands back a launch to inspect.
+///
+/// A retry now begins with a *surface* effect (§14.2 applied to git: the
+/// worktree re-attachment is a `git worktree add`, not a journal append), so a
+/// test that wants the launch phase has to walk the same crank the daemon
+/// walks rather than assuming the first step is the launch.
+fn drain(engine: &Engine, core: &mut Core, step: Step) {
+    let mut step = step;
+    loop {
+        match step.next {
+            Next::Parked => {
+                step.deferred.wait();
+                return;
+            }
+            Next::Launch(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_launch(core, pending, outcome)
+                    .expect("settle launch");
+            }
+            Next::Send(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_send(core, pending, outcome)
+                    .expect("settle send");
+            }
+            Next::Surface(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_surface(core, pending, outcome)
+                    .expect("settle surface");
+            }
+        }
+    }
+}
+
+fn advance_to_launch(engine: &Engine, core: &mut Core, step: Step) -> Box<PendingLaunch> {
+    let mut step = step;
+    loop {
+        match step.next {
+            Next::Launch(pending) => return pending,
+            Next::Surface(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_surface(core, pending, outcome)
+                    .expect("settle surface");
+            }
+            Next::Send(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_send(core, pending, outcome)
+                    .expect("settle send");
+            }
+            Next::Parked => panic!("the crank parked before it reached a launch"),
+        }
+    }
+}
+
+/// §14.2 phase 1 and 3: `execution.reserved` is durable — with the allocated
+/// id, the reserved native identity and the pinned executor spec — **before**
+/// the backend is asked to launch anything, and `execution.started` only
+/// appears after the launch reported back.
+///
+/// The load-bearing assertion is the negative one in the middle: at the
+/// moment the reservation is journaled, the backend has received no START
+/// request at all. That is what "the external effect happens outside the
+/// authoritative phase" means operationally, and it is what a regression
+/// (folding the launch back into the reservation) would break first.
+#[test]
+fn n1_the_reservation_is_journaled_before_anything_is_launched() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3RESERVE1";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+
+    // Phase 1 is complete and durable; phase 2 has not happened.
+    let reserved = events_of(&core, work_id, KIND_EXECUTION_RESERVED);
+    assert_eq!(reserved.len(), 1, "one reservation for one attempt");
+    let reservation = &reserved[0]["reservation"];
+    assert_eq!(reservation["execution_id"], pending.execution_id());
+    assert_eq!(reservation["backend"], FAKE_BACKEND_NAME);
+    assert_eq!(reservation["stage_id"], "00-only");
+    assert_eq!(reservation["index"], 0);
+    assert_eq!(reservation["attempt"], 2, "retry's fresh attempt");
+    assert_eq!(
+        reservation["stage_kind"], "actor",
+        "the pinned executor spec travels with the reservation (§12/§13.4)"
+    );
+    assert_eq!(
+        reservation["native_id"],
+        format!("fake-session-{}", pending.execution_id()),
+        "the identity the adapter reserved is journaled before it can exist"
+    );
+    assert!(
+        fake.starts().is_empty(),
+        "the backend must not have been launched while the reservation was being committed"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "no execution is started until the launch reports back"
+    );
+    assert_eq!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .map(|r| r.execution_id.clone()),
+        Some(pending.execution_id().to_string()),
+        "between the phases the projection shows an outstanding reservation"
+    );
+
+    // Phase 2, then phase 3.
+    let outcome = pending.launch();
+    let execution_id = pending.execution_id().to_string();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let started = events_of(&core, work_id, KIND_EXECUTION_STARTED);
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0]["execution"]["execution_id"], execution_id);
+    assert_eq!(
+        started[0]["execution"]["native_id"],
+        format!("fake-session-{execution_id}"),
+        "the launched identity is the reserved identity, not a second one"
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none(),
+        "a settled reservation is no longer an open window"
+    );
+    let kinds = kinds_of(&core, work_id);
+    let reserved_at = kinds
+        .iter()
+        .position(|k| k == KIND_EXECUTION_RESERVED)
+        .expect("reserved");
+    let started_at = kinds
+        .iter()
+        .position(|k| k == KIND_EXECUTION_STARTED)
+        .expect("started");
+    assert!(
+        reserved_at < started_at,
+        "the reservation must precede the start in the journal: {kinds:?}"
+    );
+}
+
+/// A launch that fails leaves no unsettled reservation behind: the journal
+/// says the reserved identity was never created, and the work fails closed.
+///
+/// Without the abandonment record this would be indistinguishable from a
+/// crash between the two phases — and the next restart would block a work
+/// over a native context that provably does not exist.
+#[test]
+fn n2_a_failed_launch_abandons_its_reservation_and_blocks_the_work() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3RESERVE2";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+    // The harness goes away between the reservation and the launch — the
+    // window the two-phase boundary opens on purpose.
+    fake.set_available(false, "the harness vanished mid-launch");
+    let outcome = pending.launch();
+    assert!(outcome.is_err(), "the launch must have failed");
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "launch_failed");
+    assert_eq!(abandoned[0]["launched"], false);
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "nothing started"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none(),
+        "the window is closed: a restart must not re-block over this"
+    );
+}
+
+/// §14.5: a launch that finishes after the durable state moved on is *late
+/// evidence*, never an outcome.
+///
+/// The core lock is open between the reservation and the launch — that is the
+/// whole point of the boundary — so a cancel can land in the middle. When it
+/// does, the launched context is asked to stop, the reservation is journaled
+/// as superseded, and the canceled work stays canceled. A regression that
+/// applied the result anyway would revive terminal Work, which is the first
+/// thing §22.5 forbids.
+#[test]
+fn n3_a_late_launch_cannot_revive_work_that_moved_on() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3LATE0001";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+
+    // …and while that launch is in flight, the human cancels.
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_CANCELED,
+        json!({"from": "active"}),
+    );
+    engine
+        .retire_run(&mut core, work_id, "work canceled")
+        .expect("retire");
+
+    let outcome = pending.launch();
+    assert!(
+        outcome.is_ok(),
+        "the launch itself succeeded — that is the point"
+    );
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "a late launch must not revive terminal work"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "the superseded execution never becomes the run's execution"
+    );
+    // Two closures of the same reservation, in the order they were learned:
+    // the cancel closed the *record* (it could not know whether the effect had
+    // happened, so `launched` is null), and the launch reporting back closed
+    // the *effect* (it had, so `launched` is true and the orphan is stopped).
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 2, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "work_retired");
+    assert!(
+        abandoned[0]["launched"].is_null(),
+        "the cancel cannot know whether the launch happened: {}",
+        abandoned[0]
+    );
+    assert_eq!(abandoned[1]["execution_id"], execution_id);
+    assert_eq!(abandoned[1]["reason"], "superseded");
+    assert_eq!(abandoned[1]["launched"], true);
+    assert_eq!(
+        abandoned[1]["stop"]["requested"], true,
+        "the orphan the launch created is asked to stop, not left running"
+    );
+    assert!(
+        fake.stop_requests().contains(&execution_id),
+        "the stop reached the backend for exactly that execution: {:?}",
+        fake.stop_requests()
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none()
+    );
+}
+
+/// A crash between the reservation and the launch result fails closed at the
+/// next restart, with the reserved native identity in the evidence — and
+/// removes nothing (§22.5's "does not delete unproven state", §14.3).
+///
+/// This is the Claude start-window, finally inspectable: before the
+/// reservation existed, a daemon that died between `claude --session-id <u>`
+/// being spawned and `execution.started` being appended left no durable trace
+/// of `<u>` at all.
+#[test]
+fn n4_a_reservation_whose_launch_never_reported_fails_closed_at_restart() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3CRASHRES";
+
+    submit_work(&mut core, work_id, "died between the phases");
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORKFLOW_BOUND,
+        json!({
+            "workflow": {"name": "tiny", "version": "1", "source": "test",
+                         "stages": [{"id": "00-only", "context": "c"}]},
+            "backend": FAKE_BACKEND_NAME,
+        }),
+    );
+    journal_surface(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 1}),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        json!({"reservation": {
+            "execution_id": "01N3EXEC0001",
+            "backend": FAKE_BACKEND_NAME,
+            "native_id": "fake-session-01N3EXEC0001",
+            "stage_id": "00-only",
+            "index": 0,
+            "attempt": 1,
+            "stage_kind": "actor",
+        }}),
+    );
+    commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked
+    );
+    let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
+    let evidence = blocked
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains("fake-session-01N3EXEC0001"),
+        "the reserved native identity is what an operator has to go and look for: {evidence}"
+    );
+    assert!(
+        evidence.contains("01N3EXEC0001"),
+        "and sergeant's own id for it: {evidence}"
+    );
+    // Nothing was started, nothing was re-launched, nothing was removed.
+    assert!(events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty());
+    assert!(
+        fake.starts().is_empty(),
+        "recovery must never start the external effect a second time"
+    );
+    assert!(
+        fake.stop_requests().is_empty(),
+        "and must not try to kill a context it cannot prove exists"
+    );
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0]["reason"], "unsettled_at_restart");
+    assert_eq!(
+        abandoned[0]["native_id"], "fake-session-01N3EXEC0001",
+        "the identity survives in the record that closes the window"
+    );
+
+    // Idempotent: the work is no longer `active`, so a second restart leaves
+    // it exactly where the first one put it.
+    let again = recovery::reconcile(&engine, &mut core).expect("reconcile again");
+    assert!(again.blocked.is_empty() && again.resumed.is_empty());
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_ABANDONED).len(),
+        1,
+        "the window is closed once"
+    );
+}
+
+/// The stop latch belongs to the execution the event *names*.
+///
+/// Before the two-phase boundary every `execution.stopped` was about the run's
+/// current execution and the id in the payload went unread. Now a superseded
+/// launch is stopped while a different execution is current — and latching
+/// *that* one would make every later stop, including a human's cancel, a
+/// permanent no-op against a live native context nobody ever asked to die.
+#[test]
+fn n5_a_stop_naming_another_execution_does_not_latch_the_current_one() {
+    let data = TempDir::new().expect("tempdir");
+    let mut core = core(data.path());
+    let work_id = "01N3LATCH001";
+    journal_active_run(&mut core, work_id, FAKE_BACKEND_NAME, "fake-session-x");
+    let current = format!("exec-{work_id}");
+
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STOPPED,
+        json!({
+            "execution_id": "some-other-execution",
+            "backend": FAKE_BACKEND_NAME,
+            "reason": "superseded",
+            "outcome": {"requested": true},
+        }),
+    );
+    assert!(
+        !core.registry.state().runs[work_id]
+            .execution
+            .as_ref()
+            .expect("execution")
+            .stop_requested,
+        "a stop aimed at another execution must not latch this one"
+    );
+
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STOPPED,
+        json!({
+            "execution_id": current,
+            "backend": FAKE_BACKEND_NAME,
+            "reason": "canceled",
+            "outcome": {"requested": true},
+        }),
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .execution
+            .as_ref()
+            .expect("execution")
+            .stop_requested,
+        "and a stop that names it does"
+    );
+}
+
+// --------------------------------- GP-2 / #42. the actor-initiated ask
+//
+// N2's grammar-pressure report found exactly one confirmed engine gap: a live
+// actor had no way to say "I cannot proceed without a human decision". The
+// state it needs already existed (`needs_input`, resumable by `respond` on the
+// same execution — U1, docs/gauntlet/notes/n2-fake-backend-semantics.md); what
+// was missing was a pathway from the harness's own output into it, and any way
+// to tell the actor's question apart from a gate's.
+
+/// A scripted `ask` parks the stage on the actor's question, and `respond`
+/// resumes **the same execution** — U1's semantics, unchanged, which is the
+/// point: the ask primitive reuses the existing resume verb rather than
+/// inventing a second one.
+#[test]
+fn n6_an_actor_authored_ask_parks_the_stage_and_respond_resumes_the_same_execution() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::ask("postgres or sqlite?"), FakeStep::complete()],
+    );
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASK00001";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput,
+        "the actor's question parks the work"
+    );
+    let parked = events_of(&core, work_id, KIND_STAGE_NEEDS_INPUT);
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0]["detail"], "postgres or sqlite?");
+    assert_eq!(
+        parked[0]["asked_by"], "actor",
+        "the authorship of the question is part of the record (GP-2)"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_WORK_NEEDS_INPUT)[0]["asked_by"],
+        "actor"
+    );
+
+    // U1: the answer goes to the execution that asked, not to a new one.
+    let execution_id = core.registry.state().runs[work_id]
+        .execution
+        .as_ref()
+        .expect("execution")
+        .execution_id
+        .clone();
+    engine
+        .provide_input(&mut core, work_id, "postgres")
+        .expect("respond");
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["postgres".to_string()],
+        "the answer reached the execution that asked"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).len(),
+        1,
+        "answering an ask continues the conversation; it does not start a second one"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed
+    );
+}
+
+/// The same park, authored by the *adapter* rather than the actor, is
+/// recorded as such.
+///
+/// Without this half, `asked_by` would be a field nothing could disagree with
+/// — and a capability flag that cannot be wrong is not a measurement.
+#[test]
+fn n7_an_adapter_authored_need_for_input_is_not_reported_as_an_actor_ask() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::needs_input("unlock me")]);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASK00002";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    let parked = events_of(&core, work_id, KIND_STAGE_NEEDS_INPUT);
+    assert_eq!(parked[0]["detail"], "unlock me");
+    assert_eq!(
+        parked[0]["asked_by"], "adapter",
+        "a gate is not an actor, and the trajectory has to be able to say so"
+    );
+}
+
+/// An ask raised **mid-execution**, out of band — the shape a real actor
+/// produces, where nothing the engine did caused the question.
+///
+/// The engine sees it on its next observation, which is what `respond`,
+/// `retry` and restart reconciliation all trigger.
+#[test]
+fn n8_a_live_execution_can_raise_a_question_between_engine_calls() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASK00003";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Active,
+        "the execution is still working"
+    );
+    let execution_id = core.registry.state().runs[work_id]
+        .execution
+        .as_ref()
+        .expect("execution")
+        .execution_id
+        .clone();
+
+    // The actor reaches a decision it cannot make alone.
+    assert!(fake.actor_asks(&execution_id, "which environment?"));
+    engine.resume(&mut core, work_id).expect("resume");
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput
+    );
+    let parked = events_of(&core, work_id, KIND_STAGE_NEEDS_INPUT);
+    assert_eq!(parked[0]["detail"], "which environment?");
+    assert_eq!(parked[0]["asked_by"], "actor");
+
+    // An ask against an execution this backend never had is refused, not
+    // invented — the same identity rule every other verb obeys.
+    assert!(!fake.actor_asks("never-started", "who are you?"));
+}
+
+/// L8: the capability list and the contract-test list are the same list.
+///
+/// Every registered backend advertising `ask` must be able to *produce* an
+/// actor-authored question, and every one that does not must never report
+/// one. The fake is checked here directly; the Claude adapter's half is the
+/// opt-in live test below plus the unit tests over the two measured
+/// `post_turn_summary` records in `src/backend/claude.rs`.
+#[test]
+fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    assert!(fake.capabilities().ask, "the fake advertises the ask");
+    let request = StartRequest {
+        work_id: "w".to_string(),
+        execution_id: "e-ask".to_string(),
+        stage_id: "00-only".to_string(),
+        attempt: 1,
+        cwd: PathBuf::from("/tmp"),
+        intent: "i".to_string(),
+        context: "c".to_string(),
+        model: None,
+        profile: None,
+    };
+    let handle = fake.start(&request).expect("start");
+    assert_eq!(
+        fake.observe(&handle).expect("observe").signal.asked_by(),
+        None,
+        "a working execution is not asking anything"
+    );
+    assert!(fake.actor_asks("e-ask", "postgres or sqlite?"));
+    assert_eq!(
+        fake.observe(&handle).expect("observe").signal,
+        BackendSignal::ask("postgres or sqlite?"),
+        "the advertised capability is one the backend can actually honour"
+    );
+
+    // The Claude adapter advertises it too, on the strength of the measured
+    // `post_turn_summary` line; a build whose adapter stopped being able to
+    // report authorship must lower the flag rather than keep the claim.
+    let claude = ClaudeBackend::new(ClaudeConfig::new(Path::new("/nonexistent")));
+    assert!(
+        claude.capabilities().ask,
+        "measured on 2.1.226: see docs/gauntlet/notes/n3-claude-ask-measurement.md"
+    );
+}
+
+/// GP-2 across a **daemon restart**: an actor's question that is still parked
+/// when the daemon dies must still be answerable, and the human's answer must
+/// not be consumed and dropped.
+///
+/// A work in `needs_input` is the work most likely to be sitting there when a
+/// restart happens — it is waiting on a person. Startup reconciliation
+/// deliberately leaves it alone (a park is a decision, not uncertainty), so the
+/// restarted adapter's empty execution table is discovered by the `respond`
+/// itself. Before the fix, that `respond` journaled `stage.input_received` and
+/// `work.resumed`, then failed `UnknownExecution` and blocked: the answer
+/// durable in the journal and reachable by nothing, because `retry` re-enters
+/// the stage as a new attempt and never re-delivers it.
+///
+/// The fake models the real shape via `forget_executions` — adapter memory
+/// gone, native context intact — which is precisely the Claude case: the
+/// conversation is a file on disk and §15 RESUME is what re-adopts it.
+#[test]
+fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
+    // Bound before the local `core` shadows the helper of the same name.
+    let reopen = core;
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::ask("postgres or sqlite?"), FakeStep::complete()],
+    );
+    let registry = Arc::new(BackendRegistry::new().with(Arc::new(fake.clone())));
+    let engine = Engine::new(Arc::clone(&registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASKRESTART";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput,
+        "the actor's question parks the work"
+    );
+    let execution_id = core.registry.state().runs[work_id]
+        .execution
+        .as_ref()
+        .expect("execution")
+        .execution_id
+        .clone();
+
+    // The daemon dies while the human is still thinking. The projection is
+    // rebuilt from the journal; the adapter's memory is not rebuilt at all.
+    drop(core);
+    fake.forget_executions();
+    let engine = Engine::new(registry, None, data.path());
+    let mut restarted = reopen(data.path());
+    let core = &mut restarted;
+    let report = recovery::reconcile(&engine, core).expect("reconcile");
+    assert!(
+        report.resumed.is_empty() && report.blocked.is_empty(),
+        "a parked work is a decision; recovery must not re-decide it: {report:?}"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput
+    );
+
+    // The human answers the restarted daemon.
+    engine
+        .provide_input(core, work_id, "postgres")
+        .expect("respond after a restart");
+
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["postgres".to_string()],
+        "the answer reached the execution that asked it"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed,
+        "and the run continued from it"
+    );
+    assert_eq!(
+        events_of(core, work_id, KIND_EXECUTION_STARTED).len(),
+        1,
+        "re-adoption continues the conversation; it never starts a second one"
+    );
+
+    // §15 RESUME is what made it reachable, and the trajectory says so —
+    // with the launch configuration re-supplied from the journal, not
+    // invented (`ResumeRequest`'s own contract).
+    let resumes = fake.resume_requests();
+    assert_eq!(resumes.len(), 1, "exactly one re-adoption: {resumes:?}");
+    assert_eq!(resumes[0].0, execution_id);
+    assert_eq!(resumes[0].1.work_id, work_id);
+    let reconciled = events_of(core, work_id, KIND_EXECUTION_RECONCILED);
+    assert_eq!(
+        reconciled.len(),
+        1,
+        "the re-adoption is journaled, not silent: {reconciled:?}"
+    );
+    assert_eq!(reconciled[0]["reattached"], true);
+    assert_eq!(reconciled[0]["execution_id"], execution_id);
+}
+
+/// An adapter that *refuses* the re-adoption still fails the work closed, with
+/// its own refusal as the evidence — the reattach is a recovery of a provable
+/// context, never a way to soften ambiguity (§25).
+#[test]
+fn n18_a_refused_reattach_still_fails_the_answer_closed() {
+    let reopen = core;
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::ask("postgres or sqlite?")]);
+    let registry = Arc::new(BackendRegistry::new().with(Arc::new(fake.clone())));
+    let engine = Engine::new(Arc::clone(&registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3ASKREFUSED";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+    engine.retry(&mut core, work_id).expect("retry");
+
+    // Nothing survived: the adapter has neither memory of the execution nor
+    // a context to re-adopt, which is what a lost native session looks like.
+    drop(core);
+    let vanished = FakeBackend::new(FAKE_BACKEND_NAME);
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(vanished.clone()))),
+        None,
+        data.path(),
+    );
+    let mut restarted = reopen(data.path());
+    let core = &mut restarted;
+    engine
+        .provide_input(core, work_id, "postgres")
+        .expect("respond is accepted, then fails closed");
+
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked,
+        "an unprovable context blocks rather than guessing"
+    );
+    let blocked = events_of(core, work_id, KIND_WORK_BLOCKED);
+    let reason = blocked
+        .last()
+        .and_then(|b| b["reason"].as_str())
+        .unwrap_or_default();
+    assert!(
+        reason.contains("cannot deliver input"),
+        "the refusal is the reason: {reason}"
+    );
+    // The answer itself is still durable — it is the input the operator gave.
+    let received = events_of(core, work_id, KIND_STAGE_INPUT_RECEIVED);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0]["input"], "postgres");
+    assert!(
+        events_of(core, work_id, KIND_EXECUTION_RECONCILED).is_empty(),
+        "a re-adoption that did not happen is not claimed"
+    );
+}
+
+/// L8's other half for `ask`: the claim is withdrawn when its evidence goes.
+///
+/// INV-N3-06 — the probe gates on version and `--help`, neither of which can
+/// see whether the installed build still emits `system/post_turn_summary`, and
+/// the absence used to fail *open*: the stage completed carrying the
+/// unanswered question as its summary, with `ask: true` still on the wire.
+/// Driven here through the stub, which is the only place a stream-grammar
+/// change can be simulated without a CLI that has one.
+#[test]
+fn n27_the_ask_claim_is_withdrawn_when_the_stream_stops_carrying_its_evidence() {
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(data.path());
+    // A build that completes turns and no longer emits the line: the exact
+    // shape "post_turn_summary changes subtype or drops needs_action" leaves
+    // behind (docs/gauntlet/notes/n3-claude-ask-measurement.md, "re-measure
+    // when").
+    stub.replays(RECORDED_TURN);
+    let mut config = ClaudeConfig::new(data.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+    assert!(
+        backend.capabilities().ask,
+        "the claim starts where 2.1.226 was measured"
+    );
+
+    let handle = backend
+        .start(&start_request(
+            "e-grammar-gone",
+            data.path(),
+            "complete without a summary line",
+            Some("haiku"),
+        ))
+        .expect("start");
+    let observation = wait_settled(&backend, &handle, Duration::from_secs(10));
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "the turn itself still completes: {observation:?}"
+    );
+    assert!(
+        !backend.capabilities().ask && !backend.ask_grammar_intact(),
+        "a capability whose evidence is absent must not stay advertised (L1, L8)"
+    );
+
+    // The measured grammar keeps the claim: same adapter shape, same turn,
+    // with the line 2.1.226 actually emits.
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn());
+    let mut config = ClaudeConfig::new(data.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+    let handle = backend
+        .start(&start_request(
+            "e-grammar-intact",
+            data.path(),
+            "complete with the measured summary line",
+            Some("haiku"),
+        ))
+        .expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+    assert!(
+        backend.capabilities().ask,
+        "a turn that carried the line — even asking nothing — is the evidence"
+    );
+}
+
+/// Opt-in, spends real tokens: the ask, measured against the installed CLI.
+///
+/// L8's rule is that an advertised verb without a contract test against the
+/// installed harness is an unmeasured claim. This is that test for `ask`: one
+/// haiku turn told it cannot proceed without a decision, driven through the
+/// real adapter, must come back as `NeedsInput` authored by the actor — not as
+/// a completed stage whose summary happens to end in a question mark.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CLAUDE_TESTS=1 cargo test -- --ignored"]
+fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
+    if !claude_live_enabled("a5_real_claude_reports_an_actor_authored_question_as_needs_input") {
+        return;
+    }
+    let data = TempDir::new().expect("tempdir");
+    let work = TempDir::new().expect("tempdir");
+    let mut config = ClaudeConfig::new(data.path());
+    config.env.insert("IS_SANDBOX".to_string(), "1".to_string());
+    let backend = ClaudeBackend::new(config);
+
+    let request = StartRequest {
+        work_id: "01N3LIVEASK".to_string(),
+        execution_id: ulid(),
+        stage_id: "00-ask".to_string(),
+        attempt: 1,
+        cwd: work.path().to_path_buf(),
+        intent: "I cannot proceed without knowing one thing.".to_string(),
+        context: "Which database should I target, postgres or sqlite? Ask me that question \
+                  and stop; do not guess and do not do anything else."
+            .to_string(),
+        model: Some("claude-haiku-4-5-20251001".to_string()),
+        profile: None,
+    };
+    let handle = backend.start(&request).expect("start");
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let observation = loop {
+        let observation = backend.observe(&handle).expect("observe");
+        if observation.native != NativeState::Running {
+            break observation;
+        }
+        assert!(Instant::now() < deadline, "the turn never finished");
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    backend.stop(&handle).expect("stop").wait();
+
+    match &observation.signal {
+        BackendSignal::NeedsInput { prompt, asked_by } => {
+            assert_eq!(
+                *asked_by,
+                AskAuthor::Actor,
+                "the question is the actor's, and the adapter must say so"
+            );
+            assert!(
+                !prompt.trim().is_empty(),
+                "the parked stage carries the actor's own words"
+            );
+            eprintln!("measured actor ask: {prompt}");
+        }
+        other => panic!(
+            "2.1.226 no longer maps an end-of-turn question to needs_input: {other:?} \
+             (evidence: {:?}). Re-measure and, if the affordance is gone, lower \
+             Capabilities::ask to false rather than guessing from prose (L1/L8).",
+            observation.evidence
+        ),
+    }
+}
+
+// ------------------------- §22.5. the crash-injection matrix (issue #20)
+//
+// "For every external lifecycle, inject process death or simulated append
+// failure at least at" eight points. Each test below is one of them: it builds
+// the journal prefix a daemon death at that instant would leave, restarts
+// recovery over it, and checks §22.5's six convergence rules —
+//
+//   no external effect started twice / no owned external identity lost /
+//   no unrelated external identity adopted / no wrong attempt advanced /
+//   no terminal work revived / no unproven state deleted
+//
+// — as they apply to that window. Windows 3 and 4 deserve their emphasis: they
+// share window 2's journal prefix exactly, and differ only in what exists out
+// in the world. The engine must answer them identically, because the journal
+// is the only thing it may read. That equality *is* the fail-closed rule.
+
+/// Journal a two-stage run up to `stage.entered` on stage 0, with a surface
+/// rooted at `root`. Every §22.5 window below extends this prefix.
+fn journal_two_stage_prefix(core: &mut Core, work_id: &str, root: &Path) {
+    submit_work(core, work_id, "crash me somewhere");
+    commit(
+        core,
+        work_id,
+        KIND_WORKFLOW_BOUND,
+        json!({
+            "workflow": {"name": "two", "version": "1", "source": "test",
+                         "stages": [{"id": "00-first", "context": "c"},
+                                    {"id": "10-second", "context": "c"}]},
+            "backend": FAKE_BACKEND_NAME,
+        }),
+    );
+    let worktree = root.join("wt");
+    commit(
+        core,
+        work_id,
+        KIND_SURFACE_MATERIALIZED,
+        json!({"surface": {
+            "work_id": work_id,
+            "root": root,
+            "bindings": [{
+                "repository": "solo",
+                "source_path": root,
+                "base_branch": "main",
+                "base_sha": "0".repeat(40),
+                "worktree_path": worktree,
+                "work_branch": format!("sergeant/{work_id}"),
+                "head_sha": "0".repeat(40),
+            }],
+        }}),
+    );
+    commit(
+        core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-first", "index": 0, "attempt": 1}),
+    );
+    commit(core, work_id, KIND_WORK_STARTED, json!({}));
+}
+
+/// The `execution.reserved` payload a crash-window prefix carries.
+fn reservation_payload(execution_id: &str) -> Value {
+    json!({"reservation": {
+        "execution_id": execution_id,
+        "backend": FAKE_BACKEND_NAME,
+        "native_id": format!("fake-session-{execution_id}"),
+        "stage_id": "00-first",
+        "index": 0,
+        "attempt": 1,
+        "stage_kind": "actor",
+    }})
+}
+
+/// The `execution.started` payload for the same execution.
+fn started_payload(execution_id: &str) -> Value {
+    json!({"execution": {
+        "execution_id": execution_id,
+        "backend": FAKE_BACKEND_NAME,
+        "native_id": format!("fake-session-{execution_id}"),
+        "stage_id": "00-first",
+        "attempt": 1,
+        "stop_requested": false,
+    }})
+}
+
+/// The current stage's (id, attempt), for the "no wrong attempt advanced" rule.
+fn stage_coordinate(core: &Core, work_id: &str) -> (String, u32) {
+    let stage = core.registry.state().runs[work_id]
+        .current_stage()
+        .expect("a stage");
+    (stage.stage_id.clone(), stage.attempt)
+}
+
+/// §22.5 window 1 — **before the reservation append**. Nothing was decided,
+/// so there is nothing to be ambiguous about and nothing in the world: the
+/// stage is entered and no execution exists. Fails closed, starts nothing.
+#[test]
+fn n10_window1_before_the_reservation_append() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W1";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_WORK_BLOCKED)[0]["reason"],
+        "no execution to reconcile"
+    );
+    assert!(fake.starts().is_empty(), "nothing may be started");
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-first".to_string(), 1)
+    );
+}
+
+/// §22.5 window 2 — **immediately after the reservation append**. Sergeant
+/// committed to an execution identity; whether anything external exists is
+/// unknowable. Fails closed with the identity in the evidence, launches
+/// nothing, deletes nothing, and closes the window so a retry starts clean.
+#[test]
+fn n11_window2_after_the_reservation_append() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W2";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W2EXEC"),
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains("fake-session-01N3W2EXEC"),
+        "the owned identity must not be lost: {evidence}"
+    );
+    assert!(fake.starts().is_empty(), "no second start");
+    assert!(
+        fake.stop_requests().is_empty(),
+        "nothing unproven is killed"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_ABANDONED)[0]["reason"],
+        "unsettled_at_restart"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-first".to_string(), 1)
+    );
+}
+
+/// §22.5 window 3 — **external identity created, before the started append**,
+/// and window 4 — **the process was running**.
+///
+/// The prefix is byte-for-byte window 2's. What differs is the world: in one
+/// run the adapter holds a context under the reserved identity that has since
+/// exited, in the other it is still live. Two things must both hold, and they
+/// are not the same thing:
+///
+/// - the **disposition** converges. Both windows fail closed, abandon the
+///   reservation for the same reason, start nothing, kill nothing and advance
+///   no attempt. Deciding differently would be reading the world to move state,
+///   which is exactly the guess §25 forbids.
+/// - the **evidence** differs. Recovery asks the adapter what it can see of the
+///   reserved identity, because for the real adapter that question is
+///   answerable from `/proc` and a live orphan writing into this work's
+///   surface is the single most important thing to put in front of the human
+///   who is about to hit `retry`. Before, the variant knob in this test was
+///   unread and the equality below was a tautology.
+#[test]
+fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
+    let mut outcomes = Vec::new();
+    let mut evidence = Vec::new();
+    for (label, native) in [
+        ("identity created, turn exited", NativeState::Exited),
+        ("process started and still live", NativeState::Running),
+    ] {
+        let data = TempDir::new().expect("tempdir");
+        let fake = FakeBackend::scripted(
+            FAKE_BACKEND_NAME,
+            [FakeStep::complete().with_native(native)],
+        );
+        let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+        let engine = Engine::new(Arc::new(registry), None, data.path());
+        let mut core = core(data.path());
+        let work_id = "01N3W34";
+        journal_two_stage_prefix(&mut core, work_id, data.path());
+        commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_RESERVED,
+            reservation_payload("01N3W34EXEC"),
+        );
+        // The world the crash left behind: a native context under the
+        // reserved identity that the journal never learned about.
+        let prepared = fake
+            .prepare(&StartRequest {
+                work_id: work_id.to_string(),
+                execution_id: "01N3W34EXEC".to_string(),
+                stage_id: "00-first".to_string(),
+                attempt: 1,
+                cwd: data.path().to_path_buf(),
+                intent: "i".to_string(),
+                context: "c".to_string(),
+                model: None,
+                profile: None,
+            })
+            .expect("prepare");
+        fake.launch(&prepared).expect("launch");
+        let launched_before = fake.starts().len();
+
+        let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+        assert_eq!(report.blocked, vec![work_id.to_string()], "{label}");
+        assert_eq!(
+            fake.starts().len(),
+            launched_before,
+            "{label}: the external effect must not be started twice"
+        );
+        assert!(
+            fake.stop_requests().is_empty(),
+            "{label}: recovery deletes nothing it cannot prove it owns"
+        );
+        assert!(
+            events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+            "{label}: an unrecorded context is never adopted as this run's execution"
+        );
+        assert_eq!(
+            stage_coordinate(&core, work_id),
+            ("00-first".to_string(), 1),
+            "{label}: no attempt advanced"
+        );
+        let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED)[0].clone();
+        assert_eq!(
+            abandoned["native"],
+            native.as_str(),
+            "{label}: the adapter's answer about the reserved identity is recorded"
+        );
+        let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
+        outcomes.push((
+            core.registry.state().works[work_id].state,
+            abandoned["reason"].clone(),
+        ));
+        evidence.push(blocked.last().expect("a block").clone());
+    }
+    assert_eq!(
+        outcomes[0], outcomes[1],
+        "the same journal prefix must converge the same way whatever the world holds"
+    );
+    assert_ne!(
+        evidence[0]["reason"], evidence[1]["reason"],
+        "…and must still say which world it found: {evidence:?}"
+    );
+    assert!(
+        evidence[1]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("still running")),
+        "a live orphan must be named where a human will read it: {}",
+        evidence[1]
+    );
+}
+
+/// §22.5 window 5 — **result observed, before the result append**. The
+/// execution is durable and the backend still has the answer, so this is the
+/// one window that resumes rather than blocking: recovery reattaches, reads
+/// the signal it never got to journal, and finishes the stage — once.
+#[test]
+fn n13_window5_result_observed_before_the_result_append() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete().with_native(NativeState::Exited)],
+    );
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W5";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W5EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STARTED,
+        started_payload("01N3W5EXEC"),
+    );
+    // The pre-crash daemon's context, which this one re-adopts.
+    let prepared = fake
+        .prepare(&StartRequest {
+            work_id: work_id.to_string(),
+            execution_id: "01N3W5EXEC".to_string(),
+            stage_id: "00-first".to_string(),
+            attempt: 1,
+            cwd: data.path().to_path_buf(),
+            intent: "i".to_string(),
+            context: "c".to_string(),
+            model: None,
+            profile: None,
+        })
+        .expect("prepare");
+    fake.launch(&prepared).expect("launch");
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.resumed, vec![work_id.to_string()]);
+    let completed: Vec<Value> = events_of(&core, work_id, "stage.completed")
+        .into_iter()
+        .filter(|e| e["stage_id"] == "00-first")
+        .collect();
+    assert_eq!(
+        completed.len(),
+        1,
+        "exactly once: the observed result is journaled one time"
+    );
+    // Forward progress: stage 1 was entered, and only stage 1 was launched.
+    assert_eq!(
+        core.registry.state().runs[work_id]
+            .stages
+            .iter()
+            .filter(|s| s.stage_id == "10-second")
+            .count(),
+        1,
+        "the next stage was entered exactly once"
+    );
+    let launched_stages: Vec<String> = fake
+        .starts()
+        .iter()
+        .skip(1) // the pre-crash context this test planted
+        .map(|s| s.stage_id.clone())
+        .collect();
+    assert_eq!(
+        launched_stages,
+        vec!["10-second".to_string()],
+        "stage 0 is never launched a second time"
+    );
+}
+
+/// §22.5 window 6 — **result appended, before the stage transition append**.
+/// `stage.completed` is durable and nothing followed it. Recovery converges
+/// forward — the next stage is entered — without re-running stage 0's
+/// execution and without advancing the wrong attempt.
+#[test]
+fn n14_window6_result_appended_before_the_transition() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete().with_native(NativeState::Exited)],
+    );
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W6";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W6EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STARTED,
+        started_payload("01N3W6EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        "stage.completed",
+        json!({"stage_id": "00-first", "index": 0}),
+    );
+    let prepared = fake
+        .prepare(&StartRequest {
+            work_id: work_id.to_string(),
+            execution_id: "01N3W6EXEC".to_string(),
+            stage_id: "00-first".to_string(),
+            attempt: 1,
+            cwd: data.path().to_path_buf(),
+            intent: "i".to_string(),
+            context: "c".to_string(),
+            model: None,
+            profile: None,
+        })
+        .expect("prepare");
+    fake.launch(&prepared).expect("launch");
+
+    recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("10-second".to_string(), 1),
+        "the transition the crash swallowed is re-derived, at attempt 1"
+    );
+    let relaunched: Vec<String> = fake
+        .starts()
+        .iter()
+        .skip(1)
+        .map(|s| format!("{}#{}", s.stage_id, s.attempt))
+        .collect();
+    assert_eq!(
+        relaunched,
+        vec!["10-second#1".to_string()],
+        "stage 0 attempt 1 is not re-run: {relaunched:?}"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_WORK_BLOCKED).is_empty(),
+        "a recoverable window must not park the work"
+    );
+}
+
+/// §22.5 window 7 — **stage terminal, before the stop/cleanup request**. The
+/// work reached its conclusion and the surface teardown never ran. Recovery
+/// finishes the teardown and journals it; the conclusion is not rewritten and
+/// no execution is revived.
+#[test]
+fn n15_window7_terminal_before_the_cleanup_request() {
+    let data = TempDir::new().expect("tempdir");
+    let surfaces = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(surfaces.path().join("wt")).expect("worktree dir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W7";
+    journal_two_stage_prefix(&mut core, work_id, surfaces.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W7EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_STARTED,
+        started_payload("01N3W7EXEC"),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_COMPLETED,
+        json!({"stages": 2}),
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed,
+        "terminal work is never revived or reclassified"
+    );
+    assert_eq!(events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(), 1);
+    assert!(fake.starts().is_empty(), "nothing is restarted");
+
+    // Idempotent: a second restart finds the teardown recorded and does
+    // nothing at all.
+    let again = recovery::reconcile(&engine, &mut core).expect("reconcile again");
+    assert!(again.surfaces_retired.is_empty());
+    assert_eq!(events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(), 1);
+}
+
+/// §22.5 window 8 — **cleanup complete, before the cleanup append**. The
+/// worktree is already gone; only the record is missing. Recovery re-inspects
+/// (it does not assume), records what the disk actually holds, and marks the
+/// event as recovered so the trail does not pretend it landed on time.
+#[test]
+fn n16_window8_cleanup_done_before_the_cleanup_append() {
+    let data = TempDir::new().expect("tempdir");
+    let surfaces = TempDir::new().expect("tempdir");
+    // No `wt` directory: the crash landed *after* teardown removed it.
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W8";
+    journal_two_stage_prefix(&mut core, work_id, surfaces.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_COMPLETED,
+        json!({"stages": 2}),
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
+    let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    assert_eq!(
+        torn[0]["recovered"], true,
+        "the record says when it was written, not that it was on time"
+    );
+    assert_eq!(
+        torn[0]["report"]["bindings"][0]["disposition"], "missing",
+        "evidence from the disk, not an assumption about which side of the window the crash fell on"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed
+    );
+}
+
+/// §22.5's **cancel-during-launch** window, which had no treatment at all.
+///
+/// The two-phase boundary made a new one: a daemon killed after a cancel lands
+/// and before `settle_launch` runs leaves a reservation outstanding on a work
+/// that is already terminal. `begin_retire_run` closes it on the live path, but
+/// a crash skips that — and reconciliation looked at `active` work,
+/// `pending`-but-started work, and terminal work *missing a teardown*, which a
+/// cancel has already written. So the reservation stayed open forever: no
+/// `execution.abandoned` would ever close it, no restart would ever look, and
+/// `work show` kept reporting an open reservation on a canceled work.
+///
+/// §22.5's rules still bind: nothing is started, nothing is stopped, nothing is
+/// removed. The reserved identity travels into the event, because it is the
+/// thing an operator has to go and look for.
+#[test]
+fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W7B";
+    journal_two_stage_prefix(&mut core, work_id, data.path());
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        reservation_payload("01N3W7BEXEC"),
+    );
+    // The cancel landed — stage marked, work canceled, surface torn down —
+    // and then the daemon died before the launch reported back.
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_CANCELED,
+        json!({"stage_id": "00-first", "detail": "work canceled"}),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_WORK_CANCELED,
+        json!({"from": "active"}),
+    );
+    commit(
+        &mut core,
+        work_id,
+        KIND_SURFACE_TORN_DOWN,
+        json!({"report": {"work_id": work_id, "clean": true, "bindings": []}}),
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_some(),
+        "the window this test is about must actually be open"
+    );
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(
+        report.reservations_retired,
+        vec![work_id.to_string()],
+        "a terminal work with an open reservation must be looked at: {report:?}"
+    );
+    assert!(
+        core.registry.state().runs[work_id]
+            .unsettled_reservation()
+            .is_none(),
+        "and the window closed"
+    );
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], "01N3W7BEXEC");
+    assert_eq!(abandoned[0]["reason"], "unsettled_at_restart");
+    assert_eq!(
+        abandoned[0]["native_id"], "fake-session-01N3W7BEXEC",
+        "no owned external identity lost"
+    );
+    assert!(
+        abandoned[0]["launched"].is_null(),
+        "whether the effect happened is exactly what this window cannot know"
+    );
+
+    // §22.5's convergence rules, unchanged by the closure.
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Canceled,
+        "no terminal work revived"
+    );
+    assert!(fake.starts().is_empty(), "no external effect started twice");
+    assert!(
+        fake.stop_requests().is_empty(),
+        "nothing unproven is killed"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-first".to_string(), 1),
+        "no wrong attempt advanced"
+    );
+
+    // Convergent: a second restart finds nothing left to do.
+    let again = recovery::reconcile(&engine, &mut core).expect("reconcile twice");
+    assert!(again.reservations_retired.is_empty(), "{again:?}");
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_ABANDONED).len(),
+        1,
+        "closing a closed window appends nothing"
+    );
+}
+
+// ------------------------------- §14.5's checklist, clause by clause
+//
+// `reservation_is_stale` enumerates four clauses as "§14.5's checklist, in
+// order": the Work still exists; it has not gone terminal; the reservation this
+// launch belongs to is still the run's outstanding one; the stage attempt it
+// named is still the current one. Only the second was pinned — deleting either
+// of the last two left the whole suite green (N3-03, N3-04), which is L7's
+// definition of an unpinned fix.
+//
+// Neither is reachable through today's *API* (`begin_retry` refuses an active
+// work, `begin_input` requires `needs_input`), and that is the point: they are
+// defensive clauses guarding a boundary the next executor — a Docker container
+// whose completion callback arrives whenever it arrives — will make reachable.
+// A defensive clause with no test is prose. The journal is the only truth, so
+// these drive the superseding decision through it, exactly as a concurrent
+// request would have left it.
+
+/// §14.5, clause 3: a launch whose reservation was superseded by another is
+/// recorded as late evidence and its context stopped — it never becomes the
+/// run's execution behind the newer decision's back.
+#[test]
+fn n23_a_launch_whose_reservation_was_superseded_never_becomes_the_execution() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3STALE145A";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+
+    // While the launch is in flight, a second reservation for the same stage
+    // and attempt becomes the run's outstanding one.
+    commit(
+        &mut core,
+        work_id,
+        KIND_EXECUTION_RESERVED,
+        json!({"reservation": {
+            "execution_id": "01N3SUPERSEDER",
+            "backend": FAKE_BACKEND_NAME,
+            "native_id": "fake-session-01N3SUPERSEDER",
+            "stage_id": "00-only",
+            "index": 0,
+            "attempt": 2,
+            "stage_kind": "actor",
+        }}),
+    );
+
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "superseded");
+    let detail = abandoned[0]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&execution_id) && detail.contains("01N3SUPERSEDER"),
+        "the detail must name both reservations: {detail}"
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "a superseded launch never becomes the run's execution"
+    );
+    assert!(
+        fake.stop_requests().contains(&execution_id),
+        "the orphan it created is asked to stop: {:?}",
+        fake.stop_requests()
+    );
+    assert_eq!(
+        core.registry.state().runs[work_id]
+            .reservation
+            .as_ref()
+            .map(|r| r.execution_id.as_str()),
+        Some("01N3SUPERSEDER"),
+        "and the newer reservation is left standing"
+    );
+}
+
+/// §14.5, clause 4 (and §22.5's "no wrong attempt advanced" at the *settle*
+/// boundary rather than the recovery one): a launch for an attempt the run has
+/// moved past is late evidence, not a result.
+#[test]
+fn n24_a_launch_for_a_superseded_attempt_does_not_advance_the_current_one() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3STALE145B";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+
+    // The run moved to a third attempt of the same stage while the second
+    // attempt's launch was still in flight. Its reservation is untouched, so
+    // clause 3 passes and clause 4 is the one under test.
+    commit(
+        &mut core,
+        work_id,
+        KIND_STAGE_ENTERED,
+        json!({"stage_id": "00-only", "index": 0, "attempt": 3}),
+    );
+
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "superseded");
+    assert!(
+        abandoned[0]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("attempt 3")),
+        "the detail must name the attempt the run actually moved to: {}",
+        abandoned[0]
+    );
+    assert!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
+        "the wrong attempt is never advanced"
+    );
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-only".to_string(), 3),
+        "and the current attempt is untouched"
+    );
+    assert!(
+        fake.stop_requests().contains(&execution_id),
+        "the orphan it created is asked to stop: {:?}",
+        fake.stop_requests()
+    );
+}
+
+/// §22.5 window 2 again, over a prefix the **engine actually produced**.
+///
+/// N3-06: the eight window tests build their `execution.reserved` /
+/// `execution.started` payloads by hand, and nothing binds those fixtures to
+/// what `reserve_stage` writes. A payload-shape drift — the mutation probe
+/// dropped `native_id` — was caught by exactly one test outside the matrix
+/// while all eight window tests kept passing on a journal image the daemon can
+/// no longer produce. That is a matrix testing its own fixtures.
+///
+/// Two guards, because they fail differently. This one is the real article: it
+/// drives the engine to a reservation, drops the launch on the floor (which
+/// *is* the crash — the daemon died before the effect reported back), and
+/// reconciles over the journal the engine wrote itself. The second is the
+/// cheap agreement check below, which fails with the offending key named.
+#[test]
+fn n25_window2_over_a_producer_derived_prefix() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3W2DERIVED";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+    // The crash: the daemon dies holding the launch. Nothing was launched,
+    // and nothing will ever report back.
+    drop(pending);
+    assert!(fake.starts().is_empty(), "the launch never happened");
+
+    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    assert_eq!(report.blocked, vec![work_id.to_string()]);
+    let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
+    assert_eq!(abandoned.len(), 1, "{abandoned:?}");
+    assert_eq!(abandoned[0]["execution_id"], execution_id);
+    assert_eq!(abandoned[0]["reason"], "unsettled_at_restart");
+    assert_eq!(
+        abandoned[0]["native_id"],
+        format!("fake-session-{execution_id}"),
+        "the identity the engine reserved must survive into the closure — \
+         which is the whole reason the reservation is journaled"
+    );
+    let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
+        .last()
+        .and_then(|b| b["evidence"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        evidence.contains(&format!("fake-session-{execution_id}")),
+        "no owned external identity lost: {evidence}"
+    );
+    assert!(fake.starts().is_empty(), "nothing started twice");
+    assert!(fake.stop_requests().is_empty(), "nothing unproven killed");
+    assert_eq!(
+        stage_coordinate(&core, work_id),
+        ("00-only".to_string(), 2),
+        "no wrong attempt advanced"
+    );
+}
+
+/// The matrix's hand-written prefixes must have the shape the engine produces.
+///
+/// A window test's value is that its journal image is one a daemon can
+/// actually leave behind. This compares the fixture payloads against a live
+/// `execution.reserved`/`execution.started` pair field by field — keys, and
+/// the coordinate values the fixtures hard-code — so a field added to,
+/// removed from or renamed in either record fails here by name instead of
+/// silently retiring eight tests.
+#[test]
+fn n26_the_crash_window_fixtures_match_what_the_engine_writes() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01N3FIXTURES";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let execution_id = pending.execution_id().to_string();
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle");
+    step.deferred.wait();
+
+    let produced_reservation = events_of(&core, work_id, KIND_EXECUTION_RESERVED)[0].clone();
+    let produced_started = events_of(&core, work_id, KIND_EXECUTION_STARTED)[0].clone();
+
+    for (label, produced, fixture, inner) in [
+        (
+            "execution.reserved",
+            &produced_reservation,
+            reservation_payload(&execution_id),
+            "reservation",
+        ),
+        (
+            "execution.started",
+            &produced_started,
+            started_payload(&execution_id),
+            "execution",
+        ),
+    ] {
+        let produced_keys = keys_of(&produced[inner]);
+        let fixture_keys = keys_of(&fixture[inner]);
+        assert_eq!(
+            produced_keys, fixture_keys,
+            "the {label} fixture the §22.5 matrix builds no longer has the shape \
+             the engine writes — update the fixture *and* re-read the windows it feeds"
+        );
+        // The coordinate fields the fixtures hard-code must also agree, or
+        // the matrix's prefixes describe a run the engine would not produce.
+        for field in ["execution_id", "backend", "native_id", "stage_id"] {
+            if produced[inner].get(field).is_some() {
+                assert_eq!(
+                    produced[inner][field].is_string(),
+                    fixture[inner][field].is_string(),
+                    "{label}.{field} changed type"
+                );
+            }
+        }
+    }
+}
+
+/// The sorted key names of a JSON object (empty for anything else).
+fn keys_of(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+/// A `Deferred` dropped on an early-return path (a `?` between `push` and
+/// `.wait()`) must not silently discard the tail work it was holding — this
+/// is the issue #14/B3 leak class reopened at the engine's internal
+/// error-propagation boundary and closed by `Deferred`'s `Drop` impl
+/// (src/backend/mod.rs). Proven by execution, not by reading the impl: push
+/// a completion whose tail work signals a channel, drop the bag without
+/// calling `.wait()`, and require the signal to arrive within a bounded
+/// wait. Reverting the `Drop` impl leaves the tail closure captured inside
+/// the dropped `Vec<Completion>` and this recv times out.
+#[test]
+fn n27_a_deferred_dropped_with_pending_completions_still_runs_their_tail_work() {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+    let mut deferred = Deferred::new();
+    deferred.push(Completion::deferred(move || {
+        tx.send(()).expect("send completion signal");
+    }));
+    assert!(deferred.is_pending());
+    drop(deferred);
+
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("dropping a Deferred with pending completions must still run their tail work");
+}
+
+/// A `Deferred` drained normally through `.wait()` must not have its
+/// completions re-run by the `Drop` impl afterward — `wait`/`absorb` take
+/// the completions out via `mem::take` precisely so the empty bag's `Drop`
+/// is a no-op. Proven by counting actual invocations of the tail closure.
+#[test]
+fn n27b_waiting_a_deferred_runs_each_completion_exactly_once() {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&count);
+
+    let mut deferred = Deferred::new();
+    deferred.push(Completion::deferred(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    deferred.wait();
+
+    // Give a wrongly-still-spawned background thread a chance to run before
+    // asserting, so a regression that double-fires is actually caught.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

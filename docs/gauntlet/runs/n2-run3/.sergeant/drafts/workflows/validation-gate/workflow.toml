@@ -1,0 +1,4 @@
+[workflow]
+name = "validation-gate"
+version = "1"
+stages = ["01-launch-validation", "02-publish-readiness"]

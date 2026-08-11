@@ -23,7 +23,9 @@
 //! recursive delete, so anything teardown retained keeps the directory it
 //! lives in.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +35,45 @@ use crate::runtime::git::{GitError, git, git_succeeds};
 
 /// Directory under the data dir holding all work surfaces.
 pub const SURFACES_DIR: &str = "surfaces";
+
+/// One lock per source repository, held across every worktree mutation this
+/// module makes against that repository.
+///
+/// **Not the core lock, and that is the point.** N3 moved git out from under
+/// the daemon's single writer (§22.6), which is what the budget asks for — and
+/// promptly let fifty submissions run `git worktree add`/`remove` against the
+/// same `.git` at once. Git does not serialize that for us: measured on a
+/// burst-50 run, two teardowns failed with `fatal: failed to read
+/// .git/worktrees/<other-work>/commondir` — one process walking the worktree
+/// registry while another rewrote it. Failing closed meant those surfaces were
+/// *retained*, journaled and left on disk, which is honest and still wrong.
+///
+/// So concurrency against one repository is serialized here, at the narrowest
+/// scope that fixes it: per source path, for the duration of the git calls
+/// that touch its registry. Two works in different repositories still proceed
+/// in parallel, and no request anywhere queues behind the core lock for it.
+fn repository_lock(source: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let table = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    // Keyed on the canonical path: two workspaces can reach one repository by
+    // different routes, and a lock they do not share is not a lock.
+    let key = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let mut table = table.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(table.entry(key).or_default())
+}
+
+/// Run `f` with this repository's worktree registry to itself.
+///
+/// Poisoning is deliberately ignored: the guard protects git's on-disk
+/// registry, not an in-memory invariant, so a panic in one caller leaves
+/// nothing for the next one to be confused by — and refusing every later
+/// worktree operation for the daemon's lifetime would be a far worse failure
+/// than the one being guarded against.
+fn with_repository<T>(source: &Path, f: impl FnOnce() -> T) -> T {
+    let lock = repository_lock(source);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
 
 /// Event kind: a work surface is about to be materialized. Appended *before*
 /// the first `git worktree add`, so the branch and worktree a crash can leave
@@ -295,17 +336,20 @@ fn materialize_one(
             source_repo: repository.path.display().to_string(),
         });
     }
-    let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
-    // A detached HEAD has no branch name; record the fact rather than
-    // inventing one.
-    let base_branch = git(
-        &repository.path,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .unwrap_or_else(|_| "(detached)".to_string());
+    let (base_sha, base_branch, head_sha) = with_repository(&repository.path, || {
+        let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
+        // A detached HEAD has no branch name; record the fact rather than
+        // inventing one.
+        let base_branch = git(
+            &repository.path,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+        .unwrap_or_else(|_| "(detached)".to_string());
 
-    add_worktree(&repository.path, &worktree_path, branch, &base_sha)?;
-    let head_sha = git(&worktree_path, &["rev-parse", "HEAD"])?;
+        add_worktree(&repository.path, &worktree_path, branch, &base_sha)?;
+        let head_sha = git(&worktree_path, &["rev-parse", "HEAD"])?;
+        Ok::<_, SurfaceError>((base_sha, base_branch, head_sha))
+    })?;
 
     Ok(RepositoryBinding {
         repository: repository.name.clone(),
@@ -334,35 +378,37 @@ pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError>
     let mut bindings = Vec::with_capacity(surface.bindings.len());
     for binding in &surface.bindings {
         if !binding.worktree_path.exists() {
-            // Whatever removed the directory may not have unregistered it —
-            // teardown only prunes on the paths it walks, and a worktree can
-            // vanish long after that (a retained-dirty one deleted by hand, a
-            // wiped `surfaces/` tree). A stale registration makes every
-            // `git worktree add` at that path fail forever, which would shut
-            // §12's one door back out of failed/blocked/waiting.
-            prune_stale_worktrees(&binding.source_path);
-            // The branch was retained by teardown; check it out again there.
-            let branch_exists = git_succeeds(
-                &binding.source_path,
-                &[
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{}", binding.work_branch),
-                ],
-            );
-            let start = if branch_exists {
-                binding.work_branch.clone()
-            } else {
-                binding.base_sha.clone()
-            };
-            add_worktree_from(
-                &binding.source_path,
-                &binding.worktree_path,
-                &binding.work_branch,
-                &start,
-                !branch_exists,
-            )?;
+            with_repository(&binding.source_path, || {
+                // Whatever removed the directory may not have unregistered it
+                // — teardown only prunes on the paths it walks, and a worktree
+                // can vanish long after that (a retained-dirty one deleted by
+                // hand, a wiped `surfaces/` tree). A stale registration makes
+                // every `git worktree add` at that path fail forever, which
+                // would shut §12's one door back out of failed/blocked/waiting.
+                prune_stale_worktrees(&binding.source_path);
+                // The branch was retained by teardown; check it out again there.
+                let branch_exists = git_succeeds(
+                    &binding.source_path,
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/heads/{}", binding.work_branch),
+                    ],
+                );
+                let start = if branch_exists {
+                    binding.work_branch.clone()
+                } else {
+                    binding.base_sha.clone()
+                };
+                add_worktree_from(
+                    &binding.source_path,
+                    &binding.worktree_path,
+                    &binding.work_branch,
+                    &start,
+                    !branch_exists,
+                )
+            })?;
         }
         let head_sha = git(&binding.worktree_path, &["rev-parse", "HEAD"])?;
         bindings.push(RepositoryBinding {
@@ -449,6 +495,10 @@ fn prune_stale_worktrees(source: &Path) {
 }
 
 fn teardown_binding(binding: &RepositoryBinding) -> BindingDisposition {
+    with_repository(&binding.source_path, || teardown_binding_locked(binding))
+}
+
+fn teardown_binding_locked(binding: &RepositoryBinding) -> BindingDisposition {
     if !binding.worktree_path.exists() {
         // The directory is gone, but the source repository still lists it;
         // unregister it now so a later rematerialize at the same path is
@@ -513,6 +563,81 @@ fn add_worktree_from(
 mod tests {
     use super::*;
     use std::process::Command;
+
+    /// Concurrent surfaces against **one** repository all materialize and all
+    /// tear down cleanly.
+    ///
+    /// N3 moved git out from under the daemon's core lock (§22.6), which is
+    /// what the budget asks for and which promptly let a burst run
+    /// `git worktree add`/`remove` against the same `.git` from many threads.
+    /// Git does not serialize that: a measured burst-50 run left two surfaces
+    /// retained with `fatal: failed to read .git/worktrees/<other>/commondir`
+    /// — one process walking the registry while another rewrote it. Failing
+    /// closed made it honest, not harmless: those worktrees stayed on disk.
+    ///
+    /// The guard is a per-repository lock inside this module, which is not the
+    /// core lock and blocks no request. This is the regression test for it:
+    /// without the serialization it fails as a flake, which is exactly how the
+    /// bug presented.
+    ///
+    /// **Why it races the same repository more than once.** One burst of
+    /// [`WORKS`] threads reproduces the bug about 17 times in 18 with the lock
+    /// removed (measured, round-2 finding N3R2-06) — a real guard, and still a
+    /// ~6% chance per run that a reverted fix goes unnoticed. That is L7's
+    /// corollary ("single-run green is not a gate") landing on one specific
+    /// test, and the cheap answer is to make one run *be* several: with
+    /// [`ROUNDS`] independent bursts the escape probability is 0.06^5, about
+    /// one run in 1.3 million, for ~2.5 s of wall clock. Anyone reverting the
+    /// per-repository lock now sees red, not a coin flip.
+    #[test]
+    fn concurrent_surfaces_on_one_repository_all_materialize_and_retire_cleanly() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = dir.path().join("data");
+        let spec = repo(&dir.path().join("solo"));
+        // Enough overlap that adds and removes interleave inside git's own
+        // `.git/worktrees` registry, which is where the measured failure was.
+        const WORKS: usize = 24;
+        // Independent races against the same `.git`, so a single lucky
+        // interleaving cannot pass the test on its own.
+        const ROUNDS: usize = 5;
+
+        for round in 0..ROUNDS {
+            let reports: Vec<TeardownReport> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..WORKS)
+                    .map(|i| {
+                        let data = data.clone();
+                        let spec = spec.clone();
+                        scope.spawn(move || {
+                            let work_id = format!("01CONCURRENT{round}{i:03}");
+                            let surface = materialize(&data, &work_id, std::slice::from_ref(&spec))
+                                .unwrap_or_else(|e| panic!("materialize {work_id}: {e}"));
+                            teardown(&surface)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("surface thread"))
+                    .collect()
+            });
+            assert_eq!(reports.len(), WORKS);
+            for report in &reports {
+                assert!(
+                    report.clean,
+                    "a concurrent teardown must not retain a worktree it could have \
+                     removed (round {round} of {ROUNDS}): {report:?}"
+                );
+            }
+            assert!(
+                !data.join(SURFACES_DIR).exists()
+                    || std::fs::read_dir(data.join(SURFACES_DIR))
+                        .expect("surfaces dir")
+                        .next()
+                        .is_none(),
+                "no surface root survives a clean teardown (round {round} of {ROUNDS})"
+            );
+        }
+    }
 
     /// A temp repository with one commit.
     fn repo(path: &Path) -> RepositorySpec {

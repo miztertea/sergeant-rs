@@ -1,0 +1,84 @@
+{
+  "backend": "claude",
+  "execution": {
+    "attempt": 1,
+    "backend": "claude",
+    "execution_id": "01KZQEMWK5FZCB90315WDYTMWN",
+    "native_id": "92a5cdd2-a9b8-47c7-a9e7-926c488e3651",
+    "stage_id": "00-contract",
+    "stop_requested": true
+  },
+  "reservation": null,
+  "route_source": "explicit",
+  "stage": {
+    "attempt": 1,
+    "detail": "work canceled",
+    "executor": {
+      "harness": "claude",
+      "index": 0,
+      "kind": "actor",
+      "route_source": "work_actor_default",
+      "stage_id": "00-contract"
+    },
+    "index": 0,
+    "of": 10,
+    "stage_id": "00-contract",
+    "status": "canceled"
+  },
+  "surface": {
+    "bindings": [
+      {
+        "base_branch": "master",
+        "base_sha": "54ed8243f880fc8b073d86e1ef89765b6590bc1b",
+        "head_sha": "54ed8243f880fc8b073d86e1ef89765b6590bc1b",
+        "repository": "subject",
+        "source_path": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/subject",
+        "work_branch": "sergeant/01KZQEMWGTPT39M7JTEP0DF38P",
+        "worktree_path": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/data/surfaces/01KZQEMWGTPT39M7JTEP0DF38P/subject"
+      }
+    ],
+    "root": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/data/surfaces/01KZQEMWGTPT39M7JTEP0DF38P",
+    "work_id": "01KZQEMWGTPT39M7JTEP0DF38P"
+  },
+  "teardown": {
+    "bindings": [
+      {
+        "changes": "?? .sergeant/workflows/repo-to-icm/00-contract/output/contract.md",
+        "disposition": "retained_dirty",
+        "repository": "subject",
+        "work_branch": "sergeant/01KZQEMWGTPT39M7JTEP0DF38P",
+        "worktree_path": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/data/surfaces/01KZQEMWGTPT39M7JTEP0DF38P/subject"
+      }
+    ],
+    "clean": false,
+    "work_id": "01KZQEMWGTPT39M7JTEP0DF38P"
+  },
+  "work": {
+    "backend": "claude",
+    "created_at": "2026-08-11T03:42:49.882Z",
+    "created_by": "cli",
+    "id": "01KZQEMWGTPT39M7JTEP0DF38P",
+    "intent": "Decompose ONLY these two scopes of the repository subtree reference/sergeant-upstream — (1) the root operating instructions (AGENTS.md, README.md) and (2) the bin/ fleet dispatch partition — pinned per reference/UPSTREAM.md at upstream SHA f430cfd4f90174a98adbd7abebbece6303817929, into draft ICM workflows per .sergeant/workflows/repo-to-icm. This is a bounded measurement run: treat all other partitions as out of scope by contract.",
+    "origin_client": "cli",
+    "state": "canceled",
+    "workflow": "repo-to-icm",
+    "workspace": "subject"
+  },
+  "workflow": {
+    "name": "repo-to-icm",
+    "source": "/tmp/claude-0/-home-user-sergeant-rs/fff58c4e-2990-5de3-a53f-f5e2c669c45f/scratchpad/runB/subject/.sergeant/workflows/repo-to-icm",
+    "stages": [
+      "00-contract",
+      "10-inventory",
+      "20-harvest",
+      "30-normalize",
+      "40-classify",
+      "50-synthesize",
+      "60-draft",
+      "70-lint",
+      "80-adversarial-review",
+      "90-reconcile"
+    ],
+    "version": "2"
+  }
+}

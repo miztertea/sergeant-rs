@@ -77,17 +77,20 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 
 use super::{
-    Backend, BackendError, BackendSignal, Capabilities, EventSink, ExecutionHandle, NativeEvent,
-    NativeState, Observation, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
+    Backend, BackendError, BackendSignal, Capabilities, Completion, EventSink, ExecutionHandle,
+    NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport, ResumeRequest,
+    RuntimeScope, StartRequest,
 };
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::profile::Profile;
 use crate::runtime::blob::BlobStore;
+use crate::runtime::graph::KIND_CONVERSATION_ASK;
 
 /// Name this backend registers under.
 pub const CLAUDE_BACKEND_NAME: &str = "claude";
@@ -115,6 +118,67 @@ pub const REQUIRED_FLAGS: &[&str] = &[
 
 /// Environment variable naming the `claude` executable to use.
 pub const CLAUDE_BIN_ENV: &str = "SGT_CLAUDE_BIN";
+
+/// The stream-json `system` subtype carrying a turn's end-of-turn status
+/// (measured on 2.1.226 — see [`actor_question`]).
+pub const POST_TURN_SUMMARY_SUBTYPE: &str = "post_turn_summary";
+
+/// The actor's question from one `post_turn_summary` line, when it asked one.
+///
+/// **Measured, 2.1.226** (`docs/gauntlet/notes/n3-claude-ask-measurement.md`),
+/// two haiku turns in print-mode stream-json:
+///
+/// ```text
+/// turn told to ask a question →
+///   {"type":"system","subtype":"post_turn_summary",
+///    "status_category":"blocked",
+///    "status_detail":"Which database should I target: **postgres** or **sqlite**?",
+///    "needs_action":"Which database should I target: **postgres** or **sqlite**?"}
+/// turn told to answer and ask nothing →
+///   {"type":"system","subtype":"post_turn_summary",
+///    "status_category":"review_ready","status_detail":"user requested confirmation",
+///    "needs_action":""}
+/// ```
+///
+/// So `needs_action` is the discriminator, and it carries the actor's own
+/// words. The rule here is deliberately the narrow one: a **non-empty
+/// `needs_action` string** is an ask, and nothing else is. Two reasons for not
+/// also keying on `status_category`:
+///
+/// - its vocabulary is unmeasured beyond the two values above, and L1's rule
+///   is that an unmeasured field is not evidence;
+/// - the two possible errors are not symmetric. Parking a stage that did not
+///   really need parking costs a human one `respond`; completing a stage
+///   whose actor was waiting for an answer is the silent-invention failure
+///   GP-2 was filed about. The branch that fails closed is the one that
+///   parks, so the narrow rule is the one that parks.
+///
+/// The category travels into the evidence regardless, because it is what an
+/// operator reads when the decision looks wrong.
+fn actor_question(summary: &Value) -> Option<String> {
+    let question = summary.get("needs_action")?.as_str()?.trim();
+    if question.is_empty() {
+        return None;
+    }
+    Some(question.to_string())
+}
+
+/// Did this finished turn show that the CLI no longer speaks the ask grammar?
+///
+/// The narrow rule, for the same reason [`actor_question`] has one: only a
+/// turn that ran to completion — a `type:"result"` envelope, not killed by
+/// sergeant — is evidence about the *grammar*. An interrupted or crashed turn
+/// legitimately has no `post_turn_summary`, and reading that as "the line is
+/// gone" would withdraw a measured capability because a human hit cancel.
+///
+/// The distinction this makes is the one INV-N3-06 named: `post_turn_summary
+/// == None` (no such line at all) and `Some({needs_action: ""})` (the line is
+/// there and the actor asked nothing) were treated identically, so the
+/// disappearance of the line was indistinguishable from a turn that ended
+/// cleanly — which is the direction that fails open.
+fn turn_lost_the_ask_grammar(outcome: &TurnOutcome) -> bool {
+    outcome.envelope.is_some() && !outcome.interrupted && outcome.post_turn_summary.is_none()
+}
 
 /// Launch configuration for the adapter.
 #[derive(Debug, Clone)]
@@ -264,6 +328,15 @@ struct TurnOutcome {
     raw_error: Option<String>,
     /// Captured stderr, for evidence when things went wrong.
     stderr: String,
+    /// The turn's last `system`/`post_turn_summary` line, verbatim.
+    ///
+    /// Measured on 2.1.226 (see the module docs and
+    /// `docs/gauntlet/notes/n3-claude-ask-measurement.md`): print-mode
+    /// stream-json emits exactly one of these per turn, and its
+    /// `needs_action` field carries the actor's own question when the actor
+    /// ended the turn asking one. This is the structured record GP-2's ask
+    /// primitive needs; without it the adapter would be guessing from prose.
+    post_turn_summary: Option<Value>,
 }
 
 impl TurnOutcome {
@@ -468,6 +541,18 @@ pub struct ClaudeBackend {
     probe_outcome: OnceLock<ProbeOutcome>,
     state: Arc<Mutex<AdapterState>>,
     sink: Mutex<Option<EventSink>>,
+    /// Whether the installed CLI still emits the stream-json line
+    /// [`Capabilities::ask`] rests on. Starts `true` — 2.1.226 was measured
+    /// emitting one `system`/`post_turn_summary` per turn — and is lowered
+    /// the first time a turn completes normally without one.
+    ///
+    /// The probe cannot check this: `--version` and `--help` say nothing
+    /// about the stream grammar, and the only honest place to learn it is a
+    /// turn. Before this existed the absence failed *open* — any later build
+    /// that dropped, renamed or re-shaped the line silently restored the
+    /// pre-N3 GP-2 behaviour (the stage completes carrying the unanswered
+    /// question as its summary) with `ask: true` still on the wire.
+    ask_grammar: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ClaudeBackend {
@@ -487,7 +572,19 @@ impl ClaudeBackend {
             probe_outcome: OnceLock::new(),
             state: Arc::new(Mutex::new(AdapterState::default())),
             sink: Mutex::new(None),
+            ask_grammar: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Whether this adapter has seen evidence that the installed CLI still
+    /// speaks the ask grammar (§11.1's explicit semantic signal).
+    ///
+    /// Lowered — never raised — by [`turn_lost_the_ask_grammar`]: one
+    /// completed turn with no `post_turn_summary` at all is enough to
+    /// withdraw the claim, because the failure it guards against is silent.
+    /// `sgt doctor` reads it through [`Backend::capabilities`].
+    pub fn ask_grammar_intact(&self) -> bool {
+        self.ask_grammar.load(Ordering::Relaxed)
     }
 
     /// Install the event sink normalized events are pushed through (§27).
@@ -831,6 +928,7 @@ impl ClaudeBackend {
 
         let reader = TurnReader {
             backend_state: Arc::clone(&self.state),
+            ask_grammar: Arc::clone(&self.ask_grammar),
             sink: self.sink.lock().expect("claude sink lock").clone(),
             data_dir: self.config.data_dir.clone(),
             execution_id: execution_id.to_string(),
@@ -857,6 +955,9 @@ impl ClaudeBackend {
 /// ingestion end to end: raw archive, normalization, outcome recording.
 struct TurnReader {
     backend_state: Arc<Mutex<AdapterState>>,
+    /// The adapter's ask-grammar claim, lowered from here when a turn
+    /// completes without the line it rests on.
+    ask_grammar: Arc<AtomicBool>,
     sink: Option<EventSink>,
     data_dir: PathBuf,
     execution_id: String,
@@ -871,12 +972,13 @@ impl TurnReader {
     fn run(self, stdout: std::process::ChildStdout) {
         let mut raw = String::new();
         let mut envelope: Option<Value> = None;
+        let mut summary: Option<Value> = None;
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             raw.push_str(&line);
             raw.push('\n');
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                self.ingest_line(&value, &mut envelope);
+                self.ingest_line(&value, &mut envelope, &mut summary);
             }
         }
         // Stdout is closed; the process has exited or is about to. Reap it.
@@ -906,14 +1008,21 @@ impl TurnReader {
             return;
         };
         let interrupted = execution.interrupt_requested;
-        execution.turn = TurnState::Finished(TurnOutcome {
+        let outcome = TurnOutcome {
             envelope: envelope.clone(),
             interrupted,
             raw_blob: raw_blob.clone(),
             raw_error: raw_error.clone(),
             stderr: stderr.clone(),
-        });
+            post_turn_summary: summary.clone(),
+        };
+        execution.turn = TurnState::Finished(outcome.clone());
         drop(state);
+
+        // L1/L8 at runtime: a completed turn that carried no
+        // `post_turn_summary` is the CLI telling this adapter that the
+        // evidence `Capabilities::ask` rests on is gone.
+        self.note_ask_grammar(&outcome);
 
         // Every turn ends with this event, whatever it left behind. It is
         // the only place the §20 blob ref reaches the journal for a turn
@@ -955,8 +1064,35 @@ impl TurnReader {
 
     /// Normalize one stream-json line into §27 events. System lines are
     /// left to the raw archive: they are vendor plumbing, not conversation.
-    fn ingest_line(&self, value: &Value, envelope: &mut Option<Value>) {
+    fn ingest_line(
+        &self,
+        value: &Value,
+        envelope: &mut Option<Value>,
+        summary: &mut Option<Value>,
+    ) {
         match value.get("type").and_then(Value::as_str) {
+            // §11.1's explicit semantic signal, as 2.1.226 actually emits it.
+            // Only this subtype is read; the rest of the `system` stream stays
+            // vendor plumbing that lives in the raw archive.
+            Some("system")
+                if value.get("subtype").and_then(Value::as_str)
+                    == Some(POST_TURN_SUMMARY_SUBTYPE) =>
+            {
+                if let Some(question) = actor_question(value) {
+                    // The actor's own words, journaled as the actor's — a
+                    // separate fact from the engine's `stage.needs_input`,
+                    // which is sergeant's decision about what to do with it.
+                    self.emit(
+                        KIND_CONVERSATION_ASK,
+                        json!({
+                            "session_id": self.session_id,
+                            "question": question,
+                            "status_category": value.get("status_category").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+                *summary = Some(value.clone());
+            }
             Some("assistant") => {
                 let content = value
                     .pointer("/message/content")
@@ -1019,6 +1155,37 @@ impl TurnReader {
         }
     }
 
+    /// Withdraw [`Capabilities::ask`] if this turn showed the grammar it
+    /// rests on has gone, and say so once, where a reader will find it.
+    fn note_ask_grammar(&self, outcome: &TurnOutcome) {
+        if !turn_lost_the_ask_grammar(outcome) {
+            return;
+        }
+        // Only the first one matters: the claim is already withdrawn after
+        // that, and an event per turn thereafter would be noise.
+        if !self.ask_grammar.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            execution_id = %self.execution_id,
+            "the installed claude CLI completed a turn with no system/post_turn_summary \
+             line; withdrawing the `ask` capability"
+        );
+        self.emit(
+            "conversation.turn.grammar_unmeasured",
+            json!({
+                "capability": "ask",
+                "expected": format!("system/{POST_TURN_SUMMARY_SUBTYPE}"),
+                "session_id": self.session_id,
+                "detail":
+                    "a turn completed with a result envelope and no post_turn_summary line; \
+                     the evidence `Capabilities::ask` rests on is not present in this CLI's \
+                     stream, so the claim is withdrawn rather than left failing open",
+                "raw": outcome.raw_blob,
+            }),
+        );
+    }
+
     fn emit(&self, kind: &str, payload: Value) {
         if let Some(sink) = &self.sink {
             sink(EventDraft {
@@ -1078,6 +1245,20 @@ impl Backend for ClaudeBackend {
             human_attach: false,
             usage: true,
             native_subagents: false,
+            // GP-2, measured on 2.1.226 rather than assumed: print-mode
+            // stream-json emits one `system`/`post_turn_summary` per turn
+            // whose `needs_action` field carries the actor's own question
+            // when the actor ended the turn asking one, and is the empty
+            // string when it did not (see `actor_question` for the two
+            // measured records, and the opt-in contract test that re-measures
+            // them against the installed CLI). That is a structured record,
+            // not an inference from prose, so the claim is `true` — and it is
+            // the only reason it is: without that line this would be `false`
+            // and every ask would silently complete its stage. Which is why
+            // it is a *runtime* answer rather than a constant — the probe
+            // cannot see the stream grammar, so the first turn that completes
+            // without the line withdraws the claim (`ask_grammar_intact`).
+            ask: self.ask_grammar_intact(),
         }
     }
 
@@ -1100,9 +1281,25 @@ impl Backend for ClaudeBackend {
         }
     }
 
-    fn start(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
+    /// PREPARE: mint the conversation's session id and refuse anything that
+    /// could never launch — with **no process, no adapter state, and no
+    /// blocking call** (§14.3).
+    ///
+    /// This is where the "spawned before `execution.started`" window finally
+    /// closes. The adapter has always chosen the session id before spawning;
+    /// what was missing was a moment at which sergeant could *journal* that
+    /// choice while it was still only a choice. PREPARE is that moment, and it
+    /// is deliberately empty of side effects so the engine can run it under
+    /// the core lock (§22.6) and append `execution.reserved` before anything
+    /// exists to be orphaned.
+    ///
+    /// The probe and the pin pre-flight run here rather than at LAUNCH so a
+    /// refusal happens before the reservation is journaled at all: a work that
+    /// cannot start should not first acquire an execution identity.
+    fn prepare(&self, request: &StartRequest) -> Result<PreparedExecution, BackendError> {
         // Version/capability gate: an unmeasured CLI is refused with the
-        // probe's own evidence (fail closed, structured, actionable).
+        // probe's own evidence (fail closed, structured, actionable). The
+        // probe is cached after the first call and is offline either way.
         let probe = self.probe_outcome();
         if !probe.available {
             return Err(BackendError::Unavailable {
@@ -1114,18 +1311,33 @@ impl Backend for ClaudeBackend {
         if let Some(model) = &request.model {
             preflight_model_pin(model).map_err(|reason| self.err_failed(reason))?;
         }
+        // The session identity exists before the process does — and now,
+        // before the *record* of the process does too.
+        Ok(PreparedExecution {
+            execution_id: request.execution_id.clone(),
+            native_id: Some(new_session_uuid()),
+            request: request.clone(),
+        })
+    }
 
-        // Launch details pinned now, from profile + config (§14: launch
-        // configuration only — credentials stay with the native harness).
+    /// LAUNCH: register the reserved conversation and spawn its first turn.
+    ///
+    /// Everything external lives here, which is why the engine calls it with
+    /// the core lock released. The launch configuration is resolved from the
+    /// same profile PREPARE saw, through the same function START always used
+    /// (§14) — a pure function of the request, so the two phases cannot
+    /// disagree about permission mode or executable.
+    fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let session_id = prepared
+            .native_id
+            .clone()
+            .ok_or_else(|| self.err_failed("prepared execution carries no session id"))?;
         let LaunchConfig {
             executable,
             env,
             permission_args,
         } = self.launch_config(request.profile.as_ref());
-
-        // The session identity exists before the process does (see module
-        // docs: this is both the nested-env hazard fix and the L6 fix).
-        let session_id = new_session_uuid();
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -1234,7 +1446,7 @@ impl Backend for ClaudeBackend {
 
     /// Kill the per-turn process. The conversation survives (measured); the
     /// reader thread archives whatever the turn streamed before dying.
-    fn interrupt(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
+    fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let child = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
@@ -1257,7 +1469,10 @@ impl Backend for ClaudeBackend {
             let mut child = child.lock().expect("turn child lock");
             let _ = child.kill();
         }
-        Ok(())
+        // Killing the child is the whole of INTERRUPT's promise: the turn's
+        // evidence is STOP's promise, not this one, and the conversation
+        // stays live and observable either way.
+        Ok(Completion::immediate())
     }
 
     /// Re-adopt a conversation after a restart: verify that the durable
@@ -1401,30 +1616,32 @@ impl Backend for ClaudeBackend {
     /// durable transcript is untouched — recoverable state survives STOP by
     /// construction.
     ///
-    /// STOP also *waits for the turn's evidence*. Killing the child closes
+    /// STOP still *promises the turn's evidence*. Killing the child closes
     /// stdout, but the reader thread then archives the raw stream-json
     /// transcript (§20) and emits `conversation.turn.ended` carrying its blob
-    /// ref — work that happens after `interrupt` returns. Returning before it
-    /// lands would make STOP a claim about the process only: the caller is
-    /// told the execution is retired while a write to its data dir is still
-    /// in flight (measured in the M4 suite, where the write recreated a data
-    /// directory the test had already removed). Joining is safe here because
-    /// the event sink never blocks on its caller (see
-    /// [`crate::daemon::journaling_sink`]) and the adapter lock is released
-    /// before the join — the reader takes that same lock on its way out.
+    /// ref — work that happens after `interrupt` returns. Declaring the
+    /// execution retired while a write to its data dir is still in flight
+    /// would make STOP a claim about the process only (measured in the M4
+    /// suite, where that write recreated a data directory the test had
+    /// already removed).
     ///
-    /// This is called from [`crate::runtime::engine::Engine::stop_execution`]
-    /// while the daemon's `Core` mutex is held, and `Engine` is deliberately
-    /// synchronous and lock-agnostic (§25/§37 — it only ever sees `&mut
-    /// Core`, never the guard), so the join cannot release that lock without
-    /// giving `Engine` a way to drop and re-validate against concurrent
-    /// mutation mid-transition. `block_in_place` below only keeps the join
-    /// from starving the executor's other tasks; the `Core` lock stays held
-    /// for the join's duration, so a concurrent request that needs it waits
-    /// out the archive write. That is the accepted trade-off until `Engine`
-    /// grows a way to suspend and safely resume across a stop boundary.
-    fn stop(&self, handle: &ExecutionHandle) -> Result<(), BackendError> {
-        self.interrupt(handle)?;
+    /// **Issue #14 / backlog B3, resolved here.** The promise used to be kept
+    /// by joining the reader inside this method — and this method is called
+    /// from the engine while the daemon's `Core` mutex is held, so a
+    /// concurrent request waited out one transcript flush. B3's registered
+    /// trigger was "the first §15 trait revision", and this is it: the join
+    /// is handed back as a [`Completion`] instead. The engine collects it
+    /// ([`crate::backend::Deferred`]) and the daemon awaits it after
+    /// releasing the core guard, so the evidence is still durable before the
+    /// operation is over and nothing waits on a thread under the lock
+    /// (§22.6). `block_in_place` is gone with the inline join.
+    ///
+    /// The join is safe wherever it eventually runs because the event sink
+    /// never blocks on its caller (see [`crate::daemon::journaling_sink`])
+    /// and the adapter lock is released before the completion is handed over
+    /// — the reader takes that same lock on its way out.
+    fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
+        self.interrupt(handle)?.wait();
         let reader = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
@@ -1435,19 +1652,12 @@ impl Backend for ClaudeBackend {
             execution.stopped = true;
             execution.reader.take()
         };
-        if let Some(reader) = reader {
-            let use_block_in_place = tokio::runtime::Handle::try_current()
-                .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-                .unwrap_or(false);
-            if use_block_in_place {
-                tokio::task::block_in_place(|| {
-                    let _ = reader.join();
-                });
-            } else {
+        match reader {
+            None => Ok(Completion::immediate()),
+            Some(reader) => Ok(Completion::deferred(move || {
                 let _ = reader.join();
-            }
+            })),
         }
-        Ok(())
     }
 }
 
@@ -1640,6 +1850,10 @@ fn observe_envelope(
         };
     }
     // Pin verification layer 3: substitution detection from model fields.
+    // Ordered *before* the ask check on purpose: a turn that ran on the wrong
+    // model fails, whatever it asked. Parking such a stage in `needs_input`
+    // would put a human in front of a question produced by a model the work
+    // never authorized.
     match verify_model_pin(execution.model.as_deref(), envelope) {
         PinVerdict::Substituted(ran) => Observation {
             native: NativeState::Exited,
@@ -1652,17 +1866,46 @@ fn observe_envelope(
             },
             evidence: raw_evidence(session, outcome),
         },
-        verdict => Observation {
-            native: NativeState::Exited,
-            signal: BackendSignal::StageCompleted {
-                summary: Some(result_text),
-            },
-            evidence: Some(format!(
-                "session {session}; model_pin={}; raw={}",
-                verdict.as_json(),
-                outcome.raw_evidence()
-            )),
-        },
+        verdict => {
+            // GP-2: the actor asked. A turn that ends on a question is not a
+            // completed stage — it is a stage waiting on a human, resumable
+            // by `respond` on this same conversation (`--resume` continues
+            // it, U1's semantics unchanged). Before this branch existed, the
+            // question became the completion summary and the workflow moved
+            // on without it ever being answered.
+            if let Some(question) = outcome.post_turn_summary.as_ref().and_then(actor_question) {
+                let category = outcome
+                    .post_turn_summary
+                    .as_ref()
+                    .and_then(|s| s.get("status_category"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                return Observation {
+                    // The *turn's* process is gone; the conversation is not,
+                    // and SEND resumes it. §25's separation, unchanged: the
+                    // exited process says nothing about the stage.
+                    native: NativeState::Exited,
+                    signal: BackendSignal::ask(question),
+                    evidence: Some(format!(
+                        "session {session}; actor asked at turn end \
+                         (post_turn_summary.status_category={category:?}); model_pin={}; raw={}",
+                        verdict.as_json(),
+                        outcome.raw_evidence()
+                    )),
+                };
+            }
+            Observation {
+                native: NativeState::Exited,
+                signal: BackendSignal::StageCompleted {
+                    summary: Some(result_text),
+                },
+                evidence: Some(format!(
+                    "session {session}; model_pin={}; raw={}",
+                    verdict.as_json(),
+                    outcome.raw_evidence()
+                )),
+            }
+        }
     }
 }
 
@@ -1870,6 +2113,7 @@ mod tests {
             "session_id": "s"
         });
         let outcome = TurnOutcome {
+            post_turn_summary: None,
             envelope: Some(envelope.clone()),
             interrupted: false,
             raw_blob: None,
@@ -1894,6 +2138,7 @@ mod tests {
         let execution = test_execution(Some("opus"));
         let envelope = substitution_envelope();
         let outcome = TurnOutcome {
+            post_turn_summary: None,
             envelope: Some(envelope.clone()),
             interrupted: false,
             raw_blob: Some("b3:aa".to_string()),
@@ -1917,6 +2162,7 @@ mod tests {
     fn a_missing_envelope_is_resumable_when_interrupted_and_unknown_otherwise() {
         let mut execution = test_execution(None);
         execution.turn = TurnState::Finished(TurnOutcome {
+            post_turn_summary: None,
             envelope: None,
             interrupted: true,
             raw_blob: Some("b3:cc".to_string()),
@@ -1928,6 +2174,7 @@ mod tests {
         assert_eq!(observation.signal, BackendSignal::Running);
 
         execution.turn = TurnState::Finished(TurnOutcome {
+            post_turn_summary: None,
             envelope: None,
             interrupted: false,
             raw_blob: None,
@@ -1959,6 +2206,7 @@ mod tests {
             "type": "result", "subtype": "success", "result": "looks fine to me"
         });
         let outcome = TurnOutcome {
+            post_turn_summary: None,
             envelope: Some(envelope.clone()),
             interrupted: false,
             raw_blob: None,
@@ -2131,6 +2379,237 @@ mod tests {
         assert_eq!(truncate("", 4), "");
     }
 
+    /// GP-2, measured: `post_turn_summary.needs_action` is the discriminator,
+    /// and it is the *only* one this adapter reads.
+    ///
+    /// Both records below are the literal lines 2.1.226 emitted for the two
+    /// prompts recorded in `docs/gauntlet/notes/n3-claude-ask-measurement.md`.
+    /// The empty-string case is the one that matters most: a turn that asked
+    /// nothing still emits the line, so "the line exists" would have been a
+    /// capability claim with no discrimination in it at all.
+    #[test]
+    fn the_actor_question_comes_from_needs_action_and_nothing_else() {
+        let asked = json!({
+            "type": "system", "subtype": "post_turn_summary",
+            "status_category": "blocked",
+            "status_detail": "Which database should I target: **postgres** or **sqlite**?",
+            "needs_action": "Which database should I target: **postgres** or **sqlite**?",
+        });
+        assert_eq!(
+            actor_question(&asked).as_deref(),
+            Some("Which database should I target: **postgres** or **sqlite**?")
+        );
+        let did_not_ask = json!({
+            "type": "system", "subtype": "post_turn_summary",
+            "status_category": "review_ready",
+            "status_detail": "user requested confirmation",
+            "needs_action": "",
+        });
+        assert_eq!(actor_question(&did_not_ask), None);
+        // Whitespace is not a question, and a missing/non-string field is
+        // not evidence of one either.
+        assert_eq!(actor_question(&json!({"needs_action": "   "})), None);
+        assert_eq!(actor_question(&json!({"needs_action": null})), None);
+        assert_eq!(actor_question(&json!({})), None);
+        // And a category alone never conjures one: an unmeasured vocabulary
+        // is not a signal (L1).
+        assert_eq!(actor_question(&json!({"status_category": "blocked"})), None);
+    }
+
+    /// A turn that ends on an actor-authored question parks the stage instead
+    /// of completing it — and the question, not the adapter, is the author.
+    ///
+    /// This is the whole of GP-2 at the adapter boundary. Before it, the
+    /// measured ask turn returned `StageCompleted { summary: "Which database
+    /// should I target…" }`: the workflow moved to the next stage carrying the
+    /// unanswered question as its predecessor's result.
+    #[test]
+    fn an_actor_authored_question_parks_the_stage_rather_than_completing_it() {
+        let execution = test_execution(None);
+        let envelope = json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "result": "Which database should I target: **postgres** or **sqlite**?",
+        });
+        let outcome = TurnOutcome {
+            post_turn_summary: Some(json!({
+                "type": "system", "subtype": "post_turn_summary",
+                "status_category": "blocked",
+                "needs_action": "Which database should I target: **postgres** or **sqlite**?",
+            })),
+            envelope: Some(envelope.clone()),
+            interrupted: false,
+            raw_blob: Some("b3:aa".to_string()),
+            raw_error: None,
+            stderr: String::new(),
+        };
+        let observation = observe_envelope(&execution, &envelope, &outcome);
+        match &observation.signal {
+            BackendSignal::NeedsInput { prompt, asked_by } => {
+                assert_eq!(
+                    prompt,
+                    "Which database should I target: **postgres** or **sqlite**?"
+                );
+                assert_eq!(*asked_by, crate::backend::AskAuthor::Actor);
+            }
+            other => panic!("expected an actor ask, got {other:?}"),
+        }
+        // The turn's process is gone; the conversation is not (§25).
+        assert_eq!(observation.native, NativeState::Exited);
+        let evidence = observation.evidence.unwrap_or_default();
+        assert!(
+            evidence.contains("status_category"),
+            "the unmeasured category travels as evidence, never as the decision: {evidence}"
+        );
+
+        // Same turn, no question: the stage completes exactly as before.
+        let quiet = TurnOutcome {
+            post_turn_summary: Some(json!({
+                "type": "system", "subtype": "post_turn_summary",
+                "status_category": "review_ready", "needs_action": "",
+            })),
+            ..outcome
+        };
+        assert!(matches!(
+            observe_envelope(&execution, &envelope, &quiet).signal,
+            BackendSignal::StageCompleted { .. }
+        ));
+    }
+
+    /// An ask never outranks a model-pin substitution. Parking a stage would
+    /// put a human in front of a question produced by a model the work never
+    /// authorized; the pin failure is the outcome, and it stays the outcome.
+    #[test]
+    fn a_substituted_pin_still_fails_even_when_the_actor_asked() {
+        let execution = test_execution(Some("opus"));
+        let envelope = substitution_envelope();
+        let outcome = TurnOutcome {
+            post_turn_summary: Some(json!({
+                "type": "system", "subtype": "post_turn_summary",
+                "status_category": "blocked", "needs_action": "which one?",
+            })),
+            envelope: Some(envelope.clone()),
+            interrupted: false,
+            raw_blob: None,
+            raw_error: None,
+            stderr: String::new(),
+        };
+        assert!(matches!(
+            observe_envelope(&execution, &envelope, &outcome).signal,
+            BackendSignal::Failed { .. }
+        ));
+    }
+
+    /// INV-N3-06: `Capabilities::ask` rests on a stream-json line the probe
+    /// cannot check, and its absence used to fail *open*.
+    ///
+    /// `post_turn_summary == None` and `Some({needs_action: ""})` were treated
+    /// identically, so a later CLI that dropped, renamed or re-shaped the line
+    /// would silently restore the pre-N3 behaviour — the stage completes
+    /// carrying the unanswered question as its summary — with `ask: true`
+    /// still on the wire and nothing but an opt-in, token-spending test to
+    /// notice. The adapter can tell at runtime, from the one place the answer
+    /// exists: a turn.
+    #[test]
+    fn a_completed_turn_with_no_post_turn_summary_withdraws_the_ask_claim() {
+        let completed = |summary: Option<Value>| TurnOutcome {
+            envelope: Some(json!({"type": "result", "is_error": false, "result": "done"})),
+            interrupted: false,
+            raw_blob: None,
+            raw_error: None,
+            stderr: String::new(),
+            post_turn_summary: summary,
+        };
+
+        // The measured 2.1.226 shapes, both of which carry the line: the
+        // capability survives an ask *and* a turn that asked nothing.
+        assert!(!turn_lost_the_ask_grammar(&completed(Some(json!({
+            "type": "system", "subtype": POST_TURN_SUMMARY_SUBTYPE,
+            "needs_action": "postgres or sqlite?",
+        })))));
+        assert!(!turn_lost_the_ask_grammar(&completed(Some(json!({
+            "type": "system", "subtype": POST_TURN_SUMMARY_SUBTYPE,
+            "needs_action": "",
+        })))));
+
+        // The line is gone: the evidence the claim rests on is not there.
+        assert!(turn_lost_the_ask_grammar(&completed(None)));
+
+        // A turn sergeant killed, and one that died without an envelope, are
+        // not evidence about the grammar — withdrawing a measured capability
+        // because a human hit cancel would be its own invention.
+        let mut interrupted = completed(None);
+        interrupted.interrupted = true;
+        assert!(!turn_lost_the_ask_grammar(&interrupted));
+        let mut crashed = completed(None);
+        crashed.envelope = None;
+        assert!(!turn_lost_the_ask_grammar(&crashed));
+    }
+
+    /// …and the withdrawal reaches the capability list, once.
+    #[test]
+    fn the_withdrawn_ask_claim_is_what_the_capability_list_reports() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let backend = ClaudeBackend::new(ClaudeConfig::new(dir.path()));
+        assert!(
+            backend.capabilities().ask && backend.ask_grammar_intact(),
+            "measured on 2.1.226: see docs/gauntlet/notes/n3-claude-ask-measurement.md"
+        );
+
+        let emitted = Arc::new(Mutex::new(Vec::<EventDraft>::new()));
+        let sink_events = Arc::clone(&emitted);
+        backend.set_event_sink(Arc::new(move |draft| {
+            sink_events.lock().expect("sink lock").push(draft);
+        }));
+        let reader = TurnReader {
+            backend_state: Arc::clone(&backend.state),
+            ask_grammar: Arc::clone(&backend.ask_grammar),
+            sink: backend.sink.lock().expect("sink lock").clone(),
+            data_dir: dir.path().to_path_buf(),
+            execution_id: "e-grammar".to_string(),
+            work_id: "w-grammar".to_string(),
+            session_id: "s-grammar".to_string(),
+            model: None,
+            child: Arc::new(Mutex::new(
+                std::process::Command::new("true")
+                    .spawn()
+                    .expect("spawn true"),
+            )),
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+        };
+        let outcome = TurnOutcome {
+            envelope: Some(json!({"type": "result", "is_error": false, "result": "done"})),
+            interrupted: false,
+            raw_blob: None,
+            raw_error: None,
+            stderr: String::new(),
+            post_turn_summary: None,
+        };
+
+        reader.note_ask_grammar(&outcome);
+        assert!(
+            !backend.capabilities().ask,
+            "an unmeasurable capability fails closed (L1, L8)"
+        );
+        reader.note_ask_grammar(&outcome);
+
+        let events = emitted.lock().expect("sink lock");
+        let notices: Vec<&EventDraft> = events
+            .iter()
+            .filter(|e| e.kind == "conversation.turn.grammar_unmeasured")
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "the withdrawal is journaled once, not once per turn: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(notices[0].payload["capability"], "ask");
+        assert_eq!(
+            notices[0].payload["expected"],
+            format!("system/{POST_TURN_SUMMARY_SUBTYPE}")
+        );
+    }
+
     fn test_execution(model: Option<&str>) -> ClaudeExecution {
         ClaudeExecution {
             session_id: "s".to_string(),
@@ -2142,6 +2621,7 @@ mod tests {
             permission_args: vec![],
             turns: 1,
             turn: TurnState::Finished(TurnOutcome {
+                post_turn_summary: None,
                 envelope: None,
                 interrupted: false,
                 raw_blob: None,

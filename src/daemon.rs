@@ -307,11 +307,13 @@ pub async fn start_with(
     if !reconciled.resumed.is_empty()
         || !reconciled.blocked.is_empty()
         || !reconciled.surfaces_retired.is_empty()
+        || !reconciled.reservations_retired.is_empty()
     {
         tracing::info!(
             resumed = ?reconciled.resumed,
             blocked = ?reconciled.blocked,
             surfaces_retired = ?reconciled.surfaces_retired,
+            reservations_retired = ?reconciled.reservations_retired,
             "reconciled in-flight work after restart"
         );
     }

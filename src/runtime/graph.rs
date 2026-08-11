@@ -41,6 +41,11 @@ pub const KIND_TOOL_COMPLETED: &str = "tool.completed";
 pub const KIND_USAGE_UPDATED: &str = "usage.updated";
 /// §27 event kind: a turn finished, however it finished.
 pub const KIND_CONVERSATION_TURN_ENDED: &str = "conversation.turn.ended";
+/// §27 event kind: the actor authored a question and is waiting for a human
+/// answer (GP-2's ask primitive). Its own kind rather than a flavour of
+/// assistant text: what the actor *said* and what the actor is *waiting on*
+/// are different facts, and only the second one parks a stage.
+pub const KIND_CONVERSATION_ASK: &str = "conversation.ask";
 
 /// One node of the derived graph.
 #[derive(Debug, Clone, PartialEq, Eq)]

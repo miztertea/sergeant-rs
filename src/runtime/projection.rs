@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::event::Event;
-use crate::domain::execution::{ExecutionRecord, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED};
+use crate::domain::execution::{
+    ExecutionRecord, ExecutionReservation, KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RESERVED,
+    KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
+};
 use crate::domain::profile::Profile;
 use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_SUBMITTED, Work, WorkState,
@@ -22,7 +25,7 @@ use crate::domain::work::{
 use crate::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
     KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
-    StageRecord, StageStatus, WorkflowDefinition,
+    StageBinding, StageRecord, StageStatus, WorkflowDefinition,
 };
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::journal::JournalError;
@@ -309,6 +312,14 @@ pub struct WorkRun {
     /// The execution last started for this work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<ExecutionRecord>,
+    /// An execution reserved but not yet observed to have launched (§14.2).
+    ///
+    /// Set by `execution.reserved` and cleared by the `execution.started`
+    /// that settles it. A run holding one outside that window is a run whose
+    /// launch phase never reported back — the crash window §22.5 injects
+    /// into, and the one thing recovery must never guess about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation: Option<ExecutionReservation>,
     /// Backend the run routed to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -318,6 +329,13 @@ pub struct WorkRun {
     /// Launch profile pinned at bind time (§14 — launch configuration only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    /// The per-stage executor decisions pinned at bind time (§12.5, §17.5).
+    ///
+    /// Empty for a run bound before N3, and for one whose every stage takes
+    /// the Work actor default — the two are the same fact, and `backend` /
+    /// `profile` above carry it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_bindings: Vec<StageBinding>,
 }
 
 impl WorkRun {
@@ -336,6 +354,50 @@ impl WorkRun {
             || self.surface.is_some()
             || self.workflow.is_some()
             || self.execution.is_some()
+            || self.reservation.is_some()
+    }
+
+    /// The reservation whose launch never reported back, if there is one.
+    ///
+    /// A reservation the matching `execution.started` cleared is not one of
+    /// these; neither is one whose execution the journal *does* record. What
+    /// is left is precisely the two-phase window: sergeant committed to an
+    /// execution identity and the journal never learned whether the external
+    /// effect happened.
+    pub fn unsettled_reservation(&self) -> Option<&ExecutionReservation> {
+        let reservation = self.reservation.as_ref()?;
+        match &self.execution {
+            Some(execution) if reservation.was_launched_as(execution) => None,
+            _ => Some(reservation),
+        }
+    }
+
+    /// The pinned executor decision for one stage of this run (§12.5).
+    ///
+    /// Matched on the stage id *and* its index: a workflow may legally repeat
+    /// a harness across stages, but two stages never share a coordinate, and
+    /// resolving by id alone would let a workflow whose author reused an id
+    /// silently borrow another stage's harness.
+    pub fn stage_binding(&self, stage_id: &str, index: usize) -> Option<&StageBinding> {
+        self.stage_bindings
+            .iter()
+            .find(|b| b.stage_id == stage_id && b.index == index)
+    }
+
+    /// The launch profile in force for the stage this run is currently on.
+    ///
+    /// A stage with a pinned binding answers from it — including when the
+    /// answer is "no profile", which for a stage on a harness the Work-level
+    /// profile does not belong to is the only correct answer. Only a run with
+    /// no bindings at all (bound before N3) falls back to the Work profile.
+    pub fn current_stage_profile(&self) -> Option<Profile> {
+        match self
+            .current_stage()
+            .and_then(|s| self.stage_binding(&s.stage_id, s.index))
+        {
+            Some(binding) => binding.profile.clone(),
+            None => self.profile.clone(),
+        }
     }
 
     fn last_stage_mut(&mut self, stage_id: &str) -> Option<&mut StageRecord> {
@@ -389,6 +451,14 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
                 run.backend = event.payload["backend"].as_str().map(str::to_string);
                 run.route_source = event.payload["route_source"].as_str().map(str::to_string);
                 run.profile = serde_json::from_value(event.payload["profile"].clone()).ok();
+                // Additive (§20.5). A `workflow.bound` journaled before N3's
+                // per-stage selection carries no `stage_bindings`, and an
+                // empty vec is exactly what that meant: every stage runs on
+                // the Work-level actor default, which `backend`/`profile`
+                // above already record.
+                run.stage_bindings =
+                    serde_json::from_value(event.payload["stage_bindings"].clone())
+                        .unwrap_or_default();
             }
         }
         KIND_SURFACE_MATERIALIZING => {
@@ -462,12 +532,34 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
                 }
             }
         }
+        KIND_EXECUTION_RESERVED => {
+            if let (Some(work_id), Ok(reservation)) = (
+                event.work_id.as_ref(),
+                serde_json::from_value::<ExecutionReservation>(
+                    event.payload["reservation"].clone(),
+                ),
+            ) {
+                state.runs.entry(work_id.clone()).or_default().reservation = Some(reservation);
+            }
+        }
         KIND_EXECUTION_STARTED => {
             if let (Some(work_id), Ok(execution)) = (
                 event.work_id.as_ref(),
                 serde_json::from_value::<ExecutionRecord>(event.payload["execution"].clone()),
             ) {
-                state.runs.entry(work_id.clone()).or_default().execution = Some(execution);
+                let run = state.runs.entry(work_id.clone()).or_default();
+                // The reservation this start settles stops being outstanding.
+                // A start that settles a *different* reservation leaves it
+                // standing, because that one is still unaccounted for — the
+                // window is about the identity, not about the clock.
+                if run
+                    .reservation
+                    .as_ref()
+                    .is_some_and(|r| r.was_launched_as(&execution))
+                {
+                    run.reservation = None;
+                }
+                run.execution = Some(execution);
             }
         }
         KIND_EXECUTION_STOPPED => {
@@ -486,13 +578,31 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
             if !acknowledged {
                 return;
             }
-            if let Some(execution) = event
-                .work_id
-                .as_ref()
-                .and_then(|id| state.runs.get_mut(id))
-                .and_then(|run| run.execution.as_mut())
+            let Some(run) = event.work_id.as_ref().and_then(|id| state.runs.get_mut(id)) else {
+                return;
+            };
+            // The latch belongs to the execution the event *names*. Before the
+            // two-phase boundary every `execution.stopped` was about the run's
+            // current execution and the id went unread; now a superseded
+            // launch can be stopped while a different execution is current,
+            // and latching that one would make a later cancel a permanent
+            // no-op against a live native context nobody ever asked to die.
+            let named = event.payload["execution_id"].as_str();
+            if let Some(execution) = run.execution.as_mut()
+                && named.is_none_or(|id| id == execution.execution_id)
             {
                 execution.stop_requested = true;
+            }
+        }
+        KIND_EXECUTION_ABANDONED => {
+            // The reservation is accounted for — whatever happened to it, the
+            // journal now says so, and it is no longer an open two-phase
+            // window for recovery to fail closed on.
+            if let Some(run) = event.work_id.as_ref().and_then(|id| state.runs.get_mut(id))
+                && let Some(reservation) = run.reservation.as_ref()
+                && event.payload["execution_id"].as_str() == Some(reservation.execution_id.as_str())
+            {
+                run.reservation = None;
             }
         }
         KIND_COMMAND_ACCEPTED | KIND_COMMAND_REJECTED => {

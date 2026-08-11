@@ -1,0 +1,4 @@
+[workflow]
+name = "project-graphify"
+version = "1"
+stages = ["01-publish-graph"]

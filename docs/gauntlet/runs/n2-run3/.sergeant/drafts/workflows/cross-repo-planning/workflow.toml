@@ -1,0 +1,4 @@
+[workflow]
+name = "cross-repo-planning"
+version = "1"
+stages = []

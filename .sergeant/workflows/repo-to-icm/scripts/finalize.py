@@ -77,8 +77,51 @@ plan against a real or scratch worktree before the closing stage actually
 applies it.
 
 Exits 0 on a clean apply (including "nothing to do"), 1 if any stage's
-output could not be resolved unambiguously (nothing is modified in that
-case), 2 on a usage/environment error.
+output could not be resolved unambiguously, or if the evidence-preservation
+guard below refuses (nothing is modified in either case), 2 on a
+usage/environment error.
+
+EVIDENCE-PRESERVATION GUARD (GP-5b; docs/gauntlet/runs/n2-run2/
+grammar-pressure-report.md GP-5b; issue #29)
+-----------------------------------------------------------------------------
+`docs/icm/convention.md` §1a's D9 disposition rule promises that
+`evidence`-class and undeclared files "remain recoverable from Work-branch
+history" after finalize removes them. That promise is only true if the file
+was actually committed to some tree before this script's own `git rm` runs.
+A `git add` immediately followed by a `git rm`, with no commit landing in
+between, writes a blob object into `.git/objects` but no tree or commit ever
+references it (measured: `git commit` after such an add+rm reports "nothing
+to commit" for that path) — `git log --all -- <path>` finds nothing, the
+object is unreachable, and it is eventually garbage-collected. That is
+exactly what happened to `20-harvest/output/coverage-note.md` in the run
+this guard was written for: two artifacts (`measurement-package.md`,
+`run-manifest.md`) both claimed it was "recoverable from Work-branch
+history," and neither claim was true — the file existed in no git tree at
+any revision.
+
+Before removing anything, this script verifies every file about to be
+removed is already reachable in at least one committed tree (`git log
+--all -- <path>` non-empty — equivalently, `git cat-file -e
+<commit>:<path>` succeeds for some commit). `90-reconcile`'s own calling
+convention stages (`git add`) every stage's `output/` before invoking this
+script, so the ordinary case is: a to-be-removed file is *staged* but not
+yet committed. For exactly that case, this script performs a **capture
+commit** first — committing whatever is currently staged, verbatim, before
+touching anything — which makes every staged file (including the ones
+about to be removed) genuinely reachable, and then proceeds with the
+ordinary removal-and-commit sequence below. This is mechanical, not
+judgment: it commits what the caller already staged, it does not decide
+what *should* be staged (this script still never runs `git add` itself).
+
+If, after that capture commit (or with nothing to capture), a file slated
+for removal is **still** not reachable — it was never staged at all, the
+literal shape of the original GP-5b defect — this script REFUSES outright
+(fail-closed, nothing modified beyond the capture commit already
+described, which by construction only ever adds content, never removes
+any) rather than deleting unrecoverable evidence.
+`scripts/test-finalize-evidence-guard.py` proves both paths (refuse on a
+never-staged file; proceed, via the capture commit, on a staged-but-
+uncommitted one) against a scratch git sandbox, runnable standalone.
 """
 
 import os
@@ -222,6 +265,26 @@ def git(*args, cwd):
     )
 
 
+def _reachable(root, rel):
+    """True iff `rel` is present in at least one commit reachable from any
+    ref (`git log --all -- rel` non-empty) — meaning its content would
+    survive even after this script's own `git rm` (GP-5b: the D9
+    disposition policy's "recoverable from Work-branch history" promise,
+    checked rather than assumed)."""
+    log = git("log", "--all", "--oneline", "--", rel, cwd=root)
+    return log.returncode == 0 and log.stdout.strip() != ""
+
+
+def _is_staged(root, rel):
+    """True iff `rel` is currently in the git index (staged via `git add`),
+    whether or not it has ever been committed — `git ls-files --stage --
+    rel` non-empty. Distinguishes "about to be captured by the next commit"
+    from "genuinely never touched," which `_reachable` alone cannot tell
+    apart (both read as unreachable in `git log`)."""
+    ls = git("ls-files", "--stage", "--", rel, cwd=root)
+    return ls.returncode == 0 and ls.stdout.strip() != ""
+
+
 def main():
     args = sys.argv[1:]
     dry_run = "--dry-run" in args
@@ -250,14 +313,97 @@ def main():
             print(" -", e)
         return 1
 
+    plan_lines = []   # ("keep", printable) | ("remove", relpath) in stage order
     to_remove = []
     for p in plans:
         for fname in p.keep:
-            print(f"keep    {p.stage_id}/output/{fname}  (promote)")
+            plan_lines.append(("keep", f"keep    {p.stage_id}/output/{fname}  (promote)"))
         for fname in p.remove:
+            rel = os.path.join(p.stage_id, "output", fname)
+            plan_lines.append(("remove", rel))
+            to_remove.append(rel)
+
+    in_git = git("rev-parse", "--is-inside-work-tree", cwd=root)
+    use_git = in_git.returncode == 0 and in_git.stdout.strip() == "true"
+
+    # Evidence-preservation guard (GP-5b) — see module docstring. Checked
+    # before anything is printed or modified. Two cases for a to-be-removed
+    # file that is not yet reachable in a committed tree:
+    #   - never staged at all (the literal GP-5b shape) -> REFUSE outright,
+    #     nothing modified.
+    #   - staged but not yet committed (the ordinary case, since
+    #     90-reconcile's own `git add` runs before this script) -> commit
+    #     whatever is currently staged first (a "capture commit" — this
+    #     script still never runs `git add` itself, it only commits what
+    #     the caller already staged), which makes it reachable, then
+    #     proceed.
+    # Only meaningful inside a git worktree; outside one there is no
+    # "Work-branch history" to preserve in the first place.
+    capture_note = None
+    if use_git and to_remove:
+        unreachable = [rel for rel in to_remove if not _reachable(root, rel)]
+        if unreachable:
+            staged = [rel for rel in unreachable if _is_staged(root, rel)]
+            never_staged = [rel for rel in unreachable if rel not in staged]
+
+            if never_staged:
+                print("REFUSED (fail-closed: nothing modified) — evidence preservation:")
+                for rel in never_staged:
+                    print(
+                        " -",
+                        f"EVIDENCE-LOSS: {rel} is about to be removed but is "
+                        f"not staged and not committed anywhere (`git log "
+                        f"--all -- {rel}` and `git ls-files --stage -- {rel}` "
+                        f"are both empty) — its removal would be "
+                        f"unrecoverable, not 'recoverable from Work-branch "
+                        f"history' as the D9 disposition policy promises "
+                        f"(GP-5b). `git add -- {rel}` it first, then re-run "
+                        f"finalize.",
+                    )
+                return 1
+
+            # Every unreachable file IS staged: a capture commit makes it,
+            # and everything else already staged, reachable before removal.
+            if dry_run:
+                capture_note = (
+                    f"would first create a capture commit for {len(staged)} "
+                    f"currently-staged file(s) not yet in any commit "
+                    f"(evidence-preservation guard, GP-5b); nothing modified "
+                    f"(dry-run)"
+                )
+            else:
+                commit = git(
+                    "commit", "-m",
+                    "repo-to-icm finalize: capture staged per-run artifact(s) "
+                    "before disposition (evidence-preservation guard, GP-5b)\n\n"
+                    "Committed whatever this run's stages had already staged, "
+                    "before removing any evidence-class/undeclared file, so "
+                    "every removal below is a recoverable deletion rather "
+                    "than an unrecorded one.",
+                    cwd=root,
+                )
+                if commit.returncode != 0:
+                    print(f"error: capture commit failed:\n{commit.stderr}", file=sys.stderr)
+                    return 2
+                still_unreachable = [rel for rel in to_remove if not _reachable(root, rel)]
+                if still_unreachable:
+                    print("REFUSED — evidence preservation still fails after capture commit:")
+                    for rel in still_unreachable:
+                        print(" -", f"EVIDENCE-LOSS: {rel} still unreachable after the capture commit")
+                    return 1
+                capture_note = (
+                    f"captured {len(staged)} staged file(s) in a commit before removal"
+                )
+
+    for kind, val in plan_lines:
+        if kind == "keep":
+            print(val)
+        else:
             verb = "would remove" if dry_run else "remove"
-            print(f"{verb}  {p.stage_id}/output/{fname}")
-            to_remove.append(os.path.join(p.stage_id, "output", fname))
+            print(f"{verb}  {val}")
+
+    if capture_note:
+        print(f"\n{capture_note}")
 
     if not to_remove:
         print("\nnothing to finalize (no evidence-class or undeclared files present)")
@@ -266,9 +412,6 @@ def main():
     if dry_run:
         print(f"\ndry-run: would finalize {len(to_remove)} file(s); nothing modified.")
         return 0
-
-    in_git = git("rev-parse", "--is-inside-work-tree", cwd=root)
-    use_git = in_git.returncode == 0 and in_git.stdout.strip() == "true"
 
     if use_git:
         rm = git("rm", "-f", "--", *to_remove, cwd=root)

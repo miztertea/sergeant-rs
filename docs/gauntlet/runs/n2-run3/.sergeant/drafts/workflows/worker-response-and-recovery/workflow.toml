@@ -1,0 +1,4 @@
+[workflow]
+name = "worker-response-and-recovery"
+version = "1"
+stages = ["01-evaluate-wake-condition", "02-respond-to-worker"]
