@@ -198,6 +198,17 @@ pub struct Workspace {
     /// (R-MVP1-5(b), MVP-3's `--group`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub groups: BTreeMap<String, GroupSpec>,
+    /// Per-repository `origin` (MVP-3, `sgt repo add`'s clone-or-verify),
+    /// keyed by repository name. Informational only — never consumed by
+    /// materialize/execution (R-NS-4: a surface adds usability, never
+    /// functionality) — recorded so `sgt repo list` can show where a
+    /// repository was cloned from and a repeated `sgt repo add` can tell "the
+    /// dir already exists" from "and here is what it should verify against".
+    /// A name absent from this map (including the zero-config fallback and
+    /// any `[[repo]]` entry that never declared `origin`) has no known
+    /// origin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repository_origin: BTreeMap<String, String>,
 }
 
 /// Failure resolving a workspace.
@@ -382,6 +393,10 @@ struct RepositoryEntry {
     /// R-MVP1-4. Unset means [`InstructionPolicy::Suppress`].
     #[serde(default)]
     instructions: InstructionPolicy,
+    /// MVP-3 `sgt repo add`'s clone-or-verify source. Recorded, never acted
+    /// on by this module beyond bookkeeping (see [`Workspace::repository_origin`]).
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +517,7 @@ impl Workspace {
                 surfaces_dir: None,
                 repository_policy: BTreeMap::new(),
                 groups: BTreeMap::new(),
+                repository_origin: BTreeMap::new(),
             })
         }
     }
@@ -573,6 +589,30 @@ impl Workspace {
 
     /// Parse and validate a `sergeant.toml` into a workspace.
     pub fn from_config(config_path: &Path) -> Result<Self, WorkspaceError> {
+        Self::from_config_impl(config_path, false)
+    }
+
+    /// [`Self::from_config`] with the `NoRepositories` refusal relaxed.
+    ///
+    /// The manifest edit pen (`sgt init`, `src/domain/manifest.rs`) validates
+    /// every edit by round-tripping it through this module's own parser
+    /// before committing (A4: "sgt remains the validating writer") — but a
+    /// freshly scaffolded `[estate]` section legitimately has no `[[repo]]`
+    /// entries yet, before the first `sgt repo add`, and that state must
+    /// validate clean rather than being refused by the same rule that
+    /// (correctly) refuses a *hand-edited* `sergeant.toml` with no
+    /// repositories at all. Every other check — legacy vocabulary,
+    /// duplicate/invalid names, group membership, profile validity — still
+    /// applies in full; this relaxes exactly the one rule that is about
+    /// "nothing to declare yet", not "something is wrong".
+    pub fn from_config_allow_empty(config_path: &Path) -> Result<Self, WorkspaceError> {
+        Self::from_config_impl(config_path, true)
+    }
+
+    fn from_config_impl(
+        config_path: &Path,
+        allow_empty_repos: bool,
+    ) -> Result<Self, WorkspaceError> {
         let file = config_path.display().to_string();
         let text = std::fs::read_to_string(config_path).map_err(|source| WorkspaceError::Io {
             path: file.clone(),
@@ -593,7 +633,7 @@ impl Workspace {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        if parsed.repo.is_empty() {
+        if parsed.repo.is_empty() && !allow_empty_repos {
             return Err(WorkspaceError::NoRepositories { file });
         }
         let mut seen = BTreeSet::new();
@@ -603,6 +643,7 @@ impl Workspace {
         let mut seen_paths: BTreeMap<PathBuf, String> = BTreeMap::new();
         let mut repositories = Vec::with_capacity(parsed.repo.len());
         let mut repository_policy = BTreeMap::new();
+        let mut repository_origin = BTreeMap::new();
         for entry in parsed.repo {
             if !is_plain_name(&entry.name) {
                 return Err(WorkspaceError::InvalidRepositoryName {
@@ -637,6 +678,9 @@ impl Workspace {
             }
             seen_paths.insert(resolved.clone(), entry.name.clone());
             repository_policy.insert(entry.name.clone(), entry.instructions);
+            if let Some(origin) = entry.origin {
+                repository_origin.insert(entry.name.clone(), origin);
+            }
             repositories.push(RepositorySpec {
                 name: entry.name,
                 path: resolved,
@@ -708,6 +752,7 @@ impl Workspace {
             surfaces_dir,
             repository_policy,
             groups,
+            repository_origin,
         })
     }
 
@@ -724,6 +769,29 @@ impl Workspace {
             .get(repository)
             .copied()
             .unwrap_or_default()
+    }
+
+    /// This repository's declared `origin`, if `sgt repo add` (or a hand
+    /// edit) recorded one. `None` for a name absent from the manifest and
+    /// for a declared repository that never gave an `origin`.
+    pub fn repository_origin(&self, repository: &str) -> Option<&str> {
+        self.repository_origin.get(repository).map(String::as_str)
+    }
+
+    /// The directory holding the nearest ancestor `sergeant.toml` carrying an
+    /// `[estate]` table (R-MVP1-12's own upward walk, delegated to rather
+    /// than duplicated), without resolving or validating any `[[repo]]`
+    /// entry. Used where only "is there an estate here, and where" is
+    /// needed — MVP-3's estate-resolved data-dir default and the manifest
+    /// edit pen (`src/domain/manifest.rs`) — because a full [`Self::discover`]
+    /// would refuse a freshly scaffolded, repo-less estate via
+    /// `NoRepositories` before either of those ever gets to run.
+    pub fn estate_root(
+        start: &Path,
+        data_dir: Option<&Path>,
+    ) -> Result<Option<PathBuf>, WorkspaceError> {
+        Ok(Self::find_estate_upward(start, data_dir)?
+            .and_then(|config| config.parent().map(Path::to_path_buf)))
     }
 
     /// Restrict the workspace to the named repositories (the submit request's
@@ -943,6 +1011,7 @@ mod tests {
             surfaces_dir: None,
             repository_policy: BTreeMap::new(),
             groups: BTreeMap::new(),
+            repository_origin: BTreeMap::new(),
         };
 
         let selected = workspace
