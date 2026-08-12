@@ -1033,6 +1033,30 @@ impl Engine {
                     .collect(),
             });
         }
+        // INV-R1-09 (MVP-2 D3 fixer pass): `local`'s adapter-side
+        // translation (`--setting-sources user,project,local`) authorizes
+        // more than its name suggests — hooks, tool permissions, MCP
+        // servers from the repository's own `.claude/settings*.json`, not
+        // just "reads a text file" (measured,
+        // `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`).
+        // The submit-time refusal that gated this on an unmeasured claim
+        // was correctly removed once the value was measured (D2 item 1),
+        // but nothing replaced it as an operator-visible signal — no
+        // warning at submit, no doctor row, no manifest vocabulary change.
+        // A daemon log line is the cheapest honest partial fix available in
+        // this pass without inventing new journal schema or CLI surface for
+        // a risk-disclosure feature the contract never asked for; it does
+        // not close the finding's full ask (a first-class operator signal),
+        // only makes the choice observable to whoever runs the daemon.
+        if first == InstructionPolicy::Local {
+            tracing::warn!(
+                repos = ?resolved.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+                "submitting with instructions = \"local\": every selected repository's own \
+                 .claude/settings.json and .claude/settings.local.json take effect for this \
+                 run (hooks, tool permissions, MCP servers) -- a materially larger authority \
+                 surface than reading an instruction file"
+            );
+        }
         Ok(())
     }
 
