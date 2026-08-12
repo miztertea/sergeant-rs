@@ -385,6 +385,100 @@ fn resume_on_a_missing_container_fails_closed_as_unknown_execution() {
     assert_containers_gone(&["sgt-m7-vanished"]);
 }
 
+/// COMPOSITION PROBE C2 survivor (m7 fixer panel): §16.10's identity check
+/// exists in `observe()` (`if !Self::labeled_for(...) { return Err(...) }`)
+/// but no existing test ever drove OBSERVE against a container that holds
+/// the deterministic name under different labels — every collision test
+/// exercised LAUNCH's own refusal instead, so deleting OBSERVE's check
+/// survived the whole suite. This exercises OBSERVE directly against a
+/// hand-built handle for a name a *foreign* (unlabeled) container already
+/// occupies — the shape a container recycled/replaced out from under the
+/// adapter between LAUNCH and OBSERVE would produce.
+#[test]
+fn observe_on_a_foreign_container_under_the_deterministic_name_fails_closed() {
+    require_docker!();
+    let execution_id = "m7-observe-collide";
+    let name = format!("sgt-{execution_id}");
+    force_remove(&name);
+    let status = Command::new("docker")
+        .args(["create", "--name", &name, PROBE_IMAGE, "true"])
+        .status()
+        .expect("docker create foreign container");
+    assert!(status.success());
+
+    let data = support::DataDir::new();
+    let backend = backend(data.path());
+    let handle = sergeant_rs::backend::ExecutionHandle {
+        execution_id: execution_id.to_string(),
+        native_id: Some(name.clone()),
+    };
+    let err = backend
+        .observe(&handle)
+        .expect_err("observe must not report on a container it does not own");
+    assert!(matches!(err, BackendError::UnknownExecution { .. }));
+
+    force_remove(&name);
+    assert_containers_gone(&[&name]);
+}
+
+/// TH-09 survivor (m7 fixer panel): `resume: true` is an advertised
+/// capability, but the only existing resume test exercised its negative row
+/// (a missing container). This exercises the two rows that were untested:
+/// a live, correctly-labeled container is adopted (`Ok(())`), and a
+/// foreign container under the deterministic name is refused rather than
+/// adopted — the exact shape L8 is about (an advertised verb whose success
+/// path was never driven against the installed harness).
+#[test]
+fn resume_adopts_a_live_labeled_container_and_refuses_a_foreign_one() {
+    require_docker!();
+    let data = support::DataDir::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend = backend(data.path());
+
+    let req = request(
+        "w4c",
+        "m7-resume-live",
+        cwd.path(),
+        spec(vec!["sleep", "60"], WorkspaceAccess::ReadOnly),
+    );
+    let prepared = backend.prepare(&req).expect("prepare");
+    let handle = launch(&backend, &prepared);
+
+    // Simulate a restart: a freshly built `ResumeRequest`/handle pair, as a
+    // new daemon process re-deriving the deterministic name would build,
+    // rather than anything carried over in memory (`DockerBackend` holds no
+    // per-execution state to lose in the first place).
+    let resume_request = sergeant_rs::backend::ResumeRequest::new("w4c", cwd.path());
+    backend
+        .resume(&handle, &resume_request)
+        .expect("a live, correctly-labeled container must be re-adopted");
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+    let _ = wait_for_exit(&backend, &handle);
+    backend.stop(&handle).expect("stop").wait();
+    assert_containers_gone(&["sgt-m7-resume-live"]);
+
+    // The refusal row: a foreign container under the deterministic name.
+    let execution_id = "m7-resume-foreign";
+    let name = format!("sgt-{execution_id}");
+    force_remove(&name);
+    let status = Command::new("docker")
+        .args(["create", "--name", &name, PROBE_IMAGE, "true"])
+        .status()
+        .expect("docker create foreign container");
+    assert!(status.success());
+    let foreign_handle = sergeant_rs::backend::ExecutionHandle {
+        execution_id: execution_id.to_string(),
+        native_id: Some(name.clone()),
+    };
+    let err = backend
+        .resume(&foreign_handle, &resume_request)
+        .expect_err("a foreign container must never be adopted");
+    assert!(matches!(err, BackendError::Failed { .. }));
+    force_remove(&name);
+    assert_containers_gone(&[&name]);
+}
+
 // ---------------------------------------- 4b. §22.6 STOP's deferred removal
 
 /// INV-R1-01 (MVP-2 D3 fixer pass, §22.6): `DockerBackend::stop` must not
