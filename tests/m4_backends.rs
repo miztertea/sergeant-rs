@@ -2547,7 +2547,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
                         .into_iter()
                         .collect(),
                 }),
-                instruction_policy: InstructionPolicy::default(),
+                instruction_policy: Some(InstructionPolicy::default()),
             },
         )
         .expect("re-adopt");
@@ -3147,7 +3147,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 cwd: data.path().to_path_buf(),
                 model: Some("anthropic/claude-haiku-4-5".to_string()),
                 profile: None,
-                instruction_policy: InstructionPolicy::default(),
+                instruction_policy: Some(InstructionPolicy::default()),
             },
         )
         .expect_err("a provider-qualified pin is refused pre-flight at RESUME too");
@@ -3167,7 +3167,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 cwd: data.path().to_path_buf(),
                 model: Some("haiku".to_string()),
                 profile: None,
-                instruction_policy: InstructionPolicy::default(),
+                instruction_policy: Some(InstructionPolicy::default()),
             },
         )
         .expect("re-adopt");
@@ -3429,7 +3429,7 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
                 cwd: data.path().to_path_buf(),
                 model: Some("haiku".to_string()),
                 profile: None,
-                instruction_policy: InstructionPolicy::default(),
+                instruction_policy: Some(InstructionPolicy::default()),
             },
         )
         .expect("re-adopt is idempotent");
@@ -5210,7 +5210,7 @@ fn a1_real_claude_session_identity_survives_turns_and_restart() {
                 cwd: cwd.path().to_path_buf(),
                 model: Some("haiku".to_string()),
                 profile: None,
-                instruction_policy: InstructionPolicy::default(),
+                instruction_policy: Some(InstructionPolicy::default()),
             },
         )
         .expect("re-adopt from session evidence");

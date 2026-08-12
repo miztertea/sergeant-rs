@@ -255,22 +255,32 @@ pub struct ResumeRequest {
     /// is a decision about the Work, pinned at bind, and a restarted
     /// adapter's later turns must launch under the same grammar the run
     /// started with, not the adapter's compiled-in default.
-    #[serde(default)]
-    pub instruction_policy: InstructionPolicy,
+    ///
+    /// `Option`, like `model` and `profile` above (INV-R1-13, MVP-2 D3
+    /// fixer pass): `None` is the type's own "not re-supplied" state an
+    /// adapter must treat as absent, never invented. Before this fix the
+    /// field was a bare `InstructionPolicy`, which has no such
+    /// representation — every caller silently supplied a real value
+    /// (`Suppress`) whether or not it actually had one to re-supply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_policy: Option<InstructionPolicy>,
 }
 
 impl ResumeRequest {
     /// A resume request carrying only the two things every caller has: the
-    /// work and its surface. Model, profile and instruction policy default to
-    /// "not re-supplied" (suppress, for the policy — today's only launched
-    /// behaviour), which adapters must treat as absent, never invented.
+    /// work and its surface. Model, profile and instruction policy all
+    /// default to `None` — "not re-supplied" — which adapters must treat as
+    /// absent, never invented; an adapter that needs *some* concrete policy
+    /// to launch under falls back to its own safe default (today,
+    /// `InstructionPolicy::default()` = `Suppress`) only at that point, not
+    /// here.
     pub fn new(work_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             work_id: work_id.into(),
             cwd: cwd.into(),
             model: None,
             profile: None,
-            instruction_policy: InstructionPolicy::default(),
+            instruction_policy: None,
         }
     }
 }

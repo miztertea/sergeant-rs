@@ -2532,7 +2532,7 @@ impl Engine {
             cwd: surface.execution_cwd(),
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile,
-            instruction_policy: Self::run_instruction_policy(run),
+            instruction_policy: Some(Self::run_instruction_policy(run)),
         })
     }
 

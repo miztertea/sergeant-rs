@@ -1798,7 +1798,7 @@ impl Backend for ClaudeBackend {
                 executable,
                 env,
                 permission_args,
-                instruction_policy: request.instruction_policy,
+                instruction_policy: request.instruction_policy.unwrap_or_default(),
                 turns: 1, // there was at least the turn that created it
                 // Adoption draws no conclusion — and says so. (It used to
                 // borrow an interrupted turn's shape here, which made OBSERVE
@@ -2925,6 +2925,19 @@ mod tests {
         let out_of_order = vec![Ok(withdrawal(5, "2.1.228")), Ok(withdrawal(2, "2.1.226"))];
         assert_eq!(
             latest_ask_withdrawal_version(out_of_order).unwrap(),
+            Some("2.1.228".to_string())
+        );
+
+        // SURVIVOR pin (MVP-2 D3 fixer pass): the mirrored ordering. The case above
+        // alone cannot distinguish "pick the highest seq" from "pick the
+        // first matching element" — the highest-seq record already comes
+        // first in iterator order there, so a `latest.is_none()`-style
+        // first-wins mutant returns the identical answer and survives. This
+        // pairing puts the highest seq *last* in iterator order so only a
+        // true highest-seq comparison passes both.
+        let in_order = vec![Ok(withdrawal(2, "2.1.226")), Ok(withdrawal(5, "2.1.228"))];
+        assert_eq!(
+            latest_ask_withdrawal_version(in_order).unwrap(),
             Some("2.1.228".to_string())
         );
 
