@@ -2385,15 +2385,24 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
         body["work"]["state"], "active",
         "an outside surfaces_dir must materialize even with data_dir inside the checkout: {body}"
     );
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     let worktree = PathBuf::from(
         body["surface"]["bindings"][0]["worktree_path"]
             .as_str()
             .expect("worktree path"),
     );
-    assert!(
-        worktree.starts_with(&outside),
-        "the worktree must live under the declared surfaces_dir, got {}",
-        worktree.display()
+    // Exact, not merely `starts_with`: `surface_root` must join `work_id`
+    // directly onto `surfaces_dir` with no implicit `surfaces/` re-nested
+    // inside it (that join happens exactly once, at `Engine`'s own default
+    // computation — `surface_root(surfaces_root, work_id)` no longer adds
+    // `SURFACES_DIR` itself). A `starts_with` check alone cannot catch a
+    // regression that re-nests an extra `surfaces/` under an already-custom
+    // `surfaces_dir`, since the result would still be a prefix match.
+    assert_eq!(
+        worktree,
+        outside.join(&work_id).join("solo"),
+        "the worktree must live directly under the declared surfaces_dir/<work_id>/<repo>, \
+         with no extra nesting"
     );
     handle.shutdown().await;
 
