@@ -98,6 +98,21 @@ perf_require_binary() {
     esac
     export PERF_COMMIT
   fi
+  # The tree's cleanliness at pin time, pinned beside the sha (and inherited
+  # the same way): a sha alone claims code the working tree may never have
+  # matched, and that fact belongs in the artifacts, not in a rerun's
+  # archaeology.
+  if [ -z "${PERF_TREE_DIRTY:-}" ]; then
+    if [ "$PERF_COMMIT" = unknown ]; then
+      PERF_TREE_DIRTY=unknown
+    elif [ -n "$(git -C "$PERF_REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
+      PERF_TREE_DIRTY=1
+      perf_warn "working tree at $PERF_REPO_ROOT is dirty — the commit field names a sha the tree did not match"
+    else
+      PERF_TREE_DIRTY=0
+    fi
+    export PERF_TREE_DIRTY
+  fi
   # The binary's own timestamp, pinned at the same moment: mtime forensics are
   # what reconstructed the truth for issue #50, so record it in the artifacts
   # and warn up front when the binary predates HEAD — then the commit field
@@ -108,9 +123,12 @@ perf_require_binary() {
       export PERF_BIN_MTIME
       local head_ct
       head_ct="$(git -C "$PERF_REPO_ROOT" log -1 --format=%ct HEAD 2>/dev/null || echo 0)"
+      PERF_BIN_STALE=0
       if [ "$head_ct" -gt 0 ] && [ "$PERF_BIN_MTIME" -lt "$head_ct" ]; then
+        PERF_BIN_STALE=1
         perf_warn "binary $SGT_BIN predates HEAD ($PERF_COMMIT) — rebuild, or the commit field describes code that is not in the binary"
       fi
+      export PERF_BIN_STALE
     fi
   fi
 }
@@ -143,6 +161,22 @@ perf_init() {
   perf_kv binary "$SGT_BIN"
   perf_kv binary_mtime "${PERF_BIN_MTIME:-0}"
   perf_kv commit "$PERF_COMMIT"
+  # The provenance caveats land in the summary artifact itself, not only on
+  # stderr (#50 was about the artifact): a binary older than HEAD at pin
+  # time, a dirty tree behind the pinned sha, and — re-statted here, once
+  # per scenario — a rebuild that swapped the code under the pinned label
+  # mid-matrix.
+  perf_kv binary_predates_head "${PERF_BIN_STALE:-0}"
+  perf_kv commit_dirty_tree "${PERF_TREE_DIRTY:-unknown}"
+  local perf_mtime_now
+  perf_mtime_now="$(stat -c %Y "$SGT_BIN" 2>/dev/null || echo 0)"
+  if [ "$perf_mtime_now" != "${PERF_BIN_MTIME:-0}" ]; then
+    perf_warn "binary $SGT_BIN was rebuilt since the run pinned it (mtime ${PERF_BIN_MTIME:-0} -> $perf_mtime_now) — this scenario's commit label may not describe its code"
+    perf_kv binary_swapped_since_pin 1
+    perf_kv binary_mtime_now "$perf_mtime_now"
+  else
+    perf_kv binary_swapped_since_pin 0
+  fi
   perf_kv started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 

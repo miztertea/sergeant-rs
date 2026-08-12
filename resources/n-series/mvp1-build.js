@@ -47,7 +47,9 @@ const axes = [
 const crits = await parallel(axes.map(a => () => agent(
   `Blind critic, sergeant-rs MVP-1 round 1. Read-only in ${REPO} (cargo test allowed, PATH="$HOME/.cargo/bin:$PATH"; NEVER edit). Read first: docs/gauntlet/contracts/MVP-1.md, GAUNTLET register (L3), LESSONS. Diff: git log --oneline ${BASE}..HEAD; git diff ${BASE}..HEAD. ${a.brief} Findings carry file:line evidence.`,
   { label: `critic:${a.key}`, phase: 'Panel', model: 'opus', effort: 'high', schema: FINDINGS })))
-const all = crits.filter(Boolean).flatMap((c, i) => c.findings.map(f => ({ ...f, id: `${axes[i].key}:${f.id}` })))
+// Label by original index BEFORE dropping nulls: filter(Boolean).flatMap((c, i) => ...)
+// compacts a dead critic out and hands the survivor the wrong axes[i].
+const all = crits.flatMap((c, i) => (c ? c.findings.map(f => ({ ...f, id: `${axes[i].key}:${f.id}` })) : []))
 log(`panel: ${all.length} findings (${all.filter(f => f.severity === 'error').length} error)`)
 
 phase('Verify')
@@ -55,6 +57,7 @@ let verdicts = []
 if (all.length) {
   const r = await agent(`Batched adversarial refuter, MVP-1. You built nothing. ${REPO}, PATH="$HOME/.cargo/bin:$PATH". CONFIRM/REFUTE/PLAUSIBLE each with evidence; mutation probes ONLY in one disposable worktree (git worktree add /tmp/mvp1-refute HEAD, own CARGO_TARGET_DIR), removed after, main tree verified clean. FINDINGS:\n${JSON.stringify(all, null, 2)}`,
     { label: 'refuter', phase: 'Verify', model: 'opus', effort: 'high', schema: { type: 'object', required: ['verdicts', 'tree_clean'], properties: { tree_clean: { type: 'boolean' }, verdicts: { type: 'array', items: { type: 'object', required: ['id', 'verdict', 'basis'], properties: { id: { type: 'string' }, verdict: { type: 'string', enum: ['CONFIRMED', 'REFUTED', 'PLAUSIBLE'] }, basis: { type: 'string' } } } } } } })
+  if (r && r.tree_clean === false) throw new Error('refuter reported tree_clean=false — mutation-probe residue in the main tree (L5); stop for orchestrator before Fix')
   verdicts = r ? r.verdicts : []
 }
 const guardMap = [inst, ...built.map(b => b.r)].filter(Boolean).flatMap(b => b.guard_map || [])

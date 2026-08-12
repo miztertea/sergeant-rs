@@ -4073,15 +4073,18 @@ async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_ca
 
 /// Item 2 — `active → blocked` from a **real** backend refusal: the fake
 /// backend's `prepare()` genuinely returns `Unavailable` mid-run
-/// (`set_available(false)`, `src/backend/fake.rs`) — the same shape as "the
-/// registry changed under a bound run" (`engine.rs`'s own comment on this
-/// path), triggered directly rather than by restarting with a different
+/// (`set_available_after_launches`, `src/backend/fake.rs`) — the same shape
+/// as "the registry changed under a bound run" (`engine.rs`'s own comment on
+/// this path), triggered directly rather than by restarting with a different
 /// registry.
 ///
-/// Stage 1's completion is held open with R-MVP1-8's settle delay so there is
-/// a real window, after the work is genuinely `active`, to flip availability
-/// off before stage 2's `LAUNCH` ever runs — never by scripting a `blocked`
-/// signal.
+/// Stage 1's completion is held open with R-MVP1-8's settle delay so submit
+/// answers while the work is genuinely `active`; the availability flip is
+/// armed *before* submit (`set_available_after_launches(1, ..)`,
+/// `src/backend/fake.rs`), so stage 2's refusal is deterministic — never a
+/// post-submit `set_available` call racing the driver's ticks (the residual
+/// race TH-10's settle(8) widening only narrowed), and never a scripted
+/// `blocked` signal.
 #[tokio::test]
 async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry() {
     let repos = TempDir::new().expect("tempdir");
@@ -4090,22 +4093,16 @@ async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry
     r_mvp1_10_init_repo(&repo);
     r_mvp1_10_write_n_stage_workflow(&repo, "two", 2);
 
-    // TH-10: `settle(1)` is consumed by `PendingLaunch::perform`'s own
-    // synchronous OBSERVE, so the completion driver's very *first* tick
-    // could already complete stage 1 and launch stage 2 — racing this
-    // function's own `fake.set_available(false, ...)` call just below
-    // against the driver's next 30ms tick, with nothing forcing the test
-    // task to run first. `settle(8)` widens that margin to ~8 driver
-    // ticks (240ms) of real scheduling slack before stage 1 can possibly
-    // complete, without adding a synthetic sleep of its own (still races
-    // in principle, just with a window wide enough that ordinary CPU
-    // contention cannot plausibly close it — measured non-flaky at 90/90
-    // runs with the original settle(1); this is headroom against a
-    // heavier future test suite, not a fix for an observed failure here).
+    // `settle(8)` holds stage 1 open ~8 driver ticks so submit's own answer
+    // still observes `active`; the pre-armed flip below is what makes stage
+    // 2's refusal certain regardless of when those ticks land.
     let fake = FakeBackend::scripted(
         FAKE_BACKEND_NAME,
         [FakeStep::complete().settle(8), FakeStep::complete()],
     );
+    // The genuine fault, armed before the run exists: stage 1's LAUNCH
+    // succeeds, then the backend refuses `prepare()` from stage 2 on.
+    fake.set_available_after_launches(1, "maintenance window");
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
     let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
     let http = client();
@@ -4116,9 +4113,6 @@ async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry
         body["work"]["state"], "active",
         "stage 1's settle delay must still be open when submit answers: {body}"
     );
-
-    // The genuine fault: the backend refuses `prepare()` from here on.
-    fake.set_available(false, "maintenance window");
 
     // Real time, real completion driver: stage 1 settles, stage 2's LAUNCH
     // hits the now-unavailable backend, and the work blocks — nothing here
@@ -4442,6 +4436,40 @@ async fn r_mvp1_10_extend_refuses_a_work_that_is_not_blocked() {
     .await;
     assert_eq!(status, reqwest::StatusCode::CONFLICT, "{extend_body}");
     assert_eq!(extend_body["error"]["code"], "not_blocked", "{extend_body}");
+
+    handle.shutdown().await;
+}
+
+/// `additional_turns: 0` is a client bug, not an extension: honoring it
+/// would journal a `turn_envelope_extended` event that changes nothing and
+/// answer 200 while the operator's follow-up retry re-blocks on the
+/// identical envelope. Refused as a structured 400 before anything but the
+/// command outcome is journaled.
+#[tokio::test]
+async fn r_mvp1_10_extend_refuses_zero_additional_turns() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "finishes clean", Some("one")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+
+    let (status, _, extend_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/extend"),
+        json!({"command_id": ulid(), "additional_turns": 0}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{extend_body}");
+    assert_eq!(extend_body["error"]["code"], "invalid_request", "{extend_body}");
 
     handle.shutdown().await;
 }

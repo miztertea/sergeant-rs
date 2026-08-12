@@ -28,10 +28,12 @@ finalize) — before finalize runs.
    reachable via `git log --all -- 00-alpha/output/evidence.md` (the "removal
    in branch history" half of the pin: recoverable, not destroyed).
 2. **Closing-stage instruction reverted** (finalize.py never runs, modeling
-   a workflow author who deletes the closing-stage instruction): the branch
-   is exactly the pre-finalize commit — both files present, including the
-   evidence one — proving finalize.py, not something else, is what removes
-   it.
+   a workflow author who deletes the closing-stage instruction), proven as a
+   differential against an identical twin sandbox that *does* run finalize:
+   the reverted branch keeps both files, evidence included, and the
+   reverted-vs-finalized delta is exactly the evidence file's removal —
+   proving finalize.py, not something else, is what removes it (and failing
+   if finalize.py stops doing so, unlike a bare before==after snapshot).
 
 USAGE
 -----
@@ -126,25 +128,36 @@ def test_closing_stage_present_promotes_and_evicts():
 
 
 def test_closing_stage_reverted_leaves_evidence_file():
-    """finalize.py never runs (the closing-stage instruction reverted,
-    per L7): the branch is exactly the pre-finalize commit, evidence file
-    included — proving finalize.py, not something else, does the removal."""
-    tmp = tempfile.mkdtemp(prefix="finalize-pin-reverted-")
+    """finalize.py never runs (the closing-stage instruction reverted, per
+    L7), asserted as a differential rather than a tautology: two identical
+    sandboxes whose one difference is whether finalize.py — the closing-stage
+    instruction's sole executable effect — was invoked. The reverted sandbox
+    keeps the evidence file, and comparing it against its finalized twin
+    pins the delta to exactly that file, so this fails if finalize.py stops
+    removing it (a no-op finalize yields an empty delta)."""
+    reverted = tempfile.mkdtemp(prefix="finalize-pin-reverted-")
+    finalized = tempfile.mkdtemp(prefix="finalize-pin-reverted-twin-")
     try:
-        build_sandbox(tmp)
-        before = files_at_head(tmp)
+        build_sandbox(reverted)
+        build_sandbox(finalized)
+        r = run([sys.executable, FINALIZE_PY, finalized], cwd=finalized, check=False)
+        assert r.returncode == 0, f"finalize.py should exit 0 on the twin sandbox, got {r.returncode}:\n{r.stdout}\n{r.stderr}"
 
-        # The closing-stage instruction is simply never invoked here.
-
-        after = files_at_head(tmp)
-        assert after == before, "no finalize invocation must mean no branch change at all"
-        assert "00-alpha/output/evidence.md" in after, (
-            f"reverting the closing-stage instruction must leave the evidence file on the branch; head has {after}"
+        reverted_files = files_at_head(reverted)
+        assert "00-alpha/output/evidence.md" in reverted_files, (
+            f"reverting the closing-stage instruction must leave the evidence file on the branch; head has {reverted_files}"
         )
-        assert "10-beta/output/promoted.md" in after
-        print("PASS  closing-stage instruction reverted: evidence file left in place, nothing removed")
+        assert "10-beta/output/promoted.md" in reverted_files
+
+        removed = reverted_files - files_at_head(finalized)
+        assert removed == {"00-alpha/output/evidence.md"}, (
+            "the invoked-vs-reverted delta must be exactly the evidence file's removal — "
+            f"finalize.py, not something else, does the removing; delta was {removed or '{}'}"
+        )
+        print("PASS  closing-stage instruction reverted: evidence file left in place; the removal is finalize.py's alone")
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(reverted, ignore_errors=True)
+        shutil.rmtree(finalized, ignore_errors=True)
 
 
 def main():

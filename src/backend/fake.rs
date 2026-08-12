@@ -268,6 +268,10 @@ struct FakeState {
     probes: usize,
     available: bool,
     detail: Option<String>,
+    /// Armed by [`FakeBackend::set_available_after_launches`]: after this
+    /// many more successful LAUNCHes, flip `available` off with the carried
+    /// detail. `None` when unarmed.
+    unavailable_after_launches: Option<(u32, String)>,
 }
 
 /// A scriptable, deterministic, in-process backend.
@@ -348,6 +352,7 @@ impl FakeBackend {
                 probes: 0,
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
+                unavailable_after_launches: None,
             })),
             launch_gate: Arc::new(Gate::default()),
             send_gate: Arc::new(Gate::default()),
@@ -475,6 +480,17 @@ impl FakeBackend {
         let mut state = self.lock();
         state.available = available;
         state.detail = Some(detail.to_string());
+    }
+
+    /// Become unavailable after `n` more successful LAUNCHes — the
+    /// deterministic form of "the registry changed under a bound run": armed
+    /// *before* submit, so a mid-run refusal needs no test-side race against
+    /// the completion driver's ticks (a post-submit `set_available(false)`
+    /// call has to beat the next stage's launch, which is a scheduling bet).
+    /// The flip lands after LAUNCH `n` returns its handle, so that launch's
+    /// own stage runs and the (`n`+1)th stage's PREPARE is the refusal.
+    pub fn set_available_after_launches(&self, n: u32, detail: &str) {
+        self.lock().unavailable_after_launches = Some((n, detail.to_string()));
     }
 
     /// Every START request this backend received, in order.
@@ -729,6 +745,14 @@ impl Backend for FakeBackend {
                 stopped: false,
             },
         );
+        if let Some((remaining, detail)) = state.unavailable_after_launches.take() {
+            if remaining <= 1 {
+                state.available = false;
+                state.detail = Some(detail);
+            } else {
+                state.unavailable_after_launches = Some((remaining - 1, detail));
+            }
+        }
         Ok(ExecutionHandle {
             execution_id: prepared.execution_id.clone(),
             native_id: Some(native_id),

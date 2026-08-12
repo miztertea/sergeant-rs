@@ -689,10 +689,27 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
     // SGT_SURFACES_DIR above — unset or unparseable both mean "keep the
     // built-in default" (fail open to the default, never refuse the whole
     // daemon start over a malformed env var only an operator can fix by
-    // restarting anyway).
+    // restarting anyway). Failing open must not fail silently: the warn is
+    // the only trace an operator gets that their override never applied,
+    // and 0 — which parses — blocks every Work at its first turn spawn.
     let turn_cap = std::env::var("SGT_TURN_CAP")
         .ok()
-        .and_then(|v| v.parse::<u32>().ok());
+        .and_then(|v| match v.parse::<u32>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "SGT_TURN_CAP=0 blocks every Work at its first turn spawn; honoring it"
+                );
+                Some(0)
+            }
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SGT_TURN_CAP is not a whole number of turns — keeping the built-in default"
+                );
+                None
+            }
+        });
     let handle = start_with(
         data_dir,
         DaemonConfig {

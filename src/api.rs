@@ -440,6 +440,13 @@ pub fn router(state: ApiState) -> Router {
 /// It requires a multi-thread runtime; the single-thread fallback runs the
 /// closure inline, which is what a current-thread runtime can do anyway.
 async fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    blocking_sync(f)
+}
+
+/// [`blocking`]'s body, callable from sync code that is already running on
+/// an async worker (a handler's view composition, e.g. `resolve_run`'s
+/// journal replay): same primitive, same single-thread fallback.
+fn blocking_sync<T>(f: impl FnOnce() -> T) -> T {
     let multi_thread = tokio::runtime::Handle::try_current()
         .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         .unwrap_or(false);
@@ -653,6 +660,34 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
         // is why this loop, alone among the two below, does not re-check
         // `closing` per iteration.
         for pending in overdue {
+            // §14.5 for the perform itself: each crank below is awaited
+            // serially, so a late entry's collection→perform window spans
+            // every earlier interrupt — long enough for the targeted turn to
+            // end and a SEND to spawn a fresh one on the same execution
+            // handle. Re-validate under the guard immediately before the
+            // kill; a stale crossing is journaled (`settle_stale_interrupt`),
+            // never silently dropped.
+            let stale = {
+                let mut core = CoreGuard::acquire(&state.core).await;
+                match state.engine.interrupt_is_stale(&core, &pending) {
+                    Some(reason) => {
+                        if let Err(e) =
+                            state.engine.settle_stale_interrupt(&mut core, &pending, reason)
+                        {
+                            tracing::error!(
+                                work_id = %pending.work_id(),
+                                error = %e,
+                                "journaling a stale ceiling crossing failed"
+                            );
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if stale {
+                continue;
+            }
             crank(
                 &state,
                 Step {
@@ -1260,15 +1295,23 @@ async fn submit_work(
 /// run_view`'s answer — checking both `runs` and `terminal_runs`), or —
 /// only when *neither* has it — the read-side full-journal re-derivation.
 ///
-/// The full-replay path is a defensive fallback, not the ordinary case:
+/// The full-replay path is a bounded fallback, not the ordinary case:
 /// every eviction populates `terminal_runs` at the moment it reclaims
-/// `runs` (`maybe_evict`), so a terminal work's view is answered from that
-/// in-memory cache, never a per-request journal walk (W2/TH-08: this used
-/// to replay the *entire* journal on every view of every terminal work,
-/// including ones with no run at all, which is exactly the unbounded-I/O-
-/// under-the-guard shape §22.6 forbids). The fallback exists only for a
-/// registry an older build populated before this cache existed, or a
-/// genuine in-memory anomaly — it must never be the common path.
+/// `runs` (`maybe_evict`), so a recently terminal work's view is answered
+/// from that in-memory cache, never a per-request journal walk (W2/TH-08:
+/// this used to replay the *entire* journal on every view of every terminal
+/// work, including ones with no run at all, which is exactly the unbounded-
+/// I/O-under-the-guard shape §22.6 forbids). What remains of that shape is
+/// an acknowledged tradeoff, not an anomaly path: `terminal_runs` holds only
+/// `TERMINAL_RUN_CACHE_CAPACITY` entries, so on an installation with more
+/// terminal works than that, viewing one aged out of the cache replays the
+/// journal while the guard is held, queueing other requests behind it —
+/// rate-limited to cache misses rather than eliminated. The replay runs via
+/// [`blocking_sync`] so it at least never starves the async worker's other
+/// tasks; moving it off the guard entirely would need a journal reader the
+/// core does not own, which is the named follow-up shape, not this build's.
+/// The same fallback also covers a registry an older build populated before
+/// the cache existed.
 ///
 /// Only `is_absorbing` states (`Completed`/`Canceled`) are ever evicted, so
 /// that is the only case worth even trying the fallback for; every other
@@ -1287,7 +1330,7 @@ fn resolve_run(core: &Core, work: &Work, cached: Option<&WorkRun>) -> Option<Wor
     if !is_absorbing(work.state) {
         return None;
     }
-    match rederive_run(&core.journal, &work.id) {
+    match blocking_sync(|| rederive_run(&core.journal, &work.id)) {
         Ok(run) => run,
         Err(e) => {
             tracing::error!(
@@ -1752,6 +1795,22 @@ async fn work_extend(
             "work.extend",
             None,
             StatusCode::NOT_FOUND,
+            result,
+        );
+    }
+    if req.additional_turns == 0 {
+        // A zero extension journals an event that changes nothing and hands
+        // the operator a 200 whose follow-up retry re-blocks on the identical
+        // envelope — a client bug answered as a success. Same shape as
+        // submit's empty-intent rejection: journaled under this command_id so
+        // a retry replays the 400.
+        let result = error_body("invalid_request", "additional_turns must be at least 1");
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.extend",
+            Some(&id),
+            StatusCode::BAD_REQUEST,
             result,
         );
     }

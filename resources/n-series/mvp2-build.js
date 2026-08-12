@@ -8,6 +8,8 @@ export const meta = {
     { title: 'Fix', detail: 'fixer over confirmed + survivors' },
   ],
 }
+// args: { base: '<git sha>' } — REQUIRED. The Panel phase diffs base..HEAD;
+// launching without it throws before any agent spends a token.
 const REPO = '/home/miztertea/sergeant-rs'
 const G = `You are building sergeant-rs MVP-2 on Cerberus, branch cerberus/mvp-1. Binding, read in order: ${REPO}/docs/gauntlet/contracts/N4.md (incl. the 2026-08-12 ADJUDICATION section — Rule A is NOT in scope), ${REPO}/docs/gauntlet/notes/mvp-bucketing-2026-08-11.md MVP-2 table, ${REPO}/NORTH-STAR.md, ${REPO}/CLAUDE.md, ${REPO}/LESSONS.md (L1/L6/L7/L8/L16), ${REPO}/docs/environments/cerberus.md (Docker facts measured; cargo needs PATH="$HOME/.cargo/bin:$PATH"). Gates: cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test. DataDir guard; L7 pins; L10 separable commits; guard_map per test (independent prober executes); §22.7 fixtures PROBE-GATE per the environments matrix (full matrix on this host; SKIPPED-ENV where a host can't express a shape). Commits end "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"; Fixes #NN only on fully-closing commits (#23 candidate in D1). Do NOT push. Leak checks: bracketed pgrep for sgt AND docker ps -a scoped to sergeant-owned names (§16.10) empty after suites.`
 const BUILD = { type: 'object', required: ['commits', 'tests_added', 'gates_green', 'design_decisions', 'guard_map', 'notes'], properties: { commits: { type: 'array', items: { type: 'string' } }, tests_added: { type: 'number' }, gates_green: { type: 'boolean' }, design_decisions: { type: 'array', items: { type: 'string' } }, guard_map: { type: 'array', items: { type: 'object', required: ['test', 'guarded_behavior', 'mutation_that_should_kill_it'], properties: { test: { type: 'string' }, guarded_behavior: { type: 'string' }, mutation_that_should_kill_it: { type: 'string' } } } }, notes: { type: 'string' } } }
@@ -29,7 +31,8 @@ for (const l of lanes) {
 }
 
 phase('Panel')
-const BASE = args && args.base ? args.base : 'UNSET'
+const BASE = args && args.base ? args.base : null
+if (!BASE) throw new Error('mvp2-build requires args.base (the git diff base sha for the Panel phase) — without it critics improvise a diff base instead of halting')
 const axes = [
   { key: 'invariants', brief: `Axis INVARIANTS: §22.5 crash windows actually injected over the Docker lifecycle; §22.6 lock discipline (no Engine/socket call under the guard — check the performer wiring); container ownership exactness (§16.10-16.12: no leaked containers after clean AND crash runs — verify the harness sweep); image identity immutability; the de-leak translation defines nothing (core policy pinned at bind, adapter translates); provenance events respect journal-only-truth; L6 on every new append pair. THE CONTRACT (N4 + its adjudication) is in scope (L9/L19).` },
   { key: 'test-honesty', brief: `Axis TEST-HONESTY: L8 — every advertised Docker capability has a contract test against the real engine on THIS host, probe-gated for hosts without; do §22.8's budget tests actually capture 1GiB (not a token stream); does the de-leak's "local" test measure the real CLI behavior or assume it; do fake-fidelity tests exercise the new shapes or mirror the implementation; would each pin fail on revert; are the guard-map mutations right. Read-only.` },
@@ -37,7 +40,9 @@ const axes = [
 const crits = await parallel(axes.map(a => () => agent(
   `Blind critic, sergeant-rs MVP-2 round 1. Read-only in ${REPO} (cargo test + docker allowed; NEVER edit). Read first: contracts/N4.md + adjudication, GAUNTLET register (L3), LESSONS. Diff: git diff ${BASE}..HEAD. ${a.brief} Findings carry file:line evidence.`,
   { label: `critic:${a.key}`, phase: 'Panel', model: 'opus', effort: 'high', schema: FINDINGS })))
-const all = crits.filter(Boolean).flatMap((c, i) => c.findings.map(f => ({ ...f, id: `${axes[i].key}:${f.id}` })))
+// Label by original index BEFORE dropping nulls: filter(Boolean).flatMap((c, i) => ...)
+// compacts a dead critic out and hands the survivor the wrong axes[i].
+const all = crits.flatMap((c, i) => (c ? c.findings.map(f => ({ ...f, id: `${axes[i].key}:${f.id}` })) : []))
 log(`panel: ${all.length} findings (${all.filter(f => f.severity === 'error').length} error)`)
 
 phase('Verify')
@@ -45,6 +50,7 @@ let verdicts = []
 if (all.length) {
   const r = await agent(`Batched adversarial refuter, MVP-2. ${REPO}, PATH="$HOME/.cargo/bin:$PATH". CONFIRM/REFUTE/PLAUSIBLE with evidence; mutations ONLY in one disposable worktree (own CARGO_TARGET_DIR), removed after, main tree verified clean. FINDINGS:\n${JSON.stringify(all, null, 2)}`,
     { label: 'refuter', phase: 'Verify', model: 'opus', effort: 'high', schema: { type: 'object', required: ['verdicts', 'tree_clean'], properties: { tree_clean: { type: 'boolean' }, verdicts: { type: 'array', items: { type: 'object', required: ['id', 'verdict', 'basis'], properties: { id: { type: 'string' }, verdict: { type: 'string', enum: ['CONFIRMED', 'REFUTED', 'PLAUSIBLE'] }, basis: { type: 'string' } } } } } } })
+  if (r && r.tree_clean === false) throw new Error('refuter reported tree_clean=false — mutation-probe residue in the main tree (L5); stop for orchestrator before Fix')
   verdicts = r ? r.verdicts : []
 }
 const guardMap = built.map(b => b.r).flatMap(b => b.guard_map || [])

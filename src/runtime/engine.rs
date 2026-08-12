@@ -3148,12 +3148,83 @@ impl Engine {
         due
     }
 
+    /// §14.5 for INTERRUPT's *middle* phase: whether the crossing
+    /// [`Self::due_interrupts`] collected still describes the turn that is
+    /// live now, checked under the guard immediately before the perform.
+    ///
+    /// The other settles re-check staleness after their effect because the
+    /// effect's evidence must be preserved either way; an interrupt is the
+    /// one effect whose staleness must be caught *before* it runs, because
+    /// `Backend::interrupt` aims at whatever turn holds the execution handle
+    /// at delivery time — and the collection→perform window stretches across
+    /// every earlier entry's serially-awaited crank. A turn that ended in
+    /// that window (and any fresh turn a SEND spawned on the same handle —
+    /// visible as a re-inserted `turn_started` entry, since collection
+    /// removed this work's) must not be killed for a crossing it never made.
+    ///
+    /// `Some(reason)` means skip the perform and journal the consumed
+    /// crossing through [`Self::settle_stale_interrupt`] instead — never
+    /// drop it silently (`due_interrupts`'s own no-silent-loss rule).
+    pub fn interrupt_is_stale(&self, core: &Core, pending: &PendingInterrupt) -> Option<&'static str> {
+        if self
+            .turn_started
+            .lock()
+            .expect("turn_started lock")
+            .contains_key(&pending.work_id)
+        {
+            return Some("a fresh turn started on this work after the crossing was collected");
+        }
+        if !self.turn_still_active(core, &pending.work_id) {
+            return Some("the targeted turn is no longer active");
+        }
+        let registry = core.registry.state();
+        let same_execution = registry
+            .runs
+            .get(&pending.work_id)
+            .and_then(|run| run.execution.as_ref())
+            .is_some_and(|e| e.execution_id == pending.execution.execution_id);
+        if same_execution {
+            None
+        } else {
+            Some("the execution handle was superseded")
+        }
+    }
+
+    /// Journal a consumed ceiling crossing whose interrupt was *not*
+    /// performed because [`Self::interrupt_is_stale`] said the targeted turn
+    /// is gone: `outcome.requested` is `false` and `outcome.stale` carries
+    /// the reason, so the trajectory records the crossing without claiming a
+    /// delivery that never happened.
+    pub fn settle_stale_interrupt(
+        &self,
+        core: &mut Core,
+        pending: &PendingInterrupt,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        self.commit(
+            core,
+            &pending.work_id,
+            KIND_TURN_CEILING_INTERRUPTED,
+            json!({
+                "execution_id": pending.execution.execution_id,
+                "backend": pending.execution.backend,
+                "stage_id": pending.execution.stage_id,
+                "attempt": pending.execution.attempt,
+                "ceiling_secs": self.turn_ceiling.as_secs_f64(),
+                "outcome": {"requested": false, "stale": reason},
+            }),
+        )
+    }
+
     /// §14.2's third phase for INTERRUPT: journal what was asked and what it
     /// produced. Unconditional — an interrupt request and its outcome are
     /// journaled regardless of whether the backend actually complied, and
     /// nothing here touches Work or stage state: the ordinary OBSERVE path
     /// (`due_observations`/`drive`) is what settles the turn, on whatever
     /// native evidence the interrupt (or its absence) eventually produces.
+    /// Staleness is the *middle* phase's question for this verb
+    /// ([`Self::interrupt_is_stale`]), already answered by the time the
+    /// perform ran.
     pub fn settle_interrupt(
         &self,
         core: &mut Core,
