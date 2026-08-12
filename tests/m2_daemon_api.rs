@@ -3465,3 +3465,273 @@ fn seed_workflow_repo(repo: &Path) {
         assert!(output.status.success(), "git {args:?}: {output:?}");
     }
 }
+
+// --------------- R-MVP1-6: the intent schema (Lane B, MVP-1)
+//
+// Five optional fields, progressive elaboration of the free-text `intent`
+// that stays required and primary. Additive-only, journaled inside
+// `work.submitted`, displayed by `work show`, and one source of truth: a
+// `workflow`/`repos` disagreeing with the submission's own flags refuses at
+// submit rather than silently picking one.
+
+/// All five fields round-trip through submit and `work show`, and a
+/// `workflow`/`repos` that merely repeats what the flags already say is not
+/// a disagreement.
+#[tokio::test]
+async fn r_mvp1_6_all_five_intent_detail_fields_journal_and_display() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "free text stays primary",
+            "workflow": "software-change",
+            "repositories": ["api", "web"],
+            "intent_detail": {
+                "objective": "ship the thing",
+                "repos": ["api", "web"],
+                "acceptance": "tests green",
+                "exclusions": "no schema changes",
+                "workflow": "software-change",
+            },
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.expect("json");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let detail = &body["work"]["intent_detail"];
+    assert_eq!(detail["objective"], "ship the thing");
+    assert_eq!(detail["repos"], json!(["api", "web"]));
+    assert_eq!(detail["acceptance"], "tests green");
+    assert_eq!(detail["exclusions"], "no schema changes");
+    assert_eq!(detail["workflow"], "software-change");
+    // Free text stays required and primary — it is never displaced by the
+    // structured elaboration.
+    assert_eq!(body["work"]["intent"], "free text stays primary");
+
+    let show: Value = http
+        .get(format!("{}/v1/work/{work_id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show")
+        .json()
+        .await
+        .expect("show json");
+    assert_eq!(
+        show["work"]["intent_detail"], body["work"]["intent_detail"],
+        "work show must display what was journaled at submit"
+    );
+    handle.shutdown().await;
+}
+
+/// A submission with no `intent_detail` at all submits exactly as it did
+/// before this schema existed — the "any subset may be present" half of
+/// progressive elaboration, checked at the empty end.
+#[tokio::test]
+async fn r_mvp1_6_no_intent_detail_at_all_is_unaffected() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+    let (status, _, body) = submit(&http, &handle, &ulid(), "plain intent, no elaboration").await;
+    assert_eq!(status, 201);
+    assert!(
+        body["work"]["intent_detail"].is_null(),
+        "absent intent_detail must stay absent, not default to an empty object: {body}"
+    );
+    handle.shutdown().await;
+}
+
+/// A structured `workflow` that disagrees with the submission's own
+/// `workflow` flag refuses at submit, naming both.
+#[tokio::test]
+async fn r_mvp1_6_a_disagreeing_workflow_refuses_naming_both_sources() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "two answers to one question",
+            "workflow": "software-change",
+            "intent_detail": {"workflow": "triage"},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "intent_detail_disagreement");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("software-change") && message.contains("triage"),
+        "the refusal must name both sources: {message}"
+    );
+
+    // Nothing was created: no work.submitted for a work this disagreement
+    // never let exist.
+    let list: Value = http
+        .get(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("list json");
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "a refused submission must create no Work: {list}"
+    );
+    handle.shutdown().await;
+}
+
+/// The same rule for `repos`, plus its non-trap: a repository set that
+/// merely names the same repos in a different order has not disagreed with
+/// itself.
+#[tokio::test]
+async fn r_mvp1_6_a_disagreeing_repos_refuses_naming_both_sources() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "two answers to one question",
+            "repositories": ["api"],
+            "intent_detail": {"repos": ["web"]},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "intent_detail_disagreement");
+
+    let resp2 = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "same repos, different order",
+            "repositories": ["api", "web"],
+            "intent_detail": {"repos": ["web", "api"]},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(
+        resp2.status(),
+        201,
+        "order alone must never read as a disagreement: {:?}",
+        resp2.text().await
+    );
+    handle.shutdown().await;
+}
+
+/// The additive-only guarantee, exercised at the boundary it actually
+/// describes: a *pre-existing* journal line — standing in for one a future
+/// binary already wrote, carrying a field `IntentDetail` does not have —
+/// replays byte-identical (the journal never parses a payload into a typed
+/// `Work`, so it has nothing to drop) and this binary's own projection
+/// still shows every field it *does* know about, rather than refusing the
+/// whole record over one field it doesn't (`IntentDetail` carries no
+/// `deny_unknown_fields`).
+///
+/// Submitting a *fresh* request with an unknown `intent_detail` key is a
+/// different claim (the client's own field is simply not recognized, same
+/// as any other unknown JSON key any endpoint here already ignores) and is
+/// not this pin — this test is deliberately about replaying a record this
+/// binary did not write.
+#[tokio::test]
+async fn r_mvp1_6_a_payload_carrying_an_unknown_key_replays_byte_identical() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = ulid();
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).expect("journal dir");
+    let seeded = json!({
+        "schema": EVENT_SCHEMA,
+        "seq": 1,
+        "id": ulid(),
+        "timestamp": "2026-08-08T00:00:00.000Z",
+        "source": {"type": "daemon", "name": "api"},
+        "work_id": work_id,
+        "kind": KIND_WORK_SUBMITTED,
+        "payload": {"work": {
+            "id": work_id,
+            "intent": "written by a hypothetical future binary",
+            "intent_detail": {
+                "objective": "ship it",
+                "from_a_future_binary": "surprise",
+            },
+            "state": "pending",
+            "created_by": "test",
+            "created_at": "2026-08-08T00:00:00.000Z",
+        }},
+    });
+    let mut line = serde_json::to_vec(&seeded).expect("seed json");
+    line.push(b'\n');
+    std::fs::write(journal.join("00000001.ndjson"), &line).expect("write seed segment");
+
+    let before: Vec<_> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .collect();
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].payload["work"]["intent_detail"]["from_a_future_binary"],
+        json!("surprise"),
+        "the journal must never lose a field it does not itself interpret"
+    );
+
+    // The daemon starts on this pre-existing journal (replay, not a fresh
+    // write) — the same crash-recovery path every restart takes.
+    let handle = start(dir.path()).await;
+    let http = client();
+    let show: Value = http
+        .get(format!("{}/v1/work/{work_id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show")
+        .json()
+        .await
+        .expect("show json");
+    assert_eq!(
+        show["work"]["intent_detail"]["objective"], "ship it",
+        "a field this binary knows must survive even beside one it does not: {show}"
+    );
+    assert!(
+        show["work"]["intent_detail"]["from_a_future_binary"].is_null(),
+        "the *projected* view legitimately drops what its own type cannot \
+         parse — only the journal's own record is required to keep it"
+    );
+    handle.shutdown().await;
+
+    // The journal line itself is exactly what was written, unknown key
+    // included — the daemon's own replay never rewrites it. Filtered to the
+    // one seeded event: starting the daemon appended its own
+    // `daemon.started`/`backend.probed`/`daemon.stopped` events to the same
+    // journal, and this pin is about the *seeded* line, not the whole file.
+    let after: Vec<_> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == KIND_WORK_SUBMITTED && e.work_id.as_deref() == Some(&work_id))
+        .collect();
+    assert_eq!(
+        before, after,
+        "replay must reproduce the seeded payload byte for byte, unknown key included"
+    );
+}

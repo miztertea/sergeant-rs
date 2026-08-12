@@ -36,9 +36,9 @@ use crate::domain::execution::{
     KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use crate::domain::work::{
-    KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
-    KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED,
-    KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
+    IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
+    KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
+    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
 };
 use crate::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
@@ -931,6 +931,47 @@ struct SubmitRequest {
     created_by: Option<String>,
     #[serde(default)]
     origin: Option<Origin>,
+    /// R-MVP1-6's structured-intent schema slot. Progressive elaboration of
+    /// `intent`, checked for agreement against `workflow`/`repositories`
+    /// above (§13's one-source-of-truth rule) and journaled verbatim
+    /// otherwise — nothing here drives routing.
+    #[serde(default)]
+    intent_detail: Option<IntentDetail>,
+}
+
+/// R-MVP1-6's submit-time agreement check: a structured elaboration that
+/// names a `workflow`/`repos` different from what the submission's own
+/// flags say is two answers to "what is this Work about" in one Work, and
+/// §13 requires exactly one source of truth. Absent on either side is not a
+/// disagreement — only *both present and different* is. Repository sets are
+/// compared unordered (a client naming the same repos in a different order
+/// has not disagreed with itself).
+fn intent_detail_disagreement(req: &SubmitRequest) -> Option<String> {
+    let detail = req.intent_detail.as_ref()?;
+    if let (Some(declared), Some(flag)) = (detail.workflow.as_deref(), req.workflow.as_deref())
+        && declared != flag
+    {
+        return Some(format!(
+            "intent_detail.workflow is {declared:?}, but the submission's workflow flag is \
+             {flag:?}; the two must agree"
+        ));
+    }
+    if let Some(declared) = detail.repos.as_ref()
+        && !req.repositories.is_empty()
+    {
+        let declared_set: std::collections::BTreeSet<&str> =
+            declared.iter().map(String::as_str).collect();
+        let flag_set: std::collections::BTreeSet<&str> =
+            req.repositories.iter().map(String::as_str).collect();
+        if declared_set != flag_set {
+            return Some(format!(
+                "intent_detail.repos is {declared:?}, but the submission's repositories are \
+                 {:?}; the two must agree",
+                req.repositories
+            ));
+        }
+    }
+    None
 }
 
 /// §13's origin metadata: who is asking, and from where.
@@ -1044,6 +1085,21 @@ async fn submit_work(
             result,
         );
     }
+    if let Some(reason) = intent_detail_disagreement(&req) {
+        // Same shape as the empty-intent rejection above: a fail-closed
+        // semantic outcome, journaled under this command_id so a retry
+        // replays it rather than re-validating against a possibly different
+        // future rule (R-MVP1-6: "one source of truth, fail closed").
+        let result = error_body("intent_detail_disagreement", reason);
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.submit",
+            None,
+            StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
 
     // The plan decided above, before the guard: workspace topology, workflow
     // content, routing, profiles and the §17.5 stage preflight, all with no
@@ -1079,6 +1135,7 @@ async fn submit_work(
         backend: req.backend,
         origin_client: origin.client,
         profile: req.profile,
+        intent_detail: req.intent_detail,
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),

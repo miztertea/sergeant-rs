@@ -20,6 +20,69 @@
 
 use serde::{Deserialize, Serialize};
 
+/// R-MVP1-6's structured-intent schema slot: five optional fields, all of
+/// them progressive elaboration of the free-text `intent` a Work already
+/// carries — never a replacement for it. Any subset may be present; a client
+/// that sends none of them submits exactly as it did before this existed.
+///
+/// **Additive-only, already safe.** `Work` derives no `deny_unknown_fields`
+/// and event payloads round-trip through `serde_json::Value` losslessly, so
+/// a field this type gains tomorrow deserializes as absent from every event
+/// already journaled, and a binary built before that field existed drops
+/// nothing when it re-serializes a newer one. The discipline this type must
+/// keep going forward: new fields are `Option`, nothing here is ever removed
+/// or retyped.
+///
+/// **Not reserved (U-R5): no dedup identity, no promotion-provenance field.**
+/// Those are the corpus's highest-correction-cost item — seven upstream
+/// collision issues — and belong to the post-MVP backlog type that decides
+/// them with data, not to a slot added here on spec.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentDetail {
+    /// What this Work is trying to achieve, in the elaborator's own words —
+    /// distinct from `intent` itself, which stays the primary, required
+    /// free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// Repositories the elaboration names. Purely descriptive data here —
+    /// nothing in M-series routes on it — and it is checked for agreement
+    /// against the submission's actual `--repo` flags (`Work::repositories`)
+    /// at submit time: a `Work` cannot carry two conflicting answers to
+    /// "which repositories is this about" (§13's one-source-of-truth rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos: Option<Vec<String>>,
+    /// A named `[group.<name>]` this elaboration targets, in place of an
+    /// explicit repository list — R-MVP1-5(b)'s group-expansion slot. No
+    /// engine surface reads this in MVP-1 (groups are MVP-3's CLI-side
+    /// expansion); it is journaled and displayed like the other four.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// What "done" looks like for this Work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<String>,
+    /// What is explicitly out of scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusions: Option<String>,
+    /// The workflow the elaboration names, checked for agreement against
+    /// the submission's actual `--workflow` flag (`Work::workflow`) at
+    /// submit time, the same way `repos` is checked against `repositories`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+}
+
+impl IntentDetail {
+    /// Whether every field is absent — a client that sent an empty object,
+    /// which is the same fact as sending nothing at all.
+    pub fn is_empty(&self) -> bool {
+        self.objective.is_none()
+            && self.repos.is_none()
+            && self.group.is_none()
+            && self.acceptance.is_none()
+            && self.exclusions.is_none()
+            && self.workflow.is_none()
+    }
+}
+
 /// Event kind: a work item was accepted and entered `pending`.
 pub const KIND_WORK_SUBMITTED: &str = "work.submitted";
 /// Event kind: a work item was canceled.
@@ -182,6 +245,12 @@ pub struct Work {
     /// Requested launch profile (§14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// R-MVP1-6's structured-intent schema slot: progressive elaboration of
+    /// `intent`, never a replacement for it. `None` (the default for every
+    /// event journaled before this field existed) and `Some` carrying every
+    /// field absent are the same fact — a client that elaborated nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_detail: Option<IntentDetail>,
     /// Current state (only mutated by folding journal events).
     pub state: WorkState,
     /// Who submitted it.
