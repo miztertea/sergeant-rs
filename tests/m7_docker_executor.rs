@@ -25,7 +25,7 @@ use std::sync::Arc;
 use serde_json::json;
 use tempfile::TempDir;
 
-use sergeant_rs::backend::docker::{DockerBackend, DockerConfig};
+use sergeant_rs::backend::docker::{self, DockerBackend, DockerConfig};
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
     Backend, BackendError, BackendRegistry, PreparedExecution, StartRequest,
@@ -826,8 +826,15 @@ fn large_captured_output_does_not_grow_this_process_proportionally() {
                     "sh",
                     "-c",
                     &format!(
+                        // Different content on each stream (not just
+                        // different fds) — the blob store is content-
+                        // addressed (BLAKE3, write-once) and correctly
+                        // deduplicates identical bytes into one blob, which
+                        // would otherwise make TH-07's "at least 2*BYTES on
+                        // disk" measurement below fail on a store working
+                        // exactly as designed.
                         "yes 0123456789abcdef | head -c {BYTES} >&1; \
-                         yes 0123456789abcdef | head -c {BYTES} >&2"
+                         yes fedcba9876543210 | head -c {BYTES} >&2"
                     ),
                 ],
                 WorkspaceAccess::ReadOnly,
@@ -855,10 +862,18 @@ fn large_captured_output_does_not_grow_this_process_proportionally() {
         }
 
         let before = vm_rss_kb();
+        // TH-07 / [Rule B] (MVP-2 D3 fixer pass): "the 1 GiB-capture test
+        // measures blob disk cost beside §22.8's RSS budget" — before this
+        // fix, only the RSS half was ever measured here. Blob bytes before
+        // capture must be counted from a store this test's own capture has
+        // not touched yet, so this reads the same `data_dir`'s disk-pressure
+        // report the doctor uses.
+        let blob_bytes_before = docker::measure_disk_pressure(data.path()).blob_bytes;
         let observation = backend
             .observe(&handle)
             .expect("observe (captures on exit)");
         let after = vm_rss_kb();
+        let blob_bytes_after = docker::measure_disk_pressure(data.path()).blob_bytes;
 
         use sergeant_rs::backend::BackendSignal;
         let detail = match &observation.signal {
@@ -880,6 +895,18 @@ fn large_captured_output_does_not_grow_this_process_proportionally() {
             "peak RSS increment while capturing {BYTES} bytes was {increment_kb} KiB, over the \
              {BUDGET_KB} KiB (64 MiB) budget — the streaming capture path must not buffer the \
              whole log in memory"
+        );
+
+        // [Rule B] the blob disk cost, measured beside the RSS budget: the
+        // 2*BYTES combined stdout+stderr must actually land on disk as
+        // blobs — a capture that silently dropped data instead of buffering
+        // it would also pass the RSS check above, so this closes that gap.
+        let blob_growth = blob_bytes_after.saturating_sub(blob_bytes_before);
+        assert!(
+            blob_growth >= 2 * BYTES,
+            "capturing {BYTES} bytes of stdout and {BYTES} of stderr must grow the blob store \
+             by at least that much on disk: before={blob_bytes_before} after={blob_bytes_after} \
+             growth={blob_growth}"
         );
     }
 }
