@@ -1,0 +1,9 @@
+stage	c2-m5_projections
+wall_s	5
+profraw_before	11
+profraw_produced	7
+profraw_mergeable	7
+profraw_discarded	0
+profraw_lost	0
+profraw_loss_expected	no
+profraw_total	18
