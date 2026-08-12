@@ -40,10 +40,148 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 | B2 | M6 adjudication | Dashboard auth delivers the bearer token in the `sgt web` URL query string (shoulder-surf/history exposure on a shared machine) | Accepted at R1 for the P0: the listener is loopback-only and the token already travels in the printed URL by design; the API refuses query tokens on non-GET/HEAD (CSRF bound), and `/ui` sits behind the same `require_bearer` gate as `/v1`. Post-P0 alternative recorded per the M6 contract: exchange the URL token once for an `HttpOnly; SameSite=Strict` cookie handoff. Trigger: any non-loopback binding or multi-user host. |
 | B3 | P0 final gate | `ClaudeBackend::stop` joins the turn's evidence-archive thread while API handlers hold the core lock, so a concurrent request waits out one transcript flush during a cancel/retry of an in-flight Claude turn | Orchestrator ruling at the final gate (three review rounds converged here): STOP's evidence promise (round-2 fix — the archive is durable before STOP returns) is kept; the lock-hold is rare-path and bounded by one local-disk write; the real fix is a §15 trait-shape change (`stop` returning a join token the caller awaits after releasing the core guard) — R7 machinery, not invented at gate-time without panel coverage. `block_in_place` (d82a6e2) keeps the executor healthy meanwhile; trade-off documented on `stop` itself (d20554d). Trigger: any measured multi-client stall, or the first §15 trait revision for other reasons. **CLOSED at N3**: the trigger fired exactly as registered — §14.3's `prepare`/`launch` split is the first §15 trait revision, and B3's own prescribed fix ("`stop` returning a join token the caller awaits after releasing the core guard") is what landed. `stop`/`interrupt` return a `Completion`; the engine collects them into a `Deferred`; `api::crank` drains it after dropping the guard. `block_in_place` removed. Pinned by `tests/m2_daemon_api.rs` t10 — a stalled evidence archive with an independent read answering in ~2 ms — and revert-probed (holding the guard across the drain fails the test in 1 s). Issue #14 closed. |
 | B4 | R-MVP1-10 (blocked exit-door invariant) build | A `pending → blocked` landing from a real start failure (a materialize permission fault, or `reconcile_crashed_start`'s crash-window block) has no working `retry` door: `begin_retry` requires `run.current_stage()` (`engine.rs`), and no stage is ever entered before `settle_materialize` fails or a crashed start is swept — `KIND_WORKFLOW_BOUND`/`KIND_STAGE_ENTERED` land together with `KIND_WORK_STARTED` in one group-committed guard hold, all *after* a successful materialize, so this is not a narrow timing window but the whole category. `retry` fails closed with `EngineError::NoRun` (404, `"no_run"`) — safe, structured, non-corrupting, never silently wrong — but not an open door. The real, working exit is `cancel` (`blocked → canceled`), proven instead. | Reopening it properly needs the full `StartPlan` (workflow resolution, routing, per-stage bindings) re-derivable from the journal alone, and today it is not: `origin.cwd` — needed to re-run `Workspace::discover` — is never persisted (`engine.rs`'s own `reconcile_crashed_start` comment says so), and guessing at a substitute `cwd` would silently re-plan against the wrong estate, which CLAUDE.md's fail-closed doctrine forbids. The honest fix is persisting enough of the submit-time plan to redo it — a bind-path change (`engine.rs`, `SurfacePlan`/`KIND_SURFACE_MATERIALIZING`'s payload) outside this ruling's own file scope (`projection.rs`/`recovery.rs`/`surface.rs`/`api.rs` views). Trigger: any MVP that needs `retry` to reopen a `pending`-origin block — the natural home is wherever the submit-time plan next gets a durable record (R-MVP1-1/R-MVP1-4's `workflow.bound` widening is adjacent territory). Pinned as *expected, safe* behavior by `tests/m2_daemon_api.rs`'s `r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_cancel` (revert-probed: removing the `NoRun`→404 mapping or the `no_run` code fails it). |
+| B5 | MVP-3 fixer pass, invariants finding MVP3-C4 | `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`'s `[estate]` shape lists `data_dir` defaulting `.sergeant/data`, but R-MVP1-1 ruled only `surfaces_dir`; `data_dir` was never implemented (`EstateSection` is `deny_unknown_fields` with no such field; `resolve_data_dir` hardcodes the estate-relative default and reads no manifest field at all). A hand-written `[estate] data_dir = "..."` following the design note literally fails closed with a parse refusal instead of overriding anything. | Not implemented in the fixer pass: this is new engine/config surface (an estate-level override of where the daemon's own data dir lives), R-NS-4 territory that wants explicit ratification, not a silent addition riding in on a bug-fix pass. Design doc corrected in place ([v3] note) so it no longer misdescribes shipped behavior. Trigger: any MVP that actually needs a non-default, manifest-declared data dir (today's only override is `--data-dir`/`SGT_DATA_DIR`, both already covered by R-MVP1-12's discovery-boundary rules). |
+| B6 | MVP-3 fixer pass, invariants finding MVP3-C5 | `sgt run --turns`/`--ceiling-secs` (commit 78e5da9) adds a per-Work `EnvelopeRequest{turn_cap, ceiling_secs}` the engine reads via `effective_turn_cap`/`effective_turn_ceiling` — genuinely new engine surface (submit-time envelope override) that R-MVP1-7 specified as daemon-wide only (`with_turn_cap`/`SGT_TURN_CAP`), and MVP-3's own bucketing plan does not list it. Counting integrity is intact (not a bypass: `check_turn_envelope` still gates on the effective values, `turns_spawned` stays journal-derived, submit rejects `turn_cap==0`/`ceiling_secs==0`) — the gap is process, not safety. | Shipped code kept as-is (it works, and reverting a MVP-3-milestone feature inside a fixer pass is a bigger unilateral move than registering it); registered here instead per R-NS-4 discipline, for owner ratification at the next adjudication rather than silently standing unregistered. Trigger: MVP-3's own adjudication — fold into the milestone's deviation record or explicitly ratify there. |
 
 ---
 
 ## Ledger entries
+
+### MVP-3 FIXER PASS — 2026-08-12, invariants/test-honesty panel findings closed
+
+**Mission outcome.** Fixer pass over the MVP-3 build's review panel: 11
+CONFIRMED findings (`invariants:MVP3-C1`…`C6`, `test-honesty:TH-1`…`TH-5`;
+2 warning, 9 info by severity), 0 PLAUSIBLE. **10 of 11 CONFIRMED touched
+and improved; 1 (TH-5) is a positive-coverage finding needing no
+change.** Nothing silently dropped: every finding below is either fixed
+with a revert-probed test, corrected in documentation, or registered as a
+deliberately deferred backlog item with a named trigger. One real
+correctness bug (duplicate transcript text) was found and fixed while
+building TH-1's closure — not itself a panel finding, so it is called out
+explicitly below rather than folded silently into TH-1's count. Gates
+green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+full `cargo test` (524 tests across the lib + 8 integration suites, 0
+failed, 4 opt-in ignored) all re-run clean after the last commit. Leak
+check clean: `pgrep -f "debug/sgt [-]-data-dir"` empty.
+
+**Warning-severity findings (2 of 2 closed).**
+- **MVP3-C1** — the estate manifest edit pens (`sgt init`/`repo add`/`repo
+  remove`/`group add`/`group remove`) validated every edit by resolving
+  ALL declared `[[repo]]` entries through git, failing closed at the
+  first one missing from disk — so one uncloned repository blocked every
+  *other* manifest edit too, including a freshly `git clone`d estate
+  (`sgt init` gitignores `repos/`), contradicting the design capture's
+  own "wrongness scoped per-entry" contract. Fixed: added
+  `Workspace::from_config_structural` (`src/domain/workspace.rs`) — every
+  schema-level check (legacy vocabulary, duplicate/invalid names, group
+  membership, profile validity) with the on-disk git resolution dropped —
+  and switched `domain::manifest::validate` to it. Pinned by
+  `domain::manifest::tests::a_missing_unrelated_repo_does_not_block_
+  edits_that_do_not_touch_it` (revert-probed: reverting to
+  `from_config_allow_empty` fails it with `RepositoryNotFound` naming the
+  untouched repo).
+- **MVP3-C2** — `sgt run --group`'s client-side expansion had the same
+  coupling: it read group membership through the strict
+  `Workspace::discover_scoped`, so an unrelated missing repository
+  refused the command before a daemon even spawned. Fixed: added
+  `Workspace::declared_groups`/`declared_groups_scoped` (same structural
+  parser) and switched `cli.rs`'s `--group` handling to it. The daemon's
+  own submit-time estate resolution is a separate, pre-existing,
+  *accepted* coupling (matches plain `--repo`, per the B4 register entry)
+  and is deliberately untouched — pinned by
+  `tests/m8_estate_cli.rs::run_group_expansion_itself_survives_an_
+  unrelated_declared_repo_missing_from_disk`, which asserts the daemon
+  actually spawns (proving the client-side refusal is gone) even though
+  the command as a whole still fails on the daemon's own, separate check.
+
+**Info-severity findings (9 of 9 addressed — 4 code-fixed, 2 doc-corrected,
+2 registered to the backlog for owner ratification, 1 needs no change).**
+- **MVP3-C3** — `.sergeant.toml.lock` (never removed by design) and
+  `sergeant.toml.validate-*` (removed on the happy path, left behind on a
+  mid-validate crash) were not gitignored, so `git status` on an
+  initialized estate showed sgt's own runtime scratch as untracked. Fixed:
+  added both to `GITIGNORE_ENTRIES`. Pinned by
+  `domain::manifest::tests::init_writes_every_gitignore_entry` (now
+  asserts every entry in the const, not two hardcoded strings).
+- **MVP3-C4** — the design capture's `[estate] data_dir` field was never
+  implemented (R-MVP1-1 ruled only `surfaces_dir`); a hand-written
+  `[estate] data_dir = "..."` fails closed with a `deny_unknown_fields`
+  parse refusal rather than overriding anything. Not implemented here —
+  new config surface wants explicit ratification, not a silent addition
+  inside a bug-fix pass. Design doc corrected in place ([v3] note,
+  `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`); registered
+  as backlog **B5**.
+- **MVP3-C5** — `sgt run --turns`/`--ceiling-secs` (commit 78e5da9) added
+  genuine new per-Work engine surface (a submit-time envelope override)
+  that R-MVP1-7 specified as daemon-wide only, with no deviation-register
+  entry. Counting integrity was never in question (not a bypass); the gap
+  is process. Kept as shipped (reverting a milestone feature inside a
+  fixer pass is a bigger unilateral move than registering it); registered
+  as backlog **B6** for owner ratification at MVP-3's own adjudication.
+- **MVP3-C6** — the manifest module's own doc claimed the advisory lock
+  makes "two concurrent editors serialize rather than tearing," but the
+  only test exercising that (`concurrent_repo_adds_do_not_lose_an_entry`)
+  uses two threads in one process, which take the wait-and-retry path
+  because the lock is already in that process's own `SELF_LOCKED` set —
+  two real `sgt` processes never share it, so the real cross-process
+  outcome is fail-closed refusal, not a queue. Fixed: corrected the
+  module doc, and added
+  `tests/m8_estate_cli.rs::two_real_sgt_processes_racing_repo_add_
+  serialize_dont_tear`, which holds the lock file itself (a genuinely
+  different process/file-description) and drives a real `sgt repo add`
+  against it — proving the documented refusal, its exact message, and
+  that a retry after release succeeds.
+- **TH-3** — the m8 transcript test's guard-map claimed to prove `sgt
+  work transcript` "decodes a completed work's conversation," but the fake
+  backend never produces a turn, so only the empty-conversation rendering
+  was ever checked. Fixed: corrected the guard-map to state what is and
+  is not covered, pointing at TH-1's new real test for the blob-decode
+  half.
+- **TH-4** — `daemon_stop_drains_admission_and_exits_cleanly`'s mutation-
+  kill list claimed to catch "the drain step never actually calling
+  `/v1/admission/pause`," but nothing in the test submits work
+  concurrently with a slow drain to observe that refusal — the claim was
+  false. Fixed the doc to say so honestly, and named what a real fix
+  needs (a scripted `SGT_FAKE_SCRIPT=hang` in-flight turn plus a
+  concurrent submit racing a backgrounded `sgt daemon stop`) rather than
+  building it inside this `info`-severity item's effort budget — left
+  open, not silently claimed.
+- **TH-5** — a positive-coverage finding (Q1/Q4 largely satisfied for the
+  m8 suite's non-transcript/non-concurrency pins). No change needed;
+  confirmed by inspection during this pass.
+
+**TH-1 (warning) — the biggest single item, plus a bonus fix found while
+closing it.** No test spanned producer (`backend::claude`'s
+`TurnReader`) → journal → `transcript_turns`'s blob-decode fallback; the
+only coverage fabricated both the `Event` and its payload by hand, so a
+producer-side rename of the `raw`/`result_envelope` payload keys would
+silently break recovery in production while both test suites stayed
+green. **While building the real e2e closure, found and fixed a genuine
+duplicate-reporting bug**: `ingest_line` emits `conversation.assistant.
+completed` for any complete, successfully parsed assistant text line —
+independent of whether the turn later gets a `result` line — so an
+ordinary interrupted turn that streamed text before being killed hit
+`transcript_turns`'s blob-decode branch too (gated only on
+`result_envelope`), reporting the same text twice. Fixed:
+`transcript_turns` now tracks, per `execution_id`, whether `conversation.
+assistant.completed` already reached the journal since that execution's
+last turn boundary, and skips the blob-decode fallback when it has —
+scoped so a *different* execution's archive is still recovered
+independently. Pinned by two new unit tests
+(`transcript_turns_never_double_reports_text_the_live_event_already_
+carried`, `transcript_turns_still_recovers_a_different_executions_
+archive`). The e2e closure itself —
+`transcript_turns_recovers_a_real_producers_text_across_a_simulated_
+adjacent_append_loss` (`src/api.rs`) — drives a real `ClaudeBackend`
+against a scripted `claude` CLI, converts its real `EventDraft`s into
+real journaled `Event`s exactly as `daemon::journaling_sink` does, but
+deliberately drops `conversation.assistant.completed` to model CLAUDE.md's
+own "adjacent-append crash window" (the one scenario in which the blob
+archive is not simply redundant with the live event, per the dedup fix
+above) — then calls the real `transcript_turns`. Revert-probed by hand:
+renaming the consumer's `raw` key read to `raw_x` (simulating a producer
+rename gone unnoticed) fails this test immediately; reverted after
+confirming.
 
 ### MVP-2 D3 FIXER PASS — 2026-08-12, N4/M7 panel findings closed
 
