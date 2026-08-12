@@ -1065,19 +1065,82 @@ impl Backend for DockerBackend {
     }
 
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
+        // §22.6 / INV-R1-01 (MVP-2 D3 fixer pass): `stop()` is called by
+        // `Engine::stop_execution` from inside `drive`, under the core
+        // lock, on every ordinary stage-retirement path (stage completed,
+        // stage failed, cancel, reconcile-ambiguous) — unlike `interrupt`,
+        // which the engine's `PendingInterrupt` performer pattern already
+        // runs with the lock released. Both `docker inspect` and
+        // `docker rm -f` are blocking subprocess round trips (measured on
+        // Cerberus: ~35 ms each, ~70 ms combined — already over this
+        // contract's entire single-submit p50 budget on its own). So, like
+        // `ClaudeBackend::stop`'s reader-thread join, the whole Docker
+        // Engine interaction becomes the `Completion`'s deferred tail work:
+        // this call only computes the (already-known, no-external-effect)
+        // container name and hands back a closure that does the identity
+        // check and removal outside the lock. A failure inside that
+        // closure (inspect fails, or the name is a foreign collision) is
+        // logged rather than surfaced through this call's `Result` —
+        // matching every other backend's Completion-tail error handling,
+        // and no less honest than before: `Engine::stop_execution` already
+        // records only `{"requested": true}` for a synchronously-`Ok`
+        // `stop()`, never the removal's own outcome.
         let name = self.name_of(handle);
-        match self.inspect(&name)? {
-            None => Ok(Completion::immediate()),
-            Some(info) if !Self::labeled_for(&info, &handle.execution_id) => {
-                // §16.12: cleanup is exact. A name collision is never a
-                // license to remove whatever happens to be sitting there.
-                Err(self.unknown(&handle.execution_id))
-            }
-            Some(_) => {
-                // Exact-owned removal only (§16.12): this container, by the
-                // id/name/labels this call already verified, nothing global.
-                let _ = self.run(&["rm", "-f", &name]);
-                Ok(Completion::immediate())
+        let execution_id = handle.execution_id.clone();
+        let docker_bin = self.config.docker_bin.clone();
+        Ok(Completion::deferred(move || {
+            remove_owned_container(&docker_bin, &name, &execution_id);
+        }))
+    }
+}
+
+/// The tail work [`DockerBackend::stop`] defers outside the core lock
+/// (§22.6, INV-R1-01): inspect, verify the label still names this
+/// execution, then remove — exact-owned only (§16.12), never a name-prefix
+/// sweep. A standalone function (not a `&self` method) so it can be
+/// captured by a `'static` `Completion::deferred` closure without borrowing
+/// the backend across the lock boundary the `Completion` type exists to
+/// enforce.
+fn remove_owned_container(docker_bin: &str, name: &str, execution_id: &str) {
+    let inspect = Command::new(docker_bin).args(["inspect", name]).output();
+    let info: Option<Value> = match inspect {
+        Ok(output) if output.status.success() => serde_json::from_slice::<Vec<Value>>(
+            &output.stdout,
+        )
+        .ok()
+        .and_then(|v| v.into_iter().next()),
+        Ok(_) => None, // Docker's "no such object": nothing to remove.
+        Err(e) => {
+            tracing::warn!(
+                container = name,
+                execution_id,
+                error = %e,
+                "docker inspect failed while removing an owned container (deferred stop)"
+            );
+            return;
+        }
+    };
+    match info {
+        None => {} // Already gone: the goal state this verb wants.
+        Some(info) if !DockerBackend::labeled_for(&info, execution_id) => {
+            // §16.12: cleanup is exact. A name collision is never a license
+            // to remove whatever happens to be sitting there.
+            tracing::warn!(
+                container = name,
+                execution_id,
+                "refusing to remove a container that exists under this execution's \
+                 deterministic name but is not labeled for it (name collision) — exact-owned \
+                 cleanup only, §16.12"
+            );
+        }
+        Some(_) => {
+            if let Err(e) = Command::new(docker_bin).args(["rm", "-f", name]).output() {
+                tracing::warn!(
+                    container = name,
+                    execution_id,
+                    error = %e,
+                    "docker rm -f failed while removing an owned container (deferred stop)"
+                );
             }
         }
     }
@@ -1263,6 +1326,39 @@ mod tests {
             .expect("prepare must not touch docker");
         assert_eq!(prepared.native_id.as_deref(), Some("sgt-e1"));
         assert_eq!(prepared.execution_id, "e1");
+    }
+
+    /// INV-R1-01 (MVP-2 D3 fixer pass, §22.6): `stop()` is called by
+    /// `Engine::stop_execution` under the daemon's core lock on every
+    /// ordinary stage-retirement path. It must therefore never itself make
+    /// a Docker Engine call — the whole inspect+remove interaction has to
+    /// be the `Completion`'s deferred tail, exactly like
+    /// `ClaudeBackend::stop`'s reader-thread join. A nonexistent
+    /// `docker_bin` proves this the same way
+    /// `prepare_reserves_the_deterministic_name...` proves PREPARE has no
+    /// external effect: if `stop()` itself ran `docker inspect`, this call
+    /// would return `Err` (a spawn failure), not `Ok` with a pending
+    /// completion.
+    #[test]
+    fn stop_touches_no_docker_engine_call_synchronously_and_defers_the_removal() {
+        let (_dir, mut config) = config();
+        config.docker_bin = "/nonexistent/docker-binary-that-must-never-run".to_string();
+        let backend = DockerBackend::new(config).expect("backend");
+        let handle = ExecutionHandle {
+            execution_id: "e1".into(),
+            native_id: Some("sgt-e1".into()),
+        };
+        let completion = backend
+            .stop(&handle)
+            .expect("stop() itself must not shell out to docker");
+        assert!(
+            completion.is_pending(),
+            "the removal must be deferred tail work, not already performed"
+        );
+        // The deferred closure is where the (failing, nonexistent-binary)
+        // docker call actually happens; it must be handled internally
+        // (logged), not panic or otherwise propagate here.
+        completion.wait();
     }
 
     /// INV-R1-12 (MVP-2 D3 fixer pass): `--mount`'s value is a CSV

@@ -2507,6 +2507,21 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
     // not an unreviewed one — named here rather than left invisible to this
     // test. See `CoreGuard`'s doc for the durability guarantee stated
     // honestly against it.
+    //
+    // INV-R1-01 (N4/M7, MVP-2 D3 fixer pass): N4 added a second backend to
+    // this same `fn stop_execution` call site — `DockerBackend::stop` — and
+    // this rationale, written entirely about the Claude adapter's cheap
+    // signal-send, did not automatically cover it: `DockerBackend::stop`
+    // originally shelled out to `docker inspect` + `docker rm -f`
+    // synchronously (measured ~70 ms combined, over this contract's entire
+    // single-submit p50 budget), which is not the "synchronous kill + reap"
+    // shape this exemption was reviewed for. Fixed by making
+    // `DockerBackend::stop` defer its whole Docker Engine interaction
+    // through `Completion`'s tail-work mechanism, the same "kill now, join
+    // later" split `ClaudeBackend::stop` already uses — so both backends
+    // registered under this fixed call site now do genuinely cheap,
+    // in-memory work synchronously, and the region stays honestly
+    // whitelisted rather than silently widened in scope by a new backend.
     for stop_under_the_request_guard in ["fn stop_execution", "pub fn settle_launch"] {
         let start = source
             .find(stop_under_the_request_guard)

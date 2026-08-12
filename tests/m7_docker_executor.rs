@@ -385,6 +385,50 @@ fn resume_on_a_missing_container_fails_closed_as_unknown_execution() {
     assert_containers_gone(&["sgt-m7-vanished"]);
 }
 
+// ---------------------------------------- 4b. §22.6 STOP's deferred removal
+
+/// INV-R1-01 (MVP-2 D3 fixer pass, §22.6): `DockerBackend::stop` must not
+/// make the Docker Engine call synchronously — the removal is the
+/// `Completion`'s deferred tail work. Proven against a real container: the
+/// container still exists immediately after `stop()` returns, and is gone
+/// only once `.wait()` runs. `docker.rs`'s own unit test
+/// (`stop_touches_no_docker_engine_call_synchronously_and_defers_the_removal`)
+/// covers the "no call at all" half without Docker; this covers the "the
+/// call really does happen, and only on wait" half, which needs a real
+/// container to observe.
+#[test]
+fn stop_defers_the_actual_removal_until_the_completion_is_waited_on() {
+    require_docker!();
+    let data = support::DataDir::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend = backend(data.path());
+
+    let req = request(
+        "w4b",
+        "m7-deferred-stop",
+        cwd.path(),
+        spec(vec!["true"], WorkspaceAccess::ReadOnly),
+    );
+    let prepared = backend.prepare(&req).expect("prepare");
+    let handle = launch(&backend, &prepared);
+    let _ = wait_for_exit(&backend, &handle);
+
+    let completion = backend.stop(&handle).expect("stop");
+    // The container must still be there: `stop()` returning is not the
+    // same event as the container being removed.
+    let still_there = Command::new("docker")
+        .args(["inspect", "sgt-m7-deferred-stop"])
+        .output()
+        .expect("docker inspect");
+    assert!(
+        still_there.status.success(),
+        "the container must still exist immediately after stop() returns — removal is deferred"
+    );
+
+    completion.wait();
+    assert_containers_gone(&["sgt-m7-deferred-stop"]);
+}
+
 // --------------------------------------------------------- 5. cancellation
 
 /// §15.5/§22.7 test 10: INTERRUPT stops exactly the named container; a
