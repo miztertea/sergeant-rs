@@ -89,16 +89,22 @@ pub const KIND_STAGE_CANCELED: &str = "stage.canceled";
 
 /// What kind of executor performs a stage (§11, §12.2, §13.1).
 ///
-/// `Actor` is the only legal kind this milestone (N3 Outcome 2). `Execute`
-/// (a declared container image run through Docker, §11.2) is N4 scope; a
-/// `[stage."<id>"]` table naming any other kind fails closed at load time
-/// rather than being accepted and ignored (§22.3).
+/// `Actor` and `Execute` are the two legal kinds (N4 activates `Execute`,
+/// §11.2/§12.3, over the vocabulary N3 reserved but refused). A
+/// `[stage."<id>"]` table naming any other kind still fails closed at load
+/// time rather than being accepted and ignored (§22.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StageKind {
     /// A native reasoning harness performs this stage (§11.1).
     #[default]
     Actor,
+    /// A declared container image, run through the local Docker Engine
+    /// (§11.2). Its semantic result is mechanical: exit 0 completes the
+    /// stage, nonzero fails it, an ambiguous container outcome blocks it.
+    /// sergeant never interprets the container's stdout to decide the
+    /// outcome (§11.2's "stdout content never silently changes the result").
+    Execute,
 }
 
 impl StageKind {
@@ -106,8 +112,95 @@ impl StageKind {
     pub fn as_str(self) -> &'static str {
         match self {
             StageKind::Actor => "actor",
+            StageKind::Execute => "execute",
         }
     }
+}
+
+/// How the container's mount of the work surface is opened (§12.3, §16.6).
+/// A stage must declare this explicitly — there is no default — because
+/// silently granting write access to a container merely because most coding
+/// workloads happen to need it is exactly the guess §16.6 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAccess {
+    /// The container may read the worktree but not modify it.
+    ReadOnly,
+    /// The container may read and write the worktree.
+    ReadWrite,
+}
+
+impl WorkspaceAccess {
+    /// The access mode's canonical snake_case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceAccess::ReadOnly => "read_only",
+            WorkspaceAccess::ReadWrite => "read_write",
+        }
+    }
+}
+
+/// The execute-stage container's network policy (§12.3, §16.7).
+///
+/// `None` (Docker's no-network mode) is the only legal value in this schema.
+/// §16.7 is explicit that "the first schema should not accept arbitrary
+/// Docker network names or host networking" — a named policy admitting
+/// outbound access is future, measured work, not a value this parser
+/// silently accepts and ignores today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPolicy {
+    /// Docker's no-network mode: the container has no usable external
+    /// network path (§16.7, §22.7 test 5).
+    None,
+}
+
+impl NetworkPolicy {
+    /// The policy's canonical snake_case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NetworkPolicy::None => "none",
+        }
+    }
+}
+
+/// A resolved, immutable image identity (§16.4). Distinct from the authored
+/// `image` reference (a mutable tag is an acceptable authoring choice, never
+/// acceptable as historical evidence): this is what actually ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedImage {
+    /// The reference the workflow authored (`python:3.13-slim`).
+    pub image_requested: String,
+    /// The immutable image ID Docker reports (`sha256:...`).
+    pub image_id: String,
+    /// Repository digests the image resolved to, when the registry gave one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_digests: Vec<String>,
+    /// The platform the image was resolved for (`linux/amd64`).
+    pub platform: String,
+}
+
+/// The pinned specification for one `kind = "execute"` stage (§12.3, §13.1's
+/// conceptual `ExecuteStage`). Every field here is execution-relevant and
+/// participates in [`WorkflowDefinition::content_hash`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecuteSpec {
+    /// The authored image reference. May be a mutable tag (§16.4) — the
+    /// executor pins the resolved identity separately, at launch.
+    pub image: String,
+    /// Argv run inside the container. No shell is invented: a workflow that
+    /// needs one names it explicitly (`["bash", "-lc", "..."]`, §12.3).
+    pub command: Vec<String>,
+    /// Container working directory.
+    pub workdir: String,
+    /// Whether the worktree mount is read-only or read-write.
+    pub workspace_access: WorkspaceAccess,
+    /// Network policy. Only [`NetworkPolicy::None`] is legal this schema.
+    pub network: NetworkPolicy,
+    /// Extra environment variables for the container. Never a place for
+    /// secrets (§16.5) — the workflow file is plaintext, versioned content.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// One stage: an ordered directory with actor-readable context, tagged with
@@ -144,6 +237,12 @@ pub struct StageDefinition {
     /// backend cannot honour it (§17.5's preflight, `Engine::bind_stages`).
     #[serde(default)]
     pub requires_ask: bool,
+    /// The pinned container specification, present exactly when
+    /// `kind == StageKind::Execute` (§12.3, §13.1). `None` for every actor
+    /// stage — the same tagged-by-`kind` shape `harness`/`profile` already
+    /// have for the actor side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execute: Option<ExecuteSpec>,
 }
 
 /// The executor decision for **one stage of one run**, resolved at plan time
@@ -316,10 +415,11 @@ pub enum WorkflowError {
         /// The repeated stage id.
         stage: String,
     },
-    /// A `[stage."<id>"]` table names a `kind` this milestone does not
-    /// support. `"actor"` is the only legal kind (N3 Outcome 2, §12.2).
+    /// A `[stage."<id>"]` table names a `kind` this parser does not
+    /// support. `"actor"` and `"execute"` are the only legal kinds (§12.2,
+    /// §12.3, N4 Outcome).
     #[error(
-        "{path} declares stage {stage:?} with unknown kind {kind:?} (only \"actor\" is supported)"
+        "{path} declares stage {stage:?} with unknown kind {kind:?} (only \"actor\" and \"execute\" are supported)"
     )]
     UnknownStageKind {
         /// Path of the descriptor.
@@ -328,6 +428,73 @@ pub enum WorkflowError {
         stage: String,
         /// The unsupported `kind` value.
         kind: String,
+    },
+    /// A `[stage."<id>"]` table with `kind = "execute"` is missing a field
+    /// the execute schema (§12.3) requires unconditionally.
+    #[error(
+        "{path} declares execute stage {stage:?} with no {field} (required for kind = \"execute\")"
+    )]
+    MissingExecuteField {
+        /// Path of the descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The missing field's name.
+        field: String,
+    },
+    /// An execute-only field (`image`, `command`, `workdir`,
+    /// `workspace_access`, `network`, `env`) appears on a stage whose kind is
+    /// (or defaults to) `"actor"` — rejected rather than silently ignored,
+    /// the same discipline `deny_unknown_fields` gives an outright typo
+    /// (§22.3).
+    #[error("{path} declares actor stage {stage:?} with execute-only field {field:?}")]
+    ExecuteFieldOnActorStage {
+        /// Path of the descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The misplaced field's name.
+        field: String,
+    },
+    /// An actor-only field (`harness`, `profile`, `requires_ask`) appears on
+    /// a stage whose kind is `"execute"` — execute stages have no harness to
+    /// select and cannot ask (§11.2, §15.4).
+    #[error("{path} declares execute stage {stage:?} with actor-only field {field:?}")]
+    ActorFieldOnExecuteStage {
+        /// Path of the descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The misplaced field's name.
+        field: String,
+    },
+    /// `workspace_access` names something other than `"read_only"` or
+    /// `"read_write"` (§16.6).
+    #[error(
+        "{path} declares execute stage {stage:?} with unknown workspace_access {value:?} \
+         (only \"read_only\" and \"read_write\" are supported)"
+    )]
+    UnknownWorkspaceAccess {
+        /// Path of the descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The unsupported value.
+        value: String,
+    },
+    /// `network` names something other than `"none"` — the first schema does
+    /// not accept arbitrary Docker network names or host networking (§16.7).
+    #[error(
+        "{path} declares execute stage {stage:?} with unknown network policy {value:?} \
+         (only \"none\" is supported)"
+    )]
+    UnknownNetworkPolicy {
+        /// Path of the descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The unsupported value.
+        value: String,
     },
     /// A `[stage."<id>"]` table names a stage id the `stages` list never
     /// declared. Metadata for a stage that does not exist is refused rather
@@ -376,19 +543,23 @@ struct WorkflowSection {
     stages: Vec<String>,
 }
 
-/// One `[stage."<id>"]` table (§12.2). `deny_unknown_fields` is what turns an
-/// execute-only field (`image`, `command`, `workdir`, ...) written under an
-/// actor stage's table into a fail-closed parse error instead of a silently
-/// ignored typo (§22.3) — this milestone models no execute-stage fields at
-/// all, so any of them here is necessarily misplaced.
+/// One `[stage."<id>"]` table (§12.2, §12.3). `deny_unknown_fields` still
+/// turns an outright typo into a fail-closed parse error rather than a
+/// silently ignored one (§22.3); which of *these* known fields are legal
+/// together is a `kind`-dependent question this struct cannot express by
+/// itself, so [`resolve_stage_tag`] enforces it explicitly — an execute-only
+/// field on an actor stage, or an actor-only field on an execute stage, is
+/// refused there with a field-naming error instead of the generic malformed
+/// one a bare typo gets.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StageTable {
-    /// `"actor"` if present; absent defaults to actor too (§12.1's
-    /// no-table default applies the same way inside an explicit table that
-    /// only sets `harness`/`profile`).
+    /// `"actor"` or `"execute"` if present; absent defaults to actor
+    /// (§12.1's no-table default applies the same way inside an explicit
+    /// table that only sets other fields).
     #[serde(default)]
     kind: Option<String>,
+    // --- actor-only (§12.2) ---
     #[serde(default)]
     harness: Option<String>,
     #[serde(default)]
@@ -397,6 +568,19 @@ struct StageTable {
     /// default every other tagged field already uses.
     #[serde(default)]
     requires_ask: bool,
+    // --- execute-only (§12.3) ---
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default)]
+    workdir: Option<String>,
+    #[serde(default)]
+    workspace_access: Option<String>,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    env: Option<BTreeMap<String, String>>,
 }
 
 /// The built-in `software-change` workflow, embedded at build time from
@@ -473,29 +657,43 @@ impl WorkflowDefinition {
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
         let mut stages = Vec::with_capacity(ids.len());
         for id in ids {
-            let (kind, harness, profile, requires_ask) =
-                resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
+            let tag = resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
             let stage_dir = dir.join(&id);
             let context_path = stage_dir.join(CONTEXT_FILE);
-            if !context_path.is_file() {
+            let context = if context_path.is_file() {
+                std::fs::read_to_string(&context_path).map_err(|source| WorkflowError::Io {
+                    path: context_path.display().to_string(),
+                    source,
+                })?
+            } else if tag.kind == StageKind::Execute {
+                // §12.4: an execute stage's `CONTEXT.md`/`README.md` is
+                // optional human-readable documentation the driver never
+                // consumes — absence is not an error the way it is for an
+                // actor stage, whose `CONTEXT.md` *is* its procedure.
+                let readme_path = stage_dir.join("README.md");
+                if readme_path.is_file() {
+                    std::fs::read_to_string(&readme_path).map_err(|source| WorkflowError::Io {
+                        path: readme_path.display().to_string(),
+                        source,
+                    })?
+                } else {
+                    String::new()
+                }
+            } else {
                 return Err(WorkflowError::MissingStage {
                     path: path.clone(),
                     stage: id,
                     missing: context_path.display().to_string(),
                 });
-            }
-            let context =
-                std::fs::read_to_string(&context_path).map_err(|source| WorkflowError::Io {
-                    path: context_path.display().to_string(),
-                    source,
-                })?;
+            };
             stages.push(StageDefinition {
                 id,
                 context,
-                kind,
-                harness,
-                profile,
-                requires_ask,
+                kind: tag.kind,
+                harness: tag.harness,
+                profile: tag.profile,
+                requires_ask: tag.requires_ask,
+                execute: tag.execute,
             });
         }
         let content_hash =
@@ -517,24 +715,34 @@ impl WorkflowDefinition {
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
         let mut stages = Vec::with_capacity(ids.len());
         for id in ids {
-            let (kind, harness, profile, requires_ask) =
-                resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
-            let context = EMBEDDED_CONTEXTS
+            let tag = resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
+            let embedded_context = EMBEDDED_CONTEXTS
                 .iter()
                 .find(|(stage, _)| *stage == id)
-                .map(|(_, context)| (*context).to_string())
-                .ok_or_else(|| WorkflowError::MissingStage {
-                    path: path.clone(),
-                    stage: id.clone(),
-                    missing: format!("<embedded>/{DEFAULT_WORKFLOW}/{id}/{CONTEXT_FILE}"),
-                })?;
+                .map(|(_, context)| (*context).to_string());
+            let context = match embedded_context {
+                Some(context) => context,
+                // §12.4: same optional-documentation rule as `load_dir` —
+                // only load-bearing for a future embedded execute stage, but
+                // kept symmetric rather than a silent divergence between the
+                // two loaders.
+                None if tag.kind == StageKind::Execute => String::new(),
+                None => {
+                    return Err(WorkflowError::MissingStage {
+                        path: path.clone(),
+                        stage: id.clone(),
+                        missing: format!("<embedded>/{DEFAULT_WORKFLOW}/{id}/{CONTEXT_FILE}"),
+                    });
+                }
+            };
             stages.push(StageDefinition {
                 id,
                 context,
-                kind,
-                harness,
-                profile,
-                requires_ask,
+                kind: tag.kind,
+                harness: tag.harness,
+                profile: tag.profile,
+                requires_ask: tag.requires_ask,
+                execute: tag.execute,
             });
         }
         let content_hash =
@@ -614,22 +822,46 @@ fn check_stage_tables(
     Ok(())
 }
 
+/// One stage's resolved executor tag (§12.2/§12.3): everything
+/// [`resolve_stage_tag`] can determine about a stage before its `CONTEXT.md`
+/// is read.
+struct ResolvedStageTag {
+    kind: StageKind,
+    harness: Option<String>,
+    profile: Option<String>,
+    requires_ask: bool,
+    execute: Option<ExecuteSpec>,
+}
+
 /// Resolve one stage's `[stage."<id>"]` table, if it declared one, into its
 /// executor tag. No table (the legacy shape, §12.1) and a table with no
 /// `kind` both mean `Actor` with no explicit harness/profile — the same
 /// actor-default outcome either way. An explicit `kind` other than `"actor"`
-/// fails closed (§22.3): this milestone has no other legal kind to fall back
-/// to.
+/// or `"execute"` fails closed (§22.3).
+///
+/// Once the kind is known, every field belonging to the *other* kind is
+/// refused rather than silently ignored (§22.3's "actor-only fields on
+/// execute stages and execute-only fields on actor stages are rejected"),
+/// and an execute stage's required fields (`image`, `command`, `workdir`,
+/// `workspace_access`, `network`) are checked for presence one at a time so
+/// the error names exactly what is missing.
 fn resolve_stage_tag(
     id: &str,
     table: Option<&StageTable>,
     path: &str,
-) -> Result<(StageKind, Option<String>, Option<String>, bool), WorkflowError> {
+) -> Result<ResolvedStageTag, WorkflowError> {
     let Some(table) = table else {
-        return Ok((StageKind::Actor, None, None, false));
+        return Ok(ResolvedStageTag {
+            kind: StageKind::Actor,
+            harness: None,
+            profile: None,
+            requires_ask: false,
+            execute: None,
+        });
     };
     let kind = match table.kind.as_deref() {
         None | Some("actor") => StageKind::Actor,
+        Some("execute") => StageKind::Execute,
         Some(other) => {
             return Err(WorkflowError::UnknownStageKind {
                 path: path.to_string(),
@@ -638,12 +870,105 @@ fn resolve_stage_tag(
             });
         }
     };
-    Ok((
-        kind,
-        table.harness.clone(),
-        table.profile.clone(),
-        table.requires_ask,
-    ))
+    let execute_field_on_actor = |field: &str| WorkflowError::ExecuteFieldOnActorStage {
+        path: path.to_string(),
+        stage: id.to_string(),
+        field: field.to_string(),
+    };
+    let actor_field_on_execute = |field: &str| WorkflowError::ActorFieldOnExecuteStage {
+        path: path.to_string(),
+        stage: id.to_string(),
+        field: field.to_string(),
+    };
+    match kind {
+        StageKind::Actor => {
+            if table.image.is_some() {
+                return Err(execute_field_on_actor("image"));
+            }
+            if table.command.is_some() {
+                return Err(execute_field_on_actor("command"));
+            }
+            if table.workdir.is_some() {
+                return Err(execute_field_on_actor("workdir"));
+            }
+            if table.workspace_access.is_some() {
+                return Err(execute_field_on_actor("workspace_access"));
+            }
+            if table.network.is_some() {
+                return Err(execute_field_on_actor("network"));
+            }
+            if table.env.is_some() {
+                return Err(execute_field_on_actor("env"));
+            }
+            Ok(ResolvedStageTag {
+                kind,
+                harness: table.harness.clone(),
+                profile: table.profile.clone(),
+                requires_ask: table.requires_ask,
+                execute: None,
+            })
+        }
+        StageKind::Execute => {
+            if table.harness.is_some() {
+                return Err(actor_field_on_execute("harness"));
+            }
+            if table.profile.is_some() {
+                return Err(actor_field_on_execute("profile"));
+            }
+            if table.requires_ask {
+                return Err(actor_field_on_execute("requires_ask"));
+            }
+            let missing = |field: &str| WorkflowError::MissingExecuteField {
+                path: path.to_string(),
+                stage: id.to_string(),
+                field: field.to_string(),
+            };
+            let image = table.image.clone().ok_or_else(|| missing("image"))?;
+            let command = table.command.clone().ok_or_else(|| missing("command"))?;
+            if command.is_empty() {
+                return Err(missing("command"));
+            }
+            let workdir = table.workdir.clone().ok_or_else(|| missing("workdir"))?;
+            let workspace_access = match table.workspace_access.as_deref() {
+                Some("read_only") => WorkspaceAccess::ReadOnly,
+                Some("read_write") => WorkspaceAccess::ReadWrite,
+                Some(other) => {
+                    return Err(WorkflowError::UnknownWorkspaceAccess {
+                        path: path.to_string(),
+                        stage: id.to_string(),
+                        value: other.to_string(),
+                    });
+                }
+                None => return Err(missing("workspace_access")),
+            };
+            let network = match table.network.as_deref() {
+                Some("none") => NetworkPolicy::None,
+                Some(other) => {
+                    return Err(WorkflowError::UnknownNetworkPolicy {
+                        path: path.to_string(),
+                        stage: id.to_string(),
+                        value: other.to_string(),
+                    });
+                }
+                None => return Err(missing("network")),
+            };
+            let env = table.env.clone().unwrap_or_default();
+            Ok(ResolvedStageTag {
+                kind,
+                harness: None,
+                profile: None,
+                requires_ask: false,
+                execute: Some(ExecuteSpec {
+                    image,
+                    command,
+                    workdir,
+                    workspace_access,
+                    network,
+                    env,
+                }),
+            })
+        }
+    }
 }
 
 /// A stage's contribution to the workflow content-identity hash: every
@@ -660,6 +985,11 @@ struct ContentIdentityStage<'a> {
     /// it is a different workflow for content-identity purposes, same as a
     /// changed `harness` or `profile` is.
     requires_ask: bool,
+    /// The pinned container spec (N4, §12.3): image, command, workdir,
+    /// access and network policy, and env are all execution-relevant —
+    /// changing any of them must change the hash the same way editing a
+    /// stage's `CONTEXT.md` does.
+    execute: Option<&'a ExecuteSpec>,
 }
 
 /// The workflow content-identity hash (§22.3): BLAKE3 over a canonical JSON
@@ -689,6 +1019,7 @@ fn compute_content_hash(name: &str, version: &str, stages: &[StageDefinition]) -
                 profile: s.profile.as_deref(),
                 context: &s.context,
                 requires_ask: s.requires_ask,
+                execute: s.execute.as_ref(),
             })
             .collect(),
     };
@@ -924,7 +1255,9 @@ mod tests {
                 "stages = [\"00-only\"]\n",
                 "\n",
                 "[stage.\"00-only\"]\n",
-                "kind = \"execute\"\n",
+                // N4 activates "execute" as legal vocabulary (below); this
+                // probes a kind that stays illegal even now.
+                "kind = \"shell\"\n",
             ),
         )
         .expect("descriptor");
@@ -933,9 +1266,253 @@ mod tests {
         let err = WorkflowDefinition::resolve(root, "bad-kind").expect_err("must refuse");
         assert!(
             matches!(&err, WorkflowError::UnknownStageKind { stage, kind, .. }
-                if stage == "00-only" && kind == "execute"),
+                if stage == "00-only" && kind == "shell"),
             "expected an unknown-kind refusal naming the offending stage and kind, got {err}"
         );
+    }
+
+    /// N4 (§12.3, §11.2): a well-formed `kind = "execute"` table parses into
+    /// a pinned [`ExecuteSpec`], `CONTEXT.md` is optional for it (§12.4), and
+    /// the resolved stage carries no actor fields.
+    #[test]
+    fn a_well_formed_execute_stage_parses_with_no_context_md_required() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "validate");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"validate\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-prepare\", \"10-validate\"]\n",
+                "\n",
+                "[stage.\"10-validate\"]\n",
+                "kind = \"execute\"\n",
+                "image = \"python:3.13-slim\"\n",
+                "command = [\"python\", \"validate.py\"]\n",
+                "workdir = \"/workspace\"\n",
+                "workspace_access = \"read_write\"\n",
+                "network = \"none\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-prepare", "prepare context");
+        // Deliberately no CONTEXT.md for 10-validate: §12.4 says it is
+        // optional for execute stages, so this must not need `write_stage`.
+        std::fs::create_dir_all(wf.join("10-validate")).expect("execute stage dir");
+
+        let workflow = WorkflowDefinition::resolve(root, "validate").expect("resolve");
+        let execute_stage = &workflow.stages[1];
+        assert_eq!(execute_stage.kind, StageKind::Execute);
+        assert_eq!(execute_stage.harness, None);
+        assert_eq!(execute_stage.profile, None);
+        assert!(!execute_stage.requires_ask);
+        assert_eq!(execute_stage.context, "", "no CONTEXT.md/README.md present");
+        let spec = execute_stage
+            .execute
+            .as_ref()
+            .expect("execute stage must carry an ExecuteSpec");
+        assert_eq!(spec.image, "python:3.13-slim");
+        assert_eq!(
+            spec.command,
+            vec!["python".to_string(), "validate.py".to_string()]
+        );
+        assert_eq!(spec.workdir, "/workspace");
+        assert_eq!(spec.workspace_access, WorkspaceAccess::ReadWrite);
+        assert_eq!(spec.network, NetworkPolicy::None);
+        assert!(spec.env.is_empty());
+
+        // The untouched actor stage still has no execute spec.
+        assert_eq!(workflow.stages[0].execute, None);
+    }
+
+    /// §12.4: when an execute stage's `CONTEXT.md` is absent but a
+    /// `README.md` exists, the README is carried as (undocumented,
+    /// unconsumed) human-readable context instead.
+    #[test]
+    fn an_execute_stage_falls_back_to_readme_when_context_md_is_absent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "readme-fallback");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"readme-fallback\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-validate\"]\n",
+                "\n",
+                "[stage.\"00-validate\"]\n",
+                "kind = \"execute\"\n",
+                "image = \"alpine:3\"\n",
+                "command = [\"true\"]\n",
+                "workdir = \"/workspace\"\n",
+                "workspace_access = \"read_only\"\n",
+                "network = \"none\"\n",
+            ),
+        )
+        .expect("descriptor");
+        std::fs::create_dir_all(wf.join("00-validate")).expect("stage dir");
+        std::fs::write(
+            wf.join("00-validate").join("README.md"),
+            "explains the check",
+        )
+        .expect("readme");
+
+        let workflow = WorkflowDefinition::resolve(root, "readme-fallback").expect("resolve");
+        assert_eq!(workflow.stages[0].context, "explains the check");
+    }
+
+    /// §12.3/§22.3: each required execute field, missing one at a time,
+    /// fails closed and names the missing field rather than a generic
+    /// malformed-file error.
+    #[test]
+    fn a_missing_required_execute_field_is_named_in_the_refusal() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let cases: &[(&str, &str)] = &[
+            (
+                "no-image",
+                concat!(
+                    "command = [\"true\"]\n",
+                    "workdir = \"/workspace\"\n",
+                    "workspace_access = \"read_only\"\n",
+                    "network = \"none\"\n"
+                ),
+            ),
+            (
+                "no-command",
+                concat!(
+                    "image = \"alpine:3\"\n",
+                    "workdir = \"/workspace\"\n",
+                    "workspace_access = \"read_only\"\n",
+                    "network = \"none\"\n"
+                ),
+            ),
+            (
+                "no-workdir",
+                concat!(
+                    "image = \"alpine:3\"\n",
+                    "command = [\"true\"]\n",
+                    "workspace_access = \"read_only\"\n",
+                    "network = \"none\"\n"
+                ),
+            ),
+            (
+                "no-access",
+                concat!(
+                    "image = \"alpine:3\"\n",
+                    "command = [\"true\"]\n",
+                    "workdir = \"/workspace\"\n",
+                    "network = \"none\"\n"
+                ),
+            ),
+            (
+                "no-network",
+                concat!(
+                    "image = \"alpine:3\"\n",
+                    "command = [\"true\"]\n",
+                    "workdir = \"/workspace\"\n",
+                    "workspace_access = \"read_only\"\n"
+                ),
+            ),
+        ];
+        let expected_field: &[&str] =
+            &["image", "command", "workdir", "workspace_access", "network"];
+        for ((name, fields), expected) in cases.iter().zip(expected_field) {
+            let wf = workflow_dir(root, name);
+            std::fs::create_dir_all(&wf).expect("workflow dir");
+            std::fs::write(
+                wf.join(WORKFLOW_FILE),
+                format!(
+                    "[workflow]\nname = {name:?}\nversion = \"1\"\nstages = [\"00-only\"]\n\n[stage.\"00-only\"]\nkind = \"execute\"\n{fields}"
+                ),
+            )
+            .expect("descriptor");
+            std::fs::create_dir_all(wf.join("00-only")).expect("stage dir");
+
+            let err = WorkflowDefinition::resolve(root, name).expect_err("must refuse");
+            assert!(
+                matches!(&err, WorkflowError::MissingExecuteField { field, .. } if field == expected),
+                "case {name}: expected MissingExecuteField({expected:?}), got {err}"
+            );
+        }
+    }
+
+    /// §16.6/§16.7: an unrecognized `workspace_access` or `network` value
+    /// fails closed by name rather than being coerced or silently ignored.
+    #[test]
+    fn unknown_workspace_access_and_network_values_fail_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        let wf = workflow_dir(root, "bad-access");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\nname = \"bad-access\"\nversion = \"1\"\nstages = [\"00-only\"]\n\n",
+                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
+                "command = [\"true\"]\nworkdir = \"/workspace\"\n",
+                "workspace_access = \"read_and_write_and_more\"\nnetwork = \"none\"\n",
+            ),
+        )
+        .expect("descriptor");
+        std::fs::create_dir_all(wf.join("00-only")).expect("stage dir");
+        assert!(matches!(
+            WorkflowDefinition::resolve(root, "bad-access"),
+            Err(WorkflowError::UnknownWorkspaceAccess { value, .. }) if value == "read_and_write_and_more"
+        ));
+
+        let wf = workflow_dir(root, "bad-network");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\nname = \"bad-network\"\nversion = \"1\"\nstages = [\"00-only\"]\n\n",
+                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
+                "command = [\"true\"]\nworkdir = \"/workspace\"\n",
+                "workspace_access = \"read_only\"\nnetwork = \"bridge\"\n",
+            ),
+        )
+        .expect("descriptor");
+        std::fs::create_dir_all(wf.join("00-only")).expect("stage dir");
+        assert!(matches!(
+            WorkflowDefinition::resolve(root, "bad-network"),
+            Err(WorkflowError::UnknownNetworkPolicy { value, .. }) if value == "bridge"
+        ));
+    }
+
+    /// §22.3: an actor-only field (`harness`, `profile`, `requires_ask`) on
+    /// a `kind = "execute"` table is refused by name — an execute stage has
+    /// no harness to select and cannot ask.
+    #[test]
+    fn actor_only_fields_on_an_execute_stage_fail_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "misplaced-actor-field");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\nname = \"misplaced-actor-field\"\nversion = \"1\"\n",
+                "stages = [\"00-only\"]\n\n",
+                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
+                "command = [\"true\"]\nworkdir = \"/workspace\"\n",
+                "workspace_access = \"read_only\"\nnetwork = \"none\"\nharness = \"claude\"\n",
+            ),
+        )
+        .expect("descriptor");
+        std::fs::create_dir_all(wf.join("00-only")).expect("stage dir");
+
+        let err = WorkflowDefinition::resolve(root, "misplaced-actor-field").expect_err("refuse");
+        assert!(matches!(
+            &err,
+            WorkflowError::ActorFieldOnExecuteStage { field, .. } if field == "harness"
+        ));
     }
 
     /// §22.3: a `[stage."<id>"]` table for an id the `stages` list never
@@ -1078,10 +1655,11 @@ mod tests {
         .expect("descriptor");
         write_stage(&wf, "00-only", "context");
 
-        assert!(matches!(
-            WorkflowDefinition::resolve(root, "misplaced"),
-            Err(WorkflowError::Malformed { .. })
-        ));
+        let err = WorkflowDefinition::resolve(root, "misplaced").expect_err("must refuse");
+        assert!(
+            matches!(&err, WorkflowError::ExecuteFieldOnActorStage { field, .. } if field == "image"),
+            "expected an ExecuteFieldOnActorStage refusal naming \"image\", got {err}"
+        );
     }
 
     /// §22.3: the content-identity hash changes when a context changes, when
