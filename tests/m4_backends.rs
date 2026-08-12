@@ -8659,7 +8659,11 @@ fn r_mvp1_7_a_consumed_crossing_whose_turn_ended_is_journaled_stale_not_delivere
         .expect("plan")
         .expect("a workspace");
     let work_id = "01MVP17STALE";
-    submit_work(&mut core, work_id, "hang, then go stale in the delivery window");
+    submit_work(
+        &mut core,
+        work_id,
+        "hang, then go stale in the delivery window",
+    );
     let work = core.registry.state().works[work_id].clone();
     let step = engine
         .begin_start(&mut core, &work, &plan)
@@ -8702,7 +8706,9 @@ fn r_mvp1_7_a_consumed_crossing_whose_turn_ended_is_journaled_stale_not_delivere
         events[0]
     );
     assert!(
-        events[0]["outcome"]["stale"].as_str().is_some_and(|s| !s.is_empty()),
+        events[0]["outcome"]["stale"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
         "the stale settle names why the perform was skipped: {}",
         events[0]
     );

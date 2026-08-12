@@ -4469,7 +4469,10 @@ async fn r_mvp1_10_extend_refuses_zero_additional_turns() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{extend_body}");
-    assert_eq!(extend_body["error"]["code"], "invalid_request", "{extend_body}");
+    assert_eq!(
+        extend_body["error"]["code"], "invalid_request",
+        "{extend_body}"
+    );
 
     handle.shutdown().await;
 }

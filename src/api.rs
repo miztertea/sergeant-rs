@@ -671,8 +671,9 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
                 let mut core = CoreGuard::acquire(&state.core).await;
                 match state.engine.interrupt_is_stale(&core, &pending) {
                     Some(reason) => {
-                        if let Err(e) =
-                            state.engine.settle_stale_interrupt(&mut core, &pending, reason)
+                        if let Err(e) = state
+                            .engine
+                            .settle_stale_interrupt(&mut core, &pending, reason)
                         {
                             tracing::error!(
                                 work_id = %pending.work_id(),

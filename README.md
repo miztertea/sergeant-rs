@@ -59,7 +59,7 @@ sgt run "add retry handling" --backend claude --workflow software-change --repo 
 ```sh
 sgt status              # daemon health + work counts, by state
 sgt work list            # the fleet: id, state, intent
-sgt work show <id>       # one item: stage, execution, surface, recent events
+sgt work show <id>       # one item: stage, execution, surface, output pointer, recent events
 sgt work show <id> --graph   # the work's provenance graph instead of its record
 sgt                       # no subcommand: the TUI — fleet + detail, live over SSE
 sgt web                  # print the dashboard URL (tokenized, loopback-only)
@@ -72,10 +72,11 @@ sgt web --open            # ...and open it in a browser
 sgt respond <id> "yes, 3 attempts with exponential backoff"
 ```
 
-**Retry or cancel:**
+**Retry, extend, or cancel:**
 
 ```sh
-sgt retry <id>     # retry the current stage of a failed, blocked, or waiting work item
+sgt retry <id>                  # retry the current stage of a failed, blocked, or waiting work item
+sgt extend <id> <extra-turns>   # work blocked on an exhausted turn envelope: grant more turns, then `sgt retry`
 sgt cancel <id>
 ```
 
@@ -135,7 +136,7 @@ This is a clean-room Rust successor to [callmeradical/sergeant](https://github.c
 
 ## Status
 
-**P0 (the full vertical slice above) is complete** — 218 tests + 2 opt-in live-Claude, zero leaked daemons across the suite. **P1 performance baselining is done**: the full load/stress matrix ran against the release binary and is written up in [`docs/perf/baseline-2026-08-10.md`](docs/perf/baseline-2026-08-10.md), with findings tracked as GitHub issues. The **N-series** (ICM workflows, per-stage harnesses, Docker execute stages) is in progress — see [GAUNTLET.md](GAUNTLET.md)'s N-series entries for what's landed so far, including the `repo-to-icm` workflow linked above. The prototype was built end-to-end by a multi-agent gauntlet loop (bounded contracts, blind critic panels, adversarial verification); the complete development record — including every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md), and the method in [reference/notes/gauntlet-pattern.md](reference/notes/gauntlet-pattern.md).
+**P0 (the full vertical slice above) is complete** — 218 tests + 2 opt-in live-Claude, zero leaked daemons across the suite. **P1 performance baselining is done**: the full load/stress matrix ran against the release binary and is written up in [`docs/perf/baseline-2026-08-10.md`](docs/perf/baseline-2026-08-10.md), with findings tracked as GitHub issues. The **N-series** (ICM workflows, per-stage harnesses, Docker execute stages) and its MVP milestones are in progress — see [GAUNTLET.md](GAUNTLET.md)'s ledger entries for what's landed so far, including the `repo-to-icm` workflow linked above and MVP-1's estate manifest, turn envelopes, and Rule A eviction. The prototype was built end-to-end by a multi-agent gauntlet loop (bounded contracts, blind critic panels, adversarial verification); the complete development record — including every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md), and the method in [reference/notes/gauntlet-pattern.md](reference/notes/gauntlet-pattern.md).
 
 ## Developing
 

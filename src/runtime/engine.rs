@@ -3165,7 +3165,11 @@ impl Engine {
     /// `Some(reason)` means skip the perform and journal the consumed
     /// crossing through [`Self::settle_stale_interrupt`] instead — never
     /// drop it silently (`due_interrupts`'s own no-silent-loss rule).
-    pub fn interrupt_is_stale(&self, core: &Core, pending: &PendingInterrupt) -> Option<&'static str> {
+    pub fn interrupt_is_stale(
+        &self,
+        core: &Core,
+        pending: &PendingInterrupt,
+    ) -> Option<&'static str> {
         if self
             .turn_started
             .lock()
