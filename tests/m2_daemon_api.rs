@@ -4090,9 +4090,21 @@ async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry
     r_mvp1_10_init_repo(&repo);
     r_mvp1_10_write_n_stage_workflow(&repo, "two", 2);
 
+    // TH-10: `settle(1)` is consumed by `PendingLaunch::perform`'s own
+    // synchronous OBSERVE, so the completion driver's very *first* tick
+    // could already complete stage 1 and launch stage 2 — racing this
+    // function's own `fake.set_available(false, ...)` call just below
+    // against the driver's next 30ms tick, with nothing forcing the test
+    // task to run first. `settle(8)` widens that margin to ~8 driver
+    // ticks (240ms) of real scheduling slack before stage 1 can possibly
+    // complete, without adding a synthetic sleep of its own (still races
+    // in principle, just with a window wide enough that ordinary CPU
+    // contention cannot plausibly close it — measured non-flaky at 90/90
+    // runs with the original settle(1); this is headroom against a
+    // heavier future test suite, not a fix for an observed failure here).
     let fake = FakeBackend::scripted(
         FAKE_BACKEND_NAME,
-        [FakeStep::complete().settle(1), FakeStep::complete()],
+        [FakeStep::complete().settle(8), FakeStep::complete()],
     );
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
     let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
