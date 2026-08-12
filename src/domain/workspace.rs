@@ -41,6 +41,21 @@ pub const WORKSPACE_FILE: &str = "sergeant.toml";
 /// the actor read natively (R-MVP1-4). Named here because it is the one
 /// value both the manifest's policy and the bind-time identity hash agree
 /// on: today's `[[repo]] instructions` vocabulary and tomorrow's file probe.
+///
+/// **W7: measured, not merely named, for `suppress` — the shipped default,
+/// and the only policy `local`'s own submit-time refusal (R-MVP1-4) lets a
+/// Work actually run under.** The Claude adapter's launch grammar is
+/// `--setting-sources user` (`backend/claude.rs`), which does not read this
+/// file; this repo's own north-star arbitration record confirms it
+/// empirically ("CLAUDE.md and AGENTS.md are invisible to the actor by
+/// design"). `Engine::resolve_instruction_identities` still hashes this
+/// file at bind time regardless of policy — R-MVP1-4's own pin ("editing an
+/// AGENTS.md after bind does not move the pinned identity") holds either
+/// way — but for `suppress`, what is pinned is bookkeeping for a file the
+/// actor never reads, not yet "the file the actor will read is the one we
+/// recorded" in the sense that claim is usually taken. That sentence is
+/// true only for `local`, which is refused at submit until MVP-2 measures
+/// what it translates to.
 pub const INSTRUCTION_FILE: &str = "AGENTS.md";
 
 /// One repository bound into a workspace.

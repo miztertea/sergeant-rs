@@ -1026,13 +1026,24 @@ impl Engine {
     }
 
     /// R-MVP1-4's R7: resolve the instruction-file identity `workflow.bound`
-    /// pins for each bound repository — "the file the actor will read is
-    /// the one we recorded". Reads from the *materialized worktree*
-    /// (`surface`'s bindings), not the source repository: that is the copy
-    /// the actor will actually see, and pinning it after materialization
-    /// (rather than at plan time, before a worktree exists) is exactly what
-    /// makes the hash mean anything. A missing file is recorded as absent —
-    /// `path`/`content_hash` both `None` — never silently skipped.
+    /// pins for each bound repository. Reads from the *materialized
+    /// worktree* (`surface`'s bindings), not the source repository: that is
+    /// the copy the actor would read under `local`, and pinning it after
+    /// materialization (rather than at plan time, before a worktree exists)
+    /// is exactly what makes the hash mean anything *for that policy*. A
+    /// missing file is recorded as absent — `path`/`content_hash` both
+    /// `None` — never silently skipped.
+    ///
+    /// **W7:** runs unconditionally, for every bound repository regardless
+    /// of its resolved `policy` — including `suppress`, the shipped default
+    /// (`local` is refused at submit, R-MVP1-4). `INSTRUCTION_FILE`'s own
+    /// doc has the measured fact: the adapter's `suppress` launch grammar
+    /// does not read this file at all, so "the file the actor will read is
+    /// the one we recorded" is true only for the resolved identities a
+    /// `local` bind would carry — none of which can currently reach a
+    /// launch. What ships today is a correctly-computed, correctly-pinned
+    /// identity for a file that, under the only policy that actually runs,
+    /// nothing reads yet.
     fn resolve_instruction_identities(
         workspace: &Workspace,
         surface: &WorkSurface,
