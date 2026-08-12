@@ -1570,4 +1570,63 @@ mod tests {
             "a member's own non-estate config does not stop the walk (no estate above it here)"
         );
     }
+
+    /// TH-03: R-MVP1-3's pin ("a same-commit grep finds zero `[workspace]`/
+    /// `[[repository]]` outside `reference/`") was a one-time manual check,
+    /// never a standing gate — nothing stopped a future fixture
+    /// reintroducing the legacy vocabulary. This is that gate: every
+    /// `sergeant.toml` actually checked into this tree outside `reference/`
+    /// (frozen evidence, exempted — CLAUDE.md's own convention) must parse
+    /// without a top-level `workspace` or `repository` table.
+    ///
+    /// Scoped to files literally named `sergeant.toml`, not a bare string
+    /// grep across every doc and note: several already-committed notes
+    /// discuss the legacy vocabulary in prose while describing the
+    /// migration itself, which is not the live-config leak this pin is
+    /// about (docs/gauntlet/notes and docs/gauntlet/runs are historical
+    /// records, not configuration this codebase reads).
+    #[test]
+    fn no_committed_sergeant_toml_outside_reference_carries_legacy_vocabulary() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut offenders = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                let name = entry.file_name();
+                if path.is_dir() {
+                    // `reference/` is frozen evidence (CLAUDE.md); `.git`
+                    // and `target` are never source content.
+                    if matches!(name.to_str(), Some("reference" | ".git" | "target")) {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if name == WORKSPACE_FILE {
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+                        // A malformed committed sergeant.toml is a real
+                        // problem, but a different one (W5 covers the
+                        // upward-walk's own handling of it) — not this
+                        // pin's concern.
+                        continue;
+                    };
+                    if let Some(table) = value.as_table()
+                        && (table.contains_key("workspace") || table.contains_key("repository"))
+                    {
+                        offenders.push(path);
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "legacy [workspace]/[[repository]] vocabulary in committed sergeant.toml file(s) \
+             outside reference/: {offenders:?}"
+        );
+    }
 }
