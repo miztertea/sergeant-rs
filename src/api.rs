@@ -387,6 +387,7 @@ pub fn router(state: ApiState) -> Router {
     let v1 = Router::new()
         .route("/work", post(submit_work).get(list_work))
         .route("/work/{id}", get(show_work))
+        .route("/work/{id}/transcript", get(work_transcript))
         .route("/work/{id}/cancel", post(cancel_work))
         .route("/work/{id}/input", post(work_input))
         .route("/work/{id}/retry", post(work_retry))
@@ -1507,6 +1508,144 @@ async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Res
     }
 }
 
+/// `GET /v1/work/{id}/transcript` — MVP-3's `sgt work transcript`: the
+/// work's conversation, decoded into causal (journal seq) order.
+///
+/// Every `conversation.*` event already carries its content inline in the
+/// payload (`text`/`question` — see `claude.rs`'s `ingest_line`), so
+/// reconstructing the transcript is filtering the journal to this work's
+/// conversation kinds and reading their causal order straight off — no new
+/// projection, no daemon-internal type crosses this boundary (R-NS-4: a
+/// client convenience over data the journal already owns).
+///
+/// The one gap: a turn that ended with **no** result envelope (interrupted
+/// or crashed — see `TurnReader::run`) never got as far as emitting
+/// `conversation.assistant.completed`, because that event is only produced
+/// from a fully-parsed `assistant` stream-json line. For that turn alone,
+/// the §20 raw archive `conversation.turn.ended` references by blob ref is
+/// the *only* place any of its content reached the journal at all, so this
+/// handler does the "minimal blob decode" MVP-3's plan calls for: split the
+/// archive into lines, parse each as JSON, and recover whatever assistant
+/// text blocks streamed before the cut. It deliberately does not replay tool
+/// calls or system/vendor plumbing — that stays raw-archive-only.
+async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let core = CoreGuard::acquire(&state.core).await;
+    if !core.registry.state().works.contains_key(&id) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "work_not_found",
+            format!("no work with id {id}"),
+        );
+    }
+    let events = match core.events_after(0) {
+        Ok(events) => events,
+        Err(e) => return internal_error(e),
+    };
+    drop(core);
+
+    let turns = transcript_turns(&id, events, &state.data_dir);
+    Json(json!({"work_id": id, "turns": turns})).into_response()
+}
+
+/// The pure decode: filter `events` to `work_id`'s `conversation.*` kinds and
+/// turn each into a `{seq, ts, role, text, source}` entry, in the journal's
+/// own causal (seq) order — factored out of the handler above so the
+/// role/source mapping and the blob-decode fallback can be pinned by a
+/// direct test without spinning up a daemon.
+fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Path) -> Vec<Value> {
+    let mut turns = Vec::new();
+    for event in events
+        .into_iter()
+        .filter(|e| e.work_id.as_deref() == Some(work_id))
+    {
+        match event.kind.as_str() {
+            KIND_CONVERSATION_USER => turns.push(json!({
+                "seq": event.seq,
+                "ts": event.timestamp,
+                "role": "user",
+                "text": event.payload["text"].as_str().unwrap_or(""),
+                "source": "event",
+            })),
+            KIND_CONVERSATION_ASSISTANT_COMPLETED => turns.push(json!({
+                "seq": event.seq,
+                "ts": event.timestamp,
+                "role": "assistant",
+                "text": event.payload["text"].as_str().unwrap_or(""),
+                "source": "event",
+            })),
+            KIND_CONVERSATION_ASK => turns.push(json!({
+                "seq": event.seq,
+                "ts": event.timestamp,
+                "role": "ask",
+                "text": event.payload["question"].as_str().unwrap_or(""),
+                "source": "event",
+            })),
+            KIND_CONVERSATION_TURN_ENDED => {
+                // A turn that closed with a result envelope already emitted
+                // its content, if any, as its own `conversation.*` event
+                // above — nothing to recover. Only the envelope-less case
+                // needs the archive.
+                if event.payload["result_envelope"].as_bool().unwrap_or(true) {
+                    continue;
+                }
+                let Some(raw_ref) = event.payload["raw"].as_str() else {
+                    continue;
+                };
+                let Ok(blob_ref) = raw_ref.parse::<crate::runtime::blob::BlobRef>() else {
+                    continue;
+                };
+                let Ok(store) = crate::runtime::blob::BlobStore::open(data_dir) else {
+                    continue;
+                };
+                let Ok(bytes) = store.get(&blob_ref) else {
+                    continue;
+                };
+                let text = decode_partial_assistant_text(&bytes);
+                if !text.is_empty() {
+                    turns.push(json!({
+                        "seq": event.seq,
+                        "ts": event.timestamp,
+                        "role": "assistant",
+                        "text": text,
+                        "source": "blob_decode",
+                        "interrupted": event.payload["interrupted"].as_bool().unwrap_or(false),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+/// The "minimal blob decode" itself: recover whatever assistant `text`
+/// content blocks appear in a raw stream-json archive, in file order. Not a
+/// general stream-json parser — it reads exactly the shape `ingest_line`'s
+/// `Some("assistant")` arm reads, on an archive rather than a live line.
+fn decode_partial_assistant_text(raw: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(raw);
+    let mut text = String::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(t) = block.get("text").and_then(Value::as_str)
+            {
+                text.push_str(t);
+            }
+        }
+    }
+    text
+}
+
 #[derive(Debug, Deserialize)]
 struct CancelRequest {
     command_id: String,
@@ -2526,6 +2665,13 @@ impl ApiClient {
         self.get(&format!("/v1/work/{id}")).await
     }
 
+    /// `GET /v1/work/{id}/transcript` — the work's conversation, decoded in
+    /// causal order (MVP-3's `sgt work transcript`).
+    pub async fn work_transcript(&self, id: &str) -> Result<Value, ClientError> {
+        self.get(&format!("/v1/work/{}/transcript", urlencode(id)))
+            .await
+    }
+
     /// `GET /v1/events` for one work's newest `limit` events.
     pub async fn work_events(&self, id: &str, limit: usize) -> Result<Value, ClientError> {
         self.get(&format!(
@@ -2680,6 +2826,7 @@ fn decode_frame(frame: &str) -> Option<Event> {
 mod tests {
     use super::*;
     use crate::backend::BackendRegistry;
+    use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
 
     /// The one knob on the client, exercised. Its only production caller is
@@ -3158,6 +3305,192 @@ mod tests {
         assert_eq!(
             seq, 5,
             "the projection must report itself caught up to the real journal head"
+        );
+    }
+
+    // ------------------------------------------------- work_transcript
+
+    /// Build a minimal `Event` for `transcript_turns` — every field the
+    /// function itself reads (`seq`, `kind`, `work_id`, `payload`), plus the
+    /// envelope fields `Event` requires to exist at all.
+    fn ev(seq: u64, work_id: &str, kind: &str, payload: Value) -> Event {
+        Event {
+            schema: EVENT_SCHEMA.to_string(),
+            seq,
+            id: format!("evt-{seq}"),
+            timestamp: rfc3339_utc_now(),
+            source: EventSource::new("backend", "test"),
+            workspace_id: None,
+            work_id: Some(work_id.to_string()),
+            execution_id: None,
+            correlation_id: None,
+            causation_id: None,
+            kind: kind.to_string(),
+            payload,
+            extra: Default::default(),
+        }
+    }
+
+    /// The mapping `transcript_turns` exists for: `conversation.user`,
+    /// `conversation.assistant.completed` and `conversation.ask` events for
+    /// *this* work decode to `{role, text, source: "event"}` in causal (seq)
+    /// order, and events belonging to a different work are dropped.
+    ///
+    /// guard-map: mutating any `KIND_CONVERSATION_*` match arm's `role` or
+    /// the payload key it reads (`"text"` vs `"question"`) makes this fail;
+    /// so does dropping the `work_id` filter or reordering by anything other
+    /// than input order (which is already seq-ascending, as the journal
+    /// guarantees).
+    #[test]
+    fn transcript_turns_decodes_conversation_events_in_causal_order_for_one_work() {
+        let events = vec![
+            ev(
+                1,
+                "w1",
+                KIND_CONVERSATION_USER,
+                json!({"text": "please do the thing"}),
+            ),
+            // A different work's event must never leak into w1's transcript.
+            ev(
+                2,
+                "w2",
+                KIND_CONVERSATION_USER,
+                json!({"text": "unrelated work"}),
+            ),
+            ev(
+                3,
+                "w1",
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "on it"}),
+            ),
+            ev(
+                4,
+                "w1",
+                KIND_CONVERSATION_ASK,
+                json!({"question": "which environment?"}),
+            ),
+        ];
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let turns = transcript_turns("w1", events, data_dir.path());
+        let shape: Vec<(u64, &str, &str, &str)> = turns
+            .iter()
+            .map(|t| {
+                (
+                    t["seq"].as_u64().unwrap(),
+                    t["role"].as_str().unwrap(),
+                    t["text"].as_str().unwrap(),
+                    t["source"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (1, "user", "please do the thing", "event"),
+                (3, "assistant", "on it", "event"),
+                (4, "ask", "which environment?", "event"),
+            ],
+            "w2's event must be excluded and the rest must decode in seq order: {turns:?}"
+        );
+    }
+
+    /// The "minimal blob decode" itself, end to end through
+    /// `transcript_turns`: a `conversation.turn.ended` with
+    /// `result_envelope: false` and a `raw` blob ref recovers whatever
+    /// assistant `text` blocks the archived stream-json carries, tagged
+    /// `source: "blob_decode"` so a reader can tell it apart from an
+    /// ordinary journaled event.
+    ///
+    /// guard-map: removing the `store.get`/`decode_partial_assistant_text`
+    /// call, or the `result_envelope` early-return, makes this fail (the
+    /// former by never recovering the text, the latter by double-reporting
+    /// or misfiring on ordinary completed turns).
+    #[test]
+    fn transcript_turns_recovers_partial_text_from_an_interrupted_turns_raw_archive() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        // A raw stream-json archive: one assistant line with a partial text
+        // block, as if the turn were cut mid-stream (no trailing `result`
+        // line — that absence is exactly why `conversation.assistant.
+        // completed` never got emitted for this turn).
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial reply before the cut"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![ev(
+            1,
+            "w1",
+            KIND_CONVERSATION_TURN_ENDED,
+            json!({
+                "interrupted": true,
+                "result_envelope": false,
+                "raw": blob_ref.to_string(),
+            }),
+        )];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert_eq!(
+            turns.len(),
+            1,
+            "the interrupted turn must recover one entry: {turns:?}"
+        );
+        assert_eq!(turns[0]["role"], "assistant");
+        assert_eq!(turns[0]["text"], "partial reply before the cut");
+        assert_eq!(turns[0]["source"], "blob_decode");
+        assert_eq!(turns[0]["interrupted"], true);
+    }
+
+    /// A turn that closed *with* a result envelope must never trigger the
+    /// blob-decode fallback — its content, if any, already reached the
+    /// journal as its own `conversation.assistant.completed` event, and
+    /// decoding the archive too would double-report it (or fabricate an
+    /// entry for a tool-only turn that produced no text at all).
+    #[test]
+    fn transcript_turns_never_decodes_the_archive_of_a_turn_that_ended_with_an_envelope() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"should never surface"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+        let events = vec![ev(
+            1,
+            "w1",
+            KIND_CONVERSATION_TURN_ENDED,
+            json!({
+                "interrupted": false,
+                "result_envelope": true,
+                "raw": blob_ref.to_string(),
+            }),
+        )];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert!(
+            turns.is_empty(),
+            "a turn that ended with an envelope must not decode its archive: {turns:?}"
+        );
+    }
+
+    /// `decode_partial_assistant_text` in isolation: it reads only
+    /// `type: "assistant"` lines' `/message/content` text blocks, in file
+    /// order, and ignores lines it cannot parse or that carry no text block
+    /// (system lines, tool_use blocks) rather than erroring on them.
+    #[test]
+    fn decode_partial_assistant_text_reads_only_assistant_text_blocks_in_order() {
+        let archive = [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first "}]}}"#,
+            "not even json",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"grep"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"second"}]}}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            decode_partial_assistant_text(archive.as_bytes()),
+            "first second"
         );
     }
 }

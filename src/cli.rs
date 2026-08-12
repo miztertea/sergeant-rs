@@ -235,6 +235,13 @@ enum WorkCommand {
         #[arg(long)]
         graph: bool,
     },
+    /// Decode a work's conversation from the journal, in causal order
+    /// (MVP-3). Read-only: never mutates daemon state. Use the global
+    /// `--json` flag for the raw structured turns instead of plain text.
+    Transcript {
+        /// Work id whose conversation to decode.
+        id: String,
+    },
 }
 
 /// CLI error: a message for stderr and a nonzero exit.
@@ -557,7 +564,27 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                                 }
                             }
                         }
+                        // R-MVP1-2's output pointer (source repo, retained
+                        // branch, worktree path, finalize commit) already
+                        // rides along inside this same object at `output`
+                        // (folded in above) — "where did my deliverable
+                        // land" is answerable from this one `work show`
+                        // without a second command, and every other key
+                        // here folds the identical way, so it stays inside
+                        // the one JSON blob rather than breaking it up with
+                        // separate prose the way a caller that treats this
+                        // "human form" as parseable JSON (several tests do)
+                        // would choke on.
                         print_json(&work);
+                    }
+                    Ok(())
+                }
+                WorkCommand::Transcript { id } => {
+                    let result = client.work_transcript(&id).await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_transcript(&result);
                     }
                     Ok(())
                 }
@@ -873,6 +900,36 @@ fn print_graph(result: &Value) {
             labels.get(from).copied().unwrap_or(""),
             labels.get(to).copied().unwrap_or(""),
         );
+    }
+}
+
+/// `sgt work transcript`'s plain-text rendering: one block per turn, in the
+/// causal order `GET /v1/work/{id}/transcript` already returns them in. A
+/// turn recovered from the raw archive of an interrupted turn (rather than
+/// its own journaled event) is called out, since it is lower-fidelity than
+/// the rest — never presented as if it were an ordinary completed turn.
+fn print_transcript(result: &Value) {
+    let empty = Vec::new();
+    let turns = result["turns"].as_array().unwrap_or(&empty);
+    if turns.is_empty() {
+        println!("no conversation recorded for this work");
+        return;
+    }
+    for turn in turns {
+        let label = match turn["role"].as_str().unwrap_or("?") {
+            "user" => "User",
+            "assistant" => "Assistant",
+            "ask" => "Ask",
+            other => other,
+        };
+        let recovered = if turn["source"].as_str() == Some("blob_decode") {
+            " (recovered from the interrupted turn's raw archive)"
+        } else {
+            ""
+        };
+        println!("{label}{recovered}:");
+        println!("{}", turn["text"].as_str().unwrap_or(""));
+        println!();
     }
 }
 

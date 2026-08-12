@@ -599,3 +599,145 @@ fn no_estate_anywhere_falls_back_to_the_pre_estate_default_unchanged() {
     let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
     assert_eq!(reported, xdg.join("sergeant"));
 }
+
+// -------------------------------------------- work transcript / output pointer
+
+/// A minimal two-stage workflow — the same shape `m5_projections.rs` uses —
+/// so a submission through the real CLI/daemon has something to run.
+fn write_two_stage_workflow(root: &Path) {
+    let dir = root.join(".sergeant/workflows/tiny");
+    std::fs::create_dir_all(&dir).expect("workflow dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"tiny\"\nversion = \"1\"\nstages = [\"00-first\", \"10-second\"]\n",
+    )
+    .expect("workflow.toml");
+    for stage in ["00-first", "10-second"] {
+        std::fs::create_dir_all(dir.join(stage)).expect("stage dir");
+        std::fs::write(dir.join(stage).join("CONTEXT.md"), "context").expect("CONTEXT.md");
+    }
+}
+
+/// Poll `sgt --json work show <id>` until the work reaches `state`, or panic
+/// after a bounded wait. No `SGT_FAKE_SCRIPT` is set for the spawned daemon
+/// in these tests, so the fake backend completes every turn immediately
+/// (`FakeBackend::next_step`'s own default) — this is a short poll for the
+/// daemon's async completion driver to catch up, not a wait for an actor.
+fn wait_for_state(cwd: &Path, data_dir: &Path, id: &str, state: &str) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let shown = run(cwd, Some(data_dir), &[], &["--json", "work", "show", id]);
+        let body = shown.json();
+        if body["work"]["state"] == state {
+            return body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "work {id} never reached {state:?}: {body}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// guard-map: `sgt work transcript` decodes a completed work's conversation
+/// (read-only, `--json` for the raw structured turns) and `sgt work show`'s
+/// human output surfaces the R-MVP1-2 output pointer — branch, worktree,
+/// finalize commit — in the same command, without hand-decoding the JSON
+/// blob above it. Mutation this kills: `work transcript` erroring or
+/// returning the wrong `work_id`/shape, or `work show`'s human rendering
+/// silently dropping the output-pointer summary this milestone adds.
+#[test]
+fn work_transcript_and_output_pointer_are_reachable_from_the_real_cli() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "run", "--workflow", "tiny", "read my output"],
+    );
+    submitted.assert_ok("run");
+    let work_id = submitted.json()["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    let shown = wait_for_state(repo.path(), data_dir.path(), &work_id, "completed");
+    assert!(
+        !shown["output"].is_null(),
+        "a completed work must carry an output pointer: {shown}"
+    );
+
+    // `sgt work show` (human form): the output pointer rides inside the same
+    // one printed object — every other folded key (`stage`, `surface`,
+    // `workflow`, ...) works this way, and several tests elsewhere in this
+    // crate (`m3_execution.rs`'s `cli_respond_and_retry_through_the_binary`)
+    // parse this "human form" as JSON, so it must stay one JSON value, not
+    // JSON-plus-prose. The pointer is answerable in this one command either
+    // way: no second command, no hand-decoding a *different* blob for it.
+    let human_show = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "show", &work_id],
+    );
+    human_show.assert_ok("work show");
+    let shown_human: Value = serde_json::from_str(&human_show.stdout).expect("work show is json");
+    let repo_pointer = &shown_human["output"]["repositories"][0];
+    assert_eq!(
+        repo_pointer["retained_branch"],
+        format!("sergeant/{work_id}"),
+        "the retained branch must be named: {shown_human}"
+    );
+    assert!(
+        repo_pointer["worktree_path"].is_string() && repo_pointer["finalize_commit"].is_string(),
+        "the worktree path and finalize commit must both be named: {shown_human}"
+    );
+
+    // `sgt work transcript`: plain text by default.
+    let transcript_text = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "transcript", &work_id],
+    );
+    transcript_text.assert_ok("work transcript");
+    // The fake backend emits no conversation events on an ordinary run
+    // (`m5_projections.rs`'s own note on this), so the honest plain-text
+    // rendering for this work is the empty-conversation message — proving
+    // the command reaches the daemon and renders successfully, rather than
+    // fabricating turns the run never produced.
+    assert!(
+        transcript_text
+            .stdout
+            .contains("no conversation recorded for this work"),
+        "got: {}",
+        transcript_text.stdout
+    );
+
+    // `--json`: the same raw structured body the API serves.
+    let transcript_json = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "work", "transcript", &work_id],
+    );
+    transcript_json.assert_ok("work transcript --json");
+    let body = transcript_json.json();
+    assert_eq!(body["work_id"], work_id);
+    assert!(body["turns"].as_array().is_some());
+
+    // Read-only: `sgt work transcript` must never mutate daemon state.
+    let after = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "work", "show", &work_id],
+    );
+    assert_eq!(after.json()["work"]["state"], "completed");
+
+    data_dir.reap();
+}

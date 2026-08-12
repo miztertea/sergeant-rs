@@ -2480,6 +2480,48 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
     handle2.shutdown().await;
 }
 
+/// MVP-3's `sgt work transcript`: `GET /v1/work/{id}/transcript` exists,
+/// answers a real work's id back, names its `turns` as an array (the fake
+/// backend emits no `conversation.*` events on an ordinary run — see
+/// `t1_rebuild_from_scratch_reproduces_every_canned_answer`'s own note on
+/// this — so "empty but well-formed" is the honest shape here; the decode
+/// logic itself is pinned directly against constructed events in
+/// `api::tests::transcript_turns_*`), and 404s a work id nothing ever
+/// created — the same "work_not_found" shape `GET /v1/work/{id}` itself
+/// uses, not a bare empty transcript that would silently look like "no
+/// conversation yet" for a work that never existed.
+#[tokio::test]
+async fn work_transcript_endpoint_exists_and_answers_a_real_work_and_a_404() {
+    let repo = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+
+    let (handle, _fake) =
+        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let created = submit(
+        &handle,
+        repo.path(),
+        "read my transcript",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = created["work"]["id"].as_str().expect("work id").to_string();
+
+    let transcript = get(&handle, &format!("/v1/work/{work_id}/transcript")).await;
+    assert_eq!(transcript["work_id"], work_id);
+    assert!(
+        transcript["turns"].as_array().is_some(),
+        "turns must always be an array, even when empty: {transcript}"
+    );
+
+    let (status, missing) = get_status(&handle, "/v1/work/does-not-exist/transcript").await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["error"]["code"], "work_not_found", "{missing}");
+
+    handle.shutdown().await;
+}
+
 /// W1/TH-01: R-MVP1-9's own pin is "an evicted Work's API view is byte-
 /// identical to a non-evicted one" — this must hold for the *fleet* view
 /// (`GET /v1/work`, what `sgt work list`/the TUI/the dashboard actually
