@@ -64,8 +64,8 @@ use sergeant_rs::backend::claude::{
 };
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
-    AskAuthor, Backend, BackendError, BackendRegistry, BackendSignal, Completion, Deferred,
-    ExecutionHandle, NativeState, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
+    AskAuthor, Backend, BackendError, BackendRegistry, BackendSignal, Capabilities, Completion,
+    Deferred, ExecutionHandle, NativeState, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, journaling_sink};
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
@@ -80,11 +80,14 @@ use sergeant_rs::domain::work::{
 };
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED,
-    KIND_STAGE_NEEDS_INPUT, KIND_WORKFLOW_BOUND,
+    KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_WORKFLOW_BOUND,
 };
 use sergeant_rs::domain::workspace::RepositorySpec;
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
-use sergeant_rs::runtime::engine::{Engine, Next, PendingLaunch, Step, SubmitContext};
+use sergeant_rs::runtime::engine::{
+    DEFAULT_TURN_CAP, Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, Next, PendingLaunch,
+    Step, SubmitContext,
+};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::work_registry_projection;
 use sergeant_rs::runtime::recovery;
@@ -5298,6 +5301,12 @@ fn drain(engine: &Engine, core: &mut Core, step: Step) {
                     .settle_observe(core, pending, outcome)
                     .expect("settle observe");
             }
+            Next::Interrupt(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_interrupt(core, *pending, outcome)
+                    .expect("settle interrupt");
+            }
         }
     }
 }
@@ -5324,6 +5333,12 @@ fn advance_to_launch(engine: &Engine, core: &mut Core, step: Step) -> Box<Pendin
                 step = engine
                     .settle_observe(core, pending, outcome)
                     .expect("settle observe");
+            }
+            Next::Interrupt(pending) => {
+                let outcome = pending.perform();
+                step = engine
+                    .settle_interrupt(core, *pending, outcome)
+                    .expect("settle interrupt");
             }
             Next::Parked => panic!("the crank parked before it reached a launch"),
         }
@@ -8014,4 +8029,438 @@ fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_han
         "the owned identity must survive a group that was never fsynced but \
          was written whole: {evidence}"
     );
+}
+
+// --------------- R-MVP1-7: the turn envelope (cap + per-turn ceiling)
+//
+// Lane B (docs/gauntlet/contracts/MVP-1.md). The cap gates `launch` and
+// `send` — the engine's two turn-spawning seams (`Engine::reserve_stage`,
+// `Engine::begin_input`) — and counts from the journal
+// (`WorkRun::turns_spawned`, folded from `execution.started`/
+// `stage.resumed`), never from how many times a caller asked for one. The
+// ceiling rides the completion driver's existing sweep and interrupts a
+// turn that outlives it.
+
+/// Writes `.sergeant/workflows/<name>/` with `n` trivial, untagged actor
+/// stages — enough that a turn-cap test can cross the cap purely by stage
+/// count, with every stage completing in exactly one turn.
+fn write_n_stage_workflow(root: &Path, name: &str, n: usize) {
+    let dir = root.join(".sergeant/workflows").join(name);
+    let ids: Vec<String> = (0..n).map(|i| format!("{i:02}-stage")).collect();
+    std::fs::create_dir_all(&dir).expect("workflow dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        format!(
+            "[workflow]\nname = \"{name}\"\nversion = \"1\"\nstages = [{}]\n",
+            ids.iter()
+                .map(|id| format!("{id:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .expect("workflow.toml");
+    for id in &ids {
+        std::fs::create_dir_all(dir.join(id)).expect("stage dir");
+        std::fs::write(dir.join(id).join("CONTEXT.md"), "context").expect("CONTEXT.md");
+    }
+}
+
+/// The default cap is the contract's own worked example, not a number
+/// invented in this lane: L16's arithmetic ("a 6-turn envelope is a ~$19
+/// bound, not a $2.50 one") only holds if the shipped default is 6.
+#[test]
+fn r_mvp1_7_the_default_turn_cap_is_the_contracts_own_worked_example() {
+    let data = TempDir::new().expect("tempdir");
+    let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path());
+    assert_eq!(engine.turn_cap, DEFAULT_TURN_CAP);
+    assert_eq!(
+        DEFAULT_TURN_CAP, 6,
+        "the contract's own $19-bound example is worked against 6 turns"
+    );
+}
+
+/// The pin, literally: a scripted run whose workflow has more stages than
+/// the cap allows turns blocks at exactly N spawned turns — never N+1.
+///
+/// Mutation targets this kills: a cap check dropped from `reserve_stage`
+/// (the run would spend all 4 stages' turns, `execution.started` count 4);
+/// a check that counts verb calls or stage entries instead of
+/// `turns_spawned` (would block one stage too early or late here, since
+/// every stage here completes in exactly one turn so the two coincide —
+/// see the next test for where they diverge); a check using `>` instead of
+/// `>=` (would allow turn N+1 through).
+#[test]
+fn r_mvp1_7_a_scripted_run_exceeding_the_cap_blocks_at_exactly_n_spawned_turns() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_n_stage_workflow(&repo, "capped", 4);
+
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME); // completes every stage
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(
+        Arc::new(registry),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    )
+    .with_turn_cap(2);
+    let mut core = core(data.path());
+    let plan = engine
+        .plan(&SubmitContext {
+            cwd: Some(&repo),
+            workflow: Some("capped"),
+            ..SubmitContext::default()
+        })
+        .expect("plan")
+        .expect("a workspace");
+
+    let work_id = "01MVP17CAP";
+    submit_work(&mut core, work_id, "spend more turns than the cap allows");
+    let work = core.registry.state().works[work_id].clone();
+    let step = engine
+        .begin_start(&mut core, &work, &plan)
+        .expect("begin start");
+    drain(&engine, &mut core, step);
+
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).len(),
+        2,
+        "exactly the cap's worth of turns may ever spawn: {:?}",
+        kinds_of(&core, work_id)
+    );
+    assert_eq!(
+        core.registry.state().runs[work_id].turns_spawned,
+        2,
+        "the durable counter must agree with the journal count above"
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Blocked,
+        "the (N+1)th turn is refused, not silently skipped"
+    );
+    let reason = events_of(&core, work_id, KIND_WORK_BLOCKED)
+        .last()
+        .expect("a block reason")["reason"]
+        .as_str()
+        .expect("reason is a string")
+        .to_string();
+    assert_eq!(
+        reason, "turn envelope exhausted (2 turns)",
+        "the contract's exact reason text, for a client that has to show it"
+    );
+    // Stage 3 (index 2) is *entered* — that is where the block fires — but
+    // never reaches a launch: the third `execution.started` never happens.
+    assert_eq!(
+        events_of(&core, work_id, KIND_STAGE_ENTERED).len(),
+        3,
+        "entering the stage the cap blocks is not itself a turn"
+    );
+}
+
+/// The double-send trap, named in the contract at `engine.rs:258-266`:
+/// `PendingSend::perform` may call `backend.send` twice for one delivery
+/// (a forgotten execution → §15 RESUME → retry) — the envelope must count
+/// that as **one** turn, from the one `stage.resumed` the settle commits,
+/// never two.
+///
+/// Mutation this kills: incrementing `turns_spawned` per `backend.send`
+/// call (or per `PendingSend::perform` invocation) instead of per settled
+/// `stage.resumed` — this run would then read 3 turns spawned instead of 2,
+/// and a cap set to exactly 2 would incorrectly block a work that has only
+/// really spent 2.
+#[test]
+fn r_mvp1_7_a_send_that_internally_retries_through_resume_counts_one_turn() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::ask("postgres or sqlite?"), FakeStep::complete()],
+    );
+    let registry = Arc::new(BackendRegistry::new().with(Arc::new(fake.clone())));
+    let engine = Engine::new(Arc::clone(&registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01MVP17SEND2";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    engine.retry(&mut core, work_id).expect("retry");
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::NeedsInput,
+        "the actor's question parks the work"
+    );
+    assert_eq!(
+        events_of(&core, work_id, KIND_EXECUTION_STARTED).len(),
+        1,
+        "retry's own launch is turn 1"
+    );
+
+    // The adapter forgets the execution — exactly the shape that forces
+    // `PendingSend::perform` to fail once, RESUME, and retry the delivery
+    // internally.
+    fake.forget_executions();
+    engine
+        .provide_input(&mut core, work_id, "postgres")
+        .expect("respond after the adapter forgot the context");
+
+    assert!(
+        !fake.resume_requests().is_empty(),
+        "the trap must actually be engaged here, or this test proves nothing"
+    );
+    let resumed_events = events_of(&core, work_id, KIND_STAGE_RESUMED);
+    assert_eq!(
+        resumed_events.len(),
+        1,
+        "one delivered turn is one `stage.resumed`, however many times \
+         `backend.send` was called to get there: {resumed_events:?}"
+    );
+    assert_eq!(
+        core.registry.state().runs[work_id].turns_spawned,
+        2,
+        "turn 1 from retry's launch, turn 2 from the (internally-retried) \
+         send — never 3"
+    );
+}
+
+/// R-MVP1-11's declaration, end to end: `grilling`'s own `workflow.toml`
+/// (`.sergeant/workflows/grilling/`) carries `requires_ask = true` on its
+/// interview stage — this is not a fixture standing in for the ruling, it
+/// is the ruling's own admitted workflow.
+#[test]
+fn r_mvp1_11_grillings_interview_stage_declares_requires_ask() {
+    let root = std::env::current_dir()
+        .expect("cwd")
+        .ancestors()
+        .find(|p| {
+            p.join(".sergeant/workflows/grilling/workflow.toml")
+                .is_file()
+        })
+        .map(|p| p.to_path_buf());
+    let Some(root) = root else {
+        // Not running from inside the checkout (e.g. a packaged binary's
+        // test run) — nothing to check against, and no fixture to fall back
+        // to would be honest here, so this pin is a no-op rather than a
+        // false failure. Every other R-MVP1-11 test below exercises the
+        // mechanism directly regardless.
+        eprintln!(
+            "SKIPPED r_mvp1_11_grillings_interview_stage_declares_requires_ask: not inside the sergeant-rs checkout"
+        );
+        return;
+    };
+    let workflow = sergeant_rs::domain::workflow::WorkflowDefinition::resolve(&root, "grilling")
+        .expect("grilling resolves");
+    let interview = workflow
+        .stages
+        .iter()
+        .find(|s| s.id == "00-interview-loop")
+        .expect("grilling has 00-interview-loop");
+    assert!(
+        interview.requires_ask,
+        "grilling's interview stage must declare requires_ask = true"
+    );
+}
+
+/// R-MVP1-11's preflight, refused: a stage declaring `requires_ask = true`
+/// against a backend whose `Capabilities::ask` is `false` is refused at
+/// submit — before a Work or a worktree exists — naming the workflow, the
+/// stage and the backend.
+#[test]
+fn r_mvp1_11_a_stage_requiring_ask_refuses_against_a_backend_that_cannot_ask() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_ask_workflow(&repo);
+
+    let no_ask = FakeBackend::scripted(FAKE_BACKEND_NAME, []).with_capabilities(Capabilities {
+        ask: false,
+        ..Capabilities::default()
+    });
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(no_ask))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+
+    let err = engine
+        .plan(&SubmitContext {
+            cwd: Some(&repo),
+            workflow: Some("asks"),
+            ..SubmitContext::default()
+        })
+        .expect_err("must refuse before a Work or worktree exists");
+    match &err {
+        EngineError::AskCapabilityUnavailable {
+            workflow,
+            stage,
+            backend,
+        } => {
+            assert_eq!(workflow, "asks");
+            assert_eq!(stage, "00-interview");
+            assert_eq!(backend, FAKE_BACKEND_NAME);
+        }
+        other => panic!("expected AskCapabilityUnavailable, got {other}"),
+    }
+    let message = err.to_string();
+    assert!(
+        message.contains("requires_ask"),
+        "the remedy must name the field an author would drop or reroute: {message}"
+    );
+    assert!(
+        !repo.join(".git").join("worktrees").exists(),
+        "refused before any worktree side effect"
+    );
+}
+
+/// The same declared workflow submits cleanly against a backend that does
+/// advertise `Capabilities::ask`.
+#[test]
+fn r_mvp1_11_the_same_workflow_submits_against_a_backend_that_can_ask() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_ask_workflow(&repo);
+
+    let can_ask = FakeBackend::scripted(FAKE_BACKEND_NAME, []); // ask: true by default
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(can_ask))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let plan = engine
+        .plan(&SubmitContext {
+            cwd: Some(&repo),
+            workflow: Some("asks"),
+            ..SubmitContext::default()
+        })
+        .expect("plan")
+        .expect("a workspace");
+    assert_eq!(plan.workflow.name, "asks");
+}
+
+/// A workflow that never declares `requires_ask` is unaffected by a backend
+/// that cannot ask — the declaration is opt-in per stage, never a blanket
+/// requirement the preflight invents on its own.
+#[test]
+fn r_mvp1_11_an_undeclared_workflow_is_unaffected_by_a_backend_that_cannot_ask() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("plain");
+    init_repo(&repo);
+    // No workflow written: the embedded `software-change` default, whose
+    // stages declare no `requires_ask` at all.
+
+    let no_ask = FakeBackend::scripted(FAKE_BACKEND_NAME, []).with_capabilities(Capabilities {
+        ask: false,
+        ..Capabilities::default()
+    });
+    let engine = Engine::new(
+        Arc::new(BackendRegistry::new().with(Arc::new(no_ask))),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    );
+    let plan = engine
+        .plan(&SubmitContext {
+            cwd: Some(&repo),
+            ..SubmitContext::default()
+        })
+        .expect("plan")
+        .expect("a workspace");
+    assert!(!plan.workflow.stages.is_empty());
+}
+
+/// Writes `.sergeant/workflows/asks/` with one stage declaring
+/// `requires_ask = true` — R-MVP1-11's preflight tests' fixture.
+fn write_ask_workflow(root: &Path) {
+    let dir = root.join(".sergeant/workflows/asks");
+    std::fs::create_dir_all(dir.join("00-interview")).expect("stage dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"asks\"\nversion = \"1\"\nstages = [\"00-interview\"]\n\n\
+         [stage.\"00-interview\"]\nrequires_ask = true\n",
+    )
+    .expect("workflow.toml");
+    std::fs::write(
+        dir.join("00-interview/CONTEXT.md"),
+        "ask one question at a time",
+    )
+    .expect("CONTEXT.md");
+}
+
+/// R-MVP1-7's per-turn wall-clock ceiling, end to end through the real
+/// completion driver (`api::drive_completions`) — never a direct call to
+/// `Engine::due_interrupts`, which would only prove the mechanism exists,
+/// not that the daemon actually rides its 200 ms sweep with it (the
+/// contract's own phrasing: "rides the completion driver").
+///
+/// A `hang()` turn ignores STOP *and* INTERRUPT by construction
+/// (`FakeStep::hang`'s doc comment) — deliberately, so this test can prove
+/// the daemon *asked* within budget without needing the turn to ever
+/// actually end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    init_repo(repo.path());
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let poll = Duration::from_millis(50);
+    let ceiling = Duration::from_millis(150);
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            completion_poll: poll,
+            turn_ceiling: ceiling,
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let http = reqwest::Client::new();
+    let submitted = submit_over_api(&http, &handle, repo.path(), "hang forever").await;
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    assert_eq!(submitted["work"]["state"], "active");
+
+    // Generous relative to `ceiling + poll` (real scheduling jitter, not the
+    // property under test) but still a real bound — never "eventually".
+    let budget = ceiling + poll * 10 + Duration::from_secs(5);
+    let submitted_at = Instant::now();
+    let events = loop {
+        let events = events_over_api(&http, &handle, &work_id).await;
+        if events
+            .iter()
+            .any(|e| e.kind == KIND_TURN_CEILING_INTERRUPTED)
+        {
+            break events;
+        }
+        assert!(
+            submitted_at.elapsed() < budget,
+            "the ceiling never fired within ceiling ({ceiling:?}) + a driver \
+             interval ({poll:?}) — this is the ceiling's own version of \
+             issue #46's stall"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    let interrupted = events
+        .iter()
+        .find(|e| e.kind == KIND_TURN_CEILING_INTERRUPTED)
+        .expect("just matched above");
+    assert_eq!(interrupted.payload["outcome"]["requested"], true);
+    let execution_id = interrupted.payload["execution_id"]
+        .as_str()
+        .expect("execution_id")
+        .to_string();
+    assert!(
+        fake.interrupt_requests().contains(&execution_id),
+        "the daemon's own claim to have interrupted must match what the \
+         backend actually saw: {:?}",
+        fake.interrupt_requests()
+    );
+
+    handle.shutdown().await;
 }

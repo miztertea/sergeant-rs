@@ -20,15 +20,17 @@
 //! the backends that need it, not before (§4's non-goal, and the M3 contract's
 //! "no generalized DAG scheduling").
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::api::{Core, CoreError};
 use crate::backend::{
-    Backend, BackendError, BackendRegistry, BackendSignal, Deferred, ExecutionHandle, NativeState,
-    Observation, PreparedExecution, ResumeRequest, StartRequest,
+    Backend, BackendError, BackendRegistry, BackendSignal, Completion, Deferred, ExecutionHandle,
+    NativeState, Observation, PreparedExecution, ResumeRequest, StartRequest,
 };
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::execution::{
@@ -352,6 +354,53 @@ pub struct ObserveOutcome {
     observed: Result<Observation, BackendError>,
 }
 
+/// A turn's INTERRUPT the engine has decided to issue (R-MVP1-7's per-turn
+/// wall-clock ceiling), to be performed **with the core lock released**
+/// (§14.2's middle phase applied to INTERRUPT, §22.6).
+///
+/// Distinct from STOP (`PendingSurface`'s teardown path, and
+/// `Engine::stop_execution`'s reviewed under-the-lock exemption): the
+/// execution stays known afterward and a later turn may still use it. Only
+/// *this* turn is being asked to end, and whether it complied is
+/// [`Engine::due_observations`]'s question to answer, never this one's
+/// (§25 — an interrupt is a request, not a verdict).
+pub struct PendingInterrupt {
+    work_id: String,
+    execution: ExecutionRecord,
+    backend: Arc<dyn Backend>,
+}
+
+impl std::fmt::Debug for PendingInterrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInterrupt")
+            .field("work_id", &self.work_id)
+            .field("execution_id", &self.execution.execution_id)
+            .finish()
+    }
+}
+
+impl PendingInterrupt {
+    /// The work whose turn is being interrupted.
+    pub fn work_id(&self) -> &str {
+        &self.work_id
+    }
+
+    /// Issue the INTERRUPT. **Never while holding the core lock** — this is
+    /// the external effect (§22.6), symmetric with every other performer
+    /// here: it cannot see a `Core` by construction.
+    pub fn perform(&self) -> InterruptOutcome {
+        InterruptOutcome {
+            outcome: self.backend.interrupt(&handle_of(&self.execution)),
+        }
+    }
+}
+
+/// What [`PendingInterrupt::perform`] came back with.
+#[derive(Debug)]
+pub struct InterruptOutcome {
+    outcome: Result<Completion, BackendError>,
+}
+
 /// A git operation the engine has committed to and must now perform **with
 /// the core lock released** (§14.2's middle phase, applied to §11's surfaces).
 ///
@@ -479,6 +528,10 @@ pub enum Next {
     /// only ever handed in by the daemon's completion driver, which is the one
     /// caller that has to ask a question nobody's request asked.
     Observe(Box<PendingObserve>),
+    /// Issue this INTERRUPT outside the lock, then feed the result back
+    /// through [`Engine::settle_interrupt`]. R-MVP1-7's per-turn ceiling —
+    /// like `Observe`, only ever handed in by the completion driver.
+    Interrupt(Box<PendingInterrupt>),
 }
 
 /// One crank of the engine: everything it committed under this lock hold,
@@ -632,6 +685,25 @@ pub enum EngineError {
         /// The offending index.
         index: usize,
     },
+    /// R-MVP1-11: a stage declares `requires_ask = true` but the harness it
+    /// resolved to advertises `Capabilities::ask == false`. Refused at
+    /// submit, before a Work exists, naming the workflow, the stage and the
+    /// backend — the same "reject before Work or worktree side effects"
+    /// timing §17.5's other preflight checks already use.
+    #[error(
+        "workflow {workflow:?} stage {stage:?} requires an actor that can author its own \
+         ask (requires_ask = true), but backend {backend:?} does not declare \
+         Capabilities::ask; route this stage to a backend that does, or drop \
+         requires_ask from the stage's declaration"
+    )]
+    AskCapabilityUnavailable {
+        /// Workflow name.
+        workflow: String,
+        /// The declaring stage's id.
+        stage: String,
+        /// The backend the stage resolved to.
+        backend: String,
+    },
 }
 
 impl EngineError {
@@ -655,6 +727,7 @@ impl EngineError {
             EngineError::NoRun { .. } => "no_run",
             EngineError::BackendMissing { .. } => "backend_missing",
             EngineError::NoSuchStage { .. } => "no_such_stage",
+            EngineError::AskCapabilityUnavailable { .. } => "ask_capability_unavailable",
         }
     }
 
@@ -666,6 +739,32 @@ impl EngineError {
         }
     }
 }
+
+/// Event kind: R-MVP1-7's per-turn wall-clock ceiling interrupted a turn
+/// that ran longer than [`Engine::turn_ceiling`]. Declared here rather than
+/// `domain::execution` — nothing outside the engine folds it into a
+/// projection yet, and the reducer's forward-compatible "unknown kinds are
+/// ignored" rule (`runtime::projection`'s own doc comment) means an
+/// unrecognized kind costs no projection change to introduce.
+pub const KIND_TURN_CEILING_INTERRUPTED: &str = "execution.turn_ceiling_interrupted";
+
+/// R-MVP1-7's default turn cap: the largest measured single turn on this
+/// build's evidence is Run B2's $3.21 (`GAUNTLET.md`'s N-series close-out,
+/// `docs/gauntlet/contracts/MVP-1.md`'s own L16 arithmetic), and the
+/// contract states its worked example against 6 turns — "a ~$19 bound, not
+/// a $2.50 one". Taking that worked number as the shipped default keeps the
+/// arithmetic that justified it and the value that enforces it from
+/// silently drifting apart. Override with [`Engine::with_turn_cap`].
+pub const DEFAULT_TURN_CAP: u32 = 6;
+
+/// R-MVP1-7's default per-turn wall-clock ceiling: "the soak's hang bound
+/// (CUT 10), not a stall detector" — sized to be well past any turn this
+/// build has measured (issue #46's Run B turns finished in minutes) and
+/// well short of #46's own 45-minute structurally-invisible stall, so a
+/// truly hung turn is bounded without the ceiling firing on ordinary work.
+/// Provisional pending the ledger's own measurement (contract Unknown #2);
+/// override with [`Engine::with_turn_ceiling`].
+pub const DEFAULT_TURN_CEILING: Duration = Duration::from_secs(15 * 60);
 
 /// The workflow engine: backends, defaults, and the data dir surfaces live in.
 #[derive(Debug, Clone)]
@@ -682,6 +781,23 @@ pub struct Engine {
     /// `[estate] surfaces_dir` narrows this further, per-plan, in
     /// [`Self::plan`] — this field is only ever the daemon-wide fallback.
     pub surfaces_root: PathBuf,
+    /// R-MVP1-7's turn cap: the total number of turns (LAUNCH's turn 1 plus
+    /// every SEND after it) any one Work may ever spawn, for its whole life
+    /// across every stage and retry. [`Self::check_turn_envelope`] is the
+    /// one gate; [`WorkRun::turns_spawned`] is the one counter.
+    pub turn_cap: u32,
+    /// R-MVP1-7's per-turn wall-clock ceiling, swept by the daemon's
+    /// completion driver alongside [`Self::due_observations`] (see
+    /// [`Self::sweep_turn_ceiling`]).
+    pub turn_ceiling: Duration,
+    /// When each Work's current turn was last (re-)spawned, for the ceiling
+    /// sweep. Deliberately **not** journaled or durable: a restart forgets
+    /// it, which is acceptable for a soak-test hang bound (never an
+    /// adversarial one) and keeps this out of the projection entirely — the
+    /// turn cap above is the envelope's durable half; this is the timing
+    /// half, and the two are independent by design. Keyed by work id, one
+    /// entry per Work with a turn currently in flight.
+    turn_started: Arc<Mutex<BTreeMap<String, Instant>>>,
 }
 
 impl Engine {
@@ -698,7 +814,24 @@ impl Engine {
             default_backend,
             surfaces_root: data_dir.join(SURFACES_DIR),
             data_dir: data_dir.to_path_buf(),
+            turn_cap: DEFAULT_TURN_CAP,
+            turn_ceiling: DEFAULT_TURN_CEILING,
+            turn_started: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Override the turn cap (R-MVP1-7). Test-only in this milestone — no
+    /// submit-time or config surface sets it per-Work yet (contract
+    /// Unknown #2: mechanism contracted, values measured at build time).
+    pub fn with_turn_cap(mut self, turn_cap: u32) -> Self {
+        self.turn_cap = turn_cap;
+        self
+    }
+
+    /// Override the per-turn wall-clock ceiling (R-MVP1-7).
+    pub fn with_turn_ceiling(mut self, turn_ceiling: Duration) -> Self {
+        self.turn_ceiling = turn_ceiling;
+        self
     }
 
     /// Override the default surfaces root (R-MVP1-1). The daemon calls this
@@ -906,6 +1039,19 @@ impl Engine {
                 Some(route.backend.as_str()),
                 &self.backends,
             )?;
+            // R-MVP1-11: the smallest declaration that makes the ask
+            // preflight real. `route_stage` above already proved this
+            // backend is registered, so the lookup here cannot miss.
+            if stage.requires_ask
+                && let Some(backend) = self.backends.get(&stage_route.backend)
+                && !backend.capabilities().ask
+            {
+                return Err(EngineError::AskCapabilityUnavailable {
+                    workflow: workflow.name.clone(),
+                    stage: stage.id.clone(),
+                    backend: stage_route.backend.clone(),
+                });
+            }
             let profile = self.stage_profile(workspace, stage, &stage_route, work_profile)?;
             bindings.push(StageBinding {
                 stage_id: stage.id.clone(),
@@ -1274,6 +1420,10 @@ impl Engine {
                     let outcome = pending.perform();
                     step = self.settle_observe(core, pending, outcome)?;
                 }
+                Next::Interrupt(pending) => {
+                    let outcome = pending.perform();
+                    step = self.settle_interrupt(core, *pending, outcome)?;
+                }
             }
         }
     }
@@ -1323,6 +1473,14 @@ impl Engine {
             KIND_STAGE_INPUT_RECEIVED,
             json!({"stage_id": stage_id, "input": input}),
         )?;
+        // R-MVP1-7: SEND is the engine's other turn-spawning seam. The
+        // human's answer is journaled above either way — it is never lost —
+        // but if the envelope is already spent, it is never delivered: the
+        // Work goes to `blocked` (a legal `needs_input -> blocked` edge)
+        // instead of `resumed`, and no `PendingSend` is ever built.
+        if !self.check_turn_envelope(core, work_id, &stage_id)? {
+            return Ok(Step::parked());
+        }
         self.transition(
             core,
             work_id,
@@ -2260,6 +2418,43 @@ impl Engine {
         )
     }
 
+    /// R-MVP1-7's turn envelope, checked at both LAUNCH ([`Self::reserve_stage`])
+    /// and SEND ([`Self::begin_input`]) — the engine's two turn-spawning
+    /// seams — before either performs its effect.
+    ///
+    /// Reads [`crate::runtime::projection::WorkRun::turns_spawned`], the one
+    /// counter both `execution.started` and `stage.resumed` increment, so
+    /// this asks "how many turns has the journal actually recorded", never
+    /// "how many times has this function been called" — the send-retry
+    /// double-count trap named in the contract (`PendingSend::perform` may
+    /// call `backend.send` twice for one delivery; only the delivered one
+    /// ever reaches `stage.resumed`).
+    ///
+    /// Returns `Ok(true)` when the caller may proceed to spend a turn.
+    /// `Ok(false)` means the (N+1)th turn was refused: the reason is already
+    /// journaled and the Work is already `blocked` — the caller's only job
+    /// left is to park rather than perform the effect.
+    fn check_turn_envelope(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        stage_id: &str,
+    ) -> Result<bool, EngineError> {
+        let spawned = self.run(core, work_id)?.turns_spawned;
+        if spawned < self.turn_cap {
+            return Ok(true);
+        }
+        let reason = format!("turn envelope exhausted ({} turns)", self.turn_cap);
+        self.commit(
+            core,
+            work_id,
+            KIND_STAGE_BLOCKED,
+            json!({"stage_id": stage_id, "detail": reason}),
+        )?;
+        self.block(core, work_id, &reason, None)?;
+        Ok(false)
+    }
+
     /// Enter a stage and reserve its execution — §14.2's first phase, whole.
     ///
     /// Everything here is authoritative and cheap: validate the stage exists,
@@ -2335,6 +2530,15 @@ impl Engine {
             KIND_STAGE_ENTERED,
             json!({"stage_id": stage.id, "index": index, "attempt": attempt}),
         )?;
+
+        // R-MVP1-7: the turn envelope gates LAUNCH here, before the harness
+        // is even looked up — reaching this stage attempt at all does not
+        // matter if there is no turn left to spend on it. Checked from the
+        // journal-derived counter (`WorkRun::turns_spawned`), never from how
+        // many times this function has been called.
+        if !self.check_turn_envelope(core, work_id, &stage.id)? {
+            return Ok(Next::Parked);
+        }
 
         // A harness the journal pinned but this daemon does not have is
         // ambiguity, not a licence to fall back to the Work default: falling
@@ -2539,6 +2743,10 @@ impl Engine {
             KIND_EXECUTION_STARTED,
             json!({"execution": record}),
         )?;
+        // R-MVP1-7's ceiling half: this turn is now in flight. Recorded
+        // in-memory only (see `Engine::turn_started`'s doc comment) — a
+        // restart forgets it, which is fine for a soak-test hang bound.
+        self.record_turn_start(&work_id);
         // An outcome with no observation attached is a launch reported without
         // one — the `From<Result<ExecutionHandle, _>>` shape, which exists for
         // callers driving the two phases apart by hand. There is nothing to
@@ -2650,6 +2858,9 @@ impl Engine {
                 "attempt": pending.attempt,
             }),
         )?;
+        // R-MVP1-7's ceiling half: SEND just spawned a new turn — restart
+        // its clock exactly as LAUNCH does in `settle_launch`.
+        self.record_turn_start(&work_id);
         if reattached {
             // §15 RESUME happened on this path, so the trajectory says so —
             // the same fact `execution.reconciled` records at restart, in the
@@ -2739,6 +2950,129 @@ impl Engine {
             }));
         }
         due
+    }
+
+    /// Record that a turn just spawned, for [`Self::sweep_turn_ceiling`].
+    fn record_turn_start(&self, work_id: &str) {
+        self.turn_started
+            .lock()
+            .expect("turn_started lock")
+            .insert(work_id.to_string(), Instant::now());
+    }
+
+    /// Whether `work_id`'s current turn is still the one [`Self::record_turn_start`]
+    /// last timed — the same "is this run actually due" predicate
+    /// [`Self::due_observations`] applies, minus the backend lookup (a
+    /// missing backend is still overdue; it is `Self::interrupt_turn` that
+    /// discovers and reports that, exactly as `due_observations` defers a
+    /// missing-backend judgement to its own caller).
+    fn turn_still_active(&self, core: &Core, work_id: &str) -> bool {
+        let registry = core.registry.state();
+        let Some(work) = registry.works.get(work_id) else {
+            return false;
+        };
+        if work.state != WorkState::Active {
+            return false;
+        }
+        let Some(run) = registry.runs.get(work_id) else {
+            return false;
+        };
+        let Some(execution) = run.execution.as_ref() else {
+            return false;
+        };
+        if execution.stop_requested {
+            return false;
+        }
+        let Some(stage) = run.current_stage() else {
+            return false;
+        };
+        stage.status == StageStatus::Active
+            && stage.stage_id == execution.stage_id
+            && stage.attempt == execution.attempt
+    }
+
+    /// R-MVP1-7's per-turn wall-clock ceiling: every turn that has run
+    /// longer than [`Self::turn_ceiling`], as an effect to interrupt
+    /// **outside the core lock** (§22.6) — the same shape
+    /// [`Self::due_observations`] already has, and meant to be swept by the
+    /// same completion-driver tick (`api.rs`'s `drive_completions`, riding
+    /// the existing 200 ms cadence per the contract).
+    ///
+    /// One interrupt attempt per turn that crosses the ceiling: an entry is
+    /// removed from the internal clock the moment it is collected here,
+    /// whether because it is stale (no longer this turn — dropped, nothing
+    /// to interrupt) or because it is overdue (interrupted once, then
+    /// forgotten). What the interrupt actually produced is
+    /// [`Self::due_observations`]'s question, not this one's (§25).
+    pub fn due_interrupts(&self, core: &Core, now: Instant) -> Vec<Box<PendingInterrupt>> {
+        let mut due = Vec::new();
+        self.turn_started
+            .lock()
+            .expect("turn_started lock")
+            .retain(|work_id, at| {
+                if !self.turn_still_active(core, work_id) {
+                    return false; // stale: settled, moved on, or superseded
+                }
+                if now.saturating_duration_since(*at) < self.turn_ceiling {
+                    return true; // keep timing it, not yet due
+                }
+                // Overdue. A backend this daemon no longer registers is the
+                // same ambiguity `due_observations` defers to restart
+                // recovery rather than guessing at here — this call simply
+                // has nothing to interrupt with, and drops the entry either
+                // way (one attempt per crossing, per this method's doc).
+                if let Ok(run) = self.run(core, work_id)
+                    && let Some(execution) = run.execution.clone()
+                    && let Some(backend) = self.backends.get(&execution.backend).cloned()
+                {
+                    due.push(Box::new(PendingInterrupt {
+                        work_id: work_id.clone(),
+                        execution,
+                        backend,
+                    }));
+                }
+                false
+            });
+        due
+    }
+
+    /// §14.2's third phase for INTERRUPT: journal what was asked and what it
+    /// produced. Unconditional — an interrupt request and its outcome are
+    /// journaled regardless of whether the backend actually complied, and
+    /// nothing here touches Work or stage state: the ordinary OBSERVE path
+    /// (`due_observations`/`drive`) is what settles the turn, on whatever
+    /// native evidence the interrupt (or its absence) eventually produces.
+    pub fn settle_interrupt(
+        &self,
+        core: &mut Core,
+        pending: PendingInterrupt,
+        outcome: InterruptOutcome,
+    ) -> Result<Step, EngineError> {
+        let mut deferred = Deferred::new();
+        let recorded = match outcome.outcome {
+            Ok(completion) => {
+                deferred.push(completion);
+                json!({"requested": true})
+            }
+            Err(e) => json!({"requested": true, "error": e.to_string()}),
+        };
+        self.commit(
+            core,
+            &pending.work_id,
+            KIND_TURN_CEILING_INTERRUPTED,
+            json!({
+                "execution_id": pending.execution.execution_id,
+                "backend": pending.execution.backend,
+                "stage_id": pending.execution.stage_id,
+                "attempt": pending.execution.attempt,
+                "ceiling_secs": self.turn_ceiling.as_secs_f64(),
+                "outcome": recorded,
+            }),
+        )?;
+        Ok(Step {
+            next: Next::Parked,
+            deferred,
+        })
     }
 
     /// §14.2's third phase for a bare OBSERVE: verify the observation still

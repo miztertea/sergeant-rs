@@ -357,6 +357,16 @@ impl FakeBackend {
         }
     }
 
+    /// Override the advertised capabilities. R-MVP1-11's preflight test
+    /// needs a fake that declares `ask: false` — every other capability the
+    /// scripted default sets is deliberately left in place unless the
+    /// caller's `capabilities` also changes it, since a test proving one
+    /// refusal should not have to restate the whole capability set.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
     /// A fake scripted from the environment (`SGT_FAKE_SCRIPT`).
     ///
     /// The script mechanism already exists; this is its front door for a fake

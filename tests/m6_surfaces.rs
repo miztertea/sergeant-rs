@@ -2438,6 +2438,16 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
             "impl PendingObserve",
             "pub fn perform(&self) -> ObserveOutcome",
         ),
+        // R-MVP1-7's per-turn wall-clock ceiling. INTERRUPT is an external
+        // effect exactly like STOP/OBSERVE are, so it gets its own performer
+        // rather than joining `stop_execution`'s reviewed under-the-lock
+        // exemption below — nothing about the ceiling needs INTERRUPT to run
+        // synchronously with a journal append the way STOP's kill-then-latch
+        // does.
+        (
+            "impl PendingInterrupt",
+            "pub fn perform(&self) -> InterruptOutcome",
+        ),
     ];
     let mut ranges = Vec::new();
     for (block, signature) in performers {

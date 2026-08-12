@@ -184,6 +184,13 @@ pub struct DaemonConfig {
     /// sleep racing the driver — is the kind of test that passes for the wrong
     /// reason. Production uses the default.
     pub completion_poll: Duration,
+    /// R-MVP1-7's per-turn wall-clock ceiling. Configurable for the same
+    /// reason `completion_poll` is: a test proving a hung turn is
+    /// interrupted within "ceiling + one interval" needs to hold both knobs
+    /// down to something a test budget can wait out, and racing the
+    /// production default (minutes) would make the test the thing that
+    /// times out. Production uses the default.
+    pub turn_ceiling: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -194,6 +201,7 @@ impl Default for DaemonConfig {
             claude: None,
             telemetry: None,
             completion_poll: COMPLETION_POLL_INTERVAL,
+            turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
         }
     }
 }
@@ -331,11 +339,10 @@ pub async fn start_with(
     // yet been settled. `reconcile` itself flushes after each work it
     // touches, so its own effects (a `git worktree remove`, a relaunched
     // harness) are never left unsynced while unbounded — see its doc.
-    let engine = Arc::new(Engine::new(
-        backends,
-        config.default_backend.clone(),
-        data_dir,
-    ));
+    let engine = Arc::new(
+        Engine::new(backends, config.default_backend.clone(), data_dir)
+            .with_turn_ceiling(config.turn_ceiling),
+    );
     let reconciled = recovery::reconcile(&engine, &mut core)?;
     // Backstop, not load-bearing: `reconcile` already leaves nothing open on
     // its own account, but a future edit there that forgets a flush must not

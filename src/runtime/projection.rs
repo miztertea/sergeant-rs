@@ -336,6 +336,17 @@ pub struct WorkRun {
     /// `profile` above carry it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stage_bindings: Vec<StageBinding>,
+    /// R-MVP1-7's turn envelope: how many turns this Work has spawned across
+    /// every stage and every attempt, for the life of the run. Incremented
+    /// exactly where a turn is actually spawned — `execution.started`
+    /// (LAUNCH) and `stage.resumed` (SEND, committed once per delivered
+    /// turn regardless of how many times `PendingSend::perform` retried the
+    /// backend call internally, engine.rs:258-266's double-send trap) — so
+    /// it is "spawned turns" per the journal, never "verb calls". Cumulative
+    /// and never reset by a retry: the envelope bounds the whole Work's
+    /// spend, not one attempt's.
+    #[serde(default)]
+    pub turns_spawned: u32,
 }
 
 impl WorkRun {
@@ -549,6 +560,12 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
             {
                 stage.status = StageStatus::Active;
                 stage.detail = None;
+                // R-MVP1-7: SEND spawns every turn after the first. This is
+                // the one commit site for `stage.resumed` (`Engine::settle_send`),
+                // so it is exactly "one delivered turn", never the internal
+                // resume-and-retry a stale send can take inside
+                // `PendingSend::perform`.
+                state.runs.entry(work_id.clone()).or_default().turns_spawned += 1;
             }
         }
         KIND_EXECUTION_RESERVED => {
@@ -579,6 +596,13 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
                     run.reservation = None;
                 }
                 run.execution = Some(execution);
+                // R-MVP1-7: LAUNCH spawns turn 1 of a stage attempt. This is
+                // the one commit site for a successful `execution.started`
+                // (`Engine::settle_launch`), so it counts one spawned turn
+                // per settled launch, never per LAUNCH attempt (a stale or
+                // failed launch never reaches here — see the abandonment
+                // arms above).
+                run.turns_spawned += 1;
             }
         }
         KIND_EXECUTION_STOPPED => {

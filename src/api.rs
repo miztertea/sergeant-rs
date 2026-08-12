@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, Request, State};
@@ -46,7 +46,9 @@ use crate::domain::workflow::{
     KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
-use crate::runtime::engine::{Engine, EngineError, Next as EngineNext, Step, SubmitContext};
+use crate::runtime::engine::{
+    Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, Next as EngineNext, Step, SubmitContext,
+};
 use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
     KIND_CONVERSATION_USER, KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
@@ -535,6 +537,16 @@ async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                     core,
                 )
             }
+            EngineNext::Interrupt(pending) => {
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = CoreGuard::acquire(&state.core).await;
+                (
+                    work_id,
+                    state.engine.settle_interrupt(&mut core, *pending, outcome),
+                    core,
+                )
+            }
         };
         let (work_id, outcome, core) = settled;
         match outcome {
@@ -606,10 +618,29 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
         if *closing.borrow() {
             return;
         }
-        let due = {
+        let (due, overdue) = {
             let core = CoreGuard::acquire(&state.core).await;
-            state.engine.due_observations(&core)
+            let due = state.engine.due_observations(&core);
+            // R-MVP1-7's per-turn wall-clock ceiling rides this same 200 ms
+            // sweep, read under the same guard hold `due_observations`
+            // already takes — both are read-only, side-effect-free
+            // questions asked of the projection (§22.6).
+            let overdue = state.engine.due_interrupts(&core, Instant::now());
+            (due, overdue)
         };
+        for pending in overdue {
+            if *closing.borrow() {
+                return;
+            }
+            crank(
+                &state,
+                Step {
+                    next: EngineNext::Interrupt(pending),
+                    deferred: Deferred::new(),
+                },
+            )
+            .await;
+        }
         for pending in due {
             if *closing.borrow() {
                 return;
@@ -1904,6 +1935,7 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_EXECUTION_STOPPED,
     KIND_EXECUTION_ABANDONED,
     KIND_EXECUTION_RECONCILED,
+    KIND_TURN_CEILING_INTERRUPTED,
     KIND_SURFACE_MATERIALIZING,
     KIND_SURFACE_MATERIALIZED,
     KIND_SURFACE_TORN_DOWN,

@@ -135,6 +135,15 @@ pub struct StageDefinition {
     /// Work/profile default".
     #[serde(default)]
     pub profile: Option<String>,
+    /// R-MVP1-11: this stage needs the actor to be able to author a
+    /// question that parks its own stage — [`crate::backend::Capabilities::ask`].
+    /// `false` (the default) is silent for every workflow that never
+    /// declares it, exactly like `kind`/`harness`/`profile` above. It says
+    /// what the stage *needs*, never that the engine converses (R-NS-6):
+    /// the engine reads it only to refuse a submission whose resolved
+    /// backend cannot honour it (§17.5's preflight, `Engine::bind_stages`).
+    #[serde(default)]
+    pub requires_ask: bool,
 }
 
 /// The executor decision for **one stage of one run**, resolved at plan time
@@ -384,6 +393,10 @@ struct StageTable {
     harness: Option<String>,
     #[serde(default)]
     profile: Option<String>,
+    /// R-MVP1-11's declaration. Absent means `false`, the same no-table
+    /// default every other tagged field already uses.
+    #[serde(default)]
+    requires_ask: bool,
 }
 
 /// The built-in `software-change` workflow, embedded at build time from
@@ -460,7 +473,7 @@ impl WorkflowDefinition {
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
         let mut stages = Vec::with_capacity(ids.len());
         for id in ids {
-            let (kind, harness, profile) =
+            let (kind, harness, profile, requires_ask) =
                 resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
             let stage_dir = dir.join(&id);
             let context_path = stage_dir.join(CONTEXT_FILE);
@@ -482,6 +495,7 @@ impl WorkflowDefinition {
                 kind,
                 harness,
                 profile,
+                requires_ask,
             });
         }
         let content_hash =
@@ -503,7 +517,7 @@ impl WorkflowDefinition {
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
         let mut stages = Vec::with_capacity(ids.len());
         for id in ids {
-            let (kind, harness, profile) =
+            let (kind, harness, profile, requires_ask) =
                 resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
             let context = EMBEDDED_CONTEXTS
                 .iter()
@@ -520,6 +534,7 @@ impl WorkflowDefinition {
                 kind,
                 harness,
                 profile,
+                requires_ask,
             });
         }
         let content_hash =
@@ -609,9 +624,9 @@ fn resolve_stage_tag(
     id: &str,
     table: Option<&StageTable>,
     path: &str,
-) -> Result<(StageKind, Option<String>, Option<String>), WorkflowError> {
+) -> Result<(StageKind, Option<String>, Option<String>, bool), WorkflowError> {
     let Some(table) = table else {
-        return Ok((StageKind::Actor, None, None));
+        return Ok((StageKind::Actor, None, None, false));
     };
     let kind = match table.kind.as_deref() {
         None | Some("actor") => StageKind::Actor,
@@ -623,7 +638,12 @@ fn resolve_stage_tag(
             });
         }
     };
-    Ok((kind, table.harness.clone(), table.profile.clone()))
+    Ok((
+        kind,
+        table.harness.clone(),
+        table.profile.clone(),
+        table.requires_ask,
+    ))
 }
 
 /// A stage's contribution to the workflow content-identity hash: every
@@ -635,6 +655,11 @@ struct ContentIdentityStage<'a> {
     harness: Option<&'a str>,
     profile: Option<&'a str>,
     context: &'a str,
+    /// R-MVP1-11's declaration is execution-relevant (it changes what
+    /// submit-time preflight will accept), so a workflow whose author flips
+    /// it is a different workflow for content-identity purposes, same as a
+    /// changed `harness` or `profile` is.
+    requires_ask: bool,
 }
 
 /// The workflow content-identity hash (§22.3): BLAKE3 over a canonical JSON
@@ -663,6 +688,7 @@ fn compute_content_hash(name: &str, version: &str, stages: &[StageDefinition]) -
                 harness: s.harness.as_deref(),
                 profile: s.profile.as_deref(),
                 context: &s.context,
+                requires_ask: s.requires_ask,
             })
             .collect(),
     };
@@ -939,6 +965,58 @@ mod tests {
         assert!(
             matches!(&err, WorkflowError::UndeclaredStageTable { stage, .. } if stage == "99-ghost"),
             "expected a refusal naming the undeclared table, got {err}"
+        );
+    }
+
+    /// R-MVP1-11: `requires_ask` parses to `true` when declared and defaults
+    /// to `false` for every stage that never mentions it — the same
+    /// no-table-means-untagged shape `kind`/`harness`/`profile` already have,
+    /// and it participates in the content-identity hash like they do.
+    #[test]
+    fn requires_ask_parses_true_and_defaults_false() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "asks");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"asks\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-interview\", \"10-close\"]\n",
+                "\n",
+                "[stage.\"00-interview\"]\n",
+                "requires_ask = true\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-interview", "interview context");
+        write_stage(&wf, "10-close", "close context");
+
+        let workflow = WorkflowDefinition::resolve(root, "asks").expect("resolve");
+        assert!(workflow.stages[0].requires_ask);
+        assert!(
+            !workflow.stages[1].requires_ask,
+            "untagged stage defaults false"
+        );
+
+        // Flipping the declaration is a different workflow (§22.3): content
+        // hash changes even though every other field is untouched.
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"asks\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-interview\", \"10-close\"]\n",
+            ),
+        )
+        .expect("descriptor");
+        let unrequired = WorkflowDefinition::resolve(root, "asks").expect("resolve");
+        assert_ne!(
+            workflow.content_hash, unrequired.content_hash,
+            "requires_ask must be execution-relevant to the content-identity hash"
         );
     }
 

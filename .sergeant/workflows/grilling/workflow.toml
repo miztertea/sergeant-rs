@@ -13,3 +13,10 @@
 name = "grilling"
 version = "1"
 stages = ["00-interview-loop", "10-confirm-understanding"]
+
+# R-MVP1-11: this stage is the whole reason grilling exists — the actor asks
+# one question at a time and parks on the human's answer. Declaring it lets
+# submit-time preflight refuse before the first turn when the resolved
+# backend cannot honour it, instead of dying mid-run on the first question.
+[stage."00-interview-loop"]
+requires_ask = true
