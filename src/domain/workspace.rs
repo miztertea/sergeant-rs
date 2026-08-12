@@ -679,6 +679,78 @@ impl Workspace {
         Ok(declared)
     }
 
+    /// A manifest **edit**'s own validator (`src/domain/manifest.rs`'s
+    /// pens — `sgt init`/`repo add`/`repo remove`/`group add`/`group
+    /// remove`): every schema-level check [`Self::from_config_allow_empty`]
+    /// runs — legacy vocabulary, duplicate/invalid repository names, group
+    /// membership against declared names, profile validity/permission modes,
+    /// `[estate]` shape — **without** resolving any `[[repo]]` entry through
+    /// git. [`RepositorySpec::path`] here is only the declared path joined
+    /// onto `root` (see [`DeclaredRepo`]'s own doc for the same distinction),
+    /// so a name that resolves fine and one that points at nothing both parse
+    /// identically; [`WorkspaceError::DuplicateRepositoryPath`] — which needs
+    /// git to know two declared paths are the same checkout — is the one
+    /// schema check this cannot make and does not attempt.
+    ///
+    /// Exists because the strict resolver's per-repo `git rev-parse
+    /// --show-toplevel` loop fails at the *first* declared repository not
+    /// present on disk, and an edit pen's job is to validate the **edit**,
+    /// not to re-verify every repository the estate has ever declared. A
+    /// `git clone`d estate (`sgt init` gitignores `repos/`) declares repos in
+    /// `sergeant.toml` with no `repos/` on disk at all — the on-disk-first
+    /// pen would refuse *every* subsequent edit, including ones that never
+    /// touch the missing repository, contradicting the design capture's own
+    /// wrongness contract ("a broken repo blocks works targeting it, not the
+    /// estate", `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`).
+    /// A repository an edit itself populates or verifies (`sgt repo add`'s
+    /// `populate_or_verify`) is already checked on disk by that caller,
+    /// directly — this validator does not need to repeat it.
+    pub fn from_config_structural(config_path: &Path) -> Result<Self, WorkspaceError> {
+        Self::from_config_impl_structural(config_path)
+    }
+
+    /// [`Self::declared_repos`]'s sibling for `[group.<name>]`: every
+    /// declared group, membership validated against declared repository
+    /// names (the same [`WorkspaceError::UnknownGroupMember`] check
+    /// [`Self::from_config_impl`] runs), without resolving any repository on
+    /// disk. Used where only membership is wanted — `sgt run --group`'s
+    /// client-side expansion (`src/cli.rs`) — so an unrelated missing
+    /// repository cannot block a group whose own members are all fine (same
+    /// root cause and remedy as [`Self::from_config_structural`]).
+    pub fn declared_groups(
+        config_path: &Path,
+    ) -> Result<BTreeMap<String, GroupSpec>, WorkspaceError> {
+        Ok(Self::from_config_impl_structural(config_path)?.groups)
+    }
+
+    /// [`Self::discover_scoped`]'s shape, but landing on
+    /// [`Self::from_config_structural`] instead of the strict resolver at
+    /// both branches (a found `[estate]`-bearing config, or a plain member
+    /// `sergeant.toml` at the zero-config git toplevel) — the disk-free
+    /// counterpart a group-membership-only caller wants. Returns an empty
+    /// map, never an error, for the true zero-config case (no `sergeant.toml`
+    /// at all): there is nothing to declare a group in.
+    pub fn declared_groups_scoped(
+        start: &Path,
+        data_dir: Option<&Path>,
+    ) -> Result<BTreeMap<String, GroupSpec>, WorkspaceError> {
+        if let Some(estate_config) = Self::find_estate_upward(start, data_dir)? {
+            return Self::declared_groups(&estate_config);
+        }
+        let toplevel = git(start, &["rev-parse", "--show-toplevel"]).map_err(|source| {
+            WorkspaceError::NotARepository {
+                path: start.display().to_string(),
+                source,
+            }
+        })?;
+        let config_path = PathBuf::from(toplevel).join(WORKSPACE_FILE);
+        if config_path.is_file() {
+            Self::declared_groups(&config_path)
+        } else {
+            Ok(BTreeMap::new())
+        }
+    }
+
     fn from_config_impl(
         config_path: &Path,
         allow_empty_repos: bool,
@@ -768,6 +840,126 @@ impl Workspace {
             // #47: an unrecognized permission_mode is refused here, at
             // config load, rather than surfacing later as an unmeasured CLI
             // argument failure at launch time.
+            if let Err(source) = profile.permission_mode() {
+                return Err(WorkspaceError::InvalidPermissionMode {
+                    file,
+                    profile: profile.name.clone(),
+                    source,
+                });
+            }
+        }
+
+        let declared_repo_names: Vec<&str> = repositories.iter().map(|r| r.name.as_str()).collect();
+        let mut groups = BTreeMap::new();
+        for (group_name, entry) in parsed.group {
+            for member in &entry.repos {
+                if !declared_repo_names.contains(&member.as_str()) {
+                    return Err(WorkspaceError::UnknownGroupMember {
+                        file,
+                        group: group_name,
+                        name: member.clone(),
+                        available: declared_repo_names.join(", "),
+                    });
+                }
+            }
+            groups.insert(
+                group_name,
+                GroupSpec {
+                    repos: entry.repos,
+                    brief: entry.brief,
+                },
+            );
+        }
+
+        let (name, default_backend, default_workflow, surfaces_dir) = match parsed.estate {
+            Some(estate) => (
+                estate.name,
+                estate.default_backend,
+                estate.default_workflow,
+                estate
+                    .surfaces_dir
+                    .map(|d| if d.is_absolute() { d } else { root.join(d) }),
+            ),
+            None => (repo_name(&root), None, None, None),
+        };
+
+        Ok(Self {
+            name,
+            root,
+            repositories,
+            default_backend,
+            default_workflow,
+            profiles: parsed.profile,
+            config_path: Some(config_path.to_path_buf()),
+            surfaces_dir,
+            repository_policy,
+            groups,
+            repository_origin,
+        })
+    }
+
+    /// [`Self::from_config_impl`] with the per-repository `git rev-parse
+    /// --show-toplevel` resolution dropped — see
+    /// [`Self::from_config_structural`]'s own doc for why this exists and
+    /// what it deliberately cannot check. Always allows an empty `[[repo]]`
+    /// list (every caller is a manifest edit, which may legitimately be
+    /// scaffolding a repo-less estate — same reason
+    /// [`Self::from_config_allow_empty`] relaxes it).
+    fn from_config_impl_structural(config_path: &Path) -> Result<Self, WorkspaceError> {
+        let file = config_path.display().to_string();
+        let text = std::fs::read_to_string(config_path).map_err(|source| WorkspaceError::Io {
+            path: file.clone(),
+            source,
+        })?;
+        check_legacy_vocabulary(&text, &file)?;
+        let parsed: WorkspaceFile =
+            toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
+                path: file.clone(),
+                source,
+            })?;
+        let root = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let mut seen = BTreeSet::new();
+        let mut repositories = Vec::with_capacity(parsed.repo.len());
+        let mut repository_policy = BTreeMap::new();
+        let mut repository_origin = BTreeMap::new();
+        for entry in parsed.repo {
+            if !is_plain_name(&entry.name) {
+                return Err(WorkspaceError::InvalidRepositoryName {
+                    file,
+                    name: entry.name,
+                });
+            }
+            if !seen.insert(entry.name.clone()) {
+                return Err(WorkspaceError::DuplicateRepository {
+                    file,
+                    name: entry.name,
+                });
+            }
+            // Declared, joined, **not** git-resolved (see this fn's own doc:
+            // that is the one thing a structural parse cannot check).
+            let joined = root.join(&entry.path);
+            repository_policy.insert(entry.name.clone(), entry.instructions);
+            if let Some(origin) = &entry.origin {
+                repository_origin.insert(entry.name.clone(), origin.clone());
+            }
+            repositories.push(RepositorySpec {
+                name: entry.name,
+                path: joined,
+            });
+        }
+
+        let mut seen = BTreeSet::new();
+        for profile in &parsed.profile {
+            if !seen.insert(profile.name.clone()) {
+                return Err(WorkspaceError::DuplicateProfile {
+                    file,
+                    name: profile.name.clone(),
+                });
+            }
             if let Err(source) = profile.permission_mode() {
                 return Err(WorkspaceError::InvalidPermissionMode {
                     file,

@@ -488,12 +488,23 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // estate discovered from the current directory (bounded at this
             // daemon's own data dir, mirroring every other client-side
             // workspace read in this binary).
+            //
+            // MVP-3 invariants finding MVP3-C2: this reads group membership
+            // through the on-disk-free structural parser
+            // (`declared_groups_scoped`), not the strict `discover_scoped`
+            // (which resolves every declared `[[repo]]` through git) — group
+            // membership is just declared names, so an unrelated missing
+            // repository must not block a group whose own members are all
+            // fine, the same coupling `domain::manifest`'s edit pens no
+            // longer have (MVP3-C1).
             if let Some(group_name) = &group {
                 let cwd = std::env::current_dir()?;
-                let resolved =
-                    crate::domain::workspace::Workspace::discover_scoped(&cwd, Some(&data_dir))?;
-                let members = resolved.groups.get(group_name).ok_or_else(|| {
-                    let available: Vec<&str> = resolved.groups.keys().map(String::as_str).collect();
+                let groups = crate::domain::workspace::Workspace::declared_groups_scoped(
+                    &cwd,
+                    Some(&data_dir),
+                )?;
+                let members = groups.get(group_name).ok_or_else(|| {
+                    let available: Vec<&str> = groups.keys().map(String::as_str).collect();
                     CliError::new(format!(
                         "no group {group_name:?} declared in this estate (declared: {}); \
                          declare it first with `sgt group add {group_name} <repo>...`",

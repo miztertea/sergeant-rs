@@ -7,10 +7,13 @@
 //! format-preserving in-memory document (`toml_edit`, "comments are for the
 //! human" — a hand-written comment elsewhere in the file survives an sgt
 //! edit), then the *whole resulting file* is round-tripped through
-//! [`Workspace::from_config_allow_empty`] — the same fail-closed parser and
-//! validation every other reader of `sergeant.toml` uses — before anything
-//! touches disk. An edit that would produce an invalid manifest is refused
-//! before the real file is touched, with the parser's own named diagnostic.
+//! [`Workspace::from_config_structural`] — the same fail-closed schema-level
+//! parser every other reader of `sergeant.toml` uses, minus the on-disk
+//! repository resolution (MVP-3 invariants finding MVP3-C1: an edit
+//! validates the manifest it would produce, not the on-disk state of every
+//! repository the estate has ever declared) — before anything touches disk.
+//! An edit that would produce an invalid manifest is refused before the
+//! real file is touched, with the parser's own named diagnostic.
 //!
 //! Concurrency: an advisory lock (`crate::runtime::fsutil`, the same
 //! mechanism the journal uses) is held around sgt's own read-modify-write,
@@ -18,6 +21,16 @@
 //! itself — this guards only against two concurrent `sgt` invocations
 //! racing each other; a foreign editor (a hand edit, the harness) is
 //! deliberately last-write-wins, per the design capture's own ruling.
+//! **MVP-3 invariants finding MVP3-C6:** "guards" here means fails closed,
+//! not serializes-and-both-succeed — `take_exclusive_lock` only waits out a
+//! `WouldBlock` when the path is already held *by this same process*
+//! (`fsutil.rs`'s `SELF_LOCKED`, there to make one process's own nested
+//! acquires reentrant), so two real `sgt` processes racing this lock never
+//! wait for each other: the loser's `try_lock` returns immediately and this
+//! module reports [`ManifestError::Locked`] — a safe, fail-closed refusal
+//! (no edit is ever lost), but a refusal, not a queue. Pinned cross-process
+//! by `tests/m8_estate_cli.rs`'s
+//! `two_real_sgt_processes_racing_repo_add_serialize_dont_tear`.
 //!
 //! The write itself is atomic: `crate::runtime::fsutil::write_atomic`
 //! (temp file, `fsync`, rename over the destination, `fsync` the directory)
@@ -40,12 +53,23 @@ use crate::domain::workspace::{InstructionPolicy, WORKSPACE_FILE, Workspace, Wor
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic};
 use crate::runtime::git::{git, git_succeeds};
 
-/// The two `.gitignore` entries `sgt init` maintains (task's own naming):
-/// the estate-local data dir and the populated repository mounts. Neither
-/// belongs in the estate's own history — `.sergeant/data` is machine-local
-/// runtime state (journal, blobs, projections) and `repos/` is populated
-/// clones of *other* repositories' own histories.
-const GITIGNORE_ENTRIES: &[&str] = &[".sergeant/data", "repos/"];
+/// The `.gitignore` entries `sgt init` maintains (task's own naming): the
+/// estate-local data dir, the populated repository mounts, and this
+/// module's own scratch files. None belong in the estate's own history —
+/// `.sergeant/data` is machine-local runtime state (journal, blobs,
+/// projections), `repos/` is populated clones of *other* repositories' own
+/// histories, `.sergeant.toml.lock` is [`ManifestLock`]'s advisory-lock
+/// marker (never removed by design — see its own doc comment — so it
+/// outlives every edit and would otherwise sit untracked at the estate root
+/// forever), and `sergeant.toml.validate-*` is [`validate`]'s throwaway
+/// probe file, removed on the happy path but left behind if the process
+/// dies mid-validate (MVP-3 invariants finding MVP3-C3).
+const GITIGNORE_ENTRIES: &[&str] = &[
+    ".sergeant/data",
+    "repos/",
+    ".sergeant.toml.lock",
+    "sergeant.toml.validate-*",
+];
 
 /// Where `sgt init` defaults the data dir, relative to the estate root
 /// (U-R2, the design capture's `[estate] data_dir defaulting .sergeant/data`).
@@ -266,12 +290,23 @@ fn read_document(manifest_path: &Path) -> Result<(DocumentMut, bool), ManifestEr
 }
 
 /// Validate `doc` by writing it to a throwaway file beside the real manifest
-/// and running the exact parser/validator every other `sergeant.toml` reader
-/// uses ([`Workspace::from_config_allow_empty`]) — never the real path,
-/// so a refused edit leaves nothing behind but its own tmp file, which is
-/// removed either way. Returns the validated [`Workspace`] on success, so
-/// callers that need it (`estate_root`'s remaining git-resolved paths) do
-/// not have to parse a third time.
+/// and running the schema-level parser/validator every manifest edit shares
+/// ([`Workspace::from_config_structural`]) — never the real path, so a
+/// refused edit leaves nothing behind but its own tmp file, which is removed
+/// either way. Returns the validated [`Workspace`] on success, so callers
+/// that need it do not have to parse a third time.
+///
+/// Deliberately **not** [`Workspace::from_config_allow_empty`] (MVP-3
+/// invariants finding MVP3-C1): that resolves every declared `[[repo]]`
+/// through git and fails closed at the first one not present on disk, so an
+/// estate with even one uncloned repository — including a freshly `git
+/// clone`d one, since `sgt init` gitignores `repos/` — would refuse every
+/// later edit here, not just one touching the missing repository. The
+/// structural validator keeps every schema-level check (legacy vocabulary,
+/// duplicate/invalid names, group membership, profile validity) and drops
+/// only the on-disk resolution; a repository an edit itself populates or
+/// verifies (`add_repo`'s `populate_or_verify`) is already checked directly
+/// by that caller.
 fn validate(root: &Path, doc: &DocumentMut) -> Result<Workspace, ManifestError> {
     let manifest_path = root.join(WORKSPACE_FILE);
     let probe_path = root.join(format!("sergeant.toml.validate-{}", ulid::Ulid::generate()));
@@ -280,7 +315,7 @@ fn validate(root: &Path, doc: &DocumentMut) -> Result<Workspace, ManifestError> 
         path: probe_path.display().to_string(),
         source,
     })?;
-    let outcome = Workspace::from_config_allow_empty(&probe_path);
+    let outcome = Workspace::from_config_structural(&probe_path);
     let _ = std::fs::remove_file(&probe_path);
     outcome.map_err(|source| ManifestError::Invalid {
         path: manifest_path.display().to_string(),
@@ -299,7 +334,7 @@ fn commit(root: &Path, doc: &DocumentMut) -> Result<(), ManifestError> {
 }
 
 /// `sgt init`: scaffold `[estate]` in `sergeant.toml`, create `repos/`, and
-/// add the two `.gitignore` entries — idempotent (a second run on an
+/// add `.gitignore`'s [`GITIGNORE_ENTRIES`] — idempotent (a second run on an
 /// already-initialized estate changes nothing, per [`InitOutcome::changed`]).
 ///
 /// `root` is the directory `sgt init` is *run from* — unlike every other
@@ -807,17 +842,24 @@ mod tests {
         assert_eq!(workspace.name, "my-estate");
     }
 
-    /// guard-map: `sgt init` scaffolds the `.gitignore` entries the task
-    /// specifies verbatim. Mutation this kills: a typo'd or missing entry
-    /// in `GITIGNORE_ENTRIES`, or `ensure_gitignore` writing to the wrong
-    /// path.
+    /// guard-map: `sgt init` scaffolds every `.gitignore` entry
+    /// `GITIGNORE_ENTRIES` specifies verbatim — the estate-local data dir,
+    /// the populated repository mounts, and (MVP3-C3) this module's own
+    /// lock marker and validate-probe pattern, so a freshly initialized
+    /// estate's `git status` never shows sgt's own runtime scratch as
+    /// untracked. Mutation this kills: a typo'd or missing entry in
+    /// `GITIGNORE_ENTRIES`, or `ensure_gitignore` writing to the wrong path.
     #[test]
-    fn init_writes_both_gitignore_entries() {
+    fn init_writes_every_gitignore_entry() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         init_estate(dir.path(), None).expect("init");
         let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).expect("read");
-        assert!(gitignore.lines().any(|l| l.trim() == ".sergeant/data"));
-        assert!(gitignore.lines().any(|l| l.trim() == "repos/"));
+        for entry in GITIGNORE_ENTRIES {
+            assert!(
+                gitignore.lines().any(|l| l.trim() == *entry),
+                "{entry:?} missing from .gitignore: {gitignore:?}"
+            );
+        }
     }
 
     /// guard-map: `sgt init` preserves a hand-written comment elsewhere in an
@@ -1054,11 +1096,20 @@ mod tests {
         );
     }
 
-    /// guard-map: two concurrent editors of the same manifest serialize
+    /// guard-map: two concurrent editors **in this one process** serialize
     /// rather than tearing each other's write — the advisory lock actually
     /// does something. Mutation this kills: dropping `ManifestLock::acquire`
     /// from any editing function (both adds would then race the read-modify-
     /// write and one repo could silently vanish from the final file).
+    ///
+    /// This is the in-process half only (MVP-3 invariants finding MVP3-C6):
+    /// `take_exclusive_lock`'s wait-and-retry path is taken here because the
+    /// second thread finds the path already in this process's own
+    /// `SELF_LOCKED` set, which is exactly what lets both adds succeed. Two
+    /// real `sgt` processes never share that set, so the loser there fails
+    /// closed instead of waiting — see
+    /// `tests/m8_estate_cli.rs`'s `two_real_sgt_processes_racing_repo_add_
+    /// serialize_dont_tear` for that half.
     #[test]
     fn concurrent_repo_adds_do_not_lose_an_entry() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1084,5 +1135,56 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    /// MVP-3 invariants finding MVP3-C1: a declared repository missing from
+    /// disk — the exact shape a freshly `git clone`d estate is in, since
+    /// `sgt init` gitignores `repos/` — must not block an edit that never
+    /// touches it. `add_repo`, `remove_repo`, `add_group` and `remove_group`
+    /// are each proven against the same setup: two declared repos, one of
+    /// which (`a`) is then deleted from disk to simulate the clone-without-
+    /// `repos/` state, and every edit that only concerns `b` still succeeds.
+    ///
+    /// guard-map: reverting `validate` to
+    /// `Workspace::from_config_allow_empty` (the strict, on-disk-resolving
+    /// parser) makes every assertion below fail with `ManifestError::Invalid`
+    /// wrapping `WorkspaceError::RepositoryNotFound { name: "a", .. }`.
+    #[test]
+    fn a_missing_unrelated_repo_does_not_block_edits_that_do_not_touch_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_estate(root, Some("e")).expect("init");
+        for name in ["a", "b"] {
+            init_repo(&root.join("repos").join(name));
+        }
+        add_repo(root, "a", None, None).expect("declare a");
+        add_repo(root, "b", None, None).expect("declare b");
+
+        // Simulate the clone-is-distro shape: `a`'s working copy is gone,
+        // but it is still declared.
+        std::fs::remove_dir_all(root.join("repos").join("a")).expect("remove a's checkout");
+
+        // `add_repo` for an unrelated new repo `c` must still succeed.
+        init_repo(&root.join("repos").join("c"));
+        add_repo(root, "c", None, None)
+            .expect("add_repo must not require every OTHER declared repo to resolve on disk");
+
+        // `add_group`/`remove_group` naming only `b`/`c` must still succeed.
+        add_group(root, "pair", &["b".to_string(), "c".to_string()], None)
+            .expect("add_group must not require every OTHER declared repo to resolve on disk");
+        remove_group(root, "pair", &[])
+            .expect("remove_group must not require every OTHER declared repo to resolve on disk");
+
+        // `remove_repo` for the untouched `b` must still succeed.
+        remove_repo(root, "b")
+            .expect("remove_repo must not require every OTHER declared repo to resolve on disk");
+
+        // `a` is still declared (never removed) and the manifest is still
+        // structurally valid — proving the above edits really did land.
+        let declared =
+            Workspace::declared_repos(&root.join(WORKSPACE_FILE)).expect("declared_repos");
+        let mut names: Vec<&str> = declared.iter().map(|r| r.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "c"]);
     }
 }
