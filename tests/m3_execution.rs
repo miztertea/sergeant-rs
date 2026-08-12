@@ -2426,6 +2426,68 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
     handle.shutdown().await;
 }
 
+/// R-MVP1-1's other override, `SGT_SURFACES_DIR`, end to end through a real
+/// spawned daemon process (not the in-process `daemon::start_with` the
+/// scenario above uses) — proving the env var this ruling names is actually
+/// read, not merely documented. `Engine::with_surfaces_root` had zero
+/// callers before this fix; a real `sgt run` against a `data_dir` inside the
+/// checkout, with `SGT_SURFACES_DIR` pointed outside it, must materialize
+/// exactly as an `[estate] surfaces_dir` override does.
+#[test]
+fn r_mvp1_1_sgt_surfaces_dir_env_var_reaches_a_real_spawned_daemon() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let data = DataDir::new();
+    let outside = repos.path().join("surfaces-outside-env");
+    let output = Command::new(SGT)
+        .current_dir(&repo)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--json")
+        .args(["run", "env var surfaces root", "--workflow", "tiny"])
+        .env("SGT_SURFACES_DIR", &outside)
+        .output()
+        .expect("run sgt");
+    assert!(
+        output.status.success(),
+        "sgt run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value =
+        serde_json::from_slice(&output.stdout).expect("json output");
+    assert_ne!(
+        body["work"]["state"], "blocked",
+        "an outside SGT_SURFACES_DIR must materialize even with data_dir inside the checkout: {body}"
+    );
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    // Exact, not merely `starts_with` — mirrors the `[estate] surfaces_dir`
+    // scenario above (materialize_one refuses a worktree inside the source
+    // checkout, so a path outside it, actually returned here, proves the
+    // env var reached `Engine::with_surfaces_root` and was actually used to
+    // materialize, not merely echoed back).
+    assert_eq!(
+        worktree,
+        outside.join(&work_id).join("solo"),
+        "SGT_SURFACES_DIR must relocate the worktree exactly as [estate] surfaces_dir does"
+    );
+    // The fake backend may complete (and tear the surface down) before this
+    // process is spawned, so a disk check would be racy; the response body
+    // above is captured synchronously at materialize time and is proof
+    // enough. The default (data_dir/surfaces, inside the checkout here)
+    // must not have been used either way.
+    assert!(!data.path().join("surfaces").join(&work_id).exists());
+
+    stop_daemon(data.path());
+}
+
 /// Retry's re-attachment falls back to a fresh branch cut from the recorded
 /// base SHA when the branch teardown was supposed to have retained is gone —
 /// deleted by something outside sergeant between the failed attempt and the

@@ -191,6 +191,14 @@ pub struct DaemonConfig {
     /// production default (minutes) would make the test the thing that
     /// times out. Production uses the default.
     pub turn_ceiling: Duration,
+    /// R-MVP1-1's daemon-wide surfaces-root override (`[estate]
+    /// surfaces_dir` / `SGT_SURFACES_DIR`): `None` keeps
+    /// [`Engine::new`]'s default, `<data_dir>/surfaces` — today's layout,
+    /// nothing moves. `Some` is wired into the engine via
+    /// [`Engine::with_surfaces_root`] in [`start_with`]. A per-estate
+    /// `[estate] surfaces_dir` narrows this further, per-submission, in
+    /// `Engine::plan` — this is only the daemon-wide fallback beneath that.
+    pub surfaces_root: Option<PathBuf>,
 }
 
 impl Default for DaemonConfig {
@@ -202,6 +210,7 @@ impl Default for DaemonConfig {
             telemetry: None,
             completion_poll: COMPLETION_POLL_INTERVAL,
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
+            surfaces_root: None,
         }
     }
 }
@@ -339,10 +348,12 @@ pub async fn start_with(
     // yet been settled. `reconcile` itself flushes after each work it
     // touches, so its own effects (a `git worktree remove`, a relaunched
     // harness) are never left unsynced while unbounded — see its doc.
-    let engine = Arc::new(
-        Engine::new(backends, config.default_backend.clone(), data_dir)
-            .with_turn_ceiling(config.turn_ceiling),
-    );
+    let mut engine = Engine::new(backends, config.default_backend.clone(), data_dir)
+        .with_turn_ceiling(config.turn_ceiling);
+    if let Some(surfaces_root) = config.surfaces_root.clone() {
+        engine = engine.with_surfaces_root(surfaces_root);
+    }
+    let engine = Arc::new(engine);
     let reconciled = recovery::reconcile(&engine, &mut core)?;
     // Backstop, not load-bearing: `reconcile` already leaves nothing open on
     // its own account, but a future edit there that forgets a flush must not
@@ -654,10 +665,19 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
             "otel export enabled"
         );
     }
+    // R-MVP1-1's daemon-wide surfaces-root override: read once at startup,
+    // exactly as `Engine::with_surfaces_root`'s own doc has always promised.
+    // An empty value is treated the same as unset (`SGT_SURFACES_DIR=`
+    // exported-but-blank must not silently relocate every surface to the
+    // data dir's own root).
+    let surfaces_root = std::env::var_os("SGT_SURFACES_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
     let handle = start_with(
         data_dir,
         DaemonConfig {
             telemetry: telemetry.clone(),
+            surfaces_root,
             ..DaemonConfig::default()
         },
     )
