@@ -1228,12 +1228,23 @@ async fn submit_work(
     )
 }
 
-/// The [`WorkRun`] to render for a work: the live registry entry if the
-/// projection still has one, or R-MVP1-9's read-side re-derivation when
-/// eviction has already reclaimed it.
+/// The [`WorkRun`] to render for a work: the live or R-MVP1-9-evicted-but-
+/// cached registry entry (`cached`, which callers pass as `WorkRegistry::
+/// run_view`'s answer — checking both `runs` and `terminal_runs`), or —
+/// only when *neither* has it — the read-side full-journal re-derivation.
+///
+/// The full-replay path is a defensive fallback, not the ordinary case:
+/// every eviction populates `terminal_runs` at the moment it reclaims
+/// `runs` (`maybe_evict`), so a terminal work's view is answered from that
+/// in-memory cache, never a per-request journal walk (W2/TH-08: this used
+/// to replay the *entire* journal on every view of every terminal work,
+/// including ones with no run at all, which is exactly the unbounded-I/O-
+/// under-the-guard shape §22.6 forbids). The fallback exists only for a
+/// registry an older build populated before this cache existed, or a
+/// genuine in-memory anomaly — it must never be the common path.
 ///
 /// Only `is_absorbing` states (`Completed`/`Canceled`) are ever evicted, so
-/// that is the only case worth paying a full journal replay for; every other
+/// that is the only case worth even trying the fallback for; every other
 /// state's `None` here means exactly what it always meant — no run exists
 /// yet — and costs nothing extra to answer.
 ///
@@ -1328,7 +1339,7 @@ fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
 fn work_view(core: &Core, work_id: &str) -> Value {
     let registry = core.registry.state();
     let work = registry.works.get(work_id);
-    let cached_run = registry.runs.get(work_id);
+    let cached_run = registry.run_view(work_id);
     let run = work.and_then(|w| resolve_run(core, w, cached_run));
     json!({
         "work": work,
@@ -1386,7 +1397,7 @@ fn fleet_body(core: &Core) -> Value {
         .works
         .values()
         .map(|work| {
-            let run = registry.runs.get(&work.id);
+            let run = registry.run_view(&work.id);
             let mut row = serde_json::to_value(work).unwrap_or(Value::Null);
             if let Some(object) = row.as_object_mut() {
                 object.insert(

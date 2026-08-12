@@ -2479,3 +2479,118 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
     );
     handle2.shutdown().await;
 }
+
+/// W1/TH-01: R-MVP1-9's own pin is "an evicted Work's API view is byte-
+/// identical to a non-evicted one" — this must hold for the *fleet* view
+/// (`GET /v1/work`, what `sgt work list`/the TUI/the dashboard actually
+/// read), not only the single-work view. Before this fix `fleet_body` read
+/// `registry.runs` directly and always saw `None` for an evicted
+/// (Completed/Canceled) work, so every finished work listed with
+/// `stage: null, resolved_backend: null` regardless of what its single-work
+/// view said.
+///
+/// Also TH-09's own gap: the comparison is evicted-vs-live, not
+/// evicted-vs-evicted — a `Failed` work is deliberately never evicted
+/// (`is_absorbing` excludes it, `retry` needs its run), so it is the one
+/// live control this journal can hold alongside a genuinely evicted
+/// `Completed` work, and both are checked field-by-field, not one subtree.
+#[tokio::test]
+async fn r_mvp1_9_the_fleet_view_matches_the_single_work_view_for_an_evicted_work() {
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+    let data = DataDir::new();
+
+    // One work that completes (Completed is absorbing: it WILL be evicted),
+    // one that fails and is never retried (Failed is never evicted — the
+    // live control).
+    let (handle, _fake) = start_fake(
+        data.path(),
+        [
+            FakeStep::complete(),
+            FakeStep::complete(),
+            FakeStep::fail("boom"),
+        ],
+    )
+    .await;
+    let completed = submit(
+        &handle,
+        repo.path(),
+        "this one finishes",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let completed_id = completed["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    assert_eq!(completed["work"]["state"], "completed", "{completed}");
+
+    let failed = submit(
+        &handle,
+        repo.path(),
+        "this one fails",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let failed_id = failed["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(failed["work"]["state"], "failed", "{failed}");
+
+    // The single-work view for the evicted (Completed) work — the answer
+    // the fleet row must match.
+    let completed_show = get(&handle, &format!("/v1/work/{completed_id}")).await;
+    assert!(
+        !completed_show["stage"].is_null(),
+        "the single-work view must not be null either — otherwise this test \
+         proves nothing: {completed_show}"
+    );
+
+    let fleet = get(&handle, "/v1/work").await;
+    let works = fleet["works"].as_array().expect("works array");
+    let completed_row = works
+        .iter()
+        .find(|w| w["id"] == completed_id)
+        .unwrap_or_else(|| panic!("completed work not in fleet: {fleet}"));
+    let failed_row = works
+        .iter()
+        .find(|w| w["id"] == failed_id)
+        .unwrap_or_else(|| panic!("failed work not in fleet: {fleet}"));
+
+    assert_eq!(
+        completed_row["stage"], completed_show["stage"],
+        "the fleet row's stage must match the single-work view for an evicted work: \
+         fleet={completed_row}, single={completed_show}"
+    );
+    assert_eq!(
+        completed_row["resolved_backend"], completed_show["backend"],
+        "the fleet row's resolved_backend must match the single-work view's backend: \
+         fleet={completed_row}, single={completed_show}"
+    );
+    assert_ne!(
+        completed_row["stage"],
+        Value::Null,
+        "an evicted Completed work must not list with a null stage: {completed_row}"
+    );
+    assert_ne!(
+        completed_row["resolved_backend"],
+        Value::Null,
+        "an evicted Completed work must not list with a null resolved_backend: {completed_row}"
+    );
+
+    // The live (never-evicted) Failed work is the control: it was never
+    // evicted at all, so it is the "non-evicted" half of the ruling's pin.
+    // Both must be populated the same way — evicted or not is invisible
+    // from the outside.
+    assert_ne!(
+        failed_row["stage"],
+        Value::Null,
+        "the live control must also carry its stage: {failed_row}"
+    );
+    assert_eq!(
+        completed_row["stage"]["of"], failed_row["stage"]["of"],
+        "an evicted work's stage shape matches a live work's — eviction changes \
+         nothing about what the fleet view renders: completed={completed_row}, failed={failed_row}"
+    );
+
+    handle.shutdown().await;
+}

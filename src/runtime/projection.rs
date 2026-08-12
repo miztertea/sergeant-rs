@@ -280,6 +280,65 @@ pub struct WorkRegistry {
     /// work state, `runs[id]` is where the run currently *is*.
     #[serde(default)]
     pub runs: std::collections::BTreeMap<String, WorkRun>,
+    /// R-MVP1-9 (Rule A)'s eviction destination: a compacted `WorkRun` for
+    /// the most recent [`TERMINAL_RUN_CACHE_CAPACITY`] works `maybe_evict`
+    /// has reclaimed from `runs`, keyed by work id.
+    ///
+    /// This is what makes eviction view-transparent (the ruling's own pin)
+    /// for the realistic case — a just-finished work someone is actually
+    /// looking at — *without* paying a full journal replay on every read:
+    /// `resolve_run` checks here before ever calling [`rederive_run`]. It is
+    /// deliberately bounded, not a second unbounded map growing forever
+    /// beside `runs`: an unbounded cache here would silently reopen the
+    /// exact monotonic-climb defect (#4) R-MVP1-9 exists to close, just
+    /// under a different field name. A work aged out of the cache (older
+    /// than the most recent `TERMINAL_RUN_CACHE_CAPACITY` evictions) falls
+    /// back to a full replay — rare under ordinary browsing, not the
+    /// self-defeating "every view, every terminal work" shape this cache
+    /// replaces.
+    ///
+    /// "Compacted", not "identical to the live run": `stages` is truncated
+    /// to the one current attempt (`current_stage()` already only ever
+    /// reads `.last()`, so nothing a view composes can tell the difference)
+    /// — the earlier attempts are exactly the "heavy state" eviction exists
+    /// to reclaim, and every other field (`surface`, `teardown`, `backend`,
+    /// `workflow`, …) is kept whole, since those are what the output
+    /// pointer and `work show` actually render.
+    ///
+    /// In-memory only, like `runs` itself: a restart's rebuild-on-start
+    /// re-folds the whole journal (`work_registry_reducer`), which
+    /// re-populates this exactly as it did the first time (capped the same
+    /// way) — there is no separate persistence path to keep in sync.
+    #[serde(default)]
+    pub terminal_runs: std::collections::BTreeMap<String, WorkRun>,
+    /// Insertion order for `terminal_runs`, oldest first — the only state
+    /// that makes it a *bounded* cache rather than a second `runs` map:
+    /// `maybe_evict` pops the front and removes it from `terminal_runs`
+    /// whenever a new insertion would exceed
+    /// [`TERMINAL_RUN_CACHE_CAPACITY`].
+    #[serde(default)]
+    pub terminal_run_order: std::collections::VecDeque<String>,
+}
+
+/// Bound on how many terminal runs [`WorkRegistry::terminal_runs`] holds at
+/// once. Sized well above ordinary interactive browsing (an operator or
+/// dashboard looking at recently finished work) so the cache is a hit for
+/// the realistic case, while still guaranteeing the map cannot grow without
+/// bound under sustained churn (R-MVP1-9's own flat-RSS pin) — an unbounded
+/// version of this cache would just move #4's monotonic climb from `runs`
+/// to here.
+const TERMINAL_RUN_CACHE_CAPACITY: usize = 512;
+
+impl WorkRegistry {
+    /// The run for `work_id`, live or evicted-but-cached — the one lookup
+    /// every API view should use instead of reading `runs` directly, so a
+    /// terminal work's view keeps working after eviction without a caller
+    /// having to know eviction happened at all.
+    pub fn run_view(&self, work_id: &str) -> Option<&WorkRun> {
+        self.runs
+            .get(work_id)
+            .or_else(|| self.terminal_runs.get(work_id))
+    }
 }
 
 /// Everything the journal says about one work's run: the workflow it pinned,
@@ -483,8 +542,27 @@ fn maybe_evict(state: &mut WorkRegistry, work_id: Option<&str>) {
     let Some(run) = state.runs.get(work_id) else {
         return;
     };
-    if run_is_settled(work, run) {
-        state.runs.remove(work_id);
+    if !run_is_settled(work, run) {
+        return;
+    }
+    let Some(mut run) = state.runs.remove(work_id) else {
+        return;
+    };
+    // Keep only the current (last) stage attempt: every view reads stages
+    // through `current_stage()`, which already only ever looks at
+    // `.last()`, so every earlier attempt is unreachable from any view and
+    // is exactly the "heavy state" R-MVP1-9 exists to reclaim.
+    if run.stages.len() > 1 {
+        let last = run.stages.pop();
+        run.stages.clear();
+        run.stages.extend(last);
+    }
+    state.terminal_runs.insert(work_id.to_string(), run);
+    state.terminal_run_order.push_back(work_id.to_string());
+    while state.terminal_run_order.len() > TERMINAL_RUN_CACHE_CAPACITY {
+        if let Some(oldest) = state.terminal_run_order.pop_front() {
+            state.terminal_runs.remove(&oldest);
+        }
     }
 }
 
@@ -1086,6 +1164,57 @@ mod rule_a_eviction_tests {
             "every one of the {N} runs settled with nothing outstanding and \
              must have been evicted — a non-flat count here is #4's leak back"
         );
+    }
+
+    /// W2/TH-08: `terminal_runs` (the read-side cache `resolve_run` checks
+    /// before ever replaying the journal) must itself stay flat under
+    /// sustained churn beyond its own capacity — an unbounded version of it
+    /// would silently reopen #4's monotonic climb under a different field
+    /// name, defeating the eviction this whole mechanism exists for.
+    #[test]
+    fn the_terminal_run_cache_itself_stays_bounded_under_churn_beyond_its_capacity() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let total = TERMINAL_RUN_CACHE_CAPACITY + 200;
+        for i in 0..total {
+            let work_id = format!("01CACHECHURN{i:06}");
+            testing::submit(&mut core, &work_id, "cache churn");
+            testing::commit(
+                &mut core,
+                &work_id,
+                KIND_SURFACE_MATERIALIZED,
+                a_surface(&work_id),
+            );
+            testing::commit(&mut core, &work_id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &work_id,
+                KIND_SURFACE_TORN_DOWN,
+                a_teardown(&work_id),
+            );
+        }
+        let state = core.registry.state();
+        assert_eq!(state.runs.len(), 0, "still fully evicted from the live map");
+        assert_eq!(
+            state.terminal_runs.len(),
+            TERMINAL_RUN_CACHE_CAPACITY,
+            "the terminal-run cache must never exceed its own capacity, however \
+             many works settle — a growing count here is the leak this cache \
+             would otherwise reintroduce"
+        );
+        assert_eq!(
+            state.terminal_run_order.len(),
+            TERMINAL_RUN_CACHE_CAPACITY,
+            "the order queue and the cache map must shrink together"
+        );
+        // The earliest works aged out of the cache; the most recent
+        // `TERMINAL_RUN_CACHE_CAPACITY` are still there — a real work
+        // rederive_run can still answer for the aged-out ones (the fallback
+        // path), never a lost record.
+        let aged_out = "01CACHECHURN000000";
+        let still_cached = format!("01CACHECHURN{:06}", total - 1);
+        assert!(!state.terminal_runs.contains_key(aged_out));
+        assert!(state.terminal_runs.contains_key(&still_cached));
     }
 
     /// Restart indifference: rebuild-on-start is a full replay through the
