@@ -8509,3 +8509,66 @@ async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() 
 
     handle.shutdown().await;
 }
+
+/// W6: `due_interrupts` destructively dequeues every overdue entry it
+/// collects in one call — unlike `due_observations`, it is not read-only or
+/// side-effect-free, so `drive_completions`'s own interrupt-delivery loop
+/// must never abandon an already-dequeued entry partway through (that would
+/// lose the crossing with no journal trace at all, not merely defer it).
+/// Two simultaneously-hung turns, both overdue in the same driver tick, is
+/// the shape that exercises "more than one entry in one `overdue` batch" —
+/// both must end up interrupted, never just the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn r_mvp1_7_two_simultaneously_overdue_hangs_are_both_interrupted() {
+    let data = support::DataDir::new();
+    let repo_a = TempDir::new().expect("repo a");
+    let repo_b = TempDir::new().expect("repo b");
+    init_repo(repo_a.path());
+    init_repo(repo_b.path());
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang(), FakeStep::hang()]);
+    let poll = Duration::from_millis(50);
+    let ceiling = Duration::from_millis(150);
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            completion_poll: poll,
+            turn_ceiling: ceiling,
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let http = reqwest::Client::new();
+    let a = submit_over_api(&http, &handle, repo_a.path(), "hang a").await;
+    let b = submit_over_api(&http, &handle, repo_b.path(), "hang b").await;
+    let work_a = a["work"]["id"].as_str().expect("work id").to_string();
+    let work_b = b["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(a["work"]["state"], "active");
+    assert_eq!(b["work"]["state"], "active");
+
+    let budget = ceiling + poll * 10 + Duration::from_secs(5);
+    let submitted_at = Instant::now();
+    loop {
+        let events_a = events_over_api(&http, &handle, &work_a).await;
+        let events_b = events_over_api(&http, &handle, &work_b).await;
+        let a_done = events_a
+            .iter()
+            .any(|e| e.kind == KIND_TURN_CEILING_INTERRUPTED);
+        let b_done = events_b
+            .iter()
+            .any(|e| e.kind == KIND_TURN_CEILING_INTERRUPTED);
+        if a_done && b_done {
+            break;
+        }
+        assert!(
+            submitted_at.elapsed() < budget,
+            "both overdue turns must be interrupted within budget — a=done:{a_done} \
+             b=done:{b_done}; a dropped mid-loop reproduces the W6 defect"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    handle.shutdown().await;
+}

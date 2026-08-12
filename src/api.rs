@@ -625,18 +625,34 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
         }
         let (due, overdue) = {
             let core = CoreGuard::acquire(&state.core).await;
+            // Read-only, side-effect-free question asked of the projection
+            // (§22.6): nothing here is consumed, so abandoning a `due`
+            // candidate mid-loop below (shutdown) just means it is asked
+            // again next tick — or, on a restart, freshly re-derived from
+            // the projection with nothing lost.
             let due = state.engine.due_observations(&core);
             // R-MVP1-7's per-turn wall-clock ceiling rides this same 200 ms
             // sweep, read under the same guard hold `due_observations`
-            // already takes — both are read-only, side-effect-free
-            // questions asked of the projection (§22.6).
+            // already takes — but unlike `due_observations`, this one is
+            // NOT side-effect-free: `due_interrupts` destructively removes
+            // every overdue entry from `Engine`'s in-memory `turn_started`
+            // map as it collects them ("one attempt per crossing", its own
+            // doc). Once collected here, an entry in `overdue` below is the
+            // *only* record that this crossing ever happened — dropping it
+            // (e.g. on a shutdown race) rather than delivering it would
+            // lose the attempt with no journal trace at all, not merely
+            // defer it to a later tick the way an abandoned `due` observe
+            // is deferred.
             let overdue = state.engine.due_interrupts(&core, Instant::now());
             (due, overdue)
         };
+        // Every `overdue` entry was already destructively dequeued above —
+        // deliver all of them before honoring a shutdown signal that lands
+        // mid-loop, so a crossing already consumed from the clock is never
+        // silently discarded (see `due_interrupts`'s doc just above). This
+        // is why this loop, alone among the two below, does not re-check
+        // `closing` per iteration.
         for pending in overdue {
-            if *closing.borrow() {
-                return;
-            }
             crank(
                 &state,
                 Step {
