@@ -118,7 +118,12 @@ both fixed); TH-06 (the `grilling` declaration pin now uses
 `CARGO_MANIFEST_DIR`, fails closed instead of silently `SKIPPED`ing outside
 the checkout root); TH-07 (the R-MVP1-1 in-checkout guard test now names the
 actual refusal diagnostic instead of a bare state check, and
-`surface.planned`'s own `root` is pinned); TH-10 (widened the settle margin
+`surface.planned`'s own `root` is pinned); TH-08 (`scripts/perf/s2-churn.sh`
+actually run, for real, against this pass's own W1/W2 fix —
+`docs/perf/s2-churn-mvp1-fixer-2026-08-12.md`; decelerating per-wave RSS
+slope, not the pre-eviction monotonic climb, real fds, clean hygiene sweep;
+time-boxed to 60 works, not the full 200-work contract cell, named as such);
+TH-10 (widened the settle margin
 in the real-backend-refusal fault test — a genuine, not merely theoretical,
 scheduling race with the completion driver); TH-11 (R-MVP1-11's refusal now
 pinned through a real HTTP submit, matching its R-MVP1-4 siblings); TH-12
