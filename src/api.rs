@@ -1730,6 +1730,19 @@ async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) 
 /// direct test without spinning up a daemon.
 fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Path) -> Vec<Value> {
     let mut turns = Vec::new();
+    // `execution_id`s that have already emitted `conversation.assistant.
+    // completed` since the last turn boundary this loop consumed for that
+    // execution — the blob-decode fallback below must skip an envelope-less
+    // turn whose text *already* reached the journal this way (`ingest_line`
+    // emits that event for any successfully parsed `assistant` line with
+    // text, independent of whether the turn later got a `result` line — a
+    // partial-but-parseable stream, the common shape of a turn interrupted
+    // mid-generation, produces both). Without this, such a turn's text would
+    // be reported twice: once `source: "event"`, once `source:
+    // "blob_decode"`, from the very same content. Removed on consumption so
+    // the next turn on the same execution starts fresh.
+    let mut assistant_emitted_since_last_turn: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for event in events
         .into_iter()
         .filter(|e| e.work_id.as_deref() == Some(work_id))
@@ -1742,13 +1755,18 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
                 "text": event.payload["text"].as_str().unwrap_or(""),
                 "source": "event",
             })),
-            KIND_CONVERSATION_ASSISTANT_COMPLETED => turns.push(json!({
-                "seq": event.seq,
-                "ts": event.timestamp,
-                "role": "assistant",
-                "text": event.payload["text"].as_str().unwrap_or(""),
-                "source": "event",
-            })),
+            KIND_CONVERSATION_ASSISTANT_COMPLETED => {
+                if let Some(execution_id) = &event.execution_id {
+                    assistant_emitted_since_last_turn.insert(execution_id.clone());
+                }
+                turns.push(json!({
+                    "seq": event.seq,
+                    "ts": event.timestamp,
+                    "role": "assistant",
+                    "text": event.payload["text"].as_str().unwrap_or(""),
+                    "source": "event",
+                }));
+            }
             KIND_CONVERSATION_ASK => turns.push(json!({
                 "seq": event.seq,
                 "ts": event.timestamp,
@@ -1757,11 +1775,23 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
                 "source": "event",
             })),
             KIND_CONVERSATION_TURN_ENDED => {
+                // This turn's own boundary: whatever `assistant.completed`
+                // this execution emitted belongs to *this* turn (the two are
+                // always emitted by the same `TurnReader` run), so consuming
+                // it here — whether or not it changes what happens below —
+                // keeps the set scoped to "since the last turn", not "ever".
+                let already_reached_the_journal = event
+                    .execution_id
+                    .as_ref()
+                    .is_some_and(|id| assistant_emitted_since_last_turn.remove(id));
                 // A turn that closed with a result envelope already emitted
                 // its content, if any, as its own `conversation.*` event
                 // above — nothing to recover. Only the envelope-less case
-                // needs the archive.
-                if event.payload["result_envelope"].as_bool().unwrap_or(true) {
+                // needs the archive, and only when that event did NOT
+                // already carry this turn's text.
+                if event.payload["result_envelope"].as_bool().unwrap_or(true)
+                    || already_reached_the_journal
+                {
                     continue;
                 }
                 let Some(raw_ref) = event.payload["raw"].as_str() else {
@@ -3494,6 +3524,20 @@ mod tests {
     /// function itself reads (`seq`, `kind`, `work_id`, `payload`), plus the
     /// envelope fields `Event` requires to exist at all.
     fn ev(seq: u64, work_id: &str, kind: &str, payload: Value) -> Event {
+        ev_exec(seq, work_id, None, kind, payload)
+    }
+
+    /// [`ev`], plus an explicit `execution_id` — the de-dup fix's own tests
+    /// need two events sharing one (`conversation.assistant.completed` and
+    /// its turn's `conversation.turn.ended`, exactly as one `TurnReader` run
+    /// emits both).
+    fn ev_exec(
+        seq: u64,
+        work_id: &str,
+        execution_id: Option<&str>,
+        kind: &str,
+        payload: Value,
+    ) -> Event {
         Event {
             schema: EVENT_SCHEMA.to_string(),
             seq,
@@ -3502,7 +3546,7 @@ mod tests {
             source: EventSource::new("backend", "test"),
             workspace_id: None,
             work_id: Some(work_id.to_string()),
-            execution_id: None,
+            execution_id: execution_id.map(str::to_string),
             correlation_id: None,
             causation_id: None,
             kind: kind.to_string(),
@@ -3651,6 +3695,305 @@ mod tests {
         assert!(
             turns.is_empty(),
             "a turn that ended with an envelope must not decode its archive: {turns:?}"
+        );
+    }
+
+    /// MVP-3 test-honesty finding TH-1 (discovered while building its e2e
+    /// closure, `tests/m4_backends.rs`'s
+    /// `work_transcript_recovers_an_interrupted_turns_text_from_the_real_
+    /// journal`): a turn interrupted *after* streaming a complete assistant
+    /// text line ends with no `result` line — `result_envelope: false`, same
+    /// as any other envelope-less turn — but `ingest_line` already emitted
+    /// `conversation.assistant.completed` live for that line, independent of
+    /// whether a `result` line ever follows. Before the fix, `transcript_
+    /// turns` had no way to know that and decoded the archive too,
+    /// reporting the same text twice. The `execution_id`-scoped fix must
+    /// recover text ONLY for the execution/turn that genuinely never
+    /// emitted it live.
+    ///
+    /// guard-map: dropping the `already_reached_the_journal` check (or its
+    /// `execution_id` scoping) makes this fail with two "already said" turns
+    /// instead of one.
+    #[test]
+    fn transcript_turns_never_double_reports_text_the_live_event_already_carried() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"already said"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![
+            // Live-ingested during the turn, exactly as `ingest_line` does
+            // for any complete `assistant` text line, whether or not a
+            // `result` line ever follows.
+            ev_exec(
+                1,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "already said"}),
+            ),
+            // The turn ends with no result envelope (interrupted mid-stream,
+            // after the line above already landed).
+            ev_exec(
+                2,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({
+                    "interrupted": true,
+                    "result_envelope": false,
+                    "raw": blob_ref.to_string(),
+                }),
+            ),
+        ];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert_eq!(
+            turns.len(),
+            1,
+            "the text already reached the journal live; the archive must not add a second \
+             copy of it: {turns:?}"
+        );
+        assert_eq!(turns[0]["source"], "event");
+        assert_eq!(turns[0]["text"], "already said");
+    }
+
+    /// A minimal scripted `claude` executable: passes the adapter's version/
+    /// help probe, then on any other invocation prints `transcript` to
+    /// stdout and exits 0. Written fresh per test so the probe cache (keyed
+    /// per `ClaudeBackend` instance, not per path) never crosses tests.
+    fn write_stub_claude(dir: &std::path::Path, transcript: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("claude-stub");
+        let replay = dir.join("replay.jsonl");
+        std::fs::write(&replay, transcript).expect("write replay");
+        let help = crate::backend::claude::REQUIRED_FLAGS.join(" ");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.226 (Claude Code)';;\n  \
+             --help) echo '{help}';;\n  *) cat '{replay}';;\nesac\n",
+            replay = replay.display(),
+        );
+        std::fs::write(&path, script).expect("write stub");
+        let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod stub");
+        path
+    }
+
+    /// MVP-3 test-honesty finding TH-1: a real producer (`backend::claude`'s
+    /// `ClaudeBackend`/`TurnReader`, driven by a scripted `claude` CLI, not a
+    /// hand-fabricated `Event`) all the way to `transcript_turns`'s blob-
+    /// decode fallback — closing the gap the finding named: "no test spans
+    /// producer→journal→transcript_turns", so a rename of the `raw`/
+    /// `result_envelope` payload key on the producer side would leave this
+    /// test failing instead of silently passing (its own guard-map below).
+    ///
+    /// The turn streams one real assistant text line and no `result` line
+    /// (an envelope-less turn — same shape `backend::claude`'s own
+    /// `partial_turn` fixture models). The event sink here converts every
+    /// `EventDraft` into a real journaled `Event`, exactly as the daemon's
+    /// own `journaling_sink` does, **except** it drops
+    /// `conversation.assistant.completed` — modeling CLAUDE.md's own
+    /// "adjacent-append crash window" (an event handed to the sink but
+    /// never durably committed before the process holding it dies), which is
+    /// this module's own doc comment's stated reason `decode_partial_
+    /// assistant_text` exists at all (`work_transcript`'s doc, above). This
+    /// is the *only* scenario in which the archive is not simply redundant
+    /// with what the live event already carried (see the de-dup tests
+    /// above) — proven by asserting the dropped kind really is absent from
+    /// what reached the journal, not merely by not looking for it.
+    ///
+    /// guard-map: renaming the producer's `raw`/`result_envelope` payload
+    /// keys (with `TurnReader::run`'s own emit call updated to match, so the
+    /// producer is internally consistent) makes this fail — `transcript_
+    /// turns` hits the `continue` fall-throughs and recovers nothing, while
+    /// the two hand-fabricated unit tests above stay green regardless.
+    #[test]
+    fn transcript_turns_recovers_a_real_producers_text_across_a_simulated_adjacent_append_loss() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let stub_dir = tempfile::TempDir::new().expect("tempdir");
+        let assistant_line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "cut off mid-thought"}]},
+        })
+        .to_string();
+        let stub = write_stub_claude(stub_dir.path(), &format!("{assistant_line}\n"));
+
+        let mut config = crate::backend::claude::ClaudeConfig::new(data_dir.path());
+        config.executable = stub;
+        let backend = crate::backend::claude::ClaudeBackend::new(config);
+
+        let journaled: Arc<std::sync::Mutex<Vec<Event>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let next_seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let (journaled_for_sink, seq_for_sink) = (Arc::clone(&journaled), Arc::clone(&next_seq));
+        backend.set_event_sink(Arc::new(move |draft: EventDraft| {
+            if draft.kind == KIND_CONVERSATION_ASSISTANT_COMPLETED {
+                // Simulated crash-window loss: handed to the sink, never
+                // committed. See this test's own doc comment.
+                return;
+            }
+            let seq = seq_for_sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            journaled_for_sink
+                .lock()
+                .expect("journaled lock")
+                .push(Event {
+                    schema: EVENT_SCHEMA.to_string(),
+                    seq,
+                    id: format!("evt-{seq}"),
+                    timestamp: rfc3339_utc_now(),
+                    source: draft.source,
+                    workspace_id: draft.workspace_id,
+                    work_id: draft.work_id,
+                    execution_id: draft.execution_id,
+                    correlation_id: draft.correlation_id,
+                    causation_id: draft.causation_id,
+                    kind: draft.kind,
+                    payload: draft.payload,
+                    extra: Default::default(),
+                });
+        }));
+
+        let request = crate::backend::StartRequest {
+            work_id: "w-real".to_string(),
+            execution_id: "e-real".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: data_dir.path().to_path_buf(),
+            intent: "say something and get cut off".to_string(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
+        };
+        let handle = {
+            use crate::backend::Backend;
+            backend.start(&request).expect("start")
+        };
+
+        // The stub exits right after replaying, so the turn settles on its
+        // own — no interrupt/kill needed to get an envelope-less outcome.
+        // A naturally-exited, envelope-less, non-interrupted turn reports
+        // `NativeState::Unknown` (ambiguity fails closed — the same
+        // classification `backend::claude`'s own
+        // `a_turns_stderr_is_waited_for_rather_than_snapshotted` pins), not
+        // `Exited`, so this waits for "no longer `Running`" rather than for
+        // a specific terminal state.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed = {
+                use crate::backend::Backend;
+                backend.observe(&handle).expect("observe")
+            };
+            if observed.native != crate::backend::NativeState::Running {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the stub turn never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The reader thread's archive write + emits land shortly after the
+        // native state flips; a short settle margin avoids a flaky read of
+        // `journaled` mid-write.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while journaled
+            .lock()
+            .expect("journaled lock")
+            .iter()
+            .all(|e| e.kind != KIND_CONVERSATION_TURN_ENDED)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "conversation.turn.ended never reached the sink"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let events = journaled.lock().expect("journaled lock").clone();
+        assert!(
+            events
+                .iter()
+                .all(|e| e.kind != KIND_CONVERSATION_ASSISTANT_COMPLETED),
+            "the simulated loss must really have dropped it, not merely gone unchecked: {events:?}"
+        );
+        let ended = events
+            .iter()
+            .find(|e| e.kind == KIND_CONVERSATION_TURN_ENDED)
+            .expect("the real producer must emit conversation.turn.ended");
+        assert_eq!(
+            ended.payload["result_envelope"], false,
+            "no result line was replayed, so the real producer must say so: {}",
+            ended.payload
+        );
+
+        let turns = transcript_turns("w-real", events, data_dir.path());
+        let recovered = turns
+            .iter()
+            .find(|t| t["source"] == "blob_decode")
+            .unwrap_or_else(|| panic!("must recover the real archive's text: {turns:?}"));
+        assert_eq!(recovered["text"], "cut off mid-thought");
+    }
+
+    /// The de-dup above is scoped to *this* execution's *next* turn boundary
+    /// only — a genuinely different execution (or a later turn on the same
+    /// execution that streamed no assistant text of its own) must still get
+    /// its own archive recovered independently.
+    #[test]
+    fn transcript_turns_still_recovers_a_different_executions_archive() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"never live-emitted"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![
+            // `e1`'s assistant text reached the journal live.
+            ev_exec(
+                1,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "e1 said this live"}),
+            ),
+            ev_exec(
+                2,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({"interrupted": false, "result_envelope": true, "raw": Value::Null}),
+            ),
+            // `e2` is a different execution that never got as far as
+            // emitting any assistant line live (killed before one parsed).
+            ev_exec(
+                3,
+                "w1",
+                Some("e2"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({
+                    "interrupted": true,
+                    "result_envelope": false,
+                    "raw": blob_ref.to_string(),
+                }),
+            ),
+        ];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        let shape: Vec<(&str, &str)> = turns
+            .iter()
+            .map(|t| (t["source"].as_str().unwrap(), t["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("event", "e1 said this live"),
+                ("blob_decode", "never live-emitted"),
+            ],
+            "e2's archive must still be recovered independently of e1's: {turns:?}"
         );
     }
 
