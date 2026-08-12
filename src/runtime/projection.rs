@@ -1233,11 +1233,14 @@ mod rule_a_eviction_tests {
         assert_eq!(rederived, None);
     }
 
-    /// The S2 churn scenario's own claim, proven at the projection level
-    /// rather than through a live daemon and `scripts/perf/s2-churn.sh`'s RSS
-    /// sampling: `WorkRegistry::runs` — the structure #4's ~25 kB/work
+    /// The S2 churn scenario's own claim, proven here at the projection
+    /// level: `WorkRegistry::runs` — the structure #4's ~25 kB/work
     /// unbounded climb lived in — stays flat across many completed works,
-    /// never one entry per work submitted.
+    /// never one entry per work submitted. TH-08: the daemon-level half of
+    /// this claim (real RSS, real fds, real hygiene, not a struct field
+    /// count) is `docs/perf/s2-churn-mvp1-fixer-2026-08-12.md` — run against
+    /// this same fix, decelerating per-wave slope, not the pre-eviction
+    /// monotonic climb `docs/perf/baseline-cerberus-2026-08-11.md` measured.
     ///
     /// Mutation this kills: removing the eviction call (or narrowing
     /// `is_absorbing` to nothing) turns `runs.len()` into `N`, not `0`.
