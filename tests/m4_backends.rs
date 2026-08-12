@@ -8275,25 +8275,22 @@ fn r_mvp1_7_a_send_that_internally_retries_through_resume_counts_one_turn() {
 /// is the ruling's own admitted workflow.
 #[test]
 fn r_mvp1_11_grillings_interview_stage_declares_requires_ask() {
-    let root = std::env::current_dir()
-        .expect("cwd")
-        .ancestors()
-        .find(|p| {
-            p.join(".sergeant/workflows/grilling/workflow.toml")
-                .is_file()
-        })
-        .map(|p| p.to_path_buf());
-    let Some(root) = root else {
-        // Not running from inside the checkout (e.g. a packaged binary's
-        // test run) — nothing to check against, and no fixture to fall back
-        // to would be honest here, so this pin is a no-op rather than a
-        // false failure. Every other R-MVP1-11 test below exercises the
-        // mechanism directly regardless.
-        eprintln!(
-            "SKIPPED r_mvp1_11_grillings_interview_stage_declares_requires_ask: not inside the sergeant-rs checkout"
-        );
-        return;
-    };
+    // TH-06: `CARGO_MANIFEST_DIR` is exact for an integration test target —
+    // this crate root is where `.sergeant/` actually lives — unlike a
+    // cwd-ancestor search, which silently converts the exact regression
+    // this pin exists to catch (`.sergeant/workflows/grilling/workflow.toml`
+    // deleted, renamed, or moved) into `SKIPPED` rather than a failure the
+    // moment `cargo test`'s own working directory is anything but the
+    // checkout root.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+    assert!(
+        root.join(".sergeant/workflows/grilling/workflow.toml")
+            .is_file(),
+        "{} has no .sergeant/workflows/grilling/workflow.toml — CARGO_MANIFEST_DIR must be \
+         this checkout's root for an integration test target, so this is a real regression, \
+         not an environment this pin should skip",
+        root.display()
+    );
     let workflow = sergeant_rs::domain::workflow::WorkflowDefinition::resolve(&root, "grilling")
         .expect("grilling resolves");
     let interview = workflow
