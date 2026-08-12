@@ -34,5 +34,5 @@ the repo — the inbox holds ONLY not-yet-accepted material. Check it on
 wake.
 
 Repo invariants (target size, build times, test counts) intentionally NOT
-here — they live in CLAUDE.md. Sibling files: `claude-code-cloud.md`,
+here — they live in `docs/DEVELOPMENT.md`. Sibling files: `claude-code-cloud.md`,
 `github-runner.md`.

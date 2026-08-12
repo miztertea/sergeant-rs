@@ -1738,7 +1738,7 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
     // assistant_lines`) produces the same count of entries in the same
     // order. The blob-decode fallback below skips that many leading lines
     // from the archive rather than an all-or-nothing flag, so a crash that
-    // lands between two of a turn's own assistant-line appends (CLAUDE.md's
+    // lands between two of a turn's own assistant-line appends (docs/DEVELOPMENT.md's
     // "adjacent-append crash window") still recovers the lines that never
     // reached the journal, instead of either double-reporting the ones that
     // did or silently dropping the ones that didn't. Removed on consumption
@@ -3883,7 +3883,7 @@ mod tests {
     /// `partial_turn` fixture models). The event sink here converts every
     /// `EventDraft` into a real journaled `Event`, exactly as the daemon's
     /// own `journaling_sink` does, **except** it drops
-    /// `conversation.assistant.completed` — modeling CLAUDE.md's own
+    /// `conversation.assistant.completed` — modeling docs/DEVELOPMENT.md's own
     /// "adjacent-append crash window" (an event handed to the sink but
     /// never durably committed before the process holding it dies), which is
     /// this module's own doc comment's stated reason `decode_partial_

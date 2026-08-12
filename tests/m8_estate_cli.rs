@@ -979,7 +979,7 @@ fn run_turns_and_ceiling_secs_override_the_envelope_for_one_work() {
 /// guard-map: `sgt daemon stop` (E4, MVP-3's "cheap-now" item) actually
 /// stops the daemon it names, gracefully — `data_dir.daemon_pids()` (the
 /// same pattern-scan `DataDir`'s own `Drop` leak check uses) finds nothing
-/// afterward, matching CLAUDE.md's own leak-detection convention. Also pins
+/// afterward, matching docs/DEVELOPMENT.md's own leak-detection convention. Also pins
 /// idempotence in both directions named in the task: stopping a daemon that
 /// is not running yet, and stopping one that is already stopped, are both
 /// clean successes, never errors. `tests/m6_surfaces.rs`'s

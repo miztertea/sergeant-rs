@@ -4081,7 +4081,7 @@ async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_ca
         }
     }
     let _restore = RestorePerms(surfaces_root.clone());
-    // Environment probe (CLAUDE.md's testing rules): the root dev container
+    // Environment probe (docs/DEVELOPMENT.md's testing rules): the root dev container
     // silently passes permission-bit tricks. Cerberus and the GH runner both
     // enforce them (docs/environments/cerberus.md); where they do not, this
     // fixture cannot be armed and must skip loudly rather than fail for the

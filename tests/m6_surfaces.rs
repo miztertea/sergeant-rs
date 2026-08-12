@@ -3270,7 +3270,7 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
 /// guard-map: MVP-3's admission drain flag (`sgt daemon stop`, scoped
 /// exactly to that use) — one journaled `admission.paused`/
 /// `admission.resumed` event pair plus a submit refusal while paused — and
-/// the L6 crash window CLAUDE.md names explicitly for this class of
+/// the L6 crash window docs/DEVELOPMENT.md names explicitly for this class of
 /// mechanism: a daemon killed *after* `admission.paused` is durable but
 /// *before* it ever gets to stop must not leave the data dir stuck refusing
 /// work forever.

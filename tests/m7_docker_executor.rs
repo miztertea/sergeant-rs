@@ -1,7 +1,7 @@
 //! N4 acceptance: the Docker executor (`kind = "execute"`), against a real
 //! local Docker Engine (§22.7-§22.10).
 //!
-//! **Environment posture (CLAUDE.md's testing rules, `docs/environments/`).**
+//! **Environment posture (docs/DEVELOPMENT.md's testing rules, `docs/environments/`).**
 //! Every test in this file probe-gates on [`docker_unavailable`] and skips
 //! loudly (`SKIPPED-ENV`) rather than failing hard when the host cannot
 //! express the shape — Cerberus (`docs/environments/cerberus.md`) runs the
@@ -41,7 +41,7 @@ const PROBE_IMAGE: &str = "alpine:3";
 
 /// Whether the local Docker Engine answers at all. Every test in this file
 /// calls this first and returns early (with a loud, named skip) when it does
-/// not — the CLAUDE.md/environments convention for a shape a hosted runner
+/// not — the docs/DEVELOPMENT.md/environments convention for a shape a hosted runner
 /// may not be able to express, distinct from a locally-fixable precondition.
 fn docker_unavailable() -> Option<&'static str> {
     match Command::new("docker").arg("version").output() {

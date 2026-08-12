@@ -1268,7 +1268,7 @@ fn dir_size(path: &Path) -> u64 {
 #[cfg(unix)]
 fn free_space(path: &Path) -> Option<u64> {
     // `statvfs` is the portable POSIX call for this; sergeant is Linux-first
-    // (`CLAUDE.md`) and this crate otherwise reaches such facts through
+    // (`docs/DEVELOPMENT.md`) and this crate otherwise reaches such facts through
     // `std`, so a `df`-equivalent shell-out is used instead of adding a
     // libc-binding dependency for one syscall — the same "smaller direct
     // client" posture the module docs already take for Docker itself. `df`
