@@ -75,6 +75,14 @@ enum Command {
         /// Targeted repository (repeatable).
         #[arg(long = "repo")]
         repositories: Vec<String>,
+        /// A declared `[group.<name>]`'s repositories, expanded client-side
+        /// into the same selection `--repo` builds (R-MVP1-5(b): group
+        /// membership gets no new engine surface — this is pure CLI-side
+        /// flag expansion over the existing `repositories` field). Combines
+        /// with any `--repo` flags given alongside it (union, declaration
+        /// order, duplicates dropped).
+        #[arg(long)]
+        group: Option<String>,
         /// Workspace to scope the work to.
         #[arg(long)]
         workspace: Option<String>,
@@ -132,6 +140,86 @@ enum Command {
     /// Diagnose this installation (§31): tools, data dir, journal, projection,
     /// daemon. Every failing check names the remedy.
     Doctor,
+    /// Scaffold an estate at the current directory (MVP-3): `[estate]` in
+    /// `sergeant.toml`, `repos/`, `.gitignore` entries for `.sergeant/data`
+    /// and `repos/`. Idempotent — a second run on an already-initialized
+    /// estate changes nothing. Runs the same `sgt doctor` checks afterward
+    /// (no daemon is spawned, matching `sgt doctor`'s own rule).
+    Init {
+        /// Estate name (default: this directory's own name). Ignored on a
+        /// re-run that finds `[estate]` already present — init never renames
+        /// an existing estate.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Manage the estate's declared repositories (`[[repo]]` in
+    /// `sergeant.toml`). A pure manifest edit — no daemon involved.
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
+    /// Manage the estate's declared groups (`[group.<name>]` in
+    /// `sergeant.toml`). A pure manifest edit — no daemon involved.
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
+}
+
+/// `sgt repo ...` subcommands (MVP-3).
+#[derive(Subcommand, Debug)]
+enum RepoCommand {
+    /// Declare a repository: clone `--origin` into `repos/<name>` if the
+    /// directory does not exist yet, or verify it is already a git
+    /// repository if it does, then add `[[repo]]`.
+    Add {
+        /// Repository name (mounts at `repos/<name>`).
+        name: String,
+        /// Clone source. Required unless `repos/<name>` already exists.
+        #[arg(long)]
+        origin: Option<String>,
+        /// R-MVP1-4 instruction policy: `local` or `suppress` (default:
+        /// unset, which resolves to `suppress`).
+        #[arg(long)]
+        instructions: Option<String>,
+    },
+    /// Undeclare a repository. Refuses (naming the group) while any group
+    /// still lists it as a member. Never deletes `repos/<name>` from disk.
+    Remove {
+        /// Repository name to undeclare.
+        name: String,
+    },
+    /// List declared repositories.
+    List,
+}
+
+/// `sgt group ...` subcommands (MVP-3).
+#[derive(Subcommand, Debug)]
+enum GroupCommand {
+    /// Declare or extend a group. mkdir-p semantics: creating an existing
+    /// group unions the given repositories into its membership rather than
+    /// erroring; every member must already be a declared repository (fail
+    /// closed, naming which one is not and the remedy).
+    Add {
+        /// Group name.
+        name: String,
+        /// Member repository names (repeatable positionally).
+        repos: Vec<String>,
+        /// One orientation line (AI-facing).
+        #[arg(long)]
+        brief: Option<String>,
+    },
+    /// Remove a group, or specific members from it. With no repository
+    /// arguments, removes the whole group; with one or more, removes just
+    /// those members (each must actually belong to the group).
+    Remove {
+        /// Group name.
+        name: String,
+        /// Member repository names to drop (omit to remove the whole group).
+        repos: Vec<String>,
+    },
+    /// List declared groups and their members.
+    List,
 }
 
 /// `sgt work ...` subcommands.
@@ -185,6 +273,18 @@ impl From<daemon::DaemonError> for CliError {
     }
 }
 
+impl From<crate::domain::workspace::WorkspaceError> for CliError {
+    fn from(e: crate::domain::workspace::WorkspaceError) -> Self {
+        Self(e.to_string())
+    }
+}
+
+impl From<crate::domain::manifest::ManifestError> for CliError {
+    fn from(e: crate::domain::manifest::ManifestError) -> Self {
+        Self(e.to_string())
+    }
+}
+
 impl From<std::io::Error> for CliError {
     fn from(e: std::io::Error) -> Self {
         Self(e.to_string())
@@ -220,14 +320,28 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// Resolve the data dir: `--data-dir` flag, `SGT_DATA_DIR`, then
-/// `$XDG_DATA_HOME/sergeant` or `~/.local/share/sergeant`.
+/// Resolve the data dir: `--data-dir` flag, `SGT_DATA_DIR` — both unchanged,
+/// unconditional precedence — then (U-R2, MVP-3's estate-resolved default) an
+/// estate discovered by walking upward from the current directory, mirroring
+/// R-MVP1-12: filesystem-first, crossing git boundaries, bounded at `$HOME`.
+/// When one is found, the default is `<estate_root>/.sergeant/data` — the
+/// same path `sgt init` scaffolds a `.gitignore` entry for
+/// ([`crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR`]). This is a new
+/// fallback *rung*, not a replacement: only once no estate is found (or the
+/// current directory cannot even be read) does resolution fall through to
+/// the pre-estate default, `$XDG_DATA_HOME/sergeant` or
+/// `~/.local/share/sergeant`, unchanged.
 fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
     if let Some(dir) = flag {
         return Ok(dir);
     }
     if let Some(dir) = std::env::var_os("SGT_DATA_DIR") {
         return Ok(PathBuf::from(dir));
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(estate_root) = crate::domain::workspace::Workspace::estate_root(&cwd, None)?
+    {
+        return Ok(estate_root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR));
     }
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         return Ok(PathBuf::from(xdg).join("sergeant"));
@@ -291,9 +405,38 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             workflow,
             backend,
             profile,
-            repositories,
+            mut repositories,
+            group,
             workspace,
         } => {
+            // R-MVP1-5(b): group membership gets no new engine surface —
+            // `--group` is pure CLI-side expansion into the same
+            // `repositories` selection `--repo` already builds, over the
+            // estate discovered from the current directory (bounded at this
+            // daemon's own data dir, mirroring every other client-side
+            // workspace read in this binary).
+            if let Some(group_name) = &group {
+                let cwd = std::env::current_dir()?;
+                let resolved =
+                    crate::domain::workspace::Workspace::discover_scoped(&cwd, Some(&data_dir))?;
+                let members = resolved.groups.get(group_name).ok_or_else(|| {
+                    let available: Vec<&str> = resolved.groups.keys().map(String::as_str).collect();
+                    CliError::new(format!(
+                        "no group {group_name:?} declared in this estate (declared: {}); \
+                         declare it first with `sgt group add {group_name} <repo>...`",
+                        if available.is_empty() {
+                            "none".to_string()
+                        } else {
+                            available.join(", ")
+                        }
+                    ))
+                })?;
+                for repo in &members.repos {
+                    if !repositories.contains(repo) {
+                        repositories.push(repo.clone());
+                    }
+                }
+            }
             let client = ensure_daemon(&data_dir).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
@@ -485,6 +628,193 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 // noise. The nonzero exit is the machine-readable half.
                 Err(CliError::silent())
             }
+        }
+        Command::Init { name } => {
+            let cwd = std::env::current_dir()?;
+            let outcome = crate::domain::manifest::init_estate(&cwd, name.as_deref())?;
+            let report = doctor::run(&data_dir).await;
+            if sgt.json {
+                print_json(&json!({
+                    "outcome": {
+                        "manifest_created": outcome.manifest_created,
+                        "estate_section_added": outcome.estate_section_added,
+                        "repos_dir_created": outcome.repos_dir_created,
+                        "gitignore_updated": outcome.gitignore_updated,
+                        "changed": outcome.changed(),
+                    },
+                    "doctor": report.to_json(),
+                }));
+            } else {
+                if outcome.changed() {
+                    println!("initialized estate at {}", cwd.display());
+                    if outcome.manifest_created {
+                        println!("  created sergeant.toml");
+                    }
+                    if outcome.estate_section_added && !outcome.manifest_created {
+                        println!("  added [estate] to the existing sergeant.toml");
+                    }
+                    if outcome.repos_dir_created {
+                        println!("  created repos/");
+                    }
+                    if outcome.gitignore_updated {
+                        println!("  updated .gitignore");
+                    }
+                } else {
+                    println!(
+                        "estate at {} is already initialized — nothing to do",
+                        cwd.display()
+                    );
+                }
+                println!();
+                report.print();
+            }
+            if report.healthy() {
+                Ok(())
+            } else {
+                Err(CliError::silent())
+            }
+        }
+        Command::Repo { command } => repo_command(sgt.json, &data_dir, command).await,
+        Command::Group { command } => group_command(sgt.json, &data_dir, command).await,
+    }
+}
+
+/// The estate root every `sgt repo`/`sgt group` verb edits: discovered from
+/// the current directory (R-MVP1-12's own walk, bounded at `$HOME` and at
+/// this daemon's own data dir), never created by these verbs — that is
+/// `sgt init`'s job.
+fn discover_estate_root(data_dir: &Path) -> Result<PathBuf, CliError> {
+    let cwd = std::env::current_dir()?;
+    crate::domain::workspace::Workspace::estate_root(&cwd, Some(data_dir))?.ok_or_else(|| {
+        CliError::new(
+            "no estate found above the current directory (bounded at $HOME) — run `sgt init` \
+             first, at the directory that should become the estate root",
+        )
+    })
+}
+
+/// `sgt repo add/remove/list` (MVP-3): a pure manifest edit/read, no daemon
+/// involved — repository declarations are estate topology (§9), not runtime
+/// state.
+async fn repo_command(json: bool, data_dir: &Path, command: RepoCommand) -> Result<(), CliError> {
+    let estate_root = discover_estate_root(data_dir)?;
+    match command {
+        RepoCommand::Add {
+            name,
+            origin,
+            instructions,
+        } => {
+            let policy = match instructions.as_deref() {
+                None => None,
+                Some("local") => Some(crate::domain::workspace::InstructionPolicy::Local),
+                Some("suppress") => Some(crate::domain::workspace::InstructionPolicy::Suppress),
+                Some(other) => {
+                    return Err(CliError::new(format!(
+                        "--instructions {other:?} is not recognized (use \"local\" or \"suppress\")"
+                    )));
+                }
+            };
+            crate::domain::manifest::add_repo(&estate_root, &name, origin.as_deref(), policy)?;
+            if json {
+                print_json(&json!({"added": name}));
+            } else {
+                println!(
+                    "added repo {name} at {}",
+                    estate_root.join("repos").join(&name).display()
+                );
+            }
+            Ok(())
+        }
+        RepoCommand::Remove { name } => {
+            crate::domain::manifest::remove_repo(&estate_root, &name)?;
+            if json {
+                print_json(&json!({"removed": name}));
+            } else {
+                println!("removed repo {name}");
+            }
+            Ok(())
+        }
+        RepoCommand::List => {
+            let workspace = crate::domain::workspace::Workspace::from_config_allow_empty(
+                &estate_root.join(crate::domain::workspace::WORKSPACE_FILE),
+            )?;
+            if json {
+                print_json(&json!({
+                    "repositories": workspace.repositories.iter().map(|r| json!({
+                        "name": r.name,
+                        "path": r.path,
+                        "instructions": workspace.instruction_policy(&r.name).as_str(),
+                        "origin": workspace.repository_origin(&r.name),
+                    })).collect::<Vec<_>>(),
+                }));
+            } else if workspace.repositories.is_empty() {
+                println!("no repositories declared");
+            } else {
+                for r in &workspace.repositories {
+                    println!(
+                        "{}  {}  instructions={}  origin={}",
+                        r.name,
+                        r.path.display(),
+                        workspace.instruction_policy(&r.name),
+                        workspace.repository_origin(&r.name).unwrap_or("-"),
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `sgt group add/remove/list` (MVP-3): a pure manifest edit/read, same
+/// rationale as [`repo_command`].
+async fn group_command(json: bool, data_dir: &Path, command: GroupCommand) -> Result<(), CliError> {
+    let estate_root = discover_estate_root(data_dir)?;
+    match command {
+        GroupCommand::Add { name, repos, brief } => {
+            crate::domain::manifest::add_group(&estate_root, &name, &repos, brief.as_deref())?;
+            if json {
+                print_json(&json!({"group": name}));
+            } else {
+                println!("group {name} updated");
+            }
+            Ok(())
+        }
+        GroupCommand::Remove { name, repos } => {
+            crate::domain::manifest::remove_group(&estate_root, &name, &repos)?;
+            if json {
+                print_json(&json!({"group": name}));
+            } else if repos.is_empty() {
+                println!("removed group {name}");
+            } else {
+                println!("removed {} from group {name}", repos.join(", "));
+            }
+            Ok(())
+        }
+        GroupCommand::List => {
+            let workspace = crate::domain::workspace::Workspace::from_config_allow_empty(
+                &estate_root.join(crate::domain::workspace::WORKSPACE_FILE),
+            )?;
+            if json {
+                print_json(&json!({
+                    "groups": workspace.groups.iter().map(|(name, g)| json!({
+                        "name": name,
+                        "repos": g.repos,
+                        "brief": g.brief,
+                    })).collect::<Vec<_>>(),
+                }));
+            } else if workspace.groups.is_empty() {
+                println!("no groups declared");
+            } else {
+                for (name, g) in &workspace.groups {
+                    let brief = g
+                        .brief
+                        .as_deref()
+                        .map(|b| format!("  {b}"))
+                        .unwrap_or_default();
+                    println!("{}  [{}]{}", name, g.repos.join(", "), brief);
+                }
+            }
+            Ok(())
         }
     }
 }
