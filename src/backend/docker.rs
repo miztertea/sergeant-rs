@@ -154,6 +154,17 @@ fn host_owner_user_flag(_cwd: &Path) -> Option<String> {
 /// evidence — the blob is the evidence.
 const TAIL_BYTES: usize = 8192;
 
+/// Overrides which `docker` binary [`DockerConfig::new`] points at, mirroring
+/// `backend::claude::CLAUDE_BIN_ENV` (TH-02, MVP-2 D3 fixer pass). Without
+/// this, `sgt doctor`'s docker row was the one check every other doctor row
+/// could be pointed away from a real binary for (`claude_check` honors
+/// `SGT_CLAUDE_BIN`) and this one could not — so the operator-visible `Warn`
+/// arm an operator *without* Docker actually sees could never be exercised
+/// on a host that has Docker, and any fixture asserting the docker row was
+/// silently host-dependent instead of being able to probe-gate on a
+/// scripted binary the way the Claude row already can.
+pub const DOCKER_BIN_ENV: &str = "SGT_DOCKER_BIN";
+
 /// Configuration for [`DockerBackend`].
 #[derive(Debug, Clone)]
 pub struct DockerConfig {
@@ -166,12 +177,12 @@ pub struct DockerConfig {
 }
 
 impl DockerConfig {
-    /// The ordinary configuration: `docker` on `PATH`, adapter state under
-    /// `data_dir`.
+    /// The ordinary configuration: `docker` on `PATH` (or [`DOCKER_BIN_ENV`]
+    /// when set — see its doc), adapter state under `data_dir`.
     pub fn new(data_dir: &Path) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
-            docker_bin: "docker".to_string(),
+            docker_bin: std::env::var(DOCKER_BIN_ENV).unwrap_or_else(|_| "docker".to_string()),
         }
     }
 }
@@ -1104,11 +1115,11 @@ impl Backend for DockerBackend {
 fn remove_owned_container(docker_bin: &str, name: &str, execution_id: &str) {
     let inspect = Command::new(docker_bin).args(["inspect", name]).output();
     let info: Option<Value> = match inspect {
-        Ok(output) if output.status.success() => serde_json::from_slice::<Vec<Value>>(
-            &output.stdout,
-        )
-        .ok()
-        .and_then(|v| v.into_iter().next()),
+        Ok(output) if output.status.success() => {
+            serde_json::from_slice::<Vec<Value>>(&output.stdout)
+                .ok()
+                .and_then(|v| v.into_iter().next())
+        }
         Ok(_) => None, // Docker's "no such object": nothing to remove.
         Err(e) => {
             tracing::warn!(

@@ -1143,11 +1143,25 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let data = TempDir::new().expect("tempdir");
     let bin = TempDir::new().expect("tempdir");
     let claude = stub_claude(bin.path());
+    // TH-02 (MVP-2 D3 fixer pass): a scripted `docker`, the same reason
+    // `claude` above is scripted — this test's "every check must be ok"
+    // assertion below must not depend on whether *this host* happens to
+    // have a reachable Docker Engine (N4.md's own probe-gating rule for
+    // Docker facts on the GH runner / cloud container).
+    let docker = stub_docker(bin.path());
 
     // --- healthy -------------------------------------------------------------
-    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
-    let (code, healthy_json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (code, healthy_json, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     assert_eq!(code, Some(0));
     let report: Value = serde_json::from_str(&healthy_json).expect("doctor --json is json");
     assert_eq!(report["healthy"], true);
@@ -1194,13 +1208,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // and require the same verdict, now with real numbers behind it.
     let used = TempDir::new().expect("tempdir");
     seed_journal(used.path(), 5);
-    let (code, stdout, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_eq!(
         code,
         Some(0),
         "a populated healthy install must exit 0:\n{stdout}"
     );
-    let (_, used_json, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, used_json, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&used_json).expect("json");
     assert_eq!(report["healthy"], true);
     let journal = named_check(&report, "journal");
@@ -1221,9 +1243,17 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     // …and a journal it cannot replay is a failure, not a shrug.
     corrupt_journal(used.path());
-    let (code, stdout, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(code, Some(0), "an unreplayable journal must exit nonzero");
-    let (_, torn_json, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, torn_json, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&torn_json).expect("json");
     assert_eq!(named_check(&report, "journal")["status"], "fail");
     assert!(
@@ -1248,7 +1278,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
 
     // Stability: the same environment produces the same shape (keys, names,
     // order, statuses) — only details may move.
-    let (_, first_again, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, first_again, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let first_again: Value = serde_json::from_str(&first_again).expect("json");
     let healthy_report: Value =
         serde_json::from_str(&healthy_json).expect("the first healthy report reparses");
@@ -1260,9 +1294,17 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
 
     // --- an absent claude -----------------------------------------------------
     let missing = bin.path().join("no-such-claude").display().to_string();
-    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &missing)], false);
+    let (code, stdout, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &missing), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(code, Some(0), "an unusable claude must exit nonzero");
-    let (_, absent_json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &missing)], true);
+    let (_, absent_json, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &missing), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&absent_json).expect("json");
     assert_eq!(report["healthy"], false);
     let check = named_check(&report, "claude");
@@ -1338,13 +1380,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let live_cwd = TempDir::new().expect("tempdir");
     {
         let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
-        let (code, stdout, _) = doctor(live_data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+        let (code, stdout, _) = doctor(
+            live_data.path(),
+            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            false,
+        );
         assert_eq!(
             code,
             Some(0),
             "a healthy install with a daemon behind it must exit 0:\n{stdout}"
         );
-        let (_, live_json, _) = doctor(live_data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+        let (_, live_json, _) = doctor(
+            live_data.path(),
+            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            true,
+        );
         let report: Value = serde_json::from_str(&live_json).expect("json");
         let check = named_check(&report, "daemon");
         assert_eq!(
@@ -1367,13 +1417,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // command republishes it.
     let stale = TempDir::new().expect("tempdir");
     write_descriptor(stale.path(), dead_pid(), "http://127.0.0.1:1");
-    let (code, stdout, _) = doctor(stale.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        stale.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_eq!(
         code,
         Some(0),
         "a stale descriptor is harmless and must not fail the install:\n{stdout}"
     );
-    let (_, stale_json, _) = doctor(stale.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, stale_json, _) = doctor(
+        stale.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&stale_json).expect("json");
     let check = named_check(&report, "daemon");
     assert_eq!(
@@ -1396,13 +1454,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         .spawn()
         .expect("spawn a process to stand in for a wedged daemon");
     write_descriptor(occupied.path(), squatter.id(), "http://127.0.0.1:1");
-    let (code, stdout, _) = doctor(occupied.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        occupied.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(
         code,
         Some(0),
         "a live pid behind a dead endpoint must exit nonzero:\n{stdout}"
     );
-    let (_, wedged_json, _) = doctor(occupied.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, wedged_json, _) = doctor(
+        occupied.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&wedged_json).expect("json");
     let check = named_check(&report, "daemon");
     assert_eq!(check["status"], "fail", "{check}");
@@ -1428,9 +1494,17 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // bits do not stop uid 0, and these tests run as root in this container).
     let blocked = bin.path().join("not-a-directory");
     std::fs::write(&blocked, b"this is a file").expect("write file");
-    let (code, stdout, _) = doctor(&blocked, &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        &blocked,
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(code, Some(0), "an unusable data dir must exit nonzero");
-    let (_, broken_json, _) = doctor(&blocked, &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, broken_json, _) = doctor(
+        &blocked,
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&broken_json).expect("json");
     assert_eq!(report["healthy"], false);
     let check = named_check(&report, "data_dir");
@@ -1464,6 +1538,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
 fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     let bin = TempDir::new().expect("tempdir");
     let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
     let workspace = TempDir::new().expect("tempdir");
     init_repo(workspace.path());
@@ -1480,14 +1555,14 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     let (code, stdout, _) = doctor_in(
         workspace.path(),
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude)],
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         false,
     );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
     let (_, json, _) = doctor_in(
         workspace.path(),
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude)],
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
     );
     let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
@@ -1526,17 +1601,26 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
 fn doctor_reports_a_journal_it_cannot_even_open() {
     let bin = TempDir::new().expect("tempdir");
     let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(data.path()).expect("data dir");
     std::fs::write(data.path().join("journal"), b"not a directory").expect("write file");
 
-    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(
         code,
         Some(0),
         "a journal directory that is a file must fail the install"
     );
-    let (_, json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, json, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&json).expect("json");
     assert_eq!(report["healthy"], false);
     let check = named_check(&report, "journal");
@@ -3417,5 +3501,19 @@ fn stub_claude(dir: &Path) -> String {
             "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.226 (Claude Code)';;\n  \
              --help) echo '{flags}';;\n  *) cat >/dev/null;;\nesac\n"
         ),
+    )
+}
+
+/// A stand-in `docker` that passes `DockerBackend::probe`'s cheap version
+/// check (`docker version --format {{.Server.Version}}`), so the doctor
+/// tests measure the doctor rather than whether *this host* happens to have
+/// a reachable Docker Engine (TH-02, MVP-2 D3 fixer pass: N4.md's
+/// probe-gating rule for Docker facts, applied to the one doctor row that
+/// previously had no override analogous to `SGT_CLAUDE_BIN`).
+fn stub_docker(dir: &Path) -> String {
+    write_script(
+        dir,
+        "docker-stub",
+        "#!/bin/sh\ncase \"$1\" in\n  version) echo '99.0.0';;\n  *) exit 1;;\nesac\n",
     )
 }
