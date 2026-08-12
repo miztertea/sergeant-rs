@@ -47,6 +47,145 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### MVP-4 HARDENING — 2026-08-12, #45 (m6 dropped-daemon flake) closed by measurement, #22 (workspace-edge tests) closed with a real bug found and fixed
+
+**Mission outcome.** Both of MVP-4's named hardening items closed. Gates
+green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+full `cargo test` (536 passed, 4 opt-in ignored, 0 failed, across the lib +
+8 integration suites) all clean after the final commit. Leak check clean:
+`pgrep -f "debug/sgt [-]-data-dir"` empty. Repeated-run gate (L7 corollary):
+`tests/m3_execution.rs`, the `runtime::surface` lib module, and
+`tests/m6_surfaces.rs` each run 10/10 clean; the two m6 dropped-daemon
+composition tests specifically also run 40/40 (isolated) and 15/15 (full
+suite) clean under sustained 16-way CPU contention — see #45 below.
+
+**#45 (m6 dropped-daemon composition flake): root cause was already fixed on
+this branch, before this session — closed by fresh measurement, not new
+code.** The issue's own suspicion ("possibly the #26 startup-window class")
+was correct: `run_until_signal` used to install its SIGTERM/SIGINT handlers
+*after* `start_with` published the runtime descriptor, leaving a window —
+descriptor write to handler install — in which SIGTERM's default
+disposition simply killed the process: no `daemon.stopped`, no journal, a
+descriptor left pointing at a dead pid. That is exactly the wave-3 shape
+("the daemon's pid was already dead while `runtime.json` remained").
+Commit `439e218` (Cerberus, 2026-08-11, dated *after* #45 was filed but
+*before* this session and already an ancestor of this branch's `HEAD`)
+moved handler installation to the first act of `run_until_signal`, before
+the listener binds and before anything publishes, and pinned the ordering
+structurally with `the_daemon_installs_its_signal_handlers_before_it_
+publishes_anything` (byte-offset assertion on `daemon.rs`'s own source, not
+a flake-rate measurement — a future regression fails deterministically, not
+~2.5%-of-runs). This session's contribution is verification, not the fix:
+`the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown`
+(the behavioral pin) and the full `m6_surfaces` suite were run repeatedly
+under artificial load matching the issue's own repro method (16-way busy-spin
+on this host's 20 cores) — 40/40 isolated runs and 15/15 full-suite runs,
+0 failures, no reproduction of either the wave-1 or wave-3 shape. Combined
+with the wave-3 fixer's own pre-fix census (0 reproductions in 10 runs + 3
+isolated m6 runs — the bug was already rare pre-fix), this is enough
+evidence to close rather than merely "not reproduced yet": the mechanism is
+understood, the fix addresses that exact mechanism, and it is pinned
+structurally so a regression cannot silently reopen the window.
+**Closes #45.**
+
+**#22 (workspace discovery edge cases): the discovery-only fixtures
+R-MVP1-12 already landed (`src/domain/workspace.rs`) were extended to the
+"remaining, non-discovery edges" the MVP-1 contract explicitly deferred
+here — full daemon/API flow (correct binding record, work completes,
+teardown clean), per the issue's own proposed shape. Four new
+`tests/m3_execution.rs` acceptance tests: `t9` (a repository with a
+submodule), `t9b` (the *source* repository is itself a git worktree, not a
+main checkout), `t9c` (a symlinked repository root), `t9d` (a path with a
+space and a non-ASCII character). The worktree-as-source and symlinked-root
+shapes needed no code change — `materialize`/`teardown` already run every
+`git` invocation with `cwd` set to whatever `repository.path`/
+`binding.source_path` resolve to, and git itself correctly resolves the
+shared common dir from a linked worktree, so both already worked; the tests
+close the "untested" half of the issue honestly, without inventing a defect
+that was not there.**
+
+**The submodule shape surfaced a real, previously-unknown bug, in two
+parts, both fixed:**
+1. `git worktree add` (what `materialize` already used) checks out the
+   superproject's gitlinks but never populates a submodule's own content —
+   that is `git submodule update`'s job, and nothing called it. A
+   repository with a submodule silently materialized a surface with an
+   empty submodule directory: not a refusal, not a warning, just content
+   the rest of a run expected and did not have. Fixed:
+   `init_submodules_if_present` (`src/runtime/surface.rs`) runs `git
+   submodule update --init --recursive` after `add_worktree` whenever the
+   checked-out worktree has a `.gitmodules`, using the identical transport
+   allowlist (`file:http:https:ssh:git`) `git_clone` already uses for a
+   `sgt repo add --origin` — a submodule URL is exactly as untrusted, and
+   this is a widened *permission* (matching an existing precedent), never
+   an unbounded one. Pinned by
+   `runtime::surface::tests::a_submodule_is_populated_into_the_
+   materialized_worktree` (unit) and `t9` (end to end through the daemon);
+   revert-probed (reverting to a no-op strands the test on a missing file
+   with `NotFound`, confirmed by hand before landing the real fix).
+2. **Found while writing the *positive*-path test, not the negative one —
+   the more dangerous kind of gap.** Wiring the submodule step into
+   `materialize_one` (before restructuring, below) reintroduced exactly the
+   class of bug `materialize`'s own partial-failure rollback exists to
+   prevent: a failure *after* `add_worktree` already created a real
+   worktree, on the *first* (and, in the single-repo case, only)
+   repository, hit `materialize`'s `if bindings.is_empty() { return
+   Err(err) }` special case — which assumed, correctly until this change,
+   that nothing to roll back could exist yet on repository 1. It stopped
+   being correct the moment a post-checkout step could fail after a real
+   worktree existed. Fixed: `materialize`'s loop now runs
+   `init_submodules_if_present` on the binding `materialize_one` already
+   produced and folds that binding into the rollback set *before* deciding
+   whether anything needs tearing down, regardless of the repository's
+   position in the list — a submodule failure on repository 1 of 1 gets
+   the exact same recorded `SurfaceError::PartialFailure` + teardown report
+   a later repository's failure always got, never the silent, unrecorded,
+   un-journaled strand the naive wiring produced. Caught, not merely fixed
+   blind: `a_submodule_is_populated_into_the_materialized_worktree` failed
+   first with git's own "working trees containing submodules cannot be
+   moved or removed" once step 1 above worked — teardown's plain `git
+   worktree remove` turned out to refuse *any* submodule-bearing worktree
+   unconditionally, clean or not, which would have leaked one worktree per
+   successfully completed submodule-bearing work, forever. Fixed as its own
+   third part: `teardown_binding_locked` retries with `--force` exactly
+   when git's refusal names "containing submodules" — safe only because
+   the existing `git status --porcelain` cleanliness check just above it
+   already recurses into a registered submodule by default (measured, not
+   assumed: an untracked file, a modified tracked file, and an advanced
+   submodule `HEAD` all report as `M <path>` at the superproject level), so
+   reaching the force-retry at all already means nothing uncommitted exists
+   to destroy. A fourth test,
+   `a_dirty_submodule_still_blocks_teardown_despite_the_force_retry`, pins
+   that real uncommitted submodule content still blocks removal — proving
+   the force-retry path is unreachable for that case, not merely untested.
+   A fifth, `a_disallowed_submodule_transport_fails_closed_and_is_not_
+   stranded`, pins the fail-closed contract itself: a submodule over a
+   transport the allowlist refuses (`ext::`, instant and deterministic, no
+   network) fails materialization with the rolled-back-and-reported shape,
+   not a bare unrecorded error. All five new `runtime::surface` unit tests
+   plus `t9` were confirmed load-bearing by reverting the fix locally and
+   observing the expected failures before restoring it (L7).
+**Closes #22.**
+
+Both fixes are scoped narrowly and documented against what they
+deliberately leave alone: `rematerialize` (the retry re-attach path) also
+now re-initializes submodules for symmetry, but a failure there still
+propagates through `settle_rematerialize`'s pre-existing `Err(e) => return
+Err(e.into())` arm as an engine error rather than a journaled `blocked`
+state — true of *every* git failure on that path already, not a gap this
+change opens, and left alone rather than folded into this pass (noted on
+`rematerialize`'s own doc comment, not silently).
+
+**Environmental behavior.** No panel/critic loop run for this pass — direct
+build-and-verify against the two named issues, per the task's own scope (a
+Sonnet-executed hardening pass, not a milestone contract). Real bug found
+and fixed came from writing the *positive*-path test for #22's submodule
+shape first, not from hunting for one — worth naming as a pattern: the
+happy-path test found what the sad-path test alone would have missed twice
+over (empty-submodule-directory, then the teardown refusal it exposed).
+
+---
+
 ### MVP-3 FIXER PASS — 2026-08-12, invariants/test-honesty panel findings closed
 
 **Mission outcome.** Fixer pass over the MVP-3 build's review panel: 11
