@@ -42,20 +42,25 @@ pub const WORKSPACE_FILE: &str = "sergeant.toml";
 /// value both the manifest's policy and the bind-time identity hash agree
 /// on: today's `[[repo]] instructions` vocabulary and tomorrow's file probe.
 ///
-/// **W7: measured, not merely named, for `suppress` — the shipped default,
-/// and the only policy `local`'s own submit-time refusal (R-MVP1-4) lets a
-/// Work actually run under.** The Claude adapter's launch grammar is
-/// `--setting-sources user` (`backend/claude.rs`), which does not read this
-/// file; this repo's own north-star arbitration record confirms it
-/// empirically ("CLAUDE.md and AGENTS.md are invisible to the actor by
-/// design"). `Engine::resolve_instruction_identities` still hashes this
-/// file at bind time regardless of policy — R-MVP1-4's own pin ("editing an
-/// AGENTS.md after bind does not move the pinned identity") holds either
-/// way — but for `suppress`, what is pinned is bookkeeping for a file the
-/// actor never reads, not yet "the file the actor will read is the one we
-/// recorded" in the sense that claim is usually taken. That sentence is
-/// true only for `local`, which is refused at submit until MVP-2 measures
-/// what it translates to.
+/// **W7, then MVP-2 D2 item 1: measured for both policies, and "the file the
+/// actor will read is the one we recorded" turns out true for *neither*.**
+/// The Claude adapter's `suppress` launch grammar is `--setting-sources
+/// user` (`backend/claude.rs`), which does not read this file; this repo's
+/// own north-star arbitration record confirms it empirically ("CLAUDE.md and
+/// AGENTS.md are invisible to the actor by design"). MVP-2 measured `local`
+/// too (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`)
+/// and found the same thing for a different reason: `--setting-sources`
+/// governs `.claude/settings*.json` configuration, not memory-file reading,
+/// for *any* value — there is no native mechanism tied to the filename
+/// `AGENTS.md` at all (there is one for the literal filename `CLAUDE.md`,
+/// unconditionally, unrelated to this flag). So `local` no longer refuses at
+/// submit — the L1 gate that refusal existed to enforce is satisfied — but
+/// what it launches under is a *wider settings-source load*, not native
+/// `AGENTS.md` consumption. `Engine::resolve_instruction_identities` still
+/// hashes this file at bind time regardless of policy — R-MVP1-4's own pin
+/// ("editing an AGENTS.md after bind does not move the pinned identity")
+/// holds either way — and for both policies on this adapter, what is pinned
+/// is honest bookkeeping for a file nothing here currently reads.
 pub const INSTRUCTION_FILE: &str = "AGENTS.md";
 
 /// One repository bound into a workspace.
@@ -83,11 +88,20 @@ pub enum InstructionPolicy {
     /// default when a repo entry says nothing.
     #[default]
     Suppress,
-    /// The actor would consume the repository's own instruction file
-    /// natively in its worktree. What this translates to for the Claude
-    /// adapter is **unmeasured** (L1): MVP-1 parses and pins it but refuses
-    /// it at submit (R-MVP1-4); MVP-2 measures it before this variant can
-    /// ever reach a launch.
+    /// The wider of the two launch grammars this build can produce for a
+    /// bound repository. MVP-2 D2 item 1 measured what it actually
+    /// translates to for the Claude adapter (L1,
+    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`):
+    /// **not** "the actor natively consumes the repository's own instruction
+    /// file", the original design intent this variant was named for — that
+    /// mechanism does not exist for a file named `AGENTS.md` under any
+    /// `--setting-sources` value. What it actually widens is whether the
+    /// repository's own `.claude/settings.json` /
+    /// `.claude/settings.local.json` — hooks, tool permissions, MCP servers
+    /// — take effect for the launch (`ClaudeBackend::setting_sources_args`).
+    /// No longer refused at submit (the L1 gate that refusal existed to
+    /// enforce is satisfied); the resolved policy still reaches the launch
+    /// grammar via `StartRequest`/`ResumeRequest`.
     Local,
 }
 

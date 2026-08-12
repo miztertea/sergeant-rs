@@ -922,6 +922,7 @@ mod tests {
             model: None,
             profile: None,
             execute: None,
+            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
         }
     }
 

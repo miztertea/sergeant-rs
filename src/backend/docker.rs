@@ -1155,6 +1155,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::domain::workspace::InstructionPolicy;
 
     fn config() -> (tempfile::TempDir, DockerConfig) {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1198,6 +1199,7 @@ mod tests {
                 network: NetworkPolicy::None,
                 env: BTreeMap::new(),
             }),
+            instruction_policy: InstructionPolicy::default(),
         };
         let prepared = backend
             .prepare(&request)
@@ -1221,6 +1223,7 @@ mod tests {
             model: None,
             profile: None,
             execute: None,
+            instruction_policy: InstructionPolicy::default(),
         };
         let err = backend.prepare(&request).expect_err("must refuse");
         assert!(matches!(err, BackendError::Failed { .. }));

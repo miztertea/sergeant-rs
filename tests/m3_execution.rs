@@ -51,6 +51,7 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
     KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
+use sergeant_rs::domain::workspace::InstructionPolicy;
 use sergeant_rs::runtime::engine::{Engine, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::{
@@ -573,11 +574,16 @@ async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos(
     handle.shutdown().await;
 }
 
-/// R-MVP1-4: `instructions = "local"` parses and pins but is refused at
-/// submit — what it translates to for the Claude adapter is unmeasured
-/// (L1), and MVP-2 measures it before this variant can ever launch.
+/// R-MVP1-4 + MVP-2 D2 item 1: `instructions = "local"` parses, pins, and —
+/// now that its launch-side translation is measured
+/// (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`,
+/// `ClaudeBackend::setting_sources_args`) — is accepted at submit and
+/// reaches the backend's `StartRequest` intact. This is the plumbing pin the
+/// un-refusal needs: MVP-1's sibling test above already proved a *mixed*
+/// selection still refuses (unchanged); this proves a *uniform* `local`
+/// selection is no longer refused at all, all the way to the backend.
 #[tokio::test]
-async fn r_mvp1_4_local_instructions_policy_is_refused_at_submit() {
+async fn r_mvp1_4_local_instructions_policy_is_accepted_at_submit_and_reaches_the_backend() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
     let repo = repos.path().join("solo");
@@ -592,12 +598,20 @@ async fn r_mvp1_4_local_instructions_policy_is_refused_at_submit() {
     let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &repo, "local unmeasured", json!({})).await;
-    assert_eq!(status, 422, "local must refuse at submit: {body}");
-    assert_eq!(body["error"]["code"], "instruction_policy_unmeasured");
-    assert!(
-        fake.starts().is_empty(),
-        "a submit-time refusal must never reach a backend"
+    let (status, body) = submit(&client, &handle, &repo, "local measured", json!({})).await;
+    assert_eq!(status, 201, "local must be accepted at submit now: {body}");
+    assert_eq!(body["work"]["state"], "active");
+
+    let starts = fake.starts();
+    assert_eq!(
+        starts.len(),
+        1,
+        "an accepted submission must actually reach the backend"
+    );
+    assert_eq!(
+        starts[0].instruction_policy,
+        InstructionPolicy::Local,
+        "the resolved policy must survive submit -> bind -> StartRequest unchanged"
     );
 
     handle.shutdown().await;

@@ -600,18 +600,6 @@ pub enum EngineError {
         /// `"<repo>=<policy>"` for every selected repository.
         repos: Vec<String>,
     },
-    /// R-MVP1-4: `instructions = "local"` parses and pins, but what it
-    /// translates to for the Claude adapter is unmeasured (L1) — refused at
-    /// submit until MVP-2 measures it.
-    #[error(
-        "instructions = \"local\" is refused at submit for {} (unmeasured — measurement \
-         pending MVP-2); use \"suppress\" or leave instructions unset",
-        .repos.join(", ")
-    )]
-    InstructionPolicyUnmeasured {
-        /// Repositories whose resolved policy is `local`.
-        repos: Vec<String>,
-    },
     /// The requested profile is not declared by the workspace.
     #[error("no profile named {requested:?} in this workspace (has: {available})")]
     ProfileNotFound {
@@ -748,7 +736,6 @@ impl EngineError {
             EngineError::Core(_) => "internal",
             EngineError::RepositorySelection(_) => "unknown_repository",
             EngineError::InstructionPolicyConflict { .. } => "instruction_policy_conflict",
-            EngineError::InstructionPolicyUnmeasured { .. } => "instruction_policy_unmeasured",
             EngineError::ProfileNotFound { .. } => "profile_not_found",
             EngineError::ProfileBackendMismatch { .. } => "profile_backend_mismatch",
             EngineError::IllegalTransition { .. } => "illegal_transition",
@@ -1013,9 +1000,15 @@ impl Engine {
     /// R-MVP1-4's submit-time policy check: every selected repository must
     /// resolve to the same [`InstructionPolicy`] — "one process, one
     /// policy — so no composition happens, and that is the ruling, not an
-    /// omission" — and that policy must not be `local`, which parses and
-    /// pins but is refused at submit until MVP-2 measures what it
-    /// translates to for the Claude adapter (L1).
+    /// omission".
+    ///
+    /// `local` no longer refuses here (MVP-2 D2 item 1): its launch-side
+    /// translation is measured (`setting_sources_args`,
+    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`),
+    /// so the L1 gate this refusal existed to enforce is satisfied. The
+    /// conflict rule is unchanged — mixing policies within one bind is still
+    /// refused, because "one process, one `--setting-sources`" is a fact
+    /// about the launch grammar, not about what any single value measures to.
     fn check_instruction_policy(
         workspace: &Workspace,
         repositories: &[RepositorySpec],
@@ -1036,12 +1029,23 @@ impl Engine {
                     .collect(),
             });
         }
-        if first == InstructionPolicy::Local {
-            return Err(EngineError::InstructionPolicyUnmeasured {
-                repos: resolved.into_iter().map(|(name, _)| name).collect(),
-            });
-        }
         Ok(())
+    }
+
+    /// The uniform [`InstructionPolicy`] a bound run resolved to
+    /// (`check_instruction_policy` refuses submission unless every selected
+    /// repository agreed, so any entry speaks for all of them), read back off
+    /// the identities `workflow.bound` pinned rather than re-derived from the
+    /// live manifest — a restarted turn must launch under the policy the run
+    /// actually started with, not whatever the manifest says today (MVP-2
+    /// D2 item 1). A run bound before R-MVP1-4 pinned no identities at all,
+    /// which resolves to [`InstructionPolicy::Suppress`] the same way an
+    /// absent manifest entry does.
+    fn run_instruction_policy(run: &WorkRun) -> InstructionPolicy {
+        run.instruction_identities
+            .first()
+            .map(|identity| identity.policy)
+            .unwrap_or_default()
     }
 
     /// R-MVP1-4's R7: resolve the instruction-file identity `workflow.bound`
@@ -1053,16 +1057,17 @@ impl Engine {
     /// missing file is recorded as absent — `path`/`content_hash` both
     /// `None` — never silently skipped.
     ///
-    /// **W7:** runs unconditionally, for every bound repository regardless
-    /// of its resolved `policy` — including `suppress`, the shipped default
-    /// (`local` is refused at submit, R-MVP1-4). `INSTRUCTION_FILE`'s own
-    /// doc has the measured fact: the adapter's `suppress` launch grammar
-    /// does not read this file at all, so "the file the actor will read is
-    /// the one we recorded" is true only for the resolved identities a
-    /// `local` bind would carry — none of which can currently reach a
-    /// launch. What ships today is a correctly-computed, correctly-pinned
-    /// identity for a file that, under the only policy that actually runs,
-    /// nothing reads yet.
+    /// **W7, then MVP-2 D2 item 1:** runs unconditionally, for every bound
+    /// repository regardless of its resolved `policy`. `INSTRUCTION_FILE`'s
+    /// own doc has the measured fact, for *both* policies now: this
+    /// adapter's launch grammar (`suppress` or the newly-unrefused `local`)
+    /// never reads this file natively, so "the file the actor will read is
+    /// the one we recorded" does not hold for either — see
+    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`.
+    /// What ships is a correctly-computed, correctly-pinned identity for a
+    /// file this adapter does not currently read under any policy — honest
+    /// bookkeeping for a mechanism the manifest schema anticipates but this
+    /// backend has not implemented, not proof of consumption.
     fn resolve_instruction_identities(
         workspace: &Workspace,
         surface: &WorkSurface,
@@ -2523,6 +2528,7 @@ impl Engine {
             cwd: surface.execution_cwd(),
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile,
+            instruction_policy: Self::run_instruction_policy(run),
         })
     }
 
@@ -2753,6 +2759,9 @@ impl Engine {
             // Docker backend, so reaching here with `Some` is always
             // actionable by the backend named above.
             execute: stage.execute.clone(),
+            // MVP-2 D2 item 1: the policy `workflow.bound` pinned, not
+            // re-derived from the live manifest.
+            instruction_policy: Self::run_instruction_policy(&run),
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,

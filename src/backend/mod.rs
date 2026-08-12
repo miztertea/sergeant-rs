@@ -48,6 +48,7 @@ use serde_json::Value;
 use crate::domain::event::EventDraft;
 use crate::domain::profile::Profile;
 use crate::domain::workflow::ExecuteSpec;
+use crate::domain::workspace::InstructionPolicy;
 
 /// One normalized native event (§20/§27): an adapter's translation of a raw
 /// vendor record into sergeant's `conversation.*`/`tool.*`/`usage.*`
@@ -212,6 +213,15 @@ pub struct StartRequest {
     /// without the engine knowing what an image or a container is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execute: Option<ExecuteSpec>,
+    /// R-MVP1-4's resolved instruction-file policy (MVP-2 D2 item 1, the
+    /// `--setting-sources` de-leak). `check_instruction_policy` at submit
+    /// already refused any selected-repository set that disagrees, so this
+    /// is uniform across the Work by construction — one value, not one per
+    /// repository. `#[serde(default)]` so a `StartRequest` journaled before
+    /// this field existed replays as [`InstructionPolicy::Suppress`], which
+    /// is exactly what every such request's actual launch grammar was.
+    #[serde(default)]
+    pub instruction_policy: InstructionPolicy,
 }
 
 /// Everything a backend needs to RESUME an execution it no longer remembers
@@ -240,18 +250,27 @@ pub struct ResumeRequest {
     /// The launch profile the execution started under (§14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    /// R-MVP1-4's resolved instruction-file policy, re-supplied on RESUME for
+    /// the same reason the model pin and profile are (MVP-2 D2 item 1): it
+    /// is a decision about the Work, pinned at bind, and a restarted
+    /// adapter's later turns must launch under the same grammar the run
+    /// started with, not the adapter's compiled-in default.
+    #[serde(default)]
+    pub instruction_policy: InstructionPolicy,
 }
 
 impl ResumeRequest {
     /// A resume request carrying only the two things every caller has: the
-    /// work and its surface. Model and profile default to "not re-supplied",
-    /// which adapters must treat as absent, never as a default.
+    /// work and its surface. Model, profile and instruction policy default to
+    /// "not re-supplied" (suppress, for the policy — today's only launched
+    /// behaviour), which adapters must treat as absent, never invented.
     pub fn new(work_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             work_id: work_id.into(),
             cwd: cwd.into(),
             model: None,
             profile: None,
+            instruction_policy: InstructionPolicy::default(),
         }
     }
 }

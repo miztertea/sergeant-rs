@@ -322,6 +322,17 @@ pub async fn start_with(
             .clone()
             .unwrap_or_else(|| ClaudeConfig::new(data_dir));
         let adapter = Arc::new(ClaudeBackend::new(claude_config));
+        // MVP-2 D2 item 2 (capability provenance durability, cv2 item 7):
+        // seed the fresh in-memory `ask` claim from the journal's own record
+        // of a prior withdrawal *before* anything reads `capabilities()` —
+        // the registration probe two steps below, first of all — so a
+        // capability this exact CLI version already proved absent stays
+        // withdrawn across a restart instead of re-defaulting to optimistic
+        // on every fresh process. A separate `replay_data_dir` read (rather
+        // than reusing `journal` above, already moved into `core`) is the
+        // same pattern step 2b's `Analytics::rebuild` already uses for a
+        // second, independent replay of the same validated chain.
+        adapter.seed_capability_provenance(Journal::replay_data_dir(data_dir)?)?;
         backends = backends.with(adapter.clone());
         Some(adapter)
     } else {

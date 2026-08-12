@@ -82,7 +82,7 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED,
     KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use sergeant_rs::domain::workspace::RepositorySpec;
+use sergeant_rs::domain::workspace::{InstructionPolicy, RepositorySpec};
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
 use sergeant_rs::runtime::engine::{
     DEFAULT_TURN_CAP, Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, Next, PendingLaunch,
@@ -806,6 +806,23 @@ fn start_request(
         model: model.map(str::to_string),
         profile: None,
         execute: None,
+        instruction_policy: InstructionPolicy::default(),
+    }
+}
+
+/// [`start_request`] plus an explicit [`InstructionPolicy`] (MVP-2 D2 item
+/// 1's launch-side contract tests need to vary this one field without a
+/// second full parameter list duplicating every other one).
+fn start_request_with_policy(
+    execution_id: &str,
+    cwd: &Path,
+    intent: &str,
+    model: Option<&str>,
+    instruction_policy: InstructionPolicy,
+) -> StartRequest {
+    StartRequest {
+        instruction_policy,
+        ..start_request(execution_id, cwd, intent, model)
     }
 }
 
@@ -2024,6 +2041,98 @@ async fn the_capability_probe_is_journaled_at_registration() {
     assert_eq!(payload["runtime_scope"], "per_execution");
 }
 
+/// MVP-2 D2 item 2 (capability provenance durability, cv2 item 7): a
+/// withdrawal journaled against the exact CLI version installed survives a
+/// daemon restart and reaches the R-MVP1-11 preflight on the *next* Work —
+/// not just within the process that measured it.
+///
+/// This is the end-to-end half of the guarantee the pure
+/// `latest_ask_withdrawal_version`/`capability_provenance_only_applies_to_a_
+/// matching_version` unit tests in `src/backend/claude.rs` pin the logic
+/// half of: this test proves `daemon.rs` actually wires
+/// `ClaudeBackend::seed_capability_provenance` into startup, against a real
+/// (stub) probe, before the registration `backend.probed` record is
+/// journaled.
+#[tokio::test]
+async fn d2_a_journaled_ask_withdrawal_survives_a_daemon_restart_at_the_matching_version() {
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubClaude::new(data.path(), "2.1.226 (Claude Code)", ALL_FLAGS);
+
+    // First daemon: bootstraps the journal/data dir. No withdrawal has
+    // happened yet, so the fresh claim is the optimistic default.
+    let mut claude = ClaudeConfig::new(data.path());
+    claude.executable = stub.path.clone();
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new()),
+            default_backend: None,
+            claude: Some(claude.clone()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("first daemon");
+    handle.shutdown().await;
+    let first_probed = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| {
+            e.kind == daemon::KIND_BACKEND_PROBED && e.payload["backend"] == CLAUDE_BACKEND_NAME
+        })
+        .last()
+        .expect("a claude backend.probed record from the first start");
+    assert_eq!(
+        first_probed.payload["capabilities"]["ask"], true,
+        "nothing has withdrawn the claim yet"
+    );
+
+    // The withdrawal a real turn would have journaled (`note_ask_grammar`),
+    // written directly here because reproducing it via a real turn would
+    // mean scripting the stub's stream-json output — this test's subject is
+    // the *seeding*, already pinned separately at the unit level.
+    {
+        let mut journal = Journal::open(data.path()).expect("open journal");
+        journal
+            .append(EventDraft::new(
+                EventSource::new("backend", CLAUDE_BACKEND_NAME),
+                "conversation.turn.grammar_unmeasured",
+                json!({"capability": "ask", "version": "2.1.226"}),
+            ))
+            .expect("append withdrawal");
+        journal.sync().expect("sync");
+    }
+
+    // Second daemon, same data dir, same (still 2.1.226) stub: the fresh
+    // process must start with the claim already withdrawn.
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new()),
+            default_backend: None,
+            claude: Some(claude),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("second daemon");
+    handle.shutdown().await;
+
+    let second_probed = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| {
+            e.kind == daemon::KIND_BACKEND_PROBED && e.payload["backend"] == CLAUDE_BACKEND_NAME
+        })
+        .last()
+        .expect("a claude backend.probed record from the second start");
+    assert_eq!(
+        second_probed.payload["capabilities"]["ask"], false,
+        "a withdrawal journaled at the exact installed version must seed the \
+         restarted claim as withdrawn, not reset to fresh-install optimism"
+    );
+}
+
 // ------------------------------------------- 2. model pin (deterministic)
 
 /// Acceptance 2 (pre-flight layer): a provider-qualified pin is refused
@@ -2198,6 +2307,59 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
         second.argv
     );
     assert_eq!(second.stdin, "second turn");
+}
+
+/// MVP-2 D2 item 1 (the `--setting-sources` de-leak), pinned against the
+/// stub the same way D2's own grammar is above: `InstructionPolicy::Suppress`
+/// keeps today's argv unchanged, and the newly-unrefused
+/// `InstructionPolicy::Local` launches with the wider setting-sources value
+/// `ClaudeBackend::setting_sources_args` measured
+/// (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`) — not
+/// with some other guess that would silently drift from the measurement.
+#[test]
+fn d2_instruction_policy_translates_to_the_measured_setting_sources_value() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let suppress = start_request_with_policy(
+        "e-suppress",
+        cwd.path(),
+        "suppress intent",
+        None,
+        InstructionPolicy::Suppress,
+    );
+    let suppress_handle = backend.start(&suppress).expect("start suppress");
+    wait_settled(&backend, &suppress_handle, Duration::from_secs(10));
+
+    let local = start_request_with_policy(
+        "e-local",
+        cwd.path(),
+        "local intent",
+        None,
+        InstructionPolicy::Local,
+    );
+    let local_handle = backend.start(&local).expect("start local");
+    wait_settled(&backend, &local_handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(2);
+    assert_eq!(launches.len(), 2);
+    assert_eq!(
+        launches[0].value_of("--setting-sources"),
+        Some("user"),
+        "Suppress must keep today's grammar unchanged: {:?}",
+        launches[0].argv
+    );
+    assert_eq!(
+        launches[1].value_of("--setting-sources"),
+        Some("user,project,local"),
+        "Local's launch-side translation must match the measured value, not \
+         a plausible-looking guess: {:?}",
+        launches[1].argv
+    );
 }
 
 /// §14: a profile is launch configuration, carried to the *real* adapter —
@@ -2385,6 +2547,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
                         .into_iter()
                         .collect(),
                 }),
+                instruction_policy: InstructionPolicy::default(),
             },
         )
         .expect("re-adopt");
@@ -2984,6 +3147,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 cwd: data.path().to_path_buf(),
                 model: Some("anthropic/claude-haiku-4-5".to_string()),
                 profile: None,
+                instruction_policy: InstructionPolicy::default(),
             },
         )
         .expect_err("a provider-qualified pin is refused pre-flight at RESUME too");
@@ -3003,6 +3167,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 cwd: data.path().to_path_buf(),
                 model: Some("haiku".to_string()),
                 profile: None,
+                instruction_policy: InstructionPolicy::default(),
             },
         )
         .expect("re-adopt");
@@ -3264,6 +3429,7 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
                 cwd: data.path().to_path_buf(),
                 model: Some("haiku".to_string()),
                 profile: None,
+                instruction_policy: InstructionPolicy::default(),
             },
         )
         .expect("re-adopt is idempotent");
@@ -5042,6 +5208,7 @@ fn a1_real_claude_session_identity_survives_turns_and_restart() {
                 cwd: cwd.path().to_path_buf(),
                 model: Some("haiku".to_string()),
                 profile: None,
+                instruction_policy: InstructionPolicy::default(),
             },
         )
         .expect("re-adopt from session evidence");
@@ -5898,6 +6065,7 @@ fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
         model: None,
         profile: None,
         execute: None,
+        instruction_policy: InstructionPolicy::default(),
     };
     let handle = fake.start(&request).expect("start");
     assert_eq!(
@@ -6202,6 +6370,7 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
         model: Some("claude-haiku-4-5-20251001".to_string()),
         profile: None,
         execute: None,
+        instruction_policy: InstructionPolicy::default(),
     };
     let handle = backend.start(&request).expect("start");
 
@@ -6341,6 +6510,7 @@ fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mo
         model: Some("claude-haiku-4-5-20251001".to_string()),
         profile: None,
         execute: None,
+        instruction_policy: InstructionPolicy::default(),
     };
     let handle = backend.start(&request).expect("start");
     let observation = wait_settled(&backend, &handle, Duration::from_secs(180));
@@ -6633,6 +6803,7 @@ fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
                 model: None,
                 profile: None,
                 execute: None,
+                instruction_policy: InstructionPolicy::default(),
             })
             .expect("prepare");
         fake.launch(&prepared).expect("launch");
@@ -6729,6 +6900,7 @@ fn n13_window5_result_observed_before_the_result_append() {
             model: None,
             profile: None,
             execute: None,
+            instruction_policy: InstructionPolicy::default(),
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");
@@ -6813,6 +6985,7 @@ fn n14_window6_result_appended_before_the_transition() {
             model: None,
             profile: None,
             execute: None,
+            instruction_policy: InstructionPolicy::default(),
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");

@@ -27,6 +27,7 @@ use crate::domain::workflow::{
     KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_STAGE_WAITING,
     KIND_WORKFLOW_BOUND, StageBinding, StageRecord, StageStatus, WorkflowDefinition,
 };
+use crate::domain::workspace::InstructionIdentity;
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::surface::{
@@ -395,6 +396,17 @@ pub struct WorkRun {
     /// `profile` above carry it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stage_bindings: Vec<StageBinding>,
+    /// R-MVP1-4's per-repository instruction-file identities, pinned at bind
+    /// time (`Engine::resolve_instruction_identities`). Uniform policy
+    /// across every entry by construction (`check_instruction_policy`
+    /// refuses submission otherwise) — MVP-2 D2 item 1 reads
+    /// `.first().policy` off this to resolve the one
+    /// [`crate::domain::workspace::InstructionPolicy`] a `StartRequest`/
+    /// `ResumeRequest` carries. Empty for a run bound before R-MVP1-4, which
+    /// resolves to [`crate::domain::workspace::InstructionPolicy::Suppress`]
+    /// the same way an absent manifest entry does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instruction_identities: Vec<InstructionIdentity>,
     /// R-MVP1-7's turn envelope: how many turns this Work has spawned across
     /// every stage and every attempt, for the life of the run. Incremented
     /// exactly where a turn is actually spawned — `execution.started`
@@ -648,6 +660,13 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 // above already record.
                 run.stage_bindings =
                     serde_json::from_value(event.payload["stage_bindings"].clone())
+                        .unwrap_or_default();
+                // Additive (§20.5), same reasoning as `stage_bindings` just
+                // above: a `workflow.bound` from before R-MVP1-4 carries no
+                // `instruction_identities`, and an empty vec is exactly what
+                // that meant — every repository resolves to `Suppress`.
+                run.instruction_identities =
+                    serde_json::from_value(event.payload["instruction_identities"].clone())
                         .unwrap_or_default();
             }
         }
