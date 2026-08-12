@@ -47,7 +47,8 @@ use crate::domain::workflow::{
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{
-    Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, Next as EngineNext, Step, SubmitContext,
+    Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
+    Next as EngineNext, Step, SubmitContext,
 };
 use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
@@ -2114,6 +2115,7 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_EXECUTION_ABANDONED,
     KIND_EXECUTION_RECONCILED,
     KIND_TURN_CEILING_INTERRUPTED,
+    KIND_TURN_ENVELOPE_EXTENDED,
     KIND_SURFACE_MATERIALIZING,
     KIND_SURFACE_MATERIALIZED,
     KIND_SURFACE_TORN_DOWN,

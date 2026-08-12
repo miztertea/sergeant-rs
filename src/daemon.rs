@@ -199,6 +199,14 @@ pub struct DaemonConfig {
     /// `[estate] surfaces_dir` narrows this further, per-submission, in
     /// `Engine::plan` — this is only the daemon-wide fallback beneath that.
     pub surfaces_root: Option<PathBuf>,
+    /// R-MVP1-7's daemon-wide turn-cap override (`SGT_TURN_CAP`): `None`
+    /// keeps [`Engine::new`]'s default ([`crate::runtime::engine::
+    /// DEFAULT_TURN_CAP`]). `Some` is wired into the engine via
+    /// [`Engine::with_turn_cap`] in [`start_with`], the same way
+    /// `turn_ceiling` and `surfaces_root` above are. R-MVP1-10's
+    /// `Engine::extend_turn_envelope` is the per-Work door beneath this
+    /// daemon-wide default.
+    pub turn_cap: Option<u32>,
 }
 
 impl Default for DaemonConfig {
@@ -211,6 +219,7 @@ impl Default for DaemonConfig {
             completion_poll: COMPLETION_POLL_INTERVAL,
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
             surfaces_root: None,
+            turn_cap: None,
         }
     }
 }
@@ -352,6 +361,9 @@ pub async fn start_with(
         .with_turn_ceiling(config.turn_ceiling);
     if let Some(surfaces_root) = config.surfaces_root.clone() {
         engine = engine.with_surfaces_root(surfaces_root);
+    }
+    if let Some(turn_cap) = config.turn_cap {
+        engine = engine.with_turn_cap(turn_cap);
     }
     let engine = Arc::new(engine);
     let reconciled = recovery::reconcile(&engine, &mut core)?;
@@ -673,11 +685,20 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
     let surfaces_root = std::env::var_os("SGT_SURFACES_DIR")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
+    // R-MVP1-7's daemon-wide turn-cap override: same discipline as
+    // SGT_SURFACES_DIR above — unset or unparseable both mean "keep the
+    // built-in default" (fail open to the default, never refuse the whole
+    // daemon start over a malformed env var only an operator can fix by
+    // restarting anyway).
+    let turn_cap = std::env::var("SGT_TURN_CAP")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
     let handle = start_with(
         data_dir,
         DaemonConfig {
             telemetry: telemetry.clone(),
             surfaces_root,
+            turn_cap,
             ..DaemonConfig::default()
         },
     )

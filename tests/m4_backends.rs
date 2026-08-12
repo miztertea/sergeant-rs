@@ -8072,18 +8072,59 @@ fn write_n_stage_workflow(root: &Path, name: &str, n: usize) {
     }
 }
 
-/// The default cap is the contract's own worked example, not a number
-/// invented in this lane: L16's arithmetic ("a 6-turn envelope is a ~$19
-/// bound, not a $2.50 one") only holds if the shipped default is 6.
+/// The default cap is structurally grounded in this repo's own admitted
+/// workflows (invariants:MVP1-R1-E1/I1), not the contract's bare worked
+/// example: `DEFAULT_TURN_CAP` must be at least the longest admitted
+/// workflow's stage count (repo-to-icm, 10 — `find .sergeant/workflows
+/// -name workflow.toml` is the fact this pins), or the shipped default
+/// blocks that workflow's very first run, unconditionally. L16's arithmetic
+/// ("bounds spend at N × the largest single turn, $3.21 measured") holds at
+/// whatever N is actually shipped.
 #[test]
-fn r_mvp1_7_the_default_turn_cap_is_the_contracts_own_worked_example() {
+fn r_mvp1_7_the_default_turn_cap_covers_the_longest_admitted_workflow() {
     let data = TempDir::new().expect("tempdir");
     let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path());
     assert_eq!(engine.turn_cap, DEFAULT_TURN_CAP);
-    assert_eq!(
-        DEFAULT_TURN_CAP, 6,
-        "the contract's own $19-bound example is worked against 6 turns"
+
+    let longest_admitted_workflow_stage_count = admitted_workflows_root()
+        .map(|root| {
+            std::fs::read_dir(&root)
+                .expect("read .sergeant/workflows")
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| {
+                    let toml = e.path().join("workflow.toml");
+                    let text = std::fs::read_to_string(&toml).unwrap_or_default();
+                    // Cheap count: one comma-separated `stages = [...]` line,
+                    // matching how the fixtures in this file build one.
+                    text.lines()
+                        .find(|l| l.trim_start().starts_with("stages"))
+                        .map(|l| l.matches('"').count() / 2)
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    assert!(
+        longest_admitted_workflow_stage_count > 0,
+        "this repo's own .sergeant/workflows must be reachable from a `cargo test` \
+         working directory for this pin to mean anything"
     );
+    assert!(
+        DEFAULT_TURN_CAP as usize >= longest_admitted_workflow_stage_count,
+        "DEFAULT_TURN_CAP ({DEFAULT_TURN_CAP}) must cover the longest admitted workflow's \
+         stage count ({longest_admitted_workflow_stage_count}), or that workflow's first \
+         run is unconditionally blocked by the shipped default"
+    );
+}
+
+/// `.sergeant/workflows`, found via `CARGO_MANIFEST_DIR` — exact for an
+/// integration test target (TH-06's own fix: this crate root is where
+/// `.sergeant/` actually lives, not a cwd search that can silently miss it).
+fn admitted_workflows_root() -> Option<std::path::PathBuf> {
+    let candidate = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".sergeant/workflows");
+    candidate.is_dir().then_some(candidate)
 }
 
 /// The pin, literally: a scripted run whose workflow has more stages than

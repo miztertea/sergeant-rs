@@ -43,6 +43,7 @@ use sergeant_rs::domain::work::{
     KIND_WORK_RESUMED, KIND_WORK_SUBMITTED, WorkState,
 };
 use sergeant_rs::domain::workflow::{KIND_STAGE_ENTERED, KIND_WORKFLOW_BOUND};
+use sergeant_rs::runtime::engine::DEFAULT_TURN_CAP;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::KIND_SURFACE_MATERIALIZED;
 
@@ -4085,10 +4086,10 @@ async fn r_mvp1_10_needs_input_to_blocked_from_real_envelope_exhaustion_at_send_
     r_mvp1_10_init_repo(&repo);
     r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
 
-    // DEFAULT_TURN_CAP (6): turn 1 is the launch, turns 2..6 are five
-    // delivered answers — six `needs_input` steps in total, one per turn.
-    const CAP: usize = 6;
-    let script: Vec<FakeStep> = (0..CAP).map(|_| FakeStep::needs_input("more?")).collect();
+    // DEFAULT_TURN_CAP: turn 1 is the launch, the rest are delivered
+    // answers — one `needs_input` step per turn, CAP steps in total.
+    let cap = DEFAULT_TURN_CAP as usize;
+    let script: Vec<FakeStep> = (0..cap).map(|_| FakeStep::needs_input("more?")).collect();
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
     let registry = BackendRegistry::new().with(Arc::new(fake));
     let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
@@ -4098,10 +4099,10 @@ async fn r_mvp1_10_needs_input_to_blocked_from_real_envelope_exhaustion_at_send_
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "needs_input", "{body}");
 
-    // Turns 2..=6: five real, successful deliveries (an exclusive `2..CAP`
-    // would only run four — the off-by-one this range spells out on
+    // Turns 2..=cap: real, successful deliveries (an exclusive `2..cap`
+    // would run one fewer — the off-by-one this range spells out on
     // purpose).
-    for turn in 2..=CAP {
+    for turn in 2..=cap {
         let (status, _, body) = post_json(
             &http,
             &handle,
@@ -4129,7 +4130,7 @@ async fn r_mvp1_10_needs_input_to_blocked_from_real_envelope_exhaustion_at_send_
     assert_eq!(status, reqwest::StatusCode::OK, "{blocked_body}");
     assert_eq!(blocked_body["work"]["state"], "blocked", "{blocked_body}");
     let reason = r_mvp1_10_block_reason(data.path(), &work_id);
-    assert_eq!(reason, format!("turn envelope exhausted ({CAP} turns)"));
+    assert_eq!(reason, format!("turn envelope exhausted ({cap} turns)"));
 
     let resumed_before = journal_events(data.path())
         .into_iter()
@@ -4176,37 +4177,39 @@ async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
     let data = TempDir::new().expect("tempdir");
     let repo = repos.path().join("solo");
     r_mvp1_10_init_repo(&repo);
-    // One more stage than DEFAULT_TURN_CAP (6): stages 1..6 spend the whole
-    // envelope completing; stage 7's own LAUNCH is the one the cap refuses.
-    const STAGES: usize = 7;
-    const CAP: usize = 6;
-    r_mvp1_10_write_n_stage_workflow(&repo, "long", STAGES);
+    // One more stage than DEFAULT_TURN_CAP: the first `cap` stages spend
+    // the whole envelope completing; the next stage's own LAUNCH is the one
+    // the cap refuses.
+    let cap = DEFAULT_TURN_CAP as usize;
+    let stages = cap + 1;
+    r_mvp1_10_write_n_stage_workflow(&repo, "long", stages);
+    let blocked_stage_id = format!("{cap:02}-stage");
 
-    let script: Vec<FakeStep> = (0..STAGES).map(|_| FakeStep::complete()).collect();
+    let script: Vec<FakeStep> = (0..stages).map(|_| FakeStep::complete()).collect();
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
     let registry = BackendRegistry::new().with(Arc::new(fake));
     let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
     let http = client();
 
     // Every stage settles synchronously (no settle delay), so the whole
-    // chain — six completions and the seventh stage's refused launch — runs
+    // chain — `cap` completions and the next stage's refused launch — runs
     // inside this one submit request.
     let body = r_mvp1_10_submit(&http, &handle, &repo, "run past the cap", Some("long")).await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "blocked", "{body}");
     assert_eq!(
-        body["stage"]["stage_id"], "06-stage",
-        "the 7th (index 6) stage is the one the cap blocks"
+        body["stage"]["stage_id"], blocked_stage_id,
+        "the (cap+1)th stage (index cap) is the one the cap blocks"
     );
     let reason = r_mvp1_10_block_reason(data.path(), &work_id);
-    assert_eq!(reason, format!("turn envelope exhausted ({CAP} turns)"));
+    assert_eq!(reason, format!("turn envelope exhausted ({cap} turns)"));
     // Entering the blocked stage is not itself a spent turn.
     assert_eq!(
         journal_events(data.path())
             .into_iter()
             .filter(|e| e.kind == KIND_STAGE_ENTERED
                 && e.work_id.as_deref() == Some(&work_id)
-                && e.payload["stage_id"] == "06-stage")
+                && e.payload["stage_id"] == blocked_stage_id)
             .count(),
         1
     );
@@ -4216,7 +4219,7 @@ async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
         .filter(|e| {
             e.kind == KIND_STAGE_ENTERED
                 && e.work_id.as_deref() == Some(&work_id)
-                && e.payload["stage_id"] == "06-stage"
+                && e.payload["stage_id"] == blocked_stage_id
         })
         .count();
 
@@ -4236,13 +4239,13 @@ async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
         .filter(|e| {
             e.kind == KIND_STAGE_ENTERED
                 && e.work_id.as_deref() == Some(&work_id)
-                && e.payload["stage_id"] == "06-stage"
+                && e.payload["stage_id"] == blocked_stage_id
         })
         .count();
     assert_eq!(
         stage_entered_after,
         stage_entered_before + 1,
-        "retry must genuinely have re-entered stage 06 (a second attempt), \
+        "retry must genuinely have re-entered the blocked stage (a second attempt), \
          not merely echoed the existing blocked state back"
     );
     let resumed = journal_events(data.path())
@@ -4260,22 +4263,22 @@ async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
 /// E3/R-MVP1-10: `retry` alone is the revolving door the finding named —
 /// this proves the *actual* exit door, `extend` + `retry`, genuinely
 /// reopens the room rather than merely opening and re-closing it. Same
-/// fault as the test above (LAUNCH-boundary envelope exhaustion at stage
-/// 06 of a 7-stage workflow against the default 6-turn cap), but this time
-/// the Work is extended by one turn before the retry — the 7th stage must
-/// actually spawn its turn and the whole Work must reach `completed`, not
-/// re-block on the identical condition.
+/// fault as the test above (LAUNCH-boundary envelope exhaustion at one more
+/// stage than the default cap allows turns), but this time the Work is
+/// extended by one turn before the retry — the last stage must actually
+/// spawn its turn and the whole Work must reach `completed`, not re-block
+/// on the identical condition.
 #[tokio::test]
 async fn r_mvp1_10_extend_then_retry_genuinely_reopens_the_envelope_exhausted_landing() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
     let repo = repos.path().join("solo");
     r_mvp1_10_init_repo(&repo);
-    const STAGES: usize = 7;
-    const CAP: usize = 6;
-    r_mvp1_10_write_n_stage_workflow(&repo, "long", STAGES);
+    let cap = DEFAULT_TURN_CAP as usize;
+    let stages = cap + 1;
+    r_mvp1_10_write_n_stage_workflow(&repo, "long", stages);
 
-    let script: Vec<FakeStep> = (0..STAGES).map(|_| FakeStep::complete()).collect();
+    let script: Vec<FakeStep> = (0..stages).map(|_| FakeStep::complete()).collect();
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
     let registry = BackendRegistry::new().with(Arc::new(fake));
     let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
@@ -4285,7 +4288,7 @@ async fn r_mvp1_10_extend_then_retry_genuinely_reopens_the_envelope_exhausted_la
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "blocked", "{body}");
     let reason = r_mvp1_10_block_reason(data.path(), &work_id);
-    assert_eq!(reason, format!("turn envelope exhausted ({CAP} turns)"));
+    assert_eq!(reason, format!("turn envelope exhausted ({cap} turns)"));
 
     // A bare retry (the revolving-door shape the finding named) re-blocks on
     // the identical condition — proven already by the sibling test above;
@@ -4351,4 +4354,47 @@ async fn r_mvp1_10_extend_refuses_a_work_that_is_not_blocked() {
     assert_eq!(extend_body["error"]["code"], "not_blocked", "{extend_body}");
 
     handle.shutdown().await;
+}
+
+/// E1: `SGT_TURN_CAP` reaches a real spawned daemon (`DaemonConfig::
+/// turn_cap`, wired in `daemon::run_until_signal`) — the production
+/// configuration surface R-MVP1-7 named and this build previously had no
+/// way to reach short of a recompile. A 3-stage workflow against a cap of
+/// 2 must block at exactly 2 spawned turns, naming the configured cap in
+/// the block reason.
+#[test]
+fn r_mvp1_7_sgt_turn_cap_env_var_reaches_a_real_spawned_daemon() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "three", 3);
+
+    let data = DataDir::new();
+    let output = std::process::Command::new(SGT)
+        .current_dir(&repo)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--json")
+        .args(["run", "capped low", "--workflow", "three"])
+        .env("SGT_TURN_CAP", "2")
+        .output()
+        .expect("run sgt");
+    assert!(
+        output.status.success(),
+        "sgt run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output");
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "a 3-stage workflow against SGT_TURN_CAP=2 must block on the 3rd \
+         stage's LAUNCH: {body}"
+    );
+    let reason = r_mvp1_10_block_reason(data.path(), body["work"]["id"].as_str().expect("id"));
+    assert_eq!(
+        reason, "turn envelope exhausted (2 turns)",
+        "the daemon must actually be running with the configured cap, not the built-in default"
+    );
+
+    stop_daemon(data.path());
 }

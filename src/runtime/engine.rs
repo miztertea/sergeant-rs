@@ -773,14 +773,35 @@ pub const KIND_TURN_CEILING_INTERRUPTED: &str = "execution.turn_ceiling_interrup
 /// change the condition itself, not just ask again.
 pub const KIND_TURN_ENVELOPE_EXTENDED: &str = "execution.turn_envelope_extended";
 
-/// R-MVP1-7's default turn cap: the largest measured single turn on this
-/// build's evidence is Run B2's $3.21 (`GAUNTLET.md`'s N-series close-out,
-/// `docs/gauntlet/contracts/MVP-1.md`'s own L16 arithmetic), and the
-/// contract states its worked example against 6 turns — "a ~$19 bound, not
-/// a $2.50 one". Taking that worked number as the shipped default keeps the
-/// arithmetic that justified it and the value that enforces it from
-/// silently drifting apart. Override with [`Engine::with_turn_cap`].
-pub const DEFAULT_TURN_CAP: u32 = 6;
+/// R-MVP1-7's default turn cap.
+///
+/// **Not yet the ledger's own measured N-series turn count (contract
+/// Unknown #2) — that measurement still has not been run** (invariants:
+/// MVP1-R1-I1). What changed from the first shipped value (6, the
+/// contract's own L16 worked example) is the evidence it is grounded in:
+/// `find .sergeant/workflows -name workflow.toml` shows this repo's own
+/// longest admitted workflow (`repo-to-icm`) declares 10 stages, and a cap
+/// of 6 blocked every admitted workflow over 6 stages on its very first
+/// run, unconditionally — `repo-to-icm`, the workflow R-MVP1-2's own
+/// finalize helper was built for, included. 12 covers every admitted
+/// workflow's stage count (max 10) with margin for at least one retry
+/// inside any single stage, without inventing an unrelated round number.
+/// L16 arithmetic still holds at the new value: the largest measured
+/// single turn on this build's evidence is Run B2's $3.21
+/// (`GAUNTLET.md`'s N-series close-out), so a 12-turn cap is a ~$38 bound,
+/// never a $2.50 one.
+///
+/// Structurally grounded, still not live-measured: a real N-series run
+/// (or the opt-in Claude suite, `SERGEANT_CLAUDE_TESTS=1`) is what would
+/// finally answer "how many turns does `repo-to-icm` actually spend",
+/// which is the number this constant should carry once it exists. Until
+/// then, override per-installation with [`Engine::with_turn_cap`]
+/// (`DaemonConfig::turn_cap` / `SGT_TURN_CAP`, wired the same way
+/// [`Self::turn_ceiling`]'s override is) — and R-MVP1-10's own exit door,
+/// `Engine::extend_turn_envelope`, means a Work that still outgrows
+/// whatever cap is configured is recoverable without a restart, let alone
+/// a recompile.
+pub const DEFAULT_TURN_CAP: u32 = 12;
 
 /// R-MVP1-7's default per-turn wall-clock ceiling: "the soak's hang bound
 /// (CUT 10), not a stall detector" — sized to be well past any turn this
@@ -845,9 +866,12 @@ impl Engine {
         }
     }
 
-    /// Override the turn cap (R-MVP1-7). Test-only in this milestone — no
-    /// submit-time or config surface sets it per-Work yet (contract
-    /// Unknown #2: mechanism contracted, values measured at build time).
+    /// Override the daemon-wide turn cap (R-MVP1-7). Wired from
+    /// `DaemonConfig::turn_cap` / `SGT_TURN_CAP` (`daemon::run_until_signal`)
+    /// the same way [`Self::with_turn_ceiling`] is — this is still not a
+    /// per-Work or submit-time surface (contract Unknown #2: mechanism
+    /// contracted, values measured at build time); R-MVP1-10's
+    /// [`Self::extend_turn_envelope`] is the per-Work door.
     pub fn with_turn_cap(mut self, turn_cap: u32) -> Self {
         self.turn_cap = turn_cap;
         self
