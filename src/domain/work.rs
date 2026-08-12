@@ -83,6 +83,45 @@ impl IntentDetail {
     }
 }
 
+/// MVP-3's submit-time envelope override (checkpoint-friction item, the
+/// bucketing doc's "turn-cap/ceiling settable at submission"): per-Work
+/// overrides of R-MVP1-7's turn cap and per-turn wall-clock ceiling, both of
+/// which were daemon-wide-only defaults before this (`Engine::turn_cap`/
+/// `turn_ceiling`, `SGT_TURN_CAP`/config, contract Unknown #2: "mechanism
+/// contracted, values measured at build time ... not yet a per-Work or
+/// submit-time surface"). This is that surface, plumbed as CLI/API onto the
+/// existing envelope mechanics — R-MVP1-10's `extend_turn_envelope` already
+/// proved a Work-specific cap is legal engine state; this is the same idea
+/// at submission time instead of after a block.
+///
+/// **Additive-only, same discipline as [`IntentDetail`]**: `Work` derives no
+/// `deny_unknown_fields`, so an event journaled before this field existed
+/// deserializes it as `None`, which is exactly the fact it recorded — no
+/// override, the daemon-wide default applied. Absent is not zero: a `None`
+/// `turn_cap` means "use `Engine::turn_cap`", never "cap at 0".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeRequest {
+    /// Per-Work turn cap, overriding `Engine::turn_cap` for this Work's
+    /// whole life. Still additive with R-MVP1-10's `turn_cap_bonus`: a
+    /// `retry`-time `sgt extend` raises *this* base, not the daemon default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_cap: Option<u32>,
+    /// Per-Work wall-clock ceiling in whole seconds, overriding
+    /// `Engine::turn_ceiling` for this Work's whole life. Seconds (not a
+    /// `Duration`) because that is what journals losslessly through
+    /// `serde_json::Value` and what a CLI flag naturally is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling_secs: Option<u64>,
+}
+
+impl EnvelopeRequest {
+    /// Whether both fields are absent — the same fact as sending nothing,
+    /// mirroring [`IntentDetail::is_empty`].
+    pub fn is_empty(&self) -> bool {
+        self.turn_cap.is_none() && self.ceiling_secs.is_none()
+    }
+}
+
 /// Event kind: a work item was accepted and entered `pending`.
 pub const KIND_WORK_SUBMITTED: &str = "work.submitted";
 /// Event kind: a work item was canceled.
@@ -251,6 +290,12 @@ pub struct Work {
     /// field absent are the same fact — a client that elaborated nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_detail: Option<IntentDetail>,
+    /// MVP-3's per-submission envelope override (see [`EnvelopeRequest`]).
+    /// `None` is the ordinary case — the daemon-wide `Engine::turn_cap`/
+    /// `turn_ceiling` defaults apply, unchanged from before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope: Option<EnvelopeRequest>,
     /// Current state (only mutated by folding journal events).
     pub state: WorkState,
     /// Who submitted it.

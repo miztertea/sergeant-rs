@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::daemon::{KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED};
 use crate::domain::event::Event;
 use crate::domain::execution::{
     ExecutionRecord, ExecutionReservation, KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RESERVED,
@@ -319,6 +320,16 @@ pub struct WorkRegistry {
     /// [`TERMINAL_RUN_CACHE_CAPACITY`].
     #[serde(default)]
     pub terminal_run_order: std::collections::VecDeque<String>,
+    /// MVP-3's admission drain flag (`sgt daemon stop`, scoped exactly to
+    /// that use): whether `POST /v1/work` currently refuses new
+    /// submissions. Folded from `admission.paused`/`admission.resumed`
+    /// (`daemon.rs`) — a plain `bool`, not a counter, so pausing twice in a
+    /// row (a `daemon stop` retry against a still-live daemon) and resuming
+    /// an already-resumed daemon (startup's own unconditional clear) are
+    /// both idempotent by construction rather than by a caller remembering
+    /// to check first.
+    #[serde(default)]
+    pub admission_paused: bool,
 }
 
 /// Bound on how many terminal runs [`WorkRegistry::terminal_runs`] holds at
@@ -616,6 +627,19 @@ fn maybe_evict(state: &mut WorkRegistry, work_id: Option<&str>) {
 /// fold, one flag, so the live registry and the read-time re-derivation can
 /// never drift into two different ideas of what a work's run looked like.
 fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
+    // MVP-3's admission drain flag: a plain fold, checked before the
+    // per-work dispatch below since neither event carries a `work_id`.
+    match event.kind.as_str() {
+        KIND_ADMISSION_PAUSED => {
+            state.admission_paused = true;
+            return;
+        }
+        KIND_ADMISSION_RESUMED => {
+            state.admission_paused = false;
+            return;
+        }
+        _ => {}
+    }
     // Work-state transitions: one mapping, shared with the writer
     // (`WorkState::for_event_kind`), so a kind cannot mean one state when
     // appended and another when replayed.

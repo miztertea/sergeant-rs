@@ -59,6 +59,34 @@ pub const KIND_DAEMON_STOPPED: &str = "daemon.stopped";
 /// registration as the M4 contract requires).
 pub const KIND_BACKEND_PROBED: &str = "backend.probed";
 
+/// Event kind: admission paused — new `POST /v1/work` submissions are
+/// refused until [`KIND_ADMISSION_RESUMED`] (MVP-3's drain flag, scoped
+/// exactly to `sgt daemon stop`: pause, wait for in-flight work to finish,
+/// then send the ordinary SIGTERM shutdown). Idempotent at the API layer
+/// (`pause_admission` in `api.rs` journals nothing new if already paused),
+/// which is what keeps a `daemon stop` retry from double-pausing — see
+/// [`KIND_ADMISSION_RESUMED`]'s doc for the other half of L6's crash window.
+pub const KIND_ADMISSION_PAUSED: &str = "admission.paused";
+/// Event kind: admission resumed — the complement of
+/// [`KIND_ADMISSION_PAUSED`].
+///
+/// **L6's crash window, closed by construction rather than by recovery
+/// logic.** A daemon can die after journaling `admission.paused` but before
+/// `sgt daemon stop` ever sends SIGTERM (killed mid-drain, or the CLI itself
+/// was killed while waiting). A single `bool` folded from these two event
+/// kinds is durable, so a naive restart would replay straight into "admission
+/// still paused" forever — a fresh process that was never mid-drain itself,
+/// permanently refusing all new work with no operator ever having asked for
+/// that. `start_with` closes this the same way `reconcile_crashed_start`
+/// closes its own crash windows: **unconditionally**, journal
+/// `admission.resumed` once at startup whenever the freshly-replayed state
+/// shows paused, before the descriptor is published and before any request
+/// can be served. This is safe rather than a guess because admission-paused
+/// is a fact about *this process's* live drain, and a new process starting
+/// is unambiguous proof no drain by *it* is in progress — unlike Work-state
+/// recovery (§25), there is no ambiguous case here to fail closed on.
+pub const KIND_ADMISSION_RESUMED: &str = "admission.resumed";
+
 /// The runtime descriptor published for clients (proposal §6): endpoint,
 /// PID, API revision, and the bearer token, protected by owner-only file
 /// permissions.
@@ -423,6 +451,23 @@ pub async fn start_with(
             reservations_retired = ?reconciled.reservations_retired,
             "reconciled in-flight work after restart"
         );
+    }
+
+    // 4c-ii. Clear a stale admission pause (L6, `KIND_ADMISSION_RESUMED`'s
+    // own doc): a predecessor that died mid-drain can leave the replayed
+    // state paused with nothing left to ever resume it. This process was
+    // never mid-drain itself, so the fact is unambiguous — resume
+    // unconditionally, before the descriptor is published and before any
+    // request can be served, exactly like the backend probes and recovery
+    // above.
+    if core.registry.state().admission_paused {
+        core.commit(EventDraft::new(
+            EventSource::new("daemon", "sergeant"),
+            KIND_ADMISSION_RESUMED,
+            json!({"reason": "startup: a fresh process was never mid-drain"}),
+        ))?;
+        core.flush()?;
+        tracing::info!("cleared an admission pause inherited from a previous process life");
     }
 
     // 5. Publish the descriptor: atomic rename, owner-only permissions,

@@ -741,3 +741,176 @@ fn work_transcript_and_output_pointer_are_reachable_from_the_real_cli() {
 
     data_dir.reap();
 }
+
+// -------------------------------------------------- envelope / daemon stop
+
+/// guard-map: `sgt run --turns N --ceiling-secs S` (checkpoint-friction
+/// item, `docs/gauntlet/notes/mvp-bucketing-2026-08-11.md`'s MVP-3 row)
+/// threads a per-submission override into R-MVP1-7's turn envelope — CLI/API
+/// plumbing onto the existing per-Work mechanics (R-NS-4: `turn_cap_bonus`
+/// already proved a Work-specific cap was legal engine state via `sgt
+/// extend`; this is the same idea at submission time), not new engine
+/// mechanics — and `sgt work show`'s `envelope` key makes turns
+/// spent/capped/ceiling readable without decoding the journal.
+///
+/// Mutation this kills: `--turns`/`--ceiling-secs` being parsed but silently
+/// dropped before reaching the submit body (the work would then run to
+/// completion against the daemon's much larger default cap instead of
+/// blocking after its first turn); `work_view`/`fleet_body` reporting the
+/// daemon-wide default instead of the submitted override; or
+/// `check_turn_envelope` ignoring `Work::envelope` and gating on the
+/// daemon-wide cap regardless.
+#[test]
+fn run_turns_and_ceiling_secs_override_the_envelope_for_one_work() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--workflow",
+            "tiny",
+            "--turns",
+            "1",
+            "--ceiling-secs",
+            "120",
+            "capped at one turn",
+        ],
+    );
+    submitted.assert_ok("run --turns 1 --ceiling-secs 120");
+    let work_id = submitted.json()["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+
+    // The two-stage workflow's first stage spawns turn 1 and completes (the
+    // fake backend finishes every turn immediately, per
+    // `work_transcript_and_output_pointer_are_reachable_from_the_real_cli`'s
+    // own note); the second stage's LAUNCH would be turn 2, which a cap of 1
+    // refuses — so this work must land `blocked`, never `completed`. That
+    // divergence from the sibling test above (same workflow, default cap,
+    // reaches `completed`) is the whole proof that `--turns 1` reached the
+    // engine's own check rather than being dropped somewhere in the
+    // CLI/API path.
+    let shown = wait_for_state(repo.path(), data_dir.path(), &work_id, "blocked");
+
+    let envelope = &shown["envelope"];
+    assert_eq!(
+        envelope["turns_spawned"], 1,
+        "exactly one turn must have spawned before the cap blocked stage two: {shown}"
+    );
+    assert_eq!(
+        envelope["turn_cap"], 1,
+        "the effective cap must be the submitted override, not the daemon-wide default: {shown}"
+    );
+    assert_eq!(
+        envelope["turn_ceiling_secs"], 120.0,
+        "the effective ceiling must be the submitted override: {shown}"
+    );
+
+    // `sgt work list --json` folds the same envelope onto every fleet row,
+    // so an operator does not need one request per work to see it.
+    let listed = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "work", "list"],
+    );
+    listed.assert_ok("work list");
+    let row = listed.json()["works"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|w| w["id"] == work_id).cloned())
+        .expect("the submitted work must appear in the fleet view");
+    assert_eq!(
+        row["envelope"]["turn_cap"], 1,
+        "the fleet view must fold the same per-Work override: {row}"
+    );
+
+    data_dir.reap();
+}
+
+/// guard-map: `sgt daemon stop` (E4, MVP-3's "cheap-now" item) actually
+/// stops the daemon it names, gracefully — `data_dir.daemon_pids()` (the
+/// same pattern-scan `DataDir`'s own `Drop` leak check uses) finds nothing
+/// afterward, matching CLAUDE.md's own leak-detection convention. Also pins
+/// idempotence in both directions named in the task: stopping a daemon that
+/// is not running yet, and stopping one that is already stopped, are both
+/// clean successes, never errors. `tests/m6_surfaces.rs`'s
+/// `r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop` covers
+/// the admission-drain mechanism's L6 crash window directly at the API
+/// level; this test proves the same verb reachable, end to end, through the
+/// real CLI binary a user actually runs.
+///
+/// Mutation this kills: `sgt daemon stop` sending SIGKILL instead of the
+/// graceful path (this test's daemon would still be gone, but
+/// `r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop`'s sibling
+/// coverage of the graceful path would not exercise what it claims to);
+/// `daemon_stop` treating "no daemon running" as an error instead of a
+/// no-op success; or the drain step never actually calling
+/// `/v1/admission/pause` (silently dropped), which would leave a work
+/// submitted concurrently with a slow drain racing admission instead of
+/// being refused.
+#[test]
+fn daemon_stop_drains_admission_and_exits_cleanly() {
+    let data_dir = DataDir::new();
+    let cwd = tempfile::TempDir::new().expect("tempdir");
+
+    // Idempotent: stopping a daemon that was never started is a clean
+    // success, not an error — a clean stop refuses nothing, including a
+    // repeat of itself.
+    let idle_stop = run(
+        cwd.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "daemon", "stop"],
+    );
+    idle_stop.assert_ok("daemon stop (never started)");
+    assert_eq!(idle_stop.json()["status"], "not_running");
+
+    // Auto-spawn a real daemon (any client command does this).
+    let status = run(cwd.path(), Some(data_dir.path()), &[], &["status"]);
+    status.assert_ok("status (auto-spawn)");
+    let pids_before = data_dir.daemon_pids();
+    assert_eq!(
+        pids_before.len(),
+        1,
+        "exactly one daemon must be running after auto-spawn: {pids_before:?}"
+    );
+
+    let stop = run(
+        cwd.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "daemon", "stop"],
+    );
+    stop.assert_ok("daemon stop");
+    assert_eq!(
+        stop.json()["status"],
+        "stopped",
+        "stop must report that it actually stopped the daemon: {}",
+        stop.stdout
+    );
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "no daemon may remain running on this data dir after `sgt daemon stop`"
+    );
+
+    // Idempotent the other direction: stopping again after it is already
+    // gone is still a clean success.
+    let after = run(
+        cwd.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "daemon", "stop"],
+    );
+    after.assert_ok("daemon stop (already stopped)");
+    assert_eq!(after.json()["status"], "not_running");
+
+    data_dir.reap();
+}

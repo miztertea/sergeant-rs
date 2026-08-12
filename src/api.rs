@@ -29,14 +29,17 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::Deferred;
-use crate::daemon::{KIND_BACKEND_PROBED, KIND_DAEMON_STARTED, KIND_DAEMON_STOPPED};
+use crate::daemon::{
+    KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
+    KIND_DAEMON_STOPPED,
+};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::execution::{
     KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use crate::domain::work::{
-    IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
+    EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
     KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
     KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
 };
@@ -392,6 +395,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/work/{id}/input", post(work_input))
         .route("/work/{id}/retry", post(work_retry))
         .route("/work/{id}/extend", post(work_extend))
+        .route("/admission/pause", post(pause_admission))
         .route("/graph/work/{id}", get(work_graph))
         .route("/analytics", get(analytics_index))
         .route("/analytics/{name}", get(analytics_query))
@@ -881,19 +885,26 @@ async fn healthz() -> Json<Value> {
 /// every live client needs it and none of them may read the journal to find
 /// it: it is the resume point an SSE subscriber passes as `from` so that
 /// attaching to the tail does not replay all of history first.
-fn system_body(state: &ApiState, journal_head: u64) -> Value {
+fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "api_revision": API_REVISION,
         "data_dir": state.data_dir,
         "journal_head": journal_head,
+        // MVP-3's admission drain flag (`sgt daemon stop`): whether new
+        // `POST /v1/work` submissions are currently refused. Surfaced here
+        // so `sgt status` can say why a submit is being turned away without
+        // an operator having to decode the journal for `admission.paused`.
+        "admission_paused": admission_paused,
     })
 }
 
 /// `GET /v1/system` — version, API revision, data dir, journal head.
 async fn system_info(State(state): State<ApiState>) -> Json<Value> {
-    let head = CoreGuard::acquire(&state.core).await.registry.last_seq();
-    Json(system_body(&state, head))
+    let core = CoreGuard::acquire(&state.core).await;
+    let head = core.registry.last_seq();
+    let admission_paused = core.registry.state().admission_paused;
+    Json(system_body(&state, head, admission_paused))
 }
 
 /// The event source all API-origin events carry.
@@ -1027,6 +1038,36 @@ struct SubmitRequest {
     /// otherwise — nothing here drives routing.
     #[serde(default)]
     intent_detail: Option<IntentDetail>,
+    /// MVP-3's submit-time envelope override (`--turns`/`--ceiling-secs`):
+    /// see [`EnvelopeRequest`]. Validated at submit (both fields, when
+    /// present, must be at least 1) and journaled verbatim otherwise —
+    /// nothing here drives routing, exactly like `intent_detail` above.
+    #[serde(default)]
+    envelope: Option<EnvelopeRequest>,
+}
+
+/// R-MVP1-7's envelope override, sanity-checked at submit: a turn cap of 0
+/// would block a Work before its first turn ever spawns (indistinguishable
+/// from "already exhausted"), and a ceiling of 0 would interrupt a turn
+/// before the completion driver's very first tick could ever see it finish —
+/// both are certainly a client mistake, never an intentional bound, so both
+/// fail closed here rather than producing a Work that can never make
+/// progress.
+fn envelope_out_of_range(req: &SubmitRequest) -> Option<String> {
+    let envelope = req.envelope.as_ref()?;
+    if envelope.turn_cap == Some(0) {
+        return Some(
+            "envelope.turn_cap must be at least 1 (0 would block before any turn)".to_string(),
+        );
+    }
+    if envelope.ceiling_secs == Some(0) {
+        return Some(
+            "envelope.ceiling_secs must be at least 1 (0 would interrupt before any turn could \
+             ever finish)"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// R-MVP1-6's submit-time agreement check: a structured elaboration that
@@ -1156,7 +1197,7 @@ async fn submit_work(
         .get(&req.command_id)
         .cloned()
     {
-        let result = work_view(&core, &work_id);
+        let result = work_view(&core, &state.engine, &work_id);
         return record_and_respond(
             &mut core,
             &req.command_id,
@@ -1192,6 +1233,40 @@ async fn submit_work(
             "work.submit",
             None,
             StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    if let Some(reason) = envelope_out_of_range(&req) {
+        let result = error_body("invalid_envelope", reason);
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.submit",
+            None,
+            StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    // MVP-3's admission drain (`sgt daemon stop`, scoped exactly to that
+    // use): a genuinely new submission arriving while admission is paused is
+    // refused, journaled like any other rejected outcome so a retry after
+    // admission resumes is a distinct, freshly-evaluated command rather than
+    // a replay of this refusal. Checked here, *after* the replay/crash-window
+    // lookups above, so a duplicate `command_id` from before the pause still
+    // replays its original (accepted) outcome — pausing admission stops new
+    // work, not the idempotent replay of work already accepted.
+    if core.registry.state().admission_paused {
+        let result = error_body(
+            "admission_paused",
+            "admission is paused (the daemon is draining for `sgt daemon stop`) — refusing new \
+             work until it resumes",
+        );
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.submit",
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
             result,
         );
     }
@@ -1234,6 +1309,9 @@ async fn submit_work(
         // all (IntentDetail::is_empty's own doc) — normalized here so that
         // promise is actually kept, not merely stated.
         intent_detail: req.intent_detail.filter(|d| !d.is_empty()),
+        // I3's own rule, reused: an empty `{}` override is the same fact as
+        // sending nothing.
+        envelope: req.envelope.filter(|e| !e.is_empty()),
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),
@@ -1281,7 +1359,7 @@ async fn submit_work(
     }
 
     // Answer from the projection, not the request: proves the read path.
-    let result = work_view(&core, &work_id);
+    let result = work_view(&core, &state.engine, &work_id);
     record_and_respond(
         &mut core,
         &req.command_id,
@@ -1408,7 +1486,7 @@ fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
 /// surface, and execution state. They are siblings of `work`, not fields
 /// inside it: §10 keeps stage orthogonal to work state, and flattening them
 /// into one record is how "in review" becomes a state-machine value.
-fn work_view(core: &Core, work_id: &str) -> Value {
+fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
     let registry = core.registry.state();
     let work = registry.works.get(work_id);
     let cached_run = registry.run_view(work_id);
@@ -1434,6 +1512,26 @@ fn work_view(core: &Core, work_id: &str) -> Value {
         // R-MVP1-2's sibling: named per repository once there is something to
         // point at.
         "output": work.and_then(|w| run.as_ref().and_then(|r| output_pointer(w, r))),
+        // MVP-3's envelope-visibility item: how much of R-MVP1-7's turn
+        // budget this Work has spent and how much it has, without decoding
+        // the journal for `execution.started`/`stage.resumed` counts or the
+        // submit-time override. `Engine::effective_turn_cap`/
+        // `effective_turn_ceiling` are the exact formulas
+        // `check_turn_envelope`/`due_interrupts` gate on, so this can never
+        // show a budget the engine is not actually enforcing. `None` (no
+        // run yet — e.g. a `pending` Work with no repository context) still
+        // reports a real, honest cap/ceiling: zero turns spent against
+        // whatever this Work would be checked against once it starts.
+        "envelope": work.map(|w| {
+            let default_run = WorkRun::default();
+            let run_ref = run.as_ref().unwrap_or(&default_run);
+            json!({
+                "turns_spawned": run_ref.turns_spawned,
+                "turn_cap": engine.effective_turn_cap(Some(w), run_ref),
+                "turn_cap_bonus": run_ref.turn_cap_bonus,
+                "turn_ceiling_secs": engine.effective_turn_ceiling(Some(w)).as_secs_f64(),
+            })
+        }),
     })
 }
 
@@ -1463,7 +1561,7 @@ fn run_stage_view(run: &WorkRun) -> Option<Value> {
 /// them is exactly how "in review" becomes a state-machine value — but a fleet
 /// view that cannot say which stage a running work is on is not a fleet view,
 /// so `stage` is a sibling key of `work` here as it is in `work_view`.
-fn fleet_body(core: &Core) -> Value {
+fn fleet_body(core: &Core, engine: &Engine) -> Value {
     let registry = core.registry.state();
     let works: Vec<Value> = registry
         .works
@@ -1481,6 +1579,22 @@ fn fleet_body(core: &Core) -> Value {
                     run.and_then(|r| r.backend.clone())
                         .map_or(Value::Null, Value::String),
                 );
+                // MVP-3's envelope-visibility item, folded onto the fleet
+                // view exactly the way `work_view` folds it onto a single
+                // work — `sgt status`/`sgt work list --json` see the same
+                // turns-spent/cap/ceiling `sgt work show` does, no second
+                // request per work required.
+                let default_run = WorkRun::default();
+                let run_ref = run.unwrap_or(&default_run);
+                object.insert(
+                    "envelope".to_string(),
+                    json!({
+                        "turns_spawned": run_ref.turns_spawned,
+                        "turn_cap": engine.effective_turn_cap(Some(work), run_ref),
+                        "turn_cap_bonus": run_ref.turn_cap_bonus,
+                        "turn_ceiling_secs": engine.effective_turn_ceiling(Some(work)).as_secs_f64(),
+                    }),
+                );
             }
             row
         })
@@ -1488,10 +1602,72 @@ fn fleet_body(core: &Core) -> Value {
     json!({"works": works})
 }
 
+#[derive(Debug, Deserialize)]
+struct PauseAdmissionRequest {
+    command_id: String,
+}
+
+/// `POST /v1/admission/pause` — MVP-3's admission drain flag, scoped exactly
+/// to `sgt daemon stop`: refuse every new `POST /v1/work` submission from
+/// this point on ([`submit_work`]'s own `admission_paused` check) until a
+/// fresh daemon process resumes it at startup (`daemon.rs`'s `start_with`,
+/// `KIND_ADMISSION_RESUMED`'s doc has the L6 crash-window argument for why
+/// resume is startup-only rather than a second endpoint here).
+///
+/// **Idempotent, not merely retried.** A `daemon stop` that finds admission
+/// already paused (its own earlier attempt, or a concurrent one) journals
+/// nothing new — the `bool` this folds into is already true, and appending a
+/// second `admission.paused` would answer "is admission paused" no more
+/// truthfully while making the journal's pause/resume pairing look like it
+/// happened twice. This is what keeps a `daemon stop` retry from
+/// "double-pausing incoherently", the other half of the L6 argument this
+/// milestone's task names.
+async fn pause_admission(
+    State(state): State<ApiState>,
+    body: Result<Json<PauseAdmissionRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = CoreGuard::acquire(&state.core).await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if core.registry.state().admission_paused {
+        let result = json!({"admission": {"paused": true}});
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "admission.pause",
+            None,
+            StatusCode::OK,
+            result,
+        );
+    }
+    let mut draft = EventDraft::new(api_source(), KIND_ADMISSION_PAUSED, json!({}));
+    draft.correlation_id = Some(req.command_id.clone());
+    if let Err(e) = core.commit(draft) {
+        return internal_error(e);
+    }
+    let result = json!({"admission": {"paused": true}});
+    record_and_respond(
+        &mut core,
+        &req.command_id,
+        "admission.pause",
+        None,
+        StatusCode::OK,
+        result,
+    )
+}
+
 /// `GET /v1/work` — list all work (ULID key order = submission order).
 async fn list_work(State(state): State<ApiState>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
-    Json(fleet_body(&core)).into_response()
+    Json(fleet_body(&core, &state.engine)).into_response()
 }
 
 /// `GET /v1/work/{id}` — one work record, with its stage, surface and
@@ -1499,7 +1675,7 @@ async fn list_work(State(state): State<ApiState>) -> Response {
 async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
     match core.registry.state().works.get(&id) {
-        Some(_) => Json(work_view(&core, &id)).into_response(),
+        Some(_) => Json(work_view(&core, &state.engine, &id)).into_response(),
         None => error_response(
             StatusCode::NOT_FOUND,
             "work_not_found",
@@ -1745,7 +1921,7 @@ async fn cancel_work(
         }
         Err(e) => tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed"),
     }
-    let result = work_view(&core, &id);
+    let result = work_view(&core, &state.engine, &id);
     record_and_respond(
         &mut core,
         &req.command_id,
@@ -1804,7 +1980,7 @@ async fn work_input(
             }
             drop(core);
             let mut core = relock(&state, crank(&state, step).await).await;
-            let result = work_view(&core, &id);
+            let result = work_view(&core, &state.engine, &id);
             record_and_respond(
                 &mut core,
                 &req.command_id,
@@ -1875,7 +2051,7 @@ async fn work_retry(
             }
             drop(core);
             let mut core = relock(&state, crank(&state, step).await).await;
-            let result = work_view(&core, &id);
+            let result = work_view(&core, &state.engine, &id);
             record_and_respond(
                 &mut core,
                 &req.command_id,
@@ -1957,7 +2133,7 @@ async fn work_extend(
     let engine = state.engine.clone();
     match engine.extend_turn_envelope(&mut core, &id, req.additional_turns) {
         Ok(()) => {
-            let result = work_view(&core, &id);
+            let result = work_view(&core, &state.engine, &id);
             record_and_respond(
                 &mut core,
                 &req.command_id,
@@ -2354,6 +2530,8 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_DAEMON_STARTED,
     KIND_DAEMON_STOPPED,
     KIND_BACKEND_PROBED,
+    KIND_ADMISSION_PAUSED,
+    KIND_ADMISSION_RESUMED,
 ];
 
 /// Encode one journal event as an SSE frame (`id` = seq for resume).
@@ -2408,14 +2586,16 @@ impl ApiViews {
 
     /// The `GET /v1/system` body.
     pub async fn system(&self) -> Value {
-        let head = CoreGuard::acquire(&self.0.core).await.registry.last_seq();
-        system_body(&self.0, head)
+        let core = CoreGuard::acquire(&self.0.core).await;
+        let head = core.registry.last_seq();
+        let admission_paused = core.registry.state().admission_paused;
+        system_body(&self.0, head, admission_paused)
     }
 
     /// The `GET /v1/work` body.
     pub async fn fleet(&self) -> Value {
         let core = CoreGuard::acquire(&self.0.core).await;
-        fleet_body(&core)
+        fleet_body(&core, &self.0.engine)
     }
 
     /// The `GET /v1/work/{id}` body, or `None` for an unknown work (the 404
@@ -2426,7 +2606,7 @@ impl ApiViews {
             .state()
             .works
             .contains_key(id)
-            .then(|| work_view(&core, id))
+            .then(|| work_view(&core, &self.0.engine, id))
     }
 
     /// The `GET /v1/events?work_id=…&limit=…` body, or the structured error

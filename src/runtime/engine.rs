@@ -369,6 +369,15 @@ pub struct PendingInterrupt {
     work_id: String,
     execution: ExecutionRecord,
     backend: Arc<dyn Backend>,
+    /// The ceiling this crossing was measured against
+    /// ([`Engine::effective_turn_ceiling`] at collection time in
+    /// [`Engine::due_interrupts`]) — MVP-3's per-Work override when the
+    /// client set one, else the daemon-wide default. Carried on the struct
+    /// rather than recomputed at settle time so the journaled
+    /// `ceiling_secs` always names the bound this specific crossing actually
+    /// violated, not just whatever `Engine::turn_ceiling` happens to be by
+    /// the time settlement runs.
+    ceiling_secs: f64,
 }
 
 impl std::fmt::Debug for PendingInterrupt {
@@ -878,19 +887,51 @@ impl Engine {
 
     /// Override the daemon-wide turn cap (R-MVP1-7). Wired from
     /// `DaemonConfig::turn_cap` / `SGT_TURN_CAP` (`daemon::run_until_signal`)
-    /// the same way [`Self::with_turn_ceiling`] is — this is still not a
-    /// per-Work or submit-time surface (contract Unknown #2: mechanism
-    /// contracted, values measured at build time); R-MVP1-10's
-    /// [`Self::extend_turn_envelope`] is the per-Work door.
+    /// the same way [`Self::with_turn_ceiling`] is — this is the fleet-wide
+    /// default beneath two per-Work doors: MVP-3's submit-time
+    /// `Work::envelope` override ([`Self::effective_turn_cap`]) and
+    /// R-MVP1-10's [`Self::extend_turn_envelope`], which raises whichever of
+    /// those two bases a Work is currently checked against.
     pub fn with_turn_cap(mut self, turn_cap: u32) -> Self {
         self.turn_cap = turn_cap;
         self
     }
 
-    /// Override the per-turn wall-clock ceiling (R-MVP1-7).
+    /// Override the per-turn wall-clock ceiling (R-MVP1-7). Same relationship
+    /// to MVP-3's submit-time override as [`Self::with_turn_cap`]: this is
+    /// the default [`Self::effective_turn_ceiling`] falls back to when a Work
+    /// carries none of its own.
     pub fn with_turn_ceiling(mut self, turn_ceiling: Duration) -> Self {
         self.turn_ceiling = turn_ceiling;
         self
+    }
+
+    /// R-MVP1-7's effective turn cap for one specific Work: MVP-3's
+    /// submit-time override (`work.envelope.turn_cap`) when the client set
+    /// one, else this engine's daemon-wide [`Self::turn_cap`] — plus
+    /// R-MVP1-10's cumulative `sgt extend` bonus either way. The **one**
+    /// formula [`Self::check_turn_envelope`] gates admission on and
+    /// `api::work_view` displays, so a client can never see a budget the
+    /// engine itself is not actually enforcing.
+    pub fn effective_turn_cap(&self, work: Option<&Work>, run: &WorkRun) -> u32 {
+        let base = work
+            .and_then(|w| w.envelope.as_ref())
+            .and_then(|e| e.turn_cap)
+            .unwrap_or(self.turn_cap);
+        base.saturating_add(run.turn_cap_bonus)
+    }
+
+    /// R-MVP1-7's effective per-turn wall-clock ceiling for one specific
+    /// Work: MVP-3's submit-time override (`work.envelope.ceiling_secs`)
+    /// when the client set one, else this engine's daemon-wide
+    /// [`Self::turn_ceiling`]. The one formula [`Self::due_interrupts`]
+    /// sweeps against and `api::work_view` displays — same reasoning as
+    /// [`Self::effective_turn_cap`].
+    pub fn effective_turn_ceiling(&self, work: Option<&Work>) -> Duration {
+        work.and_then(|w| w.envelope.as_ref())
+            .and_then(|e| e.ceiling_secs)
+            .map(Duration::from_secs)
+            .unwrap_or(self.turn_ceiling)
     }
 
     /// Override the default surfaces root (R-MVP1-1). The daemon calls this
@@ -2639,8 +2680,10 @@ impl Engine {
         // R-MVP1-10's exit door: an explicit `extend_turn_envelope` raises
         // the effective cap for this Work specifically, cumulative across
         // every extension. Zero for a Work that was never extended, so this
-        // is exactly `self.turn_cap` for the ordinary case.
-        let effective_cap = self.turn_cap.saturating_add(run.turn_cap_bonus);
+        // is exactly `self.turn_cap` (or MVP-3's submit-time override, when
+        // the client set one) for the ordinary case.
+        let work = core.registry.state().works.get(work_id);
+        let effective_cap = self.effective_turn_cap(work, &run);
         if run.turns_spawned < effective_cap {
             return Ok(true);
         }
@@ -3222,7 +3265,11 @@ impl Engine {
                 if !self.turn_still_active(core, work_id) {
                     return false; // stale: settled, moved on, or superseded
                 }
-                if now.saturating_duration_since(*at) < self.turn_ceiling {
+                // MVP-3: a Work's own submit-time override, when it set one,
+                // stands in for the daemon-wide default here — the same
+                // formula `check_turn_envelope`'s cap check uses.
+                let ceiling = self.effective_turn_ceiling(core.registry.state().works.get(work_id));
+                if now.saturating_duration_since(*at) < ceiling {
                     return true; // keep timing it, not yet due
                 }
                 // Overdue. A backend this daemon no longer registers is the
@@ -3238,6 +3285,7 @@ impl Engine {
                         work_id: work_id.clone(),
                         execution,
                         backend,
+                        ceiling_secs: ceiling.as_secs_f64(),
                     }));
                 }
                 false
@@ -3311,7 +3359,7 @@ impl Engine {
                 "backend": pending.execution.backend,
                 "stage_id": pending.execution.stage_id,
                 "attempt": pending.execution.attempt,
-                "ceiling_secs": self.turn_ceiling.as_secs_f64(),
+                "ceiling_secs": pending.ceiling_secs,
                 "outcome": {"requested": false, "stale": reason},
             }),
         )
@@ -3349,7 +3397,7 @@ impl Engine {
                 "backend": pending.execution.backend,
                 "stage_id": pending.execution.stage_id,
                 "attempt": pending.execution.attempt,
-                "ceiling_secs": self.turn_ceiling.as_secs_f64(),
+                "ceiling_secs": pending.ceiling_secs,
                 "outcome": recorded,
             }),
         )?;

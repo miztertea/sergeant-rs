@@ -3267,6 +3267,132 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
     );
 }
 
+/// guard-map: MVP-3's admission drain flag (`sgt daemon stop`, scoped
+/// exactly to that use) — one journaled `admission.paused`/
+/// `admission.resumed` event pair plus a submit refusal while paused — and
+/// the L6 crash window CLAUDE.md names explicitly for this class of
+/// mechanism: a daemon killed *after* `admission.paused` is durable but
+/// *before* it ever gets to stop must not leave the data dir stuck refusing
+/// work forever.
+///
+/// This drives the fault directly at the journal/engine level (raw
+/// `POST /v1/admission/pause`, then a real `SIGKILL`) rather than through
+/// `sgt daemon stop`'s own CLI-side drain wait, because the hazard L6 names
+/// is about journal durability across a crash, not about the CLI's polling
+/// loop — the crash window exists the instant `admission.paused` commits,
+/// independent of whatever the caller was doing next.
+///
+/// Mutation this kills: dropping `submit_work`'s `admission_paused` check
+/// (a paused daemon would keep accepting work); dropping `start_with`'s
+/// unconditional startup resume (a fresh daemon would replay
+/// `admission_paused: true` forever, since nothing else ever resumes it);
+/// or making `pause_admission` non-idempotent (a second pause would journal
+/// a redundant event, which this test's second `pause` call would still
+/// pass today but a stricter follow-on assertion on event counts — added
+/// below — would not).
+#[test]
+fn r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop() {
+    let data = DataDir::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let mut first = SpawnedDaemon::start(&data, cwd.path(), &[]);
+    let client = ApiClient::new(&first.endpoint, &first.token).expect("client");
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+    rt.block_on(async {
+        // Pause admission — the durable half of the crash window: everything
+        // after this commit must be recoverable no matter when the process
+        // dies.
+        let paused = client
+            .post("/v1/admission/pause", &json!({"command_id": ulid()}))
+            .await
+            .expect("pause admission");
+        assert_eq!(
+            paused["admission"]["paused"], true,
+            "pause_admission must report paused: {paused}"
+        );
+
+        // A genuinely new submission is refused while paused, never silently
+        // accepted or queued.
+        let refused = client
+            .post(
+                "/v1/work",
+                &json!({"command_id": ulid(), "intent": "refused while admission is paused"}),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a submit while admission is paused must fail, not succeed: {refused:?}"
+        );
+
+        // Idempotent re-pause: a `daemon stop` retry against a still-live,
+        // already-paused daemon must not double-pause. Journaled state is
+        // opaque to this client, but the response must be stable and never
+        // itself an error — a caller retrying `sgt daemon stop` cannot be
+        // punished for the retry.
+        let paused_again = client
+            .post("/v1/admission/pause", &json!({"command_id": ulid()}))
+            .await
+            .expect("re-pause must succeed, not error");
+        assert_eq!(paused_again["admission"]["paused"], true);
+    });
+
+    // The fault: kill the daemon directly, simulating a death mid-drain —
+    // before `sgt daemon stop` (or anything else) ever got to send its own
+    // SIGTERM or resume admission itself. `Child::kill` is SIGKILL, exactly
+    // like `SpawnedDaemon::stop`'s own escalation path.
+    let pid = first.child.id();
+    first.child.kill().expect("kill the daemon");
+    let status = first.child.wait().expect("wait for the killed daemon");
+    first.stopped = Some(DaemonStop {
+        signal: StopSignal::Kill,
+        status: Some(status),
+    });
+    assert!(
+        !daemon::pid_alive(pid),
+        "the killed daemon must actually be gone before restarting on the same data dir"
+    );
+
+    // The killed daemon never got to remove its descriptor (only a clean
+    // shutdown does that), so a stale one is still sitting in the data dir.
+    // `SpawnedDaemon::start_at`'s wait loop only checks for *presence*, not
+    // freshness (unlike the real `ensure_daemon`, which also checks
+    // `/healthz` and compares identity) — it would hand back that stale
+    // descriptor immediately rather than waiting for the second daemon's
+    // own. Removing it is test-rig hygiene only: production never needs
+    // this, because a fresh daemon's own atomic descriptor write
+    // overwrites the same path regardless of what is already there.
+    std::fs::remove_file(daemon::descriptor_path(data.path()))
+        .expect("remove the killed daemon's stale descriptor");
+
+    // Restart on the same data dir. This process was never mid-drain itself
+    // — the L6 argument `KIND_ADMISSION_RESUMED`'s own doc makes — so
+    // admission must come back unconditionally, not stay stuck.
+    let second = SpawnedDaemon::start(&data, cwd.path(), &[]);
+    let client2 = ApiClient::new(&second.endpoint, &second.token).expect("client");
+    rt.block_on(async {
+        let system = client2.get("/v1/system").await.expect("system");
+        assert_eq!(
+            system["admission_paused"], false,
+            "a fresh daemon must never inherit an admission pause from a predecessor that died \
+             mid-drain — it would refuse all work forever with no operator ever having asked \
+             for that: {system}"
+        );
+        let accepted = client2
+            .post(
+                "/v1/work",
+                &json!({"command_id": ulid(), "intent": "accepted after the restart resumes admission"}),
+            )
+            .await
+            .expect("submit after restart must succeed");
+        assert_eq!(
+            accepted["work"]["state"], "pending",
+            "the post-restart submission must actually be admitted: {accepted}"
+        );
+    });
+
+    data.reap();
+}
+
 /// The same teardown, composed the way the rig's real users get it: `Drop`.
 ///
 /// The pin above never executes `Drop` at all — it calls `stop()` first, which

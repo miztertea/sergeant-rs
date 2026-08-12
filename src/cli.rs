@@ -55,8 +55,12 @@ struct Sgt {
 /// Top-level `sgt` subcommands (§31 subset).
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the daemon in the foreground until SIGINT/SIGTERM.
-    Daemon,
+    /// Run the daemon in the foreground until SIGINT/SIGTERM, or (with a
+    /// subcommand) manage one already running.
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
     /// Daemon health and work counts.
     Status,
     /// Submit new work.
@@ -86,6 +90,18 @@ enum Command {
         /// Workspace to scope the work to.
         #[arg(long)]
         workspace: Option<String>,
+        /// R-MVP1-7's turn envelope, overridden for this one Work
+        /// (checkpoint-friction item — the daemon-wide `Engine::turn_cap`/
+        /// `SGT_TURN_CAP` default applies otherwise). Journaled with the
+        /// submission and enforced by the engine at every turn-spawning
+        /// verb, the same as the daemon-wide default.
+        #[arg(long)]
+        turns: Option<u32>,
+        /// R-MVP1-7's per-turn wall-clock ceiling in seconds, overridden for
+        /// this one Work (the daemon-wide `Engine::turn_ceiling` default
+        /// applies otherwise).
+        #[arg(long)]
+        ceiling_secs: Option<u64>,
     },
     /// Inspect work items.
     Work {
@@ -164,6 +180,22 @@ enum Command {
         #[command(subcommand)]
         command: GroupCommand,
     },
+}
+
+/// `sgt daemon ...` subcommands (MVP-3, E4).
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// Gracefully stop the daemon on this data dir: pause admission (new
+    /// `sgt run` submissions are refused), wait for in-flight work to
+    /// finish, then the same SIGTERM shutdown `sgt daemon` (foreground)
+    /// already answers to — journals `daemon.stopped`, removes the runtime
+    /// descriptor. A clean stop, not a kill: it refuses nothing itself, and
+    /// nothing about it destroys work — a Work still draining when the
+    /// bounded wait runs out is simply picked back up by ordinary restart
+    /// recovery (§25) the next time a daemon starts on this data dir.
+    /// Idempotent: stopping a daemon that is not running, or one already
+    /// mid-drain from an earlier `sgt daemon stop`, is not an error.
+    Stop,
 }
 
 /// `sgt repo ...` subcommands (MVP-3).
@@ -370,29 +402,48 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         return crate::tui::run(client).await.map_err(CliError::from);
     };
     match command {
-        Command::Daemon => {
+        Command::Daemon { command: None } => {
             tracing_subscriber::fmt().init();
             daemon::run_until_signal(&data_dir).await?;
             Ok(())
         }
+        Command::Daemon {
+            command: Some(DaemonCommand::Stop),
+        } => daemon_stop(&data_dir, sgt.json).await,
         Command::Status => {
             let client = ensure_daemon(&data_dir).await?;
             let system = client.get("/v1/system").await?;
             let works = client.get("/v1/work").await?;
             let mut counts = std::collections::BTreeMap::<String, u64>::new();
             let mut total = 0u64;
+            // MVP-3's envelope-visibility item: how much of R-MVP1-7's turn
+            // budget each currently-active work has spent, so an operator
+            // checking in on a walked-away run does not have to decode the
+            // journal (or run `sgt work show` per id) to see whether it is
+            // close to its cap.
+            let mut active_envelopes: Vec<(String, Value)> = Vec::new();
             if let Some(list) = works["works"].as_array() {
                 for work in list {
                     if let Some(state) = work["state"].as_str() {
                         *counts.entry(state.to_string()).or_insert(0) += 1;
                         total += 1;
+                        if state == "active" {
+                            active_envelopes.push((
+                                work["id"].as_str().unwrap_or("?").to_string(),
+                                work["envelope"].clone(),
+                            ));
+                        }
                     }
                 }
             }
+            let admission_paused = system["admission_paused"].as_bool().unwrap_or(false);
             if sgt.json {
-                print_json(
-                    &json!({"system": system, "work_total": total, "work_by_state": counts}),
-                );
+                print_json(&json!({
+                    "system": system,
+                    "work_total": total,
+                    "work_by_state": counts,
+                    "active_envelopes": active_envelopes.iter().map(|(id, e)| json!({"id": id, "envelope": e})).collect::<Vec<_>>(),
+                }));
             } else {
                 println!(
                     "daemon ok — version {} api {} data dir {}",
@@ -400,9 +451,22 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     system["api_revision"].as_str().unwrap_or("?"),
                     system["data_dir"].as_str().unwrap_or("?"),
                 );
+                if admission_paused {
+                    println!(
+                        "admission: PAUSED — new work is refused (draining for `sgt daemon stop`)"
+                    );
+                }
                 println!("work: {total} total");
                 for (state, n) in counts {
                     println!("  {state}: {n}");
+                }
+                for (id, envelope) in &active_envelopes {
+                    println!(
+                        "  {id}: turns {}/{} · ceiling {}s",
+                        envelope["turns_spawned"],
+                        envelope["turn_cap"],
+                        envelope["turn_ceiling_secs"],
+                    );
                 }
             }
             Ok(())
@@ -415,6 +479,8 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             mut repositories,
             group,
             workspace,
+            turns,
+            ceiling_secs,
         } => {
             // R-MVP1-5(b): group membership gets no new engine surface —
             // `--group` is pure CLI-side expansion into the same
@@ -445,6 +511,11 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
             }
             let client = ensure_daemon(&data_dir).await?;
+            let envelope = if turns.is_some() || ceiling_secs.is_some() {
+                Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
+            } else {
+                None
+            };
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "intent": intent,
@@ -453,6 +524,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 "profile": profile,
                 "repositories": repositories,
                 "workspace": workspace,
+                "envelope": envelope,
                 "created_by": "cli",
                 "origin": origin(),
             });
@@ -558,6 +630,12 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                                 "backend",
                                 "output",
                                 "teardown",
+                                // MVP-3's envelope-visibility item: turns
+                                // spent/capped and the effective ceiling,
+                                // folded in the same way every other key
+                                // here is (see the comment on `output`
+                                // below for why this stays one JSON blob).
+                                "envelope",
                             ] {
                                 if !result[key].is_null() {
                                     object.insert(key.to_string(), result[key].clone());
@@ -1142,6 +1220,143 @@ fn spawn_daemon(data_dir: &Path) -> Result<(), CliError> {
     }
     command.spawn()?;
     Ok(())
+}
+
+/// How long `sgt daemon stop` waits for `active` work to settle before
+/// giving up on the drain and proceeding to SIGTERM anyway.
+///
+/// A bound, not a promise: R-MVP1-7's own per-turn ceiling can run to
+/// minutes, so waiting out every possible in-flight turn unconditionally
+/// would make this command itself an unbounded hang on an interactive
+/// terminal — exactly the kind of thing a *stop* command must never be. The
+/// admission pause this function journals first is what actually protects
+/// the operator's intent (no new work starts), and a Work still draining
+/// when this deadline passes is simply left for ordinary restart recovery
+/// (§25) to pick back up the next time a daemon starts on this data dir —
+/// nothing about proceeding here destroys it. An operator who wants to wait
+/// longer can just run `sgt daemon stop` again; pausing an already-paused
+/// daemon journals nothing new (`pause_admission`'s own idempotence).
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Poll interval while draining.
+const DRAIN_POLL: Duration = Duration::from_millis(200);
+/// How long `sgt daemon stop` waits for the daemon to actually exit after
+/// SIGTERM before reporting that it did not. Mirrors the test rig's own
+/// SIGTERM grace (`tests/support::TERM_GRACE`) — the same shutdown path
+/// `the_spawned_daemon_rig_stops_its_daemon_with_sigterm` already proves the
+/// daemon meets, reached here from a client instead of a test harness.
+const STOP_TERM_GRACE: Duration = Duration::from_secs(15);
+/// Poll interval while waiting for the daemon to exit.
+const STOP_POLL: Duration = Duration::from_millis(100);
+
+/// `sgt daemon stop` (MVP-3, E4; the bucketing doc's "cheap-now" item):
+/// pause admission, drain in-flight work, then the same graceful SIGTERM
+/// shutdown `sgt daemon` (foreground) already answers to.
+///
+/// Deliberately does **not** auto-spawn a daemon — asking to stop something
+/// that is not running is answered "already stopped", never "let me start
+/// one so I can stop it", mirroring `sgt doctor`'s own no-auto-spawn rule.
+async fn daemon_stop(data_dir: &Path, json: bool) -> Result<(), CliError> {
+    let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
+        report_daemon_stop(
+            json,
+            "not_running",
+            "no daemon is running for this data dir",
+        );
+        return Ok(());
+    };
+    let http = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()?;
+    if !healthz_ok(&http, &descriptor.endpoint).await {
+        if daemon::pid_alive(descriptor.pid) {
+            // Same ambiguity `ensure_daemon` refuses to guess through: a
+            // live PID that will not answer `/healthz` might be this
+            // daemon mid-startup, or an unrelated process that happens to
+            // reuse the pid. Fail closed rather than signal it.
+            return Err(CliError::new(format!(
+                "daemon descriptor at {} names PID {} (alive) but {} does not answer /healthz; \
+                 refusing to signal it. If it is truly gone, remove the descriptor and retry.",
+                daemon::descriptor_path(data_dir).display(),
+                descriptor.pid,
+                descriptor.endpoint,
+            )));
+        }
+        report_daemon_stop(
+            json,
+            "not_running",
+            "no daemon is running for this data dir (stale descriptor)",
+        );
+        return Ok(());
+    }
+    let client = client_for(&descriptor)?;
+
+    // 1. Pause admission — MVP-3's drain flag, scoped exactly to this verb.
+    // Idempotent: a retry against a still-live, already-paused daemon
+    // journals nothing new (`pause_admission`'s own doc).
+    let pause_body = json!({"command_id": ulid::Ulid::generate().to_string()});
+    client.post("/v1/admission/pause", &pause_body).await?;
+
+    // 2. Drain: wait for every `active` work to settle, bounded by
+    // `DRAIN_TIMEOUT` above.
+    let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+    loop {
+        let works = client.get("/v1/work").await?;
+        let active = works["works"]
+            .as_array()
+            .map(|list| list.iter().filter(|w| w["state"] == "active").count())
+            .unwrap_or(0);
+        if active == 0 || Instant::now() >= drain_deadline {
+            break;
+        }
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+
+    // 3. The ordinary, already-tested graceful shutdown path: SIGTERM, then
+    // wait for the daemon to exit and journal `daemon.stopped` on its own.
+    // `kill(1)` rather than a signals crate — this binary has none, and the
+    // test rig (`tests/support::reap_daemons`) already leans on the exact
+    // same external command for the exact same reason (no dependency worth
+    // adding for one syscall's worth of shelling out).
+    let status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(descriptor.pid.to_string())
+        .status()
+        .map_err(|e| CliError::new(format!("cannot signal pid {}: {e}", descriptor.pid)))?;
+    if !status.success() {
+        // `kill` fails when the pid is already gone — treat that as success
+        // (idempotent stop), not an error.
+        if daemon::pid_alive(descriptor.pid) {
+            return Err(CliError::new(format!(
+                "kill -TERM {} exited with {status}",
+                descriptor.pid
+            )));
+        }
+        report_daemon_stop(json, "stopped", "daemon already stopped");
+        return Ok(());
+    }
+    let term_deadline = Instant::now() + STOP_TERM_GRACE;
+    while daemon::pid_alive(descriptor.pid) && Instant::now() < term_deadline {
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    if daemon::pid_alive(descriptor.pid) {
+        return Err(CliError::new(format!(
+            "sent SIGTERM to pid {} but it did not exit within {STOP_TERM_GRACE:?} — it may \
+             still be tearing down a slow effect; check daemon.log in the data dir, or retry \
+             `sgt daemon stop`",
+            descriptor.pid,
+        )));
+    }
+    report_daemon_stop(json, "stopped", "daemon stopped");
+    Ok(())
+}
+
+/// `sgt daemon stop`'s one report shape, human or `--json`.
+fn report_daemon_stop(json: bool, status: &str, message: &str) {
+    if json {
+        print_json(&json!({"status": status, "message": message}));
+    } else {
+        println!("{message}");
+    }
 }
 
 /// `sgt doctor` (proposal §31): diagnose one installation.
