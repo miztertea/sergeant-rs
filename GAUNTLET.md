@@ -47,6 +47,74 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### MVP-4 FIXER PASS — 2026-08-12, review findings on the perf re-baseline and the #45 closure
+
+**Mission outcome.** Two warning-severity findings from the review pass over
+`MVP-4 HARDENING`/`baseline-mvp-2026-08-12.md` closed, both by adding real
+evidence rather than by disputing the findings — both were correct as
+stated. Gates green: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, full `cargo test` unaffected (no `src/`/`tests/` change in this
+pass — docs only, so no code-review multi-axis loop applies per CLAUDE.md's
+"code is code" rule, which scopes that loop to diffs that change executable
+behavior). Leak check clean: `pgrep -f "debug/sgt [-]-data-dir"` empty.
+
+**`perf-raw-artifacts-not-committed` (warning) — closed by documentation,
+not by changing the artifact-commit convention.** The finding was right:
+`baseline-mvp-2026-08-12.md` asserted "every number below comes from the
+raw run artifacts" without ever stating that those artifacts are, by
+design, not committed and no longer exist — an asymmetry with
+`docs/coverage/`'s own committed-artifact convention that a reader could
+mistake for an oversight rather than a fact. Investigated before fixing:
+the P1-PERF contract itself specifies raw JSON/CSV live "under the run's
+output dir (not committed)", and `scripts/perf/README.md` requires
+`<outdir>` to live outside the repo tree — so committing raw perf artifacts
+would deviate from both the contract and the harness's own hard constraint,
+which this pass has no standing to change unilaterally. Fixed instead by
+making the convention explicit where the finding says it's missing: a new
+paragraph in `docs/perf/baseline-mvp-2026-08-12.md` states the
+not-committed convention, cites the contract and README lines it comes
+from, names `docs/perf/s2-churn-mvp1-fixer-2026-08-12.md` as the precedent
+for how this repo already handles the same fact (distill numbers, name the
+uncommitted artifact's scratch path), and confirms this run's own raw
+artifacts do not survive on disk (searched, not found) — so the honest
+statement is "transcribed from a since-gone run", not "checkable today".
+**Closed.**
+
+**`45-closed-on-preexisting-pin-no-session-code` (warning) — closed by
+re-measuring, not by disputing the closure.** The finding accepted the
+underlying #45 closure as substantively defensible (the structural pin
+fails on revert; the behavioral pin is real) but flagged that the specific
+"40/40 isolated, 15/15 full-suite" counts cited in the `MVP-4 HARDENING`
+entry had no committed or even scratch-persisted artifact — the wrapper
+scripts that produced them (`stress45.sh`/`stress45_full.sh`, found intact
+in this session's scratchpad) print to stdout only, and nothing captured
+that stdout at the time. Rather than take the prior claim on faith or
+merely soften the ledger's wording, this pass re-ran the identical method
+(16-way busy-spin background load on the 20-core host, same two commands)
+fresh, this time capturing output to `th45-reverify/isolated-40.log` and
+`th45-reverify/full-suite-15.log` (scratch, per this repo's own
+artifact-commit convention — see the previous finding). Result: **40/40
+isolated runs, 15/15 full-suite runs, 0 failures**, matching the original
+claim's shape exactly. Full write-up with method, counts, and the scratch
+artifact paths: `docs/gauntlet/notes/45-reverify-mvp4-fixer-2026-08-12.md`.
+Hygiene confirmed clean after: no leaked daemons, no leftover spin
+processes. **Closed** — #45's closure now rests on a number this session
+itself measured and can point to, not an inherited, unrecorded one.
+
+**Environmental behavior.** Direct fixer pass over two review findings, no
+panel/critic loop (docs-only diff, no executable-behavior change to
+gauntlet against CLAUDE.md's "code is code" scope rule). Both findings
+were investigated to their contractual root before fixing — neither was
+rejected, but neither was "fixed" by simply agreeing with the finding's
+framing either: the perf-artifact finding's proposed remedy (commit raw
+artifacts) would have contradicted the P1-PERF contract and the harness's
+own README, so the fix instead makes the existing, correct convention
+legible where it was previously assumed; the #45 finding's remedy (produce
+a checkable number) is exactly what was missing, so it was produced by
+re-running the measurement rather than retroactively excusing its absence.
+
+---
+
 ### MVP-4 HARDENING — 2026-08-12, #45 (m6 dropped-daemon flake) closed by measurement, #22 (workspace-edge tests) closed with a real bug found and fixed
 
 **Mission outcome.** Both of MVP-4's named hardening items closed. Gates
