@@ -15,6 +15,9 @@ const G = `You are building sergeant-rs MVP-2 on Cerberus, branch cerberus/mvp-1
 const BUILD = { type: 'object', required: ['commits', 'tests_added', 'gates_green', 'design_decisions', 'guard_map', 'notes'], properties: { commits: { type: 'array', items: { type: 'string' } }, tests_added: { type: 'number' }, gates_green: { type: 'boolean' }, design_decisions: { type: 'array', items: { type: 'string' } }, guard_map: { type: 'array', items: { type: 'object', required: ['test', 'guarded_behavior', 'mutation_that_should_kill_it'], properties: { test: { type: 'string' }, guarded_behavior: { type: 'string' }, mutation_that_should_kill_it: { type: 'string' } } } }, notes: { type: 'string' } } }
 const FINDINGS = { type: 'object', required: ['findings', 'summary'], properties: { summary: { type: 'string' }, findings: { type: 'array', items: { type: 'object', required: ['id', 'severity', 'claim', 'evidence'], properties: { id: { type: 'string' }, severity: { type: 'string', enum: ['error', 'warning', 'info'] }, claim: { type: 'string' }, evidence: { type: 'string' } } } } } }
 
+const BASE = args && args.base ? args.base : null
+if (!BASE) throw new Error('mvp2-build requires args.base (the git diff base sha for the Panel phase) — refused up front, before the Build lanes spend anything')
+
 phase('Build')
 const lanes = [
   { key: 'D1-docker', brief: `Lane D1 — the Docker executor, N4's contract verbatim: kind="execute" schema activation (§11.2/§12.3), local Engine client + capability probe (§16.1-16.3), image resolution/digest pinning + immutable identity (§16.4), worktree mount contract (§16.6), default no-network/no-privilege (§16.7), streaming bounded capture (§16.9, §22.8's 64MiB RSS budget + Rule B disk measurement), exit-to-stage mapping (§15), exact cancel/retry/recovery/cleanup (§16.10-16.12), lifecycle events + projections (§19.4), doctor rows incl. the #23 disk-pressure check (Fixes #23 on that commit). §22.5 crash windows over create/start/exit/cancel; §22.6 no Engine call under the core lock (the settle driver + performer pattern is the home). The mixed actor→execute→actor proof workflow runs on the fake actor + real Docker.`, effort: 'high' },
@@ -31,8 +34,6 @@ for (const l of lanes) {
 }
 
 phase('Panel')
-const BASE = args && args.base ? args.base : null
-if (!BASE) throw new Error('mvp2-build requires args.base (the git diff base sha for the Panel phase) — without it critics improvise a diff base instead of halting')
 const axes = [
   { key: 'invariants', brief: `Axis INVARIANTS: §22.5 crash windows actually injected over the Docker lifecycle; §22.6 lock discipline (no Engine/socket call under the guard — check the performer wiring); container ownership exactness (§16.10-16.12: no leaked containers after clean AND crash runs — verify the harness sweep); image identity immutability; the de-leak translation defines nothing (core policy pinned at bind, adapter translates); provenance events respect journal-only-truth; L6 on every new append pair. THE CONTRACT (N4 + its adjudication) is in scope (L9/L19).` },
   { key: 'test-honesty', brief: `Axis TEST-HONESTY: L8 — every advertised Docker capability has a contract test against the real engine on THIS host, probe-gated for hosts without; do §22.8's budget tests actually capture 1GiB (not a token stream); does the de-leak's "local" test measure the real CLI behavior or assume it; do fake-fidelity tests exercise the new shapes or mirror the implementation; would each pin fail on revert; are the guard-map mutations right. Read-only.` },

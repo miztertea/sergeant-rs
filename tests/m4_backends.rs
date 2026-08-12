@@ -8617,3 +8617,98 @@ async fn r_mvp1_7_two_simultaneously_overdue_hangs_are_both_interrupted() {
 
     handle.shutdown().await;
 }
+
+/// §14.5 for the interrupt's *perform*: a crossing `due_interrupts` already
+/// consumed whose targeted turn is gone by delivery time must be journaled
+/// as stale (`Engine::settle_stale_interrupt`, `outcome.requested: false`)
+/// and never reach the backend — the pre-perform re-check
+/// `api::drive_completions` runs between collection and each serially-
+/// awaited crank (`Engine::interrupt_is_stale`). Deterministic, no race:
+/// collect the overdue crossing, then retire the turn under it.
+///
+/// Mutation targets this kills (L7): a staleness check reverted to
+/// always-fresh (the `Some` assert fails, and the backend-untouched assert
+/// would fail in the wired path); one reverted to always-stale (the `None`
+/// assert fails — every live interrupt would starve); a stale settle that
+/// journals `requested: true` or nothing at all (the payload asserts fail —
+/// the trajectory would claim a delivery that never happened, or silently
+/// lose a consumed crossing).
+#[test]
+fn r_mvp1_7_a_consumed_crossing_whose_turn_ended_is_journaled_stale_not_delivered() {
+    let data = TempDir::new().expect("tempdir");
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_n_stage_workflow(&repo, "hangs", 1);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(
+        Arc::new(registry),
+        Some(FAKE_BACKEND_NAME.to_string()),
+        data.path(),
+    )
+    .with_turn_ceiling(Duration::ZERO);
+    let mut core = core(data.path());
+    let plan = engine
+        .plan(&SubmitContext {
+            cwd: Some(&repo),
+            workflow: Some("hangs"),
+            ..SubmitContext::default()
+        })
+        .expect("plan")
+        .expect("a workspace");
+    let work_id = "01MVP17STALE";
+    submit_work(&mut core, work_id, "hang, then go stale in the delivery window");
+    let work = core.registry.state().works[work_id].clone();
+    let step = engine
+        .begin_start(&mut core, &work, &plan)
+        .expect("begin start");
+    drain(&engine, &mut core, step);
+
+    let mut overdue = engine.due_interrupts(&core, Instant::now());
+    assert_eq!(
+        overdue.len(),
+        1,
+        "a zero ceiling makes the hung turn overdue on the first sweep"
+    );
+    let pending = overdue.pop().expect("the one collected crossing");
+    assert!(
+        engine.interrupt_is_stale(&core, &pending).is_none(),
+        "while the hung turn still runs, the collected crossing is fresh — a stale \
+         verdict here would starve every live interrupt"
+    );
+
+    // The delivery-window supersession, without the race: the work is
+    // retired between collection and perform.
+    commit(&mut core, work_id, KIND_WORK_CANCELED, json!({}));
+    let reason = engine
+        .interrupt_is_stale(&core, &pending)
+        .expect("a retired work's turn is no longer the collected crossing's target");
+    engine
+        .settle_stale_interrupt(&mut core, &pending, reason)
+        .expect("settle stale interrupt");
+
+    let events = events_of(&core, work_id, KIND_TURN_CEILING_INTERRUPTED);
+    assert_eq!(
+        events.len(),
+        1,
+        "the consumed crossing must still be journaled — collection destroyed the \
+         only other record of it"
+    );
+    assert_eq!(
+        events[0]["outcome"]["requested"], false,
+        "a stale crossing must not claim a delivery that never happened: {}",
+        events[0]
+    );
+    assert!(
+        events[0]["outcome"]["stale"].as_str().is_some_and(|s| !s.is_empty()),
+        "the stale settle names why the perform was skipped: {}",
+        events[0]
+    );
+    assert!(
+        fake.interrupt_requests().is_empty(),
+        "a stale crossing is journaled, never delivered to the backend: {:?}",
+        fake.interrupt_requests()
+    );
+}
