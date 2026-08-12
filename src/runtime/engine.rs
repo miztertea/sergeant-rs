@@ -46,12 +46,14 @@ use crate::domain::workflow::{
     KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
     StageStatus, WorkflowDefinition, WorkflowError,
 };
-use crate::domain::workspace::{RepositorySpec, Workspace, WorkspaceError};
+use crate::domain::workspace::{
+    InstructionIdentity, InstructionPolicy, RepositorySpec, Workspace, WorkspaceError,
+};
 use crate::runtime::projection::WorkRun;
 use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage};
 use crate::runtime::surface::{
-    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfaceError,
-    SurfacePlan, TeardownReport, WorkSurface, materialize, rematerialize, teardown,
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SURFACES_DIR,
+    SurfaceError, SurfacePlan, TeardownReport, WorkSurface, materialize, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
@@ -86,6 +88,12 @@ pub struct StartPlan {
     pub workspace: Workspace,
     /// Repositories this run targets.
     pub repositories: Vec<RepositorySpec>,
+    /// Where this run's surface will be materialized (R-MVP1-1):
+    /// `workspace.surfaces_dir` when the manifest declared one, else the
+    /// engine's own default (`SGT_SURFACES_DIR`, else `<data_dir>/surfaces`).
+    /// Resolved once, here, so a mid-flight manifest edit cannot move a
+    /// running Work's surface out from under it.
+    pub surfaces_root: PathBuf,
     /// The resolved workflow, pinned for the life of the run.
     pub workflow: WorkflowDefinition,
     /// The routing decision and the tier that made it.
@@ -363,8 +371,10 @@ pub struct PendingSurface {
 pub enum SurfaceEffect {
     /// Create the run's worktrees, then bind the workflow and enter stage 0.
     Materialize {
-        /// Data dir the `surfaces/` tree lives under.
-        data_dir: PathBuf,
+        /// Root directory this run's surface lives under (R-MVP1-1) — the
+        /// plan's already-resolved `surfaces_root`, not necessarily under
+        /// `data_dir`.
+        surfaces_root: PathBuf,
         /// The plan whose repositories are being materialized, carried so the
         /// binding it produces is the one that was admitted.
         plan: Box<StartPlan>,
@@ -411,9 +421,14 @@ impl PendingSurface {
     /// Run the git operation. **Never while holding the core lock.**
     pub fn perform(&self) -> SurfaceOutcome {
         match &self.effect {
-            SurfaceEffect::Materialize { data_dir, plan } => SurfaceOutcome::Materialized(
-                materialize(data_dir, &self.work_id, &plan.repositories),
-            ),
+            SurfaceEffect::Materialize {
+                surfaces_root,
+                plan,
+            } => SurfaceOutcome::Materialized(materialize(
+                surfaces_root,
+                &self.work_id,
+                &plan.repositories,
+            )),
             SurfaceEffect::Rematerialize { surface, .. } => {
                 // A retry whose worktrees are all still on disk needs no git
                 // at all; asking here rather than under the guard keeps even
@@ -517,6 +532,32 @@ pub enum EngineError {
     /// The requested repository subset does not match the workspace.
     #[error("{0}")]
     RepositorySelection(String),
+    /// R-MVP1-4: the selected repositories disagree on `instructions`
+    /// policy. One process, one `--setting-sources` — there is nowhere for
+    /// two policies to both take effect, so the submission is refused
+    /// naming every repository and its value.
+    #[error(
+        "repositories disagree on instructions policy ({}); one process runs one policy — \
+         align every selected [[repo]]'s instructions value, or select a consistent subset \
+         with --repo",
+        .repos.join(", ")
+    )]
+    InstructionPolicyConflict {
+        /// `"<repo>=<policy>"` for every selected repository.
+        repos: Vec<String>,
+    },
+    /// R-MVP1-4: `instructions = "local"` parses and pins, but what it
+    /// translates to for the Claude adapter is unmeasured (L1) — refused at
+    /// submit until MVP-2 measures it.
+    #[error(
+        "instructions = \"local\" is refused at submit for {} (unmeasured — measurement \
+         pending MVP-2); use \"suppress\" or leave instructions unset",
+        .repos.join(", ")
+    )]
+    InstructionPolicyUnmeasured {
+        /// Repositories whose resolved policy is `local`.
+        repos: Vec<String>,
+    },
     /// The requested profile is not declared by the workspace.
     #[error("no profile named {requested:?} in this workspace (has: {available})")]
     ProfileNotFound {
@@ -604,6 +645,8 @@ impl EngineError {
             EngineError::Backend(_) => "backend_error",
             EngineError::Core(_) => "internal",
             EngineError::RepositorySelection(_) => "unknown_repository",
+            EngineError::InstructionPolicyConflict { .. } => "instruction_policy_conflict",
+            EngineError::InstructionPolicyUnmeasured { .. } => "instruction_policy_unmeasured",
             EngineError::ProfileNotFound { .. } => "profile_not_found",
             EngineError::ProfileBackendMismatch { .. } => "profile_backend_mismatch",
             EngineError::IllegalTransition { .. } => "illegal_transition",
@@ -631,12 +674,20 @@ pub struct Engine {
     pub backends: Arc<BackendRegistry>,
     /// §13's last tier before failure.
     pub default_backend: Option<String>,
-    /// Data dir owning `surfaces/`.
+    /// Data dir owning `surfaces/` (default; R-MVP1-1 makes this a default,
+    /// not the only answer — see [`Self::surfaces_root`]).
     pub data_dir: PathBuf,
+    /// Default root for work surfaces (R-MVP1-1): `<data_dir>/surfaces`
+    /// unless overridden by [`Self::with_surfaces_root`]. A per-estate
+    /// `[estate] surfaces_dir` narrows this further, per-plan, in
+    /// [`Self::plan`] — this field is only ever the daemon-wide fallback.
+    pub surfaces_root: PathBuf,
 }
 
 impl Engine {
-    /// Build an engine over a registry and data dir.
+    /// Build an engine over a registry and data dir. `surfaces_root`
+    /// defaults to `<data_dir>/surfaces` — today's layout, nothing moves —
+    /// override with [`Self::with_surfaces_root`] (`SGT_SURFACES_DIR`).
     pub fn new(
         backends: Arc<BackendRegistry>,
         default_backend: Option<String>,
@@ -645,8 +696,18 @@ impl Engine {
         Self {
             backends,
             default_backend,
+            surfaces_root: data_dir.join(SURFACES_DIR),
             data_dir: data_dir.to_path_buf(),
         }
+    }
+
+    /// Override the default surfaces root (R-MVP1-1). The daemon calls this
+    /// once at startup from `SGT_SURFACES_DIR`; a per-estate `[estate]
+    /// surfaces_dir` overrides it again, per-submission, in [`Self::plan`] —
+    /// this is only the daemon-wide fallback beneath that.
+    pub fn with_surfaces_root(mut self, surfaces_root: PathBuf) -> Self {
+        self.surfaces_root = surfaces_root;
+        self
     }
 
     /// Resolve everything a run needs, without touching anything.
@@ -682,6 +743,20 @@ impl Engine {
         let repositories = workspace
             .select(context.repositories)
             .map_err(EngineError::RepositorySelection)?;
+
+        // R-MVP1-4: one process, one policy. Resolved and refused here, at
+        // submit, before a Work record or a worktree exists — the same
+        // "reject the submission" timing §17.5 already uses for an
+        // unsatisfiable stage requirement.
+        Self::check_instruction_policy(&workspace, &repositories)?;
+
+        // R-MVP1-1: `[estate] surfaces_dir` narrows the engine's own default,
+        // per-submission — resolved once here and pinned into the plan, so a
+        // later manifest edit cannot move a running Work's surface.
+        let surfaces_root = workspace
+            .surfaces_dir
+            .clone()
+            .unwrap_or_else(|| self.surfaces_root.clone());
 
         let workflow_name = context
             .workflow
@@ -724,11 +799,80 @@ impl Engine {
         Ok(Some(StartPlan {
             workspace,
             repositories,
+            surfaces_root,
             workflow,
             route,
             profile,
             stage_bindings,
         }))
+    }
+
+    /// R-MVP1-4's submit-time policy check: every selected repository must
+    /// resolve to the same [`InstructionPolicy`] — "one process, one
+    /// policy — so no composition happens, and that is the ruling, not an
+    /// omission" — and that policy must not be `local`, which parses and
+    /// pins but is refused at submit until MVP-2 measures what it
+    /// translates to for the Claude adapter (L1).
+    fn check_instruction_policy(
+        workspace: &Workspace,
+        repositories: &[RepositorySpec],
+    ) -> Result<(), EngineError> {
+        if repositories.is_empty() {
+            return Ok(());
+        }
+        let resolved: Vec<(String, InstructionPolicy)> = repositories
+            .iter()
+            .map(|r| (r.name.clone(), workspace.instruction_policy(&r.name)))
+            .collect();
+        let first = resolved[0].1;
+        if resolved.iter().any(|(_, policy)| *policy != first) {
+            return Err(EngineError::InstructionPolicyConflict {
+                repos: resolved
+                    .iter()
+                    .map(|(name, policy)| format!("{name}={policy}"))
+                    .collect(),
+            });
+        }
+        if first == InstructionPolicy::Local {
+            return Err(EngineError::InstructionPolicyUnmeasured {
+                repos: resolved.into_iter().map(|(name, _)| name).collect(),
+            });
+        }
+        Ok(())
+    }
+
+    /// R-MVP1-4's R7: resolve the instruction-file identity `workflow.bound`
+    /// pins for each bound repository — "the file the actor will read is
+    /// the one we recorded". Reads from the *materialized worktree*
+    /// (`surface`'s bindings), not the source repository: that is the copy
+    /// the actor will actually see, and pinning it after materialization
+    /// (rather than at plan time, before a worktree exists) is exactly what
+    /// makes the hash mean anything. A missing file is recorded as absent —
+    /// `path`/`content_hash` both `None` — never silently skipped.
+    fn resolve_instruction_identities(
+        workspace: &Workspace,
+        surface: &WorkSurface,
+    ) -> Vec<InstructionIdentity> {
+        surface
+            .bindings
+            .iter()
+            .map(|binding| {
+                let policy = workspace.instruction_policy(&binding.repository);
+                let file = binding
+                    .worktree_path
+                    .join(crate::domain::workspace::INSTRUCTION_FILE);
+                let (path, content_hash) = match std::fs::read(&file) {
+                    Ok(bytes) => (Some(file), Some(blake3::hash(&bytes).to_hex().to_string())),
+                    Err(_) => (None, None),
+                };
+                InstructionIdentity {
+                    repository: binding.repository.clone(),
+                    policy,
+                    path,
+                    content_hash,
+                }
+            })
+            .collect()
     }
 
     /// Resolve every stage's executor before anything exists (§12.5, §17.5).
@@ -906,17 +1050,19 @@ impl Engine {
     ) -> Result<Step, EngineError> {
         // Recorded first: everything the returned effect does can create a
         // branch and a worktree in a repository sergeant does not own.
+        // R-MVP1-1: `plan.surfaces_root`, not `self.data_dir` — the plan
+        // already resolved any `[estate] surfaces_dir` override at submit.
         self.commit(
             core,
             &work.id,
             KIND_SURFACE_MATERIALIZING,
-            json!({"plan": SurfacePlan::new(&self.data_dir, &work.id, &plan.repositories)}),
+            json!({"plan": SurfacePlan::new(&plan.surfaces_root, &work.id, &plan.repositories)}),
         )?;
         Ok(Step {
             next: Next::Surface(Box::new(PendingSurface {
                 work_id: work.id.clone(),
                 effect: SurfaceEffect::Materialize {
-                    data_dir: self.data_dir.clone(),
+                    surfaces_root: plan.surfaces_root.clone(),
                     plan: Box::new(plan.clone()),
                 },
             })),
@@ -1038,6 +1184,16 @@ impl Engine {
                 deferred: Deferred::new(),
             });
         }
+        // R-MVP1-4: widened from `workspace: <name>` to the resolved
+        // repository set plus per-repo instruction-policy identities —
+        // additive fields in an immutable event, so a mid-flight manifest
+        // edit cannot reach a Work already bound. `check_instruction_policy`
+        // already refused disagreement and `local` at submit, so `policy` is
+        // uniform here by construction; identities are still resolved and
+        // recorded regardless — R7's "the file the actor will read is the
+        // one we recorded" does not wait on `local` being enabled.
+        let instruction_identities =
+            Self::resolve_instruction_identities(&plan.workspace, &surface);
         self.commit(
             core,
             work_id,
@@ -1048,6 +1204,8 @@ impl Engine {
                 "route_source": plan.route.source,
                 "profile": plan.profile,
                 "workspace": plan.workspace.name,
+                "repositories": plan.repositories,
+                "instruction_identities": instruction_identities,
                 // §12.5's per-stage decisions, pinned with the procedure they
                 // belong to: the whole executor spec for the run, decided once
                 // and never re-derived (§22.4's retry and restart rows).
@@ -3335,6 +3493,7 @@ mod tests {
                 groups: std::collections::BTreeMap::new(),
             },
             repositories: Vec::new(),
+            surfaces_root: dir.path().join("surfaces"),
             workflow: WorkflowDefinition {
                 name: "tiny".to_string(),
                 version: "1".to_string(),

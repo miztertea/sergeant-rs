@@ -129,9 +129,15 @@ pub struct SurfacePlan {
 
 impl SurfacePlan {
     /// The plan `materialize` will follow for this work.
-    pub fn new(data_dir: &Path, work_id: &str, repositories: &[RepositorySpec]) -> Self {
+    ///
+    /// `surfaces_root` (R-MVP1-1) is the directory work surfaces are created
+    /// directly under — already resolved to whatever the caller wants
+    /// (`<data_dir>/surfaces` by default, an estate's `[estate]
+    /// surfaces_dir`, or `SGT_SURFACES_DIR`), not necessarily anywhere near
+    /// `data_dir`. This function does not append anything else onto it.
+    pub fn new(surfaces_root: &Path, work_id: &str, repositories: &[RepositorySpec]) -> Self {
         Self {
-            root: surface_root(data_dir, work_id),
+            root: surface_root(surfaces_root, work_id),
             work_branch: work_branch(work_id),
             repositories: repositories.to_vec(),
         }
@@ -254,9 +260,18 @@ pub enum SurfaceError {
     },
 }
 
-/// Root directory for a work's surface.
-pub fn surface_root(data_dir: &Path, work_id: &str) -> PathBuf {
-    data_dir.join(SURFACES_DIR).join(work_id)
+/// Root directory for a work's surface: `<surfaces_root>/<work_id>`.
+///
+/// **R-MVP1-1.** `surfaces_root` is already the directory work surfaces live
+/// directly under — this does not additionally join [`SURFACES_DIR`] onto
+/// it. The default `<data_dir>/surfaces` is computed once, by
+/// [`crate::runtime::engine::Engine`] (`SURFACES_DIR` beside `data_dir`),
+/// not here — a caller handing this an already-custom `surfaces_root`
+/// (an `[estate] surfaces_dir` override, `SGT_SURFACES_DIR`, or MVP-3's
+/// future outside-every-checkout default) must not get an extra `surfaces/`
+/// nested inside it.
+pub fn surface_root(surfaces_root: &Path, work_id: &str) -> PathBuf {
+    surfaces_root.join(work_id)
 }
 
 /// Materialize a work surface: one worktree per repository, each on a fresh
@@ -270,14 +285,14 @@ pub fn surface_root(data_dir: &Path, work_id: &str) -> PathBuf {
 /// what happened instead of leaving a `sergeant/<work-id>` branch nobody
 /// knows about.
 pub fn materialize(
-    data_dir: &Path,
+    surfaces_root: &Path,
     work_id: &str,
     repositories: &[RepositorySpec],
 ) -> Result<WorkSurface, SurfaceError> {
     if repositories.is_empty() {
         return Err(SurfaceError::NoRepositories);
     }
-    let root = surface_root(data_dir, work_id);
+    let root = surface_root(surfaces_root, work_id);
     create_dir_all_durable(&root).map_err(|source| SurfaceError::Io {
         path: root.display().to_string(),
         source,
@@ -628,10 +643,14 @@ mod tests {
                      removed (round {round} of {ROUNDS}): {report:?}"
                 );
             }
+            // `data` is handed to `materialize` directly as the surfaces
+            // root (R-MVP1-1: no implicit `SURFACES_DIR` nesting inside this
+            // module any more — that join happens once, at `Engine`'s
+            // default computation, not here).
             assert!(
-                !data.join(SURFACES_DIR).exists()
-                    || std::fs::read_dir(data.join(SURFACES_DIR))
-                        .expect("surfaces dir")
+                !data.exists()
+                    || std::fs::read_dir(&data)
+                        .expect("surfaces root")
                         .next()
                         .is_none(),
                 "no surface root survives a clean teardown (round {round} of {ROUNDS})"
@@ -895,9 +914,12 @@ mod tests {
             "an emptied surface root must not outlive the work: {}",
             root.display()
         );
+        // `data.path()` is handed to `materialize` directly as the surfaces
+        // root (R-MVP1-1): only the per-work child goes, the surfaces root
+        // itself — whatever the caller passed in — stays.
         assert!(
-            data.path().join(SURFACES_DIR).is_dir(),
-            "only the per-work root goes; the surfaces directory itself stays"
+            data.path().is_dir(),
+            "only the per-work root goes; the surfaces root passed in stays"
         );
         // …and tearing the same surface down again is a no-op, not an error:
         // the crash window between the removal and the `surface.torn_down`

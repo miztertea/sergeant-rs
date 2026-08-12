@@ -534,6 +534,133 @@ path = "../payments-web"
     handle.shutdown().await;
 }
 
+/// R-MVP1-4: repositories that disagree on `instructions` policy are
+/// refused at submit — before a Work record or a worktree exists — naming
+/// both repositories. "One process, one policy" is the ruling, not an
+/// omission: there is nowhere for two `--setting-sources` policies to both
+/// take effect in a single launched process.
+#[tokio::test]
+async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let api = repos.path().join("payments-api");
+    let web = repos.path().join("payments-web");
+    init_repo(&api);
+    init_repo(&web);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\ninstructions = \"suppress\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\ninstructions = \"local\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &api, "mixed policy", json!({})).await;
+    assert_eq!(status, 422, "a mixed policy must refuse at submit: {body}");
+    assert_eq!(body["error"]["code"], "instruction_policy_conflict");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("api"), "must name api: {message}");
+    assert!(message.contains("web"), "must name web: {message}");
+    assert!(
+        fake.starts().is_empty(),
+        "a submit-time refusal must never reach a backend"
+    );
+
+    handle.shutdown().await;
+}
+
+/// R-MVP1-4: `instructions = "local"` parses and pins but is refused at
+/// submit — what it translates to for the Claude adapter is unmeasured
+/// (L1), and MVP-2 measures it before this variant can ever launch.
+#[tokio::test]
+async fn r_mvp1_4_local_instructions_policy_is_refused_at_submit() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\ninstructions = \"local\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &repo, "local unmeasured", json!({})).await;
+    assert_eq!(status, 422, "local must refuse at submit: {body}");
+    assert_eq!(body["error"]["code"], "instruction_policy_unmeasured");
+    assert!(
+        fake.starts().is_empty(),
+        "a submit-time refusal must never reach a backend"
+    );
+
+    handle.shutdown().await;
+}
+
+/// R-MVP1-4's pin, positive case: a uniform (unset, so `suppress`) policy
+/// submits, and `workflow.bound` is widened to carry the resolved
+/// repository set plus, per repository, the resolved policy and its
+/// instruction-file identity — absent recorded as absent, since neither
+/// repo here has an `AGENTS.md`.
+#[tokio::test]
+async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let api = repos.path().join("payments-api");
+    let web = repos.path().join("payments-web");
+    init_repo(&api);
+    init_repo(&web);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\ninstructions = \"suppress\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &api, "uniform policy", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "active");
+
+    let bound = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
+    assert_eq!(bound.len(), 1);
+    let payload = &bound[0].payload;
+    let repositories = payload["repositories"].as_array().expect("repositories");
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|r| r["name"].as_str().expect("name"))
+            .collect::<Vec<_>>(),
+        ["api", "web"],
+        "workflow.bound must carry the resolved repository set, not just the workspace name"
+    );
+    let identities = payload["instruction_identities"]
+        .as_array()
+        .expect("instruction_identities");
+    assert_eq!(identities.len(), 2);
+    for identity in identities {
+        assert_eq!(identity["policy"], "suppress");
+        assert!(
+            identity["path"].is_null() && identity["content_hash"].is_null(),
+            "no AGENTS.md exists in either worktree — absence must be recorded as absent, \
+             not omitted: {identity}"
+        );
+    }
+
+    handle.shutdown().await;
+}
+
 /// 3. A run whose backend completes every stage reaches `completed`, with the
 ///    stage entry/completion events journaled in order, the worktree removed
 ///    and the branch retained.
@@ -2216,6 +2343,77 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     assert!(branch_exists(&api, &format!("sergeant/{work_id}")));
     assert!(!branch_exists(&web, &format!("sergeant/{work_id}")));
 
+    handle.shutdown().await;
+}
+
+/// R-MVP1-1: `surfaces_root` is a path distinct from `data_dir`, not merely
+/// `data_dir`'s fixed `surfaces/` child. A `data_dir` *inside* the source
+/// checkout materializes fine once `[estate] surfaces_dir` points the
+/// surface root outside it — the pin's exact scenario. The guard that
+/// refuses a surface inside the checkout moved from watching `data_dir` to
+/// watching the resolved `surfaces_root`; it did not weaken: a
+/// `surfaces_dir` left unset (falling back to `data_dir/surfaces`, still
+/// inside the checkout here) still refuses, exactly as an in-checkout
+/// `data_dir` always did before the split.
+#[tokio::test]
+async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_follows_it() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+
+    // Scenario 1: `data_dir` lives *inside* the checkout — before R-MVP1-1
+    // this alone doomed every submission, since the surface root was always
+    // `data_dir/surfaces`. `surfaces_dir` points outside it; materializing
+    // must succeed anyway.
+    let data_inside = repo.join(".sergeant-data");
+    let outside = repos.path().join("surfaces-outside");
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        format!(
+            "[estate]\nname = \"solo\"\nsurfaces_dir = {:?}\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            outside.to_string_lossy()
+        ),
+    )
+    .expect("sergeant.toml");
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(&data_inside, registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(&client, &handle, &repo, "split surfaces root", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    assert_eq!(
+        body["work"]["state"], "active",
+        "an outside surfaces_dir must materialize even with data_dir inside the checkout: {body}"
+    );
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    assert!(
+        worktree.starts_with(&outside),
+        "the worktree must live under the declared surfaces_dir, got {}",
+        worktree.display()
+    );
+    handle.shutdown().await;
+
+    // Scenario 2: `surfaces_dir` unset falls back to `data_dir/surfaces` —
+    // still inside the checkout here — and the guard still refuses it.
+    let data_inside2 = repo.join(".sergeant-data-2");
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+    )
+    .expect("sergeant.toml");
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(&data_inside2, registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(&client, &handle, &repo, "unsplit still refuses", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "an in-checkout surfaces_root must still be refused — the guard moved, not weakened: {body}"
+    );
     handle.shutdown().await;
 }
 
