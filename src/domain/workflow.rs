@@ -1758,6 +1758,68 @@ mod tests {
         write_stage(&reordered, "10-b", "context b");
         let reorder = WorkflowDefinition::load_dir(&reordered).expect("resolve reorder");
         assert_ne!(baseline.content_hash, reorder.content_hash);
+
+        // TH-06 (MVP-2 D3 fixer pass): an `ExecuteSpec` field must
+        // participate in the hash too — the commit that added `execute`'s
+        // participation (`compute_content_hash`'s `execute: s.execute.as_ref()`)
+        // had no test that would fail if that line were deleted; every
+        // pre-existing case above varies an actor-stage field, never an
+        // execute stage's. Two otherwise-identical workflows differing only
+        // in an execute stage's pinned `image` must hash differently.
+        let execute_base_root = tempfile::TempDir::new().expect("tempdir");
+        let execute_base = workflow_dir(execute_base_root.path(), "base");
+        std::fs::create_dir_all(&execute_base).expect("workflow dir");
+        std::fs::write(
+            execute_base.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"base\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-a\", \"20-x\"]\n",
+                "\n",
+                "[stage.\"20-x\"]\n",
+                "kind = \"execute\"\n",
+                "image = \"alpine:3\"\n",
+                "command = [\"true\"]\n",
+                "workdir = \"/workspace\"\n",
+                "workspace_access = \"read_only\"\n",
+                "network = \"none\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&execute_base, "00-a", "context a");
+        let execute_baseline =
+            WorkflowDefinition::load_dir(&execute_base).expect("resolve execute baseline");
+
+        let execute_changed_root = tempfile::TempDir::new().expect("tempdir");
+        let execute_changed = workflow_dir(execute_changed_root.path(), "base");
+        std::fs::create_dir_all(&execute_changed).expect("workflow dir");
+        std::fs::write(
+            execute_changed.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"base\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-a\", \"20-x\"]\n",
+                "\n",
+                "[stage.\"20-x\"]\n",
+                "kind = \"execute\"\n",
+                "image = \"alpine:3.19\"\n", // the only difference from the baseline above
+                "command = [\"true\"]\n",
+                "workdir = \"/workspace\"\n",
+                "workspace_access = \"read_only\"\n",
+                "network = \"none\"\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&execute_changed, "00-a", "context a");
+        let execute_changed_def =
+            WorkflowDefinition::load_dir(&execute_changed).expect("resolve execute changed");
+        assert_ne!(
+            execute_baseline.content_hash, execute_changed_def.content_hash,
+            "an execute stage's pinned image must participate in content_hash: editing it is a \
+             content change, exactly like editing an actor stage's context"
+        );
     }
 
     /// A descriptor's `name` field must match the directory it lives in — the
