@@ -827,6 +827,101 @@ fn container_written_files_and_directories_are_owned_by_the_host_worktree_owner(
     }
 }
 
+// --------------------------------- 7c. §17.5 execute-stage submit preflight
+
+/// TH-05 / SURVIVOR (m7 fixer panel): `Engine::bind_stages`' `StageKind::Execute`
+/// arm (§17.5) refuses submission when the fixed `"docker"` backend cannot
+/// be routed to, before any Work or worktree side effect — but nothing
+/// drove that arm. A mutation that swallows the error and falls through to
+/// ordinary actor routing survived the entire suite because no test ever
+/// submitted a `kind = "execute"` workflow against an unavailable docker
+/// backend. Needs no real Docker Engine — it proves the *unavailable* path,
+/// using a scripted `docker_bin` that cannot even run `docker version`
+/// (mirroring `DaemonConfig::docker`'s doc: "tests point it at a scripted
+/// `docker_bin` ... without a real Docker Engine").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() {
+    let data = support::DataDir::new();
+    let repo = TempDir::new().expect("repo");
+    init_repo(repo.path());
+
+    let workflow_dir = repo.path().join(".sergeant/workflows/execute-only");
+    std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+    std::fs::write(
+        workflow_dir.join("workflow.toml"),
+        concat!(
+            "[workflow]\n",
+            "name = \"execute-only\"\n",
+            "version = \"1\"\n",
+            "stages = [\"10-execute\"]\n",
+            "\n",
+            "[stage.\"10-execute\"]\n",
+            "kind = \"execute\"\n",
+            "image = \"alpine:3\"\n",
+            "command = [\"true\"]\n",
+            "workdir = \"/workspace\"\n",
+            "workspace_access = \"read_only\"\n",
+            "network = \"none\"\n",
+        ),
+    )
+    .expect("workflow.toml");
+
+    let fake = Arc::new(FakeBackend::scripted(FAKE_BACKEND_NAME, []));
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(fake.clone())),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            docker: Some(DockerConfig {
+                data_dir: data.path().to_path_buf(),
+                docker_bin: "/nonexistent/docker-binary-that-must-never-run".to_string(),
+            }),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+
+    let http = reqwest::Client::new();
+    let response = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid::Ulid::generate().to_string(),
+            "intent": "must be refused before anything exists",
+            "workflow": "execute-only",
+            "origin": {"client": "cli", "cwd": repo.path()},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("json");
+    assert_eq!(status, 422, "must be refused at submit: {body}");
+    assert_eq!(body["error"]["code"], "execute_backend_unavailable");
+
+    let list: serde_json::Value = http
+        .get(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "an execute-backend-unavailable refusal must not create Work: {list}"
+    );
+    assert!(
+        !data.path().join("surfaces").exists(),
+        "§17.5: rejected before any worktree side effect"
+    );
+    assert!(fake.starts().is_empty(), "no actor stage ever ran either");
+
+    handle.shutdown().await;
+}
+
 // --------------------------------------- 8. doctor's lifecycle probe (§16.3)
 
 #[test]
