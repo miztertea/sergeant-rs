@@ -533,9 +533,26 @@ pub fn is_absorbing(state: WorkState) -> bool {
 /// fine". So this re-derives the identical two conditions recovery checks —
 /// evicting exactly when they would already find nothing to do — which is
 /// what makes eviction safe *for* recovery, not merely orthogonal to it.
+///
+/// I4: a third, narrower window neither of those two conditions alone
+/// covers — `run.surface_plan` recorded (`KIND_SURFACE_MATERIALIZING`
+/// committed) but `run.surface` still `None`, meaning `materialize` may
+/// still be running outside the core lock (§14.2's own two-phase split).
+/// `cancel` commits `work.canceled` — an absorbing, `surface.is_none()`
+/// state — *before* that materialize call reports back, so without this
+/// clause a run could be evicted mid-materialize; `begin_retire_run` would
+/// then misread the now-empty `runs` entry as "nothing ever started", and
+/// the materialize call's own eventual `KIND_SURFACE_MATERIALIZED` commit
+/// would recreate a stripped run through the reducer's `or_default()` arm
+/// (§14.5's stale-start teardown check does still tear it down correctly —
+/// this clause closes the window rather than relying on that self-
+/// correction alone). A run with no plan at all (no repositories to
+/// materialize, `Engine::plan`'s "no surface" case) never sets
+/// `surface_plan`, so this never blocks a genuinely surface-less Work.
 fn run_is_settled(work: &Work, run: &WorkRun) -> bool {
     is_absorbing(work.state)
         && (run.surface.is_none() || run.teardown.is_some())
+        && !(run.surface_plan.is_some() && run.surface.is_none())
         && run.unsettled_reservation().is_none()
 }
 
@@ -908,6 +925,14 @@ mod rule_a_eviction_tests {
         }})
     }
 
+    fn a_plan(work_id: &str) -> serde_json::Value {
+        json!({"plan": {
+            "root": format!("/data/surfaces/{work_id}"),
+            "work_branch": format!("sergeant/{work_id}"),
+            "repositories": [{"name": "solo", "path": "/repos/solo"}],
+        }})
+    }
+
     fn a_teardown(work_id: &str) -> serde_json::Value {
         json!({"report": {
             "work_id": work_id,
@@ -1010,6 +1035,66 @@ mod rule_a_eviction_tests {
         assert!(
             !core.registry.state().runs.contains_key(work_id),
             "both conditions are now settled — the run must be gone"
+        );
+    }
+
+    /// I4: the third window — `surface.planned` recorded but `surface`
+    /// never materialized — must not evict either, even though
+    /// `run.surface.is_none()` alone would satisfy the first two
+    /// conditions. This is exactly the shape a `cancel` landing while
+    /// `materialize` is still running outside the lock produces:
+    /// `work.canceled` (absorbing) lands before `surface.materialized`
+    /// (or a failure) ever does.
+    #[test]
+    fn eviction_waits_for_a_planned_but_not_yet_materialized_surface_too() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01EVICTPLAN";
+
+        testing::submit(&mut core, work_id, "cancel mid-materialize");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZING,
+            a_plan(work_id),
+        );
+        // The race: cancellation lands while materialize is still running
+        // outside the lock — an absorbing state with surface_plan set and
+        // surface still None.
+        testing::commit(&mut core, work_id, KIND_WORK_CANCELED, json!({}));
+        assert!(
+            core.registry.state().runs.contains_key(work_id),
+            "a planned-but-not-yet-materialized surface must not be evicted just \
+             because the Work already transitioned to an absorbing state — \
+             materialize may still be running outside the lock"
+        );
+
+        // materialize eventually reports back: the surface exists now, so
+        // the first condition's own gate takes over (surface present,
+        // teardown not yet) — still not settled.
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            a_surface(work_id),
+        );
+        assert!(
+            core.registry.state().runs.contains_key(work_id),
+            "a materialized-but-not-torn-down surface still must not be evicted"
+        );
+
+        // The stale-start teardown (§14.5) tears it down; now every
+        // condition is settled.
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_TORN_DOWN,
+            a_teardown(work_id),
+        );
+        assert!(
+            !core.registry.state().runs.contains_key(work_id),
+            "once the surface is torn down, every condition is settled and the \
+             run must be evicted"
         );
     }
 
