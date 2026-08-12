@@ -786,12 +786,16 @@ pub const KIND_TURN_ENVELOPE_EXTENDED: &str = "execution.turn_envelope_extended"
 /// MVP1-R1-I1). What changed from the first shipped value (6, the
 /// contract's own L16 worked example) is the evidence it is grounded in:
 /// `find .sergeant/workflows -name workflow.toml` shows this repo's own
-/// longest admitted workflow (`repo-to-icm`) declares 10 stages, and a cap
-/// of 6 blocked every admitted workflow over 6 stages on its very first
-/// run, unconditionally — `repo-to-icm`, the workflow R-MVP1-2's own
-/// finalize helper was built for, included. 12 covers every admitted
-/// workflow's stage count (max 10) with margin for at least one retry
-/// inside any single stage, without inventing an unrelated round number.
+/// longest admitted workflow (`repo-to-icm`) declares 10 stages (11 as of
+/// MVP-2 lane D3's `65-self-check`, a `kind = "execute"` stage — its LAUNCH
+/// still goes through the same `execution.started`/`turns_spawned`
+/// accounting an actor stage's does, spending no model tokens but counting
+/// against this same cap exactly like any other stage), and a cap of 6
+/// blocked every admitted workflow over 6 stages on its very first run,
+/// unconditionally — `repo-to-icm`, the workflow R-MVP1-2's own finalize
+/// helper was built for, included. 12 covers every admitted workflow's
+/// stage count (max 11) with margin for at least one retry inside any
+/// single stage, without inventing an unrelated round number.
 /// L16 arithmetic still holds at the new value: the largest measured
 /// single turn on this build's evidence is Run B2's $3.21
 /// (`GAUNTLET.md`'s N-series close-out), so a 12-turn cap is a ~$38 bound,

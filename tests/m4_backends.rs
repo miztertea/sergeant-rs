@@ -8267,7 +8267,8 @@ fn write_n_stage_workflow(root: &Path, name: &str, n: usize) {
 /// The default cap is structurally grounded in this repo's own admitted
 /// workflows (invariants:MVP1-R1-E1/I1), not the contract's bare worked
 /// example: `DEFAULT_TURN_CAP` must be at least the longest admitted
-/// workflow's stage count (repo-to-icm, 10 — `find .sergeant/workflows
+/// workflow's stage count (repo-to-icm, 11 as of MVP-2 lane D3's
+/// `65-self-check` execute stage, up from 10 — `find .sergeant/workflows
 /// -name workflow.toml` is the fact this pins), or the shipped default
 /// blocks that workflow's very first run, unconditionally. L16's arithmetic
 /// ("bounds spend at N × the largest single turn, $3.21 measured") holds at

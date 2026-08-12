@@ -59,7 +59,14 @@ worktree.
                    / invariant candidates
 60-draft         → output/: materialized draft workflow package(s) under
                    .sergeant/drafts/workflows/, plus provenance.md
-70-lint          → output/: validator results + any mechanical repairs
+65-self-check    → output/: this workflow's own validate-structure.py
+                   result (kind = "execute" — a pinned container, not an
+                   actor turn; see its own CONTEXT.md)
+70-lint          → output/: validator results against each candidate
+                   package, plus any mechanical repairs; folds in
+                   65-self-check's already-run self-check result rather
+                   than re-running the validator against this workflow's
+                   own tree itself
 80-adversarial-review → output/: challenge findings (coverage gaps,
                    over-staging, hidden translation, speculative gaps)
 90-reconcile     → output/: adjudicated findings + final measurement
@@ -86,7 +93,8 @@ runs, not this one.
 | `40-classify` | The ICM decomposition ladder (`_config/icm-ladder.md`) is applied to every unit, with rationale and alternatives recorded. |
 | `50-synthesize` | Classified units are clustered into workflow, stage, context, helper, and invariant candidates. |
 | `60-draft` | Draft workflow package(s) and catalog entries are materialized under the draft namespace. |
-| `70-lint` | `scripts/validate-structure.py` is run against the drafted package(s); malformed metadata, broken references, duplicate identities, and missing provenance are repaired. |
+| `65-self-check` | (`kind = "execute"`, N4) `scripts/validate-structure.py` is run, mechanically, against this workflow's own tree; the result is written for `70-lint` to read. |
+| `70-lint` | `scripts/validate-structure.py` is run against the drafted package(s); malformed metadata, broken references, duplicate identities, and missing provenance are repaired. `65-self-check`'s already-run result covers this workflow's own tree. |
 | `80-adversarial-review` | A fresh execution challenges coverage, over-staging, hidden file-shape translation, and speculative engine-gap claims. |
 | `90-reconcile` | Findings are adjudicated, the final measurement package is emitted, and `scripts/finalize.py` applies this run's own disposition policy. |
 
@@ -105,8 +113,12 @@ runs, not this one.
 ## Helpers (`scripts/`)
 
 - `scripts/validate-structure.py` — the §9.7 structural validator. Run with
-  no arguments it checks this workflow's own tree; given a path, it checks
-  a generated draft tree (used by `70-lint`).
+  no arguments it checks this workflow's own tree — this is what
+  `65-self-check`'s pinned container runs, mechanically, as a `kind =
+  "execute"` stage (N4), not an actor turn; given a path, it checks a
+  generated draft tree (used by `70-lint`, as an actor turn — an
+  execute-stage container has no dynamic candidate list to loop over, so
+  the per-candidate checks stay actor-driven).
 - `scripts/finalize.py` — the D9 disposition finalize helper, run once by
   `90-reconcile` at the close of a run. It is deterministic machinery
   (`docs/icm/convention.md` §5): it reads dispositions, it does not decide
@@ -123,12 +135,20 @@ runs, not this one.
   `validate-structure.py`'s `[S15]` check against this workflow's own tree.
 
 All three are helpers subordinate to their invoking stage's judgment
-(`docs/icm/convention.md` §5) — their exit status and structured output are
-something the actor reviews and acts on, not something the engine
-interprets on its own. A stage invoking one of the first two states the
-exact repository-root-relative invocation and this run's working-directory
-convention in its own `CONTEXT.md` (see `70-lint` and `90-reconcile`) — this
-orientation file does not itself hand a stranger an executable command.
+(`docs/icm/convention.md` §5) when an actor invokes them directly — their
+exit status and structured output are something the actor reviews and
+acts on, not something the engine interprets on its own. `65-self-check`
+is the one exception, by design (N4, §11.2): as a `kind = "execute"`
+stage it invokes `validate-structure.py` directly as a pinned container
+command, and *there* the exit code genuinely is what the engine reads to
+decide the stage outcome — the mechanical case §11.2 carves out on
+purpose, distinct from every actor-invoked use of the same script
+elsewhere in this workflow. A stage invoking one of the first two as an
+actor states the exact repository-root-relative invocation and this run's
+working-directory convention in its own `CONTEXT.md` (see `70-lint` and
+`90-reconcile`; `65-self-check`'s own `CONTEXT.md` states its pinned
+container's exact command instead) — this orientation file does not
+itself hand a stranger an executable command.
 
 ## v2: how `20-harvest` handles volume (read before assuming one turn is enough)
 

@@ -182,5 +182,6 @@ an operational limitation, never inflate it into an engine-gap record
 Only after 1–3 are written: run `../scripts/finalize.py` (no path argument,
 so it targets this workflow's own root) and record its output verbatim at
 the end of `output/measurement-package.md`. It applies this workflow's own
-`output/` disposition policy across all ten stages of *this run* — it does
-not touch any candidate package's own (empty) `output/` directories.
+`output/` disposition policy across every stage of *this run* — actor and
+`65-self-check`'s execute stage alike — it does not touch any candidate
+package's own (empty) `output/` directories.
