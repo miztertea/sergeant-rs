@@ -445,7 +445,7 @@ impl Workspace {
     /// shape, "data dir in-estate" (`docs/gauntlet/contracts/MVP-1.md`'s own
     /// Acceptance) — can narrow it.
     pub fn discover_scoped(start: &Path, data_dir: Option<&Path>) -> Result<Self, WorkspaceError> {
-        if let Some(estate_config) = Self::find_estate_upward(start, data_dir) {
+        if let Some(estate_config) = Self::find_estate_upward(start, data_dir)? {
             return Self::from_config(&estate_config);
         }
         let toplevel = git(start, &["rev-parse", "--show-toplevel"]).map_err(|source| {
@@ -490,7 +490,10 @@ impl Workspace {
     /// keep walking" rather than a hard failure: it is not the file this
     /// walk is trying to find, and an unrelated member repo's broken config
     /// must not be able to block estate discovery for everything below it.
-    fn find_estate_upward(start: &Path, data_dir: Option<&Path>) -> Option<PathBuf> {
+    fn find_estate_upward(
+        start: &Path,
+        data_dir: Option<&Path>,
+    ) -> Result<Option<PathBuf>, WorkspaceError> {
         let boundary = std::env::var_os("HOME")
             .map(PathBuf::from)
             .and_then(|home| std::fs::canonicalize(&home).ok());
@@ -506,22 +509,36 @@ impl Workspace {
     /// "never above an explicit `--data-dir`/`SGT_DATA_DIR` scope": one more
     /// candidate boundary alongside `$HOME`, checked at every directory the
     /// walk visits so it stops at whichever boundary it reaches first.
+    ///
+    /// A `sergeant.toml` found on the way up that is readable but carries
+    /// legacy vocabulary or fails to parse fails the whole walk closed
+    /// (`Err`), exactly as one found directly would (R-MVP1-3's named
+    /// migration refusal) — this module's own header doctrine, "a typo that
+    /// silently means nothing is worse than a refusal that names the line,"
+    /// applies to a file this walk steps over just as much as one it
+    /// chooses. A file the walk cannot even *read* (permission, race) is not
+    /// this walk's failure to report and is treated as "not an estate, keep
+    /// walking" — the one case genuinely indistinguishable from "no file
+    /// here at all".
     fn find_estate_upward_bounded(
         start: &Path,
         boundary: Option<&Path>,
         data_dir_scope: Option<&Path>,
-    ) -> Option<PathBuf> {
+    ) -> Result<Option<PathBuf>, WorkspaceError> {
         let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
         let mut dir: &Path = &start;
         loop {
             let candidate = dir.join(WORKSPACE_FILE);
-            if candidate.is_file() && has_estate_table(&candidate) {
-                return Some(candidate);
+            if candidate.is_file() && estate_table_check(&candidate)? {
+                return Ok(Some(candidate));
             }
             if boundary == Some(dir) || data_dir_scope == Some(dir) {
-                return None;
+                return Ok(None);
             }
-            dir = dir.parent()?;
+            dir = match dir.parent() {
+                Some(parent) => parent,
+                None => return Ok(None),
+            };
         }
     }
 
@@ -730,16 +747,23 @@ fn repo_name(root: &Path) -> String {
 /// upward walk, not the file the walk is committed to — answers `false`:
 /// "not an estate, keep walking", never a hard error for a file that was
 /// never going to be chosen anyway.
-fn has_estate_table(config_path: &Path) -> bool {
+/// Whether `config_path` carries an `[estate]` table — [`Workspace::
+/// find_estate_upward_bounded`]'s match predicate. `Ok(false)` for a file
+/// this walk cannot even read (permission, race — indistinguishable from
+/// "no file here"). `Err` for one it CAN read but that is malformed or
+/// carries legacy vocabulary (W5/R-MVP1-3): those are not silently skipped
+/// — see the walk's own doc comment.
+fn estate_table_check(config_path: &Path) -> Result<bool, WorkspaceError> {
     let Ok(text) = std::fs::read_to_string(config_path) else {
-        return false;
+        return Ok(false);
     };
-    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
-        return false;
-    };
-    value
+    let file = config_path.display().to_string();
+    check_legacy_vocabulary(&text, &file)?;
+    let value: toml::Value =
+        toml::from_str(&text).map_err(|source| WorkspaceError::Malformed { path: file, source })?;
+    Ok(value
         .as_table()
-        .is_some_and(|table| table.contains_key("estate"))
+        .is_some_and(|table| table.contains_key("estate")))
 }
 
 #[cfg(test)]
@@ -1378,7 +1402,8 @@ mod tests {
         // host where the temp root is reached through a symlink.
         let boundary = std::fs::canonicalize(&boundary).expect("canonical boundary");
 
-        let found = Workspace::find_estate_upward_bounded(&below_boundary, Some(&boundary), None);
+        let found = Workspace::find_estate_upward_bounded(&below_boundary, Some(&boundary), None)
+            .expect("no legacy/malformed sergeant.toml in this fixture");
         assert_eq!(
             found, None,
             "an estate above the boundary must never be found"
@@ -1388,7 +1413,8 @@ mod tests {
         // above it) — proving the walk itself works and the bound is what
         // stopped it, not a bug in the walk.
         let found_unbounded =
-            Workspace::find_estate_upward_bounded(&below_boundary, Some(&above_boundary), None);
+            Workspace::find_estate_upward_bounded(&below_boundary, Some(&above_boundary), None)
+                .expect("no legacy/malformed sergeant.toml in this fixture");
         assert!(
             found_unbounded.is_some(),
             "the same estate must be found once the boundary includes it"
@@ -1423,7 +1449,8 @@ mod tests {
         let unrelated_scope =
             std::fs::canonicalize(&unrelated_scope).expect("canonical unrelated scope");
 
-        let found_unscoped = Workspace::find_estate_upward_bounded(&member, Some(&home), None);
+        let found_unscoped = Workspace::find_estate_upward_bounded(&member, Some(&home), None)
+            .expect("no legacy/malformed sergeant.toml in this fixture");
         assert!(
             found_unscoped.is_some(),
             "without a data-dir scope, the $HOME boundary alone finds the estate"
@@ -1432,7 +1459,8 @@ mod tests {
         // A data-dir scope that is NOT on `member`'s ancestor chain at all
         // — the ordinary case — must not change the outcome.
         let found_unrelated_scope =
-            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&unrelated_scope));
+            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&unrelated_scope))
+                .expect("no legacy/malformed sergeant.toml in this fixture");
         assert!(
             found_unrelated_scope.is_some(),
             "a data-dir scope that is not an ancestor of `start` must not change the outcome"
@@ -1444,11 +1472,87 @@ mod tests {
         // The walk must stop there, never reaching `estate_root` one
         // directory further up.
         let found_ancestor_scope =
-            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&repos_dir));
+            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&repos_dir))
+                .expect("no legacy/malformed sergeant.toml in this fixture");
         assert_eq!(
             found_ancestor_scope, None,
             "a data-dir scope that IS an ancestor of `start` must stop the walk there, \
              never letting it reach the estate config even one directory further up"
+        );
+    }
+
+    // -------------------------------------------------- W5: legacy/malformed
+    // sergeant.toml on the way up fails closed, not silently skipped
+
+    /// R-MVP1-3's named migration refusal must fire for a legacy-vocabulary
+    /// `sergeant.toml` the upward walk steps over on its way to (what would
+    /// otherwise be) an estate above it — not just one chosen directly.
+    /// Before this fix, `has_estate_table` swallowed the parse/legacy
+    /// failure and the walk silently treated it as "not an estate, keep
+    /// walking", falling through all the way to the zero-config member-repo
+    /// fallback with no diagnostic at all.
+    #[test]
+    fn a_legacy_vocabulary_sergeant_toml_on_the_way_up_fails_the_walk_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        let member = estate_root.join("repos").join("member");
+        std::fs::create_dir_all(&member).expect("member dir");
+        init_repo(&member);
+        std::fs::write(
+            estate_root.join(WORKSPACE_FILE),
+            "[workspace]\nname = \"legacy\"\n\n[[repository]]\nname = \"legacy\"\npath = \".\"\n",
+        )
+        .expect("legacy sergeant.toml");
+
+        let err = Workspace::find_estate_upward_bounded(&member, None, None)
+            .expect_err("a legacy-vocabulary file on the way up must refuse, not be skipped");
+        assert!(
+            matches!(err, WorkspaceError::LegacyVocabulary { .. }),
+            "got {err}"
+        );
+    }
+
+    /// Same shape, a `sergeant.toml` on the way up that is not even valid
+    /// TOML: the walk must refuse, not silently skip it and fall through to
+    /// the zero-config fallback.
+    #[test]
+    fn a_malformed_sergeant_toml_on_the_way_up_fails_the_walk_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        let member = estate_root.join("repos").join("member");
+        std::fs::create_dir_all(&member).expect("member dir");
+        init_repo(&member);
+        std::fs::write(estate_root.join(WORKSPACE_FILE), "this is not [ toml").expect("write");
+
+        let err = Workspace::find_estate_upward_bounded(&member, None, None)
+            .expect_err("a malformed file on the way up must refuse, not be skipped");
+        assert!(matches!(err, WorkspaceError::Malformed { .. }), "got {err}");
+    }
+
+    /// The control this pair calibrates against: a plain member-repo
+    /// `sergeant.toml` with no `[estate]` and no legacy vocabulary at all —
+    /// still not an error, still "keep walking" (this module's own
+    /// `a_member_repos_own_sergeant_toml_without_estate_does_not_stop_the_walk`
+    /// test covers the full discovery path; this one pins the lower-level
+    /// walk function directly).
+    #[test]
+    fn a_plain_member_sergeant_toml_with_no_estate_table_does_not_fail_the_walk() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        let member = estate_root.join("repos").join("member");
+        std::fs::create_dir_all(&member).expect("member dir");
+        init_repo(&member);
+        std::fs::write(
+            member.join(WORKSPACE_FILE),
+            "[[repo]]\nname = \"solo\"\npath = \".\"\n",
+        )
+        .expect("write");
+
+        let found = Workspace::find_estate_upward_bounded(&member, None, None)
+            .expect("a plain non-estate sergeant.toml must not fail the walk");
+        assert_eq!(
+            found, None,
+            "a member's own non-estate config does not stop the walk (no estate above it here)"
         );
     }
 }
