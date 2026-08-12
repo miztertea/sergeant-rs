@@ -1,0 +1,73 @@
+{
+  "backend": "claude",
+  "execution": {
+    "attempt": 1,
+    "backend": "claude",
+    "execution_id": "01KZTDYAQ3ZZHWT99EFYACC658",
+    "native_id": "05dfbb65-96cd-4ced-999d-705e6984ad09",
+    "stage_id": "10-implement-with-tdd",
+    "stop_requested": false
+  },
+  "output": null,
+  "reservation": null,
+  "route_source": "explicit",
+  "stage": {
+    "attempt": 1,
+    "detail": null,
+    "executor": {
+      "harness": "claude",
+      "index": 0,
+      "kind": "actor",
+      "profile": {
+        "backend": "claude",
+        "name": "mvp1selfhost",
+        "options": {
+          "permission_mode": "bypassPermissions"
+        }
+      },
+      "route_source": "work_actor_default",
+      "stage_id": "10-implement-with-tdd"
+    },
+    "index": 0,
+    "of": 2,
+    "stage_id": "10-implement-with-tdd",
+    "status": "active"
+  },
+  "surface": {
+    "bindings": [
+      {
+        "base_branch": "cerberus/mvp-1",
+        "base_sha": "00f943f9ea7c147eb44856dd8f3b765e82bdc1e4",
+        "head_sha": "00f943f9ea7c147eb44856dd8f3b765e82bdc1e4",
+        "repository": "mvp1selfhost-subject",
+        "source_path": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/mvp1-selfhost/subject",
+        "work_branch": "sergeant/01KZTDYAK8WYGCK8D95NTV6CGZ",
+        "worktree_path": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/mvp1-selfhost/data/surfaces/01KZTDYAK8WYGCK8D95NTV6CGZ/mvp1selfhost-subject"
+      }
+    ],
+    "root": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/mvp1-selfhost/data/surfaces/01KZTDYAK8WYGCK8D95NTV6CGZ",
+    "work_id": "01KZTDYAK8WYGCK8D95NTV6CGZ"
+  },
+  "teardown": null,
+  "work": {
+    "backend": "claude",
+    "created_at": "2026-08-12T07:28:13.928Z",
+    "created_by": "cli",
+    "id": "01KZTDYAK8WYGCK8D95NTV6CGZ",
+    "intent": "Fix issue #50 (see ISSUE-50.md): pin the perf summary commit field to the tested binary's identity captured once at perf_require_binary time, not a live rev-parse per scenario. Scripts-only change in scripts/perf/common.sh; update any scenario that reads it; keep the fix minimal.",
+    "origin_client": "cli",
+    "profile": "mvp1selfhost",
+    "state": "active",
+    "workflow": "implement",
+    "workspace": "mvp1selfhost-subject"
+  },
+  "workflow": {
+    "name": "implement",
+    "source": "/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/mvp1-selfhost/subject/.sergeant/workflows/implement",
+    "stages": [
+      "10-implement-with-tdd",
+      "30-review"
+    ],
+    "version": "2"
+  }
+}

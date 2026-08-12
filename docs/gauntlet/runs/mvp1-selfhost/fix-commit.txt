@@ -1,0 +1,30 @@
+commit 916650bb3c080737b2666f4205d813fb0f18fadf
+Author:     Thomas Hawes <tchawes@gmail.com>
+AuthorDate: Wed Aug 12 07:41:58 2026 +0000
+Commit:     Thomas Hawes <tchawes@gmail.com>
+CommitDate: Wed Aug 12 07:41:58 2026 +0000
+
+    perf harness: pin the summary commit field once per run, with the binary's mtime (issue #50)
+    
+    The commit field in every scenario summary and environment.txt was a live
+    git rev-parse HEAD at scenario start, so a commit landing mid-matrix made
+    6 of 8 scenarios self-report code that was never in the tested binary.
+    
+    perf_require_binary now captures the identity exactly once and exports it,
+    so scenarios spawned by run-all.sh inherit the pin instead of re-reading
+    HEAD. Review of the first cut hardened three edges: the export happens
+    whether the pin was computed or inherited (a set-but-unexported value no
+    longer silently reintroduces per-scenario drift), a failed rev-parse warns
+    and is never cached or exported (a transient git failure no longer pins
+    "unknown" for the whole matrix), and an inherited value that cannot be a
+    sha is warned about.
+    
+    Per the issue's prescription the binary's mtime is recorded alongside
+    (binary_mtime in every summary JSON, "binary mtime" in environment.txt),
+    and the harness warns at startup when the binary predates HEAD's commit
+    time — the case where the commit field cannot describe the tested code,
+    which previously took manual mtime forensics to detect.
+    
+    Fixes #50
+    
+    Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
