@@ -237,9 +237,11 @@ fi
 perf_say "orphan repro: $(grep -m1 '^orphan_repro' "$PERF_SUMMARY_TSV" | cut -f2-)"
 
 perf_kv fleet_states "$(perf_state_counts | tr '\n' ' ')"
-perf_disk_kv disk "$DD"
 s7_kill_tmux
 perf_daemon_stop
+# Issue #13: `perf_disk_kv` moved after `perf_daemon_stop` (see its doc in
+# common.sh) — `duckdb_bytes` only reflects reality post-checkpoint.
+perf_disk_kv disk "$DD"
 perf_kv daemon_force_killed "$PERF_FORCE_KILLED"
 perf_hygiene s7 "$REPO"
 perf_summary

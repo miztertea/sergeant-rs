@@ -645,6 +645,20 @@ perf_latency_kv() {
 
 perf_bytes() { du -sb "$1" 2>/dev/null | cut -f1 || echo 0; }
 
+# perf_disk_kv <prefix> <data-dir> — journal/blobs/surfaces/total bytes are
+# read straight off the filesystem and are accurate at any moment, live
+# daemon or not. `<prefix>_duckdb_bytes` is not: DuckDB only checkpoints the
+# analytics projection to disk at clean shutdown (`src/runtime/analytics.rs`
+# — the journal is the source of truth and the projection is disposable), so
+# a call against a *running* daemon reads whatever was on disk from the last
+# checkpoint, not the projection's current size. Issue #13's measured
+# example: S2's `post_disk_duckdb_bytes` read 12,288 B mid-run against a true
+# post-shutdown size of 536,576 B (~100% underreport at that scenario's
+# work count). **Callers wanting an accurate `duckdb_bytes` must call this
+# after `perf_daemon_stop`**, not before it — every scenario in this
+# directory does now (fixed alongside this comment; s6-crash.sh's own
+# `perf_disk_kv` call was already correctly ordered and is what this fix's
+# other call sites were brought in line with).
 perf_disk_kv() { # perf_disk_kv <prefix> <data-dir>
   local prefix="$1" dd="$2"
   perf_kv "${prefix}_total_bytes" "$(perf_bytes "$dd")"

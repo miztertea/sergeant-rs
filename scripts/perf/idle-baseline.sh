@@ -48,10 +48,13 @@ perf_kv threads "$max_thr"
 perf_kv cpu_total_s "$(awk -v a="$cpu0" -v b="$cpu1" 'BEGIN{printf "%.3f", b-a}')"
 perf_kv cpu_pct "$(awk -v a="$cpu0" -v b="$cpu1" -v t="$SECS" 'BEGIN{printf "%.3f", (b-a)*100/t}')"
 perf_kv samples "$nsamples"
-perf_disk_kv disk "$DD"
 perf_kv journal_events "$(perf_journal_events "$DD")"
 
 perf_daemon_stop
+# Issue #13: `perf_disk_kv` moved after `perf_daemon_stop` — its
+# `duckdb_bytes` reads DuckDB's on-disk checkpoint, which only happens at
+# clean shutdown (see the doc on `perf_disk_kv` in common.sh).
+perf_disk_kv disk "$DD"
 perf_kv daemon_force_killed "$PERF_FORCE_KILLED"
 perf_hygiene idle
 perf_summary

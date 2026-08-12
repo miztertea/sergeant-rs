@@ -174,9 +174,11 @@ perf_kv fds_leaked_vs_idle "$((FDS_FINAL - FDS_IDLE))"
 perf_kv rss_final_kb "$(perf_proc_rss "$PERF_DAEMON_PID")"
 perf_kv rss_delta_vs_idle_kb "$(($(perf_proc_rss "$PERF_DAEMON_PID") - RSS_IDLE))"
 perf_kv fleet_states "$(perf_state_counts | tr '\n' ' ')"
-perf_disk_kv disk "$DD"
 
 perf_daemon_stop
+# Issue #13: `perf_disk_kv` moved after `perf_daemon_stop` (see its doc in
+# common.sh) — `duckdb_bytes` only reflects reality post-checkpoint.
+perf_disk_kv disk "$DD"
 perf_kv daemon_force_killed "$PERF_FORCE_KILLED"
 perf_hygiene s4 "$REPO"
 perf_summary

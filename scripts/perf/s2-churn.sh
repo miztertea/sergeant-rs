@@ -122,7 +122,6 @@ perf_kv cpu_ms_per_work "$(awk -v a="$CPU1" -v b="$CPU0" -v n="$done_n" 'BEGIN{p
 perf_kv samples "$nsamples"
 perf_kv journal_events "$((HEAD1 - HEAD0))"
 perf_kv events_per_work "$(awk -v e="$((HEAD1 - HEAD0))" -v n="$done_n" 'BEGIN{printf "%.1f", n? e/n : 0}')"
-perf_disk_kv post_disk "$DD"
 
 python3 - "$WAVES_CSV" "$PERF_OUT/s2-trend.json" <<'PY'
 # The leak question is "does RSS trend up across waves", so fit a line to it:
@@ -150,6 +149,12 @@ PY
 perf_kv rss_trend_json "$PERF_OUT/s2-trend.json"
 
 perf_daemon_stop
+# Issue #13: moved from before `perf_daemon_stop` — DuckDB only checkpoints
+# to disk at clean shutdown, so `post_disk_duckdb_bytes` read here used to be
+# whatever was on disk from the last checkpoint (measured: 12,288 B) rather
+# than the projection's real post-run size (536,576 B). `perf_disk_kv`'s own
+# doc in common.sh has the full measurement.
+perf_disk_kv post_disk "$DD"
 perf_kv daemon_force_killed "$PERF_FORCE_KILLED"
 perf_hygiene s2 "$REPO"
 perf_summary

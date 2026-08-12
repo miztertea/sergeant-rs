@@ -101,9 +101,11 @@ perf_step "fleet and disk"
 perf_kv fleet_total "$(perf_api GET /v1/work | jq '.works | length')"
 perf_kv fleet_states "$(perf_state_counts | tr '\n' ' ')"
 perf_kv journal_events_on_disk "$(perf_journal_events "$DD")"
-perf_disk_kv disk "$DD"
 
 perf_daemon_stop
+# Issue #13: `perf_disk_kv` moved after `perf_daemon_stop` (see its doc in
+# common.sh) — `duckdb_bytes` only reflects reality post-checkpoint.
+perf_disk_kv disk "$DD"
 perf_kv daemon_force_killed "$PERF_FORCE_KILLED"
 perf_hygiene s1 "$REPO"
 perf_summary
