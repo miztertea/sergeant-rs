@@ -2456,8 +2456,7 @@ fn r_mvp1_1_sgt_surfaces_dir_env_var_reaches_a_real_spawned_daemon() {
         "sgt run: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let body: Value =
-        serde_json::from_slice(&output.stdout).expect("json output");
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output");
     assert_ne!(
         body["work"]["state"], "blocked",
         "an outside SGT_SURFACES_DIR must materialize even with data_dir inside the checkout: {body}"

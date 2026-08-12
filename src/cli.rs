@@ -373,7 +373,12 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         let mut work = result["work"].clone();
                         if let Some(object) = work.as_object_mut() {
                             for key in [
-                                "stage", "surface", "execution", "workflow", "backend", "output",
+                                "stage",
+                                "surface",
+                                "execution",
+                                "workflow",
+                                "backend",
+                                "output",
                                 "teardown",
                             ] {
                                 if !result[key].is_null() {
@@ -893,7 +898,7 @@ mod doctor {
         checks.push(journal_check);
         checks.push(projection_check(data_dir, journal_ok));
         checks.push(daemon_check(data_dir).await);
-        checks.push(permission_mode_check());
+        checks.push(permission_mode_check(data_dir));
         Report {
             data_dir: data_dir.to_path_buf(),
             checks,
@@ -910,7 +915,7 @@ mod doctor {
     /// also why a malformed `permission_mode` here reads as this check's own
     /// failure rather than a mysterious daemon-side refusal later — #47's
     /// fail-closed load already ran by the time this string is built.
-    fn permission_mode_check() -> Check {
+    fn permission_mode_check(data_dir: &Path) -> Check {
         use crate::domain::workspace::{Workspace, WorkspaceError};
 
         let cwd = match std::env::current_dir() {
@@ -923,7 +928,9 @@ mod doctor {
                 );
             }
         };
-        match Workspace::discover(&cwd) {
+        // R-MVP1-12's data-dir scope: bound the upward estate walk at this
+        // installation's own data dir, never above it.
+        match Workspace::discover_scoped(&cwd, Some(data_dir)) {
             Ok(workspace) if workspace.profiles.is_empty() => Check::ok(
                 "permission_mode",
                 "no profiles declared — every execution launches with no --permission-mode \

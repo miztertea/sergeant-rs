@@ -422,8 +422,30 @@ impl Workspace {
     /// topology replaced by a `sergeant.toml` found exactly there (with or
     /// without `[estate]` — the git-toplevel fallback accepts either, since
     /// there is nothing further up to prefer it over).
+    ///
+    /// Equivalent to [`Self::discover_scoped`] with no explicit data-dir
+    /// scope — kept as the unscoped entry point so every existing caller
+    /// and fixture that has no data dir of its own to bound against (most
+    /// of this module's own tests among them) keeps working unchanged.
     pub fn discover(start: &Path) -> Result<Self, WorkspaceError> {
-        if let Some(estate_config) = Self::find_estate_upward(start) {
+        Self::discover_scoped(start, None)
+    }
+
+    /// [`Self::discover`], plus R-MVP1-12's other half: the walk never
+    /// ascends past an explicit `--data-dir`/`SGT_DATA_DIR` scope, when the
+    /// caller has one. `$HOME` and the data-dir scope are both candidate
+    /// boundaries; the walk stops at whichever it reaches first ascending
+    /// from `start` (checking that directory's own `sergeant.toml` before
+    /// stopping, exactly as the `$HOME` boundary already does) — a data-dir
+    /// scope that sits *below* `start` (not on its ancestor chain at all,
+    /// the ordinary case: the data dir defaults to
+    /// `~/.local/share/sergeant`, unrelated to any repository) is never
+    /// reached during the ascent and so never changes the outcome; only a
+    /// scope that is itself an ancestor of `start` — the A8 self-hosting
+    /// shape, "data dir in-estate" (`docs/gauntlet/contracts/MVP-1.md`'s own
+    /// Acceptance) — can narrow it.
+    pub fn discover_scoped(start: &Path, data_dir: Option<&Path>) -> Result<Self, WorkspaceError> {
+        if let Some(estate_config) = Self::find_estate_upward(start, data_dir) {
             return Self::from_config(&estate_config);
         }
         let toplevel = git(start, &["rev-parse", "--show-toplevel"]).map_err(|source| {
@@ -468,19 +490,27 @@ impl Workspace {
     /// keep walking" rather than a hard failure: it is not the file this
     /// walk is trying to find, and an unrelated member repo's broken config
     /// must not be able to block estate discovery for everything below it.
-    fn find_estate_upward(start: &Path) -> Option<PathBuf> {
+    fn find_estate_upward(start: &Path, data_dir: Option<&Path>) -> Option<PathBuf> {
         let boundary = std::env::var_os("HOME")
             .map(PathBuf::from)
             .and_then(|home| std::fs::canonicalize(&home).ok());
-        Self::find_estate_upward_bounded(start, boundary.as_deref())
+        let data_dir_scope = data_dir.and_then(|d| std::fs::canonicalize(d).ok());
+        Self::find_estate_upward_bounded(start, boundary.as_deref(), data_dir_scope.as_deref())
     }
 
-    /// [`Self::find_estate_upward`] with the `$HOME` boundary passed in
-    /// rather than read from the process environment — split out so the
-    /// boundary itself is testable without mutating a process-global that
-    /// every other test in this binary also reads (`backend/claude.rs`'s own
-    /// `$HOME` fallback among them).
-    fn find_estate_upward_bounded(start: &Path, boundary: Option<&Path>) -> Option<PathBuf> {
+    /// [`Self::find_estate_upward`] with both boundaries passed in rather
+    /// than read from the process environment / caller — split out so each
+    /// is testable without mutating a process-global that every other test
+    /// in this binary also reads (`backend/claude.rs`'s own `$HOME`
+    /// fallback among them). `data_dir_scope` implements R-MVP1-12's
+    /// "never above an explicit `--data-dir`/`SGT_DATA_DIR` scope": one more
+    /// candidate boundary alongside `$HOME`, checked at every directory the
+    /// walk visits so it stops at whichever boundary it reaches first.
+    fn find_estate_upward_bounded(
+        start: &Path,
+        boundary: Option<&Path>,
+        data_dir_scope: Option<&Path>,
+    ) -> Option<PathBuf> {
         let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
         let mut dir: &Path = &start;
         loop {
@@ -488,7 +518,7 @@ impl Workspace {
             if candidate.is_file() && has_estate_table(&candidate) {
                 return Some(candidate);
             }
-            if boundary == Some(dir) {
+            if boundary == Some(dir) || data_dir_scope == Some(dir) {
                 return None;
             }
             dir = dir.parent()?;
@@ -1348,7 +1378,7 @@ mod tests {
         // host where the temp root is reached through a symlink.
         let boundary = std::fs::canonicalize(&boundary).expect("canonical boundary");
 
-        let found = Workspace::find_estate_upward_bounded(&below_boundary, Some(&boundary));
+        let found = Workspace::find_estate_upward_bounded(&below_boundary, Some(&boundary), None);
         assert_eq!(
             found, None,
             "an estate above the boundary must never be found"
@@ -1358,10 +1388,67 @@ mod tests {
         // above it) — proving the walk itself works and the bound is what
         // stopped it, not a bug in the walk.
         let found_unbounded =
-            Workspace::find_estate_upward_bounded(&below_boundary, Some(&above_boundary));
+            Workspace::find_estate_upward_bounded(&below_boundary, Some(&above_boundary), None);
         assert!(
             found_unbounded.is_some(),
             "the same estate must be found once the boundary includes it"
+        );
+    }
+
+    /// R-MVP1-12's other half: "never above an explicit `--data-dir`/
+    /// `SGT_DATA_DIR` scope." A data-dir scope that sits on `start`'s own
+    /// ancestor chain, strictly between `start` and the estate config, must
+    /// stop the walk there — never letting it reach the estate even one
+    /// directory further up — while a data-dir scope that is not on the
+    /// ancestor chain at all (the ordinary case: the data dir usually has
+    /// nothing to do with whichever repository a submission runs against)
+    /// must not change the outcome.
+    #[test]
+    fn the_data_dir_scope_bounds_the_walk_like_home_does() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir.path().join("home");
+        let estate_root = home.join("estate");
+        let repos_dir = estate_root.join("repos");
+        let member = repos_dir.join("member");
+        let unrelated_scope = home.join("scratch-data-dir");
+        std::fs::create_dir_all(&member).expect("member dir");
+        std::fs::create_dir_all(&unrelated_scope).expect("unrelated scope dir");
+        init_repo(&member);
+
+        // An estate at `estate_root` — inside `$HOME`, so an unscoped walk
+        // (or one bounded only by `$HOME`) finds it fine.
+        write_estate(&estate_root, "in-estate-data-dir");
+        let home = std::fs::canonicalize(&home).expect("canonical home");
+        let repos_dir = std::fs::canonicalize(&repos_dir).expect("canonical repos dir");
+        let unrelated_scope =
+            std::fs::canonicalize(&unrelated_scope).expect("canonical unrelated scope");
+
+        let found_unscoped = Workspace::find_estate_upward_bounded(&member, Some(&home), None);
+        assert!(
+            found_unscoped.is_some(),
+            "without a data-dir scope, the $HOME boundary alone finds the estate"
+        );
+
+        // A data-dir scope that is NOT on `member`'s ancestor chain at all
+        // — the ordinary case — must not change the outcome.
+        let found_unrelated_scope =
+            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&unrelated_scope));
+        assert!(
+            found_unrelated_scope.is_some(),
+            "a data-dir scope that is not an ancestor of `start` must not change the outcome"
+        );
+
+        // The scope genuinely is an ancestor of `start`, strictly below the
+        // estate's own `sergeant.toml` (`repos/`, one level under
+        // `estate_root`) — the A8 self-hosting shape, data dir in-estate.
+        // The walk must stop there, never reaching `estate_root` one
+        // directory further up.
+        let found_ancestor_scope =
+            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&repos_dir));
+        assert_eq!(
+            found_ancestor_scope, None,
+            "a data-dir scope that IS an ancestor of `start` must stop the walk there, \
+             never letting it reach the estate config even one directory further up"
         );
     }
 }

@@ -863,7 +863,9 @@ impl Engine {
     pub fn plan(&self, context: &SubmitContext<'_>) -> Result<Option<StartPlan>, EngineError> {
         let workspace = match context.cwd {
             None => None,
-            Some(cwd) => match Workspace::discover(cwd) {
+            // R-MVP1-12's data-dir scope: bound the upward estate walk at
+            // this engine's own data dir, never above it.
+            Some(cwd) => match Workspace::discover_scoped(cwd, Some(&self.data_dir)) {
                 Ok(workspace) => Some(workspace),
                 Err(WorkspaceError::NotARepository { .. }) => None,
                 Err(e) => return Err(e.into()),
