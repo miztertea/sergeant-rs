@@ -1359,11 +1359,34 @@ mod tests {
 
     /// #22: no `sergeant.toml` with `[estate]` anywhere on the way up falls
     /// back to the zero-config, git-toplevel behavior, unchanged.
+    ///
+    /// Deliberately includes a plain, non-estate `sergeant.toml` *above*
+    /// `root` (not merely "no sergeant.toml at all" — the guard-map
+    /// mutation this test must kill is `has_estate_table`'s own check
+    /// dropped from the walk's match predicate, i.e. `if candidate.is_file()
+    /// && has_estate_table(...)` weakened to `if candidate.is_file()`; with
+    /// no file anywhere on the ascent path, that mutated predicate is never
+    /// exercised with a file present, so a fixture with no file at all
+    /// cannot distinguish the mutant from the real thing). With the file in
+    /// place, the mutant would wrongly treat it as an estate root and
+    /// `from_config` it — landing a different workspace (`config_path`
+    /// `Some`, a different `name`) than the zero-config fallback this test
+    /// asserts.
     #[test]
     fn no_estate_anywhere_falls_back_to_zero_config_unchanged() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().join("solo-repo");
         init_repo(&root);
+        // A non-estate sergeant.toml, above `root`, on the walk's ascent
+        // path — present, but without `[estate]`, so it must not stop the
+        // walk (this module's own "a sergeant.toml without [estate] is a
+        // member's own config, not an estate" rule) and discovery still
+        // falls all the way back to zero-config.
+        std::fs::write(
+            dir.path().join(WORKSPACE_FILE),
+            "[[repo]]\nname = \"unrelated\"\npath = \".\"\n",
+        )
+        .expect("write non-estate sergeant.toml");
 
         let workspace = Workspace::discover(&root).expect("zero-config fallback");
         assert_eq!(workspace.repositories.len(), 1);
@@ -1372,6 +1395,12 @@ mod tests {
             std::fs::canonicalize(&root).ok()
         );
         assert!(workspace.config_path.is_none());
+        assert_eq!(
+            workspace.name,
+            repo_name(&std::fs::canonicalize(&root).unwrap_or(root)),
+            "the zero-config name is the repo's own directory name, not the \
+             unrelated sergeant.toml's"
+        );
     }
 
     /// #22: starting outside any git repository at all is the unchanged
