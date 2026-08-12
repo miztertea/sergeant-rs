@@ -603,6 +603,65 @@ async fn r_mvp1_4_local_instructions_policy_is_refused_at_submit() {
     handle.shutdown().await;
 }
 
+/// TH-11: R-MVP1-11's refusal pinned end to end over a real HTTP submit —
+/// its R-MVP1-4 siblings above are; this one previously wasn't (only at the
+/// `engine.plan()` call seam), so nothing asserted the client-visible 422
+/// body a real submit actually returns.
+#[tokio::test]
+async fn r_mvp1_11_a_stage_requiring_ask_refuses_at_submit_over_http() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let dir = repo.join(".sergeant/workflows/asks");
+    std::fs::create_dir_all(dir.join("00-interview")).expect("stage dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"asks\"\nversion = \"1\"\nstages = [\"00-interview\"]\n\n\
+         [stage.\"00-interview\"]\nrequires_ask = true\n",
+    )
+    .expect("workflow.toml");
+    std::fs::write(dir.join("00-interview/CONTEXT.md"), "ask questions").expect("CONTEXT.md");
+
+    let no_ask = FakeBackend::scripted(FAKE_BACKEND_NAME, []).with_capabilities(Capabilities {
+        ask: false,
+        ..Capabilities::default()
+    });
+    let registry = BackendRegistry::new().with(Arc::new(no_ask.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "needs a real ask",
+        json!({"workflow": "asks"}),
+    )
+    .await;
+    assert_eq!(status, 422, "must refuse at submit: {body}");
+    assert_eq!(body["error"]["code"], "ask_capability_unavailable");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("asks"),
+        "must name the workflow: {message}"
+    );
+    assert!(
+        message.contains("00-interview"),
+        "must name the stage: {message}"
+    );
+    assert!(
+        message.contains(FAKE_BACKEND_NAME),
+        "must name the backend: {message}"
+    );
+    assert!(
+        no_ask.starts().is_empty(),
+        "a submit-time refusal must never reach a backend"
+    );
+
+    handle.shutdown().await;
+}
+
 /// R-MVP1-4's pin, positive case: a uniform (unset, so `suppress`) policy
 /// submits, and `workflow.bound` is widened to carry the resolved
 /// repository set plus, per repository, the resolved policy and its
