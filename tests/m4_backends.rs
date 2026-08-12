@@ -8470,9 +8470,13 @@ async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() 
         .to_string();
     assert_eq!(submitted["work"]["state"], "active");
 
-    // Generous relative to `ceiling + poll` (real scheduling jitter, not the
-    // property under test) but still a real bound — never "eventually".
-    let budget = ceiling + poll * 10 + Duration::from_secs(5);
+    // TH-05: tight enough to actually test "within ceiling + one interval"
+    // (this test's own doc/name) rather than merely "eventually" — the
+    // original budget here (ceiling + poll*10 + a flat 5s) was 37x the
+    // ceiling, wide enough to pass even if the ceiling fired on an
+    // unrelated, much slower schedule. 10 poll intervals of jitter margin
+    // is still generous; the flat multi-second pad is gone.
+    let budget = ceiling + poll * 10;
     let submitted_at = Instant::now();
     let events = loop {
         let events = events_over_api(&http, &handle, &work_id).await;
@@ -8495,7 +8499,16 @@ async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() 
         .iter()
         .find(|e| e.kind == KIND_TURN_CEILING_INTERRUPTED)
         .expect("just matched above");
+    // TH-05: `requested: true` alone is vacuous — `settle_interrupt` writes
+    // it on both its Ok and Err arms, so this could never fail regardless of
+    // whether the interrupt actually succeeded. `error` distinguishes them:
+    // present only on the Err arm.
     assert_eq!(interrupted.payload["outcome"]["requested"], true);
+    assert!(
+        interrupted.payload["outcome"]["error"].is_null(),
+        "the interrupt itself must have succeeded, not merely been attempted: {}",
+        interrupted.payload["outcome"]
+    );
     let execution_id = interrupted.payload["execution_id"]
         .as_str()
         .expect("execution_id")
@@ -8548,7 +8561,8 @@ async fn r_mvp1_7_two_simultaneously_overdue_hangs_are_both_interrupted() {
     assert_eq!(a["work"]["state"], "active");
     assert_eq!(b["work"]["state"], "active");
 
-    let budget = ceiling + poll * 10 + Duration::from_secs(5);
+    // TH-05: same tightened budget as the sibling single-hang test above.
+    let budget = ceiling + poll * 10;
     let submitted_at = Instant::now();
     loop {
         let events_a = events_over_api(&http, &handle, &work_a).await;
