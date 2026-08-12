@@ -1467,8 +1467,8 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     init_repo(workspace.path());
     std::fs::write(
         workspace.path().join("sergeant.toml"),
-        "[workspace]\nname = \"w\"\n\n\
-         [[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
          [[profile]]\nname = \"quiet\"\nbackend = \"claude\"\n\n\
          [[profile]]\nname = \"careful\"\nbackend = \"claude\"\n\
          [profile.options]\npermission_mode = \"plan\"\n",

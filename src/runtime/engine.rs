@@ -3330,6 +3330,9 @@ mod tests {
                 default_workflow: None,
                 profiles: Vec::new(),
                 config_path: None,
+                surfaces_dir: None,
+                repository_policy: std::collections::BTreeMap::new(),
+                groups: std::collections::BTreeMap::new(),
             },
             repositories: Vec::new(),
             workflow: WorkflowDefinition {

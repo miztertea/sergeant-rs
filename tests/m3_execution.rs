@@ -480,14 +480,14 @@ async fn t2_multi_repo_workspace_binds_one_worktree_per_repository() {
     std::fs::write(
         api.join("sergeant.toml"),
         r#"
-[workspace]
+[estate]
 name = "payments"
 
-[[repository]]
+[[repo]]
 name = "api"
 path = "."
 
-[[repository]]
+[[repo]]
 name = "web"
 path = "../payments-web"
 "#,
@@ -681,7 +681,7 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     init_repo(&repo);
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
          [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n",
     )
     .expect("sergeant.toml");
@@ -1112,7 +1112,7 @@ async fn t7_routing_precedence_and_structured_failure() {
     init_repo(&configured);
     std::fs::write(
         configured.join("sergeant.toml"),
-        "[workspace]\nname = \"configured\"\ndefault_backend = \"codex\"\n\n[[repository]]\nname = \"configured\"\npath = \".\"\n",
+        "[estate]\nname = \"configured\"\ndefault_backend = \"codex\"\n\n[[repo]]\nname = \"configured\"\npath = \".\"\n",
     )
     .expect("sergeant.toml");
 
@@ -1235,7 +1235,7 @@ fn mixed_harness_repo(repo: &Path, tables: &str) {
     std::fs::write(
         repo.join("sergeant.toml"),
         format!(
-            "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
              [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n\
              default_model = \"alt-model-1\"\n\n\
              [[profile]]\nname = \"default-profile\"\nbackend = \"{FAKE_BACKEND_NAME}\"\n\
@@ -2149,9 +2149,9 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     git(&web, &["init", "-b", "main"]);
     std::fs::write(
         api.join("sergeant.toml"),
-        "[workspace]\nname = \"payments\"\n\n\
-         [[repository]]\nname = \"api\"\npath = \".\"\n\n\
-         [[repository]]\nname = \"web\"\npath = \"../payments-web\"\n",
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\n",
     )
     .expect("sergeant.toml");
 
@@ -2884,7 +2884,7 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     std::fs::write(
         repo.join("sergeant.toml"),
         format!(
-            "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
              [[profile]]\nname = \"enterprise\"\nbackend = \"{FAKE_BACKEND_NAME}\"\n\
              default_model = \"claude-opus-4-7\"\n\
              env = {{ CLAUDE_CONFIG_DIR = \"/tmp/work\", GIT_AUTHOR_NAME = \"sergeant\" }}\n"
@@ -2949,7 +2949,7 @@ async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_rout
     let data = TempDir::new().expect("tempdir");
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
          [[profile]]\nname = \"elsewhere\"\nbackend = \"codex\"\n\
          default_model = \"gpt-nonexistent\"\n",
     )
@@ -3160,7 +3160,7 @@ async fn a_malformed_workspace_file_fails_closed() {
     init_repo(&repo);
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\ndefault_backends = \"fake\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n",
+        "[estate]\nname = \"solo\"\ndefault_backends = \"fake\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
     )
     .expect("sergeant.toml");
 
@@ -3180,7 +3180,7 @@ async fn a_malformed_workspace_file_fails_closed() {
     // A declared repository that does not exist is refused too.
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"ghost\"\npath = \"../nowhere\"\n",
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"ghost\"\npath = \"../nowhere\"\n",
     )
     .expect("sergeant.toml");
     let (status, body) = submit(&http(), &handle, &repo, "missing repo", json!({})).await;
@@ -3199,9 +3199,9 @@ async fn a_malformed_workspace_file_fails_closed() {
     // after the first had already put a branch in the user's checkout.
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n\
-         [[repository]]\nname = \"here\"\npath = \".\"\n\n\
-         [[repository]]\nname = \"also-here\"\npath = \"./\"\n",
+        "[estate]\nname = \"solo\"\n\n\
+         [[repo]]\nname = \"here\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"also-here\"\npath = \"./\"\n",
     )
     .expect("sergeant.toml");
     let (status, body) = submit(&http(), &handle, &repo, "one repo, two names", json!({})).await;
