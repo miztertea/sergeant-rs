@@ -304,6 +304,113 @@ fn workspace_access_governs_writes_both_ways() {
     assert_containers_gone(&["sgt-m7-ro", "sgt-m7-rw"]);
 }
 
+/// §22.7 test 6 (INV-R1-07's named coverage gap, MVP-2 D3 fixer pass): the
+/// negative isolation posture `create_container`'s own comment claims
+/// (§16.7 — "no privilege, no host namespaces, no extra capabilities, no
+/// host devices, and the Docker socket is never mounted in") had never
+/// actually been inspected on a real container; every other test only
+/// checks the *positive* behavior (a write does or doesn't land). Inspects
+/// the real container Docker created and asserts the negative claims
+/// directly: exactly one mount (the workspace bind, nothing else), not
+/// privileged, no added capabilities, no devices.
+#[test]
+fn a_launched_container_carries_no_isolation_escape_hatches() {
+    require_docker!();
+    let data = support::DataDir::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend = backend(data.path());
+
+    let req = request(
+        "w2c",
+        "m7-isolation",
+        cwd.path(),
+        spec(vec!["sleep", "60"], WorkspaceAccess::ReadOnly),
+    );
+    let prepared = backend.prepare(&req).expect("prepare");
+    let handle = launch(&backend, &prepared);
+
+    let output = Command::new("docker")
+        .args(["inspect", "sgt-m7-isolation"])
+        .output()
+        .expect("docker inspect");
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("inspect json");
+    let info = &parsed[0];
+
+    let mounts = info["Mounts"].as_array().expect("Mounts array");
+    assert_eq!(
+        mounts.len(),
+        1,
+        "exactly one mount (the workspace bind), nothing else — no Docker socket, no extra \
+         host paths: {mounts:?}"
+    );
+    assert_eq!(mounts[0]["Destination"], "/workspace");
+    assert!(
+        mounts.iter().all(|m| m["Source"]
+            .as_str()
+            .is_some_and(|s| !s.contains("docker.sock"))),
+        "the Docker socket must never be mounted into an execute-stage container: {mounts:?}"
+    );
+    assert_eq!(
+        info["HostConfig"]["Privileged"], false,
+        "an execute-stage container must never run --privileged"
+    );
+    let cap_add = info["HostConfig"]["CapAdd"].as_array();
+    assert!(
+        cap_add.is_none_or(|c| c.is_empty()),
+        "no extra Linux capabilities must be added: {cap_add:?}"
+    );
+    let devices = info["HostConfig"]["Devices"].as_array();
+    assert!(
+        devices.is_none_or(|d| d.is_empty()),
+        "no host devices must be granted: {devices:?}"
+    );
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+    let _ = wait_for_exit(&backend, &handle);
+    backend.stop(&handle).expect("stop").wait();
+    assert_containers_gone(&["sgt-m7-isolation"]);
+}
+
+/// §22.7 test 2 (INV-R1-07's named coverage gap, MVP-2 D3 fixer pass): a
+/// worktree path containing a space must bind-mount and round-trip a write
+/// correctly — spaces are safe by construction (`Command`'s args are passed
+/// via `exec`, never a shell), unlike `,`/`=` which really do collide with
+/// `--mount`'s CSV grammar (INV-R1-12, covered separately by a unit test
+/// that does not need this space-specific positive proof).
+#[test]
+fn a_mount_path_containing_a_space_round_trips_correctly() {
+    require_docker!();
+    let data = support::DataDir::new();
+    let cwd_root = TempDir::new().expect("cwd root");
+    let cwd = cwd_root.path().join("has a space in it");
+    std::fs::create_dir_all(&cwd).expect("mkdir with a space");
+    let backend = backend(data.path());
+
+    let req = request(
+        "w2b",
+        "m7-space",
+        &cwd,
+        spec(
+            vec!["sh", "-c", "echo yes > /workspace/should-exist"],
+            WorkspaceAccess::ReadWrite,
+        ),
+    );
+    let prepared = backend.prepare(&req).expect("prepare");
+    let handle = launch(&backend, &prepared);
+    let observation = wait_for_exit(&backend, &handle);
+    use sergeant_rs::backend::BackendSignal;
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "a bind mount whose host path contains a space must still work: {:?}",
+        observation.signal
+    );
+    backend.stop(&handle).expect("stop").wait();
+    let written = std::fs::read_to_string(cwd.join("should-exist")).expect("host file");
+    assert_eq!(written.trim(), "yes");
+    assert_containers_gone(&["sgt-m7-space"]);
+}
+
 // ------------------------------------------------------------- 3. isolation
 
 /// §22.7 test 5 / §16.7: `network = "none"` leaves the container with no
