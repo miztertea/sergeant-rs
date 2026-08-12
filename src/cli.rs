@@ -1316,6 +1316,7 @@ mod doctor {
         checks.push(projection_check(data_dir, journal_ok));
         checks.push(daemon_check(data_dir).await);
         checks.push(permission_mode_check(data_dir));
+        checks.push(estate_check(data_dir));
         // N4/#23 (retention Rule B): disk pressure inside the data dir. Runs
         // after everything above regardless of their outcome — knowing "is
         // this installation about to run out of disk" does not depend on the
@@ -1383,6 +1384,132 @@ mod doctor {
                 format!("cannot read this workspace's profiles: {e}"),
                 "fix sergeant.toml at the location the error names",
             ),
+        }
+    }
+
+    /// MVP-3: the estate manifest's own health, beyond whether it merely
+    /// parses. Bounded at this installation's own data dir, same discovery
+    /// as [`permission_mode_check`]; silent (`ok`) outside any estate.
+    ///
+    /// A manifest that fails to parse at all (malformed TOML, R-MVP1-3's
+    /// legacy-vocabulary refusal, a duplicate or invalid repository name)
+    /// reports that failure's own message as this check's detail — every
+    /// `WorkspaceError` variant already names its file and the offending
+    /// key, and `Malformed` additionally carries `toml::de::Error`'s own
+    /// line/column, so nothing here needs to reconstruct that.
+    ///
+    /// Once the manifest parses, this looks past what execution's own
+    /// strict loader (`Workspace::from_config`) would ever tell you, because
+    /// that loader fails closed at the *first* problem it finds — right for
+    /// launching a Work, useless for "what is wrong with my estate right
+    /// now": it uses [`crate::domain::workspace::Workspace::declared_repos`]
+    /// instead, which names every declared repository regardless of whether
+    /// earlier ones are missing, then cross-checks two directions —
+    /// declared-but-absent (remedy: the declared `origin`, when there is
+    /// one, else the `sgt repo add` command that would set one) and
+    /// present-but-undeclared (a directory under `repos/` no `[[repo]]`
+    /// entry names).
+    fn estate_check(data_dir: &Path) -> Check {
+        use crate::domain::workspace::{WORKSPACE_FILE, Workspace};
+
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                return Check::warn(
+                    "estate",
+                    format!("cannot read the current directory: {e}"),
+                    "run `sgt doctor` from inside the estate you want checked",
+                );
+            }
+        };
+        let estate_root = match Workspace::estate_root(&cwd, Some(data_dir)) {
+            Ok(root) => root,
+            Err(e) => {
+                return Check::fail(
+                    "estate",
+                    e.to_string(),
+                    "fix sergeant.toml at the file and location named above",
+                );
+            }
+        };
+        let Some(estate_root) = estate_root else {
+            return Check::ok("estate", "not inside an estate — nothing to check");
+        };
+        let manifest_path = estate_root.join(WORKSPACE_FILE);
+        let declared = match Workspace::declared_repos(&manifest_path) {
+            Ok(declared) => declared,
+            Err(e) => {
+                return Check::fail(
+                    "estate",
+                    e.to_string(),
+                    format!(
+                        "fix {} at the location named above",
+                        manifest_path.display()
+                    ),
+                );
+            }
+        };
+
+        let mut declared_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut details = Vec::new();
+        let mut remedies = Vec::new();
+        for repo in &declared {
+            declared_names.insert(repo.name.clone());
+            if repo.path.exists() {
+                continue;
+            }
+            details.push(format!(
+                "{} is declared at {} but missing on disk",
+                repo.name,
+                repo.path.display()
+            ));
+            remedies.push(match &repo.origin {
+                Some(origin) => format!(
+                    "{}: clone it — `sgt repo add {} --origin {origin}`",
+                    repo.name, repo.name
+                ),
+                None => format!(
+                    "{}: no origin is declared — either place a git checkout at {} \
+                     yourself or declare one with `sgt repo add {} --origin <url>`",
+                    repo.name,
+                    repo.path.display(),
+                    repo.name
+                ),
+            });
+        }
+
+        let repos_dir = estate_root.join("repos");
+        if let Ok(entries) = std::fs::read_dir(&repos_dir) {
+            let mut undeclared: Vec<String> = entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| !declared_names.contains(name))
+                .collect();
+            undeclared.sort();
+            for name in undeclared {
+                details.push(format!(
+                    "repos/{name} is on disk but not declared in {WORKSPACE_FILE}"
+                ));
+                remedies.push(format!(
+                    "{name}: declare it — `sgt repo add {name}` (or remove the directory if it \
+                     should not be there)"
+                ));
+            }
+        }
+
+        if details.is_empty() {
+            Check::ok(
+                "estate",
+                format!(
+                    "{} repositories declared, all present on disk, no undeclared directories \
+                     under repos/",
+                    declared.len()
+                ),
+            )
+        } else {
+            Check::warn("estate", details.join("; "), remedies.join("; "))
         }
     }
 

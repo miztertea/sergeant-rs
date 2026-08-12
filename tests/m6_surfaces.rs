@@ -1182,6 +1182,12 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "projection",
             "daemon",
             "permission_mode",
+            // MVP-3: manifest health beyond "it parses" — declared repos
+            // missing on disk (origin as the remedy) and directories under
+            // `repos/` the manifest never declared. `ok` here (a temp dir
+            // outside any estate has nothing to check), same rule as
+            // `permission_mode` above it.
+            "estate",
             "disk_pressure",
         ],
         "the --json check list and its order are the stable part of this contract"
@@ -1585,6 +1591,142 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     assert!(
         !detail.contains("quiet=plan") && !detail.contains("careful=unspecified"),
         "the two profiles' effective modes must not be swapped or constant-folded: {detail}"
+    );
+}
+
+/// MVP-3: `sgt doctor`'s estate check names a declared-but-missing
+/// repository by name and reports its declared `origin` as the remedy — the
+/// exact fact an operator needs ("clone it from here"), not a generic
+/// "something is missing".
+///
+/// guard-map: a mutation that reports the missing repo's name but drops the
+/// origin from the remedy (or reports a fixed "clone it" string) survives
+/// every other doctor test but fails this one.
+#[test]
+fn t3c_doctor_estate_check_names_a_missing_repository_with_its_origin_as_the_remedy() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"payments\"\npath = \"repos/payments\"\n\
+         origin = \"https://example.com/payments.git\"\n",
+    )
+    .expect("write sergeant.toml");
+    // Deliberately never create repos/payments — that absence is the point.
+
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "estate");
+    assert_eq!(check["status"], "warn", "{check}");
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("payments") && detail.contains("missing on disk"),
+        "the missing repo must be named: {detail}"
+    );
+    let remedy = check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("https://example.com/payments.git"),
+        "the declared origin must be the remedy, not a generic instruction: {remedy}"
+    );
+}
+
+/// MVP-3: a directory under `repos/` the manifest never declared is flagged
+/// by name, distinct from (and not confused with) the missing-repository
+/// case above.
+///
+/// guard-map: dropping the `repos/` directory scan, or failing to exclude
+/// declared names from it, makes this fail — either no fault is reported, or
+/// the declared-and-present `known` repo is wrongly flagged too.
+#[test]
+fn t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    init_repo(&workspace.path().join("repos").join("known"));
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"known\"\npath = \"repos/known\"\n",
+    )
+    .expect("write sergeant.toml");
+    // On disk but never declared in sergeant.toml.
+    init_repo(&workspace.path().join("repos").join("stray"));
+
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "estate");
+    assert_eq!(check["status"], "warn", "{check}");
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("stray") && detail.contains("not declared"),
+        "the undeclared directory must be named: {detail}"
+    );
+    assert!(
+        !detail.contains("known is") && !detail.contains("known/"),
+        "the declared, present repository must not also be flagged: {detail}"
+    );
+    let remedy = check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("sgt repo add stray"),
+        "the remedy must name the fixing command: {remedy}"
+    );
+}
+
+/// MVP-3/E5: a manifest that fails to parse reports file *and* line — via
+/// `toml::de::Error`'s own diagnostic riding `WorkspaceError::Malformed`'s
+/// `Display` through the estate check — never a generic "invalid config".
+#[test]
+fn t3e_doctor_estate_check_names_file_and_line_on_a_malformed_manifest() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\nthis is not valid toml >>>\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (code, _, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
+    assert_ne!(code, Some(0), "a broken manifest must exit nonzero");
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "estate");
+    assert_eq!(check["status"], "fail", "{check}");
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("sergeant.toml"),
+        "the offending file must be named: {detail}"
+    );
+    assert!(
+        detail.to_lowercase().contains("line"),
+        "the parse error must carry a line number, not just \"invalid\": {detail}"
     );
 }
 

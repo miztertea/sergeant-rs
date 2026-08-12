@@ -72,6 +72,21 @@ pub struct RepositorySpec {
     pub path: PathBuf,
 }
 
+/// One `[[repo]]` entry read straight off `sergeant.toml`, before any
+/// on-disk existence check — see [`Workspace::declared_repos`]. Unlike
+/// [`RepositorySpec::path`] (git-resolved, guaranteed to exist), `path` here
+/// is only the declared path joined onto the manifest's directory and may
+/// point at nothing.
+#[derive(Debug, Clone)]
+pub struct DeclaredRepo {
+    /// Repository name.
+    pub name: String,
+    /// Declared path, joined but not resolved through git.
+    pub path: PathBuf,
+    /// `origin` from `[[repo]]`, when declared.
+    pub origin: Option<String>,
+}
+
 /// Per-repository instruction-suppression policy (R-MVP1-4, `[[repo]]
 /// instructions = "local" | "suppress"`).
 ///
@@ -607,6 +622,61 @@ impl Workspace {
     /// "nothing to declare yet", not "something is wrong".
     pub fn from_config_allow_empty(config_path: &Path) -> Result<Self, WorkspaceError> {
         Self::from_config_impl(config_path, true)
+    }
+
+    /// Every `[[repo]]` entry `sergeant.toml` declares, **without**
+    /// validating that any of them exist on disk — contrast
+    /// [`Self::from_config`]/[`Self::from_config_allow_empty`], which
+    /// correctly fail closed at the *first* missing repository (right for
+    /// execution: a Work must never bind a repo that is not really there).
+    /// A diagnostic wants the opposite: name *every* missing repository, not
+    /// just the first, so `sgt doctor`'s estate check uses this instead of
+    /// the strict loader.
+    ///
+    /// Every schema-level check still applies in full — malformed TOML
+    /// (line/column via `toml::de::Error`'s own diagnostic), the R-MVP1-3
+    /// legacy-vocabulary refusal, duplicate or invalid repository names —
+    /// because those are manifest bugs, not "not cloned yet", and a
+    /// diagnostic should refuse to read a broken manifest the same way
+    /// execution does, naming the same file, line and key.
+    pub fn declared_repos(config_path: &Path) -> Result<Vec<DeclaredRepo>, WorkspaceError> {
+        let file = config_path.display().to_string();
+        let text = std::fs::read_to_string(config_path).map_err(|source| WorkspaceError::Io {
+            path: file.clone(),
+            source,
+        })?;
+        check_legacy_vocabulary(&text, &file)?;
+        let parsed: WorkspaceFile =
+            toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
+                path: file.clone(),
+                source,
+            })?;
+        let root = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut seen = BTreeSet::new();
+        let mut declared = Vec::with_capacity(parsed.repo.len());
+        for entry in parsed.repo {
+            if !is_plain_name(&entry.name) {
+                return Err(WorkspaceError::InvalidRepositoryName {
+                    file,
+                    name: entry.name,
+                });
+            }
+            if !seen.insert(entry.name.clone()) {
+                return Err(WorkspaceError::DuplicateRepository {
+                    file,
+                    name: entry.name,
+                });
+            }
+            declared.push(DeclaredRepo {
+                name: entry.name,
+                path: root.join(&entry.path),
+                origin: entry.origin,
+            });
+        }
+        Ok(declared)
     }
 
     fn from_config_impl(
