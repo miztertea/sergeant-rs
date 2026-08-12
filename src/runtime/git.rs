@@ -97,6 +97,41 @@ pub fn git_clone(dir: &Path, origin: &str, dest_path: &str) -> Result<String, Gi
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// `git submodule update --init --recursive` in a freshly materialized
+/// worktree (#22: `git worktree add` never populates submodules — the
+/// superproject's gitlinks are checked out, the submodule directories are
+/// not — so a work surface over a repository with submodules silently
+/// carried empty directories where the rest of the codebase expected
+/// checked-out content, with nothing about materialization saying so).
+///
+/// A submodule URL is exactly as untrusted as a `sgt repo add --origin` one
+/// — declared inside a repository the estate owner may not fully control —
+/// so it gets the identical transport allowlist [`git_clone`] already uses,
+/// rather than either the compiled-in default (which refuses `file:` for
+/// submodule recursion specifically, breaking every sibling-path submodule
+/// a local or CI fixture might use) or an unbounded override (which would
+/// widen what a nested submodule chain can reach).
+pub fn git_submodule_update(dir: &Path) -> Result<String, GitError> {
+    let args = ["submodule", "update", "--init", "--recursive"];
+    let output = command(dir, &args)
+        .env("GIT_ALLOW_PROTOCOL", "file:http:https:ssh:git")
+        .output()
+        .map_err(|source| GitError::Spawn {
+            args: owned(&args),
+            dir: dir.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            args: owned(&args),
+            dir: dir.display().to_string(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// One hermetic Git invocation: no pager, no prompts, no editor, stdin closed.
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");

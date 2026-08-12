@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::workspace::RepositorySpec;
 use crate::runtime::fsutil::create_dir_all_durable;
-use crate::runtime::git::{GitError, git, git_succeeds};
+use crate::runtime::git::{GitError, git, git_submodule_update, git_succeeds};
 
 /// Directory under the data dir holding all work surfaces.
 pub const SURFACES_DIR: &str = "surfaces";
@@ -298,6 +298,18 @@ pub fn surface_root(surfaces_root: &Path, work_id: &str) -> PathBuf {
 /// and the report travels with the error, so the caller can journal exactly
 /// what happened instead of leaving a `sergeant/<work-id>` branch nobody
 /// knows about.
+///
+/// **The same rule applies to the *current* repository, not only earlier
+/// ones (#22).** `materialize_one` can itself fail after already creating a
+/// real worktree — [`init_submodules_if_present`] runs once the worktree
+/// exists, so a submodule it cannot initialize is a failure *with* a binding
+/// to roll back, not before one exists. The special case below ("nothing to
+/// roll back, this is the first repository") is therefore keyed on whether
+/// *this* repository produced a binding before failing, never on its
+/// position in the list — a submodule failure on repository 1 of 1 gets
+/// exactly the same recorded teardown a later repository's failure always
+/// got, instead of silently stranding the worktree `materialize_one` had
+/// already created for it.
 pub fn materialize(
     surfaces_root: &Path,
     work_id: &str,
@@ -319,11 +331,22 @@ pub fn materialize(
 
     let mut bindings: Vec<RepositoryBinding> = Vec::with_capacity(repositories.len());
     for repository in repositories {
-        match materialize_one(&root, &canonical_root, &branch, repository) {
+        let outcome = match materialize_one(&root, &canonical_root, &branch, repository) {
+            Ok(binding) => init_submodules_if_present(&binding.worktree_path)
+                .map(|()| binding.clone())
+                .map_err(|err| (Some(binding), err)),
+            Err(err) => Err((None, err)),
+        };
+        match outcome {
             Ok(binding) => bindings.push(binding),
-            Err(err) => {
-                // Nothing to roll back if this is the first repository in
-                // the request: surface the original error as-is.
+            Err((created, err)) => {
+                // A binding was created for *this* repository before the
+                // failure (the submodule case) — fold it into the set being
+                // rolled back so its own worktree is torn down, recorded,
+                // exactly like every earlier repository's.
+                bindings.extend(created);
+                // Nothing to roll back if no repository — this one included
+                // — ever produced a binding: surface the original error as-is.
                 if bindings.is_empty() {
                     return Err(err);
                 }
@@ -399,6 +422,19 @@ fn materialize_one(
 /// worktree is a view onto it. Bindings keep their recorded base branch and
 /// base SHA (the run's provenance does not change on retry); only the current
 /// HEAD is re-read.
+///
+/// Also re-initializes any submodule the original [`materialize`] would have
+/// (#22) — a re-attached worktree needs its submodule content just as much as
+/// a fresh one does. **Known asymmetry, not introduced here:** unlike
+/// `materialize`'s own submodule failure (rolled back and reported through
+/// `SurfaceError::PartialFailure`, same as any other binding failure), a
+/// failure here propagates through `settle_rematerialize`'s pre-existing
+/// `Err(e) => return Err(e.into())` arm as an engine error rather than a
+/// journaled `blocked` state — true of *every* git failure on this path
+/// already (an `add_worktree_from` failure hits the identical arm), not a gap
+/// this change opens. Left alone rather than folded into this pass: the fix
+/// belongs to `settle_rematerialize`'s error handling in general, not to
+/// submodules specifically.
 pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError> {
     create_dir_all_durable(&surface.root).map_err(|source| SurfaceError::Io {
         path: surface.root.display().to_string(),
@@ -436,7 +472,8 @@ pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError>
                     &binding.work_branch,
                     &start,
                     !branch_exists,
-                )
+                )?;
+                init_submodules_if_present(&binding.worktree_path)
             })?;
         }
         let head_sha = git(&binding.worktree_path, &["rev-parse", "HEAD"])?;
@@ -563,6 +600,32 @@ fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, 
     let path = binding.worktree_path.display().to_string();
     let disposition = match git(&binding.source_path, &["worktree", "remove", &path]) {
         Ok(_) => BindingDisposition::Removed,
+        // #22: git unconditionally refuses to remove a worktree that
+        // contains a submodule — "working trees containing submodules
+        // cannot be moved or removed" — regardless of whether anything in
+        // it is actually dirty. Left as `RetainedError` unconditionally,
+        // *every* submodule-bearing surface would leak its worktree on
+        // every single ordinary, successful teardown, forever (measured:
+        // this module's own `a_submodule_is_populated_into_the_
+        // materialized_worktree` failed here before this arm existed). The
+        // `git status --porcelain` check just above already answers
+        // whether the submodule itself has anything uncommitted — it
+        // recurses into a registered submodule by default and would have
+        // returned `RetainedDirty` already if so — so reaching this arm at
+        // all means the only reason git refused is the policy, not the
+        // content, and retrying with `--force` destroys nothing §11 does
+        // not already know is safe to remove.
+        Err(e) if e.to_string().contains("containing submodules") => {
+            match git(
+                &binding.source_path,
+                &["worktree", "remove", "--force", &path],
+            ) {
+                Ok(_) => BindingDisposition::Removed,
+                Err(e) => BindingDisposition::RetainedError {
+                    detail: e.to_string(),
+                },
+            }
+        }
         Err(e) => BindingDisposition::RetainedError {
             detail: e.to_string(),
         },
@@ -599,6 +662,28 @@ fn add_worktree_from(
         vec!["worktree", "add", &path, start]
     };
     git(source, &args)?;
+    Ok(())
+}
+
+/// #22: `git worktree add` checks out the superproject's gitlinks but never
+/// populates a submodule's own content — that is `git submodule update`'s
+/// job, and nothing calls it on the worktree-add path. Left alone, a
+/// repository with submodules materializes a surface with silently empty
+/// submodule directories: not a refusal, not a warning, just content the
+/// rest of the run expected and does not have.
+///
+/// Scoped to worktrees that actually declare submodules (`.gitmodules`
+/// present) so the ordinary no-submodule repository — the overwhelming
+/// majority — pays no extra `git` invocation. A submodule that genuinely
+/// cannot be initialized (an unreachable URL, a disallowed transport) fails
+/// this closed: the `GitError` propagates as a `SurfaceError::Git` exactly
+/// like any other materialization failure, which `materialize`'s existing
+/// partial-failure path already tears down and reports rather than leaving
+/// a stranded, half-populated surface.
+fn init_submodules_if_present(worktree_path: &Path) -> Result<(), SurfaceError> {
+    if worktree_path.join(".gitmodules").is_file() {
+        git_submodule_update(worktree_path)?;
+    }
     Ok(())
 }
 
@@ -1074,5 +1159,226 @@ mod tests {
             materialize(data.path(), "01EMPTY", &[]),
             Err(SurfaceError::NoRepositories)
         ));
+    }
+
+    // ---------------------------------------------------------- #22: submodules
+
+    /// Declares `inner` as a submodule of `superproject` at `path`, without
+    /// going through `git submodule add` (which needs the same transport
+    /// permission `materialize` itself now grants at update time — exercising
+    /// that here would just retest `git`, not this module). The gitlink and
+    /// `.gitmodules` are exactly what a real `submodule add` would have left,
+    /// committed on top of `superproject`'s existing history.
+    fn declare_submodule(superproject: &Path, inner: &Path, path: &str) {
+        let inner_head = git(inner, &["rev-parse", "HEAD"]).expect("inner HEAD");
+        std::fs::write(
+            superproject.join(".gitmodules"),
+            format!(
+                "[submodule \"{path}\"]\n\tpath = {path}\n\turl = {}\n",
+                inner.display()
+            ),
+        )
+        .expect("write .gitmodules");
+        std::fs::create_dir_all(superproject.join(path)).expect("submodule placeholder dir");
+        git_as_test_identity(superproject, &["add", ".gitmodules"]);
+        git_as_test_identity(
+            superproject,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &inner_head,
+                path,
+            ],
+        );
+        git_as_test_identity(superproject, &["commit", "-m", "declare a submodule"]);
+    }
+
+    /// #22: a repository with a submodule materializes with the submodule's
+    /// own content actually checked out — not the silent empty directory
+    /// `git worktree add` alone would leave (its own doc comment on
+    /// [`init_submodules_if_present`] has the measurement). Real teardown
+    /// afterward, same as any ordinary surface: worktree removed, branch
+    /// retained.
+    #[test]
+    fn a_submodule_is_populated_into_the_materialized_worktree() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let inner = repo(&dir.path().join("inner"));
+        std::fs::write(
+            dir.path().join("inner").join("payload.txt"),
+            "inner content\n",
+        )
+        .expect("write payload");
+        git_as_test_identity(&inner.path, &["add", "payload.txt"]);
+        git_as_test_identity(&inner.path, &["commit", "-m", "payload"]);
+
+        let outer = repo(&dir.path().join("outer"));
+        declare_submodule(&outer.path, &inner.path, "vendored");
+
+        let surface = materialize(data.path(), "01SUBMODULE", std::slice::from_ref(&outer))
+            .expect("materialize a repository with a submodule");
+        let worktree = &surface.bindings[0].worktree_path;
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("vendored").join("payload.txt"))
+                .expect("submodule content must be checked out, not an empty directory"),
+            "inner content\n"
+        );
+        // Git's own view agrees the submodule is initialized (no leading `-`,
+        // which is how `git submodule status` marks "not initialized").
+        let status = git(worktree, &["submodule", "status"]).expect("submodule status");
+        assert!(
+            !status.trim_start().starts_with('-'),
+            "the submodule must report initialized: {status:?}"
+        );
+
+        let report = teardown(&surface);
+        assert!(
+            report.clean,
+            "an untouched submodule worktree is clean: {report:?}"
+        );
+        assert!(!worktree.exists());
+        assert!(
+            git_succeeds(
+                &outer.path,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", surface.bindings[0].work_branch)
+                ]
+            ),
+            "teardown retains the branch by contract"
+        );
+    }
+
+    /// #22's own contract for a shape that legitimately cannot work: a
+    /// submodule declared over a transport `materialize` does not allow (the
+    /// same allowlist [`crate::runtime::git::git_clone`] already uses for a
+    /// `sgt repo add --origin`) fails **closed**, not silently. And — the
+    /// regression this pins — failing on the *first and only* repository must
+    /// still roll back and report exactly like a later repository's failure
+    /// always has: before this fix, `materialize`'s "nothing to roll back,
+    /// this is the first repository" special case fired unconditionally on
+    /// position, stranding the worktree `add_worktree` had already created
+    /// with no teardown, no report, nothing journaled.
+    #[test]
+    fn a_disallowed_submodule_transport_fails_closed_and_is_not_stranded() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let inner = repo(&dir.path().join("inner"));
+
+        let outer = repo(&dir.path().join("outer"));
+        // `ext::` is refused by `materialize`'s allowlist (`file:http:https:
+        // ssh:git`) the same way it would be refused for `sgt repo add
+        // --origin ext::…` — deterministic and instant, no network involved.
+        let inner_head = git(&inner.path, &["rev-parse", "HEAD"]).expect("inner HEAD");
+        std::fs::write(
+            outer.path.join(".gitmodules"),
+            "[submodule \"vendored\"]\n\tpath = vendored\n\turl = ext::false\n",
+        )
+        .expect(".gitmodules");
+        std::fs::create_dir_all(outer.path.join("vendored")).expect("placeholder");
+        git_as_test_identity(&outer.path, &["add", ".gitmodules"]);
+        git_as_test_identity(
+            &outer.path,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &inner_head,
+                "vendored",
+            ],
+        );
+        git_as_test_identity(&outer.path, &["commit", "-m", "an unreachable submodule"]);
+
+        let err = materialize(data.path(), "01BADSUBMODULE", std::slice::from_ref(&outer))
+            .expect_err("a disallowed submodule transport must refuse materialization");
+        let SurfaceError::PartialFailure { source, teardown } = err else {
+            panic!(
+                "expected the same rolled-back-and-reported shape a later repository's \
+                 failure gets, got a bare {err} — the worktree add_worktree already created \
+                 would be left with no report at all"
+            );
+        };
+        assert!(
+            source.to_string().contains("ext"),
+            "git's own transport diagnostic must survive: {source}"
+        );
+        // The worktree materialize_one already created for this (only, first)
+        // repository is named in the report — not a mystery — and actually
+        // removed: a submodule that never finished initializing has nothing
+        // of its own for `git status --porcelain` to find dirty (there is no
+        // checked-out submodule content yet to be dirty), so the force-retry
+        // `teardown_binding_locked` uses for git's blanket "containing
+        // submodules" refusal cleans it up rather than leaving it parked
+        // with a permanent `RetainedError`.
+        assert_eq!(teardown.bindings.len(), 1);
+        assert_eq!(teardown.bindings[0].repository, "solo");
+        assert_eq!(
+            teardown.bindings[0].disposition,
+            BindingDisposition::Removed,
+            "a submodule that never checked anything out has nothing to retain: {:?}",
+            teardown.bindings[0].disposition
+        );
+        assert!(
+            !teardown.bindings[0].worktree_path.exists(),
+            "the rolled-back worktree must be gone, not stranded on disk"
+        );
+        assert!(teardown.clean);
+    }
+
+    /// The force-retry `teardown_binding_locked` uses for git's blanket
+    /// "containing submodules" refusal must never bypass real dirtiness —
+    /// uncommitted content genuinely *inside* the submodule is exactly what
+    /// §11's fail-closed rule exists to protect. `git status --porcelain`
+    /// already recurses into a registered submodule by default (measured,
+    /// not assumed — an untracked file, a modified tracked file, and an
+    /// advanced submodule `HEAD` are all reported as `M sub` at the
+    /// superproject level), so `RetainedDirty` fires *before* the removal
+    /// attempt this test would otherwise reach — proving the force-retry
+    /// path is unreachable for this case, not merely untested.
+    #[test]
+    fn a_dirty_submodule_still_blocks_teardown_despite_the_force_retry() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let inner = repo(&dir.path().join("inner"));
+        let outer = repo(&dir.path().join("outer"));
+        declare_submodule(&outer.path, &inner.path, "vendored");
+
+        let surface = materialize(
+            data.path(),
+            "01DIRTYSUBMODULE",
+            std::slice::from_ref(&outer),
+        )
+        .expect("materialize a repository with a submodule");
+        let worktree = &surface.bindings[0].worktree_path;
+        // Untracked content left inside the submodule by (in spirit) an
+        // actor's run — never committed, so it must survive teardown.
+        std::fs::write(
+            worktree.join("vendored").join("actors-work.txt"),
+            "not committed\n",
+        )
+        .expect("simulate uncommitted submodule content");
+
+        let report = teardown(&surface);
+        assert!(
+            !report.clean,
+            "uncommitted content inside a submodule must block teardown: {report:?}"
+        );
+        assert!(
+            matches!(
+                &report.bindings[0].disposition,
+                BindingDisposition::RetainedDirty { changes } if changes.contains("vendored")
+            ),
+            "must be retained as dirty (not silently force-removed): {:?}",
+            report.bindings[0].disposition
+        );
+        assert!(
+            worktree.exists() && worktree.join("vendored").join("actors-work.txt").is_file(),
+            "the uncommitted file must still be there — nothing destroyed it"
+        );
     }
 }

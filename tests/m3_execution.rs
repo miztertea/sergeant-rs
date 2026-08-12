@@ -3601,6 +3601,288 @@ async fn a_malformed_workspace_file_fails_closed() {
     handle.shutdown().await;
 }
 
+// ------------------------------------------------- #22: workspace discovery
+// and binding edge cases beyond R-MVP1-12's own discovery-only fixtures
+// (`src/domain/workspace.rs`'s `#22:`-tagged tests). These are the "remaining
+// edges" `docs/gauntlet/contracts/MVP-1.md`'s R-MVP1-12 pin named and
+// deferred: one table-driven-in-spirit test per shape, through the real
+// daemon/API, asserting the issue's own three things — correct binding
+// record, work completes, teardown clean.
+
+/// A repository with a submodule: the surface actually carries the
+/// submodule's content (not the silent empty directory `git worktree add`
+/// alone leaves — `src/runtime/surface.rs`'s own unit tests pin the
+/// materialize/teardown mechanics; this is the same shape proven to reach the
+/// daemon end to end), the work completes, and teardown removes the worktree
+/// cleanly.
+#[tokio::test]
+async fn t9_a_repository_with_a_submodule_completes_and_tears_down_clean() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let inner = repos.path().join("vendor-inner");
+    init_repo(&inner);
+    std::fs::write(inner.join("vendored.txt"), "vendored content\n").expect("write");
+    git(&inner, &["add", "vendored.txt"]);
+    git(&inner, &["commit", "-m", "vendored payload"]);
+    let inner_head = git(&inner, &["rev-parse", "HEAD"]);
+
+    let outer = repos.path().join("outer");
+    init_repo(&outer);
+    write_two_stage_workflow(&outer);
+    std::fs::write(
+        outer.join(".gitmodules"),
+        format!(
+            "[submodule \"vendored\"]\n\tpath = vendored\n\turl = {}\n",
+            inner.display()
+        ),
+    )
+    .expect(".gitmodules");
+    std::fs::create_dir_all(outer.join("vendored")).expect("placeholder");
+    git(&outer, &["add", ".gitmodules"]);
+    git(
+        &outer,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &inner_head,
+            "vendored",
+        ],
+    );
+    git(&outer, &["commit", "-m", "declare a submodule"]);
+
+    // A hang keeps the surface in place so its content is inspectable, then
+    // a cancel drives real teardown — the same shape t1/t6 already use.
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(&client, &handle, &outer, "check the submodule", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("vendored").join("vendored.txt"))
+            .expect("submodule content must be checked out through the daemon's own path"),
+        "vendored content\n"
+    );
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "cancel failed: {body}");
+    assert_eq!(body["work"]["state"], "canceled");
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    assert_eq!(
+        torn[0].payload["report"]["clean"], true,
+        "an untouched submodule worktree tears down clean: {:?}",
+        torn[0].payload
+    );
+    assert!(!worktree.exists());
+    assert!(branch_exists(&outer, &format!("sergeant/{work_id}")));
+    let _ = fake.stop_requests();
+
+    handle.shutdown().await;
+}
+
+/// The source repository is itself a git worktree — `git worktree add` from
+/// a worktree, not from a repository's main checkout. Nothing about §11's
+/// materialize/teardown path assumes `repository.path` is a main worktree
+/// (`with_repository`/`add_worktree`/`teardown_binding` all just run `git`
+/// with `repository.path`/`binding.source_path` as `cwd`, and git itself
+/// resolves the shared common dir from there), so this exercises that rather
+/// than asserting it from reading the code.
+#[tokio::test]
+async fn t9b_a_worktree_as_the_source_repository_materializes_and_tears_down() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let main_repo = repos.path().join("main-repo");
+    let head = init_repo(&main_repo);
+    // The bind source: a linked worktree of `main-repo`, on its own branch —
+    // not the main checkout `git worktree list` would call the repository's
+    // own working directory.
+    let source = repos.path().join("source-worktree");
+    git(
+        &main_repo,
+        &[
+            "worktree",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "-b",
+            "a-worktree-of-its-own",
+        ],
+    );
+    write_two_stage_workflow(&source);
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &source,
+        "bind from a worktree",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed");
+    assert_eq!(fake.starts().len(), 2, "one execution per stage");
+
+    // The binding recorded the worktree as its source, and cut from the same
+    // HEAD the worktree itself was on.
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let binding = &materialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(binding["base_sha"], head.as_str());
+    assert_eq!(
+        binding["source_path"].as_str().map(PathBuf::from),
+        Some(PathBuf::from(git(
+            &source,
+            &["rev-parse", "--show-toplevel"]
+        ))),
+        "the binding's source is the worktree itself, not the main checkout"
+    );
+
+    // Teardown clean, and the original worktree — the bind *source* — is
+    // completely untouched by any of it: still registered, still on its own
+    // branch, nothing about materializing *from* it disturbed it.
+    let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
+    assert!(!worktree.exists(), "the surface worktree is torn down");
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn[0].payload["report"]["clean"], true);
+    assert!(
+        source.is_dir(),
+        "the source worktree itself must survive teardown of the surface bound from it"
+    );
+    assert_eq!(
+        git(&source, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "a-worktree-of-its-own",
+        "the source worktree's own branch is undisturbed"
+    );
+    let listing = git(&main_repo, &["worktree", "list"]);
+    assert!(
+        listing.contains(&source.display().to_string()),
+        "the source worktree stays registered against the main repo: {listing}"
+    );
+    assert!(
+        !listing.contains(&worktree.display().to_string()),
+        "the torn-down surface worktree must not still be registered: {listing}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// A symlinked repository root: the path a submission is made from reaches
+/// the repository through a symlink rather than its real path. `materialize`
+/// already canonicalizes both sides of its in-checkout guard for exactly this
+/// reason (`surface.rs`'s own doc on `materialize`) — this proves the
+/// ordinary, non-guard path (an unremarkable submission) also resolves and
+/// completes normally through a symlinked source, not only that the guard
+/// itself is not fooled by one.
+#[cfg(unix)]
+#[tokio::test]
+async fn t9c_a_symlinked_repository_root_materializes_and_completes() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let real = repos.path().join("real-repo");
+    let head = init_repo(&real);
+    write_two_stage_workflow(&real);
+    let via_symlink = repos.path().join("repo-via-symlink");
+    std::os::unix::fs::symlink(&real, &via_symlink).expect("symlink");
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    // Submit from the symlinked path, not the real one.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &via_symlink,
+        "bind through a symlink",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed");
+    assert_eq!(fake.starts().len(), 2);
+
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let binding = &materialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(binding["base_sha"], head.as_str());
+    let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
+    assert!(
+        !worktree.exists(),
+        "teardown after completion removes the worktree"
+    );
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn[0].payload["report"]["clean"], true);
+    assert!(branch_exists(&real, &format!("sergeant/{work_id}")));
+
+    handle.shutdown().await;
+}
+
+/// A path with a space (and a non-ASCII character) in the repository's own
+/// directory name, exercised through the real materialize/complete/teardown
+/// flow rather than only `Workspace::discover` (`src/domain/workspace.rs`'s
+/// own `#22:`-tagged `estate_discovery_handles_a_path_with_a_space` covers
+/// discovery; this is the same shape one level further, through git worktree
+/// creation, a real backend execution `cwd`, and teardown).
+#[tokio::test]
+async fn t9d_a_path_with_a_space_and_non_ascii_completes_and_tears_down() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("répo with spaces");
+    let head = init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "a path with a space",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed");
+    assert_eq!(fake.starts()[0].context, "first stage context");
+
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let binding = &materialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(binding["base_sha"], head.as_str());
+    let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
+    assert!(!worktree.exists());
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn[0].payload["report"]["clean"], true);
+    assert!(branch_exists(&repo, &format!("sergeant/{work_id}")));
+
+    handle.shutdown().await;
+}
+
 /// The CLI surface the contract adds, through the spawned binary: a run that
 /// asks for input, `sgt respond`, `sgt work show` carrying stage and surface,
 /// and `sgt retry`.
