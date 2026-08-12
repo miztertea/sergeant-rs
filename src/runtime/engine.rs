@@ -788,7 +788,7 @@ pub struct Engine {
     pub turn_cap: u32,
     /// R-MVP1-7's per-turn wall-clock ceiling, swept by the daemon's
     /// completion driver alongside [`Self::due_observations`] (see
-    /// [`Self::sweep_turn_ceiling`]).
+    /// [`Self::due_interrupts`]).
     pub turn_ceiling: Duration,
     /// When each Work's current turn was last (re-)spawned, for the ceiling
     /// sweep. Deliberately **not** journaled or durable: a restart forgets
@@ -2952,7 +2952,7 @@ impl Engine {
         due
     }
 
-    /// Record that a turn just spawned, for [`Self::sweep_turn_ceiling`].
+    /// Record that a turn just spawned, for [`Self::due_interrupts`].
     fn record_turn_start(&self, work_id: &str) {
         self.turn_started
             .lock()
