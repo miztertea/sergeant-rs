@@ -2466,13 +2466,16 @@ impl Engine {
     ) -> Option<NativeState> {
         let native_id = reservation.native_id.clone()?;
         let backend = self.backends.get(&reservation.backend)?;
+        // INV-R1-08: liveness-only, so a backend whose full OBSERVE pays for
+        // expensive evidence capture as a side effect (Docker's log
+        // capture) is never charged for evidence this call discards anyway
+        // — only `.native` is read below.
         backend
-            .observe(&ExecutionHandle {
+            .observe_liveness(&ExecutionHandle {
                 execution_id: reservation.execution_id.clone(),
                 native_id: Some(native_id),
             })
             .ok()
-            .map(|observation| observation.native)
     }
 
     /// §25's reattach step: ask the backend to re-adopt the recorded native

@@ -1086,6 +1086,103 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
     handle.shutdown().await;
 }
 
+// --------------------------------- 7d. §16.9 observe_liveness skips capture
+
+/// INV-R1-08 (MVP-2 D3 fixer pass): `observe()` pays for a full log capture
+/// (blob writes) as a side effect of classifying *any* exited container,
+/// even when the caller only wants liveness — exactly restart
+/// reconciliation's shape. `observe_liveness()` must answer the same
+/// liveness question (`NativeState`) without writing any blob.
+#[test]
+fn observe_liveness_answers_without_writing_a_blob_and_observe_still_does() {
+    require_docker!();
+    let data = support::DataDir::new();
+    let cwd = TempDir::new().expect("cwd");
+    let backend = backend(data.path());
+
+    let req = request(
+        "w7d",
+        "m7-liveness-only",
+        cwd.path(),
+        spec(
+            vec!["sh", "-c", "echo some captured evidence; exit 0"],
+            WorkspaceAccess::ReadOnly,
+        ),
+    );
+    let prepared = backend.prepare(&req).expect("prepare");
+    let handle = launch(&backend, &prepared);
+
+    // Wait for the container to actually exit (via docker inspect directly,
+    // not via `observe()`/`observe_liveness()` — either would already
+    // demonstrate the property under test before we can measure it).
+    loop {
+        let info = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                &handle.native_id.clone().unwrap(),
+            ])
+            .output()
+            .expect("inspect");
+        if String::from_utf8_lossy(&info.stdout).trim() == "false" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+
+    let blobs_dir = data.path().join("blobs");
+    let blob_count = |dir: &Path| -> usize { walkdir_count(dir) };
+    let before = blob_count(&blobs_dir);
+
+    let liveness = backend.observe_liveness(&handle).expect("observe_liveness");
+    assert_eq!(
+        liveness,
+        sergeant_rs::backend::NativeState::Exited,
+        "observe_liveness must still classify the exit correctly"
+    );
+    let after_liveness_only = blob_count(&blobs_dir);
+    assert_eq!(
+        before, after_liveness_only,
+        "observe_liveness must not write any blob (no evidence capture) — before={before} \
+         after={after_liveness_only}"
+    );
+
+    // The full OBSERVE, by contrast, really does capture and really does
+    // write blobs — proving the distinction above is real, not just an
+    // empty blob dir for some unrelated reason.
+    let observation = backend.observe(&handle).expect("observe");
+    assert_eq!(
+        observation.native,
+        sergeant_rs::backend::NativeState::Exited
+    );
+    let after_full_observe = blob_count(&blobs_dir);
+    assert!(
+        after_full_observe > after_liveness_only,
+        "the full observe() must write blobs (stdout+stderr capture) — \
+         after_liveness_only={after_liveness_only} after_full_observe={after_full_observe}"
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+    assert_containers_gone(&["sgt-m7-liveness-only"]);
+}
+
+fn walkdir_count(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count += walkdir_count(&path);
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
 // --------------------------------------- 8. doctor's lifecycle probe (§16.3)
 
 #[test]

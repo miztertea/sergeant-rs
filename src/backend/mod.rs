@@ -728,6 +728,23 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// OBSERVE: report current native evidence and any explicit signal.
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError>;
 
+    /// The liveness-only half of OBSERVE: "is anything alive under this
+    /// identity", with none of the evidence-capture side effects a full
+    /// OBSERVE may pay to answer the fuller question (INV-R1-08).
+    ///
+    /// Default implementation just asks the full [`Backend::observe`] and
+    /// keeps its `native` field — correct for every backend whose OBSERVE is
+    /// already cheap (an in-memory state read, for the fake and Claude
+    /// adapters today). A backend whose OBSERVE pays for expensive evidence
+    /// capture as a side effect of classifying an exited execution (the
+    /// Docker adapter's log capture, §16.9) should override this to skip
+    /// that work — callers that only need liveness, like restart
+    /// reconciliation's [`Engine::reserved_identity_liveness`], must never
+    /// pay for evidence they are about to discard.
+    fn observe_liveness(&self, handle: &ExecutionHandle) -> Result<NativeState, BackendError> {
+        self.observe(handle).map(|observation| observation.native)
+    }
+
     /// INTERRUPT: stop the current turn/action without retiring the
     /// execution. For a print-mode adapter this kills the per-turn process;
     /// the durable conversation survives and RESUME/SEND continue it

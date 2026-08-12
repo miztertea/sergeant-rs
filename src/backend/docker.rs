@@ -1031,6 +1031,32 @@ impl Backend for DockerBackend {
         })
     }
 
+    /// INV-R1-08 (MVP-2 D3 fixer pass): full `observe()` above calls
+    /// `self.capture(&name)` unconditionally once a container is not
+    /// running — a full `docker logs` read streamed into the blob store,
+    /// paid even when the caller only wants to classify liveness (restart
+    /// reconciliation's `Engine::reserved_identity_liveness`, which reads
+    /// only `.native` and discards everything else). A restart against an
+    /// exited container holding a large log would otherwise pay a
+    /// multi-second blob write inside recovery's single-owner window before
+    /// the daemon serves anything. This mirrors `observe()`'s inspect logic
+    /// exactly, without ever calling `capture`.
+    fn observe_liveness(&self, handle: &ExecutionHandle) -> Result<NativeState, BackendError> {
+        let name = self.name_of(handle);
+        let Some(info) = self.inspect(&name)? else {
+            return Err(self.unknown(&handle.execution_id));
+        };
+        if !Self::labeled_for(&info, &handle.execution_id) {
+            return Err(self.unknown(&handle.execution_id));
+        }
+        let state = &info["State"];
+        Ok(if state["Running"].as_bool().unwrap_or(false) {
+            NativeState::Running
+        } else {
+            NativeState::Exited
+        })
+    }
+
     fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let name = self.name_of(handle);
         // A no-op is not an error (trait doc): a container already stopped
