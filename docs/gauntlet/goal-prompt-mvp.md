@@ -48,6 +48,11 @@ committed — the repo is your memory, your context is not.
 - **The epistemic license binds**: every ruling in the repo, the
   owner's included, is a hypothesis with provenance. Evidence outranks
   authority. Push back with citations; ratifying the record is failing.
+- **Scratch discipline: agents write ONLY inside their assigned worktree,
+  the session scratchpad, or /tmp — never `~/`.** Every workflow preamble
+  carries this line and every lane's exit check includes
+  `ls ~ | grep -v -E '^(sergeant-rs|inbox)$'` empty of new entries
+  (first offense: the MVP-1 prober's residue, 2026-08-12).
 - **Push after every green gate. Facts into artifacts immediately.**
   Head-PR + sub-PR merge model: one branch per work period PRs to main
   (owner merges); lanes PR into it; worktree-isolate parallel lanes
