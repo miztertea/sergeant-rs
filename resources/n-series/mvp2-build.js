@@ -15,8 +15,9 @@ const G = `You are building sergeant-rs MVP-2 on Cerberus, branch cerberus/mvp-1
 const BUILD = { type: 'object', required: ['commits', 'tests_added', 'gates_green', 'design_decisions', 'guard_map', 'notes'], properties: { commits: { type: 'array', items: { type: 'string' } }, tests_added: { type: 'number' }, gates_green: { type: 'boolean' }, design_decisions: { type: 'array', items: { type: 'string' } }, guard_map: { type: 'array', items: { type: 'object', required: ['test', 'guarded_behavior', 'mutation_that_should_kill_it'], properties: { test: { type: 'string' }, guarded_behavior: { type: 'string' }, mutation_that_should_kill_it: { type: 'string' } } } }, notes: { type: 'string' } } }
 const FINDINGS = { type: 'object', required: ['findings', 'summary'], properties: { summary: { type: 'string' }, findings: { type: 'array', items: { type: 'object', required: ['id', 'severity', 'claim', 'evidence'], properties: { id: { type: 'string' }, severity: { type: 'string', enum: ['error', 'warning', 'info'] }, claim: { type: 'string' }, evidence: { type: 'string' } } } } } }
 
-const BASE = args && args.base ? args.base : null
-if (!BASE) throw new Error('mvp2-build requires args.base (the git diff base sha for the Panel phase) — refused up front, before the Build lanes spend anything')
+// base hardcoded 2026-08-12 after args-delivery failure (wf_ea4191d0, 0 agents spent):
+// 4e2f726 = the MVP-1 gate-passed SHA this build diffs against.
+const BASE = (args && args.base) || '4e2f726'
 
 phase('Build')
 const lanes = [
