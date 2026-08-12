@@ -3642,6 +3642,54 @@ async fn r_mvp1_6_a_disagreeing_repos_refuses_naming_both_sources() {
     handle.shutdown().await;
 }
 
+/// TH-12: `intent_detail.repos` is deliberately inert when the
+/// `repositories` flag is absent (`domain::work`'s own doc: "Purely
+/// descriptive data here" — R-MVP1-6 ruled `intent_detail` a progressive-
+/// elaboration record, journaled and displayed, never a second routing
+/// input) — but that was untested in either direction before this. Naming
+/// repos *only* in the structured slot must not itself trigger
+/// `intent_detail_disagreement` (there is nothing to disagree with — no
+/// `repositories` flag was given at all), and the field still round-trips
+/// exactly as submitted. Pinning the current, intended behavior so a
+/// future change to it is a deliberate ruling, not a silent drift.
+#[tokio::test]
+async fn r_mvp1_6_repos_named_only_in_intent_detail_is_inert_not_a_disagreement() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "repos named only in the structured slot",
+            "intent_detail": {"repos": ["api", "web"]},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(
+        resp.status(),
+        201,
+        "no `repositories` flag means nothing for intent_detail.repos to \
+         disagree with: {:?}",
+        resp.text().await
+    );
+    let body: Value = resp.json().await.expect("json");
+    assert!(
+        body["work"]["repositories"].is_null() || body["work"]["repositories"] == json!([]),
+        "intent_detail.repos must not itself populate the routing-level \
+         repositories list — it is descriptive, not a second selection input: {body}"
+    );
+    assert_eq!(
+        body["work"]["intent_detail"]["repos"],
+        json!(["api", "web"]),
+        "the field itself still round-trips exactly as submitted"
+    );
+    handle.shutdown().await;
+}
+
 /// The additive-only guarantee, exercised at the boundary it actually
 /// describes: a *pre-existing* journal line — standing in for one a future
 /// binary already wrote, carrying a field `IntentDetail` does not have —
