@@ -7,10 +7,17 @@
 
 use std::fmt;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
+
+/// Chunk size [`BlobStore::put_stream`] reads/hashes/writes at a time. Fixed
+/// and small on purpose (§16.9/§22.8): this is the whole reason a streaming
+/// writer exists instead of `put(&buffer_it_all_up_first)` — the RSS this
+/// path costs is bounded by this constant, not by the content length.
+const STREAM_CHUNK: usize = 64 * 1024;
 
 /// Errors from the blob store.
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +114,67 @@ impl BlobStore {
         Ok(blob_ref)
     }
 
+    /// Store the bytes read from `reader` and return their content reference
+    /// plus the total byte count, **without ever holding the whole content in
+    /// memory** (§16.9's streaming-capture requirement, §22.8's bounded-RSS
+    /// acceptance test).
+    ///
+    /// The recipe is [`write_atomic`]'s — tmp file next to the final address,
+    /// fsync, rename, directory fsync — carried over a bounded read/hash/write
+    /// loop instead of one `write_all` over a fully-buffered slice: content is
+    /// read in [`STREAM_CHUNK`]-sized pieces, each piece is folded into a
+    /// running BLAKE3 hash and written to the tmp file before the next piece
+    /// is read, so peak memory for this call is `O(STREAM_CHUNK)` regardless
+    /// of how large `reader` turns out to be. A write-once store still
+    /// deduplicates: if the finished hash already has a blob on disk, the tmp
+    /// file is discarded rather than replacing content that verifiably
+    /// matches already.
+    ///
+    /// A failure partway through (a disk-full `write_all`, an unreadable
+    /// source) leaves no partial blob at any content address — the tmp file
+    /// is removed on every error path — and the caller sees the underlying
+    /// I/O error rather than a corrupt or truncated blob silently claiming a
+    /// hash it does not have.
+    pub fn put_stream(&self, mut reader: impl Read) -> Result<(BlobRef, u64), BlobError> {
+        let tmp = self.root.join(format!("tmp-{}", ulid::Ulid::generate()));
+        let outcome = (|| -> Result<(BlobRef, u64), BlobError> {
+            let mut file = fs::File::create(&tmp)?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buf = [0u8; STREAM_CHUNK];
+            let mut total: u64 = 0;
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                file.write_all(&buf[..n])?;
+                total += n as u64;
+            }
+            file.sync_data()?;
+            drop(file);
+            let hex = hasher.finalize().to_hex().to_string();
+            let path = self.root.join(&hex);
+            let blob_ref = BlobRef { hex };
+            if path.exists() {
+                return Ok((blob_ref, total)); // write-once: identical content dedupes
+            }
+            fs::rename(&tmp, &path)?;
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok((blob_ref, total))
+        })();
+        // The rename above (success, new content) already moved the tmp file
+        // away; every other exit path — the error branch and the
+        // already-deduplicated branch — still has it sitting in `root` and
+        // must not leave it behind.
+        if tmp.exists() {
+            let _ = fs::remove_file(&tmp);
+        }
+        outcome
+    }
+
     /// Fetch a blob's bytes, verifying they still hash to the reference.
     pub fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
         let path = self.root.join(blob_ref.hex());
@@ -131,6 +199,109 @@ impl BlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `put_stream` and `put` must land on the same content address for the
+    /// same bytes, and `get` must recover exactly what was streamed in — the
+    /// streaming path is a different writer for the same store, not a
+    /// parallel one with its own notion of identity.
+    #[test]
+    fn put_stream_matches_put_and_is_readable_back() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+
+        let bytes = b"hello streamed world".repeat(10_000);
+        let buffered = store.put(&bytes).expect("buffered put");
+        let (streamed, total) = store
+            .put_stream(std::io::Cursor::new(bytes.clone()))
+            .expect("streamed put");
+
+        assert_eq!(streamed.hex(), buffered.hex());
+        assert_eq!(total, bytes.len() as u64);
+        assert_eq!(store.get(&streamed).expect("read back"), bytes);
+    }
+
+    /// §22.8's whole point: `put_stream` must not buffer its input. This
+    /// pushes content well past any size a `Vec<u8>` in this test process
+    /// could plausibly allocate by accident, from a source that streams
+    /// (never materializes a matching buffer of its own) — a regression to
+    /// `put_stream` reading `mut Read` into one owned `Vec` before hashing
+    /// would still pass functionally but would blow this test's own memory
+    /// budget, which the harness bounds externally in the RSS acceptance
+    /// test (`tests/m7_docker_executor.rs`). Here we pin the cheaper,
+    /// always-on half: content larger than any single allocation this test
+    /// makes is still hashed and stored correctly, and streamed twice
+    /// (dedup path) without error.
+    #[test]
+    fn put_stream_handles_content_larger_than_any_single_buffer_here() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+
+        /// A `Read` source that manufactures zero bytes on demand — this
+        /// process never allocates a buffer holding the full content, only
+        /// [`STREAM_CHUNK`]-sized pieces at a time, mirroring what a `docker
+        /// logs` pipe read loop actually does.
+        struct Zeros {
+            remaining: u64,
+        }
+        impl Read for Zeros {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (buf.len() as u64).min(self.remaining) as usize;
+                buf[..n].fill(0);
+                self.remaining -= n as u64;
+                Ok(n)
+            }
+        }
+
+        let size: u64 = 8 * 1024 * 1024; // 8 MiB: exceeds this test's own buffers many times over
+        let (first, total) = store
+            .put_stream(Zeros { remaining: size })
+            .expect("first stream");
+        assert_eq!(total, size);
+        // Streamed again: same content, same address, dedup path taken.
+        let (second, total2) = store
+            .put_stream(Zeros { remaining: size })
+            .expect("second stream");
+        assert_eq!(second.hex(), first.hex());
+        assert_eq!(total2, size);
+        assert_eq!(store.get(&first).expect("read back").len(), size as usize);
+    }
+
+    /// A read failure partway through must not leave a tmp file behind, and
+    /// must not fabricate a blob at any content address.
+    #[test]
+    fn put_stream_leaves_no_tmp_litter_on_a_read_failure() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+
+        struct FailsAfter {
+            remaining: usize,
+        }
+        impl Read for FailsAfter {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Err(std::io::Error::other("simulated read failure"));
+                }
+                let n = buf.len().min(self.remaining);
+                buf[..n].fill(1);
+                self.remaining -= n;
+                Ok(n)
+            }
+        }
+
+        let err = store
+            .put_stream(FailsAfter { remaining: 4 })
+            .expect_err("a read failure must surface, not silently truncate");
+        assert!(matches!(err, BlobError::Io(_)));
+
+        let entries: Vec<_> = fs::read_dir(&store.root)
+            .expect("read blob dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "a failed stream must leave no tmp file behind, found {entries:?}"
+        );
+    }
 
     /// Issue #31 item 1: `BlobStore::get`'s generic io-error branch. The
     /// existing coverage only ever exercises the happy path and the
