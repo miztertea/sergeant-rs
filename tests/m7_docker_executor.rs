@@ -168,11 +168,12 @@ fn exit_zero_completes_and_nonzero_fails_with_captured_evidence() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
-    for (execution_id, command, expect_completed) in [
+    for (execution_id, command, expect_completed, expect_exit) in [
         (
             "m7-exit0",
             vec!["sh", "-c", "echo this text must never be read; exit 0"],
             true,
+            0,
         ),
         (
             "m7-exit1",
@@ -182,6 +183,26 @@ fn exit_zero_completes_and_nonzero_fails_with_captured_evidence() {
                 "echo this text must never be read either; exit 7",
             ],
             false,
+            7,
+        ),
+        // TH-13 (MVP-2 D3 fixer pass): the two cases above pair neutral
+        // stdout with a matching exit code, so they cannot distinguish "the
+        // mapping is mechanical, from the exit code alone" from "an
+        // implementation that also scrapes stdout for a success/failure
+        // token and happens to agree with the exit code here". These two
+        // adversarially disagree: stdout says the opposite of what the exit
+        // code says, so only a pure exit-code mapping gets both right.
+        (
+            "m7-exit-adversarial-ok",
+            vec!["sh", "-c", "echo ERROR FAILED; exit 0"],
+            true,
+            0,
+        ),
+        (
+            "m7-exit-adversarial-fail",
+            vec!["sh", "-c", "echo OK SUCCESS; exit 3"],
+            false,
+            3,
         ),
     ] {
         let req = request(
@@ -199,21 +220,26 @@ fn exit_zero_completes_and_nonzero_fails_with_captured_evidence() {
             (BackendSignal::StageCompleted { summary }, true) => {
                 let detail = summary.as_deref().unwrap_or_default();
                 assert!(
-                    detail.contains("\"exit_code\":0"),
-                    "completed summary must carry exit_code 0: {detail}"
+                    detail.contains(&format!("\"exit_code\":{expect_exit}")),
+                    "completed summary must carry exit_code {expect_exit}: {detail}"
                 );
             }
             (BackendSignal::Failed { reason }, false) => {
                 assert!(
-                    reason.contains("\"exit_code\":7"),
-                    "failed reason must carry the real exit code: {reason}"
+                    reason.contains(&format!("\"exit_code\":{expect_exit}")),
+                    "failed reason must carry the real exit code {expect_exit}: {reason}"
                 );
             }
             other => panic!("execution {execution_id}: unexpected signal {other:?}"),
         }
         backend.stop(&handle).expect("stop").wait();
     }
-    assert_containers_gone(&["sgt-m7-exit0", "sgt-m7-exit1"]);
+    assert_containers_gone(&[
+        "sgt-m7-exit0",
+        "sgt-m7-exit1",
+        "sgt-m7-exit-adversarial-ok",
+        "sgt-m7-exit-adversarial-fail",
+    ]);
 }
 
 // -------------------------------------------------------- 2. mount contract
@@ -285,6 +311,37 @@ fn workspace_access_governs_writes_both_ways() {
 #[test]
 fn network_none_has_no_usable_external_path() {
     require_docker!();
+
+    // TH-12 (MVP-2 D3 fixer pass): this test only discriminates on a host
+    // with working egress — on an egress-blocked host (the cloud
+    // container's measured posture, `docs/environments/`) the isolated
+    // container's `wget` fails for the same reason a *non*-isolated one
+    // would, and the assertion below is a guaranteed false green that
+    // proves nothing about `--network none`. A positive control: the exact
+    // same command, in a container with the ordinary default network,
+    // must actually reach out — if it cannot, this host cannot discriminate
+    // this test's claim at all, and the honest response is a loud skip, not
+    // a pass that means nothing.
+    let control = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            PROBE_IMAGE,
+            "sh",
+            "-c",
+            "wget -T 2 -q -O /dev/null http://1.1.1.1/ || exit 9",
+        ])
+        .status()
+        .expect("docker run (positive control)");
+    if !control.success() {
+        eprintln!(
+            "SKIPPED-ENV: this host has no outbound egress even without --network none (the \
+             positive control itself failed), so network_none_has_no_usable_external_path \
+             cannot discriminate its claim here"
+        );
+        return;
+    }
+
     let data = support::DataDir::new();
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
