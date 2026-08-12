@@ -4398,6 +4398,8 @@ fn r1_worker_reports_done_but_native_session_stays_alive() {
         signal: BackendSignal::StageCompleted { summary: None },
         ignores_stop: true, // the session that will not die
         settle: 0,
+        interim_native: NativeState::Running,
+        interim_signal: BackendSignal::Running,
     };
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [step]);
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
