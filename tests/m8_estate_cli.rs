@@ -324,6 +324,68 @@ fn repo_remove_is_refused_while_group_referenced_then_succeeds() {
     assert_eq!(repos[0]["name"], "b");
 }
 
+/// MVP-3 test-honesty finding TH-2 (and invariants finding MVP3-C6): the
+/// manifest lock's *cross-process* half, never exercised anywhere else — the
+/// only other concurrency coverage (`domain::manifest`'s
+/// `concurrent_repo_adds_do_not_lose_an_entry`) uses two threads in one
+/// process, which take the wait-and-retry path because the lock is already
+/// in that process's own `SELF_LOCKED` set. Two real `sgt` invocations never
+/// share that set, so this test holds the lock file itself — a genuinely
+/// different process/file-description than the `sgt` subprocess below, the
+/// same relationship two real concurrent `sgt` commands would have — and
+/// proves the real, shipped outcome: the second command's `try_lock` returns
+/// immediately with no wait, so it FAILS CLOSED (nonzero exit, naming the
+/// lock file and the manual remedy) rather than serializing and both
+/// succeeding. Once the lock is released, the identical command succeeds —
+/// proving the refusal was really about contention, not a broken lock file.
+///
+/// guard-map: reverting `manifest.rs`'s module doc's old framing back into
+/// code (e.g. making `take_exclusive_lock` wait indefinitely rather than
+/// failing closed for a lock this process never held) would hang this test
+/// rather than fail it fast — the budget below catches that too.
+#[test]
+fn two_real_sgt_processes_racing_repo_add_serialize_dont_tear() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(estate.path(), None, &[], &["init"]).assert_ok("init");
+    init_repo(&estate.path().join("repos").join("a"));
+
+    let lock_path = estate.path().join(".sergeant.toml.lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open lock file");
+    held.try_lock().expect(
+        "this test process must be able to take the lock — it is standing in for the \
+         'other concurrent sgt invocation' the module doc names",
+    );
+
+    let contended = run(estate.path(), None, &[], &["repo", "add", "a"]);
+    contended.assert_fails("repo add while the manifest lock is held by another process");
+    assert!(
+        contended.stderr.contains("already editing")
+            && contended.stderr.contains(".sergeant.toml.lock"),
+        "the refusal must name the lock file and that another sgt command owns it, got: {}",
+        contended.stderr
+    );
+
+    held.unlock().expect("release the lock");
+    drop(held);
+
+    run(estate.path(), None, &[], &["repo", "add", "a"])
+        .assert_ok("repo add must succeed once the lock is free");
+    let list = run(estate.path(), None, &[], &["--json", "repo", "list"]);
+    let repos = list.json()["repositories"].as_array().cloned().unwrap();
+    assert_eq!(
+        repos.len(),
+        1,
+        "the retried add must actually land: {list:?}",
+        list = list.json()
+    );
+    assert_eq!(repos[0]["name"], "a");
+}
+
 // ----------------------------------------------------------------- group
 
 /// guard-map: `sgt group add` refuses an undeclared member, naming it; valid
@@ -491,6 +553,72 @@ fn run_group_expands_client_side_into_repositories() {
     data_dir.reap();
 }
 
+/// MVP-3 invariants finding MVP3-C2: `--group`'s *client-side* expansion
+/// reads group membership through the on-disk-free structural parser, so an
+/// unrelated declared repository missing from disk no longer refuses the
+/// command before a daemon is even spawned — the same "wrongness scoped
+/// per-entry" contract `repo add`/`group add` already hold (MVP3-C1). The
+/// daemon's own submit-time estate resolution is a *separate*, pre-existing,
+/// accepted coupling (matches plain `--repo` too, per the B4 register entry
+/// C2's own basis cites) and is deliberately left alone here — so the
+/// command as a whole still fails once `ghost` is missing, but *how* it
+/// fails is the proof: client-side no longer refuses first.
+///
+/// guard-map: reverting the group lookup back to the strict
+/// `Workspace::discover_scoped` makes this fail identically to the
+/// "undeclared group" case above — refused before `ensure_daemon` ever
+/// spawns one — instead of a daemon actually starting and the *daemon's*
+/// preflight (a 422 naming `ghost`) being what rejects the submission.
+#[test]
+fn run_group_expansion_itself_survives_an_unrelated_declared_repo_missing_from_disk() {
+    let data_dir = DataDir::new();
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(estate.path(), Some(data_dir.path()), &[], &["init"]).assert_ok("init");
+    for name in ["a", "b", "ghost"] {
+        init_repo(&estate.path().join("repos").join(name));
+        run(
+            estate.path(),
+            Some(data_dir.path()),
+            &[],
+            &["repo", "add", name],
+        )
+        .assert_ok("repo add");
+    }
+    run(
+        estate.path(),
+        Some(data_dir.path()),
+        &[],
+        &["group", "add", "pair", "a", "b"],
+    )
+    .assert_ok("group add");
+
+    // Simulate the clone-is-distro shape for the group's non-member.
+    std::fs::remove_dir_all(estate.path().join("repos").join("ghost"))
+        .expect("remove ghost's checkout");
+
+    let submitted = run(
+        estate.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "run", "--group", "pair", "expand despite ghost"],
+    );
+    submitted.assert_fails("the daemon's own full-estate bind still refuses on ghost");
+    assert!(
+        submitted.stderr.contains("ghost"),
+        "the refusal must still name the actual defect: {}",
+        submitted.stderr
+    );
+    assert!(
+        !data_dir.daemon_pids().is_empty(),
+        "client-side --group expansion must not have refused first — a daemon must have \
+         actually spawned and reached its own bind-time preflight for this to be *that* \
+         refusal rather than the client-side one: {}",
+        submitted.stderr
+    );
+
+    data_dir.reap();
+}
+
 // ---------------------------------------------------- estate-resolved data dir
 
 /// guard-map: with no `--data-dir`/`SGT_DATA_DIR`, `sgt doctor` defaults to
@@ -639,13 +767,26 @@ fn wait_for_state(cwd: &Path, data_dir: &Path, id: &str, state: &str) -> Value {
     }
 }
 
-/// guard-map: `sgt work transcript` decodes a completed work's conversation
-/// (read-only, `--json` for the raw structured turns) and `sgt work show`'s
-/// human output surfaces the R-MVP1-2 output pointer — branch, worktree,
-/// finalize commit — in the same command, without hand-decoding the JSON
-/// blob above it. Mutation this kills: `work transcript` erroring or
-/// returning the wrong `work_id`/shape, or `work show`'s human rendering
-/// silently dropping the output-pointer summary this milestone adds.
+/// guard-map: `sgt work transcript` is reachable end to end through the real
+/// CLI/daemon and renders the honest empty-conversation case correctly (the
+/// fake backend emits no conversation events for an ordinary run — see the
+/// comment below), and `sgt work show`'s human output surfaces the R-MVP1-2
+/// output pointer — branch, worktree, finalize commit — in the same command,
+/// without hand-decoding the JSON blob above it. Mutation this kills: `work
+/// transcript` erroring or returning the wrong `work_id`/shape, or `work
+/// show`'s human rendering silently dropping the output-pointer summary
+/// this milestone adds.
+///
+/// **What this test does NOT prove (MVP-3 test-honesty finding TH-3/TH-1):**
+/// the "minimal blob decode" fallback for an envelope-less turn — the fake
+/// backend never produces one, so `transcript_turns`'s
+/// `KIND_CONVERSATION_TURN_ENDED`/`decode_partial_assistant_text` branch is
+/// untouched here. That path is proven end to end, through a real
+/// `ClaudeBackend`/`TurnReader` turn (a scripted `claude` CLI, not a
+/// hand-fabricated `Event`) and a simulated adjacent-append journal loss, by
+/// `src/api.rs`'s own
+/// `transcript_turns_recovers_a_real_producers_text_across_a_simulated_
+/// adjacent_append_loss`.
 #[test]
 fn work_transcript_and_output_pointer_are_reachable_from_the_real_cli() {
     let data_dir = DataDir::new();
@@ -850,12 +991,22 @@ fn run_turns_and_ceiling_secs_override_the_envelope_for_one_work() {
 /// Mutation this kills: `sgt daemon stop` sending SIGKILL instead of the
 /// graceful path (this test's daemon would still be gone, but
 /// `r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop`'s sibling
-/// coverage of the graceful path would not exercise what it claims to);
+/// coverage of the graceful path would not exercise what it claims to); or
 /// `daemon_stop` treating "no daemon running" as an error instead of a
-/// no-op success; or the drain step never actually calling
-/// `/v1/admission/pause` (silently dropped), which would leave a work
-/// submitted concurrently with a slow drain racing admission instead of
-/// being refused.
+/// no-op success.
+///
+/// **What this test does NOT prove (MVP-3 test-honesty finding TH-4):** that
+/// `daemon_stop`'s own drain step (`src/cli.rs`) actually issues `POST
+/// /v1/admission/pause` — dropping that call entirely would still leave
+/// this test green, since nothing here submits work concurrently with a
+/// slow drain to observe the refusal it exists to cause. The sibling test
+/// named above proves the *mechanism* (pause → durable across a crash →
+/// resumed on restart) directly at the API level, not that this CLI verb is
+/// the one invoking it. Left open rather than silently claimed: a real
+/// regression here needs a scripted (`SGT_FAKE_SCRIPT=hang`) in-flight turn
+/// plus a concurrent submit racing a backgrounded `sgt daemon stop`, which
+/// is more machinery than this fixer pass's effort budget covers for an
+/// `info`-severity gap.
 #[test]
 fn daemon_stop_drains_admission_and_exits_cleanly() {
     let data_dir = DataDir::new();
