@@ -2404,6 +2404,17 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
         "the worktree must live directly under the declared surfaces_dir/<work_id>/<repo>, \
          with no extra nesting"
     );
+    // TH-07's other half: `surface.planned`'s own `root` — not just the
+    // worktree path it later produces — must reflect the split too.
+    let planned = events_of(&data_inside, &work_id, KIND_SURFACE_MATERIALIZING);
+    assert_eq!(planned.len(), 1, "exactly one plan: {planned:?}");
+    assert_eq!(
+        planned[0].payload["plan"]["root"],
+        outside.join(&work_id).display().to_string(),
+        "surface.planned's root must already reflect surfaces_dir's split, before \
+         anything is materialized: {:?}",
+        planned[0].payload
+    );
     handle.shutdown().await;
 
     // Scenario 2: `surfaces_dir` unset falls back to `data_dir/surfaces` —
@@ -2422,6 +2433,22 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
     assert_eq!(
         body["work"]["state"], "blocked",
         "an in-checkout surfaces_root must still be refused — the guard moved, not weakened: {body}"
+    );
+    // TH-07: a bare `state == "blocked"` cannot distinguish the in-checkout
+    // guard from any other unrelated materialize failure. Name the actual
+    // diagnostic (`surface.rs`'s own refusal text) so this pin means what
+    // its own doc comment claims.
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let blocked = events_of(&data_inside2, &work_id, KIND_WORK_BLOCKED);
+    assert_eq!(blocked.len(), 1, "exactly one block: {blocked:?}");
+    let reason = blocked[0].payload["reason"]
+        .as_str()
+        .expect("reason string");
+    assert!(
+        reason.contains("refusing to materialize a work surface")
+            && reason.contains("inside source repository"),
+        "the block reason must be the in-checkout guard's own diagnostic, not some other \
+         materialize failure: {reason:?}"
     );
     handle.shutdown().await;
 }
