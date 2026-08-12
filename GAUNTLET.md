@@ -45,6 +45,244 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### MVP-2 D3 FIXER PASS — 2026-08-12, N4/M7 panel findings closed
+
+**Mission outcome.** Fixer pass over the N4 (Docker executor) build's
+review panel: 26 CONFIRMED findings (12 `invariants:INV-R1-*`, 14
+`test-honesty:TH-*` — 10 error, 10 warning, 6 info by severity), 0
+PLAUSIBLE, 4 mutation-probe SURVIVORS. **19 of 26 CONFIRMED touched and
+improved** — 14 fully closed as originally scoped, plus 5 explicitly
+scoped as partial closes (INV-R1-02, INV-R1-07, INV-R1-09, TH-07, TH-08)
+with the remaining ask named per finding below; **all 4 SURVIVORS
+strengthened**, each re-verified by re-executing its named mutation
+against this pass's own fix in a disposable worktree outside the tree
+(L5/L7) — every one now fails where it previously passed. **7 CONFIRMED
+findings investigated and left untouched**, named individually below with
+reasoning — nothing silently dropped. Gates
+green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+full `cargo test` (496 tests, 0 failed, 4 opt-in ignored) all re-run
+clean after the last commit. Leak checks clean after the full suite:
+`pgrep -f "debug/sgt [-]-data-dir"` empty; `docker ps -a --filter
+label=io.sergeant.managed=true` empty.
+
+**Error-severity findings closed (5 of 10 — INV-R1-01, INV-R1-04, TH-01
+[covered under Survivors below], TH-02, TH-05; INV-R1-02, INV-R1-03,
+INV-R1-05, TH-03, TH-04 deferred, see below). TH-11 (warning) bundles
+into the INV-R1-04 bullet below since one fix closes both.**
+- **INV-R1-01** — `DockerBackend::stop`'s Docker Engine calls (`docker
+  inspect` + `docker rm -f`, measured ~40-70ms) ran synchronously under
+  the core lock via `Engine::stop_execution`, violating N4's own acceptance
+  gate verbatim. Fixed: the whole inspect+label-check+remove interaction
+  now runs as `Completion`'s deferred tail work (the same "kill now, join
+  later" split `ClaudeBackend::stop` already uses), so nothing Docker-side
+  runs under the lock. Pinned by a nonexistent-`docker_bin` unit test (the
+  call itself must not shell out) and a real-Docker test proving the
+  container survives until `.wait()` runs. `tests/m6_surfaces.rs` t11's
+  whitelist rationale, previously written only about the Claude adapter,
+  now names both backends' reviewed in-lock behavior.
+- **INV-R1-04 / TH-11** — §16.8, a contract-named Unknown never measured:
+  containers ran as image-default root, leaving root-owned files (and
+  *un-removable root-owned directories*, stronger than the finding's own
+  claim) in the user's worktree. Fixed: `--user <uid>:<gid>` sourced from
+  the mounted worktree's own host owner. Pinned by a real-Docker test
+  asserting both file and directory ownership, and that the host user can
+  actually `rm` what the container created. `docs/environments/cerberus.md`
+  now carries the measurement N4's Unknowns section required.
+- **TH-02** — m6 t3's "every doctor check must be `ok`" assertion silently
+  became Docker-reachability-dependent (measured: `warn` with no docker on
+  PATH), the exact probe-gating failure N4.md names for the GH
+  runner/cloud container — and `docker_check`, unlike `claude_check`, had
+  no `SGT_CLAUDE_BIN`-equivalent override to probe-gate it with. Fixed:
+  added `SGT_DOCKER_BIN` (`DockerConfig::new` honors it, mirroring
+  `CLAUDE_BIN_ENV`); threaded a scripted `docker` stub through every
+  `doctor()` call in the suite. Measured the fix directly (not just via
+  the test): `warn` without the override, `ok` with it, on the same
+  docker-less PATH.
+- **TH-05 / SURVIVOR 2** — §17.5's execute-stage submit preflight
+  (`ExecuteBackendUnavailable`) had zero tests despite the injection point
+  (`DaemonConfig::docker`'s scripted `docker_bin`) already existing and
+  being documented for exactly this. A mutation that swallows the routing
+  error and falls back to actor routing survived the whole suite. Fixed
+  with a test needing no live Docker: submits a `kind = "execute"`
+  workflow against a daemon whose docker backend cannot be routed to,
+  asserts 422/`execute_backend_unavailable`, no Work, no `surfaces` dir.
+  Mutation re-executed in a disposable worktree: without the fix the same
+  submission completes end to end (201) with the stage silently routed to
+  the fake actor backend.
+
+**Warning-severity findings (10 total; TH-11 already counted above as
+part of the INV-R1-04 bullet). 5 of the remaining 9 fully closed
+(INV-R1-06, INV-R1-08, TH-06, TH-09, plus TH-11 above), 4 explicitly
+partial (INV-R1-07, INV-R1-09, TH-07, TH-08 — TH-08's crash-injection
+half stays open, see Deferred), TH-10 untouched (see Deferred).**
+- **INV-R1-06** — §16.3's "a version ping proves only that something
+  answered" was not what `sgt doctor` shipped: `docker_check` called only
+  the cheap `probe()`; `DockerBackend::lifecycle_probe` (the real
+  bind-mount round trip) was dead code the module doc falsely claimed was
+  already wired in. Fixed: `docker_check` now runs the lifecycle probe
+  whenever the cheap ping succeeds and folds a failed round trip into
+  `Warn` with real evidence. Measured against real Docker on this host:
+  `"Docker Engine 29.7.2; bind-mount round trip confirmed"`, <1s added.
+- **INV-R1-07 (partial: 2 of 17 named tests + the ownership gap already
+  closed above via INV-R1-04).** Added `a_mount_path_containing_a_space_
+  round_trips_correctly` (test 2) and `a_launched_container_carries_no_
+  isolation_escape_hatches` (test 6 — the negative isolation posture
+  `create_container`'s own comment claims, never inspected on a real
+  container: exactly one mount, no `docker.sock`, not privileged, no
+  added capabilities, no devices). **Still open**: tests 1 (API
+  negotiation + server/platform evidence), 7 (mutable tag resolves to the
+  *journaled* identity, tied to INV-R1-05 below), 11/12 (restart-while-
+  running / restart-after-exit), 16 (pull-failure/registry-auth sanitized
+  evidence), and all of §22.9 (image/cache pressure) — see Deferred.
+- **INV-R1-08** — `observe()` pays for a full log capture (blob writes)
+  unconditionally on any exited container, even from restart
+  reconciliation's `reserved_identity_liveness`, which reads only
+  `.native` and discards the rest. Fixed: added `Backend::observe_liveness`
+  (default impl delegates to `observe`, correct as-is for fake/Claude);
+  `DockerBackend` overrides it to classify liveness without ever calling
+  `capture`. Pinned by a real-Docker test counting blob-store files
+  before/after both calls (liveness: no growth; full observe: growth).
+  Mutation (fall back to the default) re-executed in a disposable
+  worktree: the new test fails against it.
+- **TH-06** — the commit's explicit claim that `ExecuteSpec` participates
+  in `WorkflowDefinition::content_hash` had no test; deleting
+  `execute: s.execute.as_ref()` left the suite green. Fixed: added a case
+  to the existing hash test (two workflows differing only in an execute
+  stage's pinned image must hash differently). Mutation re-executed: fails
+  without the line.
+- **TH-07 (partial: the RSS-adjacent disk-cost measurement, not the
+  no-orphan-blob half).** [Rule B] names two acceptance items; only the
+  first ("measure blob disk cost beside §22.8's RSS budget") is closed —
+  the large-output test now also asserts the blob store grew by the
+  expected amount on disk. Fixture bug found and fixed in passing: stdout
+  and stderr previously wrote *identical* content, and the content-
+  addressed blob store correctly deduplicates that into one blob, which
+  would have failed the new assertion against a store working exactly as
+  designed. The second half ("no blob is written without a journal ref
+  naming it") is not pinned — see Deferred.
+- **TH-09** — `resume: true` is advertised (L8) but only its negative row
+  (missing container) was tested. Added a test driving both untested
+  rows: a live labeled container is re-adopted (`Ok(())`), a foreign one
+  under the deterministic name is refused.
+- **INV-R1-09 (partial: log-visible disclosure only).** D2's
+  `--setting-sources user,project,local` translation for `instructions =
+  "local"` authorizes repo-authored hooks/tool-permissions/MCP config —
+  "a materially larger risk than 'reads a text file'" by the adapter's
+  own measurement note — and the submit-time refusal that gated this on
+  an unmeasured claim was removed with no replacement operator signal.
+  Closed the log-visibility slice: `check_instruction_policy` now emits
+  `tracing::warn!` naming the repos and the widened surface. **Not
+  closed**: a first-class operator signal (doctor row, manifest
+  vocabulary) — see Deferred. Not test-pinned (a tracing-log-only change);
+  verified manually instead — a real `sgt run` against an `instructions =
+  "local"` manifest with `RUST_LOG=warn` produces exactly this line in
+  the auto-spawned daemon's `daemon.log`.
+
+**Info-severity findings closed (4 of 6 — INV-R1-10 and TH-14 deferred,
+see below).** INV-R1-12 (`--mount`'s CSV grammar (`,`/`=`-delimited)
+built by string interpolation from the worktree path; a `,`/`=`-bearing
+path splits into a malformed mount, measured — refused closed before
+image resolution, so the refusal needs no live Docker; pinned by a unit
+test with a nonexistent `docker_bin`); INV-R1-13 (`ResumeRequest.
+instruction_policy` widened to `Option`, matching its own doc's "not
+re-supplied" contract — `model`/`profile` were already `Option`, this
+field was the odd one out); TH-12 (the network-isolation test only
+discriminates on a host with egress; added a positive control — the same
+command over the default network must actually reach out first, or the
+test skips loudly rather than reporting a meaningless pass); TH-13 (the
+exit-mapping test's two fixtures paired neutral stdout with a matching
+exit code, so a stdout-scraping implementation would have passed too;
+added adversarially-paired cases, and fixed a latent bug the new cases
+exposed — the failure-arm assertion was hardcoded to exit code `7`
+regardless of which case was running).
+
+**Survivors, all 4 strengthened and mutation-reverified.**
+1. `large_captured_output_does_not_grow_this_process_proportionally`
+   (TH-01's own test) — same fix as TH-01 above (`VmHWM` not `VmRSS`).
+2. The execute-preflight swallow — same fix as TH-05 above.
+3. `latest_ask_withdrawal_version_picks_the_highest_seq_matching_event` —
+   its "out of order" case put the highest-seq record first in iterator
+   order, so "take the highest seq" and "take the first match" gave
+   identical answers; added the mirrored ordering (highest seq last).
+4. Composition probe C2 — `observe()`'s §16.10 identity check exists in
+   code but no test ever drove OBSERVE (only LAUNCH) against a container
+   occupying the deterministic name under foreign labels. Added
+   `observe_on_a_foreign_container_under_the_deterministic_name_fails_
+   closed`, forging a handle against a pre-created unlabeled container.
+
+**Deferred/partial (5 partial closes + 7 fully untouched — 12 CONFIRMED
+findings total, all investigated, none closed as originally scoped,
+named individually so nothing is silently dropped).**
+- **INV-R1-02 / TH-08 (partial)** — both named the §22.5 crash-injection
+  matrix over the Docker lifecycle (all create/start/exit/cancel windows)
+  and §22.6 lock-discipline coverage for Docker. The lock-discipline half
+  is now addressed (INV-R1-01's fix + the m6 t11 whitelist comment update
+  above); the crash-injection matrix itself — killing a daemon
+  mid-Docker-lifecycle and asserting recovery, the same shape m4's
+  `n10`-`n18` fixtures already build for the Claude/fake backends — is
+  real, substantial harness work (a daemon-kill rig driving real
+  container state) not attempted in this pass.
+- **INV-R1-03** — §16.11's "reserved, no recorded ID / one exact
+  name+label match → adopt" row is unimplemented:
+  `reconcile_unsettled_reservation` returns `Ambiguous` unconditionally
+  and never reaches Docker's own stronger evidence (name+label match).
+  Closing this means teaching engine-level restart reconciliation a
+  Docker-specific adoption path without leaking Docker knowledge into the
+  generic engine (§13.2) — an engine-level design change, not a local
+  fix, deferred to a build pass rather than attempted piecemeal here.
+- **INV-R1-05** — the image pin (`<data_dir>/docker-adapter/image-pins/`)
+  is the retry decision's actual source of truth but lives outside the
+  journal, best-effort-written, with no rebuild-from-journal path — a
+  real journal-only-truth gap. Fixing it properly (rebuild the pin cache
+  from `execute.image_resolved` events at startup, or make the pin write
+  itself journaled and synchronous before `docker start`) is a
+  daemon-startup-path change with its own crash-window analysis (L6)
+  this pass did not have room to do carefully.
+- **INV-R1-07 (remainder)** — tests 1, 7, 11, 12, 16 and all of §22.9;
+  see the partial-close note above for which two of seventeen landed.
+- **INV-R1-10** — `capture: "complete"` is asserted on any successful
+  `docker logs` read with no check of the container's own
+  `HostConfig.LogConfig`; a rotating `json-file` driver or `--log-driver
+  none` would misreport truncated/unavailable logs as complete. Fix is a
+  driver check at create time or a named `"truncated"`/`"driver_
+  unsupported"` outcome — not attempted.
+- **TH-03** — the suite's only environment gate is `docker version`; on a
+  host with Docker but no registry egress (the cloud container N4.md
+  names explicitly) every container-creating test fails hard instead of
+  probe-gating via a Sergeant-owned static (`FROM scratch`) probe image.
+  Cerberus itself has open egress, so this gap does not bite locally;
+  building and vendoring a static probe image plus an image-availability
+  gate is real work not attempted here.
+- **TH-04** — the `local` instruction policy's shipped
+  `--setting-sources user,project,local` value is asserted against a
+  stub, never measured against the real installed Claude CLI (no
+  `#[ignore]`/`SERGEANT_CLAUDE_TESTS` test drives a Local-policy turn).
+  Fixing this means spending real tokens against the live CLI, which — per
+  the MVP-1 fixer pass's own precedent (its I2) — a fixer pass does not
+  authorize itself; left for a session with owner-approved token spend.
+- **TH-14** — N4's "first real execute stage"
+  (`.sergeant/workflows/repo-to-icm/workflow.toml`'s `65-self-check`) is
+  validated only by a hand-run `docker run` recorded in a commit message;
+  no automated test loads and actually executes it (the automated m7
+  proof uses a synthetic `mixed-proof` workflow instead). Building this
+  properly means a test that materializes the real repo-to-icm workflow
+  and runs its execute stage end to end — moderate effort, not attempted
+  in this pass.
+- **TH-10** — R-H0-7's fake-fidelity work (`FakeBackend::settle_as`, the
+  interrupt-vs-terminal-signal fix) is pinned only by in-module unit
+  tests; `settle_as` has no caller outside its own test and the interrupt
+  fix has no engine-level consumer, so no test demonstrates either shape
+  ever changes an engine outcome. Needs an engine-level test built around
+  a scripted fake that would produce a different result with vs. without
+  the fix — not attempted; the underlying R-H0-7 bug fix itself is not in
+  question, only this coverage gap.
+
+**Evidence.** Every closed finding's commit (`git log --oneline
+fec2e3c..4e3f625` — 14 commits over this pass) carries its own
+measurement transcript, mutation re-execution, or manual-verification
+transcript inline; not restated here. `docs/environments/cerberus.md`
+gained the §16.8 measurement row N4.md's Unknowns section required.
+
 ### MVP-1 SHIPPING GATE — 2026-08-12, passed (22→4→0); as-run note
 
 no-mistakes over the full MVP-1 diff: 22 findings, 12 fixed (headline:
