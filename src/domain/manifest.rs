@@ -51,7 +51,7 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use crate::domain::is_plain_name;
 use crate::domain::workspace::{InstructionPolicy, WORKSPACE_FILE, Workspace, WorkspaceError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic};
-use crate::runtime::git::{git, git_succeeds};
+use crate::runtime::git::{git_clone, git_succeeds};
 
 /// The `.gitignore` entries `sgt init` maintains (task's own naming): the
 /// estate-local data dir, the populated repository mounts, and this
@@ -513,20 +513,14 @@ fn populate_or_verify(
             source,
         })?;
     }
-    match git(
-        repo_path.parent().unwrap_or(repo_path),
-        &[
-            "clone",
-            origin,
-            repo_path
-                .to_str()
-                .ok_or_else(|| ManifestError::CloneFailed {
-                    origin: origin.to_string(),
-                    path: repo_path.display().to_string(),
-                    detail: "destination path is not valid UTF-8".to_string(),
-                })?,
-        ],
-    ) {
+    let dest_path = repo_path
+        .to_str()
+        .ok_or_else(|| ManifestError::CloneFailed {
+            origin: origin.to_string(),
+            path: repo_path.display().to_string(),
+            detail: "destination path is not valid UTF-8".to_string(),
+        })?;
+    match git_clone(repo_path.parent().unwrap_or(repo_path), origin, dest_path) {
         Ok(_) => Ok(()),
         Err(e) => Err(ManifestError::CloneFailed {
             origin: origin.to_string(),
@@ -955,6 +949,68 @@ mod tests {
         assert_eq!(
             workspace.instruction_policy("api"),
             InstructionPolicy::Local
+        );
+    }
+
+    /// `sgt repo add --origin <url>` passes a human-supplied string straight
+    /// to `git clone`; git's `ext::` transport runs an arbitrary local
+    /// command as part of "cloning" from it — a classic clone-URL RCE if the
+    /// origin ever reaches the clone unrestricted. Proves the restriction
+    /// actually holds by checking for the command's own side effect (a
+    /// sentinel file) rather than just the returned error: `ext::` failing
+    /// for an unrelated reason (e.g. the shell itself missing) would still
+    /// leave this false-safe if the test only asserted `Err`.
+    ///
+    /// guard-map: dropping `git_clone`'s `GIT_ALLOW_PROTOCOL` restriction (or
+    /// routing this call through the unrestricted `git()` helper again) lets
+    /// the sentinel file get created, failing this test.
+    #[test]
+    fn add_repo_refuses_an_ext_transport_origin_without_running_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("estate");
+        std::fs::create_dir_all(&root).expect("estate dir");
+        init_estate(&root, Some("e")).expect("init");
+
+        let sentinel = dir.path().join("pwned");
+        let origin = format!("ext::sh -c \"touch {}\"", sentinel.display());
+
+        let err = add_repo(&root, "api", Some(&origin), None).expect_err("ext:: must not clone");
+        assert!(
+            matches!(err, ManifestError::CloneFailed { .. }),
+            "expected a CloneFailed refusal, got: {err:?}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "the ext:: transport's command must never have run: {}",
+            sentinel.display()
+        );
+    }
+
+    /// An origin beginning with `-` must be read as a literal (failing
+    /// clone) rather than a `git clone` flag — proven by using a real flag
+    /// name (`--upload-pack`) that, if parsed as a flag instead of a
+    /// positional, would produce git's "too many arguments"/usage-text
+    /// failure instead of an ordinary "not a valid origin" clone failure.
+    ///
+    /// guard-map: dropping the `--` separator in `git_clone` makes this
+    /// origin get parsed as a flag, changing the failure shape (and, for a
+    /// differently-chosen real flag, could change behavior entirely rather
+    /// than just failing).
+    #[test]
+    fn add_repo_treats_a_dash_prefixed_origin_as_a_literal_not_a_flag() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("estate");
+        std::fs::create_dir_all(&root).expect("estate dir");
+        init_estate(&root, Some("e")).expect("init");
+
+        let err = add_repo(&root, "api", Some("--upload-pack=x"), None)
+            .expect_err("a dash-prefixed origin must not clone");
+        let ManifestError::CloneFailed { detail, .. } = err else {
+            panic!("expected a CloneFailed refusal, got: {err:?}");
+        };
+        assert!(
+            !detail.contains("usage: git clone") && !detail.contains("Too many arguments"),
+            "the origin must never reach git's flag parser as a flag: {detail}"
         );
     }
 

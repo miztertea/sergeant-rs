@@ -1730,19 +1730,21 @@ async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) 
 /// direct test without spinning up a daemon.
 fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Path) -> Vec<Value> {
     let mut turns = Vec::new();
-    // `execution_id`s that have already emitted `conversation.assistant.
-    // completed` since the last turn boundary this loop consumed for that
-    // execution — the blob-decode fallback below must skip an envelope-less
-    // turn whose text *already* reached the journal this way (`ingest_line`
-    // emits that event for any successfully parsed `assistant` line with
-    // text, independent of whether the turn later got a `result` line — a
-    // partial-but-parseable stream, the common shape of a turn interrupted
-    // mid-generation, produces both). Without this, such a turn's text would
-    // be reported twice: once `source: "event"`, once `source:
-    // "blob_decode"`, from the very same content. Removed on consumption so
-    // the next turn on the same execution starts fresh.
-    let mut assistant_emitted_since_last_turn: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    // Per-`execution_id` count of `conversation.assistant.completed` events
+    // consumed since the last turn boundary — `ingest_line` emits exactly one
+    // such event per successfully-parsed `assistant` stream-json line that
+    // carried text, so a turn can legitimately emit several before ending
+    // (or crashing) and the archive's own per-line decode (`decode_partial_
+    // assistant_lines`) produces the same count of entries in the same
+    // order. The blob-decode fallback below skips that many leading lines
+    // from the archive rather than an all-or-nothing flag, so a crash that
+    // lands between two of a turn's own assistant-line appends (CLAUDE.md's
+    // "adjacent-append crash window") still recovers the lines that never
+    // reached the journal, instead of either double-reporting the ones that
+    // did or silently dropping the ones that didn't. Removed on consumption
+    // so the next turn on the same execution starts fresh.
+    let mut assistant_completed_since_last_turn: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for event in events
         .into_iter()
         .filter(|e| e.work_id.as_deref() == Some(work_id))
@@ -1757,7 +1759,9 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
             })),
             KIND_CONVERSATION_ASSISTANT_COMPLETED => {
                 if let Some(execution_id) = &event.execution_id {
-                    assistant_emitted_since_last_turn.insert(execution_id.clone());
+                    *assistant_completed_since_last_turn
+                        .entry(execution_id.clone())
+                        .or_insert(0) += 1;
                 }
                 turns.push(json!({
                     "seq": event.seq,
@@ -1779,19 +1783,18 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
                 // this execution emitted belongs to *this* turn (the two are
                 // always emitted by the same `TurnReader` run), so consuming
                 // it here — whether or not it changes what happens below —
-                // keeps the set scoped to "since the last turn", not "ever".
-                let already_reached_the_journal = event
+                // keeps the count scoped to "since the last turn", not
+                // "ever".
+                let already_emitted_lines = event
                     .execution_id
                     .as_ref()
-                    .is_some_and(|id| assistant_emitted_since_last_turn.remove(id));
+                    .and_then(|id| assistant_completed_since_last_turn.remove(id))
+                    .unwrap_or(0);
                 // A turn that closed with a result envelope already emitted
-                // its content, if any, as its own `conversation.*` event
+                // its content, if any, as its own `conversation.*` event(s)
                 // above — nothing to recover. Only the envelope-less case
-                // needs the archive, and only when that event did NOT
-                // already carry this turn's text.
-                if event.payload["result_envelope"].as_bool().unwrap_or(true)
-                    || already_reached_the_journal
-                {
+                // needs the archive.
+                if event.payload["result_envelope"].as_bool().unwrap_or(true) {
                     continue;
                 }
                 let Some(raw_ref) = event.payload["raw"].as_str() else {
@@ -1806,7 +1809,12 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
                 let Ok(bytes) = store.get(&blob_ref) else {
                     continue;
                 };
-                let text = decode_partial_assistant_text(&bytes);
+                // Skip exactly the lines this execution already reported
+                // live; only genuinely unreported lines are recovered.
+                let text: String = decode_partial_assistant_lines(&bytes)
+                    .into_iter()
+                    .skip(already_emitted_lines)
+                    .collect();
                 if !text.is_empty() {
                     turns.push(json!({
                         "seq": event.seq,
@@ -1825,12 +1833,17 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
 }
 
 /// The "minimal blob decode" itself: recover whatever assistant `text`
-/// content blocks appear in a raw stream-json archive, in file order. Not a
-/// general stream-json parser — it reads exactly the shape `ingest_line`'s
-/// `Some("assistant")` arm reads, on an archive rather than a live line.
-fn decode_partial_assistant_text(raw: &[u8]) -> String {
+/// content blocks appear in a raw stream-json archive, one entry per
+/// `assistant` line that carried text — the same granularity `ingest_line`'s
+/// `Some("assistant")` arm reads a live line at (one `conversation.assistant.
+/// completed` event per such line), so callers can line an archive's entries
+/// up against how many of them already reached the journal live. Not a
+/// general stream-json parser. Lines with no text block (tool-only, or
+/// unparseable) contribute no entry, matching `ingest_line`'s own
+/// `!text.is_empty()` gate on emitting the event.
+fn decode_partial_assistant_lines(raw: &[u8]) -> Vec<String> {
     let raw = String::from_utf8_lossy(raw);
-    let mut text = String::new();
+    let mut lines_text = Vec::new();
     for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -1841,6 +1854,7 @@ fn decode_partial_assistant_text(raw: &[u8]) -> String {
         let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
             continue;
         };
+        let mut text = String::new();
         for block in blocks {
             if block.get("type").and_then(Value::as_str) == Some("text")
                 && let Some(t) = block.get("text").and_then(Value::as_str)
@@ -1848,8 +1862,18 @@ fn decode_partial_assistant_text(raw: &[u8]) -> String {
                 text.push_str(t);
             }
         }
+        if !text.is_empty() {
+            lines_text.push(text);
+        }
     }
-    text
+    lines_text
+}
+
+/// The full-archive convenience `decode_partial_assistant_lines` factors
+/// out of: every recovered line's text, concatenated in file order.
+#[cfg(test)]
+fn decode_partial_assistant_text(raw: &[u8]) -> String {
+    decode_partial_assistant_lines(raw).concat()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3759,6 +3783,69 @@ mod tests {
         );
         assert_eq!(turns[0]["source"], "event");
         assert_eq!(turns[0]["text"], "already said");
+    }
+
+    /// The narrower case the finding above didn't cover: a turn that
+    /// streamed *two* assistant lines, where only the first's
+    /// `conversation.assistant.completed` reached the journal (the second
+    /// lost in a simulated adjacent-append crash window) before
+    /// `conversation.turn.ended` landed with `result_envelope: false`. The
+    /// archive carries both lines' text. A per-execution boolean would treat
+    /// "any line reached the journal" as "the whole turn did" and drop the
+    /// second line's text entirely; the count-based fix must recover exactly
+    /// the lines that never made it live.
+    ///
+    /// guard-map: reverting to a per-execution boolean (any emitted ⇒ skip
+    /// the archive entirely) makes this fail by losing "line two" instead of
+    /// recovering it.
+    #[test]
+    fn transcript_turns_recovers_only_the_lines_lost_to_a_partial_adjacent_append_crash() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"line one "}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"line two"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![
+            // Only line one's live event reached the journal; line two's own
+            // `conversation.assistant.completed` was lost to the crash.
+            ev_exec(
+                1,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "line one "}),
+            ),
+            ev_exec(
+                2,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({
+                    "interrupted": true,
+                    "result_envelope": false,
+                    "raw": blob_ref.to_string(),
+                }),
+            ),
+        ];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert_eq!(
+            turns.len(),
+            2,
+            "line one's live event plus line two's recovered text: {turns:?}"
+        );
+        assert_eq!(turns[0]["source"], "event");
+        assert_eq!(turns[0]["text"], "line one ");
+        assert_eq!(turns[1]["source"], "blob_decode");
+        assert_eq!(
+            turns[1]["text"], "line two",
+            "line two never reached the journal live and must be recovered, not dropped: {turns:?}"
+        );
     }
 
     /// A minimal scripted `claude` executable: passes the adapter's version/

@@ -70,6 +70,33 @@ pub fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
     matches!(command(dir, args).output(), Ok(output) if output.status.success())
 }
 
+/// `git clone` where `origin` is untrusted, human-supplied input (`sgt repo
+/// add --origin <url>`, not a value this codebase generated). `--` stops an
+/// origin starting with `-` from being read as a clone flag, and
+/// `GIT_ALLOW_PROTOCOL` locks the transport to the ones a repository origin
+/// should ever need — closing off `ext::`/`fd::`-style transport helpers,
+/// classic clone-URL command execution.
+pub fn git_clone(dir: &Path, origin: &str, dest_path: &str) -> Result<String, GitError> {
+    let args = ["clone", "--", origin, dest_path];
+    let output = command(dir, &args)
+        .env("GIT_ALLOW_PROTOCOL", "file:http:https:ssh:git")
+        .output()
+        .map_err(|source| GitError::Spawn {
+            args: owned(&args),
+            dir: dir.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            args: owned(&args),
+            dir: dir.display().to_string(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// One hermetic Git invocation: no pager, no prompts, no editor, stdin closed.
 fn command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");

@@ -3726,6 +3726,75 @@ async fn r_mvp1_6_an_empty_intent_detail_object_normalizes_to_absent() {
     handle.shutdown().await;
 }
 
+/// R-MVP1-7's submit-time envelope override sanity check (`envelope_out_of_
+/// range`): a `turn_cap` of 0 would block a Work before its first turn ever
+/// spawns, so submit refuses it as a structured 400 rather than creating a
+/// Work that can never make progress. The CLI itself does no client-side
+/// zero-check (`sgt run --turns 0` would otherwise reach here unguarded), so
+/// this server-side rejection is the sole enforcement point.
+#[tokio::test]
+async fn r_mvp1_7_a_zero_turn_cap_override_refuses_at_submit() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "a turn cap of zero can never make progress",
+            "envelope": {"turn_cap": 0},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400, "{:?}", resp.text().await);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_envelope");
+
+    let list: Value = http
+        .get(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("list json");
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "a refused submission must create no Work: {list}"
+    );
+    handle.shutdown().await;
+}
+
+/// The same rule's other seam: a `ceiling_secs` of 0 would interrupt a turn
+/// before the completion driver's very first tick could ever see it finish,
+/// so it refuses at submit exactly like a zero `turn_cap` does.
+#[tokio::test]
+async fn r_mvp1_7_a_zero_ceiling_secs_override_refuses_at_submit() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "a ceiling of zero can never let a turn finish",
+            "envelope": {"ceiling_secs": 0},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400, "{:?}", resp.text().await);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_envelope");
+    handle.shutdown().await;
+}
+
 /// The additive-only guarantee, exercised at the boundary it actually
 /// describes: a *pre-existing* journal line — standing in for one a future
 /// binary already wrote, carrying a field `IntentDetail` does not have —
