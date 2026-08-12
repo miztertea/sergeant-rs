@@ -52,7 +52,7 @@ sgt run "add retry handling to the settlement worker"
 sgt run "add retry handling" --backend claude --workflow software-change --repo billing-service
 ```
 
-`run` takes an intent plus optional `--workflow <name>`, `--backend <claude|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), and `--workspace <name>`.
+`run` takes an intent plus optional `--workflow <name>`, `--backend <claude|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), `--group <name>` (a declared estate group, expanded into the same repo selection), `--workspace <name>`, and `--turns <n>`/`--ceiling-secs <n>` (override this one work item's turn envelope instead of the daemon-wide default).
 
 **Watch it** — three equal clients, same daemon state, pick whichever fits:
 
@@ -61,6 +61,7 @@ sgt status              # daemon health + work counts, by state
 sgt work list            # the fleet: id, state, intent
 sgt work show <id>       # one item: stage, execution, surface, output pointer, recent events
 sgt work show <id> --graph   # the work's provenance graph instead of its record
+sgt work transcript <id> # decode the work's conversation from the journal, in causal order
 sgt                       # no subcommand: the TUI — fleet + detail, live over SSE
 sgt web                  # print the dashboard URL (tokenized, loopback-only)
 sgt web --open            # ...and open it in a browser
@@ -93,7 +94,25 @@ sgt analytics blocked_time_per_work  # answer one of them
 sgt doctor
 ```
 
-Checks git, the `claude` CLI (presence and version gate), the data directory, the journal (full validating replay), the analytics projection, the daemon, and the effective permission mode each declared profile launches with — in that order, so a fault is reported under the right name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon (every other command does), because it's diagnosing the installation, not priming it.
+Checks git, the `claude` CLI (presence and version gate), Docker (capability probe), the data directory, the journal (full validating replay), the analytics projection, the daemon, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, and disk pressure inside the data directory — in that order, so a fault is reported under the right name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon (every other command does), because it's diagnosing the installation, not priming it.
+
+**Set up a multi-repo estate** — a directory declaring the repositories and groups a work item can target with `--repo`/`--group`:
+
+```sh
+sgt init                              # scaffold [estate] in sergeant.toml, repos/, .gitignore entries
+sgt repo add <name> --origin <url>    # clone repos/<name> and declare it (origin optional if it's already there)
+sgt repo remove <name>                # undeclare it (refuses while a group still lists it; never deletes repos/<name>)
+sgt repo list                         # declared repositories
+sgt group add <name> <repo>...        # declare or extend a group (mkdir-p semantics)
+sgt group remove <name> [<repo>...]   # drop members, or the whole group with none given
+sgt group list                        # declared groups and their members
+```
+
+**Stop the daemon cleanly** — pauses admission, waits for in-flight work to drain, then shuts down (idempotent):
+
+```sh
+sgt daemon stop
+```
 
 ## Workflows
 
@@ -130,7 +149,7 @@ Full authoring rules — the four-layer context model (workflow orientation, sta
                           └──── work surfaces: git worktrees, one per work ───┘
 ```
 
-Every state change — submit, worktree binding, stage entry, each model turn's raw output, the question the agent asked, your answer — is an event in a crash-tolerant journal (large payloads in a BLAKE3 content-addressed blob store). Everything else — the in-memory work state, the DuckDB analytics tables, the graph projection, every client screen — is a disposable projection rebuilt from it; there is no snapshot loading. The daemon exclusively owns the data directory and every process handle; clients (CLI, TUI, dashboard) hold no state of their own and reach it only through the same loopback HTTP/SSE API — a structural test fails if one gets a private shortcut. A Claude "session" is a durable conversation identity, not a process: the OS process exists per turn, so killing the daemon mid-execution and restarting it resumes on unambiguous evidence, or fails closed into `blocked` with a stated reason — never a guess. Each work item gets its own git worktree on its own branch (`sergeant/<work-id>`), outside your checkout, so agents never fight over a working tree.
+Every state change — submit, worktree binding, stage entry, each model turn's raw output, the question the agent asked, your answer — is an event in a crash-tolerant journal (large payloads in a BLAKE3 content-addressed blob store). Everything else — the in-memory work state, the DuckDB analytics tables, the graph projection, every client screen — is a disposable projection rebuilt from it; there is no snapshot loading. The daemon exclusively owns the data directory and every process handle; clients (CLI, TUI, dashboard) hold no state of their own and reach it only through the same loopback HTTP/SSE API — a structural test fails if one gets a private shortcut. A Claude "session" is a durable conversation identity, not a process: the OS process exists per turn, so killing the daemon mid-execution and restarting it resumes on unambiguous evidence, or fails closed into `blocked` with a stated reason — never a guess. Each work item gets its own git worktree on its own branch (`sergeant/<work-id>`), outside your checkout, so agents never fight over a working tree. A third `Backend` — `docker` — runs `kind = "execute"` workflow stages (pinned, offline containers) rather than agent turns; it isn't user-selectable via `--backend`, since a workflow's own stages declare their kind.
 
 This is a clean-room Rust successor to [callmeradical/sergeant](https://github.com/callmeradical/sergeant) — the Bash/tmux original whose failure modes became this project's regression-test catalog. The architecture is specified in [a full proposal](reference/proposal-depot-rust-execution-surface.md) committed to this repo; the ICM workflow model layered on top of it is specified in [its successor](reference/proposal-next-iteration-icm-workflows.md); every deviation from either is registered with rationale in [GAUNTLET.md](GAUNTLET.md).
 
