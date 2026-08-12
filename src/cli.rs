@@ -97,6 +97,17 @@ enum Command {
         /// Work id to retry.
         id: String,
     },
+    /// R-MVP1-10's exit door for R-MVP1-7's envelope-exhausted `blocked`
+    /// landing: raise a work's turn envelope, then `sgt retry` to actually
+    /// re-enter the stage (extending alone has no effect on its own — it
+    /// only changes what the next retry is checked against).
+    Extend {
+        /// Work id whose envelope is being raised.
+        id: String,
+        /// How many additional turns to allow, on top of whatever this work
+        /// already has (cumulative across repeated extensions).
+        additional_turns: u32,
+    },
     /// Cancel a work item.
     Cancel {
         /// Work id to cancel.
@@ -325,6 +336,23 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 print_json(&result);
             } else {
                 print_work_line("retried", &result);
+            }
+            Ok(())
+        }
+        Command::Extend {
+            id,
+            additional_turns,
+        } => {
+            let client = ensure_daemon(&data_dir).await?;
+            let body = json!({
+                "command_id": ulid::Ulid::generate().to_string(),
+                "additional_turns": additional_turns,
+            });
+            let result = client.post(&format!("/v1/work/{id}/extend"), &body).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_work_line("extended", &result);
             }
             Ok(())
         }

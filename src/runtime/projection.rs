@@ -406,6 +406,16 @@ pub struct WorkRun {
     /// spend, not one attempt's.
     #[serde(default)]
     pub turns_spawned: u32,
+    /// R-MVP1-10's exit door for R-MVP1-7's envelope-exhausted landing
+    /// (`Engine::extend_turn_envelope`): turns added to `Engine::turn_cap`
+    /// for this Work specifically, cumulative across every extension. Zero
+    /// for every Work that has never had its envelope extended — the
+    /// ordinary case, and why this changes no existing test. Never reset by
+    /// a retry, exactly like `turns_spawned` itself: extending the envelope
+    /// is a durable, explicit operator decision about this Work's whole
+    /// life, not a per-attempt allowance.
+    #[serde(default)]
+    pub turn_cap_bonus: u32,
 }
 
 impl WorkRun {
@@ -755,6 +765,22 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 // failed launch never reaches here — see the abandonment
                 // arms above).
                 run.turns_spawned += 1;
+            }
+        }
+        crate::runtime::engine::KIND_TURN_ENVELOPE_EXTENDED => {
+            // R-MVP1-10's exit door: raises the bonus `check_turn_envelope`
+            // adds to `Engine::turn_cap` for this Work, cumulative across
+            // every extension (`Engine::extend_turn_envelope` is the one
+            // commit site). A run with no `runs` entry yet has nothing to
+            // extend — `extend_turn_envelope` never reaches this state
+            // (requires `Blocked`, which requires a run), so `or_default()`
+            // here is defensive, not a real code path.
+            if let (Some(work_id), Some(additional)) = (
+                event.work_id.as_ref(),
+                event.payload["additional_turns"].as_u64(),
+            ) {
+                let run = state.runs.entry(work_id.clone()).or_default();
+                run.turn_cap_bonus = run.turn_cap_bonus.saturating_add(additional as u32);
             }
         }
         KIND_EXECUTION_STOPPED => {

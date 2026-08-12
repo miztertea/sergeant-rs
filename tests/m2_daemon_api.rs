@@ -4256,3 +4256,99 @@ async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
 
     handle.shutdown().await;
 }
+
+/// E3/R-MVP1-10: `retry` alone is the revolving door the finding named —
+/// this proves the *actual* exit door, `extend` + `retry`, genuinely
+/// reopens the room rather than merely opening and re-closing it. Same
+/// fault as the test above (LAUNCH-boundary envelope exhaustion at stage
+/// 06 of a 7-stage workflow against the default 6-turn cap), but this time
+/// the Work is extended by one turn before the retry — the 7th stage must
+/// actually spawn its turn and the whole Work must reach `completed`, not
+/// re-block on the identical condition.
+#[tokio::test]
+async fn r_mvp1_10_extend_then_retry_genuinely_reopens_the_envelope_exhausted_landing() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    const STAGES: usize = 7;
+    const CAP: usize = 6;
+    r_mvp1_10_write_n_stage_workflow(&repo, "long", STAGES);
+
+    let script: Vec<FakeStep> = (0..STAGES).map(|_| FakeStep::complete()).collect();
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "extend past the cap", Some("long")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "blocked", "{body}");
+    let reason = r_mvp1_10_block_reason(data.path(), &work_id);
+    assert_eq!(reason, format!("turn envelope exhausted ({CAP} turns)"));
+
+    // A bare retry (the revolving-door shape the finding named) re-blocks on
+    // the identical condition — proven already by the sibling test above;
+    // this test goes straight to the real door.
+    let (extend_status, _, extend_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/extend"),
+        json!({"command_id": ulid(), "additional_turns": 1}),
+    )
+    .await;
+    assert_eq!(extend_status, reqwest::StatusCode::OK, "{extend_body}");
+    // Extending alone has no effect on Work state — it only changes what the
+    // next retry is checked against.
+    assert_eq!(extend_body["work"]["state"], "blocked", "{extend_body}");
+
+    let (retry_status, _, retry_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(retry_status, reqwest::StatusCode::OK, "{retry_body}");
+    assert_eq!(
+        retry_body["work"]["state"], "completed",
+        "the extended envelope must let the 7th stage's turn actually spawn \
+         and the whole (7-stage) workflow finish, not re-block on the same \
+         exhausted condition: {retry_body}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Extending a Work that is not `blocked` refuses — extending an envelope
+/// means nothing for a Work that is not stopped at one, and the refusal
+/// must be structured (409, naming the actual state), not a silent no-op.
+#[tokio::test]
+async fn r_mvp1_10_extend_refuses_a_work_that_is_not_blocked() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "finishes clean", Some("one")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    let (status, _, extend_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/extend"),
+        json!({"command_id": ulid(), "additional_turns": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{extend_body}");
+    assert_eq!(extend_body["error"]["code"], "not_blocked", "{extend_body}");
+
+    handle.shutdown().await;
+}

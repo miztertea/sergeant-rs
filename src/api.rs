@@ -389,6 +389,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/work/{id}/cancel", post(cancel_work))
         .route("/work/{id}/input", post(work_input))
         .route("/work/{id}/retry", post(work_retry))
+        .route("/work/{id}/extend", post(work_extend))
         .route("/graph/work/{id}", get(work_graph))
         .route("/analytics", get(analytics_index))
         .route("/analytics/{name}", get(analytics_query))
@@ -725,6 +726,7 @@ fn engine_error_status(e: &EngineError) -> StatusCode {
         EngineError::Core(_) => StatusCode::INTERNAL_SERVER_ERROR,
         EngineError::NotAwaitingInput { .. }
         | EngineError::NotRetryable { .. }
+        | EngineError::NotBlocked { .. }
         | EngineError::IllegalTransition { .. } => StatusCode::CONFLICT,
         EngineError::NoRun { .. } => StatusCode::NOT_FOUND,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -1682,6 +1684,72 @@ async fn work_retry(
                 &mut core,
                 &req.command_id,
                 "work.retry",
+                Some(&id),
+                status,
+                result,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendRequest {
+    command_id: String,
+    additional_turns: u32,
+}
+
+/// `POST /v1/work/{id}/extend` — R-MVP1-10's exit door for R-MVP1-7's
+/// envelope-exhausted landing (`Engine::extend_turn_envelope`). A pure
+/// commit, unlike `retry`: raising the envelope has no external effect of
+/// its own, so there is nothing to crank — `retry` afterward is what
+/// actually re-enters the stage.
+async fn work_extend(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Result<Json<ExtendRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = CoreGuard::acquire(&state.core).await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if !core.registry.state().works.contains_key(&id) {
+        let result = error_body("work_not_found", format!("no work with id {id}"));
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.extend",
+            None,
+            StatusCode::NOT_FOUND,
+            result,
+        );
+    }
+    let engine = state.engine.clone();
+    match engine.extend_turn_envelope(&mut core, &id, req.additional_turns) {
+        Ok(()) => {
+            let result = work_view(&core, &id);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.extend",
+                Some(&id),
+                StatusCode::OK,
+                result,
+            )
+        }
+        Err(e) => {
+            let status = engine_error_status(&e);
+            let result = engine_error_body(&e);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.extend",
                 Some(&id),
                 status,
                 result,

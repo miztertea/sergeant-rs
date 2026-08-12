@@ -669,6 +669,18 @@ pub enum EngineError {
         /// Work id.
         work_id: String,
     },
+    /// R-MVP1-10's exit door (`Engine::extend_turn_envelope`) was asked for
+    /// a work that is not `blocked` — extending an envelope only means
+    /// something for a Work actually stopped at one.
+    #[error(
+        "work {work_id} is {state}, not blocked; nothing here needs its turn envelope extended"
+    )]
+    NotBlocked {
+        /// Work id.
+        work_id: String,
+        /// Its actual state.
+        state: WorkState,
+    },
     /// A run references a backend the daemon does not have registered.
     #[error("work {work_id} routed to backend {backend:?}, which is not registered here")]
     BackendMissing {
@@ -725,6 +737,7 @@ impl EngineError {
             EngineError::NotAwaitingInput { .. } => "not_awaiting_input",
             EngineError::NotRetryable { .. } => "not_retryable",
             EngineError::NoRun { .. } => "no_run",
+            EngineError::NotBlocked { .. } => "not_blocked",
             EngineError::BackendMissing { .. } => "backend_missing",
             EngineError::NoSuchStage { .. } => "no_such_stage",
             EngineError::AskCapabilityUnavailable { .. } => "ask_capability_unavailable",
@@ -747,6 +760,18 @@ impl EngineError {
 /// ignored" rule (`runtime::projection`'s own doc comment) means an
 /// unrecognized kind costs no projection change to introduce.
 pub const KIND_TURN_CEILING_INTERRUPTED: &str = "execution.turn_ceiling_interrupted";
+
+/// Event kind: R-MVP1-10's exit door for R-MVP1-7's envelope-exhausted
+/// landing (`Engine::extend_turn_envelope`) — an explicit, journaled
+/// operator decision raising this Work's turn envelope by some number of
+/// additional turns, cumulative across every extension. Unlike
+/// `KIND_TURN_CEILING_INTERRUPTED` above, this one *is* folded —
+/// `runtime::projection`'s reducer applies it to `WorkRun::turn_cap_bonus`,
+/// because changing what `check_turn_envelope` compares against is the
+/// whole point: `retry` alone re-blocks on the identical, unchangeable
+/// condition (the revolving-door defect this closes), so the door has to
+/// change the condition itself, not just ask again.
+pub const KIND_TURN_ENVELOPE_EXTENDED: &str = "execution.turn_envelope_extended";
 
 /// R-MVP1-7's default turn cap: the largest measured single turn on this
 /// build's evidence is Run B2's $3.21 (`GAUNTLET.md`'s N-series close-out,
@@ -1527,6 +1552,51 @@ impl Engine {
     pub fn retry(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
         let step = self.begin_retry(core, work_id)?;
         self.run_inline(core, step)
+    }
+
+    /// R-MVP1-10's exit door for R-MVP1-7's envelope-exhausted landing:
+    /// raise this Work's turn envelope by `additional_turns`, journaled
+    /// (`KIND_TURN_ENVELOPE_EXTENDED`) and cumulative across every call.
+    ///
+    /// `retry` alone is a revolving door for this landing: `WorkRun::
+    /// turns_spawned` is cumulative and never reset by a retry, and
+    /// `Engine::turn_cap` has no per-Work setter, so re-entering the stage
+    /// re-checks the identical, unchangeable condition and re-blocks
+    /// immediately (`check_turn_envelope`'s own doc). This is the door that
+    /// actually changes the condition: `check_turn_envelope` compares
+    /// against `turn_cap + turn_cap_bonus`, so a `retry` issued after this
+    /// call can spawn the next turn instead of re-blocking on the same one.
+    ///
+    /// Legal only from `blocked` — extending an envelope means nothing for
+    /// a Work that is not stopped at one, and every landing this door is
+    /// meant to open is one, by construction (`check_turn_envelope` always
+    /// blocks before returning `Ok(false)`).
+    pub fn extend_turn_envelope(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        additional_turns: u32,
+    ) -> Result<(), EngineError> {
+        let state = self.work_state(core, work_id)?;
+        if state != WorkState::Blocked {
+            return Err(EngineError::NotBlocked {
+                work_id: work_id.to_string(),
+                state,
+            });
+        }
+        // A run must exist to extend: the envelope-exhausted landing this
+        // door targets always has one (`check_turn_envelope` only ever runs
+        // inside an active stage), so a `blocked` Work with none is some
+        // other landing this door was never meant to touch — `self.run`
+        // fails closed with `NoRun` rather than journal an extension
+        // nothing will ever read.
+        self.run(core, work_id)?;
+        self.commit(
+            core,
+            work_id,
+            KIND_TURN_ENVELOPE_EXTENDED,
+            json!({"additional_turns": additional_turns}),
+        )
     }
 
     /// [`Engine::retry`]'s first phase (see [`Engine::begin_start`]).
@@ -2442,11 +2512,16 @@ impl Engine {
         work_id: &str,
         stage_id: &str,
     ) -> Result<bool, EngineError> {
-        let spawned = self.run(core, work_id)?.turns_spawned;
-        if spawned < self.turn_cap {
+        let run = self.run(core, work_id)?;
+        // R-MVP1-10's exit door: an explicit `extend_turn_envelope` raises
+        // the effective cap for this Work specifically, cumulative across
+        // every extension. Zero for a Work that was never extended, so this
+        // is exactly `self.turn_cap` for the ordinary case.
+        let effective_cap = self.turn_cap.saturating_add(run.turn_cap_bonus);
+        if run.turns_spawned < effective_cap {
             return Ok(true);
         }
-        let reason = format!("turn envelope exhausted ({} turns)", self.turn_cap);
+        let reason = format!("turn envelope exhausted ({effective_cap} turns)");
         self.commit(
             core,
             work_id,
