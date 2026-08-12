@@ -1741,6 +1741,17 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
             .all(|e| e["source_seq"].is_number()),
         "every edge carries provenance in the JSON form too: {as_json}"
     );
+
+    // W8: `work show`'s human form must render the output pointer too — the
+    // API's `output` key names, per repository, the retained branch,
+    // worktree path and finalize commit; before this fix cli.rs's key
+    // whitelist silently dropped it (and `teardown`) from the printed
+    // record.
+    let shown = sgt(&data, &["work", "show", &work_id]);
+    assert!(
+        shown.contains("retained_branch") && shown.contains(&format!("sergeant/{work_id}")),
+        "`sgt work show` (human form) must render the output pointer's retained branch: {shown}"
+    );
 }
 
 /// Run `sgt` against a data dir, returning stdout (the CLI spawns and reuses

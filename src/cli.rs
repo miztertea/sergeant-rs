@@ -372,7 +372,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         // folded into `state` — stage is orthogonal (§10).
                         let mut work = result["work"].clone();
                         if let Some(object) = work.as_object_mut() {
-                            for key in ["stage", "surface", "execution", "workflow", "backend"] {
+                            for key in [
+                                "stage", "surface", "execution", "workflow", "backend", "output",
+                                "teardown",
+                            ] {
                                 if !result[key].is_null() {
                                     object.insert(key.to_string(), result[key].clone());
                                 }
