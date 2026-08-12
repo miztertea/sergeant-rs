@@ -4217,6 +4217,7 @@ fn r1_worker_reports_done_but_native_session_stays_alive() {
         native: NativeState::Running,
         signal: BackendSignal::StageCompleted { summary: None },
         ignores_stop: true, // the session that will not die
+        settle: 0,
     };
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [step]);
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
@@ -7425,6 +7426,139 @@ fn n30_two_observations_of_one_finished_turn_complete_the_stage_once() {
         1,
         "a second teardown would re-run git on a retired surface: {:?}",
         kinds_of(&core, work_id)
+    );
+}
+
+// --------------- R-MVP1-8: the fake backend's settle-delay instrument
+//
+// Before this, the fake had no in-flight turn at all for a step that
+// finishes: `launch`'s own OBSERVE (`PendingLaunch::perform`, "launch-settle")
+// saw the terminal signal on the very next call, so no test could ever stand
+// between "a turn was spawned" and "the turn finished" for a turn that does
+// finish — the exact interval issue #46's 45-minute stall lived in, and the
+// interval R-MVP1-7's turn envelope legislates over. `FakeStep::settle(k)`
+// makes that interval reproducible: the first `k` OBSERVEs after the launch
+// or send that spawned the step report a bare `Running` turn-in-progress
+// signal, and only the `k+1`th reveals the step's real native/signal.
+
+/// The contract's own pin: a `k=2` step reports `Running` twice — once at
+/// launch-settle, once at the completion driver's first poll — and completes
+/// only on the driver's *second* poll, never inside launch-settle itself.
+///
+/// This is `park_with_a_live_turn`'s shape with one substitution: a settling
+/// `complete()` step stands in for `hang()`, so unlike every earlier test in
+/// this section the turn genuinely finishes — it just does not say so yet.
+#[test]
+fn r_mvp1_8_a_k2_settle_reports_running_twice_then_completes_via_the_completion_driver() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete().settle(2)]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01MVP18SETTLE1";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    // Launch-settle: LAUNCH plus its own immediate OBSERVE, together
+    // (`PendingLaunch::perform`). This is settle tick 1 of 2 — it must NOT
+    // see the scripted completion.
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle launch");
+    step.deferred.wait();
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Active,
+        "settle tick 1 of 2: launch-settle's own observation must still \
+         report Running, or this test is measuring the pre-R-MVP1-8 fake"
+    );
+    assert!(
+        events_of(&core, work_id, "stage.completed").is_empty(),
+        "settle tick 1 of 2 must not have completed the stage"
+    );
+
+    // The completion driver's first poll — settle tick 2 of 2. Still Running:
+    // the whole point is that launch-settle alone can never exhaust a k=2
+    // window.
+    let mut due = engine.due_observations(&core);
+    assert_eq!(
+        due.len(),
+        1,
+        "an active run with a live execution is due an observation: {due:?}"
+    );
+    let pending = due.remove(0);
+    let outcome = pending.perform();
+    let step = engine
+        .settle_observe(&mut core, pending, outcome)
+        .expect("settle observe");
+    step.deferred.wait();
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Active,
+        "settle tick 2 of 2 must still report Running"
+    );
+    assert!(
+        events_of(&core, work_id, "stage.completed").is_empty(),
+        "settle tick 2 of 2 must not have completed the stage either"
+    );
+
+    // The driver's second poll: the settle window is spent, so the real
+    // scripted signal is now visible and the stage completes.
+    let mut due = engine.due_observations(&core);
+    assert_eq!(
+        due.len(),
+        1,
+        "still due once the settle window exhausts: {due:?}"
+    );
+    let pending = due.remove(0);
+    let outcome = pending.perform();
+    let step = engine
+        .settle_observe(&mut core, pending, outcome)
+        .expect("settle observe");
+    step.deferred.wait();
+    assert_eq!(
+        events_of(&core, work_id, "stage.completed").len(),
+        1,
+        "the settle window is spent: the stage must complete on this \
+         observation, and exactly once: {:?}",
+        kinds_of(&core, work_id)
+    );
+}
+
+/// `k = 0` is the default and must stay today's behaviour byte-for-byte: the
+/// scripted signal is visible on launch-settle's own OBSERVE, with no
+/// completion-driver poll needed at all. This is the pin for "no existing
+/// test changes" — every other fake-backend test in this file relies on
+/// exactly this.
+#[test]
+fn r_mvp1_8_k0_is_the_unchanged_default_scripted_signal_visible_at_launch_settle() {
+    let data = TempDir::new().expect("tempdir");
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let engine = Engine::new(Arc::new(registry), None, data.path());
+    let mut core = core(data.path());
+    let work_id = "01MVP18SETTLE0";
+    journal_blocked_run(&mut core, work_id, FAKE_BACKEND_NAME, data.path());
+
+    let step = engine.begin_retry(&mut core, work_id).expect("begin retry");
+    let pending = advance_to_launch(&engine, &mut core, step);
+    let outcome = pending.perform();
+    let step = engine
+        .settle_launch(&mut core, pending, outcome)
+        .expect("settle launch");
+    step.deferred.wait();
+
+    assert_eq!(
+        events_of(&core, work_id, "stage.completed").len(),
+        1,
+        "k=0 must complete on launch-settle's own observation, unchanged: {:?}",
+        kinds_of(&core, work_id)
+    );
+    assert_eq!(
+        core.registry.state().works[work_id].state,
+        WorkState::Completed
     );
 }
 

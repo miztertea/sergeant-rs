@@ -73,6 +73,12 @@ pub struct FakeStep {
     pub signal: BackendSignal,
     /// Whether the native context ignores STOP (a hang).
     pub ignores_stop: bool,
+    /// R-MVP1-8's settle delay: the number of OBSERVEs, counted from the
+    /// launch or send that spawned this step, that report `Running` before
+    /// this step's real native/signal become visible. `0` (the default) is
+    /// today's behaviour — the scripted signal is visible on the very next
+    /// OBSERVE — so no existing script changes meaning.
+    pub settle: u32,
 }
 
 impl FakeStep {
@@ -129,6 +135,7 @@ impl FakeStep {
             native: NativeState::Running,
             signal: BackendSignal::Running,
             ignores_stop: true,
+            settle: 0,
         }
     }
 
@@ -141,11 +148,23 @@ impl FakeStep {
         self
     }
 
+    /// R-MVP1-8: report `Running` for the first `k` OBSERVEs after the
+    /// launch or send that spawns this step, before this step's own
+    /// native/signal become visible. `k = 0` is the no-op default — this
+    /// method exists so a test can stand between "a turn was spawned" and
+    /// "the turn finished" for a turn that *does* finish, the interval the
+    /// fake had no way to model before.
+    pub fn settle(mut self, k: u32) -> Self {
+        self.settle = k;
+        self
+    }
+
     fn running(signal: BackendSignal) -> Self {
         Self {
             native: NativeState::Running,
             signal,
             ignores_stop: false,
+            settle: 0,
         }
     }
 }
@@ -226,6 +245,12 @@ struct FakeExecution {
     step: FakeStep,
     inputs: Vec<String>,
     stopped: bool,
+    /// R-MVP1-8: OBSERVEs remaining that must report `Running` before
+    /// `step`'s own native/signal become visible. Set from `step.settle`
+    /// whenever `step` is assigned by LAUNCH or SEND (the spawn points);
+    /// left untouched by the out-of-band restart/ask mutators, which are
+    /// not spawn events.
+    settle_remaining: u32,
 }
 
 #[derive(Debug)]
@@ -688,6 +713,7 @@ impl Backend for FakeBackend {
             prepared.execution_id.clone(),
             FakeExecution {
                 native_id: native_id.clone(),
+                settle_remaining: step.settle,
                 step,
                 inputs: Vec::new(),
                 stopped: false,
@@ -715,6 +741,7 @@ impl Backend for FakeBackend {
             .expect("presence checked above");
         execution.inputs.push(input.to_string());
         execution.step = step;
+        execution.settle_remaining = execution.step.settle;
         Ok(())
     }
 
@@ -725,13 +752,30 @@ impl Backend for FakeBackend {
         self.observe_gate.pass();
         let mut state = self.lock();
         state.observations.push(handle.execution_id.clone());
-        let execution = self.resolve(&state, handle)?;
+        // Identity check first, exactly as SEND does: a handle that does not
+        // resolve must not consume a settle tick either.
+        self.resolve(&state, handle)?;
+        let execution = state
+            .executions
+            .get_mut(&handle.execution_id)
+            .expect("presence checked above");
+        // R-MVP1-8: the first `settle_remaining` OBSERVEs after the spawning
+        // launch/send report a bare `Running` turn-in-progress signal; the
+        // scripted native/signal become visible only once the window is
+        // spent. This is what lets a test stand between "turn spawned" and
+        // "turn finished" for a turn that finishes.
+        let (native, signal) = if execution.settle_remaining > 0 {
+            execution.settle_remaining -= 1;
+            (NativeState::Running, BackendSignal::Running)
+        } else {
+            (execution.step.native, execution.step.signal.clone())
+        };
         Ok(Observation {
-            native: execution.step.native,
-            signal: execution.step.signal.clone(),
+            native,
+            signal,
             evidence: Some(format!(
                 "fake backend: native={}, stopped={}",
-                execution.step.native.as_str(),
+                native.as_str(),
                 execution.stopped
             )),
         })
