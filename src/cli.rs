@@ -780,6 +780,7 @@ mod doctor {
     use crate::backend::claude::{
         CLAUDE_BIN_ENV, ClaudeBackend, ClaudeConfig, MIN_TRUSTED_VERSION,
     };
+    use crate::backend::docker::{self, DockerBackend, DockerConfig};
     use crate::daemon;
     use crate::runtime::analytics::Analytics;
     use crate::runtime::journal::Journal;
@@ -916,6 +917,7 @@ mod doctor {
         let mut checks = vec![
             git_check(),
             claude_check(data_dir),
+            docker_check(data_dir),
             data_dir_check(data_dir),
         ];
         // The journal is the only durable fact in the installation, so it is
@@ -927,6 +929,11 @@ mod doctor {
         checks.push(projection_check(data_dir, journal_ok));
         checks.push(daemon_check(data_dir).await);
         checks.push(permission_mode_check(data_dir));
+        // N4/#23 (retention Rule B): disk pressure inside the data dir. Runs
+        // after everything above regardless of their outcome — knowing "is
+        // this installation about to run out of disk" does not depend on the
+        // daemon, the journal, or Docker being reachable.
+        checks.push(disk_pressure_check(data_dir));
         Report {
             data_dir: data_dir.to_path_buf(),
             checks,
@@ -1042,6 +1049,112 @@ mod doctor {
                     MIN_TRUSTED_VERSION.0, MIN_TRUSTED_VERSION.1, MIN_TRUSTED_VERSION.2
                 ),
             )
+        }
+    }
+
+    /// N4/§17.4: whether the local Docker Engine is reachable at all — the
+    /// cheap probe `Engine::bind_stages` also runs on every submission
+    /// touching an execute stage, surfaced here the same "doctor asks the
+    /// adapter, never keeps a second copy of its rule" way `claude_check`
+    /// does. `Warn`, not `Fail`: §17.5 makes an execute-workflow submission
+    /// the thing that actually refuses when Docker is unavailable, and an
+    /// actor-only installation is fully healthy without it — this row exists
+    /// so an operator can tell *why* an execute submission would be refused
+    /// before trying one.
+    fn docker_check(data_dir: &Path) -> Check {
+        let backend = match DockerBackend::new(DockerConfig::new(data_dir)) {
+            Ok(backend) => backend,
+            Err(e) => {
+                return Check::warn(
+                    "docker",
+                    format!("could not initialize the Docker adapter: {e}"),
+                    "check that the data dir is writable; this is the same failure data_dir \
+                     would report",
+                );
+            }
+        };
+        let report = backend.probe();
+        let detail = report
+            .detail
+            .unwrap_or_else(|| "no detail reported".to_string());
+        if report.available {
+            Check::ok("docker", detail)
+        } else {
+            Check::warn(
+                "docker",
+                detail,
+                "install Docker and make sure this user can reach its socket (the `docker` \
+                 group on Linux); until then only actor-only workflows can run — a workflow \
+                 with a `kind = \"execute\"` stage is refused at submit, before any Work exists",
+            )
+        }
+    }
+
+    /// N4/#23 (retention Rule B): data-dir size, the blob store's share of
+    /// it, and headroom on the filesystem it lives on. Runs regardless of
+    /// Docker's availability — this is a core disk concern (the blob store
+    /// exists independent of any execute stage ever running), folded into
+    /// this module because Docker-captured stdout/stderr is the evidence
+    /// class most likely to grow it fast (§16.9, §22.8).
+    fn disk_pressure_check(data_dir: &Path) -> Check {
+        let report = docker::measure_disk_pressure(data_dir);
+        let detail = format!(
+            "data dir {} ({} blobs), {}",
+            human_bytes(report.data_dir_bytes),
+            human_bytes(report.blob_bytes),
+            match report.free_bytes {
+                Some(free) => format!("{} free on its filesystem", human_bytes(free)),
+                None => "free space could not be measured on this platform".to_string(),
+            }
+        );
+        const FAIL_BELOW: u64 = 100 * 1024 * 1024; // 100 MiB: imminent and actionable
+        const WARN_BELOW: u64 = 1024 * 1024 * 1024; // 1 GiB
+        match report.free_bytes {
+            Some(free) if free < FAIL_BELOW => Check::fail(
+                "disk_pressure",
+                detail,
+                format!(
+                    "free {} disk space urgently — the data dir has {} of headroom left; the \
+                     blob store never deletes on its own (no blob GC this milestone), so freeing \
+                     space elsewhere on the same filesystem is the only lever today",
+                    human_bytes(WARN_BELOW),
+                    human_bytes(free)
+                ),
+            ),
+            Some(free) if free < WARN_BELOW => Check::warn(
+                "disk_pressure",
+                detail,
+                format!(
+                    "only {} free on the data dir's filesystem; watch it, especially if \
+                     execute-stage workflows are capturing large output (§22.8)",
+                    human_bytes(free)
+                ),
+            ),
+            Some(_) => Check::ok("disk_pressure", detail),
+            None => Check::warn(
+                "disk_pressure",
+                detail,
+                "free space could not be measured on this platform (no `df`); watch data dir \
+                 growth manually",
+            ),
+        }
+    }
+
+    /// Render a byte count the way an operator reading a terminal wants it,
+    /// not the raw integer `disk_pressure_check`'s JSON already carries
+    /// losslessly.
+    fn human_bytes(bytes: u64) -> String {
+        const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+        let mut value = bytes as f64;
+        let mut unit = 0;
+        while value >= 1024.0 && unit < UNITS.len() - 1 {
+            value /= 1024.0;
+            unit += 1;
+        }
+        if unit == 0 {
+            format!("{bytes} {}", UNITS[unit])
+        } else {
+            format!("{value:.1} {}", UNITS[unit])
         }
     }
 

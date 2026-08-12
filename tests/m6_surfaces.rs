@@ -1162,11 +1162,13 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         vec![
             "git",
             "claude",
+            "docker",
             "data_dir",
             "journal",
             "projection",
             "daemon",
-            "permission_mode"
+            "permission_mode",
+            "disk_pressure",
         ],
         "the --json check list and its order are the stable part of this contract"
     );
