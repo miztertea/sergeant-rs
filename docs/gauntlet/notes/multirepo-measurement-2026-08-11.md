@@ -265,3 +265,28 @@ Scratch tree, disposable, not committed:
 Both scratch daemons were stopped (`SIGTERM`) and `pgrep -af
 "sergeant-rs/target/debug/sgt [-]-data-dir"` was empty after — no leaked
 process from this measurement.
+
+## Addendum, MVP-1 fixer pass (2026-08-12) — I2
+
+Open Item 1's stated blocker ("R-MVP1-7 ... is not built yet") is gone:
+R-MVP1-7's turn envelope landed (commit `9b24742`, before this fixer pass),
+and this pass itself added its exit door (R-MVP1-10's `extend_turn_envelope`)
+and its production config surface (`SGT_TURN_CAP`). The re-measure Open Item
+1 asks for is genuinely unblocked now.
+
+**Not run in this pass.** "One bounded real-Claude turn inside R-MVP1-7's
+envelope" spends real tokens (`SERGEANT_CLAUDE_TESTS=1`'s own opt-in
+condition, CLAUDE.md), and a fixer pass closing review findings is not
+authorization to spend them unilaterally — that call belongs to whoever
+scopes the token budget for this milestone. This addendum exists so the
+unblocking is on record and the remaining gap is a deliberate, named
+decision (L15: a transmitted claim carries its evidence or is a labeled
+hypothesis) rather than a silently stale "not built yet."
+
+**Recommended next step**, when someone allocates the spend: repeat this
+note's own scenario (two-repo `sgt run --repo a --repo b`) with a real
+`claude` turn substituted for the fake backend's scripted completion, inside
+`DEFAULT_TURN_CAP`'s envelope, recording whether the actor's own
+`execution_cwd` actually reached both worktrees (Open Item 1's "structural,
+not demonstrated" gap) — the same six columns this note's table already
+tracks, this time with a live column to fill in rather than "structural".

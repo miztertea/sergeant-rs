@@ -45,6 +45,120 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### MVP-1 FIXER PASS — 2026-08-12, panel findings closed (I6)
+
+**Mission outcome.** Fixer pass over the MVP-1 build-panel review: 20
+CONFIRMED findings, 1 PLAUSIBLE, 1 mutation-probe SURVIVOR — every one closed
+or refuted with evidence, nothing silently dropped. Gates green (`cargo fmt
+--check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, repeated
+across runs, not single-run — L7); `pgrep -af "sergeant-rs/target/debug/sgt
+[-]-data-dir"` empty after every commit in this pass.
+
+**Errors closed.** E1 (`DEFAULT_TURN_CAP` 6→12, evidence-grounded in this
+repo's own longest admitted workflow's stage count, plus a real production
+config surface — `DaemonConfig::turn_cap`/`SGT_TURN_CAP`, the same pattern
+`turn_ceiling`/`surfaces_root` already use); E2/TH-02 (R-MVP1-2's shared
+finalize helper generalized to `.sergeant/lib/finalize.py`, repo-to-icm's own
+copy now a thin back-compat wrapper, R-MVP1-2's own L7 pin now has a real
+test); E3 (R-MVP1-10's exit door for the envelope-exhausted landing —
+`Engine::extend_turn_envelope`, `KIND_TURN_ENVELOPE_EXTENDED`,
+`POST /v1/work/{id}/extend`, `sgt extend` — `retry` alone was a revolving
+door; `extend` then `retry` now genuinely reopens the room).
+
+**Warnings closed.** W1/W2/TH-01/TH-09 (the fleet view — `GET /v1/work` —
+bypassed R-MVP1-9's re-derivation entirely for evicted works, and the
+re-derivation path itself replayed the *whole* journal per view; both fixed
+by a bounded (`TERMINAL_RUN_CACHE_CAPACITY = 512`), LRU-evicted
+`WorkRegistry::terminal_runs` cache populated at eviction time — flat under
+churn beyond its own bound, unlike an unbounded cache would be); W3
+(`SGT_SURFACES_DIR` now actually read, `Engine::with_surfaces_root` had zero
+production callers before this); W4 (the estate-discovery upward walk now
+bounded at an explicit `--data-dir`/`SGT_DATA_DIR` scope too, not only
+`$HOME`); W5 (a legacy-vocabulary or malformed `sergeant.toml` the walk steps
+over on the way up now fails the whole walk closed, matching R-MVP1-3's named
+refusal, instead of being silently skipped); W6 (`due_interrupts`'s doc
+corrected — it is not side-effect-free, it destructively dequeues — and the
+driver's interrupt-delivery loop no longer abandons an already-dequeued entry
+on a shutdown race); W7 (doc-only: the AGENTS.md identity hash is measured
+true only for `local`, which cannot currently reach a launch — `suppress`,
+the shipped default, hashes a file the adapter does not read); W8 (`sgt work
+show`'s human form now renders `output`/`teardown`, previously dropped by
+cli.rs's own key whitelist).
+
+**Info findings closed.** I1 (folded into E1 — the new default is evidence-
+grounded, not measured against live N-series turns; that gap is named
+honestly in the constant's own doc and here); I2 (addendum to
+`docs/gauntlet/notes/multirepo-measurement-2026-08-11.md`: its stated blocker
+is gone now that R-MVP1-7 has landed, but the actual real-Claude re-measure
+was not run in this pass — spending real tokens is not something a fixer
+pass authorizes itself); I3 (`IntentDetail::is_empty`, previously dead code,
+now normalizes an empty `intent_detail: {}` to absent at submit;
+`group`'s non-validation documented in place as R-MVP1-5(b)'s own scope, not
+a gap); I4 (`run_is_settled` gained the third eviction-safety condition —
+`surface_plan` recorded but `surface` not yet materialized — closing the
+cancel-during-materialize race the doc already claimed was covered); this
+entry (I6 — the ledger entry and evidence trail I6 itself named as missing).
+I5 (PLAUSIBLE) investigated: found and reaped a real, currently-running
+orphan daemon on this host (`sgt daemon --data-dir /tmp/sgt-demo-*`, PPID 1,
+its own data dir already deleted) — confirms the underlying concern
+(build-lane daemons do leak on this host) with independent evidence, though
+not the specific PID/path originally reported. Worth flagging structurally:
+this daemon's argv (`sgt daemon --data-dir <dir>`, subcommand before the
+flag) does not match the mandated bracketed leak-check pattern
+(`sgt [-]-data-dir`, which assumes the flag immediately follows the binary
+name) — a real blind spot in that convention, not fixed here (out of this
+pass's scope; flagged for whoever owns the housekeeping loop next).
+
+**Test-honesty findings closed.** TH-01/TH-02/TH-09 above; TH-03 (a standing
+hygiene gate — `no_committed_sergeant_toml_outside_reference_carries_
+legacy_vocabulary` — replaces the one-time manual grep R-MVP1-3's pin relied
+on); TH-05 (the ceiling test's budget was 37x its own claimed bound, and its
+`outcome.requested` assertion was vacuous on both `settle_interrupt` arms —
+both fixed); TH-06 (the `grilling` declaration pin now uses
+`CARGO_MANIFEST_DIR`, fails closed instead of silently `SKIPPED`ing outside
+the checkout root); TH-07 (the R-MVP1-1 in-checkout guard test now names the
+actual refusal diagnostic instead of a bare state check, and
+`surface.planned`'s own `root` is pinned); TH-10 (widened the settle margin
+in the real-backend-refusal fault test — a genuine, not merely theoretical,
+scheduling race with the completion driver); TH-11 (R-MVP1-11's refusal now
+pinned through a real HTTP submit, matching its R-MVP1-4 siblings); TH-12
+(`intent_detail.repos`'s intentional inertness when `repositories` is absent
+now has a test in each direction); TH-13 (two broken intra-doc links fixed).
+
+**SURVIVOR strengthened.** `no_estate_anywhere_falls_back_to_zero_config_
+unchanged`'s own fixture now includes a non-estate `sergeant.toml` above
+`root`, so the named mutation (the estate-table check dropped from the
+walk's match predicate) actually reaches a file and the test now kills it —
+verified directly, not merely re-attributed to the sibling test that already
+caught it.
+
+**What this pass did not do.** A live-Claude re-measure for I2 (see above);
+retrofitting every admitted workflow's own closing stage to invoke the
+shared finalize helper (E2's own boundary: "Owner: workflow content" per
+R-MVP1-2 itself — core's job was the shared helper and the pointer, both
+done); a dedicated deterministic regression test for W6's shutdown-drop
+race specifically (fixed and verified by code inspection — the only
+`closing` check that could discard an already-dequeued interrupt is the one
+removed — but a reliable timing-controlled test for it was judged not worth
+the flakiness risk, TH-10's own class of hazard). B4 (the backlog row for
+R-MVP1-10's *pending*-origin landing) is untouched by this pass's E3 fix,
+which closed the *envelope-exhausted* landing specifically — B4 remains
+open, its own trigger unfired.
+
+**Deviation note (R-MVP1-2 / NORTH-STAR).** Already self-documented at
+`NORTH-STAR.md`'s own amendment line (2026-08-11, "R-MVP1-2 held:
+promote/finalize EXECUTION is workflow content... only the pointer is
+core") per that document's own "amended in place with a dated entry"
+convention — not duplicated into this file's deviation register, which is
+scoped to departures from `reference/proposal-depot-rust-execution-surface.md`
+specifically, a different governing document. The schema break (R-MVP1-3's
+`[workspace]`/`[[repository]]` → `[estate]`/`[[repo]]` rename) is likewise
+self-evident from the migration itself (`WorkspaceError::LegacyVocabulary`,
+the fixtures, TH-03's new standing gate above) rather than a second written
+record.
+
+---
+
 ### CERBERUS DAY 2 — 2026-08-11, direction: North Star adjudicated, MVP plan triple-reviewed, goal prompt cut
 
 **Mission outcome.** Adjudication day, zero engine code. (1) Retention
