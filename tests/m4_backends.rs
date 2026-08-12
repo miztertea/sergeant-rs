@@ -805,6 +805,7 @@ fn start_request(
         context: String::new(),
         model: model.map(str::to_string),
         profile: None,
+        execute: None,
     }
 }
 
@@ -1991,8 +1992,18 @@ async fn the_capability_probe_is_journaled_at_registration() {
         .map(|e| e.expect("event"))
         .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
         .collect();
-    assert_eq!(probed.len(), 1, "one record per registered backend");
-    let payload = &probed[0].payload;
+    // One record per registered backend: claude (this test's subject) and
+    // docker (N4 — `start_with` always registers it alongside claude, same
+    // as claude is added here even though this test's registry started
+    // empty). Located by name rather than trusted-by-index, so this stays
+    // correct regardless of how many backends a future adapter adds the
+    // same way.
+    assert_eq!(probed.len(), 2, "one record per registered backend");
+    let claude_probed = probed
+        .iter()
+        .find(|e| e.payload["backend"] == CLAUDE_BACKEND_NAME)
+        .expect("a backend.probed record for claude");
+    let payload = &claude_probed.payload;
     assert_eq!(payload["backend"], CLAUDE_BACKEND_NAME);
     assert_eq!(payload["available"], false);
     let detail = payload["detail"].as_str().expect("probe detail recorded");
@@ -5886,6 +5897,7 @@ fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
         context: "c".to_string(),
         model: None,
         profile: None,
+        execute: None,
     };
     let handle = fake.start(&request).expect("start");
     assert_eq!(
@@ -6189,6 +6201,7 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
             .to_string(),
         model: Some("claude-haiku-4-5-20251001".to_string()),
         profile: None,
+        execute: None,
     };
     let handle = backend.start(&request).expect("start");
 
@@ -6327,6 +6340,7 @@ fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mo
             .to_string(),
         model: Some("claude-haiku-4-5-20251001".to_string()),
         profile: None,
+        execute: None,
     };
     let handle = backend.start(&request).expect("start");
     let observation = wait_settled(&backend, &handle, Duration::from_secs(180));
@@ -6618,6 +6632,7 @@ fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
                 context: "c".to_string(),
                 model: None,
                 profile: None,
+                execute: None,
             })
             .expect("prepare");
         fake.launch(&prepared).expect("launch");
@@ -6713,6 +6728,7 @@ fn n13_window5_result_observed_before_the_result_append() {
             context: "c".to_string(),
             model: None,
             profile: None,
+            execute: None,
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");
@@ -6796,6 +6812,7 @@ fn n14_window6_result_appended_before_the_transition() {
             context: "c".to_string(),
             model: None,
             profile: None,
+            execute: None,
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");

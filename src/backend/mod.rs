@@ -35,6 +35,7 @@
 pub mod claude;
 /// Descoped per deviation D6 — see the module's own doc comment.
 pub mod codex;
+pub mod docker;
 pub mod fake;
 
 use std::collections::BTreeMap;
@@ -46,6 +47,7 @@ use serde_json::Value;
 
 use crate::domain::event::EventDraft;
 use crate::domain::profile::Profile;
+use crate::domain::workflow::ExecuteSpec;
 
 /// One normalized native event (§20/§27): an adapter's translation of a raw
 /// vendor record into sergeant's `conversation.*`/`tool.*`/`usage.*`
@@ -201,6 +203,15 @@ pub struct StartRequest {
     /// Launch profile to apply (§14: launch configuration, never credentials).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    /// The pinned container spec, present exactly when the stage this
+    /// request serves is `kind = "execute"` (N4, §12.3, §13.1). `None` for
+    /// every actor stage. This is how the two-phase executor lifecycle
+    /// (§14.2) — unmodified from what the Claude adapter already exercises —
+    /// carries Docker's stage-authored contract from `bind_stages`' pinned
+    /// [`crate::domain::workflow::StageDefinition`] through PREPARE/LAUNCH
+    /// without the engine knowing what an image or a container is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execute: Option<ExecuteSpec>,
 }
 
 /// Everything a backend needs to RESUME an execution it no longer remembers

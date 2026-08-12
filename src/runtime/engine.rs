@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::api::{Core, CoreError};
+use crate::backend::docker::DOCKER_BACKEND_NAME;
 use crate::backend::{
     Backend, BackendError, BackendRegistry, BackendSignal, Completion, Deferred, ExecutionHandle,
     NativeState, Observation, PreparedExecution, ResumeRequest, StartRequest,
@@ -46,7 +47,7 @@ use crate::domain::workflow::{
     DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
     KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
     KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
-    StageStatus, WorkflowDefinition, WorkflowError,
+    StageKind, StageStatus, WorkflowDefinition, WorkflowError,
 };
 use crate::domain::workspace::{
     InstructionIdentity, InstructionPolicy, RepositorySpec, Workspace, WorkspaceError,
@@ -716,6 +717,23 @@ pub enum EngineError {
         /// The backend the stage resolved to.
         backend: String,
     },
+    /// §17.5: a workflow declares a `kind = "execute"` stage, but the
+    /// `"docker"` backend is not registered or its probe reports
+    /// unavailable. Refused before Work or worktree side effects, exactly
+    /// like every other §17.5 preflight — "an actor-only workflow may run
+    /// when Docker is unavailable; a mixed or execute workflow may not."
+    #[error(
+        "workflow {workflow:?} stage {stage:?} is a Docker execute stage, but the local Docker \
+         executor is unavailable: {detail}"
+    )]
+    ExecuteBackendUnavailable {
+        /// Workflow name.
+        workflow: String,
+        /// The declaring stage's id.
+        stage: String,
+        /// Why the Docker backend could not be routed to.
+        detail: String,
+    },
 }
 
 impl EngineError {
@@ -741,6 +759,7 @@ impl EngineError {
             EngineError::BackendMissing { .. } => "backend_missing",
             EngineError::NoSuchStage { .. } => "no_such_stage",
             EngineError::AskCapabilityUnavailable { .. } => "ask_capability_unavailable",
+            EngineError::ExecuteBackendUnavailable { .. } => "execute_backend_unavailable",
         }
     }
 
@@ -1096,6 +1115,38 @@ impl Engine {
     ) -> Result<Vec<StageBinding>, EngineError> {
         let mut bindings = Vec::with_capacity(workflow.stages.len());
         for (index, stage) in workflow.stages.iter().enumerate() {
+            if stage.kind == StageKind::Execute {
+                // §17.5: "Docker execute capability when any execute stage
+                // exists" is a requirement distinct from — and never
+                // substitutable by — the actor harness chain. An execute
+                // stage always runs on the fixed `"docker"` backend; there is
+                // no author-facing harness choice to make (§20.6: container
+                // policy lives in the stage, not in a harness selection).
+                // Routing it through `route_stage`'s decisive-tier resolver
+                // gets the same "unavailable means fail here, not fall
+                // through" guarantee an explicit `stage.harness` gets, for
+                // free, and the same probe-availability check that makes
+                // this preflight (not a later surprise at stage entry).
+                let stage_route = route_stage(Some(DOCKER_BACKEND_NAME), None, &self.backends)
+                    .map_err(|e| EngineError::ExecuteBackendUnavailable {
+                        workflow: workflow.name.clone(),
+                        stage: stage.id.clone(),
+                        detail: e.to_string(),
+                    })?;
+                bindings.push(StageBinding {
+                    stage_id: stage.id.clone(),
+                    index,
+                    kind: stage.kind,
+                    harness: stage_route.backend,
+                    route_source: stage_route.source.as_str().to_string(),
+                    // §20.6: profiles are harness launch configuration.
+                    // Execute stages have none — their policy is the pinned
+                    // `ExecuteSpec` carried on the `StageDefinition` itself,
+                    // journaled whole in `workflow.bound`.
+                    profile: None,
+                });
+                continue;
+            }
             let stage_route = route_stage(
                 stage.harness.as_deref(),
                 Some(route.backend.as_str()),
@@ -2696,6 +2747,12 @@ impl Engine {
             // carries the stage's model. There is no per-stage model field.
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile.clone(),
+            // N4: the pinned container spec rides along exactly when this
+            // stage is `kind = "execute"` — `bind_stages` already refused
+            // the submission if that pin could not resolve to an available
+            // Docker backend, so reaching here with `Some` is always
+            // actionable by the backend named above.
+            execute: stage.execute.clone(),
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,

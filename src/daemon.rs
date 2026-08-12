@@ -32,6 +32,7 @@ use crate::api::{
     drive_completions, router,
 };
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
+use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
 use crate::domain::event::{EventDraft, EventSource};
@@ -171,6 +172,12 @@ pub struct DaemonConfig {
     /// it at a stub binary so the *real* adapter — not a fake wearing its
     /// name — can be driven through the daemon's own request path.
     pub claude: Option<ClaudeConfig>,
+    /// Launch configuration for the Docker adapter this daemon registers
+    /// itself (N4). `None` is the ordinary `docker` on `PATH`, adapter state
+    /// under this data dir — mirrors `claude` above for the same reason:
+    /// tests point it at a scripted `docker_bin` to drive the real adapter's
+    /// request path without a real Docker Engine.
+    pub docker: Option<DockerConfig>,
     /// §28 OpenTelemetry export. `None` is **off**, and off is the default:
     /// with no pipeline here the daemon builds no provider, spawns no
     /// exporter task, and subscribes nothing to the event stream.
@@ -215,6 +222,7 @@ impl Default for DaemonConfig {
             backends: Arc::new(BackendRegistry::default_registry()),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
+            docker: None,
             telemetry: None,
             completion_poll: COMPLETION_POLL_INTERVAL,
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
@@ -314,6 +322,26 @@ pub async fn start_with(
             .clone()
             .unwrap_or_else(|| ClaudeConfig::new(data_dir));
         let adapter = Arc::new(ClaudeBackend::new(claude_config));
+        backends = backends.with(adapter.clone());
+        Some(adapter)
+    } else {
+        None
+    };
+    // N4: the Docker executor, registered the same way and for the same
+    // reason as Claude above — it needs this data dir (image pins, its own
+    // blob-store instance) and an event sink that only exists once the core
+    // does. `DockerBackend::new` only opens its blob store (durable,
+    // infallible in ordinary operation); it never touches the Docker socket,
+    // so a host with no Docker installed still starts a daemon that can
+    // route actor-only workflows (§17.5's "degraded daemon, strict work
+    // admission" — routing an execute stage to this backend is what actually
+    // fails, at submit time, via its `probe()`).
+    let docker = if config.backends.get(DOCKER_BACKEND_NAME).is_none() {
+        let docker_config = config
+            .docker
+            .clone()
+            .unwrap_or_else(|| DockerConfig::new(data_dir));
+        let adapter = Arc::new(DockerBackend::new(docker_config)?);
         backends = backends.with(adapter.clone());
         Some(adapter)
     } else {
@@ -422,6 +450,12 @@ pub async fn start_with(
     // through the core; the sink can only exist now that the core is shared.
     if let Some(claude) = claude {
         claude.set_event_sink(journaling_sink(state.core.clone()));
+    }
+    // The Docker adapter's own provenance events (`execute.image_resolved`)
+    // flow through the identical sink (same reasoning as Claude's, directly
+    // above).
+    if let Some(docker) = docker {
+        docker.set_event_sink(journaling_sink(state.core.clone()));
     }
     let app = router(state.clone());
 

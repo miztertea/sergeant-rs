@@ -1372,9 +1372,14 @@ async fn t7_routing_precedence_and_structured_failure() {
     .await;
     assert_eq!(status, 422);
     assert_eq!(body["error"]["code"], "backend_not_found");
+    // "docker" is present even though this registry only names three fakes:
+    // `start_with` always registers the real docker adapter unless the
+    // config already names one (N4), the same way it always adds claude
+    // unless the config pre-empts it — none of these three fakes is named
+    // "docker", so nothing pre-empts it here.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
     );
     handle.shutdown().await;
 
@@ -1387,9 +1392,13 @@ async fn t7_routing_precedence_and_structured_failure() {
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
     // The scripted fake occupies the "claude" slot, so the daemon adds
-    // nothing: Codex is descoped (D6) and never registered, and a backend
-    // that is not registered is not offered.
-    assert_eq!(body["error"]["available_backends"], json!(["claude"]));
+    // nothing there — but it still adds the real docker adapter (N4, nothing
+    // here is named "docker"). Codex is descoped (D6) and never registered,
+    // and a backend that is not registered is not offered.
+    assert_eq!(
+        body["error"]["available_backends"],
+        json!(["claude", "docker"])
+    );
     assert!(
         body["error"]["message"]
             .as_str()
@@ -1593,12 +1602,12 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     .await;
     assert_eq!(status, 422, "must be refused: {body}");
     assert_eq!(body["error"]["code"], "backend_not_found");
-    // The daemon registers the real Claude adapter alongside the scripted
-    // fake, so the options list names both; Codex is descoped (D6) and never
-    // registered, which is exactly why naming it fails.
+    // The daemon registers the real Claude and Docker adapters alongside the
+    // scripted fake, so the options list names all three; Codex is descoped
+    // (D6) and never registered, which is exactly why naming it fails.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", FAKE_BACKEND_NAME])
+        json!(["claude", "docker", FAKE_BACKEND_NAME])
     );
     assert!(fake.starts().is_empty(), "no silent provider substitution");
     let list = get(&client, &handle, "/v1/work").await;
@@ -3396,10 +3405,12 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     );
     assert_eq!(body["error"]["code"], "backend_not_found");
     // Since M4 the daemon registers the real claude adapter alongside the
-    // scripted fake. Codex is descoped (D6): not registered, not offered.
+    // scripted fake, and since N4 the docker adapter too (registered names
+    // sort: claude, docker, fake). Codex is descoped (D6): not registered,
+    // not offered.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", FAKE_BACKEND_NAME])
+        json!(["claude", "docker", FAKE_BACKEND_NAME])
     );
 
     // Only two works exist: the refusal created none.

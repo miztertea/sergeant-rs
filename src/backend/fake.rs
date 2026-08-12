@@ -921,6 +921,7 @@ mod tests {
             context: "context".to_string(),
             model: None,
             profile: None,
+            execute: None,
         }
     }
 
