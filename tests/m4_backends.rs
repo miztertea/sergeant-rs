@@ -89,7 +89,7 @@ use sergeant_rs::runtime::engine::{
     Step, SubmitContext,
 };
 use sergeant_rs::runtime::journal::Journal;
-use sergeant_rs::runtime::projection::work_registry_projection;
+use sergeant_rs::runtime::projection::{WorkRun, rederive_run, work_registry_projection};
 use sergeant_rs::runtime::recovery;
 use sergeant_rs::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, materialize,
@@ -5567,11 +5567,7 @@ fn n3_a_late_launch_cannot_revive_work_that_moved_on() {
         "the stop reached the backend for exactly that execution: {:?}",
         fake.stop_requests()
     );
-    assert!(
-        core.registry.state().runs[work_id]
-            .unsettled_reservation()
-            .is_none()
-    );
+    assert!(run_of(&core, work_id).unsettled_reservation().is_none());
 }
 
 /// A crash between the reservation and the launch result fails closed at the
@@ -6468,11 +6464,26 @@ fn started_payload(execution_id: &str) -> Value {
     }})
 }
 
+/// This work's run, from the live projection or R-MVP1-9's re-derivation if
+/// `is_absorbing` eviction (`Completed`/`Canceled`) already reclaimed it.
+///
+/// Direct `core.registry.state().runs[work_id]` indexing — every call site
+/// below used before R-MVP1-9 existed — panics on an evicted work with "no
+/// entry found for key"; this is the eviction-aware replacement for the
+/// sites that need to inspect a run after its work went absorbing.
+fn run_of(core: &Core, work_id: &str) -> WorkRun {
+    if let Some(run) = core.registry.state().runs.get(work_id) {
+        return run.clone();
+    }
+    rederive_run(&core.journal, work_id)
+        .expect("replay")
+        .unwrap_or_else(|| panic!("no run ever recorded for {work_id}"))
+}
+
 /// The current stage's (id, attempt), for the "no wrong attempt advanced" rule.
 fn stage_coordinate(core: &Core, work_id: &str) -> (String, u32) {
-    let stage = core.registry.state().runs[work_id]
-        .current_stage()
-        .expect("a stage");
+    let run = run_of(core, work_id);
+    let stage = run.current_stage().expect("a stage");
     (stage.stage_id.clone(), stage.attempt)
 }
 
@@ -6719,7 +6730,7 @@ fn n13_window5_result_observed_before_the_result_append() {
     );
     // Forward progress: stage 1 was entered, and only stage 1 was launched.
     assert_eq!(
-        core.registry.state().runs[work_id]
+        run_of(&core, work_id)
             .stages
             .iter()
             .filter(|s| s.stage_id == "10-second")
@@ -6953,9 +6964,7 @@ fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
         json!({"report": {"work_id": work_id, "clean": true, "bindings": []}}),
     );
     assert!(
-        core.registry.state().runs[work_id]
-            .unsettled_reservation()
-            .is_some(),
+        run_of(&core, work_id).unsettled_reservation().is_some(),
         "the window this test is about must actually be open"
     );
 
@@ -6966,9 +6975,7 @@ fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
         "a terminal work with an open reservation must be looked at: {report:?}"
     );
     assert!(
-        core.registry.state().runs[work_id]
-            .unsettled_reservation()
-            .is_none(),
+        run_of(&core, work_id).unsettled_reservation().is_none(),
         "and the window closed"
     );
     let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
@@ -8214,7 +8221,7 @@ fn r_mvp1_7_a_send_that_internally_retries_through_resume_counts_one_turn() {
          `backend.send` was called to get there: {resumed_events:?}"
     );
     assert_eq!(
-        core.registry.state().runs[work_id].turns_spawned,
+        run_of(&core, work_id).turns_spawned,
         2,
         "turn 1 from retry's launch, turn 2 from the (internally-retried) \
          send — never 3"

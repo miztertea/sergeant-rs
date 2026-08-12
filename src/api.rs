@@ -54,9 +54,12 @@ use crate::runtime::graph::{
     KIND_CONVERSATION_USER, KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
 use crate::runtime::journal::{Journal, JournalError};
-use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry, WorkRun};
+use crate::runtime::projection::{
+    Projection, ProjectionError, WorkRegistry, WorkRun, is_absorbing, rederive_run,
+};
 use crate::runtime::surface::{
-    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
+    BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
+    KIND_SURFACE_TORN_DOWN,
 };
 
 /// API revision served by this build (`GET /v1/system`, runtime descriptor).
@@ -1225,6 +1228,98 @@ async fn submit_work(
     )
 }
 
+/// The [`WorkRun`] to render for a work: the live registry entry if the
+/// projection still has one, or R-MVP1-9's read-side re-derivation when
+/// eviction has already reclaimed it.
+///
+/// Only `is_absorbing` states (`Completed`/`Canceled`) are ever evicted, so
+/// that is the only case worth paying a full journal replay for; every other
+/// state's `None` here means exactly what it always meant — no run exists
+/// yet — and costs nothing extra to answer.
+///
+/// A replay failure is logged and treated as "nothing to show" rather than
+/// failing the whole view: `work_view` composes many independent fields from
+/// this one `Option`, and a journal I/O error re-deriving a *terminal* work's
+/// history should not turn into a 500 for `work.state` and every other field
+/// that needed no replay at all.
+fn resolve_run(core: &Core, work: &Work, cached: Option<&WorkRun>) -> Option<WorkRun> {
+    if let Some(run) = cached {
+        return Some(run.clone());
+    }
+    if !is_absorbing(work.state) {
+        return None;
+    }
+    match rederive_run(&core.journal, &work.id) {
+        Ok(run) => run,
+        Err(e) => {
+            tracing::error!(
+                work_id = %work.id,
+                error = %e,
+                "could not re-derive an evicted work's run from the journal"
+            );
+            None
+        }
+    }
+}
+
+/// R-MVP1-2's output pointer (the sibling half of the ruling, not itself a
+/// ruling): once a surface has been torn down, name per repository what §11
+/// already recorded — the source repository, the retained branch, the
+/// worktree path — plus the finalize commit `surface::teardown` now captures
+/// as it reads the branch (R-MVP1-2's own extension to `BindingTeardown`).
+/// That commit is whatever a closing stage's `promote` disposition landed
+/// before teardown ran, per the ruled timing, or just the surface's base SHA
+/// if the stage declared nothing.
+///
+/// `None` before teardown has run: there is no output to point at yet, and a
+/// null here (rather than a partial view built from `run.surface` alone) is
+/// the honest answer for a work still in flight.
+fn output_pointer(work: &Work, run: &WorkRun) -> Option<Value> {
+    let teardown = run.teardown.as_ref()?;
+    let surface = run.surface.as_ref();
+    let repositories: Vec<Value> = teardown
+        .bindings
+        .iter()
+        .map(|binding| {
+            let source_repo = surface
+                .and_then(|s| {
+                    s.bindings
+                        .iter()
+                        .find(|b| b.repository == binding.repository)
+                })
+                .map(|b| b.source_path.display().to_string());
+            json!({
+                "repository": binding.repository,
+                "source_repo": source_repo,
+                "retained_branch": binding.work_branch,
+                "worktree_path": binding.worktree_path,
+                "finalize_commit": binding.final_sha,
+                "disposition": disposition_tag(&binding.disposition),
+            })
+        })
+        .collect();
+    Some(json!({
+        "work_id": work.id,
+        "clean": teardown.clean,
+        "repositories": repositories,
+    }))
+}
+
+/// The bare tag of a [`BindingDisposition`] — `"removed"`, `"missing"`, etc.
+/// — without its internally-tagged detail fields (`changes`/`detail`), which
+/// the output pointer does not repeat: the full `teardown` field elsewhere
+/// in [`work_view`] already carries them, and serializing the enum directly
+/// here would nest a second `"disposition"` key inside this one (its own
+/// `#[serde(tag = "disposition")]`), not replace it.
+fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
+    match disposition {
+        BindingDisposition::Removed => "removed",
+        BindingDisposition::RetainedDirty { .. } => "retained_dirty",
+        BindingDisposition::Missing => "missing",
+        BindingDisposition::RetainedError { .. } => "retained_error",
+    }
+}
+
 /// The full view of a work: the §10 record, plus the orthogonal run
 /// coordinates the M3 contract asks `work show` to include — current stage,
 /// surface, and execution state. They are siblings of `work`, not fields
@@ -1233,25 +1328,29 @@ async fn submit_work(
 fn work_view(core: &Core, work_id: &str) -> Value {
     let registry = core.registry.state();
     let work = registry.works.get(work_id);
-    let run = registry.runs.get(work_id);
+    let cached_run = registry.runs.get(work_id);
+    let run = work.and_then(|w| resolve_run(core, w, cached_run));
     json!({
         "work": work,
-        "stage": run.and_then(run_stage_view),
-        "surface": run.and_then(|r| r.surface.clone()),
-        "execution": run.and_then(|r| r.execution.clone()),
+        "stage": run.as_ref().and_then(run_stage_view),
+        "surface": run.as_ref().and_then(|r| r.surface.clone()),
+        "execution": run.as_ref().and_then(|r| r.execution.clone()),
         // Additive (§20.5): a run whose launch phase is in flight, or whose
         // launch phase a crash left unaccounted for, is a state a client can
         // now see rather than infer from a gap between events.
-        "reservation": run.and_then(|r| r.reservation.clone()),
-        "workflow": run.and_then(|r| r.workflow.as_ref().map(|w| json!({
+        "reservation": run.as_ref().and_then(|r| r.reservation.clone()),
+        "workflow": run.as_ref().and_then(|r| r.workflow.as_ref().map(|w| json!({
             "name": w.name,
             "version": w.version,
             "source": w.source,
             "stages": w.stages.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
         }))),
-        "backend": run.and_then(|r| r.backend.clone()),
-        "route_source": run.and_then(|r| r.route_source.clone()),
-        "teardown": run.and_then(|r| r.teardown.clone()),
+        "backend": run.as_ref().and_then(|r| r.backend.clone()),
+        "route_source": run.as_ref().and_then(|r| r.route_source.clone()),
+        "teardown": run.as_ref().and_then(|r| r.teardown.clone()),
+        // R-MVP1-2's sibling: named per repository once there is something to
+        // point at.
+        "output": work.and_then(|w| run.as_ref().and_then(|r| output_pointer(w, r))),
     })
 }
 

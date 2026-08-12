@@ -2394,3 +2394,77 @@ fn synthetic_run(work_id: &str) -> Vec<sergeant_rs::domain::event::EventDraft> {
         draft("work.completed", json!({})),
     ]
 }
+
+// -------------------------------------------------------- R-MVP1-2's output pointer
+
+/// R-MVP1-2's sibling, not itself a ruling: once a work's surface has been
+/// torn down, `work show` names — per repository — the source repository,
+/// the retained branch, the worktree path, and the finalize commit
+/// (`surface::teardown`'s own extension, `BindingTeardown::final_sha`) —
+/// without decoding the journal. Proven end to end through a real daemon and
+/// a real repository, then again after a restart: rebuild-on-start is the
+/// only population path (R-MVP1-9), so the pointer must read back
+/// byte-identically from a freshly replayed journal, not just from the
+/// process that wrote it — and `Completed` is exactly the absorbing state
+/// R-MVP1-9 evicts, so this also exercises eviction's read-side
+/// re-derivation, not merely a live in-memory hit.
+#[tokio::test]
+async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_commit() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    let base_sha = init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (handle, _fake) =
+        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let body = submit(
+        &handle,
+        &repo,
+        "point me at the output",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    let output = body["output"].clone();
+    assert_eq!(output["work_id"], work_id);
+    assert_eq!(output["clean"], true);
+    let repositories = output["repositories"]
+        .as_array()
+        .expect("repositories array");
+    assert_eq!(repositories.len(), 1);
+    let repo_out = &repositories[0];
+    assert_eq!(repo_out["repository"], "solo");
+    assert_eq!(repo_out["source_repo"], repo.display().to_string());
+    assert_eq!(repo_out["retained_branch"], format!("sergeant/{work_id}"));
+    assert_eq!(repo_out["disposition"], "removed");
+    // Nothing was ever committed inside the worktree, so the finalize commit
+    // is exactly the SHA the surface was cut from — the honest answer when a
+    // closing stage declares no `promote` output.
+    assert_eq!(repo_out["finalize_commit"], base_sha);
+    // The branch itself really is there, at that commit, in the source repo
+    // — the pointer names a real, checkable fact, not a projection artifact.
+    assert_eq!(
+        git(
+            &repo,
+            &["rev-parse", &format!("refs/heads/sergeant/{work_id}")]
+        ),
+        base_sha
+    );
+
+    handle.shutdown().await;
+
+    // Restart: rebuild-on-start replays the journal from scratch. The
+    // pointer — like every other view `work show` composes — must read back
+    // byte-identical, whether or not R-MVP1-9 eviction reclaimed this work's
+    // run in between (it did: `Completed` is absorbing).
+    let (handle2, _fake2) = start_fake(data.path(), []).await;
+    let after = get(&handle2, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        after["output"], output,
+        "the output pointer must survive a restart byte-identically"
+    );
+    handle2.shutdown().await;
+}

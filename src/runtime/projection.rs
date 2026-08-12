@@ -28,7 +28,7 @@ use crate::domain::workflow::{
     KIND_WORKFLOW_BOUND, StageBinding, StageRecord, StageStatus, WorkflowDefinition,
 };
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
-use crate::runtime::journal::JournalError;
+use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfacePlan,
     TeardownReport, WorkSurface,
@@ -427,7 +427,78 @@ impl WorkRun {
 /// payload shapes this reducer does not understand are ignored, never an
 /// error — a newer writer's events must not brick an older reader's replay
 /// (§20's forward-compatibility stance).
+///
+/// Thin wrapper: the live registry (this daemon's in-memory projection, and
+/// rebuild-on-start's full replay of it) is the one caller that should ever
+/// evict — see [`apply_registry_event`] and [`rederive_run`].
 pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
+    apply_registry_event(state, event, true);
+}
+
+/// Whether a §10 state is *absorbing* — the two states `WorkState::can_transition`
+/// answers `false` for from every `to`, so nothing ever leaves them again
+/// (`Failed` is deliberately excluded: it is "terminal for the run but
+/// retryable by explicit operator action", per `WorkState`'s own doc comment,
+/// and `retry` needs the run this function's caller may evict).
+///
+/// R-MVP1-9 (Rule A) evicts a run's heavy state — `WorkRun`'s stages,
+/// execution history, surface and teardown records — exactly when nothing
+/// can ever act on it again, which is precisely this set. Evicting `Failed`
+/// too would delete state `retry` still needs to re-enter the stage; this is
+/// the whole reason eviction is scoped to `is_absorbing`, not to every state
+/// `WorkState`'s own doc comment happens to call "terminal".
+pub fn is_absorbing(state: WorkState) -> bool {
+    matches!(state, WorkState::Completed | WorkState::Canceled)
+}
+
+/// Whether `work_id`'s run is safe to evict *right now*, given the state
+/// [`WorkRegistry`] already holds for it.
+///
+/// Absorbing state alone is not enough: `recovery::reconcile` (issue #9,
+/// §22.5) finds work still needing attention after a restart by reading
+/// exactly the fields eviction would delete — `run.surface`/`run.teardown`
+/// for a stranded teardown, `run.unsettled_reservation()` for a stranded
+/// two-phase launch. Evicting before those are settled would not just lose
+/// data recovery could have used; it would make recovery's own filters see
+/// nothing to reconcile, silently turning "needs attention" into "looks
+/// fine". So this re-derives the identical two conditions recovery checks —
+/// evicting exactly when they would already find nothing to do — which is
+/// what makes eviction safe *for* recovery, not merely orthogonal to it.
+fn run_is_settled(work: &Work, run: &WorkRun) -> bool {
+    is_absorbing(work.state)
+        && (run.surface.is_none() || run.teardown.is_some())
+        && run.unsettled_reservation().is_none()
+}
+
+/// Evict `work_id`'s run if [`run_is_settled`] says it is safe to. A no-op
+/// for a work with no run recorded at all, or one not yet settled — called
+/// unconditionally after every event, so it fires the instant the *last*
+/// settling event lands, whichever of teardown/reservation-closure/state
+/// transition that turns out to be for a given run.
+fn maybe_evict(state: &mut WorkRegistry, work_id: Option<&str>) {
+    let Some(work_id) = work_id else { return };
+    let Some(work) = state.works.get(work_id) else {
+        return;
+    };
+    let Some(run) = state.runs.get(work_id) else {
+        return;
+    };
+    if run_is_settled(work, run) {
+        state.runs.remove(work_id);
+    }
+}
+
+/// The shared fold behind both [`work_registry_reducer`] (`evict: true`) and
+/// [`rederive_run`] (`evict: false`).
+///
+/// Eviction must be optional here, not merely absent from a second copy of
+/// this match: `rederive_run` re-derives one work's run by folding *only that
+/// work's own events* — including its own terminal transition and teardown —
+/// through this exact function, and evicting mid-fold would delete the very
+/// run being reconstructed before `rederive_run` ever reads it back out. One
+/// fold, one flag, so the live registry and the read-time re-derivation can
+/// never drift into two different ideas of what a work's run looked like.
+fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
     // Work-state transitions: one mapping, shared with the writer
     // (`WorkState::for_event_kind`), so a kind cannot mean one state when
     // appended and another when replayed.
@@ -438,6 +509,9 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
             .and_then(|id| state.works.get_mut(id))
         {
             work.state = new_state;
+        }
+        if evict {
+            maybe_evict(state, event.work_id.as_deref());
         }
         return;
     }
@@ -664,9 +738,394 @@ pub fn work_registry_reducer(state: &mut WorkRegistry, event: &Event) {
         }
         _ => {}
     }
+    if evict {
+        maybe_evict(state, event.work_id.as_deref());
+    }
 }
 
 /// An empty [`WorkRegistry`] projection ready to fold the journal.
 pub fn work_registry_projection() -> Projection<WorkRegistry> {
     Projection::new(WorkRegistry::default(), work_registry_reducer)
+}
+
+/// R-MVP1-9's read side: rebuild one work's [`WorkRun`] straight from the
+/// journal, for a caller that finds `WorkRegistry::runs` no longer has it —
+/// [`is_absorbing`] eviction having already reclaimed it.
+///
+/// Folds *only this work's own events* — every other event in the journal is
+/// skipped before it ever reaches [`apply_registry_event`] — through the
+/// exact reducer logic the live registry uses (`evict: false`, so the
+/// terminal transition this replay necessarily includes does not immediately
+/// delete what it just rebuilt). The result is therefore byte-identical to
+/// what `WorkRegistry::runs` would still hold had eviction never run: same
+/// events, same fold, same order, the only difference is when it happens
+/// (lazily, at read time, instead of once and kept).
+///
+/// Returns `Ok(None)` for a work whose events never touched `runs` at all
+/// (never started, or genuinely unknown) — the same answer a live,
+/// non-evicted registry would give for that work.
+pub fn rederive_run(journal: &Journal, work_id: &str) -> Result<Option<WorkRun>, JournalError> {
+    let mut scratch = WorkRegistry::default();
+    for event in journal.replay()? {
+        let event = event?;
+        if event.work_id.as_deref() == Some(work_id) {
+            apply_registry_event(&mut scratch, &event, false);
+        }
+    }
+    Ok(scratch.runs.remove(work_id))
+}
+
+#[cfg(test)]
+mod rule_a_eviction_tests {
+    //! R-MVP1-9 (Rule A): eviction, its two-condition safety gate, and
+    //! [`rederive_run`]'s read-side reconstruction.
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::execution::{KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RESERVED};
+    use crate::domain::work::{KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED};
+    use crate::runtime::journal::Journal;
+    use crate::runtime::testing;
+
+    fn a_surface(work_id: &str) -> serde_json::Value {
+        json!({"surface": {
+            "work_id": work_id,
+            "root": "/data/surfaces/x",
+            "bindings": [{
+                "repository": "solo",
+                "source_path": "/repos/solo",
+                "base_branch": "main",
+                "base_sha": "0".repeat(40),
+                "worktree_path": "/data/surfaces/x/solo",
+                "work_branch": format!("sergeant/{work_id}"),
+                "head_sha": "0".repeat(40),
+            }],
+        }})
+    }
+
+    fn a_teardown(work_id: &str) -> serde_json::Value {
+        json!({"report": {
+            "work_id": work_id,
+            "clean": true,
+            "bindings": [{
+                "repository": "solo",
+                "worktree_path": "/data/surfaces/x/solo",
+                "work_branch": format!("sergeant/{work_id}"),
+                "disposition": "removed",
+            }],
+        }})
+    }
+
+    /// `is_absorbing` matches exactly the two states `WorkState::can_transition`
+    /// answers `false` for every `to` — the set §25's own doc comment calls
+    /// absorbing, not the broader set `WorkState`'s per-variant doc comments
+    /// individually call "terminal" (which also includes `Failed`, and
+    /// `Failed` is retryable — evicting it would break `retry`).
+    #[test]
+    fn is_absorbing_is_exactly_the_two_states_nothing_ever_leaves() {
+        use WorkState::*;
+        for state in [
+            Pending, Active, Waiting, NeedsInput, Blocked, Completed, Failed, Canceled,
+        ] {
+            let never_transitions_anywhere = [
+                Pending, Active, Waiting, NeedsInput, Blocked, Completed, Failed, Canceled,
+            ]
+            .iter()
+            .all(|&to| !state.can_transition(to));
+            assert_eq!(
+                is_absorbing(state),
+                never_transitions_anywhere,
+                "state {state}"
+            );
+        }
+        assert!(
+            !is_absorbing(WorkState::Failed),
+            "Failed must stay retryable"
+        );
+    }
+
+    /// Eviction waits for *both* settling conditions, in either order: a
+    /// completed work whose surface is still standing is not evicted even
+    /// though its state is absorbing, and neither is one whose surface is
+    /// down but a reservation is still open. Only once both clear does the
+    /// run go — and it goes on whichever event turns out to be the second
+    /// one to settle, without caring which that was.
+    #[test]
+    fn eviction_waits_for_both_the_surface_and_the_reservation_to_settle() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01EVICT1";
+
+        testing::submit(&mut core, work_id, "evict me");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            a_surface(work_id),
+        );
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_RESERVED,
+            json!({"reservation": {
+                "execution_id": "01EXEC",
+                "backend": "fake",
+                "native_id": "n1",
+                "stage_id": "00-first",
+                "index": 0,
+                "attempt": 1,
+                "stage_kind": "actor",
+            }}),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_COMPLETED, json!({}));
+        assert!(
+            core.registry.state().runs.contains_key(work_id),
+            "absorbing state alone must not evict a run whose surface is still up \
+             and whose reservation is still open"
+        );
+
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_TORN_DOWN,
+            a_teardown(work_id),
+        );
+        assert!(
+            core.registry.state().runs.contains_key(work_id),
+            "the surface settling is not enough on its own — the reservation \
+             is still open, and recovery still needs to see it"
+        );
+
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_ABANDONED,
+            json!({"execution_id": "01EXEC"}),
+        );
+        assert!(
+            !core.registry.state().runs.contains_key(work_id),
+            "both conditions are now settled — the run must be gone"
+        );
+    }
+
+    /// A run whose terminal transition alone settles both conditions (no
+    /// surface was ever materialized, no execution was ever reserved) is
+    /// evicted the instant the terminal event lands — there is nothing else
+    /// to wait for.
+    #[test]
+    fn a_run_with_nothing_outstanding_is_evicted_at_the_terminal_transition_itself() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01EVICT2";
+
+        testing::submit(&mut core, work_id, "cancel me early");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORK_CANCELED,
+            json!({"from": "pending"}),
+        );
+        assert!(
+            !core.registry.state().runs.contains_key(work_id),
+            "nothing was outstanding, so eviction has nothing to wait for"
+        );
+        // The light `Work` record — never evicted — still answers.
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Canceled
+        );
+    }
+
+    /// `Failed` is deliberately excluded from `is_absorbing`: it is
+    /// retryable, and `retry` needs exactly the run state eviction would
+    /// otherwise delete. A failed work's run must survive its own teardown.
+    #[test]
+    fn a_failed_work_is_never_evicted_because_retry_needs_its_run() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01NOEVICT";
+
+        testing::submit(&mut core, work_id, "fail me");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            a_surface(work_id),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_FAILED, json!({}));
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_TORN_DOWN,
+            a_teardown(work_id),
+        );
+
+        assert!(
+            core.registry.state().runs.contains_key(work_id),
+            "a failed work's run must still be there for retry to re-enter, \
+             even though its surface has already been torn down"
+        );
+    }
+
+    /// The pin, stated directly: `rederive_run` reconstructs a run that is
+    /// byte-identical to the one a non-evicting fold of the identical events
+    /// would produce. Same events, same reducer logic (`apply_registry_event`
+    /// with `evict: false` either way), same order — the only variable this
+    /// test isolates is *whether eviction ran in between*.
+    #[test]
+    fn rederive_run_is_byte_identical_to_a_run_that_was_never_evicted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let journal_dir = dir.path().join("journal");
+        let work_id = "01REDERIVE";
+
+        // Build the journal once, through the *evicting* live registry —
+        // exactly the daemon's own path.
+        let mut core = testing::core(&journal_dir);
+        testing::submit(&mut core, work_id, "rederive me");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            a_surface(work_id),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_TORN_DOWN,
+            a_teardown(work_id),
+        );
+        assert!(
+            !core.registry.state().runs.contains_key(work_id),
+            "precondition: this run must actually have been evicted, or the \
+             comparison below proves nothing"
+        );
+
+        // The independent answer: fold the *same* journal from scratch with
+        // eviction switched off, the way the registry would look if Rule A
+        // had never been built at all. Reuses `core.journal`'s own handle —
+        // the journal takes an exclusive lock on its directory, so a second
+        // `Journal::open` here would find it held by `core` itself.
+        fn non_evicting(state: &mut WorkRegistry, event: &Event) {
+            apply_registry_event(state, event, false);
+        }
+        let mut never_evicted = Projection::new(WorkRegistry::default(), non_evicting);
+        never_evicted
+            .catch_up(core.journal.replay().expect("replay"))
+            .expect("catch up");
+        let expected = never_evicted
+            .state()
+            .runs
+            .get(work_id)
+            .cloned()
+            .expect("the never-evicted fold must have a run for this work");
+
+        let rederived = rederive_run(&core.journal, work_id)
+            .expect("replay")
+            .expect("a run to rederive");
+        assert_eq!(
+            rederived, expected,
+            "the evicted work's re-derived run must be byte-identical to the \
+             run a non-evicting fold of the same events would have produced"
+        );
+    }
+
+    /// `rederive_run` answers `None` for a work whose events never touched
+    /// `runs` at all — the same answer a live, non-evicted registry gives.
+    #[test]
+    fn rederive_run_of_a_work_with_no_run_ever_recorded_is_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01NORUN";
+        testing::submit(&mut core, work_id, "never started");
+
+        let rederived = rederive_run(&core.journal, work_id).expect("replay");
+        assert_eq!(rederived, None);
+    }
+
+    /// The S2 churn scenario's own claim, proven at the projection level
+    /// rather than through a live daemon and `scripts/perf/s2-churn.sh`'s RSS
+    /// sampling: `WorkRegistry::runs` — the structure #4's ~25 kB/work
+    /// unbounded climb lived in — stays flat across many completed works,
+    /// never one entry per work submitted.
+    ///
+    /// Mutation this kills: removing the eviction call (or narrowing
+    /// `is_absorbing` to nothing) turns `runs.len()` into `N`, not `0`.
+    #[test]
+    fn many_completed_works_leave_the_runs_map_flat_not_growing_with_n() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        const N: usize = 300;
+        for i in 0..N {
+            let work_id = format!("01CHURN{i:05}");
+            testing::submit(&mut core, &work_id, "churn");
+            testing::commit(
+                &mut core,
+                &work_id,
+                KIND_SURFACE_MATERIALIZED,
+                a_surface(&work_id),
+            );
+            testing::commit(&mut core, &work_id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &work_id,
+                KIND_SURFACE_TORN_DOWN,
+                a_teardown(&work_id),
+            );
+        }
+        assert_eq!(
+            core.registry.state().works.len(),
+            N,
+            "the light Work record is never evicted — the fleet listing still \
+             sees every work"
+        );
+        assert_eq!(
+            core.registry.state().runs.len(),
+            0,
+            "every one of the {N} runs settled with nothing outstanding and \
+             must have been evicted — a non-flat count here is #4's leak back"
+        );
+    }
+
+    /// Restart indifference: rebuild-on-start is a full replay through the
+    /// same evicting reducer, so a work that was evicted before a restart is
+    /// evicted again afterwards — never resurrected into memory just because
+    /// the projection was rebuilt from scratch.
+    #[test]
+    fn a_restart_rebuild_re_evicts_exactly_what_was_evicted_before_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let journal_dir = dir.path().join("journal");
+        let work_id = "01RESTART";
+        {
+            let mut core = testing::core(&journal_dir);
+            testing::submit(&mut core, work_id, "restart me");
+            testing::commit(
+                &mut core,
+                work_id,
+                KIND_SURFACE_MATERIALIZED,
+                a_surface(work_id),
+            );
+            testing::commit(&mut core, work_id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                work_id,
+                KIND_SURFACE_TORN_DOWN,
+                a_teardown(work_id),
+            );
+            assert!(!core.registry.state().runs.contains_key(work_id));
+        }
+        // A fresh process, rebuilding the same way `daemon::start` does:
+        // `Projection::new` + `catch_up` over a full replay, nothing else.
+        let journal = Journal::open(&journal_dir).expect("reopen journal");
+        let mut rebuilt = work_registry_projection();
+        rebuilt
+            .catch_up(journal.replay().expect("replay"))
+            .expect("catch up");
+        assert!(
+            !rebuilt.state().runs.contains_key(work_id),
+            "rebuild-on-start must not resurrect an evicted run into memory"
+        );
+        assert_eq!(rebuilt.state().works[work_id].state, WorkState::Completed);
+    }
 }

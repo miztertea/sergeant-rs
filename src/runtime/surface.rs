@@ -196,6 +196,20 @@ pub struct BindingTeardown {
     pub worktree_path: PathBuf,
     /// Branch that was retained (always: teardown never deletes a branch).
     pub work_branch: String,
+    /// The branch tip at the moment teardown ran — R-MVP1-2's output
+    /// pointer's "finalize commit". Read from the *branch*
+    /// (`refs/heads/<work_branch>` in the source repository), never the
+    /// worktree, so it is available whether or not the worktree itself
+    /// survives this teardown (`Missing`, `RetainedDirty` and
+    /// `RetainedError` all still resolve it — only `git rev-parse` on a
+    /// branch teardown itself never deletes can fail, and that is recorded
+    /// as `None` rather than guessed). If a closing stage's `promote`
+    /// disposition (R-MVP1-2) committed before teardown ran — the ruled
+    /// timing, "inside the closing stage, before terminal state and
+    /// therefore before teardown, while the worktree exists" — this is that
+    /// commit; otherwise it is whatever the branch already pointed at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_sha: Option<String>,
     /// What happened.
     #[serde(flatten)]
     pub disposition: BindingDisposition,
@@ -446,11 +460,12 @@ pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError>
 pub fn teardown(surface: &WorkSurface) -> TeardownReport {
     let mut bindings = Vec::with_capacity(surface.bindings.len());
     for binding in &surface.bindings {
-        let disposition = teardown_binding(binding);
+        let (disposition, final_sha) = teardown_binding(binding);
         bindings.push(BindingTeardown {
             repository: binding.repository.clone(),
             worktree_path: binding.worktree_path.clone(),
             work_branch: binding.work_branch.clone(),
+            final_sha,
             disposition,
         });
     }
@@ -509,37 +524,50 @@ fn prune_stale_worktrees(source: &Path) {
     let _ = git(source, &["worktree", "prune"]);
 }
 
-fn teardown_binding(binding: &RepositoryBinding) -> BindingDisposition {
+fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
     with_repository(&binding.source_path, || teardown_binding_locked(binding))
 }
 
-fn teardown_binding_locked(binding: &RepositoryBinding) -> BindingDisposition {
+fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
+    // Read the retained branch's tip before anything else. Teardown always
+    // keeps the branch regardless of what happens to the worktree below, so
+    // this is available in every disposition — including `Missing`, where
+    // there is no worktree left to read a HEAD from at all.
+    let final_sha = git(
+        &binding.source_path,
+        &["rev-parse", &format!("refs/heads/{}", binding.work_branch)],
+    )
+    .ok();
     if !binding.worktree_path.exists() {
         // The directory is gone, but the source repository still lists it;
         // unregister it now so a later rematerialize at the same path is
         // possible. This does not change the disposition below either way.
         prune_stale_worktrees(&binding.source_path);
-        return BindingDisposition::Missing;
+        return (BindingDisposition::Missing, final_sha);
     }
     match git(&binding.worktree_path, &["status", "--porcelain"]) {
         Ok(changes) if !changes.is_empty() => {
-            return BindingDisposition::RetainedDirty { changes };
+            return (BindingDisposition::RetainedDirty { changes }, final_sha);
         }
         Ok(_) => {}
         Err(e) => {
             // Cannot establish that it is clean ⇒ must not remove it.
-            return BindingDisposition::RetainedError {
-                detail: e.to_string(),
-            };
+            return (
+                BindingDisposition::RetainedError {
+                    detail: e.to_string(),
+                },
+                final_sha,
+            );
         }
     }
     let path = binding.worktree_path.display().to_string();
-    match git(&binding.source_path, &["worktree", "remove", &path]) {
+    let disposition = match git(&binding.source_path, &["worktree", "remove", &path]) {
         Ok(_) => BindingDisposition::Removed,
         Err(e) => BindingDisposition::RetainedError {
             detail: e.to_string(),
         },
-    }
+    };
+    (disposition, final_sha)
 }
 
 fn add_worktree(
@@ -656,6 +684,26 @@ mod tests {
                 "no surface root survives a clean teardown (round {round} of {ROUNDS})"
             );
         }
+    }
+
+    /// Run one git command in `dir` with a fixture identity, same shape as
+    /// [`repo`]'s own commits — for tests that need to commit *inside* an
+    /// already-materialized worktree, where the crate's `git()` wrapper alone
+    /// would hit "please tell me who you are" on a host with no global
+    /// identity configured.
+    fn git_as_test_identity(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
     }
 
     /// A temp repository with one commit.
@@ -963,6 +1011,58 @@ mod tests {
         assert!(
             dirty.root.is_dir() && dirty.bindings[0].worktree_path.is_dir(),
             "uncommitted work is never removed, and neither is the root holding it"
+        );
+    }
+
+    /// R-MVP1-2's output-pointer sibling: teardown records each binding's
+    /// finalize commit — the retained branch's tip — so `work show` can name
+    /// it without decoding the journal. A commit made in the worktree *before*
+    /// teardown runs (the closing stage's `promote` disposition, per the
+    /// ruled timing) is exactly what this must capture: the branch tip is
+    /// read before the worktree is touched, so a fresh commit on the branch
+    /// is the finalize commit, not the SHA the surface was cut from.
+    #[test]
+    fn teardown_captures_the_retained_branchs_tip_as_the_finalize_commit() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(data.path(), "01FINALIZE", std::slice::from_ref(&spec))
+            .expect("materialize");
+        let worktree = &surface.bindings[0].worktree_path;
+        let base_sha = surface.bindings[0].base_sha.clone();
+
+        // A closing stage's finalize helper commits before teardown runs.
+        std::fs::write(worktree.join("output.txt"), "promoted\n").expect("write output");
+        git_as_test_identity(worktree, &["add", "."]);
+        git_as_test_identity(worktree, &["commit", "-m", "finalize"]);
+        let finalize_commit = git(worktree, &["rev-parse", "HEAD"]).expect("finalize commit");
+        assert_ne!(
+            finalize_commit, base_sha,
+            "the fixture must actually advance the branch"
+        );
+
+        let report = teardown(&surface);
+        assert_eq!(report.bindings[0].disposition, BindingDisposition::Removed);
+        assert_eq!(
+            report.bindings[0].final_sha.as_deref(),
+            Some(finalize_commit.as_str()),
+            "teardown must record the branch tip as it stood at teardown time, \
+             including a finalize commit made before it ran"
+        );
+
+        // A worktree the repository never had (Missing) still resolves the
+        // branch tip: it lives on the branch, not the worktree.
+        let again = materialize(data.path(), "01FINALIZE2", std::slice::from_ref(&spec))
+            .expect("materialize again");
+        std::fs::remove_dir_all(&again.bindings[0].worktree_path).expect("simulate vanished");
+        let missing_report = teardown(&again);
+        assert_eq!(
+            missing_report.bindings[0].disposition,
+            BindingDisposition::Missing
+        );
+        assert!(
+            missing_report.bindings[0].final_sha.is_some(),
+            "a vanished worktree still has a branch tip to report"
         );
     }
 
