@@ -45,6 +45,22 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### MVP-1 SHIPPING GATE — 2026-08-12, passed (22→4→0); as-run note
+
+no-mistakes over the full MVP-1 diff: 22 findings, 12 fixed (headline:
+terminal-run replay under the CoreGuard past the 512 cache; the ceiling
+interrupt gaining §14.5 staleness discipline + its L7 pin on the gate's
+own insistence), 10 accepted as documented trades. Self-hosting
+checkpoint passed pre-gate: #50 fixed via a sergeant Work (2 turns of a
+12 cap; fix verified by independent reproduction; evidence in
+docs/gauntlet/runs/mvp1-selfhost/). As-run provenance note: the gate's
+fix round edited resources/n-series/mvp1-build.js (axis-misalignment
+correction) AFTER that script's run — the file carries a post-run
+correction marker; the version that drove the build is the parent of
+the fix commit. Owner ruling applied mid-pass: dollar figures are
+telemetry only, never guards — all bounds speak turns/wall-clock.
+
+
 ### MVP-1 FIXER PASS — 2026-08-12, panel findings closed (I6)
 
 **Mission outcome.** Fixer pass over the MVP-1 build-panel review: 20
