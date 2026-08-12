@@ -1008,6 +1008,11 @@ fn intent_detail_disagreement(req: &SubmitRequest) -> Option<String> {
             ));
         }
     }
+    // `detail.group` is deliberately not checked here (I3): R-MVP1-5(b)
+    // gives group membership "no new engine surface" in MVP-1 — there is no
+    // `--group` flag yet for it to disagree with, and expanding it into a
+    // repository set to compare is MVP-3's CLI-side job. Revisit this
+    // function when `--group` lands, not before.
     None
 }
 
@@ -1172,7 +1177,10 @@ async fn submit_work(
         backend: req.backend,
         origin_client: origin.client,
         profile: req.profile,
-        intent_detail: req.intent_detail,
+        // I3: an empty `{}` object is the same fact as sending nothing at
+        // all (IntentDetail::is_empty's own doc) — normalized here so that
+        // promise is actually kept, not merely stated.
+        intent_detail: req.intent_detail.filter(|d| !d.is_empty()),
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),

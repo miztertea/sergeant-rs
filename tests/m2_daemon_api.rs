@@ -3690,6 +3690,36 @@ async fn r_mvp1_6_repos_named_only_in_intent_detail_is_inert_not_a_disagreement(
     handle.shutdown().await;
 }
 
+/// I3: an empty `intent_detail: {}` is the same fact as sending nothing at
+/// all — `IntentDetail::is_empty`'s own doc, previously dead code (never
+/// called anywhere). Now actually enforced at submit: the journaled and
+/// displayed `intent_detail` is absent, not an empty object.
+#[tokio::test]
+async fn r_mvp1_6_an_empty_intent_detail_object_normalizes_to_absent() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "an empty elaboration is no elaboration",
+            "intent_detail": {},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 201, "{:?}", resp.text().await);
+    let body: Value = resp.json().await.expect("json");
+    assert!(
+        body["work"]["intent_detail"].is_null(),
+        "an empty intent_detail object must normalize to absent: {body}"
+    );
+    handle.shutdown().await;
+}
+
 /// The additive-only guarantee, exercised at the boundary it actually
 /// describes: a *pre-existing* journal line — standing in for one a future
 /// binary already wrote, carrying a field `IntentDetail` does not have —
