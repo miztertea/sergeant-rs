@@ -3504,16 +3504,39 @@ fn stub_claude(dir: &Path) -> String {
     )
 }
 
-/// A stand-in `docker` that passes `DockerBackend::probe`'s cheap version
-/// check (`docker version --format {{.Server.Version}}`), so the doctor
-/// tests measure the doctor rather than whether *this host* happens to have
-/// a reachable Docker Engine (TH-02, MVP-2 D3 fixer pass: N4.md's
-/// probe-gating rule for Docker facts, applied to the one doctor row that
-/// previously had no override analogous to `SGT_CLAUDE_BIN`).
+/// A stand-in `docker` that passes both `DockerBackend::probe`'s cheap
+/// version check (`docker version --format {{.Server.Version}}`) and
+/// `DockerBackend::lifecycle_probe`'s real bind-mount round trip (INV-R1-06:
+/// `docker_check` now runs both, so the doctor tests need a stub that fakes
+/// both, not just the ping), so the doctor tests measure the doctor rather
+/// than whether *this host* happens to have a reachable Docker Engine
+/// (TH-02, MVP-2 D3 fixer pass: N4.md's probe-gating rule for Docker facts,
+/// applied to the one doctor row that previously had no override analogous
+/// to `SGT_CLAUDE_BIN`). For `run`, it parses the `--mount`
+/// `type=bind,source=...,target=...` value straight out of argv and writes
+/// the probe marker there itself, standing in for what a real container
+/// would do — good enough to prove the doctor *asks* the lifecycle
+/// question, without needing a real container runtime in this suite.
 fn stub_docker(dir: &Path) -> String {
     write_script(
         dir,
         "docker-stub",
-        "#!/bin/sh\ncase \"$1\" in\n  version) echo '99.0.0';;\n  *) exit 1;;\nesac\n",
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         \x20 version) echo '99.0.0';;\n\
+         \x20 run)\n\
+         \x20   for arg in \"$@\"; do\n\
+         \x20     case \"$arg\" in\n\
+         \x20       type=bind,source=*)\n\
+         \x20         src=$(echo \"$arg\" | sed -n 's/.*source=\\([^,]*\\),target=.*/\\1/p')\n\
+         \x20         echo sergeant-probe > \"$src/probe-marker\"\n\
+         \x20         ;;\n\
+         \x20     esac\n\
+         \x20   done\n\
+         \x20   exit 0\n\
+         \x20   ;;\n\
+         \x20 rm) exit 0;;\n\
+         \x20 *) exit 1;;\n\
+         esac\n",
     )
 }

@@ -1052,15 +1052,28 @@ mod doctor {
         }
     }
 
-    /// N4/§17.4: whether the local Docker Engine is reachable at all — the
-    /// cheap probe `Engine::bind_stages` also runs on every submission
-    /// touching an execute stage, surfaced here the same "doctor asks the
-    /// adapter, never keeps a second copy of its rule" way `claude_check`
-    /// does. `Warn`, not `Fail`: §17.5 makes an execute-workflow submission
-    /// the thing that actually refuses when Docker is unavailable, and an
-    /// actor-only installation is fully healthy without it — this row exists
-    /// so an operator can tell *why* an execute submission would be refused
-    /// before trying one.
+    /// N4/§17.4/§16.3: whether the local Docker Engine is reachable, *and*
+    /// whether the full container lifecycle actually works — not just
+    /// whether something answered a version ping.
+    ///
+    /// INV-R1-06 (MVP-2 D3 fixer pass): before this fix, this check only
+    /// ever ran `backend.probe()` (the cheap `docker version` ping
+    /// `Engine::bind_stages` also runs on every submission), and
+    /// `DockerBackend::lifecycle_probe` — §16.3's real round trip: create,
+    /// bind-mount, start, write, read the write back on the host, remove —
+    /// was dead code the module's own doc incorrectly claimed was already
+    /// wired in here. §16.3's whole point is that a version ping proves only
+    /// that *something* answered: a daemon whose socket responds but whose
+    /// bind-mount plumbing is broken (a misconfigured storage driver, a
+    /// permission wall on the mount path) would report `ok` forever under
+    /// the cheap probe alone. Now the real round trip runs whenever the
+    /// cheap probe succeeds, and its own failure (not just the ping's)
+    /// downgrades this check to `Warn` — still not `Fail`, for the same
+    /// reason as before: §17.5 makes an execute-workflow submission the
+    /// thing that actually refuses, and an actor-only installation is fully
+    /// healthy either way. This row exists so an operator can tell *why* an
+    /// execute submission would be refused before trying one, with real
+    /// evidence rather than a ping's optimism.
     fn docker_check(data_dir: &Path) -> Check {
         let backend = match DockerBackend::new(DockerConfig::new(data_dir)) {
             Ok(backend) => backend,
@@ -1074,18 +1087,35 @@ mod doctor {
             }
         };
         let report = backend.probe();
-        let detail = report
+        let ping_detail = report
             .detail
             .unwrap_or_else(|| "no detail reported".to_string());
-        if report.available {
-            Check::ok("docker", detail)
-        } else {
-            Check::warn(
+        if !report.available {
+            return Check::warn(
                 "docker",
-                detail,
+                ping_detail,
                 "install Docker and make sure this user can reach its socket (the `docker` \
                  group on Linux); until then only actor-only workflows can run — a workflow \
                  with a `kind = \"execute\"` stage is refused at submit, before any Work exists",
+            );
+        }
+        let probe = backend.lifecycle_probe(docker::PROD_PROBE_IMAGE);
+        if probe.available {
+            Check::ok(
+                "docker",
+                format!("{ping_detail}; bind-mount round trip confirmed"),
+            )
+        } else {
+            Check::warn(
+                "docker",
+                format!(
+                    "{ping_detail}; the container lifecycle round trip failed: {}",
+                    probe.detail.as_deref().unwrap_or("no detail reported")
+                ),
+                "the Docker Engine answers a version ping but a real container round trip \
+                 (create, bind-mount, start, write, read back, remove) did not succeed — check \
+                 the storage driver and that this user's containers can actually write through \
+                 a bind mount; until fixed, only actor-only workflows can run",
             )
         }
     }

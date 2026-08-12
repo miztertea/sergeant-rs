@@ -132,6 +132,11 @@ pub const SCHEMA_VERSION: &str = "execution/v1";
 /// Container-side mount point for the work surface (§16.6).
 const WORKSPACE_MOUNT: &str = "/workspace";
 
+/// The small, always-pullable image [`DockerBackend::lifecycle_probe`] uses
+/// in production (`sgt doctor`) — see its own doc for why a test may need a
+/// different one (the environments matrix, §22.7's probe-gating rule).
+pub const PROD_PROBE_IMAGE: &str = "alpine:3";
+
 /// The `--user uid:gid` value to run a container as, so its writes into a
 /// `read_write` mount come out owned by whoever already owns the mounted
 /// directory on the host (§16.8, INV-R1-04). `None` when the owner cannot be
