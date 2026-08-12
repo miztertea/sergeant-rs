@@ -9,6 +9,30 @@ estimated; unsourced cells are marked "—". Token-free: fake backend
 throughout, zero real-Claude spend (the real soak is a separate owner-gated
 step, not run here).
 
+**Traceability note (added in the MVP-4 fixer pass, 2026-08-12):** the raw
+per-scenario JSON/CSV this doc distills from are **not committed**, by the
+harness's own explicit convention (`scripts/perf/README.md`: "`<outdir>` must
+live **outside the repo tree**") and the P1-PERF contract's own measurement
+rule ("recorded raw in per-scenario JSON/CSV under the run's output dir
+(not committed); the baseline doc commits the distilled table"). This is
+the same convention every prior baseline in this directory has followed
+(`baseline-2026-08-10.md`, `baseline-cerberus-2026-08-11.md` cite the same
+uncommitted `run-all-status.tsv`) and the same one `docs/perf/s2-churn-mvp1-
+fixer-2026-08-12.md` names explicitly by artifact filename and scratch path.
+It is a deliberate, contract-level choice, distinct from `docs/coverage/`'s
+own separate convention of committing its run artifacts under
+`docs/coverage/artifacts-*/` — the two record types are not governed by the
+same rule, so the difference in what's checkable is not an inconsistency to
+fix, just a fact worth stating plainly rather than leaving implicit. This
+run's own raw artifacts no longer exist on disk (the scratch outdir they
+lived in was not preserved past the run), so — like the 2026-08-10 and
+2026-08-11 baselines before it — this doc's numbers rest on the operator's
+transcription from that run's console/summary output, not on a
+still-inspectable file. Anyone who wants an independently checkable perf
+run should re-run `scripts/perf/run-all.sh <outdir>` (deterministic fake
+backend, same harness) and diff against the tables below, rather than
+looking for this run's now-gone raw files.
+
 **Unit under test:** `target/release/sgt`, commit `aedc7cb075d573854a7986a0b6d9078c4cf730e7`
 ("MVP-4 stabilize workflow (token-free half; real soak owner-gated)" —
 every scenario's own `commit` field agrees, `commit_dirty_tree=0`,
