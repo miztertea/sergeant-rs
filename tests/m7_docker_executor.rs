@@ -492,7 +492,8 @@ fn retry_uses_the_pinned_image_identity_not_a_fresh_resolution() {
 // -------------------------------------------- 7. §22.8 large-output budget
 
 /// §22.8: peak RSS does not grow proportionally with a large capture. This
-/// test process's own RSS is measured before and after streaming roughly
+/// test process's own peak RSS (`VmHWM`, TH-01) is measured before and
+/// after streaming roughly
 /// 256 MiB combined stdout/stderr through `DockerBackend::observe`'s capture
 /// path (scaled down from the contract's 1 GiB to keep this test's own
 /// runtime reasonable on every measured host; the mechanism being proven —
@@ -581,11 +582,25 @@ fn large_captured_output_does_not_grow_this_process_proportionally() {
     }
 }
 
+/// Reads peak RSS (`VmHWM`), not instantaneous RSS (`VmRSS`).
+///
+/// TH-01 (MVP-2 D3 fixer pass, 2026-08-12): a buffering capture
+/// implementation (`read_to_end` into a `Vec` instead of streaming into the
+/// blob store) passes an instantaneous-RSS check with ~500x headroom,
+/// because glibc serves large allocations via `mmap` and returns the pages
+/// to the OS (`munmap`) once the buffer is freed — by the time the "after"
+/// sample is taken, the buffer is already gone and RSS has settled back
+/// near its "before" value. `VmHWM` is the kernel's own high-water mark for
+/// the process and cannot be un-set by freeing memory, so it is the field
+/// that actually expresses §22.8's "peak RSS" claim. Measured on Cerberus
+/// against a deliberately buffering `stream_one`: `VmRSS` delta 1,148 KiB
+/// (comfortably under the 64 MiB budget) vs. `VmHWM` delta 523,224 KiB
+/// (~511 MiB, 8x over budget) for the identical run.
 #[cfg(target_os = "linux")]
 fn vm_rss_kb() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
     for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
             return rest
                 .trim()
                 .trim_end_matches(" kB")
@@ -595,6 +610,83 @@ fn vm_rss_kb() -> u64 {
         }
     }
     0
+}
+
+// --------------------------------- 7b. §16.8 host-usable file ownership
+
+/// §16.8 / INV-R1-04 (MVP-2 D3 fixer pass): a container-written file, and a
+/// container-created *directory*, both come out owned by the host user who
+/// already owns the mounted worktree — not root — so the worktree stays
+/// editable and cleanable by that user afterward. Before this fix, files
+/// landed `uid 0` (measured on Cerberus) and a root-owned directory could
+/// not even be `rm -rf`'d by the host user, which breaks worktree teardown,
+/// not just editing.
+#[test]
+fn container_written_files_and_directories_are_owned_by_the_host_worktree_owner() {
+    require_docker!();
+    #[cfg(not(unix))]
+    {
+        eprintln!("SKIPPED-ENV: uid/gid ownership is a unix-only concept");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let data = support::DataDir::new();
+        let cwd = TempDir::new().expect("cwd");
+        let backend = backend(data.path());
+        let host_uid = std::fs::metadata(cwd.path()).expect("stat cwd").uid();
+        let host_gid = std::fs::metadata(cwd.path()).expect("stat cwd").gid();
+
+        let req = request(
+            "w7b",
+            "m7-ownership",
+            cwd.path(),
+            spec(
+                vec![
+                    "sh",
+                    "-c",
+                    "echo hi > /workspace/owned-file.txt && mkdir /workspace/owned-dir && \
+                     echo inner > /workspace/owned-dir/inner.txt",
+                ],
+                WorkspaceAccess::ReadWrite,
+            ),
+        );
+        let prepared = backend.prepare(&req).expect("prepare");
+        let handle = launch(&backend, &prepared);
+        let observation = wait_for_exit(&backend, &handle);
+        use sergeant_rs::backend::BackendSignal;
+        assert!(
+            matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+            "the container's own write/mkdir must succeed: {:?}",
+            observation.signal
+        );
+        backend.stop(&handle).expect("stop").wait();
+        assert_containers_gone(&["sgt-m7-ownership"]);
+
+        let file_meta = std::fs::metadata(cwd.path().join("owned-file.txt")).expect("file meta");
+        assert_eq!(
+            (file_meta.uid(), file_meta.gid()),
+            (host_uid, host_gid),
+            "a container-written file must be owned by the host worktree owner, not root"
+        );
+        let dir_meta = std::fs::metadata(cwd.path().join("owned-dir")).expect("dir meta");
+        assert_eq!(
+            (dir_meta.uid(), dir_meta.gid()),
+            (host_uid, host_gid),
+            "a container-created directory must be owned by the host worktree owner, not root"
+        );
+
+        // The stronger claim INV-R1-04 named: the host user can actually
+        // remove what the container created, including a nested file inside
+        // a container-created directory — the shape that broke under root
+        // ownership (a root-owned directory refuses `rm` from a non-root
+        // host user even when the file inside it is otherwise readable).
+        std::fs::remove_dir_all(cwd.path().join("owned-dir"))
+            .expect("host user must be able to remove a container-created directory");
+        std::fs::remove_file(cwd.path().join("owned-file.txt"))
+            .expect("host user must be able to remove a container-created file");
+    }
 }
 
 // --------------------------------------- 8. doctor's lifecycle probe (§16.3)

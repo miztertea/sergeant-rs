@@ -132,6 +132,23 @@ pub const SCHEMA_VERSION: &str = "execution/v1";
 /// Container-side mount point for the work surface (§16.6).
 const WORKSPACE_MOUNT: &str = "/workspace";
 
+/// The `--user uid:gid` value to run a container as, so its writes into a
+/// `read_write` mount come out owned by whoever already owns the mounted
+/// directory on the host (§16.8, INV-R1-04). `None` when the owner cannot be
+/// read (non-unix, or the directory is gone) — the caller's fallback is to
+/// run without `--user`, i.e. the image default.
+#[cfg(unix)]
+fn host_owner_user_flag(cwd: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(cwd).ok()?;
+    Some(format!("{}:{}", meta.uid(), meta.gid()))
+}
+
+#[cfg(not(unix))]
+fn host_owner_user_flag(_cwd: &Path) -> Option<String> {
+    None
+}
+
 /// Bounded human tail length kept alongside the full blob (§16.9's "bounded
 /// human tail" product). Small on purpose: it is display material, not
 /// evidence — the blob is the evidence.
@@ -477,6 +494,27 @@ impl DockerBackend {
         request: &StartRequest,
         spec: &ExecuteSpec,
     ) -> Result<(), BackendError> {
+        // INV-R1-12: `--mount`'s value is a comma-delimited `key=value` CSV
+        // grammar, built below by string interpolation. A surfaces root or
+        // repository path containing `,` or `=` would split into a bogus or
+        // silently misinterpreted option (measured: a `,`-bearing path
+        // produces "invalid field '<segment-after-comma>' must be a
+        // key=value pair"). Refuse closed with a named error rather than
+        // hand Docker a mount spec that means something other than what was
+        // intended — the CLI's own error here is aimed at a human debugging
+        // a `docker` invocation by hand, not at an operator who never typed
+        // `--mount` themselves. Checked before image resolution so this
+        // refusal never depends on Docker (or a registry) being reachable.
+        let cwd_str = request.cwd.to_string_lossy();
+        if cwd_str.contains(',') || cwd_str.contains('=') {
+            return Err(self.failed(format!(
+                "worktree path {:?} contains ',' or '=', which `--mount`'s key=value CSV \
+                 grammar cannot carry safely; refusing to build a bind mount that Docker could \
+                 misparse (§16.6)",
+                request.cwd
+            )));
+        }
+
         let image = self.resolve_image(&request.work_id, &request.stage_id, spec)?;
         self.emit_image_resolved(&request.work_id, &request.execution_id, &image);
 
@@ -518,6 +556,25 @@ impl DockerBackend {
             "--mount".into(),
             mount,
         ];
+        // §16.8 (INV-R1-04, MVP-2 D3 fixer pass): without `--user`, a
+        // container runs as the image's default — root in every measured
+        // probe image — and anything it writes into a `read_write` mount
+        // lands root-owned on the host. Measured on Cerberus: a root-owned
+        // *file* is merely un-editable by the host user, but a root-owned
+        // *directory* the container creates is un-removable too (`rm -rf`
+        // on the worktree fails), which breaks worktree teardown. Run the
+        // container as the uid:gid that already owns the mounted worktree,
+        // so anything it writes is immediately usable and cleanable by
+        // whoever owns the surface — no new identity is invented, the
+        // existing owner is just carried in. Best-effort: if the owner
+        // cannot be read (non-unix, or the path vanished between the mount
+        // string being built and now), the container still runs — as the
+        // image default — rather than refusing the whole stage over a
+        // stat() failure on a path Docker itself is about to bind-mount.
+        if let Some(user) = host_owner_user_flag(&request.cwd) {
+            args.push("--user".into());
+            args.push(user);
+        }
         for (key, value) in &spec.env {
             args.push("--env".into());
             args.push(format!("{key}={value}"));
@@ -1206,6 +1263,52 @@ mod tests {
             .expect("prepare must not touch docker");
         assert_eq!(prepared.native_id.as_deref(), Some("sgt-e1"));
         assert_eq!(prepared.execution_id, "e1");
+    }
+
+    /// INV-R1-12 (MVP-2 D3 fixer pass): `--mount`'s value is a CSV
+    /// `key=value` grammar; a worktree path containing `,` or `=` must be
+    /// refused before it ever reaches Docker, never handed through as a
+    /// malformed or misinterpreted `--mount` flag. Uses a nonexistent
+    /// `docker_bin` — like `prepare_reserves_the_deterministic_name...`
+    /// above — to prove the refusal happens before any external effect;
+    /// `resolve_image` (the first thing that would shell out) is never
+    /// reached because the path check runs first.
+    #[test]
+    fn create_container_refuses_a_mount_path_with_special_csv_characters() {
+        let (_dir, mut config) = config();
+        config.docker_bin = "/nonexistent/docker-binary-that-must-never-run".to_string();
+        let backend = DockerBackend::new(config).expect("backend");
+        for bad_cwd in ["/tmp/has,a-comma", "/tmp/has=an-equals"] {
+            let request = StartRequest {
+                work_id: "w1".into(),
+                execution_id: "e1".into(),
+                stage_id: "10-validate".into(),
+                attempt: 1,
+                cwd: PathBuf::from(bad_cwd),
+                intent: "check it".into(),
+                context: String::new(),
+                model: None,
+                profile: None,
+                execute: None,
+                instruction_policy: InstructionPolicy::default(),
+            };
+            let spec = ExecuteSpec {
+                image: "alpine:3".into(),
+                command: vec!["true".into()],
+                workdir: "/workspace".into(),
+                workspace_access: WorkspaceAccess::ReadOnly,
+                network: NetworkPolicy::None,
+                env: BTreeMap::new(),
+            };
+            let err = backend
+                .create_container("sgt-e1", &request, &spec)
+                .expect_err(&format!("must refuse a mount path of {bad_cwd:?}"));
+            assert!(matches!(err, BackendError::Failed { .. }));
+            assert!(
+                err.to_string().contains("cannot carry safely"),
+                "refusal must name the mount grammar hazard: {err}"
+            );
+        }
     }
 
     #[test]
