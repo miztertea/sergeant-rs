@@ -1143,11 +1143,25 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let data = TempDir::new().expect("tempdir");
     let bin = TempDir::new().expect("tempdir");
     let claude = stub_claude(bin.path());
+    // TH-02 (MVP-2 D3 fixer pass): a scripted `docker`, the same reason
+    // `claude` above is scripted — this test's "every check must be ok"
+    // assertion below must not depend on whether *this host* happens to
+    // have a reachable Docker Engine (N4.md's own probe-gating rule for
+    // Docker facts on the GH runner / cloud container).
+    let docker = stub_docker(bin.path());
 
     // --- healthy -------------------------------------------------------------
-    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
-    let (code, healthy_json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (code, healthy_json, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     assert_eq!(code, Some(0));
     let report: Value = serde_json::from_str(&healthy_json).expect("doctor --json is json");
     assert_eq!(report["healthy"], true);
@@ -1162,11 +1176,19 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         vec![
             "git",
             "claude",
+            "docker",
             "data_dir",
             "journal",
             "projection",
             "daemon",
-            "permission_mode"
+            "permission_mode",
+            // MVP-3: manifest health beyond "it parses" — declared repos
+            // missing on disk (origin as the remedy) and directories under
+            // `repos/` the manifest never declared. `ok` here (a temp dir
+            // outside any estate has nothing to check), same rule as
+            // `permission_mode` above it.
+            "estate",
+            "disk_pressure",
         ],
         "the --json check list and its order are the stable part of this contract"
     );
@@ -1192,13 +1214,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // and require the same verdict, now with real numbers behind it.
     let used = TempDir::new().expect("tempdir");
     seed_journal(used.path(), 5);
-    let (code, stdout, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_eq!(
         code,
         Some(0),
         "a populated healthy install must exit 0:\n{stdout}"
     );
-    let (_, used_json, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, used_json, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&used_json).expect("json");
     assert_eq!(report["healthy"], true);
     let journal = named_check(&report, "journal");
@@ -1219,9 +1249,17 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     // …and a journal it cannot replay is a failure, not a shrug.
     corrupt_journal(used.path());
-    let (code, stdout, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(code, Some(0), "an unreplayable journal must exit nonzero");
-    let (_, torn_json, _) = doctor(used.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, torn_json, _) = doctor(
+        used.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&torn_json).expect("json");
     assert_eq!(named_check(&report, "journal")["status"], "fail");
     assert!(
@@ -1246,7 +1284,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
 
     // Stability: the same environment produces the same shape (keys, names,
     // order, statuses) — only details may move.
-    let (_, first_again, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, first_again, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let first_again: Value = serde_json::from_str(&first_again).expect("json");
     let healthy_report: Value =
         serde_json::from_str(&healthy_json).expect("the first healthy report reparses");
@@ -1258,9 +1300,17 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
 
     // --- an absent claude -----------------------------------------------------
     let missing = bin.path().join("no-such-claude").display().to_string();
-    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &missing)], false);
+    let (code, stdout, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &missing), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(code, Some(0), "an unusable claude must exit nonzero");
-    let (_, absent_json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &missing)], true);
+    let (_, absent_json, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &missing), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&absent_json).expect("json");
     assert_eq!(report["healthy"], false);
     let check = named_check(&report, "claude");
@@ -1336,13 +1386,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let live_cwd = TempDir::new().expect("tempdir");
     {
         let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
-        let (code, stdout, _) = doctor(live_data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+        let (code, stdout, _) = doctor(
+            live_data.path(),
+            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            false,
+        );
         assert_eq!(
             code,
             Some(0),
             "a healthy install with a daemon behind it must exit 0:\n{stdout}"
         );
-        let (_, live_json, _) = doctor(live_data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+        let (_, live_json, _) = doctor(
+            live_data.path(),
+            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            true,
+        );
         let report: Value = serde_json::from_str(&live_json).expect("json");
         let check = named_check(&report, "daemon");
         assert_eq!(
@@ -1365,13 +1423,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // command republishes it.
     let stale = TempDir::new().expect("tempdir");
     write_descriptor(stale.path(), dead_pid(), "http://127.0.0.1:1");
-    let (code, stdout, _) = doctor(stale.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        stale.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_eq!(
         code,
         Some(0),
         "a stale descriptor is harmless and must not fail the install:\n{stdout}"
     );
-    let (_, stale_json, _) = doctor(stale.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, stale_json, _) = doctor(
+        stale.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&stale_json).expect("json");
     let check = named_check(&report, "daemon");
     assert_eq!(
@@ -1394,13 +1460,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         .spawn()
         .expect("spawn a process to stand in for a wedged daemon");
     write_descriptor(occupied.path(), squatter.id(), "http://127.0.0.1:1");
-    let (code, stdout, _) = doctor(occupied.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        occupied.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(
         code,
         Some(0),
         "a live pid behind a dead endpoint must exit nonzero:\n{stdout}"
     );
-    let (_, wedged_json, _) = doctor(occupied.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, wedged_json, _) = doctor(
+        occupied.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&wedged_json).expect("json");
     let check = named_check(&report, "daemon");
     assert_eq!(check["status"], "fail", "{check}");
@@ -1426,9 +1500,17 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // bits do not stop uid 0, and these tests run as root in this container).
     let blocked = bin.path().join("not-a-directory");
     std::fs::write(&blocked, b"this is a file").expect("write file");
-    let (code, stdout, _) = doctor(&blocked, &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        &blocked,
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(code, Some(0), "an unusable data dir must exit nonzero");
-    let (_, broken_json, _) = doctor(&blocked, &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, broken_json, _) = doctor(
+        &blocked,
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&broken_json).expect("json");
     assert_eq!(report["healthy"], false);
     let check = named_check(&report, "data_dir");
@@ -1462,13 +1544,14 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
 fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     let bin = TempDir::new().expect("tempdir");
     let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
     let workspace = TempDir::new().expect("tempdir");
     init_repo(workspace.path());
     std::fs::write(
         workspace.path().join("sergeant.toml"),
-        "[workspace]\nname = \"w\"\n\n\
-         [[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
          [[profile]]\nname = \"quiet\"\nbackend = \"claude\"\n\n\
          [[profile]]\nname = \"careful\"\nbackend = \"claude\"\n\
          [profile.options]\npermission_mode = \"plan\"\n",
@@ -1478,14 +1561,14 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     let (code, stdout, _) = doctor_in(
         workspace.path(),
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude)],
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         false,
     );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
     let (_, json, _) = doctor_in(
         workspace.path(),
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude)],
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
     );
     let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
@@ -1511,6 +1594,142 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     );
 }
 
+/// MVP-3: `sgt doctor`'s estate check names a declared-but-missing
+/// repository by name and reports its declared `origin` as the remedy — the
+/// exact fact an operator needs ("clone it from here"), not a generic
+/// "something is missing".
+///
+/// guard-map: a mutation that reports the missing repo's name but drops the
+/// origin from the remedy (or reports a fixed "clone it" string) survives
+/// every other doctor test but fails this one.
+#[test]
+fn t3c_doctor_estate_check_names_a_missing_repository_with_its_origin_as_the_remedy() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"payments\"\npath = \"repos/payments\"\n\
+         origin = \"https://example.com/payments.git\"\n",
+    )
+    .expect("write sergeant.toml");
+    // Deliberately never create repos/payments — that absence is the point.
+
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "estate");
+    assert_eq!(check["status"], "warn", "{check}");
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("payments") && detail.contains("missing on disk"),
+        "the missing repo must be named: {detail}"
+    );
+    let remedy = check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("https://example.com/payments.git"),
+        "the declared origin must be the remedy, not a generic instruction: {remedy}"
+    );
+}
+
+/// MVP-3: a directory under `repos/` the manifest never declared is flagged
+/// by name, distinct from (and not confused with) the missing-repository
+/// case above.
+///
+/// guard-map: dropping the `repos/` directory scan, or failing to exclude
+/// declared names from it, makes this fail — either no fault is reported, or
+/// the declared-and-present `known` repo is wrongly flagged too.
+#[test]
+fn t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    init_repo(&workspace.path().join("repos").join("known"));
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"known\"\npath = \"repos/known\"\n",
+    )
+    .expect("write sergeant.toml");
+    // On disk but never declared in sergeant.toml.
+    init_repo(&workspace.path().join("repos").join("stray"));
+
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "estate");
+    assert_eq!(check["status"], "warn", "{check}");
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("stray") && detail.contains("not declared"),
+        "the undeclared directory must be named: {detail}"
+    );
+    assert!(
+        !detail.contains("known is") && !detail.contains("known/"),
+        "the declared, present repository must not also be flagged: {detail}"
+    );
+    let remedy = check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("sgt repo add stray"),
+        "the remedy must name the fixing command: {remedy}"
+    );
+}
+
+/// MVP-3/E5: a manifest that fails to parse reports file *and* line — via
+/// `toml::de::Error`'s own diagnostic riding `WorkspaceError::Malformed`'s
+/// `Display` through the estate check — never a generic "invalid config".
+#[test]
+fn t3e_doctor_estate_check_names_file_and_line_on_a_malformed_manifest() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\nthis is not valid toml >>>\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (code, _, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
+    assert_ne!(code, Some(0), "a broken manifest must exit nonzero");
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "estate");
+    assert_eq!(check["status"], "fail", "{check}");
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("sergeant.toml"),
+        "the offending file must be named: {detail}"
+    );
+    assert!(
+        detail.to_lowercase().contains("line"),
+        "the parse error must carry a line number, not just \"invalid\": {detail}"
+    );
+}
+
 /// The journal check's *other* failure arm: `corrupt_journal` above only
 /// ever reaches "replay failed after N events" (a line the replay gets to
 /// and cannot parse). `Journal::replay_data_dir` can also fail before it
@@ -1524,17 +1743,26 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
 fn doctor_reports_a_journal_it_cannot_even_open() {
     let bin = TempDir::new().expect("tempdir");
     let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
     std::fs::create_dir_all(data.path()).expect("data dir");
     std::fs::write(data.path().join("journal"), b"not a directory").expect("write file");
 
-    let (code, stdout, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], false);
+    let (code, stdout, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
     assert_ne!(
         code,
         Some(0),
         "a journal directory that is a file must fail the install"
     );
-    let (_, json, _) = doctor(data.path(), &[("SGT_CLAUDE_BIN", &claude)], true);
+    let (_, json, _) = doctor(
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
     let report: Value = serde_json::from_str(&json).expect("json");
     assert_eq!(report["healthy"], false);
     let check = named_check(&report, "journal");
@@ -2438,6 +2666,16 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
             "impl PendingObserve",
             "pub fn perform(&self) -> ObserveOutcome",
         ),
+        // R-MVP1-7's per-turn wall-clock ceiling. INTERRUPT is an external
+        // effect exactly like STOP/OBSERVE are, so it gets its own performer
+        // rather than joining `stop_execution`'s reviewed under-the-lock
+        // exemption below — nothing about the ceiling needs INTERRUPT to run
+        // synchronously with a journal append the way STOP's kill-then-latch
+        // does.
+        (
+            "impl PendingInterrupt",
+            "pub fn perform(&self) -> InterruptOutcome",
+        ),
     ];
     let mut ranges = Vec::new();
     for (block, signature) in performers {
@@ -2495,6 +2733,21 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
     // not an unreviewed one — named here rather than left invisible to this
     // test. See `CoreGuard`'s doc for the durability guarantee stated
     // honestly against it.
+    //
+    // INV-R1-01 (N4/M7, MVP-2 D3 fixer pass): N4 added a second backend to
+    // this same `fn stop_execution` call site — `DockerBackend::stop` — and
+    // this rationale, written entirely about the Claude adapter's cheap
+    // signal-send, did not automatically cover it: `DockerBackend::stop`
+    // originally shelled out to `docker inspect` + `docker rm -f`
+    // synchronously (measured ~70 ms combined, over this contract's entire
+    // single-submit p50 budget), which is not the "synchronous kill + reap"
+    // shape this exemption was reviewed for. Fixed by making
+    // `DockerBackend::stop` defer its whole Docker Engine interaction
+    // through `Completion`'s tail-work mechanism, the same "kill now, join
+    // later" split `ClaudeBackend::stop` already uses — so both backends
+    // registered under this fixed call site now do genuinely cheap,
+    // in-memory work synchronously, and the region stays honestly
+    // whitelisted rather than silently widened in scope by a new backend.
     for stop_under_the_request_guard in ["fn stop_execution", "pub fn settle_launch"] {
         let start = source
             .find(stop_under_the_request_guard)
@@ -3014,6 +3267,132 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
     );
 }
 
+/// guard-map: MVP-3's admission drain flag (`sgt daemon stop`, scoped
+/// exactly to that use) — one journaled `admission.paused`/
+/// `admission.resumed` event pair plus a submit refusal while paused — and
+/// the L6 crash window docs/DEVELOPMENT.md names explicitly for this class of
+/// mechanism: a daemon killed *after* `admission.paused` is durable but
+/// *before* it ever gets to stop must not leave the data dir stuck refusing
+/// work forever.
+///
+/// This drives the fault directly at the journal/engine level (raw
+/// `POST /v1/admission/pause`, then a real `SIGKILL`) rather than through
+/// `sgt daemon stop`'s own CLI-side drain wait, because the hazard L6 names
+/// is about journal durability across a crash, not about the CLI's polling
+/// loop — the crash window exists the instant `admission.paused` commits,
+/// independent of whatever the caller was doing next.
+///
+/// Mutation this kills: dropping `submit_work`'s `admission_paused` check
+/// (a paused daemon would keep accepting work); dropping `start_with`'s
+/// unconditional startup resume (a fresh daemon would replay
+/// `admission_paused: true` forever, since nothing else ever resumes it);
+/// or making `pause_admission` non-idempotent (a second pause would journal
+/// a redundant event, which this test's second `pause` call would still
+/// pass today but a stricter follow-on assertion on event counts — added
+/// below — would not).
+#[test]
+fn r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop() {
+    let data = DataDir::new();
+    let cwd = TempDir::new().expect("tempdir");
+    let mut first = SpawnedDaemon::start(&data, cwd.path(), &[]);
+    let client = ApiClient::new(&first.endpoint, &first.token).expect("client");
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+    rt.block_on(async {
+        // Pause admission — the durable half of the crash window: everything
+        // after this commit must be recoverable no matter when the process
+        // dies.
+        let paused = client
+            .post("/v1/admission/pause", &json!({"command_id": ulid()}))
+            .await
+            .expect("pause admission");
+        assert_eq!(
+            paused["admission"]["paused"], true,
+            "pause_admission must report paused: {paused}"
+        );
+
+        // A genuinely new submission is refused while paused, never silently
+        // accepted or queued.
+        let refused = client
+            .post(
+                "/v1/work",
+                &json!({"command_id": ulid(), "intent": "refused while admission is paused"}),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a submit while admission is paused must fail, not succeed: {refused:?}"
+        );
+
+        // Idempotent re-pause: a `daemon stop` retry against a still-live,
+        // already-paused daemon must not double-pause. Journaled state is
+        // opaque to this client, but the response must be stable and never
+        // itself an error — a caller retrying `sgt daemon stop` cannot be
+        // punished for the retry.
+        let paused_again = client
+            .post("/v1/admission/pause", &json!({"command_id": ulid()}))
+            .await
+            .expect("re-pause must succeed, not error");
+        assert_eq!(paused_again["admission"]["paused"], true);
+    });
+
+    // The fault: kill the daemon directly, simulating a death mid-drain —
+    // before `sgt daemon stop` (or anything else) ever got to send its own
+    // SIGTERM or resume admission itself. `Child::kill` is SIGKILL, exactly
+    // like `SpawnedDaemon::stop`'s own escalation path.
+    let pid = first.child.id();
+    first.child.kill().expect("kill the daemon");
+    let status = first.child.wait().expect("wait for the killed daemon");
+    first.stopped = Some(DaemonStop {
+        signal: StopSignal::Kill,
+        status: Some(status),
+    });
+    assert!(
+        !daemon::pid_alive(pid),
+        "the killed daemon must actually be gone before restarting on the same data dir"
+    );
+
+    // The killed daemon never got to remove its descriptor (only a clean
+    // shutdown does that), so a stale one is still sitting in the data dir.
+    // `SpawnedDaemon::start_at`'s wait loop only checks for *presence*, not
+    // freshness (unlike the real `ensure_daemon`, which also checks
+    // `/healthz` and compares identity) — it would hand back that stale
+    // descriptor immediately rather than waiting for the second daemon's
+    // own. Removing it is test-rig hygiene only: production never needs
+    // this, because a fresh daemon's own atomic descriptor write
+    // overwrites the same path regardless of what is already there.
+    std::fs::remove_file(daemon::descriptor_path(data.path()))
+        .expect("remove the killed daemon's stale descriptor");
+
+    // Restart on the same data dir. This process was never mid-drain itself
+    // — the L6 argument `KIND_ADMISSION_RESUMED`'s own doc makes — so
+    // admission must come back unconditionally, not stay stuck.
+    let second = SpawnedDaemon::start(&data, cwd.path(), &[]);
+    let client2 = ApiClient::new(&second.endpoint, &second.token).expect("client");
+    rt.block_on(async {
+        let system = client2.get("/v1/system").await.expect("system");
+        assert_eq!(
+            system["admission_paused"], false,
+            "a fresh daemon must never inherit an admission pause from a predecessor that died \
+             mid-drain — it would refuse all work forever with no operator ever having asked \
+             for that: {system}"
+        );
+        let accepted = client2
+            .post(
+                "/v1/work",
+                &json!({"command_id": ulid(), "intent": "accepted after the restart resumes admission"}),
+            )
+            .await
+            .expect("submit after restart must succeed");
+        assert_eq!(
+            accepted["work"]["state"], "pending",
+            "the post-restart submission must actually be admitted: {accepted}"
+        );
+    });
+
+    data.reap();
+}
+
 /// The same teardown, composed the way the rig's real users get it: `Drop`.
 ///
 /// The pin above never executes `Drop` at all — it calls `stop()` first, which
@@ -3390,5 +3769,42 @@ fn stub_claude(dir: &Path) -> String {
             "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.226 (Claude Code)';;\n  \
              --help) echo '{flags}';;\n  *) cat >/dev/null;;\nesac\n"
         ),
+    )
+}
+
+/// A stand-in `docker` that passes both `DockerBackend::probe`'s cheap
+/// version check (`docker version --format {{.Server.Version}}`) and
+/// `DockerBackend::lifecycle_probe`'s real bind-mount round trip (INV-R1-06:
+/// `docker_check` now runs both, so the doctor tests need a stub that fakes
+/// both, not just the ping), so the doctor tests measure the doctor rather
+/// than whether *this host* happens to have a reachable Docker Engine
+/// (TH-02, MVP-2 D3 fixer pass: N4.md's probe-gating rule for Docker facts,
+/// applied to the one doctor row that previously had no override analogous
+/// to `SGT_CLAUDE_BIN`). For `run`, it parses the `--mount`
+/// `type=bind,source=...,target=...` value straight out of argv and writes
+/// the probe marker there itself, standing in for what a real container
+/// would do — good enough to prove the doctor *asks* the lifecycle
+/// question, without needing a real container runtime in this suite.
+fn stub_docker(dir: &Path) -> String {
+    write_script(
+        dir,
+        "docker-stub",
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         \x20 version) echo '99.0.0';;\n\
+         \x20 run)\n\
+         \x20   for arg in \"$@\"; do\n\
+         \x20     case \"$arg\" in\n\
+         \x20       type=bind,source=*)\n\
+         \x20         src=$(echo \"$arg\" | sed -n 's/.*source=\\([^,]*\\),target=.*/\\1/p')\n\
+         \x20         echo sergeant-probe > \"$src/probe-marker\"\n\
+         \x20         ;;\n\
+         \x20     esac\n\
+         \x20   done\n\
+         \x20   exit 0\n\
+         \x20   ;;\n\
+         \x20 rm) exit 0;;\n\
+         \x20 *) exit 1;;\n\
+         esac\n",
     )
 }

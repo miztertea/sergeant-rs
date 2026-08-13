@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, Request, State};
@@ -29,16 +29,19 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::Deferred;
-use crate::daemon::{KIND_BACKEND_PROBED, KIND_DAEMON_STARTED, KIND_DAEMON_STOPPED};
+use crate::daemon::{
+    KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
+    KIND_DAEMON_STOPPED,
+};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::execution::{
     KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use crate::domain::work::{
-    KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
-    KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED,
-    KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
+    EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
+    KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
+    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
 };
 use crate::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
@@ -46,15 +49,21 @@ use crate::domain::workflow::{
     KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
-use crate::runtime::engine::{Engine, EngineError, Next as EngineNext, Step, SubmitContext};
+use crate::runtime::engine::{
+    Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
+    Next as EngineNext, Step, SubmitContext,
+};
 use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
     KIND_CONVERSATION_USER, KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
 use crate::runtime::journal::{Journal, JournalError};
-use crate::runtime::projection::{Projection, ProjectionError, WorkRegistry, WorkRun};
+use crate::runtime::projection::{
+    Projection, ProjectionError, WorkRegistry, WorkRun, is_absorbing, rederive_run,
+};
 use crate::runtime::surface::{
-    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
+    BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
+    KIND_SURFACE_TORN_DOWN,
 };
 
 /// API revision served by this build (`GET /v1/system`, runtime descriptor).
@@ -381,9 +390,12 @@ pub fn router(state: ApiState) -> Router {
     let v1 = Router::new()
         .route("/work", post(submit_work).get(list_work))
         .route("/work/{id}", get(show_work))
+        .route("/work/{id}/transcript", get(work_transcript))
         .route("/work/{id}/cancel", post(cancel_work))
         .route("/work/{id}/input", post(work_input))
         .route("/work/{id}/retry", post(work_retry))
+        .route("/work/{id}/extend", post(work_extend))
+        .route("/admission/pause", post(pause_admission))
         .route("/graph/work/{id}", get(work_graph))
         .route("/analytics", get(analytics_index))
         .route("/analytics/{name}", get(analytics_query))
@@ -433,6 +445,13 @@ pub fn router(state: ApiState) -> Router {
 /// It requires a multi-thread runtime; the single-thread fallback runs the
 /// closure inline, which is what a current-thread runtime can do anyway.
 async fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    blocking_sync(f)
+}
+
+/// [`blocking`]'s body, callable from sync code that is already running on
+/// an async worker (a handler's view composition, e.g. `resolve_run`'s
+/// journal replay): same primitive, same single-thread fallback.
+fn blocking_sync<T>(f: impl FnOnce() -> T) -> T {
     let multi_thread = tokio::runtime::Handle::try_current()
         .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         .unwrap_or(false);
@@ -535,6 +554,16 @@ async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                     core,
                 )
             }
+            EngineNext::Interrupt(pending) => {
+                let outcome = blocking(|| pending.perform()).await;
+                let work_id = pending.work_id().to_string();
+                let mut core = CoreGuard::acquire(&state.core).await;
+                (
+                    work_id,
+                    state.engine.settle_interrupt(&mut core, *pending, outcome),
+                    core,
+                )
+            }
         };
         let (work_id, outcome, core) = settled;
         match outcome {
@@ -606,10 +635,74 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
         if *closing.borrow() {
             return;
         }
-        let due = {
+        let (due, overdue) = {
             let core = CoreGuard::acquire(&state.core).await;
-            state.engine.due_observations(&core)
+            // Read-only, side-effect-free question asked of the projection
+            // (§22.6): nothing here is consumed, so abandoning a `due`
+            // candidate mid-loop below (shutdown) just means it is asked
+            // again next tick — or, on a restart, freshly re-derived from
+            // the projection with nothing lost.
+            let due = state.engine.due_observations(&core);
+            // R-MVP1-7's per-turn wall-clock ceiling rides this same 200 ms
+            // sweep, read under the same guard hold `due_observations`
+            // already takes — but unlike `due_observations`, this one is
+            // NOT side-effect-free: `due_interrupts` destructively removes
+            // every overdue entry from `Engine`'s in-memory `turn_started`
+            // map as it collects them ("one attempt per crossing", its own
+            // doc). Once collected here, an entry in `overdue` below is the
+            // *only* record that this crossing ever happened — dropping it
+            // (e.g. on a shutdown race) rather than delivering it would
+            // lose the attempt with no journal trace at all, not merely
+            // defer it to a later tick the way an abandoned `due` observe
+            // is deferred.
+            let overdue = state.engine.due_interrupts(&core, Instant::now());
+            (due, overdue)
         };
+        // Every `overdue` entry was already destructively dequeued above —
+        // deliver all of them before honoring a shutdown signal that lands
+        // mid-loop, so a crossing already consumed from the clock is never
+        // silently discarded (see `due_interrupts`'s doc just above). This
+        // is why this loop, alone among the two below, does not re-check
+        // `closing` per iteration.
+        for pending in overdue {
+            // §14.5 for the perform itself: each crank below is awaited
+            // serially, so a late entry's collection→perform window spans
+            // every earlier interrupt — long enough for the targeted turn to
+            // end and a SEND to spawn a fresh one on the same execution
+            // handle. Re-validate under the guard immediately before the
+            // kill; a stale crossing is journaled (`settle_stale_interrupt`),
+            // never silently dropped.
+            let stale = {
+                let mut core = CoreGuard::acquire(&state.core).await;
+                match state.engine.interrupt_is_stale(&core, &pending) {
+                    Some(reason) => {
+                        if let Err(e) = state
+                            .engine
+                            .settle_stale_interrupt(&mut core, &pending, reason)
+                        {
+                            tracing::error!(
+                                work_id = %pending.work_id(),
+                                error = %e,
+                                "journaling a stale ceiling crossing failed"
+                            );
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            };
+            if stale {
+                continue;
+            }
+            crank(
+                &state,
+                Step {
+                    next: EngineNext::Interrupt(pending),
+                    deferred: Deferred::new(),
+                },
+            )
+            .await;
+        }
         for pending in due {
             if *closing.borrow() {
                 return;
@@ -691,6 +784,7 @@ fn engine_error_status(e: &EngineError) -> StatusCode {
         EngineError::Core(_) => StatusCode::INTERNAL_SERVER_ERROR,
         EngineError::NotAwaitingInput { .. }
         | EngineError::NotRetryable { .. }
+        | EngineError::NotBlocked { .. }
         | EngineError::IllegalTransition { .. } => StatusCode::CONFLICT,
         EngineError::NoRun { .. } => StatusCode::NOT_FOUND,
         _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -791,19 +885,26 @@ async fn healthz() -> Json<Value> {
 /// every live client needs it and none of them may read the journal to find
 /// it: it is the resume point an SSE subscriber passes as `from` so that
 /// attaching to the tail does not replay all of history first.
-fn system_body(state: &ApiState, journal_head: u64) -> Value {
+fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "api_revision": API_REVISION,
         "data_dir": state.data_dir,
         "journal_head": journal_head,
+        // MVP-3's admission drain flag (`sgt daemon stop`): whether new
+        // `POST /v1/work` submissions are currently refused. Surfaced here
+        // so `sgt status` can say why a submit is being turned away without
+        // an operator having to decode the journal for `admission.paused`.
+        "admission_paused": admission_paused,
     })
 }
 
 /// `GET /v1/system` — version, API revision, data dir, journal head.
 async fn system_info(State(state): State<ApiState>) -> Json<Value> {
-    let head = CoreGuard::acquire(&state.core).await.registry.last_seq();
-    Json(system_body(&state, head))
+    let core = CoreGuard::acquire(&state.core).await;
+    let head = core.registry.last_seq();
+    let admission_paused = core.registry.state().admission_paused;
+    Json(system_body(&state, head, admission_paused))
 }
 
 /// The event source all API-origin events carry.
@@ -931,6 +1032,82 @@ struct SubmitRequest {
     created_by: Option<String>,
     #[serde(default)]
     origin: Option<Origin>,
+    /// R-MVP1-6's structured-intent schema slot. Progressive elaboration of
+    /// `intent`, checked for agreement against `workflow`/`repositories`
+    /// above (§13's one-source-of-truth rule) and journaled verbatim
+    /// otherwise — nothing here drives routing.
+    #[serde(default)]
+    intent_detail: Option<IntentDetail>,
+    /// MVP-3's submit-time envelope override (`--turns`/`--ceiling-secs`):
+    /// see [`EnvelopeRequest`]. Validated at submit (both fields, when
+    /// present, must be at least 1) and journaled verbatim otherwise —
+    /// nothing here drives routing, exactly like `intent_detail` above.
+    #[serde(default)]
+    envelope: Option<EnvelopeRequest>,
+}
+
+/// R-MVP1-7's envelope override, sanity-checked at submit: a turn cap of 0
+/// would block a Work before its first turn ever spawns (indistinguishable
+/// from "already exhausted"), and a ceiling of 0 would interrupt a turn
+/// before the completion driver's very first tick could ever see it finish —
+/// both are certainly a client mistake, never an intentional bound, so both
+/// fail closed here rather than producing a Work that can never make
+/// progress.
+fn envelope_out_of_range(req: &SubmitRequest) -> Option<String> {
+    let envelope = req.envelope.as_ref()?;
+    if envelope.turn_cap == Some(0) {
+        return Some(
+            "envelope.turn_cap must be at least 1 (0 would block before any turn)".to_string(),
+        );
+    }
+    if envelope.ceiling_secs == Some(0) {
+        return Some(
+            "envelope.ceiling_secs must be at least 1 (0 would interrupt before any turn could \
+             ever finish)"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// R-MVP1-6's submit-time agreement check: a structured elaboration that
+/// names a `workflow`/`repos` different from what the submission's own
+/// flags say is two answers to "what is this Work about" in one Work, and
+/// §13 requires exactly one source of truth. Absent on either side is not a
+/// disagreement — only *both present and different* is. Repository sets are
+/// compared unordered (a client naming the same repos in a different order
+/// has not disagreed with itself).
+fn intent_detail_disagreement(req: &SubmitRequest) -> Option<String> {
+    let detail = req.intent_detail.as_ref()?;
+    if let (Some(declared), Some(flag)) = (detail.workflow.as_deref(), req.workflow.as_deref())
+        && declared != flag
+    {
+        return Some(format!(
+            "intent_detail.workflow is {declared:?}, but the submission's workflow flag is \
+             {flag:?}; the two must agree"
+        ));
+    }
+    if let Some(declared) = detail.repos.as_ref()
+        && !req.repositories.is_empty()
+    {
+        let declared_set: std::collections::BTreeSet<&str> =
+            declared.iter().map(String::as_str).collect();
+        let flag_set: std::collections::BTreeSet<&str> =
+            req.repositories.iter().map(String::as_str).collect();
+        if declared_set != flag_set {
+            return Some(format!(
+                "intent_detail.repos is {declared:?}, but the submission's repositories are \
+                 {:?}; the two must agree",
+                req.repositories
+            ));
+        }
+    }
+    // `detail.group` is deliberately not checked here (I3): R-MVP1-5(b)
+    // gives group membership "no new engine surface" in MVP-1 — there is no
+    // `--group` flag yet for it to disagree with, and expanding it into a
+    // repository set to compare is MVP-3's CLI-side job. Revisit this
+    // function when `--group` lands, not before.
+    None
 }
 
 /// §13's origin metadata: who is asking, and from where.
@@ -1020,7 +1197,7 @@ async fn submit_work(
         .get(&req.command_id)
         .cloned()
     {
-        let result = work_view(&core, &work_id);
+        let result = work_view(&core, &state.engine, &work_id);
         return record_and_respond(
             &mut core,
             &req.command_id,
@@ -1041,6 +1218,55 @@ async fn submit_work(
             "work.submit",
             None,
             StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    if let Some(reason) = intent_detail_disagreement(&req) {
+        // Same shape as the empty-intent rejection above: a fail-closed
+        // semantic outcome, journaled under this command_id so a retry
+        // replays it rather than re-validating against a possibly different
+        // future rule (R-MVP1-6: "one source of truth, fail closed").
+        let result = error_body("intent_detail_disagreement", reason);
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.submit",
+            None,
+            StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    if let Some(reason) = envelope_out_of_range(&req) {
+        let result = error_body("invalid_envelope", reason);
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.submit",
+            None,
+            StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    // MVP-3's admission drain (`sgt daemon stop`, scoped exactly to that
+    // use): a genuinely new submission arriving while admission is paused is
+    // refused, journaled like any other rejected outcome so a retry after
+    // admission resumes is a distinct, freshly-evaluated command rather than
+    // a replay of this refusal. Checked here, *after* the replay/crash-window
+    // lookups above, so a duplicate `command_id` from before the pause still
+    // replays its original (accepted) outcome — pausing admission stops new
+    // work, not the idempotent replay of work already accepted.
+    if core.registry.state().admission_paused {
+        let result = error_body(
+            "admission_paused",
+            "admission is paused (the daemon is draining for `sgt daemon stop`) — refusing new \
+             work until it resumes",
+        );
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.submit",
+            None,
+            StatusCode::SERVICE_UNAVAILABLE,
             result,
         );
     }
@@ -1079,6 +1305,13 @@ async fn submit_work(
         backend: req.backend,
         origin_client: origin.client,
         profile: req.profile,
+        // I3: an empty `{}` object is the same fact as sending nothing at
+        // all (IntentDetail::is_empty's own doc) — normalized here so that
+        // promise is actually kept, not merely stated.
+        intent_detail: req.intent_detail.filter(|d| !d.is_empty()),
+        // I3's own rule, reused: an empty `{}` override is the same fact as
+        // sending nothing.
+        envelope: req.envelope.filter(|e| !e.is_empty()),
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),
@@ -1126,7 +1359,7 @@ async fn submit_work(
     }
 
     // Answer from the projection, not the request: proves the read path.
-    let result = work_view(&core, &work_id);
+    let result = work_view(&core, &state.engine, &work_id);
     record_and_respond(
         &mut core,
         &req.command_id,
@@ -1137,33 +1370,168 @@ async fn submit_work(
     )
 }
 
+/// The [`WorkRun`] to render for a work: the live or R-MVP1-9-evicted-but-
+/// cached registry entry (`cached`, which callers pass as `WorkRegistry::
+/// run_view`'s answer — checking both `runs` and `terminal_runs`), or —
+/// only when *neither* has it — the read-side full-journal re-derivation.
+///
+/// The full-replay path is a bounded fallback, not the ordinary case:
+/// every eviction populates `terminal_runs` at the moment it reclaims
+/// `runs` (`maybe_evict`), so a recently terminal work's view is answered
+/// from that in-memory cache, never a per-request journal walk (W2/TH-08:
+/// this used to replay the *entire* journal on every view of every terminal
+/// work, including ones with no run at all, which is exactly the unbounded-
+/// I/O-under-the-guard shape §22.6 forbids). What remains of that shape is
+/// an acknowledged tradeoff, not an anomaly path: `terminal_runs` holds only
+/// `TERMINAL_RUN_CACHE_CAPACITY` entries, so on an installation with more
+/// terminal works than that, viewing one aged out of the cache replays the
+/// journal while the guard is held, queueing other requests behind it —
+/// rate-limited to cache misses rather than eliminated. The replay runs via
+/// [`blocking_sync`] so it at least never starves the async worker's other
+/// tasks; moving it off the guard entirely would need a journal reader the
+/// core does not own, which is the named follow-up shape, not this build's.
+/// The same fallback also covers a registry an older build populated before
+/// the cache existed.
+///
+/// Only `is_absorbing` states (`Completed`/`Canceled`) are ever evicted, so
+/// that is the only case worth even trying the fallback for; every other
+/// state's `None` here means exactly what it always meant — no run exists
+/// yet — and costs nothing extra to answer.
+///
+/// A replay failure is logged and treated as "nothing to show" rather than
+/// failing the whole view: `work_view` composes many independent fields from
+/// this one `Option`, and a journal I/O error re-deriving a *terminal* work's
+/// history should not turn into a 500 for `work.state` and every other field
+/// that needed no replay at all.
+fn resolve_run(core: &Core, work: &Work, cached: Option<&WorkRun>) -> Option<WorkRun> {
+    if let Some(run) = cached {
+        return Some(run.clone());
+    }
+    if !is_absorbing(work.state) {
+        return None;
+    }
+    match blocking_sync(|| rederive_run(&core.journal, &work.id)) {
+        Ok(run) => run,
+        Err(e) => {
+            tracing::error!(
+                work_id = %work.id,
+                error = %e,
+                "could not re-derive an evicted work's run from the journal"
+            );
+            None
+        }
+    }
+}
+
+/// R-MVP1-2's output pointer (the sibling half of the ruling, not itself a
+/// ruling): once a surface has been torn down, name per repository what §11
+/// already recorded — the source repository, the retained branch, the
+/// worktree path — plus the finalize commit `surface::teardown` now captures
+/// as it reads the branch (R-MVP1-2's own extension to `BindingTeardown`).
+/// That commit is whatever a closing stage's `promote` disposition landed
+/// before teardown ran, per the ruled timing, or just the surface's base SHA
+/// if the stage declared nothing.
+///
+/// `None` before teardown has run: there is no output to point at yet, and a
+/// null here (rather than a partial view built from `run.surface` alone) is
+/// the honest answer for a work still in flight.
+fn output_pointer(work: &Work, run: &WorkRun) -> Option<Value> {
+    let teardown = run.teardown.as_ref()?;
+    let surface = run.surface.as_ref();
+    let repositories: Vec<Value> = teardown
+        .bindings
+        .iter()
+        .map(|binding| {
+            let source_repo = surface
+                .and_then(|s| {
+                    s.bindings
+                        .iter()
+                        .find(|b| b.repository == binding.repository)
+                })
+                .map(|b| b.source_path.display().to_string());
+            json!({
+                "repository": binding.repository,
+                "source_repo": source_repo,
+                "retained_branch": binding.work_branch,
+                "worktree_path": binding.worktree_path,
+                "finalize_commit": binding.final_sha,
+                "disposition": disposition_tag(&binding.disposition),
+            })
+        })
+        .collect();
+    Some(json!({
+        "work_id": work.id,
+        "clean": teardown.clean,
+        "repositories": repositories,
+    }))
+}
+
+/// The bare tag of a [`BindingDisposition`] — `"removed"`, `"missing"`, etc.
+/// — without its internally-tagged detail fields (`changes`/`detail`), which
+/// the output pointer does not repeat: the full `teardown` field elsewhere
+/// in [`work_view`] already carries them, and serializing the enum directly
+/// here would nest a second `"disposition"` key inside this one (its own
+/// `#[serde(tag = "disposition")]`), not replace it.
+fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
+    match disposition {
+        BindingDisposition::Removed => "removed",
+        BindingDisposition::RetainedDirty { .. } => "retained_dirty",
+        BindingDisposition::Missing => "missing",
+        BindingDisposition::RetainedError { .. } => "retained_error",
+    }
+}
+
 /// The full view of a work: the §10 record, plus the orthogonal run
 /// coordinates the M3 contract asks `work show` to include — current stage,
 /// surface, and execution state. They are siblings of `work`, not fields
 /// inside it: §10 keeps stage orthogonal to work state, and flattening them
 /// into one record is how "in review" becomes a state-machine value.
-fn work_view(core: &Core, work_id: &str) -> Value {
+fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
     let registry = core.registry.state();
     let work = registry.works.get(work_id);
-    let run = registry.runs.get(work_id);
+    let cached_run = registry.run_view(work_id);
+    let run = work.and_then(|w| resolve_run(core, w, cached_run));
     json!({
         "work": work,
-        "stage": run.and_then(run_stage_view),
-        "surface": run.and_then(|r| r.surface.clone()),
-        "execution": run.and_then(|r| r.execution.clone()),
+        "stage": run.as_ref().and_then(run_stage_view),
+        "surface": run.as_ref().and_then(|r| r.surface.clone()),
+        "execution": run.as_ref().and_then(|r| r.execution.clone()),
         // Additive (§20.5): a run whose launch phase is in flight, or whose
         // launch phase a crash left unaccounted for, is a state a client can
         // now see rather than infer from a gap between events.
-        "reservation": run.and_then(|r| r.reservation.clone()),
-        "workflow": run.and_then(|r| r.workflow.as_ref().map(|w| json!({
+        "reservation": run.as_ref().and_then(|r| r.reservation.clone()),
+        "workflow": run.as_ref().and_then(|r| r.workflow.as_ref().map(|w| json!({
             "name": w.name,
             "version": w.version,
             "source": w.source,
             "stages": w.stages.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
         }))),
-        "backend": run.and_then(|r| r.backend.clone()),
-        "route_source": run.and_then(|r| r.route_source.clone()),
-        "teardown": run.and_then(|r| r.teardown.clone()),
+        "backend": run.as_ref().and_then(|r| r.backend.clone()),
+        "route_source": run.as_ref().and_then(|r| r.route_source.clone()),
+        "teardown": run.as_ref().and_then(|r| r.teardown.clone()),
+        // R-MVP1-2's sibling: named per repository once there is something to
+        // point at.
+        "output": work.and_then(|w| run.as_ref().and_then(|r| output_pointer(w, r))),
+        // MVP-3's envelope-visibility item: how much of R-MVP1-7's turn
+        // budget this Work has spent and how much it has, without decoding
+        // the journal for `execution.started`/`stage.resumed` counts or the
+        // submit-time override. `Engine::effective_turn_cap`/
+        // `effective_turn_ceiling` are the exact formulas
+        // `check_turn_envelope`/`due_interrupts` gate on, so this can never
+        // show a budget the engine is not actually enforcing. `None` (no
+        // run yet — e.g. a `pending` Work with no repository context) still
+        // reports a real, honest cap/ceiling: zero turns spent against
+        // whatever this Work would be checked against once it starts.
+        "envelope": work.map(|w| {
+            let default_run = WorkRun::default();
+            let run_ref = run.as_ref().unwrap_or(&default_run);
+            json!({
+                "turns_spawned": run_ref.turns_spawned,
+                "turn_cap": engine.effective_turn_cap(Some(w), run_ref),
+                "turn_cap_bonus": run_ref.turn_cap_bonus,
+                "turn_ceiling_secs": engine.effective_turn_ceiling(Some(w)).as_secs_f64(),
+            })
+        }),
     })
 }
 
@@ -1193,13 +1561,13 @@ fn run_stage_view(run: &WorkRun) -> Option<Value> {
 /// them is exactly how "in review" becomes a state-machine value — but a fleet
 /// view that cannot say which stage a running work is on is not a fleet view,
 /// so `stage` is a sibling key of `work` here as it is in `work_view`.
-fn fleet_body(core: &Core) -> Value {
+fn fleet_body(core: &Core, engine: &Engine) -> Value {
     let registry = core.registry.state();
     let works: Vec<Value> = registry
         .works
         .values()
         .map(|work| {
-            let run = registry.runs.get(&work.id);
+            let run = registry.run_view(&work.id);
             let mut row = serde_json::to_value(work).unwrap_or(Value::Null);
             if let Some(object) = row.as_object_mut() {
                 object.insert(
@@ -1211,6 +1579,22 @@ fn fleet_body(core: &Core) -> Value {
                     run.and_then(|r| r.backend.clone())
                         .map_or(Value::Null, Value::String),
                 );
+                // MVP-3's envelope-visibility item, folded onto the fleet
+                // view exactly the way `work_view` folds it onto a single
+                // work — `sgt status`/`sgt work list --json` see the same
+                // turns-spent/cap/ceiling `sgt work show` does, no second
+                // request per work required.
+                let default_run = WorkRun::default();
+                let run_ref = run.unwrap_or(&default_run);
+                object.insert(
+                    "envelope".to_string(),
+                    json!({
+                        "turns_spawned": run_ref.turns_spawned,
+                        "turn_cap": engine.effective_turn_cap(Some(work), run_ref),
+                        "turn_cap_bonus": run_ref.turn_cap_bonus,
+                        "turn_ceiling_secs": engine.effective_turn_ceiling(Some(work)).as_secs_f64(),
+                    }),
+                );
             }
             row
         })
@@ -1218,10 +1602,72 @@ fn fleet_body(core: &Core) -> Value {
     json!({"works": works})
 }
 
+#[derive(Debug, Deserialize)]
+struct PauseAdmissionRequest {
+    command_id: String,
+}
+
+/// `POST /v1/admission/pause` — MVP-3's admission drain flag, scoped exactly
+/// to `sgt daemon stop`: refuse every new `POST /v1/work` submission from
+/// this point on ([`submit_work`]'s own `admission_paused` check) until a
+/// fresh daemon process resumes it at startup (`daemon.rs`'s `start_with`,
+/// `KIND_ADMISSION_RESUMED`'s doc has the L6 crash-window argument for why
+/// resume is startup-only rather than a second endpoint here).
+///
+/// **Idempotent, not merely retried.** A `daemon stop` that finds admission
+/// already paused (its own earlier attempt, or a concurrent one) journals
+/// nothing new — the `bool` this folds into is already true, and appending a
+/// second `admission.paused` would answer "is admission paused" no more
+/// truthfully while making the journal's pause/resume pairing look like it
+/// happened twice. This is what keeps a `daemon stop` retry from
+/// "double-pausing incoherently", the other half of the L6 argument this
+/// milestone's task names.
+async fn pause_admission(
+    State(state): State<ApiState>,
+    body: Result<Json<PauseAdmissionRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = CoreGuard::acquire(&state.core).await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if core.registry.state().admission_paused {
+        let result = json!({"admission": {"paused": true}});
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "admission.pause",
+            None,
+            StatusCode::OK,
+            result,
+        );
+    }
+    let mut draft = EventDraft::new(api_source(), KIND_ADMISSION_PAUSED, json!({}));
+    draft.correlation_id = Some(req.command_id.clone());
+    if let Err(e) = core.commit(draft) {
+        return internal_error(e);
+    }
+    let result = json!({"admission": {"paused": true}});
+    record_and_respond(
+        &mut core,
+        &req.command_id,
+        "admission.pause",
+        None,
+        StatusCode::OK,
+        result,
+    )
+}
+
 /// `GET /v1/work` — list all work (ULID key order = submission order).
 async fn list_work(State(state): State<ApiState>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
-    Json(fleet_body(&core)).into_response()
+    Json(fleet_body(&core, &state.engine)).into_response()
 }
 
 /// `GET /v1/work/{id}` — one work record, with its stage, surface and
@@ -1229,13 +1675,220 @@ async fn list_work(State(state): State<ApiState>) -> Response {
 async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
     match core.registry.state().works.get(&id) {
-        Some(_) => Json(work_view(&core, &id)).into_response(),
+        Some(_) => Json(work_view(&core, &state.engine, &id)).into_response(),
         None => error_response(
             StatusCode::NOT_FOUND,
             "work_not_found",
             format!("no work with id {id}"),
         ),
     }
+}
+
+/// `GET /v1/work/{id}/transcript` — MVP-3's `sgt work transcript`: the
+/// work's conversation, decoded into causal (journal seq) order.
+///
+/// Every `conversation.*` event already carries its content inline in the
+/// payload (`text`/`question` — see `claude.rs`'s `ingest_line`), so
+/// reconstructing the transcript is filtering the journal to this work's
+/// conversation kinds and reading their causal order straight off — no new
+/// projection, no daemon-internal type crosses this boundary (R-NS-4: a
+/// client convenience over data the journal already owns).
+///
+/// The one gap: a turn that ended with **no** result envelope (interrupted
+/// or crashed — see `TurnReader::run`) never got as far as emitting
+/// `conversation.assistant.completed`, because that event is only produced
+/// from a fully-parsed `assistant` stream-json line. For that turn alone,
+/// the §20 raw archive `conversation.turn.ended` references by blob ref is
+/// the *only* place any of its content reached the journal at all, so this
+/// handler does the "minimal blob decode" MVP-3's plan calls for: split the
+/// archive into lines, parse each as JSON, and recover whatever assistant
+/// text blocks streamed before the cut. It deliberately does not replay tool
+/// calls or system/vendor plumbing — that stays raw-archive-only.
+///
+/// §22.6 tradeoff, disclosed rather than hidden: `events_after(0)` below
+/// runs a full from-seq-0 journal replay while `core` — the exclusive
+/// `CoreGuard` — is still held. `blocking_sync` only keeps the tokio
+/// scheduler's other, guard-independent tasks off this worker thread; it
+/// does not release the guard itself, so every call here still queues
+/// every other Core-guarded request (submit, cancel, retry, input,
+/// `/v1/system`) for the full replay duration, exactly as `events_after`'s
+/// own doc comment says every caller must expect. `resolve_run`'s
+/// `terminal_runs` cache accepts the identical shape only as a rare,
+/// capacity-bounded cache-miss fallback; there is no equivalent bound
+/// here, because a work's conversation history is unbounded and not
+/// capped by any terminal-state cache. Closing this for good needs a
+/// journal reader the core does not own — the same named follow-up
+/// `resolve_run` already defers, not this build's.
+async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    let core = CoreGuard::acquire(&state.core).await;
+    if !core.registry.state().works.contains_key(&id) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "work_not_found",
+            format!("no work with id {id}"),
+        );
+    }
+    let events = match blocking_sync(|| core.events_after(0)) {
+        Ok(events) => events,
+        Err(e) => return internal_error(e),
+    };
+    drop(core);
+
+    let turns = transcript_turns(&id, events, &state.data_dir);
+    Json(json!({"work_id": id, "turns": turns})).into_response()
+}
+
+/// The pure decode: filter `events` to `work_id`'s `conversation.*` kinds and
+/// turn each into a `{seq, ts, role, text, source}` entry, in the journal's
+/// own causal (seq) order — factored out of the handler above so the
+/// role/source mapping and the blob-decode fallback can be pinned by a
+/// direct test without spinning up a daemon.
+fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Path) -> Vec<Value> {
+    let mut turns = Vec::new();
+    // Per-`execution_id` count of `conversation.assistant.completed` events
+    // consumed since the last turn boundary — `ingest_line` emits exactly one
+    // such event per successfully-parsed `assistant` stream-json line that
+    // carried text, so a turn can legitimately emit several before ending
+    // (or crashing) and the archive's own per-line decode (`decode_partial_
+    // assistant_lines`) produces the same count of entries in the same
+    // order. The blob-decode fallback below skips that many leading lines
+    // from the archive rather than an all-or-nothing flag, so a crash that
+    // lands between two of a turn's own assistant-line appends (docs/DEVELOPMENT.md's
+    // "adjacent-append crash window") still recovers the lines that never
+    // reached the journal, instead of either double-reporting the ones that
+    // did or silently dropping the ones that didn't. Removed on consumption
+    // so the next turn on the same execution starts fresh.
+    let mut assistant_completed_since_last_turn: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for event in events
+        .into_iter()
+        .filter(|e| e.work_id.as_deref() == Some(work_id))
+    {
+        match event.kind.as_str() {
+            KIND_CONVERSATION_USER => turns.push(json!({
+                "seq": event.seq,
+                "ts": event.timestamp,
+                "role": "user",
+                "text": event.payload["text"].as_str().unwrap_or(""),
+                "source": "event",
+            })),
+            KIND_CONVERSATION_ASSISTANT_COMPLETED => {
+                if let Some(execution_id) = &event.execution_id {
+                    *assistant_completed_since_last_turn
+                        .entry(execution_id.clone())
+                        .or_insert(0) += 1;
+                }
+                turns.push(json!({
+                    "seq": event.seq,
+                    "ts": event.timestamp,
+                    "role": "assistant",
+                    "text": event.payload["text"].as_str().unwrap_or(""),
+                    "source": "event",
+                }));
+            }
+            KIND_CONVERSATION_ASK => turns.push(json!({
+                "seq": event.seq,
+                "ts": event.timestamp,
+                "role": "ask",
+                "text": event.payload["question"].as_str().unwrap_or(""),
+                "source": "event",
+            })),
+            KIND_CONVERSATION_TURN_ENDED => {
+                // This turn's own boundary: whatever `assistant.completed`
+                // this execution emitted belongs to *this* turn (the two are
+                // always emitted by the same `TurnReader` run), so consuming
+                // it here — whether or not it changes what happens below —
+                // keeps the count scoped to "since the last turn", not
+                // "ever".
+                let already_emitted_lines = event
+                    .execution_id
+                    .as_ref()
+                    .and_then(|id| assistant_completed_since_last_turn.remove(id))
+                    .unwrap_or(0);
+                // A turn that closed with a result envelope already emitted
+                // its content, if any, as its own `conversation.*` event(s)
+                // above — nothing to recover. Only the envelope-less case
+                // needs the archive.
+                if event.payload["result_envelope"].as_bool().unwrap_or(true) {
+                    continue;
+                }
+                let Some(raw_ref) = event.payload["raw"].as_str() else {
+                    continue;
+                };
+                let Ok(blob_ref) = raw_ref.parse::<crate::runtime::blob::BlobRef>() else {
+                    continue;
+                };
+                let Ok(store) = crate::runtime::blob::BlobStore::open(data_dir) else {
+                    continue;
+                };
+                let Ok(bytes) = store.get(&blob_ref) else {
+                    continue;
+                };
+                // Skip exactly the lines this execution already reported
+                // live; only genuinely unreported lines are recovered.
+                let text: String = decode_partial_assistant_lines(&bytes)
+                    .into_iter()
+                    .skip(already_emitted_lines)
+                    .collect();
+                if !text.is_empty() {
+                    turns.push(json!({
+                        "seq": event.seq,
+                        "ts": event.timestamp,
+                        "role": "assistant",
+                        "text": text,
+                        "source": "blob_decode",
+                        "interrupted": event.payload["interrupted"].as_bool().unwrap_or(false),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+/// The "minimal blob decode" itself: recover whatever assistant `text`
+/// content blocks appear in a raw stream-json archive, one entry per
+/// `assistant` line that carried text — the same granularity `ingest_line`'s
+/// `Some("assistant")` arm reads a live line at (one `conversation.assistant.
+/// completed` event per such line), so callers can line an archive's entries
+/// up against how many of them already reached the journal live. Not a
+/// general stream-json parser. Lines with no text block (tool-only, or
+/// unparseable) contribute no entry, matching `ingest_line`'s own
+/// `!text.is_empty()` gate on emitting the event.
+fn decode_partial_assistant_lines(raw: &[u8]) -> Vec<String> {
+    let raw = String::from_utf8_lossy(raw);
+    let mut lines_text = Vec::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut text = String::new();
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(t) = block.get("text").and_then(Value::as_str)
+            {
+                text.push_str(t);
+            }
+        }
+        if !text.is_empty() {
+            lines_text.push(text);
+        }
+    }
+    lines_text
+}
+
+/// The full-archive convenience `decode_partial_assistant_lines` factors
+/// out of: every recovered line's text, concatenated in file order.
+#[cfg(test)]
+fn decode_partial_assistant_text(raw: &[u8]) -> String {
+    decode_partial_assistant_lines(raw).concat()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1337,7 +1990,7 @@ async fn cancel_work(
         }
         Err(e) => tracing::warn!(work_id = %id, error = %e, "retiring the canceled run failed"),
     }
-    let result = work_view(&core, &id);
+    let result = work_view(&core, &state.engine, &id);
     record_and_respond(
         &mut core,
         &req.command_id,
@@ -1396,7 +2049,7 @@ async fn work_input(
             }
             drop(core);
             let mut core = relock(&state, crank(&state, step).await).await;
-            let result = work_view(&core, &id);
+            let result = work_view(&core, &state.engine, &id);
             record_and_respond(
                 &mut core,
                 &req.command_id,
@@ -1467,7 +2120,7 @@ async fn work_retry(
             }
             drop(core);
             let mut core = relock(&state, crank(&state, step).await).await;
-            let result = work_view(&core, &id);
+            let result = work_view(&core, &state.engine, &id);
             record_and_respond(
                 &mut core,
                 &req.command_id,
@@ -1484,6 +2137,88 @@ async fn work_retry(
                 &mut core,
                 &req.command_id,
                 "work.retry",
+                Some(&id),
+                status,
+                result,
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ExtendRequest {
+    command_id: String,
+    additional_turns: u32,
+}
+
+/// `POST /v1/work/{id}/extend` — R-MVP1-10's exit door for R-MVP1-7's
+/// envelope-exhausted landing (`Engine::extend_turn_envelope`). A pure
+/// commit, unlike `retry`: raising the envelope has no external effect of
+/// its own, so there is nothing to crank — `retry` afterward is what
+/// actually re-enters the stage.
+async fn work_extend(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Result<Json<ExtendRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = CoreGuard::acquire(&state.core).await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if !core.registry.state().works.contains_key(&id) {
+        let result = error_body("work_not_found", format!("no work with id {id}"));
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.extend",
+            None,
+            StatusCode::NOT_FOUND,
+            result,
+        );
+    }
+    if req.additional_turns == 0 {
+        // A zero extension journals an event that changes nothing and hands
+        // the operator a 200 whose follow-up retry re-blocks on the identical
+        // envelope — a client bug answered as a success. Same shape as
+        // submit's empty-intent rejection: journaled under this command_id so
+        // a retry replays the 400.
+        let result = error_body("invalid_request", "additional_turns must be at least 1");
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.extend",
+            Some(&id),
+            StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    let engine = state.engine.clone();
+    match engine.extend_turn_envelope(&mut core, &id, req.additional_turns) {
+        Ok(()) => {
+            let result = work_view(&core, &state.engine, &id);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.extend",
+                Some(&id),
+                StatusCode::OK,
+                result,
+            )
+        }
+        Err(e) => {
+            let status = engine_error_status(&e);
+            let result = engine_error_body(&e);
+            record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.extend",
                 Some(&id),
                 status,
                 result,
@@ -1847,6 +2582,8 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_EXECUTION_STOPPED,
     KIND_EXECUTION_ABANDONED,
     KIND_EXECUTION_RECONCILED,
+    KIND_TURN_CEILING_INTERRUPTED,
+    KIND_TURN_ENVELOPE_EXTENDED,
     KIND_SURFACE_MATERIALIZING,
     KIND_SURFACE_MATERIALIZED,
     KIND_SURFACE_TORN_DOWN,
@@ -1862,6 +2599,8 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_DAEMON_STARTED,
     KIND_DAEMON_STOPPED,
     KIND_BACKEND_PROBED,
+    KIND_ADMISSION_PAUSED,
+    KIND_ADMISSION_RESUMED,
 ];
 
 /// Encode one journal event as an SSE frame (`id` = seq for resume).
@@ -1916,14 +2655,16 @@ impl ApiViews {
 
     /// The `GET /v1/system` body.
     pub async fn system(&self) -> Value {
-        let head = CoreGuard::acquire(&self.0.core).await.registry.last_seq();
-        system_body(&self.0, head)
+        let core = CoreGuard::acquire(&self.0.core).await;
+        let head = core.registry.last_seq();
+        let admission_paused = core.registry.state().admission_paused;
+        system_body(&self.0, head, admission_paused)
     }
 
     /// The `GET /v1/work` body.
     pub async fn fleet(&self) -> Value {
         let core = CoreGuard::acquire(&self.0.core).await;
-        fleet_body(&core)
+        fleet_body(&core, &self.0.engine)
     }
 
     /// The `GET /v1/work/{id}` body, or `None` for an unknown work (the 404
@@ -1934,7 +2675,7 @@ impl ApiViews {
             .state()
             .works
             .contains_key(id)
-            .then(|| work_view(&core, id))
+            .then(|| work_view(&core, &self.0.engine, id))
     }
 
     /// The `GET /v1/events?work_id=…&limit=…` body, or the structured error
@@ -2173,6 +2914,13 @@ impl ApiClient {
         self.get(&format!("/v1/work/{id}")).await
     }
 
+    /// `GET /v1/work/{id}/transcript` — the work's conversation, decoded in
+    /// causal order (MVP-3's `sgt work transcript`).
+    pub async fn work_transcript(&self, id: &str) -> Result<Value, ClientError> {
+        self.get(&format!("/v1/work/{}/transcript", urlencode(id)))
+            .await
+    }
+
     /// `GET /v1/events` for one work's newest `limit` events.
     pub async fn work_events(&self, id: &str, limit: usize) -> Result<Value, ClientError> {
         self.get(&format!(
@@ -2327,6 +3075,7 @@ fn decode_frame(frame: &str) -> Option<Event> {
 mod tests {
     use super::*;
     use crate::backend::BackendRegistry;
+    use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
 
     /// The one knob on the client, exercised. Its only production caller is
@@ -2805,6 +3554,568 @@ mod tests {
         assert_eq!(
             seq, 5,
             "the projection must report itself caught up to the real journal head"
+        );
+    }
+
+    // ------------------------------------------------- work_transcript
+
+    /// Build a minimal `Event` for `transcript_turns` — every field the
+    /// function itself reads (`seq`, `kind`, `work_id`, `payload`), plus the
+    /// envelope fields `Event` requires to exist at all.
+    fn ev(seq: u64, work_id: &str, kind: &str, payload: Value) -> Event {
+        ev_exec(seq, work_id, None, kind, payload)
+    }
+
+    /// [`ev`], plus an explicit `execution_id` — the de-dup fix's own tests
+    /// need two events sharing one (`conversation.assistant.completed` and
+    /// its turn's `conversation.turn.ended`, exactly as one `TurnReader` run
+    /// emits both).
+    fn ev_exec(
+        seq: u64,
+        work_id: &str,
+        execution_id: Option<&str>,
+        kind: &str,
+        payload: Value,
+    ) -> Event {
+        Event {
+            schema: EVENT_SCHEMA.to_string(),
+            seq,
+            id: format!("evt-{seq}"),
+            timestamp: rfc3339_utc_now(),
+            source: EventSource::new("backend", "test"),
+            workspace_id: None,
+            work_id: Some(work_id.to_string()),
+            execution_id: execution_id.map(str::to_string),
+            correlation_id: None,
+            causation_id: None,
+            kind: kind.to_string(),
+            payload,
+            extra: Default::default(),
+        }
+    }
+
+    /// The mapping `transcript_turns` exists for: `conversation.user`,
+    /// `conversation.assistant.completed` and `conversation.ask` events for
+    /// *this* work decode to `{role, text, source: "event"}` in causal (seq)
+    /// order, and events belonging to a different work are dropped.
+    ///
+    /// guard-map: mutating any `KIND_CONVERSATION_*` match arm's `role` or
+    /// the payload key it reads (`"text"` vs `"question"`) makes this fail;
+    /// so does dropping the `work_id` filter or reordering by anything other
+    /// than input order (which is already seq-ascending, as the journal
+    /// guarantees).
+    #[test]
+    fn transcript_turns_decodes_conversation_events_in_causal_order_for_one_work() {
+        let events = vec![
+            ev(
+                1,
+                "w1",
+                KIND_CONVERSATION_USER,
+                json!({"text": "please do the thing"}),
+            ),
+            // A different work's event must never leak into w1's transcript.
+            ev(
+                2,
+                "w2",
+                KIND_CONVERSATION_USER,
+                json!({"text": "unrelated work"}),
+            ),
+            ev(
+                3,
+                "w1",
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "on it"}),
+            ),
+            ev(
+                4,
+                "w1",
+                KIND_CONVERSATION_ASK,
+                json!({"question": "which environment?"}),
+            ),
+        ];
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let turns = transcript_turns("w1", events, data_dir.path());
+        let shape: Vec<(u64, &str, &str, &str)> = turns
+            .iter()
+            .map(|t| {
+                (
+                    t["seq"].as_u64().unwrap(),
+                    t["role"].as_str().unwrap(),
+                    t["text"].as_str().unwrap(),
+                    t["source"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (1, "user", "please do the thing", "event"),
+                (3, "assistant", "on it", "event"),
+                (4, "ask", "which environment?", "event"),
+            ],
+            "w2's event must be excluded and the rest must decode in seq order: {turns:?}"
+        );
+    }
+
+    /// The "minimal blob decode" itself, end to end through
+    /// `transcript_turns`: a `conversation.turn.ended` with
+    /// `result_envelope: false` and a `raw` blob ref recovers whatever
+    /// assistant `text` blocks the archived stream-json carries, tagged
+    /// `source: "blob_decode"` so a reader can tell it apart from an
+    /// ordinary journaled event.
+    ///
+    /// guard-map: removing the `store.get`/`decode_partial_assistant_text`
+    /// call, or the `result_envelope` early-return, makes this fail (the
+    /// former by never recovering the text, the latter by double-reporting
+    /// or misfiring on ordinary completed turns).
+    #[test]
+    fn transcript_turns_recovers_partial_text_from_an_interrupted_turns_raw_archive() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        // A raw stream-json archive: one assistant line with a partial text
+        // block, as if the turn were cut mid-stream (no trailing `result`
+        // line — that absence is exactly why `conversation.assistant.
+        // completed` never got emitted for this turn).
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial reply before the cut"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![ev(
+            1,
+            "w1",
+            KIND_CONVERSATION_TURN_ENDED,
+            json!({
+                "interrupted": true,
+                "result_envelope": false,
+                "raw": blob_ref.to_string(),
+            }),
+        )];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert_eq!(
+            turns.len(),
+            1,
+            "the interrupted turn must recover one entry: {turns:?}"
+        );
+        assert_eq!(turns[0]["role"], "assistant");
+        assert_eq!(turns[0]["text"], "partial reply before the cut");
+        assert_eq!(turns[0]["source"], "blob_decode");
+        assert_eq!(turns[0]["interrupted"], true);
+    }
+
+    /// A turn that closed *with* a result envelope must never trigger the
+    /// blob-decode fallback — its content, if any, already reached the
+    /// journal as its own `conversation.assistant.completed` event, and
+    /// decoding the archive too would double-report it (or fabricate an
+    /// entry for a tool-only turn that produced no text at all).
+    #[test]
+    fn transcript_turns_never_decodes_the_archive_of_a_turn_that_ended_with_an_envelope() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"should never surface"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+        let events = vec![ev(
+            1,
+            "w1",
+            KIND_CONVERSATION_TURN_ENDED,
+            json!({
+                "interrupted": false,
+                "result_envelope": true,
+                "raw": blob_ref.to_string(),
+            }),
+        )];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert!(
+            turns.is_empty(),
+            "a turn that ended with an envelope must not decode its archive: {turns:?}"
+        );
+    }
+
+    /// MVP-3 test-honesty finding TH-1 (discovered while building its e2e
+    /// closure, `tests/m4_backends.rs`'s
+    /// `work_transcript_recovers_an_interrupted_turns_text_from_the_real_
+    /// journal`): a turn interrupted *after* streaming a complete assistant
+    /// text line ends with no `result` line — `result_envelope: false`, same
+    /// as any other envelope-less turn — but `ingest_line` already emitted
+    /// `conversation.assistant.completed` live for that line, independent of
+    /// whether a `result` line ever follows. Before the fix, `transcript_
+    /// turns` had no way to know that and decoded the archive too,
+    /// reporting the same text twice. The `execution_id`-scoped fix must
+    /// recover text ONLY for the execution/turn that genuinely never
+    /// emitted it live.
+    ///
+    /// guard-map: dropping the `already_reached_the_journal` check (or its
+    /// `execution_id` scoping) makes this fail with two "already said" turns
+    /// instead of one.
+    #[test]
+    fn transcript_turns_never_double_reports_text_the_live_event_already_carried() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"already said"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![
+            // Live-ingested during the turn, exactly as `ingest_line` does
+            // for any complete `assistant` text line, whether or not a
+            // `result` line ever follows.
+            ev_exec(
+                1,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "already said"}),
+            ),
+            // The turn ends with no result envelope (interrupted mid-stream,
+            // after the line above already landed).
+            ev_exec(
+                2,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({
+                    "interrupted": true,
+                    "result_envelope": false,
+                    "raw": blob_ref.to_string(),
+                }),
+            ),
+        ];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert_eq!(
+            turns.len(),
+            1,
+            "the text already reached the journal live; the archive must not add a second \
+             copy of it: {turns:?}"
+        );
+        assert_eq!(turns[0]["source"], "event");
+        assert_eq!(turns[0]["text"], "already said");
+    }
+
+    /// The narrower case the finding above didn't cover: a turn that
+    /// streamed *two* assistant lines, where only the first's
+    /// `conversation.assistant.completed` reached the journal (the second
+    /// lost in a simulated adjacent-append crash window) before
+    /// `conversation.turn.ended` landed with `result_envelope: false`. The
+    /// archive carries both lines' text. A per-execution boolean would treat
+    /// "any line reached the journal" as "the whole turn did" and drop the
+    /// second line's text entirely; the count-based fix must recover exactly
+    /// the lines that never made it live.
+    ///
+    /// guard-map: reverting to a per-execution boolean (any emitted ⇒ skip
+    /// the archive entirely) makes this fail by losing "line two" instead of
+    /// recovering it.
+    #[test]
+    fn transcript_turns_recovers_only_the_lines_lost_to_a_partial_adjacent_append_crash() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"line one "}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"line two"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![
+            // Only line one's live event reached the journal; line two's own
+            // `conversation.assistant.completed` was lost to the crash.
+            ev_exec(
+                1,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "line one "}),
+            ),
+            ev_exec(
+                2,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({
+                    "interrupted": true,
+                    "result_envelope": false,
+                    "raw": blob_ref.to_string(),
+                }),
+            ),
+        ];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        assert_eq!(
+            turns.len(),
+            2,
+            "line one's live event plus line two's recovered text: {turns:?}"
+        );
+        assert_eq!(turns[0]["source"], "event");
+        assert_eq!(turns[0]["text"], "line one ");
+        assert_eq!(turns[1]["source"], "blob_decode");
+        assert_eq!(
+            turns[1]["text"], "line two",
+            "line two never reached the journal live and must be recovered, not dropped: {turns:?}"
+        );
+    }
+
+    /// A minimal scripted `claude` executable: passes the adapter's version/
+    /// help probe, then on any other invocation prints `transcript` to
+    /// stdout and exits 0. Written fresh per test so the probe cache (keyed
+    /// per `ClaudeBackend` instance, not per path) never crosses tests.
+    fn write_stub_claude(dir: &std::path::Path, transcript: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("claude-stub");
+        let replay = dir.join("replay.jsonl");
+        std::fs::write(&replay, transcript).expect("write replay");
+        let help = crate::backend::claude::REQUIRED_FLAGS.join(" ");
+        let script = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.226 (Claude Code)';;\n  \
+             --help) echo '{help}';;\n  *) cat '{replay}';;\nesac\n",
+            replay = replay.display(),
+        );
+        std::fs::write(&path, script).expect("write stub");
+        let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod stub");
+        path
+    }
+
+    /// MVP-3 test-honesty finding TH-1: a real producer (`backend::claude`'s
+    /// `ClaudeBackend`/`TurnReader`, driven by a scripted `claude` CLI, not a
+    /// hand-fabricated `Event`) all the way to `transcript_turns`'s blob-
+    /// decode fallback — closing the gap the finding named: "no test spans
+    /// producer→journal→transcript_turns", so a rename of the `raw`/
+    /// `result_envelope` payload key on the producer side would leave this
+    /// test failing instead of silently passing (its own guard-map below).
+    ///
+    /// The turn streams one real assistant text line and no `result` line
+    /// (an envelope-less turn — same shape `backend::claude`'s own
+    /// `partial_turn` fixture models). The event sink here converts every
+    /// `EventDraft` into a real journaled `Event`, exactly as the daemon's
+    /// own `journaling_sink` does, **except** it drops
+    /// `conversation.assistant.completed` — modeling docs/DEVELOPMENT.md's own
+    /// "adjacent-append crash window" (an event handed to the sink but
+    /// never durably committed before the process holding it dies), which is
+    /// this module's own doc comment's stated reason `decode_partial_
+    /// assistant_text` exists at all (`work_transcript`'s doc, above). This
+    /// is the *only* scenario in which the archive is not simply redundant
+    /// with what the live event already carried (see the de-dup tests
+    /// above) — proven by asserting the dropped kind really is absent from
+    /// what reached the journal, not merely by not looking for it.
+    ///
+    /// guard-map: renaming the producer's `raw`/`result_envelope` payload
+    /// keys (with `TurnReader::run`'s own emit call updated to match, so the
+    /// producer is internally consistent) makes this fail — `transcript_
+    /// turns` hits the `continue` fall-throughs and recovers nothing, while
+    /// the two hand-fabricated unit tests above stay green regardless.
+    #[test]
+    fn transcript_turns_recovers_a_real_producers_text_across_a_simulated_adjacent_append_loss() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let stub_dir = tempfile::TempDir::new().expect("tempdir");
+        let assistant_line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "cut off mid-thought"}]},
+        })
+        .to_string();
+        let stub = write_stub_claude(stub_dir.path(), &format!("{assistant_line}\n"));
+
+        let mut config = crate::backend::claude::ClaudeConfig::new(data_dir.path());
+        config.executable = stub;
+        let backend = crate::backend::claude::ClaudeBackend::new(config);
+
+        let journaled: Arc<std::sync::Mutex<Vec<Event>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let next_seq = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let (journaled_for_sink, seq_for_sink) = (Arc::clone(&journaled), Arc::clone(&next_seq));
+        backend.set_event_sink(Arc::new(move |draft: EventDraft| {
+            if draft.kind == KIND_CONVERSATION_ASSISTANT_COMPLETED {
+                // Simulated crash-window loss: handed to the sink, never
+                // committed. See this test's own doc comment.
+                return;
+            }
+            let seq = seq_for_sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            journaled_for_sink
+                .lock()
+                .expect("journaled lock")
+                .push(Event {
+                    schema: EVENT_SCHEMA.to_string(),
+                    seq,
+                    id: format!("evt-{seq}"),
+                    timestamp: rfc3339_utc_now(),
+                    source: draft.source,
+                    workspace_id: draft.workspace_id,
+                    work_id: draft.work_id,
+                    execution_id: draft.execution_id,
+                    correlation_id: draft.correlation_id,
+                    causation_id: draft.causation_id,
+                    kind: draft.kind,
+                    payload: draft.payload,
+                    extra: Default::default(),
+                });
+        }));
+
+        let request = crate::backend::StartRequest {
+            work_id: "w-real".to_string(),
+            execution_id: "e-real".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: data_dir.path().to_path_buf(),
+            intent: "say something and get cut off".to_string(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
+        };
+        let handle = {
+            use crate::backend::Backend;
+            backend.start(&request).expect("start")
+        };
+
+        // The stub exits right after replaying, so the turn settles on its
+        // own — no interrupt/kill needed to get an envelope-less outcome.
+        // A naturally-exited, envelope-less, non-interrupted turn reports
+        // `NativeState::Unknown` (ambiguity fails closed — the same
+        // classification `backend::claude`'s own
+        // `a_turns_stderr_is_waited_for_rather_than_snapshotted` pins), not
+        // `Exited`, so this waits for "no longer `Running`" rather than for
+        // a specific terminal state.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let observed = {
+                use crate::backend::Backend;
+                backend.observe(&handle).expect("observe")
+            };
+            if observed.native != crate::backend::NativeState::Running {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the stub turn never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The reader thread's archive write + emits land shortly after the
+        // native state flips; a short settle margin avoids a flaky read of
+        // `journaled` mid-write.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while journaled
+            .lock()
+            .expect("journaled lock")
+            .iter()
+            .all(|e| e.kind != KIND_CONVERSATION_TURN_ENDED)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "conversation.turn.ended never reached the sink"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let events = journaled.lock().expect("journaled lock").clone();
+        assert!(
+            events
+                .iter()
+                .all(|e| e.kind != KIND_CONVERSATION_ASSISTANT_COMPLETED),
+            "the simulated loss must really have dropped it, not merely gone unchecked: {events:?}"
+        );
+        let ended = events
+            .iter()
+            .find(|e| e.kind == KIND_CONVERSATION_TURN_ENDED)
+            .expect("the real producer must emit conversation.turn.ended");
+        assert_eq!(
+            ended.payload["result_envelope"], false,
+            "no result line was replayed, so the real producer must say so: {}",
+            ended.payload
+        );
+
+        let turns = transcript_turns("w-real", events, data_dir.path());
+        let recovered = turns
+            .iter()
+            .find(|t| t["source"] == "blob_decode")
+            .unwrap_or_else(|| panic!("must recover the real archive's text: {turns:?}"));
+        assert_eq!(recovered["text"], "cut off mid-thought");
+    }
+
+    /// The de-dup above is scoped to *this* execution's *next* turn boundary
+    /// only — a genuinely different execution (or a later turn on the same
+    /// execution that streamed no assistant text of its own) must still get
+    /// its own archive recovered independently.
+    #[test]
+    fn transcript_turns_still_recovers_a_different_executions_archive() {
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            crate::runtime::blob::BlobStore::open(data_dir.path()).expect("open blob store");
+        let archive = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"never live-emitted"}]}}"#,
+            "\n"
+        );
+        let blob_ref = store.put(archive.as_bytes()).expect("store blob");
+
+        let events = vec![
+            // `e1`'s assistant text reached the journal live.
+            ev_exec(
+                1,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_ASSISTANT_COMPLETED,
+                json!({"text": "e1 said this live"}),
+            ),
+            ev_exec(
+                2,
+                "w1",
+                Some("e1"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({"interrupted": false, "result_envelope": true, "raw": Value::Null}),
+            ),
+            // `e2` is a different execution that never got as far as
+            // emitting any assistant line live (killed before one parsed).
+            ev_exec(
+                3,
+                "w1",
+                Some("e2"),
+                KIND_CONVERSATION_TURN_ENDED,
+                json!({
+                    "interrupted": true,
+                    "result_envelope": false,
+                    "raw": blob_ref.to_string(),
+                }),
+            ),
+        ];
+        let turns = transcript_turns("w1", events, data_dir.path());
+        let shape: Vec<(&str, &str)> = turns
+            .iter()
+            .map(|t| (t["source"].as_str().unwrap(), t["text"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("event", "e1 said this live"),
+                ("blob_decode", "never live-emitted"),
+            ],
+            "e2's archive must still be recovered independently of e1's: {turns:?}"
+        );
+    }
+
+    /// `decode_partial_assistant_text` in isolation: it reads only
+    /// `type: "assistant"` lines' `/message/content` text blocks, in file
+    /// order, and ignores lines it cannot parse or that carry no text block
+    /// (system lines, tool_use blocks) rather than erroring on them.
+    #[test]
+    fn decode_partial_assistant_text_reads_only_assistant_text_blocks_in_order() {
+        let archive = [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"first "}]}}"#,
+            "not even json",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"grep"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"second"}]}}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            decode_partial_assistant_text(archive.as_bytes()),
+            "first second"
         );
     }
 }

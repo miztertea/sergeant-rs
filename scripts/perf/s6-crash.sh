@@ -53,8 +53,15 @@ WARM_MS="$(perf_ms $((p1 - p0)))"
 perf_kv warmup_submit_ms "$WARM_MS"
 perf_kv warmup_work "${WARM:-none}"
 if [ "$KILL_DELAY" = auto ]; then
-  # Half a single submit's latency: late enough that work is genuinely in
-  # flight, early enough that the burst has not already finished.
+  # `PERF_S6_KILL_FACTOR * warmup_submit_ms` (default factor 1.0, per the
+  # file header: "the kill lands one single-submit latency into the burst,
+  # so some calls have answered and some have not"). Issue #13: this comment
+  # used to say "half a single submit's latency", which matched an earlier
+  # default factor of 0.5 — the default moved to 1.0 (full latency) without
+  # the comment following, so it drifted into describing a delay half the
+  # size of the one actually computed below. Clamped to [0.05s, 2s] either
+  # way, so late enough that work is genuinely in flight and early enough
+  # that the burst has not already finished.
   KILL_DELAY="$(awk -v ms="$WARM_MS" -v f="${PERF_S6_KILL_FACTOR:-1.0}" \
     'BEGIN{ d = ms * f / 1000; if (d < 0.05) d = 0.05; if (d > 2) d = 2; printf "%.3f", d }')"
 fi
@@ -66,6 +73,19 @@ for ((c = 1; c <= CYCLES; c++)); do
   pid="$PERF_DAEMON_PID"
   events_before="$(perf_journal_events "$DD")"
 
+  # Issue #13: this scenario carried no `perf_sampler_start`/`perf_proc_*`
+  # calls at all, so the crash-and-recovery cycle produced no RSS/VmHWM/fd/
+  # CPU data — a prior baseline had to fill that cell with a one-off manual
+  # `/proc` sample instead of anything this scenario actually measured.
+  # Sampled here (during the burst that leads up to the kill, same 0.5s-ish
+  # cadence other scenarios use) rather than left to the eventual daemon
+  # restart below: the whole point is resource behavior of the daemon that
+  # is *about to be killed*, and `perf_sampler_start`'s background loop
+  # already exits on its own the instant `perf_daemon_kill9` takes the pid
+  # down, so nothing here needs special-casing for that.
+  samples_csv="$PERF_OUT/s6-samples-$c.csv"
+  perf_sampler_start "$pid" "$samples_csv" 0.2 "s6c$c"
+
   calls="$PERF_SCRATCH/s6/calls-$c"
   rm -rf "$calls"; mkdir -p "$calls"
   perf_burst "$INFLIGHT" "$INFLIGHT" "$calls" "s6c$c" &
@@ -73,6 +93,17 @@ for ((c = 1; c <= CYCLES; c++)); do
   sleep "$KILL_DELAY"
   perf_daemon_kill9 "$pid"
   wait "$burst_job" 2>/dev/null || true
+  perf_sampler_stop
+
+  read -r peak_rss peak_hwm max_fds max_thr last_cpu first_rss _ nsamples \
+    <<< "$(perf_sample_stats "$samples_csv")"
+  perf_kv "c${c}_peak_rss_kb" "$peak_rss"
+  perf_kv "c${c}_peak_hwm_kb" "$peak_hwm"
+  perf_kv "c${c}_peak_fds" "$max_fds"
+  perf_kv "c${c}_peak_threads" "$max_thr"
+  perf_kv "c${c}_cpu_sec_before_kill" "$last_cpu"
+  perf_kv "c${c}_rss_at_burst_start_kb" "$first_rss"
+  perf_kv "c${c}_resource_samples" "$nsamples"
 
   csv="$PERF_OUT/s6-calls-$c.csv"
   perf_collect_calls "$calls" "$csv"

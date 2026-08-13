@@ -35,6 +35,7 @@
 pub mod claude;
 /// Descoped per deviation D6 — see the module's own doc comment.
 pub mod codex;
+pub mod docker;
 pub mod fake;
 
 use std::collections::BTreeMap;
@@ -46,6 +47,8 @@ use serde_json::Value;
 
 use crate::domain::event::EventDraft;
 use crate::domain::profile::Profile;
+use crate::domain::workflow::ExecuteSpec;
+use crate::domain::workspace::InstructionPolicy;
 
 /// One normalized native event (§20/§27): an adapter's translation of a raw
 /// vendor record into sergeant's `conversation.*`/`tool.*`/`usage.*`
@@ -201,6 +204,24 @@ pub struct StartRequest {
     /// Launch profile to apply (§14: launch configuration, never credentials).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    /// The pinned container spec, present exactly when the stage this
+    /// request serves is `kind = "execute"` (N4, §12.3, §13.1). `None` for
+    /// every actor stage. This is how the two-phase executor lifecycle
+    /// (§14.2) — unmodified from what the Claude adapter already exercises —
+    /// carries Docker's stage-authored contract from `bind_stages`' pinned
+    /// [`crate::domain::workflow::StageDefinition`] through PREPARE/LAUNCH
+    /// without the engine knowing what an image or a container is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execute: Option<ExecuteSpec>,
+    /// R-MVP1-4's resolved instruction-file policy (MVP-2 D2 item 1, the
+    /// `--setting-sources` de-leak). `check_instruction_policy` at submit
+    /// already refused any selected-repository set that disagrees, so this
+    /// is uniform across the Work by construction — one value, not one per
+    /// repository. `#[serde(default)]` so a `StartRequest` journaled before
+    /// this field existed replays as [`InstructionPolicy::Suppress`], which
+    /// is exactly what every such request's actual launch grammar was.
+    #[serde(default)]
+    pub instruction_policy: InstructionPolicy,
 }
 
 /// Everything a backend needs to RESUME an execution it no longer remembers
@@ -229,18 +250,37 @@ pub struct ResumeRequest {
     /// The launch profile the execution started under (§14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    /// R-MVP1-4's resolved instruction-file policy, re-supplied on RESUME for
+    /// the same reason the model pin and profile are (MVP-2 D2 item 1): it
+    /// is a decision about the Work, pinned at bind, and a restarted
+    /// adapter's later turns must launch under the same grammar the run
+    /// started with, not the adapter's compiled-in default.
+    ///
+    /// `Option`, like `model` and `profile` above (INV-R1-13, MVP-2 D3
+    /// fixer pass): `None` is the type's own "not re-supplied" state an
+    /// adapter must treat as absent, never invented. Before this fix the
+    /// field was a bare `InstructionPolicy`, which has no such
+    /// representation — every caller silently supplied a real value
+    /// (`Suppress`) whether or not it actually had one to re-supply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_policy: Option<InstructionPolicy>,
 }
 
 impl ResumeRequest {
     /// A resume request carrying only the two things every caller has: the
-    /// work and its surface. Model and profile default to "not re-supplied",
-    /// which adapters must treat as absent, never as a default.
+    /// work and its surface. Model, profile and instruction policy all
+    /// default to `None` — "not re-supplied" — which adapters must treat as
+    /// absent, never invented; an adapter that needs *some* concrete policy
+    /// to launch under falls back to its own safe default (today,
+    /// `InstructionPolicy::default()` = `Suppress`) only at that point, not
+    /// here.
     pub fn new(work_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             work_id: work_id.into(),
             cwd: cwd.into(),
             model: None,
             profile: None,
+            instruction_policy: None,
         }
     }
 }
@@ -687,6 +727,23 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
 
     /// OBSERVE: report current native evidence and any explicit signal.
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError>;
+
+    /// The liveness-only half of OBSERVE: "is anything alive under this
+    /// identity", with none of the evidence-capture side effects a full
+    /// OBSERVE may pay to answer the fuller question (INV-R1-08).
+    ///
+    /// Default implementation just asks the full [`Backend::observe`] and
+    /// keeps its `native` field — correct for every backend whose OBSERVE is
+    /// already cheap (an in-memory state read, for the fake and Claude
+    /// adapters today). A backend whose OBSERVE pays for expensive evidence
+    /// capture as a side effect of classifying an exited execution (the
+    /// Docker adapter's log capture, §16.9) should override this to skip
+    /// that work — callers that only need liveness, like restart
+    /// reconciliation's [`Engine::reserved_identity_liveness`], must never
+    /// pay for evidence they are about to discard.
+    fn observe_liveness(&self, handle: &ExecutionHandle) -> Result<NativeState, BackendError> {
+        self.observe(handle).map(|observation| observation.native)
+    }
 
     /// INTERRUPT: stop the current turn/action without retiring the
     /// execution. For a print-mode adapter this kills the per-turn process;

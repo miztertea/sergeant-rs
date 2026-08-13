@@ -1,0 +1,8 @@
+profraw_present	122
+profraw_merged	122
+profdata	/home/miztertea/sergeant-rs/target/llvm-cov-target/sergeant-rs.profdata
+profdata_bytes	606400
+lcov_bytes	775771
+lcov_sha256	83c7c72757f25b19a5d531983a9a9974a7c7686aff29fdd8eac7af5aa0b860b1
+lcov_path	/home/miztertea/sergeant-rs/target/llvm-cov-reports/lcov.info
+html_path	/home/miztertea/sergeant-rs/target/llvm-cov-reports/html/index.html

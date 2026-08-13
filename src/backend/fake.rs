@@ -18,6 +18,87 @@
 //! - [`FakeStep::hang`] models a native context that ignores STOP, so
 //!   "terminal work still has live process" (§37's Sergeant regression list)
 //!   is reproducible without a real process.
+//!
+//! ## R-H0-7: the fidelity register (what this backend can and cannot express)
+//!
+//! MVP-2's H0 review asked this module to state, honestly, what it can now
+//! script beyond MVP-1's flat settle delay, and what real-adapter behaviour
+//! it still cannot stand in for. This is that register — kept here, not in
+//! a separate note, so it stays next to the code it describes and does not
+//! go stale the way a standalone doc would.
+//!
+//! **Expressible today:**
+//! - every §15 verb's terminal outcome, scripted per execution
+//!   ([`FakeStep::complete`]/`complete_with`/`needs_input`/`ask`/`waiting`/
+//!   `blocked`/`fail`), plus §25's native-vs-signal split
+//!   ([`FakeStep::with_native`]) for the pathologies that split produces;
+//! - a native context that ignores STOP/INTERRUPT entirely
+//!   ([`FakeStep::hang`]);
+//! - R-MVP1-8's settle window — some number of OBSERVEs that report an
+//!   interim shape before the step's real outcome becomes visible
+//!   ([`FakeStep::settle`]), generalised by R-H0-7's
+//!   [`FakeStep::settle_as`] to script *what* that interim shape is rather
+//!   than a fixed `(Running, Running)` — including a native context already
+//!   `Exited` while the signal is still unresolved, the "deferred terminal
+//!   signal" window a real adapter's read-then-parse lag can produce;
+//! - R-H0-7's interrupt fidelity: a `StageCompleted`/`Failed` outcome an
+//!   execution had not yet reached when INTERRUPT landed (still inside the
+//!   settle window) is discarded, never delivered late — matching the
+//!   measured fact that a SIGKILLed turn produces no terminal `type:"result"`
+//!   envelope
+//!   (`docs/environments/cerberus.md`) — while an already-reached signal, or
+//!   a park signal (`NeedsInput`/`Waiting`/`Blocked`) at any settle depth,
+//!   survives, matching INTERRUPT's own "no turn in flight is a no-op"
+//!   contract and a real `post_turn_summary` line's independent stream
+//!   timing;
+//! - the three external-effect gates (LAUNCH/SEND/OBSERVE) plus the
+//!   STOP/INTERRUPT archive-join gate ([`FakeBackend::hold_archives`]),
+//!   for proving the core lock is not held across an adapter call and that
+//!   an unawaited [`Completion`] is a bug the caller must not commit;
+//! - capability withdrawal ([`FakeBackend::set_available`]/
+//!   `set_available_after_launches`) and restart shapes that differ per
+//!   adapter memory model ([`FakeBackend::forget_executions`] — the Claude
+//!   case, contexts durable but unremembered — versus
+//!   [`FakeBackend::complete_live_executions`] — the "finished while the
+//!   daemon was down" case).
+//!
+//! **Not expressible, by design or by unmeasured gap — named so nobody
+//! assumes silence means "covered":**
+//! - **no wall-clock timing.** [`FakeStep::settle`]/`settle_as` count
+//!   OBSERVEs, not elapsed duration; the per-turn wall-clock ceiling
+//!   (R-MVP1-7) is tested against the *engine's* own `Instant`-based
+//!   deadline with a real-but-tiny `Duration` (`Engine::with_turn_ceiling`),
+//!   never against backend-reported timing. This is a deliberate design
+//!   choice, not a hole: the ceiling has to fire correctly however long a
+//!   real adapter's turn takes, and that property does not need this
+//!   backend to simulate a clock at all.
+//! - **no usage/cost reporting.** [`Capabilities::usage`] is not modelled;
+//!   OBSERVE carries no token/dollar figures for any step, scripted or not.
+//!   L16's guard-granularity argument and the Claude adapter's own measured
+//!   partial-usage-on-interrupt facts (MVP-2 lane D2) both live on the real
+//!   adapter's side; nothing here stands in for them, and a test needing
+//!   usage evidence must go through `ClaudeBackend` or assert on the
+//!   engine's handling of an adapter that *cannot* report it.
+//! - **no streamed/partial evidence within one turn.** A real interrupted
+//!   turn can leave "whatever `assistant` chunks streamed before the kill"
+//!   in its raw archive (`docs/environments/cerberus.md`); this backend has
+//!   no chunk or streaming concept at all — one execution carries exactly
+//!   one scripted outcome, delivered whole or not at all, never a partial
+//!   fragment of it. A test needing partial-evidence fidelity is a
+//!   `ClaudeBackend` contract test, not a fake-backend one.
+//! - **`kind = "execute"` stages never reach this backend.**
+//!   `Engine::bind_stages` routes an execute stage to the fixed `"docker"`
+//!   backend before any Work exists (N4); `FakeBackend` has no execute-stage
+//!   concept and is never asked for one in a real run. Naming this so it
+//!   reads as a scope boundary, not an oversight.
+//! - **one flat script queue, not a per-execution or per-stage-kind one.**
+//!   `SGT_FAKE_SCRIPT`'s steps are drawn from one FIFO shared by every
+//!   execution this backend starts or sends to
+//!   (`parsed_steps_are_one_global_fifo_shared_across_executions_and_sends`);
+//!   there is no way to script "this specific execution behaves this way
+//!   regardless of draw order" except by controlling submission order
+//!   yourself. Unchanged by this review — named because R-H0-7 asked what
+//!   the fake still cannot do, and this is a real, standing limit on it.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
@@ -73,6 +154,25 @@ pub struct FakeStep {
     pub signal: BackendSignal,
     /// Whether the native context ignores STOP (a hang).
     pub ignores_stop: bool,
+    /// R-MVP1-8's settle delay: the number of OBSERVEs, counted from the
+    /// launch or send that spawned this step, that report `interim_native`/
+    /// `interim_signal` before this step's real native/signal become
+    /// visible. `0` (the default) is today's behaviour — the scripted
+    /// signal is visible on the very next OBSERVE — so no existing script
+    /// changes meaning.
+    pub settle: u32,
+    /// R-H0-7: what an OBSERVE inside the settle window reports, in place of
+    /// the flat `(Running, Running)` every script before this used. Defaults
+    /// to exactly that pair — [`FakeStep::settle`] alone is still the same
+    /// uniform delay it always was — but [`FakeStep::settle_as`] can script
+    /// a *different* interim shape, e.g. a turn whose native context has
+    /// already exited while its result is still unresolved: the "deferred
+    /// terminal signal" window a real adapter's read-loop-then-parse lag can
+    /// produce (§25's ambiguity class), which a bare settle count could not
+    /// distinguish from "still running toward the outcome".
+    pub interim_native: NativeState,
+    /// See [`FakeStep::interim_native`].
+    pub interim_signal: BackendSignal,
 }
 
 impl FakeStep {
@@ -129,6 +229,9 @@ impl FakeStep {
             native: NativeState::Running,
             signal: BackendSignal::Running,
             ignores_stop: true,
+            settle: 0,
+            interim_native: NativeState::Running,
+            interim_signal: BackendSignal::Running,
         }
     }
 
@@ -141,11 +244,45 @@ impl FakeStep {
         self
     }
 
+    /// R-MVP1-8: report `Running` for the first `k` OBSERVEs after the
+    /// launch or send that spawns this step, before this step's own
+    /// native/signal become visible. `k = 0` is the no-op default — this
+    /// method exists so a test can stand between "a turn was spawned" and
+    /// "the turn finished" for a turn that *does* finish, the interval the
+    /// fake had no way to model before.
+    pub fn settle(mut self, k: u32) -> Self {
+        self.settle = k;
+        self
+    }
+
+    /// R-H0-7: like [`FakeStep::settle`], but the settle window reports
+    /// `(interim_native, interim_signal)` instead of the flat
+    /// `(Running, Running)` `settle` alone produces. Names the shape
+    /// directly rather than adding a family of single-purpose constructors:
+    /// a "native already exited, signal not yet resolved" window is
+    /// `settle_as(k, NativeState::Exited, BackendSignal::Running)`; any
+    /// other scriptable interim observation is the same call with different
+    /// arguments.
+    pub fn settle_as(
+        mut self,
+        k: u32,
+        interim_native: NativeState,
+        interim_signal: BackendSignal,
+    ) -> Self {
+        self.settle = k;
+        self.interim_native = interim_native;
+        self.interim_signal = interim_signal;
+        self
+    }
+
     fn running(signal: BackendSignal) -> Self {
         Self {
             native: NativeState::Running,
             signal,
             ignores_stop: false,
+            settle: 0,
+            interim_native: NativeState::Running,
+            interim_signal: BackendSignal::Running,
         }
     }
 }
@@ -226,6 +363,12 @@ struct FakeExecution {
     step: FakeStep,
     inputs: Vec<String>,
     stopped: bool,
+    /// R-MVP1-8: OBSERVEs remaining that must report `Running` before
+    /// `step`'s own native/signal become visible. Set from `step.settle`
+    /// whenever `step` is assigned by LAUNCH or SEND (the spawn points);
+    /// left untouched by the out-of-band restart/ask mutators, which are
+    /// not spawn events.
+    settle_remaining: u32,
 }
 
 #[derive(Debug)]
@@ -243,6 +386,10 @@ struct FakeState {
     probes: usize,
     available: bool,
     detail: Option<String>,
+    /// Armed by [`FakeBackend::set_available_after_launches`]: after this
+    /// many more successful LAUNCHes, flip `available` off with the carried
+    /// detail. `None` when unarmed.
+    unavailable_after_launches: Option<(u32, String)>,
 }
 
 /// A scriptable, deterministic, in-process backend.
@@ -323,6 +470,7 @@ impl FakeBackend {
                 probes: 0,
                 available: true,
                 detail: Some("deterministic in-process test backend".to_string()),
+                unavailable_after_launches: None,
             })),
             launch_gate: Arc::new(Gate::default()),
             send_gate: Arc::new(Gate::default()),
@@ -330,6 +478,16 @@ impl FakeBackend {
             archive_gate: Arc::new(Gate::default()),
             archive_armed: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Override the advertised capabilities. R-MVP1-11's preflight test
+    /// needs a fake that declares `ask: false` — every other capability the
+    /// scripted default sets is deliberately left in place unless the
+    /// caller's `capabilities` also changes it, since a test proving one
+    /// refusal should not have to restate the whole capability set.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// A fake scripted from the environment (`SGT_FAKE_SCRIPT`).
@@ -440,6 +598,17 @@ impl FakeBackend {
         let mut state = self.lock();
         state.available = available;
         state.detail = Some(detail.to_string());
+    }
+
+    /// Become unavailable after `n` more successful LAUNCHes — the
+    /// deterministic form of "the registry changed under a bound run": armed
+    /// *before* submit, so a mid-run refusal needs no test-side race against
+    /// the completion driver's ticks (a post-submit `set_available(false)`
+    /// call has to beat the next stage's launch, which is a scheduling bet).
+    /// The flip lands after LAUNCH `n` returns its handle, so that launch's
+    /// own stage runs and the (`n`+1)th stage's PREPARE is the refusal.
+    pub fn set_available_after_launches(&self, n: u32, detail: &str) {
+        self.lock().unavailable_after_launches = Some((n, detail.to_string()));
     }
 
     /// Every START request this backend received, in order.
@@ -688,11 +857,20 @@ impl Backend for FakeBackend {
             prepared.execution_id.clone(),
             FakeExecution {
                 native_id: native_id.clone(),
+                settle_remaining: step.settle,
                 step,
                 inputs: Vec::new(),
                 stopped: false,
             },
         );
+        if let Some((remaining, detail)) = state.unavailable_after_launches.take() {
+            if remaining <= 1 {
+                state.available = false;
+                state.detail = Some(detail);
+            } else {
+                state.unavailable_after_launches = Some((remaining - 1, detail));
+            }
+        }
         Ok(ExecutionHandle {
             execution_id: prepared.execution_id.clone(),
             native_id: Some(native_id),
@@ -715,6 +893,7 @@ impl Backend for FakeBackend {
             .expect("presence checked above");
         execution.inputs.push(input.to_string());
         execution.step = step;
+        execution.settle_remaining = execution.step.settle;
         Ok(())
     }
 
@@ -725,13 +904,36 @@ impl Backend for FakeBackend {
         self.observe_gate.pass();
         let mut state = self.lock();
         state.observations.push(handle.execution_id.clone());
-        let execution = self.resolve(&state, handle)?;
+        // Identity check first, exactly as SEND does: a handle that does not
+        // resolve must not consume a settle tick either.
+        self.resolve(&state, handle)?;
+        let execution = state
+            .executions
+            .get_mut(&handle.execution_id)
+            .expect("presence checked above");
+        // R-MVP1-8/R-H0-7: the first `settle_remaining` OBSERVEs after the
+        // spawning launch/send report the step's scripted interim shape
+        // (`(Running, Running)` unless [`FakeStep::settle_as`] scripted
+        // something else); the real native/signal become visible only once
+        // the window is spent. This is what lets a test stand between "turn
+        // spawned" and "turn finished" for a turn that finishes, and — with
+        // a non-default interim — script a native context that has already
+        // exited while its result is still unresolved.
+        let (native, signal) = if execution.settle_remaining > 0 {
+            execution.settle_remaining -= 1;
+            (
+                execution.step.interim_native,
+                execution.step.interim_signal.clone(),
+            )
+        } else {
+            (execution.step.native, execution.step.signal.clone())
+        };
         Ok(Observation {
-            native: execution.step.native,
-            signal: execution.step.signal.clone(),
+            native,
+            signal,
             evidence: Some(format!(
                 "fake backend: native={}, stopped={}",
-                execution.step.native.as_str(),
+                native.as_str(),
                 execution.stopped
             )),
         })
@@ -741,6 +943,22 @@ impl Backend for FakeBackend {
     /// the execution stays known, its signal survives, and — like the real
     /// adapters — a compliant native context reports its turn process gone
     /// while a hang keeps running.
+    ///
+    /// R-H0-7 fidelity fix: "signal survives" is true for a signal that was
+    /// already *reached* (`settle_remaining == 0` — the trait's own "no turn
+    /// in flight" no-op case) or that is a park state (`NeedsInput`/
+    /// `Waiting`/`Blocked`) at any settle depth — a real `post_turn_summary`
+    /// line streams independently of the turn's terminal envelope, so a kill
+    /// after it was written can still leave it standing. It is never true
+    /// for a `StageCompleted`/`Failed` outcome the execution had not yet
+    /// reached (`settle_remaining > 0`): measured against Claude 2.1.227
+    /// (`docs/environments/cerberus.md`'s interrupt/SIGTERM entry), a
+    /// SIGKILLed turn — `interrupt` and `stop` both use it — never produces
+    /// a terminal `type:"result"` envelope, so a not-yet-reached terminal
+    /// outcome is lost, not delivered late. Before this fix the fake
+    /// delivered it anyway once `settle_remaining` ticked down on later
+    /// OBSERVEs, which is exactly the shape a real killed turn cannot
+    /// produce.
     fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         let mut state = self.lock();
         state.interrupt_requests.push(handle.execution_id.clone());
@@ -751,6 +969,15 @@ impl Backend for FakeBackend {
             .expect("presence checked above");
         if !execution.step.ignores_stop {
             execution.step.native = NativeState::Exited;
+            if execution.settle_remaining > 0
+                && matches!(
+                    execution.step.signal,
+                    BackendSignal::StageCompleted { .. } | BackendSignal::Failed { .. }
+                )
+            {
+                execution.step.signal = BackendSignal::Running;
+                execution.settle_remaining = 0;
+            }
         }
         drop(state);
         Ok(self.completion())
@@ -843,6 +1070,8 @@ mod tests {
             context: "context".to_string(),
             model: None,
             profile: None,
+            execute: None,
+            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
         }
     }
 
@@ -994,6 +1223,149 @@ mod tests {
                 kind: "conversation.user".to_string(),
                 payload: serde_json::json!({"text": "it was Mallory"}),
             }]
+        );
+    }
+
+    /// R-H0-7's headline fix: a `StageCompleted` outcome an execution had
+    /// not yet reached (mid-settle) at the moment INTERRUPT lands is
+    /// discarded, not delivered late. Every OBSERVE from here on — not just
+    /// the very next one — must keep reporting the unresolved shape, proving
+    /// this isn't a one-tick artefact of where `settle_remaining` happened
+    /// to be.
+    ///
+    /// Mutation targets this kills (L7): the settle-window check dropped
+    /// (a terminal signal would then survive an interrupt taken before it
+    /// was reached — the exact regression this fix closes); the guard
+    /// inverted to fire only when `settle_remaining == 0` (a terminal signal
+    /// already reached would be wiped instead of surviving, breaking the
+    /// no-op contract the next test pins); `settle_remaining` left non-zero
+    /// after the wipe (the interim shape would resurface once the window
+    /// ran out, re-delivering the discarded outcome late).
+    #[test]
+    fn interrupt_mid_settle_discards_a_not_yet_reached_terminal_signal_forever() {
+        let fake = FakeBackend::scripted("fake", [FakeStep::complete_with("done").settle(3)]);
+        let handle = fake.start(&request("mid-flight")).expect("start");
+
+        // Interrupt immediately, before any OBSERVE has spent a settle tick.
+        fake.interrupt(&handle).expect("interrupt").wait();
+
+        for tick in 0..5 {
+            let observed = fake.observe(&handle).expect("observe");
+            assert_eq!(
+                observed.native,
+                NativeState::Exited,
+                "tick {tick}: the turn died on interrupt"
+            );
+            assert_eq!(
+                observed.signal,
+                BackendSignal::Running,
+                "tick {tick}: a StageCompleted this execution never reached must never \
+                 surface, on this OBSERVE or any later one — SIGKILL produces no terminal \
+                 envelope, ever"
+            );
+        }
+    }
+
+    /// The other half of the same fix: INTERRUPT on an execution whose
+    /// signal was already reached (no settle window, or one already spent)
+    /// is a true no-op on the signal, matching the trait's own "no turn in
+    /// flight is a no-op" contract — this is what stops the fix above from
+    /// overreaching into "INTERRUPT always erases the outcome".
+    #[test]
+    fn interrupt_after_the_signal_is_already_reached_is_a_true_no_op() {
+        let fake = FakeBackend::scripted("fake", [FakeStep::complete_with("done")]);
+        let handle = fake.start(&request("already-done")).expect("start");
+
+        fake.interrupt(&handle).expect("interrupt").wait();
+
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(observed.native, NativeState::Exited);
+        assert_eq!(
+            observed.signal,
+            BackendSignal::StageCompleted {
+                summary: Some("done".to_string())
+            },
+            "settle = 0 means the outcome was already reached — nothing to discard"
+        );
+    }
+
+    /// The fix is scoped to terminal outcomes only: a park signal
+    /// (`NeedsInput`) mid-settle survives an interrupt exactly as it always
+    /// has, because a real `post_turn_summary` line streams independently of
+    /// the turn's terminal envelope and a kill after it was written can
+    /// still leave it standing — unlike `StageCompleted`/`Failed`, which
+    /// come only from that envelope.
+    #[test]
+    fn interrupt_mid_settle_still_lets_a_park_signal_through_once_settled() {
+        let fake = FakeBackend::scripted("fake", [FakeStep::needs_input("who?").settle(2)]);
+        let handle = fake.start(&request("parked")).expect("start");
+
+        fake.interrupt(&handle).expect("interrupt").wait();
+
+        // The settle window itself is untouched by the interrupt — still two
+        // interim ticks before the real signal shows.
+        assert_eq!(
+            fake.observe(&handle).expect("observe").signal,
+            BackendSignal::Running
+        );
+        assert_eq!(
+            fake.observe(&handle).expect("observe").signal,
+            BackendSignal::Running
+        );
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(observed.native, NativeState::Exited);
+        assert_eq!(
+            observed.signal,
+            BackendSignal::needs_input("who?"),
+            "a park signal is not a terminal envelope — it survives the interrupt \
+             even though it had not settled yet either"
+        );
+    }
+
+    /// R-H0-7's [`FakeStep::settle_as`]: the settle window can script a
+    /// native context that has already exited while the signal it will
+    /// eventually report is still unresolved — the "deferred terminal
+    /// signal" shape a flat [`FakeStep::settle`] (always `(Running,
+    /// Running)` mid-window) could not express, and which a naive reader of
+    /// `native == Exited` as "the outcome is known" would get wrong.
+    #[test]
+    fn settle_as_scripts_an_exited_native_context_with_an_unresolved_signal() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [FakeStep::complete_with("done").settle_as(
+                2,
+                NativeState::Exited,
+                BackendSignal::Running,
+            )],
+        );
+        let handle = fake.start(&request("deferred")).expect("start");
+
+        for tick in 0..2 {
+            let observed = fake.observe(&handle).expect("observe");
+            assert_eq!(
+                observed.native,
+                NativeState::Exited,
+                "tick {tick}: the native context is already gone"
+            );
+            assert_eq!(
+                observed.signal,
+                BackendSignal::Running,
+                "tick {tick}: but the result is not resolved yet — native exit and \
+                 signal resolution are independently scriptable"
+            );
+        }
+        let settled = fake.observe(&handle).expect("observe");
+        assert_eq!(
+            settled.native,
+            NativeState::Running,
+            "the scripted step's own native"
+        );
+        assert_eq!(
+            settled.signal,
+            BackendSignal::StageCompleted {
+                summary: Some("done".to_string())
+            },
+            "the real outcome becomes visible once the window is spent"
         );
     }
 

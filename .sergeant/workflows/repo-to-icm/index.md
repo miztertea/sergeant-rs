@@ -2,7 +2,7 @@
 kind: workflow
 name: repo-to-icm
 status: published
-version: 2
+version: 3
 description: >-
   Convert a repository's distributed procedural knowledge — skills, agent
   instructions, scripts, docs, tests — into draft ICM workflow packages
@@ -18,9 +18,11 @@ tags:
 
 # repo-to-icm
 
-Ten-stage actor-only workflow (`docs/gauntlet/contracts/N2.md`; proposal
-§9) that decomposes a target repository's procedural knowledge into the
-ICM representation vocabulary (`docs/icm/record-shapes.md` §4) and
+Eleven-stage workflow (`docs/gauntlet/contracts/N2.md`; proposal §9) —
+ten actor stages plus one `kind = "execute"` stage, `65-self-check`
+(N4, `docs/gauntlet/contracts/N4.md`) — that decomposes a target
+repository's procedural knowledge into the ICM representation vocabulary
+(`docs/icm/record-shapes.md` §4) and
 materializes the result as **draft** workflow packages — never admitted
 procedure. See `CONTEXT.md` for workflow orientation (what each stage
 hands the next, the blindness rule for measurement runs, and v2's harvest
@@ -43,6 +45,15 @@ distribution sanity); `scripts/finalize.py` now refuses to remove a file
 that is not yet reachable in any committed tree (GP-5b / issue #29), proven
 by `scripts/test-finalize-evidence-guard.py` and wired into
 `scripts/validate-structure.py` as `[S15]`.
+
+**v3** (`docs/gauntlet/contracts/N4.md`, MVP-2 lane D3): adds
+`65-self-check`, a `kind = "execute"` stage between `60-draft` and
+`70-lint` that runs `scripts/validate-structure.py` against this
+workflow's own tree in a pinned, offline container — the mechanical
+self-check `70-lint`'s own instructions used to ask an actor to run by
+hand. `70-lint` now reads that stage's output artifact instead of
+re-running the validator itself for that one check; every other stage's
+contract is unchanged.
 
 Use when: a repository's procedural knowledge needs to be surfaced as
 reviewable ICM candidates — either to seed a first admitted decomposition

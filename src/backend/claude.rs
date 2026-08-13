@@ -50,6 +50,32 @@
 //!   sufficient (L1); `is_error` and the model fields are what this adapter
 //!   reads. A valid alias resolves visibly: `system:init.model` and the
 //!   result's `modelUsage` keys carry the full resolved id.
+//! - `--setting-sources` (MVP-2 D2 item 1, measured 2026-08-12) governs
+//!   `.claude/settings*.json`-style configuration only — it does not gate
+//!   whether the actor's agentic turn reads a memory file already sitting in
+//!   its cwd. That native discovery is a separate, always-on mechanism keyed
+//!   to the literal filename `CLAUDE.md`, orthogonal to this flag's value in
+//!   every combination measured, and it never fires for a file named
+//!   `AGENTS.md` (Sergeant's own instruction filename) at all. See
+//!   [`setting_sources_args`] for the full measurement and what the flag
+//!   actually widens under `InstructionPolicy::Local`.
+//! - A SIGKILLed turn (`interrupt`/`stop`, `Child::kill()`) leaves no final
+//!   `type:"result"` envelope — confirmed above. A SIGTERM sent to the same
+//!   process (not a mechanism this adapter uses) is measured to behave
+//!   differently: the CLI traps it, aborts the stream gracefully, and emits
+//!   a terminal `result` envelope (`is_error:true`,
+//!   `terminal_reason:"aborted_streaming"`) carrying real `usage`/
+//!   `modelUsage`/`total_cost_usd` fields (MVP-2 D2 item 3, measured
+//!   2026-08-12: one turn killed early with no assistant content yet
+//!   streamed produced zero usable lines under SIGKILL; a second, killed
+//!   after content began streaming, still ended with no envelope under
+//!   SIGKILL but did carry a `usage` object on its last in-flight
+//!   `assistant` chunk — a snapshot of that chunk's own accounting, not a
+//!   cumulative turn total, and not currently parsed out by this adapter).
+//! - Fact-finding only, no promise attached: recorded here and in
+//!   `docs/environments/cerberus.md` because it is the honest answer to
+//!   "what can interrupt actually tell us", not because anything in this
+//!   milestone changes `interrupt`'s mechanism.
 //!
 //! **The one crash window this adapter does not close (stated, not papered
 //! over).** START chooses the session id before spawning, so the identity
@@ -102,10 +128,12 @@ use super::{
     NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport, ResumeRequest,
     RuntimeScope, StartRequest,
 };
-use crate::domain::event::{EventDraft, EventSource};
+use crate::domain::event::{Event, EventDraft, EventSource};
 use crate::domain::profile::Profile;
+use crate::domain::workspace::InstructionPolicy;
 use crate::runtime::blob::BlobStore;
 use crate::runtime::graph::KIND_CONVERSATION_ASK;
+use crate::runtime::journal::JournalError;
 
 /// Name this backend registers under.
 pub const CLAUDE_BACKEND_NAME: &str = "claude";
@@ -194,6 +222,49 @@ fn turn_lost_the_ask_grammar(outcome: &TurnOutcome) -> bool {
     outcome.envelope.is_some() && !outcome.interrupted && outcome.post_turn_summary.is_none()
 }
 
+/// Scan a journal replay for this adapter's own `ask`-withdrawal record
+/// (`conversation.turn.grammar_unmeasured`, §27) and return the CLI version
+/// the *most recent* one was journaled against, if any.
+///
+/// Pure with respect to the live CLI — it never runs a probe, only reads
+/// events — which is what makes it independently testable (L13): feed it
+/// constructed events, assert the version it picks, with no `claude` binary
+/// anywhere in the loop. [`ClaudeBackend::apply_capability_provenance`] is
+/// the half that compares this answer against a *live* measurement.
+///
+/// "Most recent" is by journal `seq`, not by payload timestamp or event
+/// order in the iterator (a `Replay` already yields in seq order, but this
+/// does not assume its caller does): the withdrawal is a one-way claim
+/// (`note_ask_grammar` never re-raises it, so any recorded withdrawal for a
+/// version implies every later one *for that version* would say the same
+/// thing) and only the version matters to the caller, not which specific
+/// occurrence. Events this adapter did not emit, or whose `capability` is
+/// not `"ask"`, or that carry no `version` at all (a build predating this
+/// field), are skipped rather than treated as evidence either way.
+fn latest_ask_withdrawal_version<I>(events: I) -> Result<Option<String>, JournalError>
+where
+    I: IntoIterator<Item = Result<Event, JournalError>>,
+{
+    let mut latest: Option<(u64, String)> = None;
+    for event in events {
+        let event = event?;
+        if event.source.source_type != "backend"
+            || event.source.name != CLAUDE_BACKEND_NAME
+            || event.kind != "conversation.turn.grammar_unmeasured"
+            || event.payload.get("capability").and_then(Value::as_str) != Some("ask")
+        {
+            continue;
+        }
+        let Some(version) = event.payload.get("version").and_then(Value::as_str) else {
+            continue;
+        };
+        if latest.as_ref().is_none_or(|(seq, _)| event.seq > *seq) {
+            latest = Some((event.seq, version.to_string()));
+        }
+    }
+    Ok(latest.map(|(_, version)| version))
+}
+
 /// Launch configuration for the adapter.
 #[derive(Debug, Clone)]
 pub struct ClaudeConfig {
@@ -239,6 +310,12 @@ struct ProbeOutcome {
     available: bool,
     /// Human-readable evidence: version found, or exactly which gate failed.
     detail: String,
+    /// The canonical `major.minor.patch` this probe parsed from `--version`,
+    /// when parsing got that far — even on a probe that later fails a gate
+    /// (below [`MIN_TRUSTED_VERSION`], missing a required flag). Capability
+    /// provenance (MVP-2 D2 item 2) keys a withdrawal to the exact version
+    /// that showed it, so this is recorded independent of `available`.
+    version: Option<String>,
 }
 
 /// The verdict of three-layer model-pin verification (adapted from the
@@ -524,6 +601,13 @@ struct ClaudeExecution {
     executable: PathBuf,
     env: BTreeMap<String, String>,
     permission_args: Vec<String>,
+    /// R-MVP1-4's resolved policy, pinned at launch (MVP-2 D2 item 1: the
+    /// `--setting-sources` de-leak). Same rule as `executable`/`env`/
+    /// `permission_args` above — resolved once at START and replayed
+    /// unchanged on every subsequent turn of the conversation, never
+    /// re-derived, so a manifest edit mid-flight cannot change what a
+    /// running execution's turns launch with.
+    instruction_policy: InstructionPolicy,
     /// Number of turns launched so far.
     turns: u32,
     turn: TurnState,
@@ -601,6 +685,53 @@ impl ClaudeBackend {
         self.ask_grammar.load(Ordering::Relaxed)
     }
 
+    /// MVP-2 D2 item 2 (capability provenance durability, cv2 item 7):
+    /// re-derive [`Self::ask_grammar`]'s starting value from the journal's
+    /// own record of a prior withdrawal, so a daemon restart does not
+    /// silently re-optimism a capability this exact CLI version already
+    /// proved absent.
+    ///
+    /// Before this existed, [`ClaudeBackend::new`] always started
+    /// `ask_grammar` at `true`: a withdrawal recorded by a daemon that later
+    /// restarted (or crashed) was visible only in the journal's history, not
+    /// in the fresh process's in-memory claim, so `sgt run`'s R-MVP1-11
+    /// preflight (`Engine::bind_stages`) would let a `requires_ask` stage
+    /// back onto a CLI already measured not to speak the grammar — exactly
+    /// once per restart, forever, because nothing ever asked the journal.
+    ///
+    /// Called once at daemon startup (`daemon.rs`, before the registration
+    /// probe emits `capabilities` for the record), fed a full journal
+    /// replay. Read-only: never raises the claim, matching
+    /// [`Self::note_ask_grammar`]'s one-directional rule — a version bump
+    /// makes an old record stale (the CLI that earned it no longer runs
+    /// here) and reverts to the same measure-fresh optimism a brand new
+    /// installation starts with, never to a claim this run has not itself
+    /// measured or the journal has not itself evidenced *for this exact
+    /// version*.
+    pub fn seed_capability_provenance<I>(&self, events: I) -> Result<(), JournalError>
+    where
+        I: IntoIterator<Item = Result<Event, JournalError>>,
+    {
+        let latest = latest_ask_withdrawal_version(events)?;
+        self.apply_capability_provenance(latest.as_deref());
+        Ok(())
+    }
+
+    /// The pure half of [`Self::seed_capability_provenance`]: given the
+    /// version a prior withdrawal was recorded against (if any), lower the
+    /// claim only when it matches the version this probe measures *right
+    /// now*. Split out from the journal-reading half so the decision itself
+    /// — "does a stale-version record apply?" — is testable without a real
+    /// `claude` binary on the test host driving `self.probe_outcome()`.
+    fn apply_capability_provenance(&self, withdrawn_at_version: Option<&str>) {
+        let Some(withdrawn_at_version) = withdrawn_at_version else {
+            return;
+        };
+        if self.probe_outcome().version.as_deref() == Some(withdrawn_at_version) {
+            self.ask_grammar.store(false, Ordering::Relaxed);
+        }
+    }
+
     /// Install the event sink normalized events are pushed through (§27).
     ///
     /// The daemon installs one as soon as its core exists and before it
@@ -661,6 +792,7 @@ impl ClaudeBackend {
                 return ProbeOutcome {
                     available: false,
                     detail: format!("capability probe: cannot run {exe:?} --version: {e}"),
+                    version: None,
                 };
             }
         };
@@ -674,8 +806,10 @@ impl ClaudeBackend {
                     "capability probe: cannot parse a version from {exe:?} --version output \
                      {version_text:?}; refusing an unmeasurable CLI"
                 ),
+                version: None,
             };
         };
+        let canonical_version = format!("{}.{}.{}", version.0, version.1, version.2);
         if version < MIN_TRUSTED_VERSION {
             return ProbeOutcome {
                 available: false,
@@ -689,6 +823,7 @@ impl ClaudeBackend {
                     MIN_TRUSTED_VERSION.1,
                     MIN_TRUSTED_VERSION.2
                 ),
+                version: Some(canonical_version),
             };
         }
         let help_out = match Command::new(exe).arg("--help").output() {
@@ -697,6 +832,7 @@ impl ClaudeBackend {
                 return ProbeOutcome {
                     available: false,
                     detail: format!("capability probe: cannot run {exe:?} --help: {e}"),
+                    version: Some(canonical_version),
                 };
             }
         };
@@ -714,6 +850,7 @@ impl ClaudeBackend {
                      required flag(s) {}; this launch grammar was never measured against it",
                     missing.join(", ")
                 ),
+                version: Some(canonical_version),
             };
         }
         ProbeOutcome {
@@ -722,6 +859,7 @@ impl ClaudeBackend {
                 "claude {version_text}; all {} required flags present",
                 REQUIRED_FLAGS.len()
             ),
+            version: Some(canonical_version),
         }
     }
 
@@ -853,7 +991,17 @@ impl ClaudeBackend {
     /// writer thread, and hands stdout to the reader thread that ingests
     /// stream-json, archives the raw transcript, and records the outcome.
     fn spawn_turn(&self, execution_id: &str, prompt: String) -> Result<(), BackendError> {
-        let (exe, cwd, env, permission_args, session_id, model, first_turn, work_id) = {
+        let (
+            exe,
+            cwd,
+            env,
+            permission_args,
+            session_id,
+            model,
+            first_turn,
+            work_id,
+            instruction_policy,
+        ) = {
             let state = self.lock();
             let execution = state
                 .executions
@@ -868,6 +1016,7 @@ impl ClaudeBackend {
                 execution.model.clone(),
                 execution.turns == 0,
                 execution.work_id.clone(),
+                execution.instruction_policy,
             )
         };
 
@@ -876,9 +1025,12 @@ impl ClaudeBackend {
             .arg("-p")
             .arg("--verbose")
             .args(["--output-format", "stream-json"])
-            // L2's capture hazard: the target repo's project memory must not
-            // be able to install a different identity on the execution agent.
-            .args(["--setting-sources", "user"]);
+            // MVP-2 D2 item 1 (the `--setting-sources` de-leak): R-MVP1-4's
+            // pinned policy translates to the CLI's own setting-sources
+            // grammar. See `setting_sources_args` for what this flag is
+            // measured to actually control — it is narrower than L2's
+            // original "project memory" framing (module docs).
+            .args(setting_sources_args(instruction_policy));
         if first_turn {
             // Session identity is chosen by sergeant before the process
             // exists, so the handle START returns already names the
@@ -966,6 +1118,7 @@ impl ClaudeBackend {
         let reader = TurnReader {
             backend_state: Arc::clone(&self.state),
             ask_grammar: Arc::clone(&self.ask_grammar),
+            version: self.probe_outcome().version.clone(),
             sink: self.sink.lock().expect("claude sink lock").clone(),
             data_dir: self.config.data_dir.clone(),
             execution_id: execution_id.to_string(),
@@ -995,6 +1148,14 @@ struct TurnReader {
     /// The adapter's ask-grammar claim, lowered from here when a turn
     /// completes without the line it rests on.
     ask_grammar: Arc<AtomicBool>,
+    /// The canonical version this backend's registration probe measured
+    /// (`ProbeOutcome::version`), carried down so a withdrawal this reader
+    /// journals names the exact version that showed it (MVP-2 D2 item 2) —
+    /// without this, `conversation.turn.grammar_unmeasured` events would be
+    /// provenance with no key to seed a later restart from. `None` only when
+    /// the probe itself could not parse a version at all (an unmeasurable
+    /// CLI, refused elsewhere in that path already).
+    version: Option<String>,
     sink: Option<EventSink>,
     data_dir: PathBuf,
     execution_id: String,
@@ -1236,6 +1397,12 @@ impl TurnReader {
                 "capability": "ask",
                 "expected": format!("system/{POST_TURN_SUMMARY_SUBTYPE}"),
                 "session_id": self.session_id,
+                // MVP-2 D2 item 2: the CLI version this withdrawal was
+                // measured against, so a later daemon start can tell whether
+                // the record still applies (`latest_ask_withdrawal_version`)
+                // rather than blindly re-lowering a claim about a CLI that
+                // has since been upgraded out from under it.
+                "version": self.version,
                 "detail":
                     "a turn completed with a result envelope and no post_turn_summary line; \
                      the evidence `Capabilities::ask` rests on is not present in this CLI's \
@@ -1409,6 +1576,7 @@ impl Backend for ClaudeBackend {
                     executable,
                     env,
                     permission_args,
+                    instruction_policy: request.instruction_policy,
                     turns: 0,
                     turn: TurnState::Unlaunched,
                     stopped: false,
@@ -1630,6 +1798,7 @@ impl Backend for ClaudeBackend {
                 executable,
                 env,
                 permission_args,
+                instruction_policy: request.instruction_policy.unwrap_or_default(),
                 turns: 1, // there was at least the turn that created it
                 // Adoption draws no conclusion — and says so. (It used to
                 // borrow an interrupted turn's shape here, which made OBSERVE
@@ -1965,6 +2134,57 @@ fn observe_envelope(
                 )),
             }
         }
+    }
+}
+
+/// Translate R-MVP1-4's [`InstructionPolicy`] into this adapter's launch
+/// grammar (MVP-2 D2 item 1, the `--setting-sources` de-leak).
+///
+/// Pure with respect to the process — no spawn, no I/O — so the exact argv
+/// value for each policy is testable without a `claude` binary anywhere in
+/// the loop (L13); `spawn_turn` is the only caller that turns the answer
+/// into a real command.
+///
+/// **Measured** (four real bounded `claude-haiku-4-5` turns against a
+/// scratch git repo with both `AGENTS.md` and `CLAUDE.md` present, one
+/// codeword marker each, 2026-08-12 — logged in this build's commit notes,
+/// L1): `--setting-sources` governs which `.claude/settings*.json`
+/// configuration files the CLI loads (permissions, hooks, MCP server
+/// config) — it does **not** gate whether the actor's own agentic turn
+/// reads a memory file already sitting in its cwd. The CLI's native
+/// "CLAUDE.md auto-discovery" (its own `--bare --help` text's name for the
+/// mechanism) is a separate, always-on behaviour keyed to the literal
+/// filename `CLAUDE.md`: it fired identically under no flag,
+/// `--setting-sources user`, and `--setting-sources user,project` in this
+/// measurement (the model actively `Read` the file each time, prompted by
+/// its own default system prompt — not a settings-driven injection), and it
+/// never fired at all for byte-identical content under Sergeant's actual
+/// instruction filename, `AGENTS.md` — under any of those three source
+/// sets. Two consequences follow directly:
+///
+/// - `Suppress`'s existing grammar (`--setting-sources user`, unchanged
+///   below) was never actually suppressing `AGENTS.md` consumption for
+///   *this* adapter — there was nothing native to suppress under that
+///   filename in the first place. The flag still earns its keep for what it
+///   *does* gate (below), so it stays.
+/// - `InstructionPolicy::Local`'s doc comment ("the actor would consume the
+///   repository's own instruction file natively") has no `--setting-sources`
+///   value that implements it for `AGENTS.md`, because the mechanism that
+///   comment describes does not exist for that filename at all. What
+///   `Local` *actually* widens, honestly: whether the repository's own
+///   `.claude/settings.json` / `.claude/settings.local.json` — hooks, tool
+///   permissions, MCP servers, potentially arbitrary command execution via a
+///   repo-authored hook — take effect for the turn. That is real,
+///   repo-controlled surface, and a materially *larger* risk than "reads a
+///   text file", not a smaller one. `Engine::resolve_instruction_identities`
+///   still pins `AGENTS.md`'s content hash as evidence either way (R7's "the
+///   file the actor will read is the one we recorded") — on this adapter,
+///   under either policy, nothing reads it via this mechanism, and the pin
+///   is honest bookkeeping about that, not proof of consumption.
+fn setting_sources_args(policy: InstructionPolicy) -> [&'static str; 2] {
+    match policy {
+        InstructionPolicy::Suppress => ["--setting-sources", "user"],
+        InstructionPolicy::Local => ["--setting-sources", "user,project,local"],
     }
 }
 
@@ -2622,6 +2842,7 @@ mod tests {
         let reader = TurnReader {
             backend_state: Arc::clone(&backend.state),
             ask_grammar: Arc::clone(&backend.ask_grammar),
+            version: Some("2.1.226".to_string()),
             sink: backend.sink.lock().expect("sink lock").clone(),
             data_dir: dir.path().to_path_buf(),
             execution_id: "e-grammar".to_string(),
@@ -2666,6 +2887,137 @@ mod tests {
         assert_eq!(
             notices[0].payload["expected"],
             format!("system/{POST_TURN_SUMMARY_SUBTYPE}")
+        );
+        assert_eq!(
+            notices[0].payload["version"], "2.1.226",
+            "the withdrawal must name the version it was measured against \
+             (MVP-2 D2 item 2) — a restart's provenance seed has nothing to \
+             match against otherwise"
+        );
+    }
+
+    /// MVP-2 D2 item 2: [`latest_ask_withdrawal_version`] picks the
+    /// highest-`seq` withdrawal, ignores events from other backends/kinds,
+    /// and treats "no version field" (a pre-D2 build's record) as no
+    /// evidence at all.
+    #[test]
+    fn latest_ask_withdrawal_version_picks_the_highest_seq_matching_event() {
+        fn withdrawal(seq: u64, version: &str) -> Event {
+            EventDraft::new(
+                EventSource::new("backend", CLAUDE_BACKEND_NAME),
+                "conversation.turn.grammar_unmeasured",
+                json!({"capability": "ask", "version": version}),
+            )
+            .into_event(seq)
+        }
+
+        // Nothing recorded yet: no opinion.
+        assert_eq!(latest_ask_withdrawal_version(Vec::new()).unwrap(), None);
+
+        // A single matching record names its version.
+        assert_eq!(
+            latest_ask_withdrawal_version(vec![Ok(withdrawal(1, "2.1.226"))]).unwrap(),
+            Some("2.1.226".to_string())
+        );
+
+        // Two records for two versions (a restart, an upgrade, another
+        // withdrawal): the later `seq` wins, out of iterator order too.
+        let out_of_order = vec![Ok(withdrawal(5, "2.1.228")), Ok(withdrawal(2, "2.1.226"))];
+        assert_eq!(
+            latest_ask_withdrawal_version(out_of_order).unwrap(),
+            Some("2.1.228".to_string())
+        );
+
+        // SURVIVOR pin (MVP-2 D3 fixer pass): the mirrored ordering. The case above
+        // alone cannot distinguish "pick the highest seq" from "pick the
+        // first matching element" — the highest-seq record already comes
+        // first in iterator order there, so a `latest.is_none()`-style
+        // first-wins mutant returns the identical answer and survives. This
+        // pairing puts the highest seq *last* in iterator order so only a
+        // true highest-seq comparison passes both.
+        let in_order = vec![Ok(withdrawal(2, "2.1.226")), Ok(withdrawal(5, "2.1.228"))];
+        assert_eq!(
+            latest_ask_withdrawal_version(in_order).unwrap(),
+            Some("2.1.228".to_string())
+        );
+
+        // A same-adapter event of a different kind, a different backend's
+        // event, and a record with no `version` field at all (pre-D2) are
+        // all skipped, not misread as evidence.
+        let noise = vec![
+            Ok(EventDraft::new(
+                EventSource::new("backend", CLAUDE_BACKEND_NAME),
+                "conversation.user",
+                json!({}),
+            )
+            .into_event(9)),
+            Ok(EventDraft::new(
+                EventSource::new("backend", "docker"),
+                "conversation.turn.grammar_unmeasured",
+                json!({"capability": "ask", "version": "2.1.226"}),
+            )
+            .into_event(10)),
+            Ok(EventDraft::new(
+                EventSource::new("backend", CLAUDE_BACKEND_NAME),
+                "conversation.turn.grammar_unmeasured",
+                json!({"capability": "ask"}),
+            )
+            .into_event(11)),
+        ];
+        assert_eq!(latest_ask_withdrawal_version(noise).unwrap(), None);
+    }
+
+    /// MVP-2 D2 item 2: the durability half. A record for the version this
+    /// probe measures *right now* lowers the claim; a record for any other
+    /// version (a CLI upgrade or downgrade since it was journaled) leaves
+    /// the fresh-install optimism untouched — the mutation this guards
+    /// against is a seed that applies regardless of version, which would
+    /// wrongly keep an `ask` refusal alive across an upgrade that fixed it.
+    #[test]
+    fn capability_provenance_only_applies_to_a_matching_version() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut config = ClaudeConfig::new(dir.path());
+        // A `claude` binary this probe can actually run and parse, entirely
+        // offline: `--version`/`--help` are shelled out for real
+        // (`run_probe`), so the stand-in must answer both without touching
+        // the network or spending a token.
+        let script = dir.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.226 (Claude Code)'; else echo '{}'; fi\n",
+                REQUIRED_FLAGS.join(" ")
+            ),
+        )
+        .expect("write stand-in");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod +x");
+        }
+        config.executable = script;
+        let backend = ClaudeBackend::new(config);
+        assert_eq!(
+            backend.probe_outcome().version.as_deref(),
+            Some("2.1.226"),
+            "stand-in must parse as the version the test reasons about"
+        );
+
+        // A different version's withdrawal: stale, does not apply.
+        backend.apply_capability_provenance(Some("2.1.225"));
+        assert!(
+            backend.ask_grammar_intact(),
+            "a withdrawal recorded against a CLI version other than the one \
+             installed now must not lower a fresh install's claim"
+        );
+
+        // The exact version just measured: applies.
+        backend.apply_capability_provenance(Some("2.1.226"));
+        assert!(
+            !backend.ask_grammar_intact(),
+            "a withdrawal recorded against exactly this version must seed \
+             the restarted claim as withdrawn"
         );
     }
 
@@ -2718,6 +3070,7 @@ mod tests {
         let reader = TurnReader {
             backend_state: Arc::clone(&backend.state),
             ask_grammar: Arc::clone(&backend.ask_grammar),
+            version: None,
             sink: backend.sink.lock().expect("sink lock").clone(),
             data_dir: dir.path().to_path_buf(),
             execution_id: "e-stderr".to_string(),
@@ -2802,6 +3155,7 @@ mod tests {
         let reader = TurnReader {
             backend_state: Arc::clone(&backend.state),
             ask_grammar: Arc::clone(&backend.ask_grammar),
+            version: None,
             sink: backend.sink.lock().expect("sink lock").clone(),
             data_dir: dir.path().to_path_buf(),
             execution_id: "e-stderr-never".to_string(),
@@ -2871,6 +3225,7 @@ mod tests {
             executable: PathBuf::from("claude"),
             env: BTreeMap::new(),
             permission_args: vec![],
+            instruction_policy: InstructionPolicy::Suppress,
             turns: 1,
             turn: TurnState::Finished(TurnOutcome {
                 post_turn_summary: None,

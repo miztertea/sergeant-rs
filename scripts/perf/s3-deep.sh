@@ -184,15 +184,19 @@ perf_kv fds_before_reads "$FDS_BEFORE"
 perf_kv fds_peak_reads "$max_fds"
 perf_kv fds_after_reads "$(perf_proc_fds "$PERF_DAEMON_PID")"
 perf_kv cpu_s "$last_cpu"
-perf_disk_kv disk "$DD"
 
 # The work is still parked in needs_input holding a live surface; cancel it so
-# the sweep below is a real sweep and not a known-dirty one.
+# the sweep below is a real sweep and not a known-dirty one. Needs the daemon
+# alive, so it stays before `perf_daemon_stop` even though `perf_disk_kv`
+# below has moved after it.
 [ "$STATE" = "needs_input" ] && perf_cancel "$WORK"
 sleep 1
 perf_kv state_at_teardown "$(perf_work_state "$WORK")"
 
 perf_daemon_stop
+# Issue #13: `perf_disk_kv` moved after `perf_daemon_stop` (see its doc in
+# common.sh) — `duckdb_bytes` only reflects reality post-checkpoint.
+perf_disk_kv disk "$DD"
 perf_kv daemon_force_killed "$PERF_FORCE_KILLED"
 perf_hygiene s3 "$REPO"
 perf_summary

@@ -32,6 +32,7 @@ use crate::api::{
     drive_completions, router,
 };
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
+use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
 use crate::domain::event::{EventDraft, EventSource};
@@ -57,6 +58,34 @@ pub const KIND_DAEMON_STOPPED: &str = "daemon.stopped";
 /// Event kind: a backend was registered and probed (§15 PROBE, recorded at
 /// registration as the M4 contract requires).
 pub const KIND_BACKEND_PROBED: &str = "backend.probed";
+
+/// Event kind: admission paused — new `POST /v1/work` submissions are
+/// refused until [`KIND_ADMISSION_RESUMED`] (MVP-3's drain flag, scoped
+/// exactly to `sgt daemon stop`: pause, wait for in-flight work to finish,
+/// then send the ordinary SIGTERM shutdown). Idempotent at the API layer
+/// (`pause_admission` in `api.rs` journals nothing new if already paused),
+/// which is what keeps a `daemon stop` retry from double-pausing — see
+/// [`KIND_ADMISSION_RESUMED`]'s doc for the other half of L6's crash window.
+pub const KIND_ADMISSION_PAUSED: &str = "admission.paused";
+/// Event kind: admission resumed — the complement of
+/// [`KIND_ADMISSION_PAUSED`].
+///
+/// **L6's crash window, closed by construction rather than by recovery
+/// logic.** A daemon can die after journaling `admission.paused` but before
+/// `sgt daemon stop` ever sends SIGTERM (killed mid-drain, or the CLI itself
+/// was killed while waiting). A single `bool` folded from these two event
+/// kinds is durable, so a naive restart would replay straight into "admission
+/// still paused" forever — a fresh process that was never mid-drain itself,
+/// permanently refusing all new work with no operator ever having asked for
+/// that. `start_with` closes this the same way `reconcile_crashed_start`
+/// closes its own crash windows: **unconditionally**, journal
+/// `admission.resumed` once at startup whenever the freshly-replayed state
+/// shows paused, before the descriptor is published and before any request
+/// can be served. This is safe rather than a guess because admission-paused
+/// is a fact about *this process's* live drain, and a new process starting
+/// is unambiguous proof no drain by *it* is in progress — unlike Work-state
+/// recovery (§25), there is no ambiguous case here to fail closed on.
+pub const KIND_ADMISSION_RESUMED: &str = "admission.resumed";
 
 /// The runtime descriptor published for clients (proposal §6): endpoint,
 /// PID, API revision, and the bearer token, protected by owner-only file
@@ -171,6 +200,12 @@ pub struct DaemonConfig {
     /// it at a stub binary so the *real* adapter — not a fake wearing its
     /// name — can be driven through the daemon's own request path.
     pub claude: Option<ClaudeConfig>,
+    /// Launch configuration for the Docker adapter this daemon registers
+    /// itself (N4). `None` is the ordinary `docker` on `PATH`, adapter state
+    /// under this data dir — mirrors `claude` above for the same reason:
+    /// tests point it at a scripted `docker_bin` to drive the real adapter's
+    /// request path without a real Docker Engine.
+    pub docker: Option<DockerConfig>,
     /// §28 OpenTelemetry export. `None` is **off**, and off is the default:
     /// with no pipeline here the daemon builds no provider, spawns no
     /// exporter task, and subscribes nothing to the event stream.
@@ -184,6 +219,29 @@ pub struct DaemonConfig {
     /// sleep racing the driver — is the kind of test that passes for the wrong
     /// reason. Production uses the default.
     pub completion_poll: Duration,
+    /// R-MVP1-7's per-turn wall-clock ceiling. Configurable for the same
+    /// reason `completion_poll` is: a test proving a hung turn is
+    /// interrupted within "ceiling + one interval" needs to hold both knobs
+    /// down to something a test budget can wait out, and racing the
+    /// production default (minutes) would make the test the thing that
+    /// times out. Production uses the default.
+    pub turn_ceiling: Duration,
+    /// R-MVP1-1's daemon-wide surfaces-root override (`[estate]
+    /// surfaces_dir` / `SGT_SURFACES_DIR`): `None` keeps
+    /// [`Engine::new`]'s default, `<data_dir>/surfaces` — today's layout,
+    /// nothing moves. `Some` is wired into the engine via
+    /// [`Engine::with_surfaces_root`] in [`start_with`]. A per-estate
+    /// `[estate] surfaces_dir` narrows this further, per-submission, in
+    /// `Engine::plan` — this is only the daemon-wide fallback beneath that.
+    pub surfaces_root: Option<PathBuf>,
+    /// R-MVP1-7's daemon-wide turn-cap override (`SGT_TURN_CAP`): `None`
+    /// keeps [`Engine::new`]'s default ([`crate::runtime::engine::
+    /// DEFAULT_TURN_CAP`]). `Some` is wired into the engine via
+    /// [`Engine::with_turn_cap`] in [`start_with`], the same way
+    /// `turn_ceiling` and `surfaces_root` above are. R-MVP1-10's
+    /// `Engine::extend_turn_envelope` is the per-Work door beneath this
+    /// daemon-wide default.
+    pub turn_cap: Option<u32>,
 }
 
 impl Default for DaemonConfig {
@@ -192,8 +250,12 @@ impl Default for DaemonConfig {
             backends: Arc::new(BackendRegistry::default_registry()),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
+            docker: None,
             telemetry: None,
             completion_poll: COMPLETION_POLL_INTERVAL,
+            turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
+            surfaces_root: None,
+            turn_cap: None,
         }
     }
 }
@@ -288,6 +350,37 @@ pub async fn start_with(
             .clone()
             .unwrap_or_else(|| ClaudeConfig::new(data_dir));
         let adapter = Arc::new(ClaudeBackend::new(claude_config));
+        // MVP-2 D2 item 2 (capability provenance durability, cv2 item 7):
+        // seed the fresh in-memory `ask` claim from the journal's own record
+        // of a prior withdrawal *before* anything reads `capabilities()` —
+        // the registration probe two steps below, first of all — so a
+        // capability this exact CLI version already proved absent stays
+        // withdrawn across a restart instead of re-defaulting to optimistic
+        // on every fresh process. A separate `replay_data_dir` read (rather
+        // than reusing `journal` above, already moved into `core`) is the
+        // same pattern step 2b's `Analytics::rebuild` already uses for a
+        // second, independent replay of the same validated chain.
+        adapter.seed_capability_provenance(Journal::replay_data_dir(data_dir)?)?;
+        backends = backends.with(adapter.clone());
+        Some(adapter)
+    } else {
+        None
+    };
+    // N4: the Docker executor, registered the same way and for the same
+    // reason as Claude above — it needs this data dir (image pins, its own
+    // blob-store instance) and an event sink that only exists once the core
+    // does. `DockerBackend::new` only opens its blob store (durable,
+    // infallible in ordinary operation); it never touches the Docker socket,
+    // so a host with no Docker installed still starts a daemon that can
+    // route actor-only workflows (§17.5's "degraded daemon, strict work
+    // admission" — routing an execute stage to this backend is what actually
+    // fails, at submit time, via its `probe()`).
+    let docker = if config.backends.get(DOCKER_BACKEND_NAME).is_none() {
+        let docker_config = config
+            .docker
+            .clone()
+            .unwrap_or_else(|| DockerConfig::new(data_dir));
+        let adapter = Arc::new(DockerBackend::new(docker_config)?);
         backends = backends.with(adapter.clone());
         Some(adapter)
     } else {
@@ -331,11 +424,15 @@ pub async fn start_with(
     // yet been settled. `reconcile` itself flushes after each work it
     // touches, so its own effects (a `git worktree remove`, a relaunched
     // harness) are never left unsynced while unbounded — see its doc.
-    let engine = Arc::new(Engine::new(
-        backends,
-        config.default_backend.clone(),
-        data_dir,
-    ));
+    let mut engine = Engine::new(backends, config.default_backend.clone(), data_dir)
+        .with_turn_ceiling(config.turn_ceiling);
+    if let Some(surfaces_root) = config.surfaces_root.clone() {
+        engine = engine.with_surfaces_root(surfaces_root);
+    }
+    if let Some(turn_cap) = config.turn_cap {
+        engine = engine.with_turn_cap(turn_cap);
+    }
+    let engine = Arc::new(engine);
     let reconciled = recovery::reconcile(&engine, &mut core)?;
     // Backstop, not load-bearing: `reconcile` already leaves nothing open on
     // its own account, but a future edit there that forgets a flush must not
@@ -354,6 +451,23 @@ pub async fn start_with(
             reservations_retired = ?reconciled.reservations_retired,
             "reconciled in-flight work after restart"
         );
+    }
+
+    // 4c-ii. Clear a stale admission pause (L6, `KIND_ADMISSION_RESUMED`'s
+    // own doc): a predecessor that died mid-drain can leave the replayed
+    // state paused with nothing left to ever resume it. This process was
+    // never mid-drain itself, so the fact is unambiguous — resume
+    // unconditionally, before the descriptor is published and before any
+    // request can be served, exactly like the backend probes and recovery
+    // above.
+    if core.registry.state().admission_paused {
+        core.commit(EventDraft::new(
+            EventSource::new("daemon", "sergeant"),
+            KIND_ADMISSION_RESUMED,
+            json!({"reason": "startup: a fresh process was never mid-drain"}),
+        ))?;
+        core.flush()?;
+        tracing::info!("cleared an admission pause inherited from a previous process life");
     }
 
     // 5. Publish the descriptor: atomic rename, owner-only permissions,
@@ -392,6 +506,12 @@ pub async fn start_with(
     // through the core; the sink can only exist now that the core is shared.
     if let Some(claude) = claude {
         claude.set_event_sink(journaling_sink(state.core.clone()));
+    }
+    // The Docker adapter's own provenance events (`execute.image_resolved`)
+    // flow through the identical sink (same reasoning as Claude's, directly
+    // above).
+    if let Some(docker) = docker {
+        docker.set_event_sink(journaling_sink(state.core.clone()));
     }
     let app = router(state.clone());
 
@@ -647,10 +767,45 @@ pub async fn run_until_signal(data_dir: &Path) -> Result<(), DaemonError> {
             "otel export enabled"
         );
     }
+    // R-MVP1-1's daemon-wide surfaces-root override: read once at startup,
+    // exactly as `Engine::with_surfaces_root`'s own doc has always promised.
+    // An empty value is treated the same as unset (`SGT_SURFACES_DIR=`
+    // exported-but-blank must not silently relocate every surface to the
+    // data dir's own root).
+    let surfaces_root = std::env::var_os("SGT_SURFACES_DIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty());
+    // R-MVP1-7's daemon-wide turn-cap override: same discipline as
+    // SGT_SURFACES_DIR above — unset or unparseable both mean "keep the
+    // built-in default" (fail open to the default, never refuse the whole
+    // daemon start over a malformed env var only an operator can fix by
+    // restarting anyway). Failing open must not fail silently: the warn is
+    // the only trace an operator gets that their override never applied,
+    // and 0 — which parses — blocks every Work at its first turn spawn.
+    let turn_cap = std::env::var("SGT_TURN_CAP")
+        .ok()
+        .and_then(|v| match v.parse::<u32>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "SGT_TURN_CAP=0 blocks every Work at its first turn spawn; honoring it"
+                );
+                Some(0)
+            }
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SGT_TURN_CAP is not a whole number of turns — keeping the built-in default"
+                );
+                None
+            }
+        });
     let handle = start_with(
         data_dir,
         DaemonConfig {
             telemetry: telemetry.clone(),
+            surfaces_root,
+            turn_cap,
             ..DaemonConfig::default()
         },
     )

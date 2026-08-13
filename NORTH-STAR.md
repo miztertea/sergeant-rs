@@ -29,8 +29,11 @@ setup. (Stranger onboarding itself is gated — see Waves.)
 
 - **Core (`sgt`)** owns durable execution: journal, blobs, projections,
   the Backend boundary, WorkState, the API, admission, holds and message
-  delivery to running executions, promote/finalize, backlog identity and
-  provenance, the intent schema, the spend envelope.
+  delivery to running executions, the terminal output POINTER, backlog
+  identity and provenance, the intent schema, the spend envelope.
+  (Amended 2026-08-11, R-MVP1-2 held: promote/finalize EXECUTION is
+  workflow content invoking a shared deterministic helper — the engine
+  learns no output vocabulary; only the pointer is core.)
 - **OS (AGENTS.md, skills, workflows, conventions)** owns judgment and
   dialogue: how to talk to sergeant, what deserves the Work apparatus,
   how to ask and guide. AGENTS.md is hand-authored canonical doctrine;

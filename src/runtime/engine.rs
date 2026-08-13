@@ -20,15 +20,18 @@
 //! the backends that need it, not before (§4's non-goal, and the M3 contract's
 //! "no generalized DAG scheduling").
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::api::{Core, CoreError};
+use crate::backend::docker::DOCKER_BACKEND_NAME;
 use crate::backend::{
-    Backend, BackendError, BackendRegistry, BackendSignal, Deferred, ExecutionHandle, NativeState,
-    Observation, PreparedExecution, ResumeRequest, StartRequest,
+    Backend, BackendError, BackendRegistry, BackendSignal, Completion, Deferred, ExecutionHandle,
+    NativeState, Observation, PreparedExecution, ResumeRequest, StartRequest,
 };
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::execution::{
@@ -44,14 +47,16 @@ use crate::domain::workflow::{
     DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
     KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
     KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
-    StageStatus, WorkflowDefinition, WorkflowError,
+    StageKind, StageStatus, WorkflowDefinition, WorkflowError,
 };
-use crate::domain::workspace::{RepositorySpec, Workspace, WorkspaceError};
+use crate::domain::workspace::{
+    InstructionIdentity, InstructionPolicy, RepositorySpec, Workspace, WorkspaceError,
+};
 use crate::runtime::projection::WorkRun;
 use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage};
 use crate::runtime::surface::{
-    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfaceError,
-    SurfacePlan, TeardownReport, WorkSurface, materialize, rematerialize, teardown,
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SURFACES_DIR,
+    SurfaceError, SurfacePlan, TeardownReport, WorkSurface, materialize, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
@@ -86,6 +91,12 @@ pub struct StartPlan {
     pub workspace: Workspace,
     /// Repositories this run targets.
     pub repositories: Vec<RepositorySpec>,
+    /// Where this run's surface will be materialized (R-MVP1-1):
+    /// `workspace.surfaces_dir` when the manifest declared one, else the
+    /// engine's own default (`SGT_SURFACES_DIR`, else `<data_dir>/surfaces`).
+    /// Resolved once, here, so a mid-flight manifest edit cannot move a
+    /// running Work's surface out from under it.
+    pub surfaces_root: PathBuf,
     /// The resolved workflow, pinned for the life of the run.
     pub workflow: WorkflowDefinition,
     /// The routing decision and the tier that made it.
@@ -344,6 +355,62 @@ pub struct ObserveOutcome {
     observed: Result<Observation, BackendError>,
 }
 
+/// A turn's INTERRUPT the engine has decided to issue (R-MVP1-7's per-turn
+/// wall-clock ceiling), to be performed **with the core lock released**
+/// (§14.2's middle phase applied to INTERRUPT, §22.6).
+///
+/// Distinct from STOP (`PendingSurface`'s teardown path, and
+/// `Engine::stop_execution`'s reviewed under-the-lock exemption): the
+/// execution stays known afterward and a later turn may still use it. Only
+/// *this* turn is being asked to end, and whether it complied is
+/// [`Engine::due_observations`]'s question to answer, never this one's
+/// (§25 — an interrupt is a request, not a verdict).
+pub struct PendingInterrupt {
+    work_id: String,
+    execution: ExecutionRecord,
+    backend: Arc<dyn Backend>,
+    /// The ceiling this crossing was measured against
+    /// ([`Engine::effective_turn_ceiling`] at collection time in
+    /// [`Engine::due_interrupts`]) — MVP-3's per-Work override when the
+    /// client set one, else the daemon-wide default. Carried on the struct
+    /// rather than recomputed at settle time so the journaled
+    /// `ceiling_secs` always names the bound this specific crossing actually
+    /// violated, not just whatever `Engine::turn_ceiling` happens to be by
+    /// the time settlement runs.
+    ceiling_secs: f64,
+}
+
+impl std::fmt::Debug for PendingInterrupt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingInterrupt")
+            .field("work_id", &self.work_id)
+            .field("execution_id", &self.execution.execution_id)
+            .finish()
+    }
+}
+
+impl PendingInterrupt {
+    /// The work whose turn is being interrupted.
+    pub fn work_id(&self) -> &str {
+        &self.work_id
+    }
+
+    /// Issue the INTERRUPT. **Never while holding the core lock** — this is
+    /// the external effect (§22.6), symmetric with every other performer
+    /// here: it cannot see a `Core` by construction.
+    pub fn perform(&self) -> InterruptOutcome {
+        InterruptOutcome {
+            outcome: self.backend.interrupt(&handle_of(&self.execution)),
+        }
+    }
+}
+
+/// What [`PendingInterrupt::perform`] came back with.
+#[derive(Debug)]
+pub struct InterruptOutcome {
+    outcome: Result<Completion, BackendError>,
+}
+
 /// A git operation the engine has committed to and must now perform **with
 /// the core lock released** (§14.2's middle phase, applied to §11's surfaces).
 ///
@@ -363,8 +430,10 @@ pub struct PendingSurface {
 pub enum SurfaceEffect {
     /// Create the run's worktrees, then bind the workflow and enter stage 0.
     Materialize {
-        /// Data dir the `surfaces/` tree lives under.
-        data_dir: PathBuf,
+        /// Root directory this run's surface lives under (R-MVP1-1) — the
+        /// plan's already-resolved `surfaces_root`, not necessarily under
+        /// `data_dir`.
+        surfaces_root: PathBuf,
         /// The plan whose repositories are being materialized, carried so the
         /// binding it produces is the one that was admitted.
         plan: Box<StartPlan>,
@@ -411,9 +480,14 @@ impl PendingSurface {
     /// Run the git operation. **Never while holding the core lock.**
     pub fn perform(&self) -> SurfaceOutcome {
         match &self.effect {
-            SurfaceEffect::Materialize { data_dir, plan } => SurfaceOutcome::Materialized(
-                materialize(data_dir, &self.work_id, &plan.repositories),
-            ),
+            SurfaceEffect::Materialize {
+                surfaces_root,
+                plan,
+            } => SurfaceOutcome::Materialized(materialize(
+                surfaces_root,
+                &self.work_id,
+                &plan.repositories,
+            )),
             SurfaceEffect::Rematerialize { surface, .. } => {
                 // A retry whose worktrees are all still on disk needs no git
                 // at all; asking here rather than under the guard keeps even
@@ -464,6 +538,10 @@ pub enum Next {
     /// only ever handed in by the daemon's completion driver, which is the one
     /// caller that has to ask a question nobody's request asked.
     Observe(Box<PendingObserve>),
+    /// Issue this INTERRUPT outside the lock, then feed the result back
+    /// through [`Engine::settle_interrupt`]. R-MVP1-7's per-turn ceiling —
+    /// like `Observe`, only ever handed in by the completion driver.
+    Interrupt(Box<PendingInterrupt>),
 }
 
 /// One crank of the engine: everything it committed under this lock hold,
@@ -517,6 +595,20 @@ pub enum EngineError {
     /// The requested repository subset does not match the workspace.
     #[error("{0}")]
     RepositorySelection(String),
+    /// R-MVP1-4: the selected repositories disagree on `instructions`
+    /// policy. One process, one `--setting-sources` — there is nowhere for
+    /// two policies to both take effect, so the submission is refused
+    /// naming every repository and its value.
+    #[error(
+        "repositories disagree on instructions policy ({}); one process runs one policy — \
+         align every selected [[repo]]'s instructions value, or select a consistent subset \
+         with --repo",
+        .repos.join(", ")
+    )]
+    InstructionPolicyConflict {
+        /// `"<repo>=<policy>"` for every selected repository.
+        repos: Vec<String>,
+    },
     /// The requested profile is not declared by the workspace.
     #[error("no profile named {requested:?} in this workspace (has: {available})")]
     ProfileNotFound {
@@ -575,6 +667,18 @@ pub enum EngineError {
         /// Work id.
         work_id: String,
     },
+    /// R-MVP1-10's exit door (`Engine::extend_turn_envelope`) was asked for
+    /// a work that is not `blocked` — extending an envelope only means
+    /// something for a Work actually stopped at one.
+    #[error(
+        "work {work_id} is {state}, not blocked; nothing here needs its turn envelope extended"
+    )]
+    NotBlocked {
+        /// Work id.
+        work_id: String,
+        /// Its actual state.
+        state: WorkState,
+    },
     /// A run references a backend the daemon does not have registered.
     #[error("work {work_id} routed to backend {backend:?}, which is not registered here")]
     BackendMissing {
@@ -591,6 +695,42 @@ pub enum EngineError {
         /// The offending index.
         index: usize,
     },
+    /// R-MVP1-11: a stage declares `requires_ask = true` but the harness it
+    /// resolved to advertises `Capabilities::ask == false`. Refused at
+    /// submit, before a Work exists, naming the workflow, the stage and the
+    /// backend — the same "reject before Work or worktree side effects"
+    /// timing §17.5's other preflight checks already use.
+    #[error(
+        "workflow {workflow:?} stage {stage:?} requires an actor that can author its own \
+         ask (requires_ask = true), but backend {backend:?} does not declare \
+         Capabilities::ask; route this stage to a backend that does, or drop \
+         requires_ask from the stage's declaration"
+    )]
+    AskCapabilityUnavailable {
+        /// Workflow name.
+        workflow: String,
+        /// The declaring stage's id.
+        stage: String,
+        /// The backend the stage resolved to.
+        backend: String,
+    },
+    /// §17.5: a workflow declares a `kind = "execute"` stage, but the
+    /// `"docker"` backend is not registered or its probe reports
+    /// unavailable. Refused before Work or worktree side effects, exactly
+    /// like every other §17.5 preflight — "an actor-only workflow may run
+    /// when Docker is unavailable; a mixed or execute workflow may not."
+    #[error(
+        "workflow {workflow:?} stage {stage:?} is a Docker execute stage, but the local Docker \
+         executor is unavailable: {detail}"
+    )]
+    ExecuteBackendUnavailable {
+        /// Workflow name.
+        workflow: String,
+        /// The declaring stage's id.
+        stage: String,
+        /// Why the Docker backend could not be routed to.
+        detail: String,
+    },
 }
 
 impl EngineError {
@@ -604,14 +744,18 @@ impl EngineError {
             EngineError::Backend(_) => "backend_error",
             EngineError::Core(_) => "internal",
             EngineError::RepositorySelection(_) => "unknown_repository",
+            EngineError::InstructionPolicyConflict { .. } => "instruction_policy_conflict",
             EngineError::ProfileNotFound { .. } => "profile_not_found",
             EngineError::ProfileBackendMismatch { .. } => "profile_backend_mismatch",
             EngineError::IllegalTransition { .. } => "illegal_transition",
             EngineError::NotAwaitingInput { .. } => "not_awaiting_input",
             EngineError::NotRetryable { .. } => "not_retryable",
             EngineError::NoRun { .. } => "no_run",
+            EngineError::NotBlocked { .. } => "not_blocked",
             EngineError::BackendMissing { .. } => "backend_missing",
             EngineError::NoSuchStage { .. } => "no_such_stage",
+            EngineError::AskCapabilityUnavailable { .. } => "ask_capability_unavailable",
+            EngineError::ExecuteBackendUnavailable { .. } => "execute_backend_unavailable",
         }
     }
 
@@ -624,6 +768,69 @@ impl EngineError {
     }
 }
 
+/// Event kind: R-MVP1-7's per-turn wall-clock ceiling interrupted a turn
+/// that ran longer than [`Engine::turn_ceiling`]. Declared here rather than
+/// `domain::execution` — nothing outside the engine folds it into a
+/// projection yet, and the reducer's forward-compatible "unknown kinds are
+/// ignored" rule (`runtime::projection`'s own doc comment) means an
+/// unrecognized kind costs no projection change to introduce.
+pub const KIND_TURN_CEILING_INTERRUPTED: &str = "execution.turn_ceiling_interrupted";
+
+/// Event kind: R-MVP1-10's exit door for R-MVP1-7's envelope-exhausted
+/// landing (`Engine::extend_turn_envelope`) — an explicit, journaled
+/// operator decision raising this Work's turn envelope by some number of
+/// additional turns, cumulative across every extension. Unlike
+/// `KIND_TURN_CEILING_INTERRUPTED` above, this one *is* folded —
+/// `runtime::projection`'s reducer applies it to `WorkRun::turn_cap_bonus`,
+/// because changing what `check_turn_envelope` compares against is the
+/// whole point: `retry` alone re-blocks on the identical, unchangeable
+/// condition (the revolving-door defect this closes), so the door has to
+/// change the condition itself, not just ask again.
+pub const KIND_TURN_ENVELOPE_EXTENDED: &str = "execution.turn_envelope_extended";
+
+/// R-MVP1-7's default turn cap.
+///
+/// **Not yet the ledger's own measured N-series turn count (contract
+/// Unknown #2) — that measurement still has not been run** (invariants:
+/// MVP1-R1-I1). What changed from the first shipped value (6, the
+/// contract's own L16 worked example) is the evidence it is grounded in:
+/// `find .sergeant/workflows -name workflow.toml` shows this repo's own
+/// longest admitted workflow (`repo-to-icm`) declares 10 stages (11 as of
+/// MVP-2 lane D3's `65-self-check`, a `kind = "execute"` stage — its LAUNCH
+/// still goes through the same `execution.started`/`turns_spawned`
+/// accounting an actor stage's does, spending no model tokens but counting
+/// against this same cap exactly like any other stage), and a cap of 6
+/// blocked every admitted workflow over 6 stages on its very first run,
+/// unconditionally — `repo-to-icm`, the workflow R-MVP1-2's own finalize
+/// helper was built for, included. 12 covers every admitted workflow's
+/// stage count (max 11) with margin for at least one retry inside any
+/// single stage, without inventing an unrelated round number.
+/// L16 arithmetic still holds at the new value: the largest measured
+/// single turn on this build's evidence is Run B2's $3.21
+/// (`GAUNTLET.md`'s N-series close-out), so a 12-turn cap is a ~$38 bound,
+/// never a $2.50 one.
+///
+/// Structurally grounded, still not live-measured: a real N-series run
+/// (or the opt-in Claude suite, `SERGEANT_CLAUDE_TESTS=1`) is what would
+/// finally answer "how many turns does `repo-to-icm` actually spend",
+/// which is the number this constant should carry once it exists. Until
+/// then, override per-installation with [`Engine::with_turn_cap`]
+/// (`DaemonConfig::turn_cap` / `SGT_TURN_CAP`, wired the same way
+/// [`Self::turn_ceiling`]'s override is) — and R-MVP1-10's own exit door,
+/// `Engine::extend_turn_envelope`, means a Work that still outgrows
+/// whatever cap is configured is recoverable without a restart, let alone
+/// a recompile.
+pub const DEFAULT_TURN_CAP: u32 = 12;
+
+/// R-MVP1-7's default per-turn wall-clock ceiling: "the soak's hang bound
+/// (CUT 10), not a stall detector" — sized to be well past any turn this
+/// build has measured (issue #46's Run B turns finished in minutes) and
+/// well short of #46's own 45-minute structurally-invisible stall, so a
+/// truly hung turn is bounded without the ceiling firing on ordinary work.
+/// Provisional pending the ledger's own measurement (contract Unknown #2);
+/// override with [`Engine::with_turn_ceiling`].
+pub const DEFAULT_TURN_CEILING: Duration = Duration::from_secs(15 * 60);
+
 /// The workflow engine: backends, defaults, and the data dir surfaces live in.
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -631,12 +838,37 @@ pub struct Engine {
     pub backends: Arc<BackendRegistry>,
     /// §13's last tier before failure.
     pub default_backend: Option<String>,
-    /// Data dir owning `surfaces/`.
+    /// Data dir owning `surfaces/` (default; R-MVP1-1 makes this a default,
+    /// not the only answer — see [`Self::surfaces_root`]).
     pub data_dir: PathBuf,
+    /// Default root for work surfaces (R-MVP1-1): `<data_dir>/surfaces`
+    /// unless overridden by [`Self::with_surfaces_root`]. A per-estate
+    /// `[estate] surfaces_dir` narrows this further, per-plan, in
+    /// [`Self::plan`] — this field is only ever the daemon-wide fallback.
+    pub surfaces_root: PathBuf,
+    /// R-MVP1-7's turn cap: the total number of turns (LAUNCH's turn 1 plus
+    /// every SEND after it) any one Work may ever spawn, for its whole life
+    /// across every stage and retry. [`Self::check_turn_envelope`] is the
+    /// one gate; [`WorkRun::turns_spawned`] is the one counter.
+    pub turn_cap: u32,
+    /// R-MVP1-7's per-turn wall-clock ceiling, swept by the daemon's
+    /// completion driver alongside [`Self::due_observations`] (see
+    /// [`Self::due_interrupts`]).
+    pub turn_ceiling: Duration,
+    /// When each Work's current turn was last (re-)spawned, for the ceiling
+    /// sweep. Deliberately **not** journaled or durable: a restart forgets
+    /// it, which is acceptable for a soak-test hang bound (never an
+    /// adversarial one) and keeps this out of the projection entirely — the
+    /// turn cap above is the envelope's durable half; this is the timing
+    /// half, and the two are independent by design. Keyed by work id, one
+    /// entry per Work with a turn currently in flight.
+    turn_started: Arc<Mutex<BTreeMap<String, Instant>>>,
 }
 
 impl Engine {
-    /// Build an engine over a registry and data dir.
+    /// Build an engine over a registry and data dir. `surfaces_root`
+    /// defaults to `<data_dir>/surfaces` — today's layout, nothing moves —
+    /// override with [`Self::with_surfaces_root`] (`SGT_SURFACES_DIR`).
     pub fn new(
         backends: Arc<BackendRegistry>,
         default_backend: Option<String>,
@@ -645,8 +877,70 @@ impl Engine {
         Self {
             backends,
             default_backend,
+            surfaces_root: data_dir.join(SURFACES_DIR),
             data_dir: data_dir.to_path_buf(),
+            turn_cap: DEFAULT_TURN_CAP,
+            turn_ceiling: DEFAULT_TURN_CEILING,
+            turn_started: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Override the daemon-wide turn cap (R-MVP1-7). Wired from
+    /// `DaemonConfig::turn_cap` / `SGT_TURN_CAP` (`daemon::run_until_signal`)
+    /// the same way [`Self::with_turn_ceiling`] is — this is the fleet-wide
+    /// default beneath two per-Work doors: MVP-3's submit-time
+    /// `Work::envelope` override ([`Self::effective_turn_cap`]) and
+    /// R-MVP1-10's [`Self::extend_turn_envelope`], which raises whichever of
+    /// those two bases a Work is currently checked against.
+    pub fn with_turn_cap(mut self, turn_cap: u32) -> Self {
+        self.turn_cap = turn_cap;
+        self
+    }
+
+    /// Override the per-turn wall-clock ceiling (R-MVP1-7). Same relationship
+    /// to MVP-3's submit-time override as [`Self::with_turn_cap`]: this is
+    /// the default [`Self::effective_turn_ceiling`] falls back to when a Work
+    /// carries none of its own.
+    pub fn with_turn_ceiling(mut self, turn_ceiling: Duration) -> Self {
+        self.turn_ceiling = turn_ceiling;
+        self
+    }
+
+    /// R-MVP1-7's effective turn cap for one specific Work: MVP-3's
+    /// submit-time override (`work.envelope.turn_cap`) when the client set
+    /// one, else this engine's daemon-wide [`Self::turn_cap`] — plus
+    /// R-MVP1-10's cumulative `sgt extend` bonus either way. The **one**
+    /// formula [`Self::check_turn_envelope`] gates admission on and
+    /// `api::work_view` displays, so a client can never see a budget the
+    /// engine itself is not actually enforcing.
+    pub fn effective_turn_cap(&self, work: Option<&Work>, run: &WorkRun) -> u32 {
+        let base = work
+            .and_then(|w| w.envelope.as_ref())
+            .and_then(|e| e.turn_cap)
+            .unwrap_or(self.turn_cap);
+        base.saturating_add(run.turn_cap_bonus)
+    }
+
+    /// R-MVP1-7's effective per-turn wall-clock ceiling for one specific
+    /// Work: MVP-3's submit-time override (`work.envelope.ceiling_secs`)
+    /// when the client set one, else this engine's daemon-wide
+    /// [`Self::turn_ceiling`]. The one formula [`Self::due_interrupts`]
+    /// sweeps against and `api::work_view` displays — same reasoning as
+    /// [`Self::effective_turn_cap`].
+    pub fn effective_turn_ceiling(&self, work: Option<&Work>) -> Duration {
+        work.and_then(|w| w.envelope.as_ref())
+            .and_then(|e| e.ceiling_secs)
+            .map(Duration::from_secs)
+            .unwrap_or(self.turn_ceiling)
+    }
+
+    /// Override the default surfaces root (R-MVP1-1). The daemon calls this
+    /// once at startup from `SGT_SURFACES_DIR`; a per-estate `[estate]
+    /// surfaces_dir` overrides it again, per-submission, in [`Self::plan`] —
+    /// this is only the daemon-wide fallback beneath that.
+    pub fn with_surfaces_root(mut self, surfaces_root: PathBuf) -> Self {
+        self.surfaces_root = surfaces_root;
+        self
     }
 
     /// Resolve everything a run needs, without touching anything.
@@ -669,7 +963,9 @@ impl Engine {
     pub fn plan(&self, context: &SubmitContext<'_>) -> Result<Option<StartPlan>, EngineError> {
         let workspace = match context.cwd {
             None => None,
-            Some(cwd) => match Workspace::discover(cwd) {
+            // R-MVP1-12's data-dir scope: bound the upward estate walk at
+            // this engine's own data dir, never above it.
+            Some(cwd) => match Workspace::discover_scoped(cwd, Some(&self.data_dir)) {
                 Ok(workspace) => Some(workspace),
                 Err(WorkspaceError::NotARepository { .. }) => None,
                 Err(e) => return Err(e.into()),
@@ -682,6 +978,20 @@ impl Engine {
         let repositories = workspace
             .select(context.repositories)
             .map_err(EngineError::RepositorySelection)?;
+
+        // R-MVP1-4: one process, one policy. Resolved and refused here, at
+        // submit, before a Work record or a worktree exists — the same
+        // "reject the submission" timing §17.5 already uses for an
+        // unsatisfiable stage requirement.
+        Self::check_instruction_policy(&workspace, &repositories)?;
+
+        // R-MVP1-1: `[estate] surfaces_dir` narrows the engine's own default,
+        // per-submission — resolved once here and pinned into the plan, so a
+        // later manifest edit cannot move a running Work's surface.
+        let surfaces_root = workspace
+            .surfaces_dir
+            .clone()
+            .unwrap_or_else(|| self.surfaces_root.clone());
 
         let workflow_name = context
             .workflow
@@ -724,11 +1034,133 @@ impl Engine {
         Ok(Some(StartPlan {
             workspace,
             repositories,
+            surfaces_root,
             workflow,
             route,
             profile,
             stage_bindings,
         }))
+    }
+
+    /// R-MVP1-4's submit-time policy check: every selected repository must
+    /// resolve to the same [`InstructionPolicy`] — "one process, one
+    /// policy — so no composition happens, and that is the ruling, not an
+    /// omission".
+    ///
+    /// `local` no longer refuses here (MVP-2 D2 item 1): its launch-side
+    /// translation is measured (`setting_sources_args`,
+    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`),
+    /// so the L1 gate this refusal existed to enforce is satisfied. The
+    /// conflict rule is unchanged — mixing policies within one bind is still
+    /// refused, because "one process, one `--setting-sources`" is a fact
+    /// about the launch grammar, not about what any single value measures to.
+    fn check_instruction_policy(
+        workspace: &Workspace,
+        repositories: &[RepositorySpec],
+    ) -> Result<(), EngineError> {
+        if repositories.is_empty() {
+            return Ok(());
+        }
+        let resolved: Vec<(String, InstructionPolicy)> = repositories
+            .iter()
+            .map(|r| (r.name.clone(), workspace.instruction_policy(&r.name)))
+            .collect();
+        let first = resolved[0].1;
+        if resolved.iter().any(|(_, policy)| *policy != first) {
+            return Err(EngineError::InstructionPolicyConflict {
+                repos: resolved
+                    .iter()
+                    .map(|(name, policy)| format!("{name}={policy}"))
+                    .collect(),
+            });
+        }
+        // INV-R1-09 (MVP-2 D3 fixer pass): `local`'s adapter-side
+        // translation (`--setting-sources user,project,local`) authorizes
+        // more than its name suggests — hooks, tool permissions, MCP
+        // servers from the repository's own `.claude/settings*.json`, not
+        // just "reads a text file" (measured,
+        // `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`).
+        // The submit-time refusal that gated this on an unmeasured claim
+        // was correctly removed once the value was measured (D2 item 1),
+        // but nothing replaced it as an operator-visible signal — no
+        // warning at submit, no doctor row, no manifest vocabulary change.
+        // A daemon log line is the cheapest honest partial fix available in
+        // this pass without inventing new journal schema or CLI surface for
+        // a risk-disclosure feature the contract never asked for; it does
+        // not close the finding's full ask (a first-class operator signal),
+        // only makes the choice observable to whoever runs the daemon.
+        if first == InstructionPolicy::Local {
+            tracing::warn!(
+                repos = ?resolved.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+                "submitting with instructions = \"local\": every selected repository's own \
+                 .claude/settings.json and .claude/settings.local.json take effect for this \
+                 run (hooks, tool permissions, MCP servers) -- a materially larger authority \
+                 surface than reading an instruction file"
+            );
+        }
+        Ok(())
+    }
+
+    /// The uniform [`InstructionPolicy`] a bound run resolved to
+    /// (`check_instruction_policy` refuses submission unless every selected
+    /// repository agreed, so any entry speaks for all of them), read back off
+    /// the identities `workflow.bound` pinned rather than re-derived from the
+    /// live manifest — a restarted turn must launch under the policy the run
+    /// actually started with, not whatever the manifest says today (MVP-2
+    /// D2 item 1). A run bound before R-MVP1-4 pinned no identities at all,
+    /// which resolves to [`InstructionPolicy::Suppress`] the same way an
+    /// absent manifest entry does.
+    fn run_instruction_policy(run: &WorkRun) -> InstructionPolicy {
+        run.instruction_identities
+            .first()
+            .map(|identity| identity.policy)
+            .unwrap_or_default()
+    }
+
+    /// R-MVP1-4's R7: resolve the instruction-file identity `workflow.bound`
+    /// pins for each bound repository. Reads from the *materialized
+    /// worktree* (`surface`'s bindings), not the source repository: that is
+    /// the copy the actor would read under `local`, and pinning it after
+    /// materialization (rather than at plan time, before a worktree exists)
+    /// is exactly what makes the hash mean anything *for that policy*. A
+    /// missing file is recorded as absent — `path`/`content_hash` both
+    /// `None` — never silently skipped.
+    ///
+    /// **W7, then MVP-2 D2 item 1:** runs unconditionally, for every bound
+    /// repository regardless of its resolved `policy`. `INSTRUCTION_FILE`'s
+    /// own doc has the measured fact, for *both* policies now: this
+    /// adapter's launch grammar (`suppress` or the newly-unrefused `local`)
+    /// never reads this file natively, so "the file the actor will read is
+    /// the one we recorded" does not hold for either — see
+    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`.
+    /// What ships is a correctly-computed, correctly-pinned identity for a
+    /// file this adapter does not currently read under any policy — honest
+    /// bookkeeping for a mechanism the manifest schema anticipates but this
+    /// backend has not implemented, not proof of consumption.
+    fn resolve_instruction_identities(
+        workspace: &Workspace,
+        surface: &WorkSurface,
+    ) -> Vec<InstructionIdentity> {
+        surface
+            .bindings
+            .iter()
+            .map(|binding| {
+                let policy = workspace.instruction_policy(&binding.repository);
+                let file = binding
+                    .worktree_path
+                    .join(crate::domain::workspace::INSTRUCTION_FILE);
+                let (path, content_hash) = match std::fs::read(&file) {
+                    Ok(bytes) => (Some(file), Some(blake3::hash(&bytes).to_hex().to_string())),
+                    Err(_) => (None, None),
+                };
+                InstructionIdentity {
+                    repository: binding.repository.clone(),
+                    policy,
+                    path,
+                    content_hash,
+                }
+            })
+            .collect()
     }
 
     /// Resolve every stage's executor before anything exists (§12.5, §17.5).
@@ -757,11 +1189,56 @@ impl Engine {
     ) -> Result<Vec<StageBinding>, EngineError> {
         let mut bindings = Vec::with_capacity(workflow.stages.len());
         for (index, stage) in workflow.stages.iter().enumerate() {
+            if stage.kind == StageKind::Execute {
+                // §17.5: "Docker execute capability when any execute stage
+                // exists" is a requirement distinct from — and never
+                // substitutable by — the actor harness chain. An execute
+                // stage always runs on the fixed `"docker"` backend; there is
+                // no author-facing harness choice to make (§20.6: container
+                // policy lives in the stage, not in a harness selection).
+                // Routing it through `route_stage`'s decisive-tier resolver
+                // gets the same "unavailable means fail here, not fall
+                // through" guarantee an explicit `stage.harness` gets, for
+                // free, and the same probe-availability check that makes
+                // this preflight (not a later surprise at stage entry).
+                let stage_route = route_stage(Some(DOCKER_BACKEND_NAME), None, &self.backends)
+                    .map_err(|e| EngineError::ExecuteBackendUnavailable {
+                        workflow: workflow.name.clone(),
+                        stage: stage.id.clone(),
+                        detail: e.to_string(),
+                    })?;
+                bindings.push(StageBinding {
+                    stage_id: stage.id.clone(),
+                    index,
+                    kind: stage.kind,
+                    harness: stage_route.backend,
+                    route_source: stage_route.source.as_str().to_string(),
+                    // §20.6: profiles are harness launch configuration.
+                    // Execute stages have none — their policy is the pinned
+                    // `ExecuteSpec` carried on the `StageDefinition` itself,
+                    // journaled whole in `workflow.bound`.
+                    profile: None,
+                });
+                continue;
+            }
             let stage_route = route_stage(
                 stage.harness.as_deref(),
                 Some(route.backend.as_str()),
                 &self.backends,
             )?;
+            // R-MVP1-11: the smallest declaration that makes the ask
+            // preflight real. `route_stage` above already proved this
+            // backend is registered, so the lookup here cannot miss.
+            if stage.requires_ask
+                && let Some(backend) = self.backends.get(&stage_route.backend)
+                && !backend.capabilities().ask
+            {
+                return Err(EngineError::AskCapabilityUnavailable {
+                    workflow: workflow.name.clone(),
+                    stage: stage.id.clone(),
+                    backend: stage_route.backend.clone(),
+                });
+            }
             let profile = self.stage_profile(workspace, stage, &stage_route, work_profile)?;
             bindings.push(StageBinding {
                 stage_id: stage.id.clone(),
@@ -906,17 +1383,19 @@ impl Engine {
     ) -> Result<Step, EngineError> {
         // Recorded first: everything the returned effect does can create a
         // branch and a worktree in a repository sergeant does not own.
+        // R-MVP1-1: `plan.surfaces_root`, not `self.data_dir` — the plan
+        // already resolved any `[estate] surfaces_dir` override at submit.
         self.commit(
             core,
             &work.id,
             KIND_SURFACE_MATERIALIZING,
-            json!({"plan": SurfacePlan::new(&self.data_dir, &work.id, &plan.repositories)}),
+            json!({"plan": SurfacePlan::new(&plan.surfaces_root, &work.id, &plan.repositories)}),
         )?;
         Ok(Step {
             next: Next::Surface(Box::new(PendingSurface {
                 work_id: work.id.clone(),
                 effect: SurfaceEffect::Materialize {
-                    data_dir: self.data_dir.clone(),
+                    surfaces_root: plan.surfaces_root.clone(),
                     plan: Box::new(plan.clone()),
                 },
             })),
@@ -1038,6 +1517,16 @@ impl Engine {
                 deferred: Deferred::new(),
             });
         }
+        // R-MVP1-4: widened from `workspace: <name>` to the resolved
+        // repository set plus per-repo instruction-policy identities —
+        // additive fields in an immutable event, so a mid-flight manifest
+        // edit cannot reach a Work already bound. `check_instruction_policy`
+        // already refused disagreement and `local` at submit, so `policy` is
+        // uniform here by construction; identities are still resolved and
+        // recorded regardless — R7's "the file the actor will read is the
+        // one we recorded" does not wait on `local` being enabled.
+        let instruction_identities =
+            Self::resolve_instruction_identities(&plan.workspace, &surface);
         self.commit(
             core,
             work_id,
@@ -1048,6 +1537,8 @@ impl Engine {
                 "route_source": plan.route.source,
                 "profile": plan.profile,
                 "workspace": plan.workspace.name,
+                "repositories": plan.repositories,
+                "instruction_identities": instruction_identities,
                 // §12.5's per-stage decisions, pinned with the procedure they
                 // belong to: the whole executor spec for the run, decided once
                 // and never re-derived (§22.4's retry and restart rows).
@@ -1116,6 +1607,10 @@ impl Engine {
                     let outcome = pending.perform();
                     step = self.settle_observe(core, pending, outcome)?;
                 }
+                Next::Interrupt(pending) => {
+                    let outcome = pending.perform();
+                    step = self.settle_interrupt(core, *pending, outcome)?;
+                }
             }
         }
     }
@@ -1165,6 +1660,14 @@ impl Engine {
             KIND_STAGE_INPUT_RECEIVED,
             json!({"stage_id": stage_id, "input": input}),
         )?;
+        // R-MVP1-7: SEND is the engine's other turn-spawning seam. The
+        // human's answer is journaled above either way — it is never lost —
+        // but if the envelope is already spent, it is never delivered: the
+        // Work goes to `blocked` (a legal `needs_input -> blocked` edge)
+        // instead of `resumed`, and no `PendingSend` is ever built.
+        if !self.check_turn_envelope(core, work_id, &stage_id)? {
+            return Ok(Step::parked());
+        }
         self.transition(
             core,
             work_id,
@@ -1209,6 +1712,51 @@ impl Engine {
     pub fn retry(&self, core: &mut Core, work_id: &str) -> Result<(), EngineError> {
         let step = self.begin_retry(core, work_id)?;
         self.run_inline(core, step)
+    }
+
+    /// R-MVP1-10's exit door for R-MVP1-7's envelope-exhausted landing:
+    /// raise this Work's turn envelope by `additional_turns`, journaled
+    /// (`KIND_TURN_ENVELOPE_EXTENDED`) and cumulative across every call.
+    ///
+    /// `retry` alone is a revolving door for this landing: `WorkRun::
+    /// turns_spawned` is cumulative and never reset by a retry, and
+    /// `Engine::turn_cap` has no per-Work setter, so re-entering the stage
+    /// re-checks the identical, unchangeable condition and re-blocks
+    /// immediately (`check_turn_envelope`'s own doc). This is the door that
+    /// actually changes the condition: `check_turn_envelope` compares
+    /// against `turn_cap + turn_cap_bonus`, so a `retry` issued after this
+    /// call can spawn the next turn instead of re-blocking on the same one.
+    ///
+    /// Legal only from `blocked` — extending an envelope means nothing for
+    /// a Work that is not stopped at one, and every landing this door is
+    /// meant to open is one, by construction (`check_turn_envelope` always
+    /// blocks before returning `Ok(false)`).
+    pub fn extend_turn_envelope(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        additional_turns: u32,
+    ) -> Result<(), EngineError> {
+        let state = self.work_state(core, work_id)?;
+        if state != WorkState::Blocked {
+            return Err(EngineError::NotBlocked {
+                work_id: work_id.to_string(),
+                state,
+            });
+        }
+        // A run must exist to extend: the envelope-exhausted landing this
+        // door targets always has one (`check_turn_envelope` only ever runs
+        // inside an active stage), so a `blocked` Work with none is some
+        // other landing this door was never meant to touch — `self.run`
+        // fails closed with `NoRun` rather than journal an extension
+        // nothing will ever read.
+        self.run(core, work_id)?;
+        self.commit(
+            core,
+            work_id,
+            KIND_TURN_ENVELOPE_EXTENDED,
+            json!({"additional_turns": additional_turns}),
+        )
     }
 
     /// [`Engine::retry`]'s first phase (see [`Engine::begin_start`]).
@@ -1983,13 +2531,16 @@ impl Engine {
     ) -> Option<NativeState> {
         let native_id = reservation.native_id.clone()?;
         let backend = self.backends.get(&reservation.backend)?;
+        // INV-R1-08: liveness-only, so a backend whose full OBSERVE pays for
+        // expensive evidence capture as a side effect (Docker's log
+        // capture) is never charged for evidence this call discards anyway
+        // — only `.native` is read below.
         backend
-            .observe(&ExecutionHandle {
+            .observe_liveness(&ExecutionHandle {
                 execution_id: reservation.execution_id.clone(),
                 native_id: Some(native_id),
             })
             .ok()
-            .map(|observation| observation.native)
     }
 
     /// §25's reattach step: ask the backend to re-adopt the recorded native
@@ -2049,6 +2600,7 @@ impl Engine {
             cwd: surface.execution_cwd(),
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile,
+            instruction_policy: Some(Self::run_instruction_policy(run)),
         })
     }
 
@@ -2100,6 +2652,50 @@ impl Engine {
             "work surface was left half-materialized by a daemon restart",
             Some(evidence.join("; ")),
         )
+    }
+
+    /// R-MVP1-7's turn envelope, checked at both LAUNCH ([`Self::reserve_stage`])
+    /// and SEND ([`Self::begin_input`]) — the engine's two turn-spawning
+    /// seams — before either performs its effect.
+    ///
+    /// Reads [`crate::runtime::projection::WorkRun::turns_spawned`], the one
+    /// counter both `execution.started` and `stage.resumed` increment, so
+    /// this asks "how many turns has the journal actually recorded", never
+    /// "how many times has this function been called" — the send-retry
+    /// double-count trap named in the contract (`PendingSend::perform` may
+    /// call `backend.send` twice for one delivery; only the delivered one
+    /// ever reaches `stage.resumed`).
+    ///
+    /// Returns `Ok(true)` when the caller may proceed to spend a turn.
+    /// `Ok(false)` means the (N+1)th turn was refused: the reason is already
+    /// journaled and the Work is already `blocked` — the caller's only job
+    /// left is to park rather than perform the effect.
+    fn check_turn_envelope(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        stage_id: &str,
+    ) -> Result<bool, EngineError> {
+        let run = self.run(core, work_id)?;
+        // R-MVP1-10's exit door: an explicit `extend_turn_envelope` raises
+        // the effective cap for this Work specifically, cumulative across
+        // every extension. Zero for a Work that was never extended, so this
+        // is exactly `self.turn_cap` (or MVP-3's submit-time override, when
+        // the client set one) for the ordinary case.
+        let work = core.registry.state().works.get(work_id);
+        let effective_cap = self.effective_turn_cap(work, &run);
+        if run.turns_spawned < effective_cap {
+            return Ok(true);
+        }
+        let reason = format!("turn envelope exhausted ({effective_cap} turns)");
+        self.commit(
+            core,
+            work_id,
+            KIND_STAGE_BLOCKED,
+            json!({"stage_id": stage_id, "detail": reason}),
+        )?;
+        self.block(core, work_id, &reason, None)?;
+        Ok(false)
     }
 
     /// Enter a stage and reserve its execution — §14.2's first phase, whole.
@@ -2178,6 +2774,15 @@ impl Engine {
             json!({"stage_id": stage.id, "index": index, "attempt": attempt}),
         )?;
 
+        // R-MVP1-7: the turn envelope gates LAUNCH here, before the harness
+        // is even looked up — reaching this stage attempt at all does not
+        // matter if there is no turn left to spend on it. Checked from the
+        // journal-derived counter (`WorkRun::turns_spawned`), never from how
+        // many times this function has been called.
+        if !self.check_turn_envelope(core, work_id, &stage.id)? {
+            return Ok(Next::Parked);
+        }
+
         // A harness the journal pinned but this daemon does not have is
         // ambiguity, not a licence to fall back to the Work default: falling
         // back is the silent substitution §12.5 forbids, and it would run the
@@ -2222,6 +2827,15 @@ impl Engine {
             // carries the stage's model. There is no per-stage model field.
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile.clone(),
+            // N4: the pinned container spec rides along exactly when this
+            // stage is `kind = "execute"` — `bind_stages` already refused
+            // the submission if that pin could not resolve to an available
+            // Docker backend, so reaching here with `Some` is always
+            // actionable by the backend named above.
+            execute: stage.execute.clone(),
+            // MVP-2 D2 item 1: the policy `workflow.bound` pinned, not
+            // re-derived from the live manifest.
+            instruction_policy: Self::run_instruction_policy(&run),
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -2381,6 +2995,10 @@ impl Engine {
             KIND_EXECUTION_STARTED,
             json!({"execution": record}),
         )?;
+        // R-MVP1-7's ceiling half: this turn is now in flight. Recorded
+        // in-memory only (see `Engine::turn_started`'s doc comment) — a
+        // restart forgets it, which is fine for a soak-test hang bound.
+        self.record_turn_start(&work_id);
         // An outcome with no observation attached is a launch reported without
         // one — the `From<Result<ExecutionHandle, _>>` shape, which exists for
         // callers driving the two phases apart by hand. There is nothing to
@@ -2492,6 +3110,9 @@ impl Engine {
                 "attempt": pending.attempt,
             }),
         )?;
+        // R-MVP1-7's ceiling half: SEND just spawned a new turn — restart
+        // its clock exactly as LAUNCH does in `settle_launch`.
+        self.record_turn_start(&work_id);
         if reattached {
             // §15 RESUME happened on this path, so the trajectory says so —
             // the same fact `execution.reconciled` records at restart, in the
@@ -2581,6 +3202,209 @@ impl Engine {
             }));
         }
         due
+    }
+
+    /// Record that a turn just spawned, for [`Self::due_interrupts`].
+    fn record_turn_start(&self, work_id: &str) {
+        self.turn_started
+            .lock()
+            .expect("turn_started lock")
+            .insert(work_id.to_string(), Instant::now());
+    }
+
+    /// Whether `work_id`'s current turn is still the one [`Self::record_turn_start`]
+    /// last timed — the same "is this run actually due" predicate
+    /// [`Self::due_observations`] applies, minus the backend lookup (a
+    /// missing backend is still overdue; it is `Self::interrupt_turn` that
+    /// discovers and reports that, exactly as `due_observations` defers a
+    /// missing-backend judgement to its own caller).
+    fn turn_still_active(&self, core: &Core, work_id: &str) -> bool {
+        let registry = core.registry.state();
+        let Some(work) = registry.works.get(work_id) else {
+            return false;
+        };
+        if work.state != WorkState::Active {
+            return false;
+        }
+        let Some(run) = registry.runs.get(work_id) else {
+            return false;
+        };
+        let Some(execution) = run.execution.as_ref() else {
+            return false;
+        };
+        if execution.stop_requested {
+            return false;
+        }
+        let Some(stage) = run.current_stage() else {
+            return false;
+        };
+        stage.status == StageStatus::Active
+            && stage.stage_id == execution.stage_id
+            && stage.attempt == execution.attempt
+    }
+
+    /// R-MVP1-7's per-turn wall-clock ceiling: every turn that has run
+    /// longer than [`Self::turn_ceiling`], as an effect to interrupt
+    /// **outside the core lock** (§22.6) — the same shape
+    /// [`Self::due_observations`] already has, and meant to be swept by the
+    /// same completion-driver tick (`api.rs`'s `drive_completions`, riding
+    /// the existing 200 ms cadence per the contract).
+    ///
+    /// One interrupt attempt per turn that crosses the ceiling: an entry is
+    /// removed from the internal clock the moment it is collected here,
+    /// whether because it is stale (no longer this turn — dropped, nothing
+    /// to interrupt) or because it is overdue (interrupted once, then
+    /// forgotten). What the interrupt actually produced is
+    /// [`Self::due_observations`]'s question, not this one's (§25).
+    pub fn due_interrupts(&self, core: &Core, now: Instant) -> Vec<Box<PendingInterrupt>> {
+        let mut due = Vec::new();
+        self.turn_started
+            .lock()
+            .expect("turn_started lock")
+            .retain(|work_id, at| {
+                if !self.turn_still_active(core, work_id) {
+                    return false; // stale: settled, moved on, or superseded
+                }
+                // MVP-3: a Work's own submit-time override, when it set one,
+                // stands in for the daemon-wide default here — the same
+                // formula `check_turn_envelope`'s cap check uses.
+                let ceiling = self.effective_turn_ceiling(core.registry.state().works.get(work_id));
+                if now.saturating_duration_since(*at) < ceiling {
+                    return true; // keep timing it, not yet due
+                }
+                // Overdue. A backend this daemon no longer registers is the
+                // same ambiguity `due_observations` defers to restart
+                // recovery rather than guessing at here — this call simply
+                // has nothing to interrupt with, and drops the entry either
+                // way (one attempt per crossing, per this method's doc).
+                if let Ok(run) = self.run(core, work_id)
+                    && let Some(execution) = run.execution.clone()
+                    && let Some(backend) = self.backends.get(&execution.backend).cloned()
+                {
+                    due.push(Box::new(PendingInterrupt {
+                        work_id: work_id.clone(),
+                        execution,
+                        backend,
+                        ceiling_secs: ceiling.as_secs_f64(),
+                    }));
+                }
+                false
+            });
+        due
+    }
+
+    /// §14.5 for INTERRUPT's *middle* phase: whether the crossing
+    /// [`Self::due_interrupts`] collected still describes the turn that is
+    /// live now, checked under the guard immediately before the perform.
+    ///
+    /// The other settles re-check staleness after their effect because the
+    /// effect's evidence must be preserved either way; an interrupt is the
+    /// one effect whose staleness must be caught *before* it runs, because
+    /// `Backend::interrupt` aims at whatever turn holds the execution handle
+    /// at delivery time — and the collection→perform window stretches across
+    /// every earlier entry's serially-awaited crank. A turn that ended in
+    /// that window (and any fresh turn a SEND spawned on the same handle —
+    /// visible as a re-inserted `turn_started` entry, since collection
+    /// removed this work's) must not be killed for a crossing it never made.
+    ///
+    /// `Some(reason)` means skip the perform and journal the consumed
+    /// crossing through [`Self::settle_stale_interrupt`] instead — never
+    /// drop it silently (`due_interrupts`'s own no-silent-loss rule).
+    pub fn interrupt_is_stale(
+        &self,
+        core: &Core,
+        pending: &PendingInterrupt,
+    ) -> Option<&'static str> {
+        if self
+            .turn_started
+            .lock()
+            .expect("turn_started lock")
+            .contains_key(&pending.work_id)
+        {
+            return Some("a fresh turn started on this work after the crossing was collected");
+        }
+        if !self.turn_still_active(core, &pending.work_id) {
+            return Some("the targeted turn is no longer active");
+        }
+        let registry = core.registry.state();
+        let same_execution = registry
+            .runs
+            .get(&pending.work_id)
+            .and_then(|run| run.execution.as_ref())
+            .is_some_and(|e| e.execution_id == pending.execution.execution_id);
+        if same_execution {
+            None
+        } else {
+            Some("the execution handle was superseded")
+        }
+    }
+
+    /// Journal a consumed ceiling crossing whose interrupt was *not*
+    /// performed because [`Self::interrupt_is_stale`] said the targeted turn
+    /// is gone: `outcome.requested` is `false` and `outcome.stale` carries
+    /// the reason, so the trajectory records the crossing without claiming a
+    /// delivery that never happened.
+    pub fn settle_stale_interrupt(
+        &self,
+        core: &mut Core,
+        pending: &PendingInterrupt,
+        reason: &str,
+    ) -> Result<(), EngineError> {
+        self.commit(
+            core,
+            &pending.work_id,
+            KIND_TURN_CEILING_INTERRUPTED,
+            json!({
+                "execution_id": pending.execution.execution_id,
+                "backend": pending.execution.backend,
+                "stage_id": pending.execution.stage_id,
+                "attempt": pending.execution.attempt,
+                "ceiling_secs": pending.ceiling_secs,
+                "outcome": {"requested": false, "stale": reason},
+            }),
+        )
+    }
+
+    /// §14.2's third phase for INTERRUPT: journal what was asked and what it
+    /// produced. Unconditional — an interrupt request and its outcome are
+    /// journaled regardless of whether the backend actually complied, and
+    /// nothing here touches Work or stage state: the ordinary OBSERVE path
+    /// (`due_observations`/`drive`) is what settles the turn, on whatever
+    /// native evidence the interrupt (or its absence) eventually produces.
+    /// Staleness is the *middle* phase's question for this verb
+    /// ([`Self::interrupt_is_stale`]), already answered by the time the
+    /// perform ran.
+    pub fn settle_interrupt(
+        &self,
+        core: &mut Core,
+        pending: PendingInterrupt,
+        outcome: InterruptOutcome,
+    ) -> Result<Step, EngineError> {
+        let mut deferred = Deferred::new();
+        let recorded = match outcome.outcome {
+            Ok(completion) => {
+                deferred.push(completion);
+                json!({"requested": true})
+            }
+            Err(e) => json!({"requested": true, "error": e.to_string()}),
+        };
+        self.commit(
+            core,
+            &pending.work_id,
+            KIND_TURN_CEILING_INTERRUPTED,
+            json!({
+                "execution_id": pending.execution.execution_id,
+                "backend": pending.execution.backend,
+                "stage_id": pending.execution.stage_id,
+                "attempt": pending.execution.attempt,
+                "ceiling_secs": pending.ceiling_secs,
+                "outcome": recorded,
+            }),
+        )?;
+        Ok(Step {
+            next: Next::Parked,
+            deferred,
+        })
     }
 
     /// §14.2's third phase for a bare OBSERVE: verify the observation still
@@ -3330,8 +4154,13 @@ mod tests {
                 default_workflow: None,
                 profiles: Vec::new(),
                 config_path: None,
+                surfaces_dir: None,
+                repository_policy: std::collections::BTreeMap::new(),
+                groups: std::collections::BTreeMap::new(),
+                repository_origin: std::collections::BTreeMap::new(),
             },
             repositories: Vec::new(),
+            surfaces_root: dir.path().join("surfaces"),
             workflow: WorkflowDefinition {
                 name: "tiny".to_string(),
                 version: "1".to_string(),

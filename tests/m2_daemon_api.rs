@@ -40,9 +40,10 @@ use sergeant_rs::domain::event::{EVENT_SCHEMA, Event};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
-    KIND_WORK_SUBMITTED, WorkState,
+    KIND_WORK_RESUMED, KIND_WORK_SUBMITTED, WorkState,
 };
 use sergeant_rs::domain::workflow::{KIND_STAGE_ENTERED, KIND_WORKFLOW_BOUND};
+use sergeant_rs::runtime::engine::DEFAULT_TURN_CAP;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::KIND_SURFACE_MATERIALIZED;
 
@@ -763,12 +764,18 @@ async fn event_history_from_seq_returns_exactly_the_tail() {
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     cancel(&http, &handle, &work_id, &ulid()).await;
 
-    // daemon.started + backend.probed (one per registered backend, M4)
+    // daemon.started + backend.probed (one per registered backend: fake,
+    // claude, and docker as of N4 — DaemonConfig::default's registry plus
+    // the two adapters `start_with` always adds)
     // + 2×(work.submitted, command.accepted) + work.canceled
     // + command.accepted.
     let all = history_seqs(&http, &handle, None).await;
-    assert_eq!(all.len(), 9, "unexpected history: {all:?}");
-    assert_eq!(all, (1..=9).collect::<Vec<u64>>(), "seqs are 1..n in order");
+    assert_eq!(all.len(), 10, "unexpected history: {all:?}");
+    assert_eq!(
+        all,
+        (1..=10).collect::<Vec<u64>>(),
+        "seqs are 1..n in order"
+    );
 
     // from=N ⇒ exactly the events after N, for every N in the history.
     for (cut, from) in all.iter().copied().enumerate() {
@@ -3464,4 +3471,1126 @@ fn seed_workflow_repo(repo: &Path) {
             .expect("run git");
         assert!(output.status.success(), "git {args:?}: {output:?}");
     }
+}
+
+// --------------- R-MVP1-6: the intent schema (Lane B, MVP-1)
+//
+// Five optional fields, progressive elaboration of the free-text `intent`
+// that stays required and primary. Additive-only, journaled inside
+// `work.submitted`, displayed by `work show`, and one source of truth: a
+// `workflow`/`repos` disagreeing with the submission's own flags refuses at
+// submit rather than silently picking one.
+
+/// All five fields round-trip through submit and `work show`, and a
+/// `workflow`/`repos` that merely repeats what the flags already say is not
+/// a disagreement.
+#[tokio::test]
+async fn r_mvp1_6_all_five_intent_detail_fields_journal_and_display() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "free text stays primary",
+            "workflow": "software-change",
+            "repositories": ["api", "web"],
+            "intent_detail": {
+                "objective": "ship the thing",
+                "repos": ["api", "web"],
+                "acceptance": "tests green",
+                "exclusions": "no schema changes",
+                "workflow": "software-change",
+            },
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.expect("json");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let detail = &body["work"]["intent_detail"];
+    assert_eq!(detail["objective"], "ship the thing");
+    assert_eq!(detail["repos"], json!(["api", "web"]));
+    assert_eq!(detail["acceptance"], "tests green");
+    assert_eq!(detail["exclusions"], "no schema changes");
+    assert_eq!(detail["workflow"], "software-change");
+    // Free text stays required and primary — it is never displaced by the
+    // structured elaboration.
+    assert_eq!(body["work"]["intent"], "free text stays primary");
+
+    let show: Value = http
+        .get(format!("{}/v1/work/{work_id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show")
+        .json()
+        .await
+        .expect("show json");
+    assert_eq!(
+        show["work"]["intent_detail"], body["work"]["intent_detail"],
+        "work show must display what was journaled at submit"
+    );
+    handle.shutdown().await;
+}
+
+/// A submission with no `intent_detail` at all submits exactly as it did
+/// before this schema existed — the "any subset may be present" half of
+/// progressive elaboration, checked at the empty end.
+#[tokio::test]
+async fn r_mvp1_6_no_intent_detail_at_all_is_unaffected() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+    let (status, _, body) = submit(&http, &handle, &ulid(), "plain intent, no elaboration").await;
+    assert_eq!(status, 201);
+    assert!(
+        body["work"]["intent_detail"].is_null(),
+        "absent intent_detail must stay absent, not default to an empty object: {body}"
+    );
+    handle.shutdown().await;
+}
+
+/// A structured `workflow` that disagrees with the submission's own
+/// `workflow` flag refuses at submit, naming both.
+#[tokio::test]
+async fn r_mvp1_6_a_disagreeing_workflow_refuses_naming_both_sources() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "two answers to one question",
+            "workflow": "software-change",
+            "intent_detail": {"workflow": "triage"},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "intent_detail_disagreement");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("software-change") && message.contains("triage"),
+        "the refusal must name both sources: {message}"
+    );
+
+    // Nothing was created: no work.submitted for a work this disagreement
+    // never let exist.
+    let list: Value = http
+        .get(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("list json");
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "a refused submission must create no Work: {list}"
+    );
+    handle.shutdown().await;
+}
+
+/// The same rule for `repos`, plus its non-trap: a repository set that
+/// merely names the same repos in a different order has not disagreed with
+/// itself.
+#[tokio::test]
+async fn r_mvp1_6_a_disagreeing_repos_refuses_naming_both_sources() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "two answers to one question",
+            "repositories": ["api"],
+            "intent_detail": {"repos": ["web"]},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "intent_detail_disagreement");
+
+    let resp2 = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "same repos, different order",
+            "repositories": ["api", "web"],
+            "intent_detail": {"repos": ["web", "api"]},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(
+        resp2.status(),
+        201,
+        "order alone must never read as a disagreement: {:?}",
+        resp2.text().await
+    );
+    handle.shutdown().await;
+}
+
+/// TH-12: `intent_detail.repos` is deliberately inert when the
+/// `repositories` flag is absent (`domain::work`'s own doc: "Purely
+/// descriptive data here" — R-MVP1-6 ruled `intent_detail` a progressive-
+/// elaboration record, journaled and displayed, never a second routing
+/// input) — but that was untested in either direction before this. Naming
+/// repos *only* in the structured slot must not itself trigger
+/// `intent_detail_disagreement` (there is nothing to disagree with — no
+/// `repositories` flag was given at all), and the field still round-trips
+/// exactly as submitted. Pinning the current, intended behavior so a
+/// future change to it is a deliberate ruling, not a silent drift.
+#[tokio::test]
+async fn r_mvp1_6_repos_named_only_in_intent_detail_is_inert_not_a_disagreement() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "repos named only in the structured slot",
+            "intent_detail": {"repos": ["api", "web"]},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(
+        resp.status(),
+        201,
+        "no `repositories` flag means nothing for intent_detail.repos to \
+         disagree with: {:?}",
+        resp.text().await
+    );
+    let body: Value = resp.json().await.expect("json");
+    assert!(
+        body["work"]["repositories"].is_null() || body["work"]["repositories"] == json!([]),
+        "intent_detail.repos must not itself populate the routing-level \
+         repositories list — it is descriptive, not a second selection input: {body}"
+    );
+    assert_eq!(
+        body["work"]["intent_detail"]["repos"],
+        json!(["api", "web"]),
+        "the field itself still round-trips exactly as submitted"
+    );
+    handle.shutdown().await;
+}
+
+/// I3: an empty `intent_detail: {}` is the same fact as sending nothing at
+/// all — `IntentDetail::is_empty`'s own doc, previously dead code (never
+/// called anywhere). Now actually enforced at submit: the journaled and
+/// displayed `intent_detail` is absent, not an empty object.
+#[tokio::test]
+async fn r_mvp1_6_an_empty_intent_detail_object_normalizes_to_absent() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "an empty elaboration is no elaboration",
+            "intent_detail": {},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 201, "{:?}", resp.text().await);
+    let body: Value = resp.json().await.expect("json");
+    assert!(
+        body["work"]["intent_detail"].is_null(),
+        "an empty intent_detail object must normalize to absent: {body}"
+    );
+    handle.shutdown().await;
+}
+
+/// R-MVP1-7's submit-time envelope override sanity check (`envelope_out_of_
+/// range`): a `turn_cap` of 0 would block a Work before its first turn ever
+/// spawns, so submit refuses it as a structured 400 rather than creating a
+/// Work that can never make progress. The CLI itself does no client-side
+/// zero-check (`sgt run --turns 0` would otherwise reach here unguarded), so
+/// this server-side rejection is the sole enforcement point.
+#[tokio::test]
+async fn r_mvp1_7_a_zero_turn_cap_override_refuses_at_submit() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "a turn cap of zero can never make progress",
+            "envelope": {"turn_cap": 0},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400, "{:?}", resp.text().await);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_envelope");
+
+    let list: Value = http
+        .get(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("list json");
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "a refused submission must create no Work: {list}"
+    );
+    handle.shutdown().await;
+}
+
+/// The same rule's other seam: a `ceiling_secs` of 0 would interrupt a turn
+/// before the completion driver's very first tick could ever see it finish,
+/// so it refuses at submit exactly like a zero `turn_cap` does.
+#[tokio::test]
+async fn r_mvp1_7_a_zero_ceiling_secs_override_refuses_at_submit() {
+    let dir = TempDir::new().expect("tempdir");
+    let handle = start(dir.path()).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "a ceiling of zero can never let a turn finish",
+            "envelope": {"ceiling_secs": 0},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 400, "{:?}", resp.text().await);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "invalid_envelope");
+    handle.shutdown().await;
+}
+
+/// The additive-only guarantee, exercised at the boundary it actually
+/// describes: a *pre-existing* journal line — standing in for one a future
+/// binary already wrote, carrying a field `IntentDetail` does not have —
+/// replays byte-identical (the journal never parses a payload into a typed
+/// `Work`, so it has nothing to drop) and this binary's own projection
+/// still shows every field it *does* know about, rather than refusing the
+/// whole record over one field it doesn't (`IntentDetail` carries no
+/// `deny_unknown_fields`).
+///
+/// Submitting a *fresh* request with an unknown `intent_detail` key is a
+/// different claim (the client's own field is simply not recognized, same
+/// as any other unknown JSON key any endpoint here already ignores) and is
+/// not this pin — this test is deliberately about replaying a record this
+/// binary did not write.
+#[tokio::test]
+async fn r_mvp1_6_a_payload_carrying_an_unknown_key_replays_byte_identical() {
+    let dir = TempDir::new().expect("tempdir");
+    let work_id = ulid();
+    let journal = dir.path().join("journal");
+    std::fs::create_dir_all(&journal).expect("journal dir");
+    let seeded = json!({
+        "schema": EVENT_SCHEMA,
+        "seq": 1,
+        "id": ulid(),
+        "timestamp": "2026-08-08T00:00:00.000Z",
+        "source": {"type": "daemon", "name": "api"},
+        "work_id": work_id,
+        "kind": KIND_WORK_SUBMITTED,
+        "payload": {"work": {
+            "id": work_id,
+            "intent": "written by a hypothetical future binary",
+            "intent_detail": {
+                "objective": "ship it",
+                "from_a_future_binary": "surprise",
+            },
+            "state": "pending",
+            "created_by": "test",
+            "created_at": "2026-08-08T00:00:00.000Z",
+        }},
+    });
+    let mut line = serde_json::to_vec(&seeded).expect("seed json");
+    line.push(b'\n');
+    std::fs::write(journal.join("00000001.ndjson"), &line).expect("write seed segment");
+
+    let before: Vec<_> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .collect();
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].payload["work"]["intent_detail"]["from_a_future_binary"],
+        json!("surprise"),
+        "the journal must never lose a field it does not itself interpret"
+    );
+
+    // The daemon starts on this pre-existing journal (replay, not a fresh
+    // write) — the same crash-recovery path every restart takes.
+    let handle = start(dir.path()).await;
+    let http = client();
+    let show: Value = http
+        .get(format!("{}/v1/work/{work_id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show")
+        .json()
+        .await
+        .expect("show json");
+    assert_eq!(
+        show["work"]["intent_detail"]["objective"], "ship it",
+        "a field this binary knows must survive even beside one it does not: {show}"
+    );
+    assert!(
+        show["work"]["intent_detail"]["from_a_future_binary"].is_null(),
+        "the *projected* view legitimately drops what its own type cannot \
+         parse — only the journal's own record is required to keep it"
+    );
+    handle.shutdown().await;
+
+    // The journal line itself is exactly what was written, unknown key
+    // included — the daemon's own replay never rewrites it. Filtered to the
+    // one seeded event: starting the daemon appended its own
+    // `daemon.started`/`backend.probed`/`daemon.stopped` events to the same
+    // journal, and this pin is about the *seeded* line, not the whole file.
+    let after: Vec<_> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == KIND_WORK_SUBMITTED && e.work_id.as_deref() == Some(&work_id))
+        .collect();
+    assert_eq!(
+        before, after,
+        "replay must reproduce the seeded payload byte for byte, unknown key included"
+    );
+}
+
+// -------------------------------------------------------- R-MVP1-10: the blocked exit-door invariant
+//
+// "Every state a fault can land a Work in has a journaled, testable way out,
+// proven by injecting the fault — never by synthesizing the state." A
+// scripted `FakeStep::blocked(...)` proves the *transition* is legal; it
+// proves nothing about what a real fault does to a real work, which is the
+// upstream scar (§ contract, "Upstream's 15-issue scar is the reason") this
+// invariant exists to close. Each of the contract's four scope items below
+// gets its own genuine trigger — a real permission fault, a real backend
+// refusal, R-MVP1-7's real turn-envelope exhaustion at each of its two seams
+// — and then genuinely calls `retry` (or, where that door does not exist,
+// documents why and proves the door that does).
+//
+// Local helpers: this suite has no repository/workflow machinery of its own
+// (M2's scope predates it), so a minimal, self-contained copy lives here
+// rather than reaching into `m3_execution.rs` (Lane A/B's file).
+
+fn r_mvp1_10_git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn r_mvp1_10_init_repo(path: &Path) {
+    std::fs::create_dir_all(path).expect("repo dir");
+    r_mvp1_10_git(path, &["init", "-b", "main"]);
+    std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
+    r_mvp1_10_git(path, &["add", "."]);
+    r_mvp1_10_git(path, &["commit", "-m", "initial"]);
+}
+
+/// A workflow with `n` trivial actor stages, `00-stage`, `01-stage`, ...
+fn r_mvp1_10_write_n_stage_workflow(root: &Path, name: &str, n: usize) {
+    let dir = root.join(".sergeant/workflows").join(name);
+    std::fs::create_dir_all(&dir).expect("workflow dir");
+    let ids: Vec<String> = (0..n).map(|i| format!("\"{i:02}-stage\"")).collect();
+    std::fs::write(
+        dir.join("workflow.toml"),
+        format!(
+            "[workflow]\nname = \"{name}\"\nversion = \"1\"\nstages = [{}]\n",
+            ids.join(", ")
+        ),
+    )
+    .expect("workflow.toml");
+    for i in 0..n {
+        let stage_dir = dir.join(format!("{i:02}-stage"));
+        std::fs::create_dir_all(&stage_dir).expect("stage dir");
+        std::fs::write(stage_dir.join("CONTEXT.md"), "context").expect("CONTEXT.md");
+    }
+}
+
+async fn r_mvp1_10_start(
+    data_dir: &Path,
+    registry: BackendRegistry,
+    completion_poll: Duration,
+) -> DaemonHandle {
+    daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            backends: Arc::new(registry),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            completion_poll,
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
+}
+
+async fn r_mvp1_10_submit(
+    http: &reqwest::Client,
+    handle: &DaemonHandle,
+    cwd: &Path,
+    intent: &str,
+    workflow: Option<&str>,
+) -> Value {
+    let mut req = json!({
+        "command_id": ulid(),
+        "intent": intent,
+        "origin": {"client": "cli", "cwd": cwd},
+    });
+    if let Some(name) = workflow {
+        req["workflow"] = json!(name);
+    }
+    let (_, _, body) = post_json(http, handle, "/v1/work", req).await;
+    body
+}
+
+async fn r_mvp1_10_show(http: &reqwest::Client, handle: &DaemonHandle, work_id: &str) -> Value {
+    http.get(format!("{}/v1/work/{work_id}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show")
+        .json()
+        .await
+        .expect("show json")
+}
+
+/// Poll `work show` until `state` matches, or panic after `timeout`. Only
+/// used where a real background effect (the completion driver) must run on
+/// its own schedule — every other assertion below reads a synchronous
+/// response body directly, needing no poll at all.
+async fn r_mvp1_10_wait_for_state(
+    http: &reqwest::Client,
+    handle: &DaemonHandle,
+    work_id: &str,
+    state: &str,
+    timeout: Duration,
+) -> Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let body = r_mvp1_10_show(http, handle, work_id).await;
+        if body["work"]["state"] == state {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {work_id} to reach {state:?}; last seen: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The reason of the most recent `work.blocked` event for `work_id`.
+fn r_mvp1_10_block_reason(data_dir: &Path, work_id: &str) -> String {
+    journal_events(data_dir)
+        .into_iter()
+        .rfind(|e| e.kind == KIND_WORK_BLOCKED && e.work_id.as_deref() == Some(work_id))
+        .expect("at least one work.blocked event")
+        .payload["reason"]
+        .as_str()
+        .expect("reason string")
+        .to_string()
+}
+
+/// Item 1 — `pending → blocked` from a **real** start failure: the surfaces
+/// root itself refuses `mkdir`, so `settle_materialize`'s error path
+/// (`engine.rs`) is what fires, not a scripted signal.
+///
+/// The exit door proven here is honestly `cancel`, not `retry` — and that is
+/// a finding, not an oversight (GAUNTLET.md backlog). `begin_start`'s only
+/// durable record before a materialize failure is `surface.materializing` (a
+/// `SurfacePlan`); `workflow.bound` never lands, because binding only
+/// happens *after* a successful materialize (`settle_materialize`'s success
+/// arm). `retry` requires a current stage (`begin_retry`, `EngineError::NoRun`
+/// otherwise) and none was ever entered — there is no plan left to resume,
+/// and re-deriving one is not possible from the journal alone: the client's
+/// original `origin.cwd` is never persisted (documented in `engine.rs`'s own
+/// `reconcile_crashed_start` comment). Proven below: the refusal is honest
+/// and safe (a structured 404, nothing corrupted, nothing silently retried),
+/// and `cancel` — also a legal `blocked → *` edge — is the real, working way
+/// out.
+#[tokio::test]
+async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_cancel() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+
+    // Arm the fault before the daemon exists: `<data_dir>/surfaces` is the
+    // default surfaces root (R-MVP1-1) `materialize` will `mkdir` a work's
+    // subdirectory under. Pre-created and stripped of write+exec, `mkdir`
+    // inside it genuinely fails EACCES.
+    let surfaces_root = data.path().join("surfaces");
+    std::fs::create_dir_all(&surfaces_root).expect("pre-create surfaces root");
+    std::fs::set_permissions(&surfaces_root, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod surfaces root read+exec only");
+    struct RestorePerms(PathBuf);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestorePerms(surfaces_root.clone());
+    // Environment probe (docs/DEVELOPMENT.md's testing rules): the root dev container
+    // silently passes permission-bit tricks. Cerberus and the GH runner both
+    // enforce them (docs/environments/cerberus.md); where they do not, this
+    // fixture cannot be armed and must skip loudly rather than fail for the
+    // wrong reason.
+    if std::fs::create_dir(surfaces_root.join("probe")).is_ok() {
+        eprintln!(
+            "SKIPPED-ENV: permission bits are not enforced on this host (root \
+             container shape) — the materialize-permission fault cannot be armed here"
+        );
+        return;
+    }
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "materialize will fail", None).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "a real EACCES materializing the surface must fail closed to blocked: {body}"
+    );
+    let reason = r_mvp1_10_block_reason(data.path(), &work_id);
+    assert!(
+        reason.contains("cannot materialize work surface"),
+        "the real git/io failure must be in the evidence: {reason}"
+    );
+
+    // The honest refusal: retry cannot re-enter a stage that was never
+    // entered, and says so structurally rather than corrupting state or
+    // guessing at a plan the journal never durably recorded.
+    let (retry_status, _, retry_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(
+        retry_status,
+        reqwest::StatusCode::NOT_FOUND,
+        "retry must refuse structurally, not crash or silently no-op: {retry_body}"
+    );
+    assert_eq!(retry_body["error"]["code"], "no_run");
+    // And refusing did not move the work anywhere, or leave the journal any
+    // less honest about it: it is exactly where the block left it.
+    let still = r_mvp1_10_show(&http, &handle, &work_id).await;
+    assert_eq!(still["work"]["state"], "blocked");
+
+    // The real, working door: cancel.
+    let (cancel_status, _, cancel_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(cancel_status, reqwest::StatusCode::OK, "{cancel_body}");
+    assert_eq!(cancel_body["work"]["state"], "canceled");
+
+    handle.shutdown().await;
+}
+
+/// Item 2 — `active → blocked` from a **real** backend refusal: the fake
+/// backend's `prepare()` genuinely returns `Unavailable` mid-run
+/// (`set_available_after_launches`, `src/backend/fake.rs`) — the same shape
+/// as "the registry changed under a bound run" (`engine.rs`'s own comment on
+/// this path), triggered directly rather than by restarting with a different
+/// registry.
+///
+/// Stage 1's completion is held open with R-MVP1-8's settle delay so submit
+/// answers while the work is genuinely `active`; the availability flip is
+/// armed *before* submit (`set_available_after_launches(1, ..)`,
+/// `src/backend/fake.rs`), so stage 2's refusal is deterministic — never a
+/// post-submit `set_available` call racing the driver's ticks (the residual
+/// race TH-10's settle(8) widening only narrowed), and never a scripted
+/// `blocked` signal.
+#[tokio::test]
+async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "two", 2);
+
+    // `settle(8)` holds stage 1 open ~8 driver ticks so submit's own answer
+    // still observes `active`; the pre-armed flip below is what makes stage
+    // 2's refusal certain regardless of when those ticks land.
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete().settle(8), FakeStep::complete()],
+    );
+    // The genuine fault, armed before the run exists: stage 1's LAUNCH
+    // succeeds, then the backend refuses `prepare()` from stage 2 on.
+    fake.set_available_after_launches(1, "maintenance window");
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "flip me mid-run", Some("two")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(
+        body["work"]["state"], "active",
+        "stage 1's settle delay must still be open when submit answers: {body}"
+    );
+
+    // Real time, real completion driver: stage 1 settles, stage 2's LAUNCH
+    // hits the now-unavailable backend, and the work blocks — nothing here
+    // scripts that outcome directly.
+    let blocked =
+        r_mvp1_10_wait_for_state(&http, &handle, &work_id, "blocked", Duration::from_secs(5)).await;
+    assert_eq!(blocked["stage"]["stage_id"], "01-stage");
+    let reason = r_mvp1_10_block_reason(data.path(), &work_id);
+    assert_eq!(
+        reason, "backend could not start an execution",
+        "the real `prepare()` refusal's own reason, not a synthesized one"
+    );
+
+    // The door: restore the backend, then retry.
+    fake.set_available(true, "");
+    let (retry_status, _, retry_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(retry_status, reqwest::StatusCode::OK, "{retry_body}");
+
+    let done = r_mvp1_10_wait_for_state(
+        &http,
+        &handle,
+        &work_id,
+        "completed",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(done["stage"]["stage_id"], "01-stage");
+    handle.shutdown().await;
+}
+
+/// Item 3 — `needs_input → blocked` from R-MVP1-7's turn envelope genuinely
+/// exhausted at the **SEND** boundary (`begin_input`, `engine.rs`): the actor
+/// keeps asking for input, real answers are delivered over `/v1/work/{id}/input`
+/// turn after turn, and the `(cap+1)`th delivery is the one the engine itself
+/// refuses — never a scripted `blocked` signal.
+///
+/// The exit door is `retry`, and it is genuinely exercised: `blocked → active`
+/// is journaled (`work.resumed`) even though the same exhausted envelope
+/// re-blocks it immediately afterward — R-MVP1-7's own ruling states this is
+/// not a bug ("cumulative and never reset by a retry: the envelope bounds the
+/// whole Work's spend, not one attempt's"). The door opening is what this
+/// proves; a bigger room behind it is a different, later, backend-capacity
+/// concern.
+#[tokio::test]
+async fn r_mvp1_10_needs_input_to_blocked_from_real_envelope_exhaustion_at_send_exits_via_retry() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+
+    // DEFAULT_TURN_CAP: turn 1 is the launch, the rest are delivered
+    // answers — one `needs_input` step per turn, CAP steps in total.
+    let cap = DEFAULT_TURN_CAP as usize;
+    let script: Vec<FakeStep> = (0..cap).map(|_| FakeStep::needs_input("more?")).collect();
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "keep asking", Some("one")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "needs_input", "{body}");
+
+    // Turns 2..=cap: real, successful deliveries (an exclusive `2..cap`
+    // would run one fewer — the off-by-one this range spells out on
+    // purpose).
+    for turn in 2..=cap {
+        let (status, _, body) = post_json(
+            &http,
+            &handle,
+            &format!("/v1/work/{work_id}/input"),
+            json!({"command_id": ulid(), "input": "postgres"}),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::OK, "turn {turn}: {body}");
+        assert_eq!(
+            body["work"]["state"], "needs_input",
+            "turn {turn} must still have envelope left: {body}"
+        );
+    }
+
+    // The (cap+1)th delivery: the engine's own envelope check refuses it —
+    // still a 200 (the answer itself is journaled either way), but the work
+    // is blocked instead of resumed.
+    let (status, _, blocked_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "one too many"}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "{blocked_body}");
+    assert_eq!(blocked_body["work"]["state"], "blocked", "{blocked_body}");
+    let reason = r_mvp1_10_block_reason(data.path(), &work_id);
+    assert_eq!(reason, format!("turn envelope exhausted ({cap} turns)"));
+
+    let resumed_before = journal_events(data.path())
+        .into_iter()
+        .filter(|e| e.kind == KIND_WORK_RESUMED && e.work_id.as_deref() == Some(&work_id))
+        .count();
+
+    // The door: retry. `blocked -> active` is journaled even though the same
+    // exhausted envelope immediately re-blocks it — that re-close is the
+    // ruling's own stated semantics, not this test's bug.
+    let (retry_status, _, retry_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(retry_status, reqwest::StatusCode::OK, "{retry_body}");
+    assert_eq!(
+        retry_body["work"]["state"], "blocked",
+        "the same exhausted envelope re-blocks it immediately: {retry_body}"
+    );
+    let resumed_after = journal_events(data.path())
+        .into_iter()
+        .filter(|e| e.kind == KIND_WORK_RESUMED && e.work_id.as_deref() == Some(&work_id))
+        .count();
+    assert_eq!(
+        resumed_after,
+        resumed_before + 1,
+        "the door must genuinely have opened — `work.resumed` journaled — \
+         even though the room behind it was immediately exhausted again"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Item 4 — R-MVP1-7's envelope-exhausted landing at its **other** seam, the
+/// `LAUNCH` boundary (`reserve_stage`, `engine.rs`): a workflow with more
+/// stages than the cap allows turns exhausts it entering a later stage,
+/// distinct in code path from item 2 (a backend refusal) and item 3 (the
+/// `SEND` boundary) even though both land in `active → blocked`.
+#[tokio::test]
+async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    // One more stage than DEFAULT_TURN_CAP: the first `cap` stages spend
+    // the whole envelope completing; the next stage's own LAUNCH is the one
+    // the cap refuses.
+    let cap = DEFAULT_TURN_CAP as usize;
+    let stages = cap + 1;
+    r_mvp1_10_write_n_stage_workflow(&repo, "long", stages);
+    let blocked_stage_id = format!("{cap:02}-stage");
+
+    let script: Vec<FakeStep> = (0..stages).map(|_| FakeStep::complete()).collect();
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    // Every stage settles synchronously (no settle delay), so the whole
+    // chain — `cap` completions and the next stage's refused launch — runs
+    // inside this one submit request.
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "run past the cap", Some("long")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "blocked", "{body}");
+    assert_eq!(
+        body["stage"]["stage_id"], blocked_stage_id,
+        "the (cap+1)th stage (index cap) is the one the cap blocks"
+    );
+    let reason = r_mvp1_10_block_reason(data.path(), &work_id);
+    assert_eq!(reason, format!("turn envelope exhausted ({cap} turns)"));
+    // Entering the blocked stage is not itself a spent turn.
+    assert_eq!(
+        journal_events(data.path())
+            .into_iter()
+            .filter(|e| e.kind == KIND_STAGE_ENTERED
+                && e.work_id.as_deref() == Some(&work_id)
+                && e.payload["stage_id"] == blocked_stage_id)
+            .count(),
+        1
+    );
+
+    let stage_entered_before = journal_events(data.path())
+        .into_iter()
+        .filter(|e| {
+            e.kind == KIND_STAGE_ENTERED
+                && e.work_id.as_deref() == Some(&work_id)
+                && e.payload["stage_id"] == blocked_stage_id
+        })
+        .count();
+
+    // The door: retry re-enters the same stage — `work.resumed` journaled,
+    // genuinely `active` again — before the identical envelope re-blocks it.
+    let (retry_status, _, retry_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(retry_status, reqwest::StatusCode::OK, "{retry_body}");
+    assert_eq!(retry_body["work"]["state"], "blocked", "{retry_body}");
+    let stage_entered_after = journal_events(data.path())
+        .into_iter()
+        .filter(|e| {
+            e.kind == KIND_STAGE_ENTERED
+                && e.work_id.as_deref() == Some(&work_id)
+                && e.payload["stage_id"] == blocked_stage_id
+        })
+        .count();
+    assert_eq!(
+        stage_entered_after,
+        stage_entered_before + 1,
+        "retry must genuinely have re-entered the blocked stage (a second attempt), \
+         not merely echoed the existing blocked state back"
+    );
+    let resumed = journal_events(data.path())
+        .into_iter()
+        .filter(|e| e.kind == KIND_WORK_RESUMED && e.work_id.as_deref() == Some(&work_id))
+        .count();
+    assert_eq!(
+        resumed, 1,
+        "the door genuinely opened once before re-closing"
+    );
+
+    handle.shutdown().await;
+}
+
+/// E3/R-MVP1-10: `retry` alone is the revolving door the finding named —
+/// this proves the *actual* exit door, `extend` + `retry`, genuinely
+/// reopens the room rather than merely opening and re-closing it. Same
+/// fault as the test above (LAUNCH-boundary envelope exhaustion at one more
+/// stage than the default cap allows turns), but this time the Work is
+/// extended by one turn before the retry — the last stage must actually
+/// spawn its turn and the whole Work must reach `completed`, not re-block
+/// on the identical condition.
+#[tokio::test]
+async fn r_mvp1_10_extend_then_retry_genuinely_reopens_the_envelope_exhausted_landing() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    let cap = DEFAULT_TURN_CAP as usize;
+    let stages = cap + 1;
+    r_mvp1_10_write_n_stage_workflow(&repo, "long", stages);
+
+    let script: Vec<FakeStep> = (0..stages).map(|_| FakeStep::complete()).collect();
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "extend past the cap", Some("long")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "blocked", "{body}");
+    let reason = r_mvp1_10_block_reason(data.path(), &work_id);
+    assert_eq!(reason, format!("turn envelope exhausted ({cap} turns)"));
+
+    // A bare retry (the revolving-door shape the finding named) re-blocks on
+    // the identical condition — proven already by the sibling test above;
+    // this test goes straight to the real door.
+    let (extend_status, _, extend_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/extend"),
+        json!({"command_id": ulid(), "additional_turns": 1}),
+    )
+    .await;
+    assert_eq!(extend_status, reqwest::StatusCode::OK, "{extend_body}");
+    // Extending alone has no effect on Work state — it only changes what the
+    // next retry is checked against.
+    assert_eq!(extend_body["work"]["state"], "blocked", "{extend_body}");
+
+    let (retry_status, _, retry_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(retry_status, reqwest::StatusCode::OK, "{retry_body}");
+    assert_eq!(
+        retry_body["work"]["state"], "completed",
+        "the extended envelope must let the 7th stage's turn actually spawn \
+         and the whole (7-stage) workflow finish, not re-block on the same \
+         exhausted condition: {retry_body}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Extending a Work that is not `blocked` refuses — extending an envelope
+/// means nothing for a Work that is not stopped at one, and the refusal
+/// must be structured (409, naming the actual state), not a silent no-op.
+#[tokio::test]
+async fn r_mvp1_10_extend_refuses_a_work_that_is_not_blocked() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "finishes clean", Some("one")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    let (status, _, extend_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/extend"),
+        json!({"command_id": ulid(), "additional_turns": 1}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{extend_body}");
+    assert_eq!(extend_body["error"]["code"], "not_blocked", "{extend_body}");
+
+    handle.shutdown().await;
+}
+
+/// `additional_turns: 0` is a client bug, not an extension: honoring it
+/// would journal a `turn_envelope_extended` event that changes nothing and
+/// answer 200 while the operator's follow-up retry re-blocks on the
+/// identical envelope. Refused as a structured 400 before anything but the
+/// command outcome is journaled.
+#[tokio::test]
+async fn r_mvp1_10_extend_refuses_zero_additional_turns() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
+    let registry = BackendRegistry::new().with(Arc::new(fake));
+    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let http = client();
+
+    let body = r_mvp1_10_submit(&http, &handle, &repo, "finishes clean", Some("one")).await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+
+    let (status, _, extend_body) = post_json(
+        &http,
+        &handle,
+        &format!("/v1/work/{work_id}/extend"),
+        json!({"command_id": ulid(), "additional_turns": 0}),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{extend_body}");
+    assert_eq!(
+        extend_body["error"]["code"], "invalid_request",
+        "{extend_body}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// E1: `SGT_TURN_CAP` reaches a real spawned daemon (`DaemonConfig::
+/// turn_cap`, wired in `daemon::run_until_signal`) — the production
+/// configuration surface R-MVP1-7 named and this build previously had no
+/// way to reach short of a recompile. A 3-stage workflow against a cap of
+/// 2 must block at exactly 2 spawned turns, naming the configured cap in
+/// the block reason.
+#[test]
+fn r_mvp1_7_sgt_turn_cap_env_var_reaches_a_real_spawned_daemon() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    r_mvp1_10_init_repo(&repo);
+    r_mvp1_10_write_n_stage_workflow(&repo, "three", 3);
+
+    let data = DataDir::new();
+    let output = std::process::Command::new(SGT)
+        .current_dir(&repo)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--json")
+        .args(["run", "capped low", "--workflow", "three"])
+        .env("SGT_TURN_CAP", "2")
+        .output()
+        .expect("run sgt");
+    assert!(
+        output.status.success(),
+        "sgt run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output");
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "a 3-stage workflow against SGT_TURN_CAP=2 must block on the 3rd \
+         stage's LAUNCH: {body}"
+    );
+    let reason = r_mvp1_10_block_reason(data.path(), body["work"]["id"].as_str().expect("id"));
+    assert_eq!(
+        reason, "turn envelope exhausted (2 turns)",
+        "the daemon must actually be running with the configured cap, not the built-in default"
+    );
+
+    stop_daemon(data.path());
 }

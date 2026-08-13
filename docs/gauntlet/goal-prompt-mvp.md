@@ -38,13 +38,21 @@ committed — the repo is your memory, your context is not.
   manager and guardian of the North Star: contracts, adjudication,
   tie-breaks, and nothing a subagent could do instead.**
 
-- **Contracts before build; the owner adjudicates every contract.**
-  Never start a bucket without its adjudicated contract.
+- **Contracts before build — adjudication is flag-and-proceed (owner,
+  2026-08-11).** The orchestrator rules on its own recommendation,
+  records it (North-Star amendments included), and proceeds; the owner
+  overrules by exception. Hard stops remain ONLY: merges to main, spend
+  beyond precedent, destructive/irreversible acts.
 - **Code is code (R-S0-12)** — full multi-axis loop for every
   executable diff; batch small diffs into the next larger panel.
 - **The epistemic license binds**: every ruling in the repo, the
   owner's included, is a hypothesis with provenance. Evidence outranks
   authority. Push back with citations; ratifying the record is failing.
+- **Scratch discipline: agents write ONLY inside their assigned worktree,
+  the session scratchpad, or /tmp — never `~/`.** Every workflow preamble
+  carries this line and every lane's exit check includes
+  `ls ~ | grep -v -E '^(sergeant-rs|inbox)$'` empty of new entries
+  (first offense: the MVP-1 prober's residue, 2026-08-12).
 - **Push after every green gate. Facts into artifacts immediately.**
   Head-PR + sub-PR merge model: one branch per work period PRs to main
   (owner merges); lanes PR into it; worktree-isolate parallel lanes

@@ -135,10 +135,14 @@ perf_kv works_submitted "$works"
 perf_kv final_journal_head "$(perf_journal_head)"
 perf_kv fleet_total "$(perf_api GET /v1/work | jq '.works | length')"
 perf_kv fleet_states "$(perf_state_counts | tr '\n' ' ')"
-perf_disk_kv final_disk "$DD"
 perf_kv bytes_per_event "$(awk -v b="$(perf_bytes "$DD/journal")" -v e="$(perf_journal_events "$DD")" 'BEGIN{printf "%.1f", e? b/e : 0}')"
 
 perf_daemon_stop
+# Issue #13: `perf_disk_kv` moved after `perf_daemon_stop` (see its doc in
+# common.sh) — `duckdb_bytes` only reflects reality post-checkpoint (the
+# S5 50k mark cited in the issue: 8.1 MiB right after start vs 31.8 MiB
+# after clean stop).
+perf_disk_kv final_disk "$DD"
 perf_kv daemon_force_killed "$PERF_FORCE_KILLED"
 perf_hygiene s5 "$REPO"
 perf_summary

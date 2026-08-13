@@ -1,0 +1,51 @@
+
+[1m== stage c3-m6_surfaces — 2026-08-12T21:18:29Z[0m
+   disk: 826 GB free (floor 10 GB)
+   toolchain: 1.97.1 / cargo-llvm-cov 0.8.7
+   profraw before: 62
+   $ cargo llvm-cov --no-report --test m6_surfaces
+info: cargo-llvm-cov currently setting cfg(coverage); you can opt-out it by passing --no-cfg-coverage
+   Compiling sergeant-rs v0.1.0 (/home/miztertea/sergeant-rs)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.79s
+     Running tests/m6_surfaces.rs (target/llvm-cov-target/debug/deps/m6_surfaces-9c014a4cb9bab77d)
+
+running 31 tests
+test t4_the_demo_and_the_client_name_the_same_timeout_knob ... ok
+test t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for ... ok
+test t1_the_tui_has_no_private_shortcut ... ok
+test t5b_the_structural_scan_sees_every_spelling_of_a_path ... ok
+test t11_external_effects_live_only_in_the_out_of_lock_performers ... ok
+test doctor_reports_a_journal_it_cannot_even_open ... ok
+test the_daemon_installs_its_signal_handlers_before_it_publishes_anything ... ok
+test t6_the_sse_vocabulary_is_stated_once_and_stays_complete ... ok
+test t5_the_tui_and_the_dashboard_are_clients_like_any_other ... ok
+test t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos ... ok
+test the_tui_stack_is_ratatui_with_crossterm_reached_through_it ... ok
+test t11c_every_core_lock_hold_ends_in_the_group_commit_guard ... ok
+test t3c_doctor_estate_check_names_a_missing_repository_with_its_origin_as_the_remedy ... ok
+test t3e_doctor_estate_check_names_file_and_line_on_a_malformed_manifest ... ok
+test t3b_doctor_reports_the_effective_permission_mode_per_profile ... ok
+test the_dashboard_answers_a_missing_work_and_an_unreadable_journal_as_faults ... ok
+test a_detail_screen_whose_work_vanished_falls_back_to_the_fleet ... ok
+test t4_a_client_that_applies_the_knob_is_quiet_about_it ... ok
+test t1_bare_sgt_opens_the_tui_as_a_client ... ok
+test t1_the_events_endpoint_filters_and_tails_by_work ... ok
+test t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob ... ok
+test the_spawned_daemon_rig_stops_its_daemon_with_sigterm ... ok
+test the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown ... ok
+test t1_the_tui_renders_and_drives_the_fleet_over_the_api ... ok
+test web_open_reports_a_browser_that_refuses_to_open_it ... ok
+test the_coverage_harness_grades_its_own_accounting ... ok
+test r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop ... ok
+http://127.0.0.1:39937/ui?token=01KZVXEP0FTFRGXGNFW0GKMHNN01KZVXEP0FX0R8A1M5BNPW3DTB
+the token is in that URL — it is a secret; loopback only, and it changes every time the daemon restarts
+test t2_the_dashboard_serves_real_data_and_is_embedded ... ok
+test t3_doctor_names_every_fault_and_its_remedy ... ok
+test t4_the_section_39_demo_runs_and_its_evidence_resolves ... ok
+test t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.49s
+
+   profraw produced=60 mergeable=60 discarded=0 lost=0
+   hygiene: leaked daemons [] /tmp entries 49
+   stage c3-m6_surfaces ok

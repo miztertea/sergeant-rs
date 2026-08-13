@@ -1741,6 +1741,17 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
             .all(|e| e["source_seq"].is_number()),
         "every edge carries provenance in the JSON form too: {as_json}"
     );
+
+    // W8: `work show`'s human form must render the output pointer too — the
+    // API's `output` key names, per repository, the retained branch,
+    // worktree path and finalize commit; before this fix cli.rs's key
+    // whitelist silently dropped it (and `teardown`) from the printed
+    // record.
+    let shown = sgt(&data, &["work", "show", &work_id]);
+    assert!(
+        shown.contains("retained_branch") && shown.contains(&format!("sergeant/{work_id}")),
+        "`sgt work show` (human form) must render the output pointer's retained branch: {shown}"
+    );
 }
 
 /// Run `sgt` against a data dir, returning stdout (the CLI spawns and reuses
@@ -2393,4 +2404,235 @@ fn synthetic_run(work_id: &str) -> Vec<sergeant_rs::domain::event::EventDraft> {
         draft("stage.completed", json!({"stage_id": "00-first"})),
         draft("work.completed", json!({})),
     ]
+}
+
+// -------------------------------------------------------- R-MVP1-2's output pointer
+
+/// R-MVP1-2's sibling, not itself a ruling: once a work's surface has been
+/// torn down, `work show` names — per repository — the source repository,
+/// the retained branch, the worktree path, and the finalize commit
+/// (`surface::teardown`'s own extension, `BindingTeardown::final_sha`) —
+/// without decoding the journal. Proven end to end through a real daemon and
+/// a real repository, then again after a restart: rebuild-on-start is the
+/// only population path (R-MVP1-9), so the pointer must read back
+/// byte-identically from a freshly replayed journal, not just from the
+/// process that wrote it — and `Completed` is exactly the absorbing state
+/// R-MVP1-9 evicts, so this also exercises eviction's read-side
+/// re-derivation, not merely a live in-memory hit.
+#[tokio::test]
+async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_commit() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    let base_sha = init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (handle, _fake) =
+        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let body = submit(
+        &handle,
+        &repo,
+        "point me at the output",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    let output = body["output"].clone();
+    assert_eq!(output["work_id"], work_id);
+    assert_eq!(output["clean"], true);
+    let repositories = output["repositories"]
+        .as_array()
+        .expect("repositories array");
+    assert_eq!(repositories.len(), 1);
+    let repo_out = &repositories[0];
+    assert_eq!(repo_out["repository"], "solo");
+    assert_eq!(repo_out["source_repo"], repo.display().to_string());
+    assert_eq!(repo_out["retained_branch"], format!("sergeant/{work_id}"));
+    assert_eq!(repo_out["disposition"], "removed");
+    // Nothing was ever committed inside the worktree, so the finalize commit
+    // is exactly the SHA the surface was cut from — the honest answer when a
+    // closing stage declares no `promote` output.
+    assert_eq!(repo_out["finalize_commit"], base_sha);
+    // The branch itself really is there, at that commit, in the source repo
+    // — the pointer names a real, checkable fact, not a projection artifact.
+    assert_eq!(
+        git(
+            &repo,
+            &["rev-parse", &format!("refs/heads/sergeant/{work_id}")]
+        ),
+        base_sha
+    );
+
+    handle.shutdown().await;
+
+    // Restart: rebuild-on-start replays the journal from scratch. The
+    // pointer — like every other view `work show` composes — must read back
+    // byte-identical, whether or not R-MVP1-9 eviction reclaimed this work's
+    // run in between (it did: `Completed` is absorbing).
+    let (handle2, _fake2) = start_fake(data.path(), []).await;
+    let after = get(&handle2, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        after["output"], output,
+        "the output pointer must survive a restart byte-identically"
+    );
+    handle2.shutdown().await;
+}
+
+/// MVP-3's `sgt work transcript`: `GET /v1/work/{id}/transcript` exists,
+/// answers a real work's id back, names its `turns` as an array (the fake
+/// backend emits no `conversation.*` events on an ordinary run — see
+/// `t1_rebuild_from_scratch_reproduces_every_canned_answer`'s own note on
+/// this — so "empty but well-formed" is the honest shape here; the decode
+/// logic itself is pinned directly against constructed events in
+/// `api::tests::transcript_turns_*`), and 404s a work id nothing ever
+/// created — the same "work_not_found" shape `GET /v1/work/{id}` itself
+/// uses, not a bare empty transcript that would silently look like "no
+/// conversation yet" for a work that never existed.
+#[tokio::test]
+async fn work_transcript_endpoint_exists_and_answers_a_real_work_and_a_404() {
+    let repo = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+
+    let (handle, _fake) =
+        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let created = submit(
+        &handle,
+        repo.path(),
+        "read my transcript",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = created["work"]["id"].as_str().expect("work id").to_string();
+
+    let transcript = get(&handle, &format!("/v1/work/{work_id}/transcript")).await;
+    assert_eq!(transcript["work_id"], work_id);
+    assert!(
+        transcript["turns"].as_array().is_some(),
+        "turns must always be an array, even when empty: {transcript}"
+    );
+
+    let (status, missing) = get_status(&handle, "/v1/work/does-not-exist/transcript").await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["error"]["code"], "work_not_found", "{missing}");
+
+    handle.shutdown().await;
+}
+
+/// W1/TH-01: R-MVP1-9's own pin is "an evicted Work's API view is byte-
+/// identical to a non-evicted one" — this must hold for the *fleet* view
+/// (`GET /v1/work`, what `sgt work list`/the TUI/the dashboard actually
+/// read), not only the single-work view. Before this fix `fleet_body` read
+/// `registry.runs` directly and always saw `None` for an evicted
+/// (Completed/Canceled) work, so every finished work listed with
+/// `stage: null, resolved_backend: null` regardless of what its single-work
+/// view said.
+///
+/// Also TH-09's own gap: the comparison is evicted-vs-live, not
+/// evicted-vs-evicted — a `Failed` work is deliberately never evicted
+/// (`is_absorbing` excludes it, `retry` needs its run), so it is the one
+/// live control this journal can hold alongside a genuinely evicted
+/// `Completed` work, and both are checked field-by-field, not one subtree.
+#[tokio::test]
+async fn r_mvp1_9_the_fleet_view_matches_the_single_work_view_for_an_evicted_work() {
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+    let data = DataDir::new();
+
+    // One work that completes (Completed is absorbing: it WILL be evicted),
+    // one that fails and is never retried (Failed is never evicted — the
+    // live control).
+    let (handle, _fake) = start_fake(
+        data.path(),
+        [
+            FakeStep::complete(),
+            FakeStep::complete(),
+            FakeStep::fail("boom"),
+        ],
+    )
+    .await;
+    let completed = submit(
+        &handle,
+        repo.path(),
+        "this one finishes",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let completed_id = completed["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    assert_eq!(completed["work"]["state"], "completed", "{completed}");
+
+    let failed = submit(
+        &handle,
+        repo.path(),
+        "this one fails",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let failed_id = failed["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(failed["work"]["state"], "failed", "{failed}");
+
+    // The single-work view for the evicted (Completed) work — the answer
+    // the fleet row must match.
+    let completed_show = get(&handle, &format!("/v1/work/{completed_id}")).await;
+    assert!(
+        !completed_show["stage"].is_null(),
+        "the single-work view must not be null either — otherwise this test \
+         proves nothing: {completed_show}"
+    );
+
+    let fleet = get(&handle, "/v1/work").await;
+    let works = fleet["works"].as_array().expect("works array");
+    let completed_row = works
+        .iter()
+        .find(|w| w["id"] == completed_id)
+        .unwrap_or_else(|| panic!("completed work not in fleet: {fleet}"));
+    let failed_row = works
+        .iter()
+        .find(|w| w["id"] == failed_id)
+        .unwrap_or_else(|| panic!("failed work not in fleet: {fleet}"));
+
+    assert_eq!(
+        completed_row["stage"], completed_show["stage"],
+        "the fleet row's stage must match the single-work view for an evicted work: \
+         fleet={completed_row}, single={completed_show}"
+    );
+    assert_eq!(
+        completed_row["resolved_backend"], completed_show["backend"],
+        "the fleet row's resolved_backend must match the single-work view's backend: \
+         fleet={completed_row}, single={completed_show}"
+    );
+    assert_ne!(
+        completed_row["stage"],
+        Value::Null,
+        "an evicted Completed work must not list with a null stage: {completed_row}"
+    );
+    assert_ne!(
+        completed_row["resolved_backend"],
+        Value::Null,
+        "an evicted Completed work must not list with a null resolved_backend: {completed_row}"
+    );
+
+    // The live (never-evicted) Failed work is the control: it was never
+    // evicted at all, so it is the "non-evicted" half of the ruling's pin.
+    // Both must be populated the same way — evicted or not is invisible
+    // from the outside.
+    assert_ne!(
+        failed_row["stage"],
+        Value::Null,
+        "the live control must also carry its stage: {failed_row}"
+    );
+    assert_eq!(
+        completed_row["stage"]["of"], failed_row["stage"]["of"],
+        "an evicted work's stage shape matches a live work's — eviction changes \
+         nothing about what the fleet view renders: completed={completed_row}, failed={failed_row}"
+    );
+
+    handle.shutdown().await;
 }

@@ -7,7 +7,7 @@
 # with an unmeasured container fact discovered the expensive way, mid-task.
 # Run this once at session start on ANY host and paste its table into that
 # host's docs/environments/<hostname>.md before doing anything else. See
-# CLAUDE.md's "Environments" section for the workflow this script serves.
+# docs/DEVELOPMENT.md's "Environments" section for the workflow this script serves.
 #
 # Contract:
 #   - Every probe fails SOFT. A missing tool or a negative result prints
@@ -361,7 +361,7 @@ gh_raw="$(https_probe https://raw.githubusercontent.com)"
 add_fact "HTTPS reachability: raw.githubusercontent.com (bare host)" "$gh_raw" \
   "curl -s -o /dev/null -w '%{http_code}' --max-time 5 https://raw.githubusercontent.com"
 
-# The real asset path CLAUDE.md names as the working fallback when the
+# The real asset path docs/DEVELOPMENT.md names as the working fallback when the
 # release installer 403s — reproduces the fact that actually costs sessions
 # time, not just bare-host reachability.
 nomistakes_asset="$(https_probe https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh)"

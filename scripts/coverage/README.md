@@ -25,7 +25,7 @@ stage's artifacts are read before the next one starts.
 | constant | value | why |
 | --- | --- | --- |
 | profile | `dev` | the profile the repo's own gates run; coverage measures what `cargo test` exercises, not what ships (diverges from P1-PERF's release rule, deliberately) |
-| collection tree | `target/llvm-cov-target/` | cargo-llvm-cov's own; never `target/`, never a shared cache (CLAUDE.md's thrice-bitten rule). Two build trees exist at most, which is R-S0-6's ceiling |
+| collection tree | `target/llvm-cov-target/` | cargo-llvm-cov's own; never `target/`, never a shared cache (docs/DEVELOPMENT.md's thrice-bitten rule). Two build trees exist at most, which is R-S0-6's ceiling |
 | report scope | `src/**` | the tool's default exclusions already achieve it — measured below, no flag needed |
 | `--ignored` | never run | the two opt-in real-Claude tests spend tokens; their absence is a registered known loss, not an oversight |
 | toolchain | recorded per run | `rustc -vV` + `cargo llvm-cov --version` into the artifacts dir; a mid-run change is a hard stop (R-S0-2) |

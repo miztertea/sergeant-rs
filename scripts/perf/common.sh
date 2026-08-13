@@ -75,6 +75,62 @@ perf_require_binary() {
   for tool in curl jq python3 git; do
     command -v "$tool" >/dev/null || perf_die "missing required tool: $tool"
   done
+  # The tested binary's identity, captured exactly once — a live rev-parse per
+  # scenario tracks the checkout, not the binary: a commit landing mid-matrix
+  # made 6 of 8 scenarios self-report code that was never in the binary
+  # (issue #50). Exported so scenarios spawned by run-all.sh inherit the pin
+  # instead of re-reading HEAD. A failed rev-parse warns and is never cached
+  # or exported, so a later call (or a child scenario) retries instead of
+  # inheriting a permanent "unknown".
+  if [ -z "${PERF_COMMIT:-}" ] || [ "$PERF_COMMIT" = unknown ]; then
+    if PERF_COMMIT="$(git -C "$PERF_REPO_ROOT" rev-parse HEAD 2>/dev/null)"; then
+      export PERF_COMMIT
+    else
+      perf_warn "git rev-parse failed for $PERF_REPO_ROOT — commit recorded as unknown"
+      PERF_COMMIT=unknown
+    fi
+  else
+    # An inherited pin is the designed path (run-all.sh exports it for its
+    # scenarios) but the value is trusted, so at least say when it cannot be
+    # a sha of this repo.
+    case "$PERF_COMMIT" in
+      *[!0-9a-f]*) perf_warn "inherited PERF_COMMIT '$PERF_COMMIT' does not look like a commit sha" ;;
+    esac
+    export PERF_COMMIT
+  fi
+  # The tree's cleanliness at pin time, pinned beside the sha (and inherited
+  # the same way): a sha alone claims code the working tree may never have
+  # matched, and that fact belongs in the artifacts, not in a rerun's
+  # archaeology.
+  if [ -z "${PERF_TREE_DIRTY:-}" ]; then
+    if [ "$PERF_COMMIT" = unknown ]; then
+      PERF_TREE_DIRTY=unknown
+    elif [ -n "$(git -C "$PERF_REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
+      PERF_TREE_DIRTY=1
+      perf_warn "working tree at $PERF_REPO_ROOT is dirty — the commit field names a sha the tree did not match"
+    else
+      PERF_TREE_DIRTY=0
+    fi
+    export PERF_TREE_DIRTY
+  fi
+  # The binary's own timestamp, pinned at the same moment: mtime forensics are
+  # what reconstructed the truth for issue #50, so record it in the artifacts
+  # and warn up front when the binary predates HEAD — then the commit field
+  # cannot describe the code in the binary and the run needs a rebuild first.
+  if [ -z "${PERF_BIN_MTIME:-}" ] || [ "$PERF_BIN_MTIME" = 0 ]; then
+    PERF_BIN_MTIME="$(stat -c %Y "$SGT_BIN" 2>/dev/null || echo 0)"
+    if [ "$PERF_BIN_MTIME" != 0 ]; then
+      export PERF_BIN_MTIME
+      local head_ct
+      head_ct="$(git -C "$PERF_REPO_ROOT" log -1 --format=%ct HEAD 2>/dev/null || echo 0)"
+      PERF_BIN_STALE=0
+      if [ "$head_ct" -gt 0 ] && [ "$PERF_BIN_MTIME" -lt "$head_ct" ]; then
+        PERF_BIN_STALE=1
+        perf_warn "binary $SGT_BIN predates HEAD ($PERF_COMMIT) — rebuild, or the commit field describes code that is not in the binary"
+      fi
+      export PERF_BIN_STALE
+    fi
+  fi
 }
 
 # --- scenario lifecycle ----------------------------------------------------
@@ -103,7 +159,24 @@ perf_init() {
   perf_step "$PERF_SCENARIO — output $PERF_OUT"
   perf_kv scenario "$PERF_SCENARIO"
   perf_kv binary "$SGT_BIN"
-  perf_kv commit "$(git -C "$PERF_REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  perf_kv binary_mtime "${PERF_BIN_MTIME:-0}"
+  perf_kv commit "$PERF_COMMIT"
+  # The provenance caveats land in the summary artifact itself, not only on
+  # stderr (#50 was about the artifact): a binary older than HEAD at pin
+  # time, a dirty tree behind the pinned sha, and — re-statted here, once
+  # per scenario — a rebuild that swapped the code under the pinned label
+  # mid-matrix.
+  perf_kv binary_predates_head "${PERF_BIN_STALE:-0}"
+  perf_kv commit_dirty_tree "${PERF_TREE_DIRTY:-unknown}"
+  local perf_mtime_now
+  perf_mtime_now="$(stat -c %Y "$SGT_BIN" 2>/dev/null || echo 0)"
+  if [ "$perf_mtime_now" != "${PERF_BIN_MTIME:-0}" ]; then
+    perf_warn "binary $SGT_BIN was rebuilt since the run pinned it (mtime ${PERF_BIN_MTIME:-0} -> $perf_mtime_now) — this scenario's commit label may not describe its code"
+    perf_kv binary_swapped_since_pin 1
+    perf_kv binary_mtime_now "$perf_mtime_now"
+  else
+    perf_kv binary_swapped_since_pin 0
+  fi
   perf_kv started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
@@ -572,6 +645,20 @@ perf_latency_kv() {
 
 perf_bytes() { du -sb "$1" 2>/dev/null | cut -f1 || echo 0; }
 
+# perf_disk_kv <prefix> <data-dir> — journal/blobs/surfaces/total bytes are
+# read straight off the filesystem and are accurate at any moment, live
+# daemon or not. `<prefix>_duckdb_bytes` is not: DuckDB only checkpoints the
+# analytics projection to disk at clean shutdown (`src/runtime/analytics.rs`
+# — the journal is the source of truth and the projection is disposable), so
+# a call against a *running* daemon reads whatever was on disk from the last
+# checkpoint, not the projection's current size. Issue #13's measured
+# example: S2's `post_disk_duckdb_bytes` read 12,288 B mid-run against a true
+# post-shutdown size of 536,576 B (~100% underreport at that scenario's
+# work count). **Callers wanting an accurate `duckdb_bytes` must call this
+# after `perf_daemon_stop`**, not before it — every scenario in this
+# directory does now (fixed alongside this comment; s6-crash.sh's own
+# `perf_disk_kv` call was already correctly ordered and is what this fix's
+# other call sites were brought in line with).
 perf_disk_kv() { # perf_disk_kv <prefix> <data-dir>
   local prefix="$1" dd="$2"
   perf_kv "${prefix}_total_bytes" "$(perf_bytes "$dd")"
@@ -677,8 +764,9 @@ perf_hygiene() {
 perf_environment() { # perf_environment <outfile>
   local out="$1"
   {
-    echo "commit: $(git -C "$PERF_REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "commit: ${PERF_COMMIT:-unknown}"
     echo "binary: $SGT_BIN"
+    echo "binary mtime: ${PERF_BIN_MTIME:-0} ($(date -u -d "@${PERF_BIN_MTIME:-0}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '?'))"
     echo "sgt --version: $("$SGT_BIN" --version 2>&1 | head -1)"
     echo "nproc: $(nproc)"
     echo "cgroup cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo 'absent (cgroup v1)')"

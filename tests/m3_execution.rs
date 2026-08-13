@@ -51,6 +51,7 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
     KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
+use sergeant_rs::domain::workspace::InstructionPolicy;
 use sergeant_rs::runtime::engine::{Engine, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::{
@@ -480,14 +481,14 @@ async fn t2_multi_repo_workspace_binds_one_worktree_per_repository() {
     std::fs::write(
         api.join("sergeant.toml"),
         r#"
-[workspace]
+[estate]
 name = "payments"
 
-[[repository]]
+[[repo]]
 name = "api"
 path = "."
 
-[[repository]]
+[[repo]]
 name = "web"
 path = "../payments-web"
 "#,
@@ -530,6 +531,205 @@ path = "../payments-web"
     let starts = _fake.starts();
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].cwd, root);
+
+    handle.shutdown().await;
+}
+
+/// R-MVP1-4: repositories that disagree on `instructions` policy are
+/// refused at submit — before a Work record or a worktree exists — naming
+/// both repositories. "One process, one policy" is the ruling, not an
+/// omission: there is nowhere for two `--setting-sources` policies to both
+/// take effect in a single launched process.
+#[tokio::test]
+async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let api = repos.path().join("payments-api");
+    let web = repos.path().join("payments-web");
+    init_repo(&api);
+    init_repo(&web);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\ninstructions = \"suppress\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\ninstructions = \"local\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &api, "mixed policy", json!({})).await;
+    assert_eq!(status, 422, "a mixed policy must refuse at submit: {body}");
+    assert_eq!(body["error"]["code"], "instruction_policy_conflict");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("api"), "must name api: {message}");
+    assert!(message.contains("web"), "must name web: {message}");
+    assert!(
+        fake.starts().is_empty(),
+        "a submit-time refusal must never reach a backend"
+    );
+
+    handle.shutdown().await;
+}
+
+/// R-MVP1-4 + MVP-2 D2 item 1: `instructions = "local"` parses, pins, and —
+/// now that its launch-side translation is measured
+/// (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`,
+/// `ClaudeBackend::setting_sources_args`) — is accepted at submit and
+/// reaches the backend's `StartRequest` intact. This is the plumbing pin the
+/// un-refusal needs: MVP-1's sibling test above already proved a *mixed*
+/// selection still refuses (unchanged); this proves a *uniform* `local`
+/// selection is no longer refused at all, all the way to the backend.
+#[tokio::test]
+async fn r_mvp1_4_local_instructions_policy_is_accepted_at_submit_and_reaches_the_backend() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\ninstructions = \"local\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &repo, "local measured", json!({})).await;
+    assert_eq!(status, 201, "local must be accepted at submit now: {body}");
+    assert_eq!(body["work"]["state"], "active");
+
+    let starts = fake.starts();
+    assert_eq!(
+        starts.len(),
+        1,
+        "an accepted submission must actually reach the backend"
+    );
+    assert_eq!(
+        starts[0].instruction_policy,
+        InstructionPolicy::Local,
+        "the resolved policy must survive submit -> bind -> StartRequest unchanged"
+    );
+
+    handle.shutdown().await;
+}
+
+/// TH-11: R-MVP1-11's refusal pinned end to end over a real HTTP submit —
+/// its R-MVP1-4 siblings above are; this one previously wasn't (only at the
+/// `engine.plan()` call seam), so nothing asserted the client-visible 422
+/// body a real submit actually returns.
+#[tokio::test]
+async fn r_mvp1_11_a_stage_requiring_ask_refuses_at_submit_over_http() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    let dir = repo.join(".sergeant/workflows/asks");
+    std::fs::create_dir_all(dir.join("00-interview")).expect("stage dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"asks\"\nversion = \"1\"\nstages = [\"00-interview\"]\n\n\
+         [stage.\"00-interview\"]\nrequires_ask = true\n",
+    )
+    .expect("workflow.toml");
+    std::fs::write(dir.join("00-interview/CONTEXT.md"), "ask questions").expect("CONTEXT.md");
+
+    let no_ask = FakeBackend::scripted(FAKE_BACKEND_NAME, []).with_capabilities(Capabilities {
+        ask: false,
+        ..Capabilities::default()
+    });
+    let registry = BackendRegistry::new().with(Arc::new(no_ask.clone()));
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "needs a real ask",
+        json!({"workflow": "asks"}),
+    )
+    .await;
+    assert_eq!(status, 422, "must refuse at submit: {body}");
+    assert_eq!(body["error"]["code"], "ask_capability_unavailable");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("asks"),
+        "must name the workflow: {message}"
+    );
+    assert!(
+        message.contains("00-interview"),
+        "must name the stage: {message}"
+    );
+    assert!(
+        message.contains(FAKE_BACKEND_NAME),
+        "must name the backend: {message}"
+    );
+    assert!(
+        no_ask.starts().is_empty(),
+        "a submit-time refusal must never reach a backend"
+    );
+
+    handle.shutdown().await;
+}
+
+/// R-MVP1-4's pin, positive case: a uniform (unset, so `suppress`) policy
+/// submits, and `workflow.bound` is widened to carry the resolved
+/// repository set plus, per repository, the resolved policy and its
+/// instruction-file identity — absent recorded as absent, since neither
+/// repo here has an `AGENTS.md`.
+#[tokio::test]
+async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let api = repos.path().join("payments-api");
+    let web = repos.path().join("payments-web");
+    init_repo(&api);
+    init_repo(&web);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\ninstructions = \"suppress\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &api, "uniform policy", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "active");
+
+    let bound = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
+    assert_eq!(bound.len(), 1);
+    let payload = &bound[0].payload;
+    let repositories = payload["repositories"].as_array().expect("repositories");
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|r| r["name"].as_str().expect("name"))
+            .collect::<Vec<_>>(),
+        ["api", "web"],
+        "workflow.bound must carry the resolved repository set, not just the workspace name"
+    );
+    let identities = payload["instruction_identities"]
+        .as_array()
+        .expect("instruction_identities");
+    assert_eq!(identities.len(), 2);
+    for identity in identities {
+        assert_eq!(identity["policy"], "suppress");
+        assert!(
+            identity["path"].is_null() && identity["content_hash"].is_null(),
+            "no AGENTS.md exists in either worktree — absence must be recorded as absent, \
+             not omitted: {identity}"
+        );
+    }
 
     handle.shutdown().await;
 }
@@ -681,7 +881,7 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     init_repo(&repo);
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
          [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n",
     )
     .expect("sergeant.toml");
@@ -1112,7 +1312,7 @@ async fn t7_routing_precedence_and_structured_failure() {
     init_repo(&configured);
     std::fs::write(
         configured.join("sergeant.toml"),
-        "[workspace]\nname = \"configured\"\ndefault_backend = \"codex\"\n\n[[repository]]\nname = \"configured\"\npath = \".\"\n",
+        "[estate]\nname = \"configured\"\ndefault_backend = \"codex\"\n\n[[repo]]\nname = \"configured\"\npath = \".\"\n",
     )
     .expect("sergeant.toml");
 
@@ -1186,9 +1386,14 @@ async fn t7_routing_precedence_and_structured_failure() {
     .await;
     assert_eq!(status, 422);
     assert_eq!(body["error"]["code"], "backend_not_found");
+    // "docker" is present even though this registry only names three fakes:
+    // `start_with` always registers the real docker adapter unless the
+    // config already names one (N4), the same way it always adds claude
+    // unless the config pre-empts it — none of these three fakes is named
+    // "docker", so nothing pre-empts it here.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
     );
     handle.shutdown().await;
 
@@ -1201,9 +1406,13 @@ async fn t7_routing_precedence_and_structured_failure() {
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
     // The scripted fake occupies the "claude" slot, so the daemon adds
-    // nothing: Codex is descoped (D6) and never registered, and a backend
-    // that is not registered is not offered.
-    assert_eq!(body["error"]["available_backends"], json!(["claude"]));
+    // nothing there — but it still adds the real docker adapter (N4, nothing
+    // here is named "docker"). Codex is descoped (D6) and never registered,
+    // and a backend that is not registered is not offered.
+    assert_eq!(
+        body["error"]["available_backends"],
+        json!(["claude", "docker"])
+    );
     assert!(
         body["error"]["message"]
             .as_str()
@@ -1235,7 +1444,7 @@ fn mixed_harness_repo(repo: &Path, tables: &str) {
     std::fs::write(
         repo.join("sergeant.toml"),
         format!(
-            "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
              [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n\
              default_model = \"alt-model-1\"\n\n\
              [[profile]]\nname = \"default-profile\"\nbackend = \"{FAKE_BACKEND_NAME}\"\n\
@@ -1407,12 +1616,12 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     .await;
     assert_eq!(status, 422, "must be refused: {body}");
     assert_eq!(body["error"]["code"], "backend_not_found");
-    // The daemon registers the real Claude adapter alongside the scripted
-    // fake, so the options list names both; Codex is descoped (D6) and never
-    // registered, which is exactly why naming it fails.
+    // The daemon registers the real Claude and Docker adapters alongside the
+    // scripted fake, so the options list names all three; Codex is descoped
+    // (D6) and never registered, which is exactly why naming it fails.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", FAKE_BACKEND_NAME])
+        json!(["claude", "docker", FAKE_BACKEND_NAME])
     );
     assert!(fake.starts().is_empty(), "no silent provider substitution");
     let list = get(&client, &handle, "/v1/work").await;
@@ -2149,9 +2358,9 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     git(&web, &["init", "-b", "main"]);
     std::fs::write(
         api.join("sergeant.toml"),
-        "[workspace]\nname = \"payments\"\n\n\
-         [[repository]]\nname = \"api\"\npath = \".\"\n\n\
-         [[repository]]\nname = \"web\"\npath = \"../payments-web\"\n",
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\n",
     )
     .expect("sergeant.toml");
 
@@ -2217,6 +2426,174 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     assert!(!branch_exists(&web, &format!("sergeant/{work_id}")));
 
     handle.shutdown().await;
+}
+
+/// R-MVP1-1: `surfaces_root` is a path distinct from `data_dir`, not merely
+/// `data_dir`'s fixed `surfaces/` child. A `data_dir` *inside* the source
+/// checkout materializes fine once `[estate] surfaces_dir` points the
+/// surface root outside it — the pin's exact scenario. The guard that
+/// refuses a surface inside the checkout moved from watching `data_dir` to
+/// watching the resolved `surfaces_root`; it did not weaken: a
+/// `surfaces_dir` left unset (falling back to `data_dir/surfaces`, still
+/// inside the checkout here) still refuses, exactly as an in-checkout
+/// `data_dir` always did before the split.
+#[tokio::test]
+async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_follows_it() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+
+    // Scenario 1: `data_dir` lives *inside* the checkout — before R-MVP1-1
+    // this alone doomed every submission, since the surface root was always
+    // `data_dir/surfaces`. `surfaces_dir` points outside it; materializing
+    // must succeed anyway.
+    let data_inside = repo.join(".sergeant-data");
+    let outside = repos.path().join("surfaces-outside");
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        format!(
+            "[estate]\nname = \"solo\"\nsurfaces_dir = {:?}\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            outside.to_string_lossy()
+        ),
+    )
+    .expect("sergeant.toml");
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(&data_inside, registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(&client, &handle, &repo, "split surfaces root", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    assert_eq!(
+        body["work"]["state"], "active",
+        "an outside surfaces_dir must materialize even with data_dir inside the checkout: {body}"
+    );
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    // Exact, not merely `starts_with`: `surface_root` must join `work_id`
+    // directly onto `surfaces_dir` with no implicit `surfaces/` re-nested
+    // inside it (that join happens exactly once, at `Engine`'s own default
+    // computation — `surface_root(surfaces_root, work_id)` no longer adds
+    // `SURFACES_DIR` itself). A `starts_with` check alone cannot catch a
+    // regression that re-nests an extra `surfaces/` under an already-custom
+    // `surfaces_dir`, since the result would still be a prefix match.
+    assert_eq!(
+        worktree,
+        outside.join(&work_id).join("solo"),
+        "the worktree must live directly under the declared surfaces_dir/<work_id>/<repo>, \
+         with no extra nesting"
+    );
+    // TH-07's other half: `surface.planned`'s own `root` — not just the
+    // worktree path it later produces — must reflect the split too.
+    let planned = events_of(&data_inside, &work_id, KIND_SURFACE_MATERIALIZING);
+    assert_eq!(planned.len(), 1, "exactly one plan: {planned:?}");
+    assert_eq!(
+        planned[0].payload["plan"]["root"],
+        outside.join(&work_id).display().to_string(),
+        "surface.planned's root must already reflect surfaces_dir's split, before \
+         anything is materialized: {:?}",
+        planned[0].payload
+    );
+    handle.shutdown().await;
+
+    // Scenario 2: `surfaces_dir` unset falls back to `data_dir/surfaces` —
+    // still inside the checkout here — and the guard still refuses it.
+    let data_inside2 = repo.join(".sergeant-data-2");
+    std::fs::write(
+        repo.join("sergeant.toml"),
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+    )
+    .expect("sergeant.toml");
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(&data_inside2, registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(&client, &handle, &repo, "unsplit still refuses", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    assert_eq!(
+        body["work"]["state"], "blocked",
+        "an in-checkout surfaces_root must still be refused — the guard moved, not weakened: {body}"
+    );
+    // TH-07: a bare `state == "blocked"` cannot distinguish the in-checkout
+    // guard from any other unrelated materialize failure. Name the actual
+    // diagnostic (`surface.rs`'s own refusal text) so this pin means what
+    // its own doc comment claims.
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let blocked = events_of(&data_inside2, &work_id, KIND_WORK_BLOCKED);
+    assert_eq!(blocked.len(), 1, "exactly one block: {blocked:?}");
+    let reason = blocked[0].payload["reason"]
+        .as_str()
+        .expect("reason string");
+    assert!(
+        reason.contains("refusing to materialize a work surface")
+            && reason.contains("inside source repository"),
+        "the block reason must be the in-checkout guard's own diagnostic, not some other \
+         materialize failure: {reason:?}"
+    );
+    handle.shutdown().await;
+}
+
+/// R-MVP1-1's other override, `SGT_SURFACES_DIR`, end to end through a real
+/// spawned daemon process (not the in-process `daemon::start_with` the
+/// scenario above uses) — proving the env var this ruling names is actually
+/// read, not merely documented. `Engine::with_surfaces_root` had zero
+/// callers before this fix; a real `sgt run` against a `data_dir` inside the
+/// checkout, with `SGT_SURFACES_DIR` pointed outside it, must materialize
+/// exactly as an `[estate] surfaces_dir` override does.
+#[test]
+fn r_mvp1_1_sgt_surfaces_dir_env_var_reaches_a_real_spawned_daemon() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let data = DataDir::new();
+    let outside = repos.path().join("surfaces-outside-env");
+    let output = Command::new(SGT)
+        .current_dir(&repo)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("--json")
+        .args(["run", "env var surfaces root", "--workflow", "tiny"])
+        .env("SGT_SURFACES_DIR", &outside)
+        .output()
+        .expect("run sgt");
+    assert!(
+        output.status.success(),
+        "sgt run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("json output");
+    assert_ne!(
+        body["work"]["state"], "blocked",
+        "an outside SGT_SURFACES_DIR must materialize even with data_dir inside the checkout: {body}"
+    );
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    // Exact, not merely `starts_with` — mirrors the `[estate] surfaces_dir`
+    // scenario above (materialize_one refuses a worktree inside the source
+    // checkout, so a path outside it, actually returned here, proves the
+    // env var reached `Engine::with_surfaces_root` and was actually used to
+    // materialize, not merely echoed back).
+    assert_eq!(
+        worktree,
+        outside.join(&work_id).join("solo"),
+        "SGT_SURFACES_DIR must relocate the worktree exactly as [estate] surfaces_dir does"
+    );
+    // The fake backend may complete (and tear the surface down) before this
+    // process is spawned, so a disk check would be racy; the response body
+    // above is captured synchronously at materialize time and is proof
+    // enough. The default (data_dir/surfaces, inside the checkout here)
+    // must not have been used either way.
+    assert!(!data.path().join("surfaces").join(&work_id).exists());
+
+    stop_daemon(data.path());
 }
 
 /// Retry's re-attachment falls back to a fresh branch cut from the recorded
@@ -2884,7 +3261,7 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     std::fs::write(
         repo.join("sergeant.toml"),
         format!(
-            "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
              [[profile]]\nname = \"enterprise\"\nbackend = \"{FAKE_BACKEND_NAME}\"\n\
              default_model = \"claude-opus-4-7\"\n\
              env = {{ CLAUDE_CONFIG_DIR = \"/tmp/work\", GIT_AUTHOR_NAME = \"sergeant\" }}\n"
@@ -2949,7 +3326,7 @@ async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_rout
     let data = TempDir::new().expect("tempdir");
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n\n\
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
          [[profile]]\nname = \"elsewhere\"\nbackend = \"codex\"\n\
          default_model = \"gpt-nonexistent\"\n",
     )
@@ -3042,10 +3419,12 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     );
     assert_eq!(body["error"]["code"], "backend_not_found");
     // Since M4 the daemon registers the real claude adapter alongside the
-    // scripted fake. Codex is descoped (D6): not registered, not offered.
+    // scripted fake, and since N4 the docker adapter too (registered names
+    // sort: claude, docker, fake). Codex is descoped (D6): not registered,
+    // not offered.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", FAKE_BACKEND_NAME])
+        json!(["claude", "docker", FAKE_BACKEND_NAME])
     );
 
     // Only two works exist: the refusal created none.
@@ -3160,7 +3539,7 @@ async fn a_malformed_workspace_file_fails_closed() {
     init_repo(&repo);
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\ndefault_backends = \"fake\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n",
+        "[estate]\nname = \"solo\"\ndefault_backends = \"fake\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
     )
     .expect("sergeant.toml");
 
@@ -3180,7 +3559,7 @@ async fn a_malformed_workspace_file_fails_closed() {
     // A declared repository that does not exist is refused too.
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n[[repository]]\nname = \"ghost\"\npath = \"../nowhere\"\n",
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"ghost\"\npath = \"../nowhere\"\n",
     )
     .expect("sergeant.toml");
     let (status, body) = submit(&http(), &handle, &repo, "missing repo", json!({})).await;
@@ -3199,9 +3578,9 @@ async fn a_malformed_workspace_file_fails_closed() {
     // after the first had already put a branch in the user's checkout.
     std::fs::write(
         repo.join("sergeant.toml"),
-        "[workspace]\nname = \"solo\"\n\n\
-         [[repository]]\nname = \"here\"\npath = \".\"\n\n\
-         [[repository]]\nname = \"also-here\"\npath = \"./\"\n",
+        "[estate]\nname = \"solo\"\n\n\
+         [[repo]]\nname = \"here\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"also-here\"\npath = \"./\"\n",
     )
     .expect("sergeant.toml");
     let (status, body) = submit(&http(), &handle, &repo, "one repo, two names", json!({})).await;
@@ -3218,6 +3597,288 @@ async fn a_malformed_workspace_file_fails_closed() {
         "",
         "a statically rejectable submission must not touch the repository"
     );
+
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------- #22: workspace discovery
+// and binding edge cases beyond R-MVP1-12's own discovery-only fixtures
+// (`src/domain/workspace.rs`'s `#22:`-tagged tests). These are the "remaining
+// edges" `docs/gauntlet/contracts/MVP-1.md`'s R-MVP1-12 pin named and
+// deferred: one table-driven-in-spirit test per shape, through the real
+// daemon/API, asserting the issue's own three things — correct binding
+// record, work completes, teardown clean.
+
+/// A repository with a submodule: the surface actually carries the
+/// submodule's content (not the silent empty directory `git worktree add`
+/// alone leaves — `src/runtime/surface.rs`'s own unit tests pin the
+/// materialize/teardown mechanics; this is the same shape proven to reach the
+/// daemon end to end), the work completes, and teardown removes the worktree
+/// cleanly.
+#[tokio::test]
+async fn t9_a_repository_with_a_submodule_completes_and_tears_down_clean() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let inner = repos.path().join("vendor-inner");
+    init_repo(&inner);
+    std::fs::write(inner.join("vendored.txt"), "vendored content\n").expect("write");
+    git(&inner, &["add", "vendored.txt"]);
+    git(&inner, &["commit", "-m", "vendored payload"]);
+    let inner_head = git(&inner, &["rev-parse", "HEAD"]);
+
+    let outer = repos.path().join("outer");
+    init_repo(&outer);
+    write_two_stage_workflow(&outer);
+    std::fs::write(
+        outer.join(".gitmodules"),
+        format!(
+            "[submodule \"vendored\"]\n\tpath = vendored\n\turl = {}\n",
+            inner.display()
+        ),
+    )
+    .expect(".gitmodules");
+    std::fs::create_dir_all(outer.join("vendored")).expect("placeholder");
+    git(&outer, &["add", ".gitmodules"]);
+    git(
+        &outer,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &inner_head,
+            "vendored",
+        ],
+    );
+    git(&outer, &["commit", "-m", "declare a submodule"]);
+
+    // A hang keeps the surface in place so its content is inspectable, then
+    // a cancel drives real teardown — the same shape t1/t6 already use.
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(&client, &handle, &outer, "check the submodule", json!({})).await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree path"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("vendored").join("vendored.txt"))
+            .expect("submodule content must be checked out through the daemon's own path"),
+        "vendored content\n"
+    );
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "cancel failed: {body}");
+    assert_eq!(body["work"]["state"], "canceled");
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    assert_eq!(
+        torn[0].payload["report"]["clean"], true,
+        "an untouched submodule worktree tears down clean: {:?}",
+        torn[0].payload
+    );
+    assert!(!worktree.exists());
+    assert!(branch_exists(&outer, &format!("sergeant/{work_id}")));
+    let _ = fake.stop_requests();
+
+    handle.shutdown().await;
+}
+
+/// The source repository is itself a git worktree — `git worktree add` from
+/// a worktree, not from a repository's main checkout. Nothing about §11's
+/// materialize/teardown path assumes `repository.path` is a main worktree
+/// (`with_repository`/`add_worktree`/`teardown_binding` all just run `git`
+/// with `repository.path`/`binding.source_path` as `cwd`, and git itself
+/// resolves the shared common dir from there), so this exercises that rather
+/// than asserting it from reading the code.
+#[tokio::test]
+async fn t9b_a_worktree_as_the_source_repository_materializes_and_tears_down() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let main_repo = repos.path().join("main-repo");
+    let head = init_repo(&main_repo);
+    // The bind source: a linked worktree of `main-repo`, on its own branch —
+    // not the main checkout `git worktree list` would call the repository's
+    // own working directory.
+    let source = repos.path().join("source-worktree");
+    git(
+        &main_repo,
+        &[
+            "worktree",
+            "add",
+            source.to_str().expect("utf8 path"),
+            "-b",
+            "a-worktree-of-its-own",
+        ],
+    );
+    write_two_stage_workflow(&source);
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &source,
+        "bind from a worktree",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed");
+    assert_eq!(fake.starts().len(), 2, "one execution per stage");
+
+    // The binding recorded the worktree as its source, and cut from the same
+    // HEAD the worktree itself was on.
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let binding = &materialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(binding["base_sha"], head.as_str());
+    assert_eq!(
+        binding["source_path"].as_str().map(PathBuf::from),
+        Some(PathBuf::from(git(
+            &source,
+            &["rev-parse", "--show-toplevel"]
+        ))),
+        "the binding's source is the worktree itself, not the main checkout"
+    );
+
+    // Teardown clean, and the original worktree — the bind *source* — is
+    // completely untouched by any of it: still registered, still on its own
+    // branch, nothing about materializing *from* it disturbed it.
+    let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
+    assert!(!worktree.exists(), "the surface worktree is torn down");
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn[0].payload["report"]["clean"], true);
+    assert!(
+        source.is_dir(),
+        "the source worktree itself must survive teardown of the surface bound from it"
+    );
+    assert_eq!(
+        git(&source, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "a-worktree-of-its-own",
+        "the source worktree's own branch is undisturbed"
+    );
+    let listing = git(&main_repo, &["worktree", "list"]);
+    assert!(
+        listing.contains(&source.display().to_string()),
+        "the source worktree stays registered against the main repo: {listing}"
+    );
+    assert!(
+        !listing.contains(&worktree.display().to_string()),
+        "the torn-down surface worktree must not still be registered: {listing}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// A symlinked repository root: the path a submission is made from reaches
+/// the repository through a symlink rather than its real path. `materialize`
+/// already canonicalizes both sides of its in-checkout guard for exactly this
+/// reason (`surface.rs`'s own doc on `materialize`) — this proves the
+/// ordinary, non-guard path (an unremarkable submission) also resolves and
+/// completes normally through a symlinked source, not only that the guard
+/// itself is not fooled by one.
+#[cfg(unix)]
+#[tokio::test]
+async fn t9c_a_symlinked_repository_root_materializes_and_completes() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let real = repos.path().join("real-repo");
+    let head = init_repo(&real);
+    write_two_stage_workflow(&real);
+    let via_symlink = repos.path().join("repo-via-symlink");
+    std::os::unix::fs::symlink(&real, &via_symlink).expect("symlink");
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    // Submit from the symlinked path, not the real one.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &via_symlink,
+        "bind through a symlink",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed");
+    assert_eq!(fake.starts().len(), 2);
+
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let binding = &materialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(binding["base_sha"], head.as_str());
+    let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
+    assert!(
+        !worktree.exists(),
+        "teardown after completion removes the worktree"
+    );
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn[0].payload["report"]["clean"], true);
+    assert!(branch_exists(&real, &format!("sergeant/{work_id}")));
+
+    handle.shutdown().await;
+}
+
+/// A path with a space (and a non-ASCII character) in the repository's own
+/// directory name, exercised through the real materialize/complete/teardown
+/// flow rather than only `Workspace::discover` (`src/domain/workspace.rs`'s
+/// own `#22:`-tagged `estate_discovery_handles_a_path_with_a_space` covers
+/// discovery; this is the same shape one level further, through git worktree
+/// creation, a real backend execution `cwd`, and teardown).
+#[tokio::test]
+async fn t9d_a_path_with_a_space_and_non_ascii_completes_and_tears_down() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("répo with spaces");
+    let head = init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "a path with a space",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "completed");
+    assert_eq!(fake.starts()[0].context, "first stage context");
+
+    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
+    let binding = &materialized[0].payload["surface"]["bindings"][0];
+    assert_eq!(binding["base_sha"], head.as_str());
+    let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
+    assert!(!worktree.exists());
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn[0].payload["report"]["clean"], true);
+    assert!(branch_exists(&repo, &format!("sergeant/{work_id}")));
 
     handle.shutdown().await;
 }

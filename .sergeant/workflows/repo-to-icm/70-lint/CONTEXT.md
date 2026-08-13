@@ -6,9 +6,10 @@
 |---|---|---|
 | references/mechanical-vs-substantive.md | L3 | the line between defects this stage may fix directly and defects it must leave for `80`/`90` |
 | ../_config/run-discipline.md | L3 | the blindness rule and the `# AMBIGUOUS — NOT RESOLVED` propagation rule |
-| ../scripts/validate-structure.py | L3 | the helper this stage runs, both against each candidate package and against this workflow's own run worktree (see "How to do it") |
+| ../scripts/validate-structure.py | L3 | the helper this stage runs against each candidate package (see "How to do it"); this workflow's own tree is checked by `65-self-check`'s pinned container instead — see that stage's own row below |
 | ../60-draft/output/draft-report.md | L4 | upstream artifact produced by `60-draft` — the manifest naming every candidate package this stage validates |
 | ../40-classify/output/classifications.ndjson | L4 | upstream — `references/mechanical-vs-substantive.md`'s substantive test for a missing `engine_gap` field requires checking whether the correct content is already recoverable verbatim from here |
+| ../65-self-check/output/self-check-result.txt | L4 | upstream artifact produced by `65-self-check` (`kind = "execute"`, N4) — this workflow's own tree's validator result, already run mechanically before this stage started; folded in verbatim rather than re-run |
 
 ## Working directory
 
@@ -26,13 +27,15 @@ this turn starts.
 Run `.sergeant/workflows/repo-to-icm/scripts/validate-structure.py` against
 every candidate package `60-draft` materialized; repair the defects that
 are mechanical per `references/mechanical-vs-substantive.md`; leave
-substantive ones for `80-adversarial-review` and `90-reconcile`. This stage
-**also** re-validates this workflow's own tree (no path argument) — the
-*authored* tree passes cleanly by construction, but this is a *run*
+substantive ones for `80-adversarial-review` and `90-reconcile`. This
+stage's `output/lint-report.md` **also** covers this workflow's own tree —
+the *authored* tree passes cleanly by construction, but this is a *run*
 worktree: `40-classify` has just written new `classifications.ndjson` into
 it, and that is exactly the kind of NDJSON the validator's S9 check (engine-
-gap record completeness) exists to scan. Skipping the no-argument run would
-mean this run's own engine-gap records are never checked by anything.
+gap record completeness) exists to scan. That check itself already ran,
+mechanically, in `65-self-check` (`kind = "execute"`, N4) before this stage
+started; this stage folds its result in rather than re-running the
+validator against this workflow's own tree a second time.
 
 ## What must become true here (durable outcome)
 
@@ -75,13 +78,18 @@ For each candidate package path from `../60-draft/output/draft-report.md`
 
 After every candidate has been processed:
 
-6. Run `python3 .sergeant/workflows/repo-to-icm/scripts/validate-structure.py`
-   (no argument — validates this workflow's own tree as admitted). Record
-   its result under a `## This workflow's own tree` heading in
-   `output/lint-report.md`, the same way as a candidate: PASS/FAIL, and any
-   `[S9]` engine-gap defects found in `40-classify/output/classifications.ndjson`
-   are substantive findings for `80`/`90`, not something this stage
-   force-fixes.
+6. Read `../65-self-check/output/self-check-result.txt` — the validator's
+   result against this workflow's own tree, already run mechanically by
+   the `65-self-check` execute stage before this stage started (nothing to
+   invoke here; that stage's container ran it once, unconditionally, for
+   every run). Record it under a `## This workflow's own tree` heading in
+   `output/lint-report.md`, the same way as a candidate: PASS/FAIL
+   verbatim from that file, and any `[S9]` engine-gap defects found in
+   `40-classify/output/classifications.ndjson` are substantive findings
+   for `80`/`90`, not something this stage force-fixes. Do not re-run the
+   validator against this workflow's own tree yourself — `65-self-check`
+   already did, and re-running it here would only reproduce the same
+   mechanical result a second time for no reason.
 
 A candidate (or this workflow's own tree) that still fails after mechanical
 repairs is not a failure of this stage; it is real signal for

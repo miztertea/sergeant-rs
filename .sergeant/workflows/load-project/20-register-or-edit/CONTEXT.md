@@ -38,16 +38,21 @@ A project definition is written to the Sergeant-owned config path and validated,
 
 This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
 
-## Helpers (folded per N1 adjudication A4)
+## Retired helper content (execution-surface re-triage, MVP-5 F2, 2026-08-12)
 
-This workflow originally ended in two further stages, `30-sync-repositories` and `40-report-state`. Both are demoted and fold into this stage (now the workflow's terminal stage) as helper invocations performed after registration/edit completes:
-
-- **Sync repositories.** A missing required repository is synced only once the requested work actually requires it, via sgt-sync <project>; the workflow stops if cloning or pulling fails. sgt-sync runs only when repositories actually need cloning or refreshing. Syncing treats three distinct repo states differently: an already-cloned repo on a named branch is pulled fast-forward-only, an existing non-git directory is left untouched with a warning, and a missing repo with a configured URL is cloned. If a required repository entry has no clone URL or a required executable is missing, load-project stops naming the exact gap.
-  — `BU-P5-095`, `BU-P5-102`, `BU-P6-013`, `BU-P6-014`, `BU-P5-109`, `BU-P5-110`, `reference/sergeant-upstream/skills/load-project/SKILL.md` (lines 28-29, 47, 73, 74), `reference/sergeant-upstream/bin/sgt-sync` (L30-45, L33-39)
-- **Report state.** A read-only per-repo report of clone/branch/cleanliness/ahead-behind status, plus a filtered, unified view of open tracked work across the project's repos (repos without an initialized task database are silently skipped rather than erroring the whole listing).
-  — `BU-P6-012`, `BU-P6-035`, `reference/sergeant-upstream/bin/sgt-status` (L1-2), `reference/sergeant-upstream/bin/sgt-td-list` (L2-13)
-
-`30-sync-repositories` carried no argument beyond the §6.5 boilerplate. `40-report-state` carried an "Additional note" ("Borderline per synthesis.md (closer to a query than a checkpoint); kept as a stage because operators do care whether it succeeded before planning") that was weighed against §6.3's reimplementation test and failed: swapping the status/listing implementation would leave nothing about the surrounding checkpoint changed, and the note's own framing ("closer to a query than a checkpoint") concedes the point. See `provenance.md`'s "Adjudication A4" section.
+This stage previously folded `30-sync-repositories`/`40-report-state`
+(demoted machinery, N1 adjudication A4) as helper invocations covering
+`list-projects`, `project-status`, `project-sync`, and `project-task-list`.
+The §2a execution-surface test's SPLIT verdict
+(`docs/icm/retriage-2026-08-11.md`) found those four to be command surfaces,
+not procedures with a bounded outcome (§6.2) — CLI-SURFACE, not workflow
+content — and they retired to `docs/icm/re-homing-record-2026-08-12.md`
+rather than staying here. `sgt repo list` + `sgt doctor` answer the
+status/listing half today; `sgt repo add <name> --origin <url>` (clone if
+missing, verify if present) answers most of the sync half — see the
+`estate-navigation` skill for the honest remaining gap (no bulk "pull
+existing repos" verb exists yet). The register/edit judgment above this
+section is unaffected; only the folded machinery moved.
 
 ## Output
 

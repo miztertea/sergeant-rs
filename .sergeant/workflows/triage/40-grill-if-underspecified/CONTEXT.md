@@ -18,9 +18,14 @@ Underspecified items are escalated to an interview.
 
 ## Behavior contract
 
-- **If the item is underspecified after verification, the actor invokes the grilling and domain-modeling procedures together to sharpen it into shape.**
+- **If the item is underspecified after verification, the actor invokes the grilling procedure to sharpen it into shape.**
   (trigger: verification shows the request needs fleshing out; outcome: the item's specification and domain terms are sharpened, with decisions captured inline)
-  — `BU-P3-068`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 76)
+  — `BU-P3-068`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 76). Upstream pairs this with a
+  separate `domain-modeling` procedure; no `domain-modeling` skill package
+  exists in this repo yet (only frozen upstream evidence — see
+  `docs/icm/agents-invariant-dispositions.md` BU-1064), so sharpening
+  domain terminology folds into the same `grilling` session below rather
+  than a second invocation.
 
 ## Judgment required
 
@@ -28,7 +33,14 @@ This is an actor stage (ladder §6.4): the acting harness must inspect evidence,
 
 ## Delegation
 
-This stage's outcome is produced by running **grilling** to its own completion (context composition today — see `docs/icm/convention.md` §4 on `@@name` versus true nested-workflow invocation, which does not exist yet).
+This stage's outcome is produced by running the **grilling** operator skill
+(`skills/grilling/SKILL.md`) to completion, live in this session — not by
+dispatching a Work item. `grilling` retired as a `.sergeant/workflows/`
+package at the MVP-5 F2 execution-surface re-triage (North Star ruling
+R-NS-6: conversation is the harness's job, never engine work; see
+`docs/icm/re-homing-record-2026-08-12.md`), which also resolves the E3
+dependency this stage previously inherited from the retired package's
+WORKFLOW-IF-E3 classification.
 
 ## Output
 

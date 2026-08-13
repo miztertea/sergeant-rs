@@ -39,10 +39,918 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 | B1 | M1 adjudication | A foreign snapshot whose `last_seq` is within the journal's range loads undetected (identity binding was removed as beyond-contract machinery) | Snapshots live in the daemon-owned data dir; the threat is operator error, not adversarial. **Revisited at M2 (per checkpoint-gate finding document-1):** the daemon now owns the data dir exclusively (daemon.lock) AND uses full journal replay — no snapshot loading exists in the daemon path at all (builder ruling, R1). B1 is unreachable in production flow; trigger narrowed to "if/when the daemon adopts snapshot loading (likely M5 perf)". **Revisited at M5 (checkpoint round 1):** rebuild-from-journal measured well within budget (bulk-appender fold, ~580x a row-wise-SQL baseline — see `Analytics`'s doc comment in `src/runtime/analytics.rs` and the rebuild bench in `tests/m5_projections.rs`), so rebuild-on-start remains the only population path with no perf case for snapshot loading. B1's trigger still does not fire; still dormant. |
 | B2 | M6 adjudication | Dashboard auth delivers the bearer token in the `sgt web` URL query string (shoulder-surf/history exposure on a shared machine) | Accepted at R1 for the P0: the listener is loopback-only and the token already travels in the printed URL by design; the API refuses query tokens on non-GET/HEAD (CSRF bound), and `/ui` sits behind the same `require_bearer` gate as `/v1`. Post-P0 alternative recorded per the M6 contract: exchange the URL token once for an `HttpOnly; SameSite=Strict` cookie handoff. Trigger: any non-loopback binding or multi-user host. |
 | B3 | P0 final gate | `ClaudeBackend::stop` joins the turn's evidence-archive thread while API handlers hold the core lock, so a concurrent request waits out one transcript flush during a cancel/retry of an in-flight Claude turn | Orchestrator ruling at the final gate (three review rounds converged here): STOP's evidence promise (round-2 fix — the archive is durable before STOP returns) is kept; the lock-hold is rare-path and bounded by one local-disk write; the real fix is a §15 trait-shape change (`stop` returning a join token the caller awaits after releasing the core guard) — R7 machinery, not invented at gate-time without panel coverage. `block_in_place` (d82a6e2) keeps the executor healthy meanwhile; trade-off documented on `stop` itself (d20554d). Trigger: any measured multi-client stall, or the first §15 trait revision for other reasons. **CLOSED at N3**: the trigger fired exactly as registered — §14.3's `prepare`/`launch` split is the first §15 trait revision, and B3's own prescribed fix ("`stop` returning a join token the caller awaits after releasing the core guard") is what landed. `stop`/`interrupt` return a `Completion`; the engine collects them into a `Deferred`; `api::crank` drains it after dropping the guard. `block_in_place` removed. Pinned by `tests/m2_daemon_api.rs` t10 — a stalled evidence archive with an independent read answering in ~2 ms — and revert-probed (holding the guard across the drain fails the test in 1 s). Issue #14 closed. |
+| B4 | R-MVP1-10 (blocked exit-door invariant) build | A `pending → blocked` landing from a real start failure (a materialize permission fault, or `reconcile_crashed_start`'s crash-window block) has no working `retry` door: `begin_retry` requires `run.current_stage()` (`engine.rs`), and no stage is ever entered before `settle_materialize` fails or a crashed start is swept — `KIND_WORKFLOW_BOUND`/`KIND_STAGE_ENTERED` land together with `KIND_WORK_STARTED` in one group-committed guard hold, all *after* a successful materialize, so this is not a narrow timing window but the whole category. `retry` fails closed with `EngineError::NoRun` (404, `"no_run"`) — safe, structured, non-corrupting, never silently wrong — but not an open door. The real, working exit is `cancel` (`blocked → canceled`), proven instead. | Reopening it properly needs the full `StartPlan` (workflow resolution, routing, per-stage bindings) re-derivable from the journal alone, and today it is not: `origin.cwd` — needed to re-run `Workspace::discover` — is never persisted (`engine.rs`'s own `reconcile_crashed_start` comment says so), and guessing at a substitute `cwd` would silently re-plan against the wrong estate, which CLAUDE.md's fail-closed doctrine forbids. The honest fix is persisting enough of the submit-time plan to redo it — a bind-path change (`engine.rs`, `SurfacePlan`/`KIND_SURFACE_MATERIALIZING`'s payload) outside this ruling's own file scope (`projection.rs`/`recovery.rs`/`surface.rs`/`api.rs` views). Trigger: any MVP that needs `retry` to reopen a `pending`-origin block — the natural home is wherever the submit-time plan next gets a durable record (R-MVP1-1/R-MVP1-4's `workflow.bound` widening is adjacent territory). Pinned as *expected, safe* behavior by `tests/m2_daemon_api.rs`'s `r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_cancel` (revert-probed: removing the `NoRun`→404 mapping or the `no_run` code fails it). |
+| B5 | MVP-3 fixer pass, invariants finding MVP3-C4 | `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`'s `[estate]` shape lists `data_dir` defaulting `.sergeant/data`, but R-MVP1-1 ruled only `surfaces_dir`; `data_dir` was never implemented (`EstateSection` is `deny_unknown_fields` with no such field; `resolve_data_dir` hardcodes the estate-relative default and reads no manifest field at all). A hand-written `[estate] data_dir = "..."` following the design note literally fails closed with a parse refusal instead of overriding anything. | Not implemented in the fixer pass: this is new engine/config surface (an estate-level override of where the daemon's own data dir lives), R-NS-4 territory that wants explicit ratification, not a silent addition riding in on a bug-fix pass. Design doc corrected in place ([v3] note) so it no longer misdescribes shipped behavior. Trigger: any MVP that actually needs a non-default, manifest-declared data dir (today's only override is `--data-dir`/`SGT_DATA_DIR`, both already covered by R-MVP1-12's discovery-boundary rules). |
+| B6 | MVP-3 fixer pass, invariants finding MVP3-C5 | `sgt run --turns`/`--ceiling-secs` (commit 78e5da9) adds a per-Work `EnvelopeRequest{turn_cap, ceiling_secs}` the engine reads via `effective_turn_cap`/`effective_turn_ceiling` — genuinely new engine surface (submit-time envelope override) that R-MVP1-7 specified as daemon-wide only (`with_turn_cap`/`SGT_TURN_CAP`), and MVP-3's own bucketing plan does not list it. Counting integrity is intact (not a bypass: `check_turn_envelope` still gates on the effective values, `turns_spawned` stays journal-derived, submit rejects `turn_cap==0`/`ceiling_secs==0`) — the gap is process, not safety. | Shipped code kept as-is (it works, and reverting a MVP-3-milestone feature inside a fixer pass is a bigger unilateral move than registering it); registered here instead per R-NS-4 discipline, for owner ratification at the next adjudication rather than silently standing unregistered. Trigger: MVP-3's own adjudication — fold into the milestone's deviation record or explicitly ratify there. |
+| B7 | MVP-5 F2 execution-surface re-triage (`docs/icm/retriage-2026-08-11.md`, `load-project` verdict notes) | `sergeant-setup`'s `30-project-interview` stage duplicates `load-project`'s registration job wholesale (same "complete project definition... previewed... written only after confirmation" shape) instead of delegating to it — the retriage itself flags this as "a duplication defect, not a clean stage-boundary split," and it stood unresolved when the F2 pass executed the surrounding CLI-SURFACE verdicts around it. | Fixing it means editing `sergeant-setup`'s own package to delegate its interview stage to `load-project` instead of reimplementing it — a `.sergeant/workflows/` content edit outside the MVP-5 fixer pass's file scope (docs/`AGENTS.md`/`skills/` only). Trigger: any pass that next touches either `sergeant-setup` or `load-project`'s own package. |
+| B8 | MVP-5 Lane F1 dispositions, content-honesty CH-1 (fixer pass, 2026-08-13) | 17 `agents-invariant` units (BU-1033..1048's codebase-design vocabulary/deepening rules, BU-1064's domain-modeling CONTEXT.md file-role rule) have no live skill package to land in — only frozen upstream evidence under `reference/sergeant-upstream/.claude/skills/`, which `docs/DEVELOPMENT.md` forbids treating as live content. `docs/icm/agents-invariant-dispositions.md` previously (and wrongly) claimed both were already-published `.sergeant/workflows/` packages; corrected to `not-adopted` this pass, and the two live packages that named a "grilling/domain-modeling" pair (`triage/40-grill-if-underspecified`, `wayfinder/00-name-destination`) were corrected to name `grilling` alone rather than invent the second invocation. | Promoting either skill is new content, not a dispositioning correction — this fixer pass's job was to stop asserting they exist, not to build them. Trigger: an owner decision to actually promote `codebase-design` and/or `domain-modeling` as `skills/` packages (nearest precedent: `deepen-module` already cites `codebase-design`'s upstream `DEEPENING.md` directly, without a `skill:` indirection — see `00-classify-dependencies/CONTEXT.md`). |
 
 ---
 
 ## Ledger entries
+
+### MVP CLOSE-OUT — 2026-08-13, the ship: all five buckets landed, ship gate PASS, #19 closed
+
+**Mission outcome.** The North Star MVP is complete on cerberus/mvp-1
+(PR #65, owner merges). Since the MVP-4 entries: (1) **Extended #19
+soak** (91ba140, Fixes #19): 2h36m unbroken daemon, 13 works, 10 real
+Docker execute stages digest-identical, settle driver reconfirmed 12×,
+envelope exit door proven live (blocked → extend → retry → completed —
+upstream's no-exit-door scar closed with journal evidence), and Rule A
+eviction's first sustained-load measurement (RSS 58.8→24.8 MB, flat
+62 min). Operator disclosed its own mid-run dormancy in the manifest.
+(2) **Ship gate PASS** (e5af0a6): a fresh clone walked the full
+colleague path on product surfaces alone — install, init, two repos,
+real intent, genuine 5-min detach, return to a verified diff via the
+output pointer, daemon-stop + respawn with zero loss. Four findings
+(dormancy/process; cargo-install collision; model-pin syntax
+undocumented — the sharpest product gap, backlog; cosmetic). (3) **CI
+exposed a real day-one bug this host could not**: init propagated
+doctor's claude-row failure as its own exit — a colleague without
+claude could not init (§17.5 violation). Fixed ace9b16/0c8650a
+(healthy_for_init: harness rows advisory at init, doctor keeps hard
+semantics), pinned via SGT_CLAUDE_BIN=/nonexistent both-environments,
+CI green on the fix commit. (4) **Residue sweep found two bugs**
+(trace-then-clean doctrine): #66 sgt-probe container leak past the
+harness sweep (postdates the launch-error fix — different path), #67
+doctor fresh-dir docker blob-store EPERM + unmeasurable disk_pressure.
+(5) **Final shipping gate passed** (5→2→1-approve): manifest
+malformed-TOML panic fixed (fail-closed means refusal, never panic),
+transcript full-replay-under-guard fixed after the gate caught its own
+first fix not releasing the guard, docker inspect absence/failure
+conflation fixed with its L7 pin on the gate's insistence. Suite at
+close: 539 passed + 4 opt-in, CI green, all sweeps clean.
+
+**Environmental behavior.** The recurring failure of this stretch was
+agent dormancy — the soak operator (twice), the first ship-gate seat
+(placeholder verdict), and the second ship-gate seat (80-min install
+wait) all ended turns to wait on nothing; watchdogs on artifacts (not
+agent claims) caught every instance, and the anti-dormancy rule
+(foreground sleeps, artifact watchers, process-table evidence for every
+"still running") is now standard workflow-prompt text. Owner
+corrections continued to be the highest-value input: dollars-are-
+telemetry (re-enforced twice), the repo-to-icm soak redirect (same
+adapter evidence at a fraction of the volume), residue-is-evidence
+(produced #66/#67), and verify-before-speaking (the "ten minutes" that
+measured 23 seconds). Model economy held: Sonnet workforce, Opus
+panels/refuters, no-mistakes pinned Sonnet (verified via the binary's
+per-agent override string), Fable one orchestrator seat.
+
+
+### MVP-5 FIXER PASS — 2026-08-13, 15 vision-fidelity/content-honesty findings closed
+
+**Mission outcome.** All 15 findings from the panel review of MVP-5
+CONTENT (below) closed by editing content, none rejected. Docs/content
+only — no `src/`/`tests/` change, so CLAUDE.md's "code is code" multi-axis
+loop does not apply; gates re-run anyway (`cargo fmt --check`, `cargo
+clippy --all-targets -- -D warnings`, `cargo test`) since the workflow-
+catalog and `m6_surfaces` t5 suites read `.sergeant/` and `AGENTS.md`
+directly and a content edit can break them. Leak check clean: `pgrep -f
+"debug/sgt [-]-data-dir"` empty.
+
+**vision-fidelity (4 findings, all closed).** VF-1/CH-4 (the colleague
+README path never delivers the OS layer — `sgt init` in a bare
+`~/my-estate` has no `AGENTS.md`/`skills/`/`.sergeant/`): `README.md`'s
+"Get it" section now keeps the reader in the clone itself
+(clone-is-distro, matching the A7 ship-gate happy path and
+`docs/gauntlet/notes/mvp-bucketing-2026-08-11.md`'s "gh repo clone → ...
+→ `sgt init` → open Claude" sequence) instead of sending them to an empty
+directory elsewhere. VF-2 (the standard loop never teaches walk-away →
+return, the product's whole differentiator): step 5 of `AGENTS.md`'s
+standard workflow loop now states `sgt run` returns on submission, not
+completion, and that the daemon outlives the terminal; step 7 states a
+`needs_input` you weren't watching for is exactly why the loop hands
+control back rather than blocking in-session; step 8 now asks for the
+spent-envelope report (`envelope.turns_spawned` vs. ceiling) as part of
+"collect", not merely the branch/artifacts. VF-3 (README states the wrong
+data-dir default, omitting the estate-resolved rung that is R-NS-3's whole
+mechanism): the "Using sgt day-to-day" section now states the full,
+correct precedence chain measured from `src/cli.rs`'s `resolve_data_dir`
+and names the first-`sgt-init`-reports-against-the-fallback wrinkle
+explicitly rather than leaving a reader to discover it. VF-4/CH-7 (the
+"see it first" demo path prescribes a discarded release build
+`scripts/demo.sh` never consults): the release-build line is gone; the
+walkthrough now just runs `scripts/demo.sh` (which builds its own debug
+binary) with a one-line note on pointing it at an already-installed `sgt`
+via `SGT_BIN` instead.
+
+**content-honesty (8 findings, all closed).** CH-1 (17 of 126
+`agents-invariant` units routed to `skill: codebase-design`/`skill:
+domain-modeling`, which don't exist as published packages — only frozen
+`reference/sergeant-upstream/` evidence): `docs/icm/agents-invariant-
+dispositions.md`'s 17 rows (BU-1033..1048, BU-1064) reclassified to
+`not-adopted` with the honest reason (nearest live host, `deepen-module`,
+already cites the upstream path directly rather than through a fabricated
+`skill:` indirection); `AGENTS.md`'s corpus-summary paragraph no longer
+names either as a workflow; the two live packages that named a
+"grilling/domain-modeling" pair (`triage/40-grill-if-underspecified`,
+`wayfinder/00-name-destination`) now name `grilling` alone, matching what
+was actually built. Backlog row B8 registers the promotion gap. CH-2 (10
+of 40 `AGENTS.md`-dispositioned units uncited, 5 with no satisfying text
+at all): `AGENTS.md` gained real cited text for BU-0004/BU-0005/BU-0009
+(the direct-vs-dispatch criteria, previously absent), BU-0109
+(single-developer-per-install, previously absent), and citations for the
+five that had satisfying text but no marker (BU-0020/BU-0037/BU-0056/
+BU-0172/BU-1262); BU-0003's inverted default-to-coordinate claim was
+reclassified `not-adopted` rather than forced into text that contradicts
+this repo's actual routing judgment. CH-3 (three dispositions cite a
+"`NORTH-STAR.md` 'One owner'" quotation that isn't in that file):
+corrected the BU-0054/BU-0109 citations to `docs/DEVELOPMENT.md`, where
+the phrase actually lives (and clarified it's an intra-process invariant,
+distinct from BU-0109's adoption-model claim); corrected BU-0110's
+dismissal, which had wrongly claimed `NORTH-STAR.md`'s Never list names
+tenancy/RBAC/credentials/leases — it doesn't; the real reasoning
+(sergeant-rs has no multi-tenant server surface at all) replaces it. CH-4:
+same fix as VF-1 above (single finding, two review passes). CH-5 (a new
+skill cites "CLAUDE.md L1", which the very next commit symlinked away
+from any such text): `skills/sergeant-help/SKILL.md`'s precedence-order
+citation now points at `docs/DEVELOPMENT.md`'s actual L1 sentence. CH-6
+(`load-project/CONTEXT.md` contradicts itself about whether the folded
+N1-A4 helpers still exist, and cites a `provenance.md` that never
+existed): rewrote the N1-adjudication-A4 paragraph to state the fold and
+its later supersession by the MVP-5 F2 SPLIT verdict in one consistent
+account, and named the real provenance trail
+(`docs/gauntlet/promoted-provenance/load-project.md`) instead of the
+dangling reference. CH-7: same fix as VF-4 above. CH-8 (no GAUNTLET entry
+for MVP-5, breaking the per-milestone register discipline every prior
+milestone followed): this entry, plus the MVP-5 CONTENT entry below it and
+backlog rows B7/B8 for this pass's own named-but-unfixed gaps
+(`sergeant-setup`'s `30-project-interview` duplication; the
+codebase-design/domain-modeling skill-promotion gap CH-1 surfaced).
+
+**Rejections: none.** Every finding was investigated to its cited
+evidence before fixing; none was found to already be correct as shipped.
+
+**Environmental behavior.** Direct fixer pass over a panel's 15 findings,
+no further panel/critic loop for this response (docs/content-only diff
+against CLAUDE.md's "code is code" scope rule — no `src/`/`tests/`
+executable-behavior change). Findings spanned five files' worth of
+cross-references (`README.md`, `AGENTS.md`, two workflow `CONTEXT.md`
+files, one skill file, one dispositions ledger) with real cross-file
+contradictions (CH-3's misquoted "One owner", CH-6's self-contradicting
+paragraphs) rather than single-file typos — each was traced to its actual
+source text before correcting, not patched at the symptom line alone.
+
+---
+
+### MVP-5 CONTENT — 2026-08-12, AgentOS layer shipped: `AGENTS.md` rewrite, symlink, execution-surface re-homing, README recenter
+
+**Mission outcome.** MVP-5's content lane landed: `docs/DEVELOPMENT.md`
+carries the dev rulebook moved out of `CLAUDE.md` (commit 9bb84fe);
+`AGENTS.md` rewritten as the canonical front door — trigger→skill/workflow
+routing table, an 8-step standard workflow loop, guardrails — consuming
+all 126 `agents-invariant`-classified units from N2 run 4 with every one
+dispositioned in `docs/icm/agents-invariant-dispositions.md` (commit
+cdfd2a5); `CLAUDE.md` retargeted to a symlink onto `AGENTS.md` with dev-
+rulebook citations across `src/`/`tests/`/`scripts/`/docs retargeted to
+`docs/DEVELOPMENT.md` (commit 2c4eb29); `README.md` recentered on
+clone-and-work (commit 0b87800); the MVP-5 F2 execution-surface re-triage
+executed — 12 of 35 draft/published packages retired to `skills/`
+(operator skills) or `docs/icm/re-homing-record-2026-08-12.md`
+(CLI-verb/engine-gap candidates), landing the 23-package catalog
+`.sergeant/index.md` now lists, plus the R-NS-6 `grilling`/
+`grill-with-docs` dissolution out of the WORKFLOW-IF-E3 category (commit
+774a372); two small pre-existing package defects fixed in passing
+(`validate-and-ship`'s S4 Inputs-table, `repo-to-icm`'s wrong resume verb).
+`#53`/`#57` closed in passing per the MVP-5 plan.
+
+**Gates.** `cargo fmt --check && cargo clippy --all-targets -- -D
+warnings && cargo test` green (re-confirmed at the fixer pass above, which
+touched only docs/content and re-ran the full gate rather than assume the
+milestone commit's own run still held). Leak check clean.
+
+**Deviation/backlog notes.** See backlog rows B7 (`sergeant-setup`'s
+`30-project-interview` duplicating `load-project` rather than delegating
+to it — retriage-flagged, left unresolved by this lane's file scope) and
+B8 (17 `agents-invariant` units this lane's own dispositions document
+initially — wrongly — claimed already had a published skill home; found
+and corrected at the MVP-5 FIXER PASS above).
+
+**Environmental behavior.** Multi-commit content lane (8 commits,
+9bb84fe..774a372) executing a plan (`docs/icm/agents-invariant-
+dispositions.md`'s own provenance note, `docs/icm/retriage-2026-08-11.md`,
+`docs/icm/re-homing-record-2026-08-12.md`) rather than a single fixer
+response; a follow-on panel review (findings closed above) is this
+milestone's fixer-pass discipline, matching every prior milestone's
+two-entry (ship + fixer) ledger shape.
+
+---
+
+### MVP-4 FIXER PASS — 2026-08-12, review findings on the perf re-baseline and the #45 closure
+
+**Mission outcome.** Two warning-severity findings from the review pass over
+`MVP-4 HARDENING`/`baseline-mvp-2026-08-12.md` closed, both by adding real
+evidence rather than by disputing the findings — both were correct as
+stated. Gates green: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, full `cargo test` unaffected (no `src/`/`tests/` change in this
+pass — docs only, so no code-review multi-axis loop applies per CLAUDE.md's
+"code is code" rule, which scopes that loop to diffs that change executable
+behavior). Leak check clean: `pgrep -f "debug/sgt [-]-data-dir"` empty.
+
+**`perf-raw-artifacts-not-committed` (warning) — closed by documentation,
+not by changing the artifact-commit convention.** The finding was right:
+`baseline-mvp-2026-08-12.md` asserted "every number below comes from the
+raw run artifacts" without ever stating that those artifacts are, by
+design, not committed and no longer exist — an asymmetry with
+`docs/coverage/`'s own committed-artifact convention that a reader could
+mistake for an oversight rather than a fact. Investigated before fixing:
+the P1-PERF contract itself specifies raw JSON/CSV live "under the run's
+output dir (not committed)", and `scripts/perf/README.md` requires
+`<outdir>` to live outside the repo tree — so committing raw perf artifacts
+would deviate from both the contract and the harness's own hard constraint,
+which this pass has no standing to change unilaterally. Fixed instead by
+making the convention explicit where the finding says it's missing: a new
+paragraph in `docs/perf/baseline-mvp-2026-08-12.md` states the
+not-committed convention, cites the contract and README lines it comes
+from, names `docs/perf/s2-churn-mvp1-fixer-2026-08-12.md` as the precedent
+for how this repo already handles the same fact (distill numbers, name the
+uncommitted artifact's scratch path), and confirms this run's own raw
+artifacts do not survive on disk (searched, not found) — so the honest
+statement is "transcribed from a since-gone run", not "checkable today".
+**Closed.**
+
+**`45-closed-on-preexisting-pin-no-session-code` (warning) — closed by
+re-measuring, not by disputing the closure.** The finding accepted the
+underlying #45 closure as substantively defensible (the structural pin
+fails on revert; the behavioral pin is real) but flagged that the specific
+"40/40 isolated, 15/15 full-suite" counts cited in the `MVP-4 HARDENING`
+entry had no committed or even scratch-persisted artifact — the wrapper
+scripts that produced them (`stress45.sh`/`stress45_full.sh`, found intact
+in this session's scratchpad) print to stdout only, and nothing captured
+that stdout at the time. Rather than take the prior claim on faith or
+merely soften the ledger's wording, this pass re-ran the identical method
+(16-way busy-spin background load on the 20-core host, same two commands)
+fresh, this time capturing output to `th45-reverify/isolated-40.log` and
+`th45-reverify/full-suite-15.log` (scratch, per this repo's own
+artifact-commit convention — see the previous finding). Result: **40/40
+isolated runs, 15/15 full-suite runs, 0 failures**, matching the original
+claim's shape exactly. Full write-up with method, counts, and the scratch
+artifact paths: `docs/gauntlet/notes/45-reverify-mvp4-fixer-2026-08-12.md`.
+Hygiene confirmed clean after: no leaked daemons, no leftover spin
+processes. **Closed** — #45's closure now rests on a number this session
+itself measured and can point to, not an inherited, unrecorded one.
+
+**Environmental behavior.** Direct fixer pass over two review findings, no
+panel/critic loop (docs-only diff, no executable-behavior change to
+gauntlet against CLAUDE.md's "code is code" scope rule). Both findings
+were investigated to their contractual root before fixing — neither was
+rejected, but neither was "fixed" by simply agreeing with the finding's
+framing either: the perf-artifact finding's proposed remedy (commit raw
+artifacts) would have contradicted the P1-PERF contract and the harness's
+own README, so the fix instead makes the existing, correct convention
+legible where it was previously assumed; the #45 finding's remedy (produce
+a checkable number) is exactly what was missing, so it was produced by
+re-running the measurement rather than retroactively excusing its absence.
+
+---
+
+### MVP-4 HARDENING — 2026-08-12, #45 (m6 dropped-daemon flake) closed by measurement, #22 (workspace-edge tests) closed with a real bug found and fixed
+
+**Mission outcome.** Both of MVP-4's named hardening items closed. Gates
+green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+full `cargo test` (536 passed, 4 opt-in ignored, 0 failed, across the lib +
+8 integration suites) all clean after the final commit. Leak check clean:
+`pgrep -f "debug/sgt [-]-data-dir"` empty. Repeated-run gate (L7 corollary):
+`tests/m3_execution.rs`, the `runtime::surface` lib module, and
+`tests/m6_surfaces.rs` each run 10/10 clean; the two m6 dropped-daemon
+composition tests specifically also run 40/40 (isolated) and 15/15 (full
+suite) clean under sustained 16-way CPU contention — see #45 below.
+
+**#45 (m6 dropped-daemon composition flake): root cause was already fixed on
+this branch, before this session — closed by fresh measurement, not new
+code.** The issue's own suspicion ("possibly the #26 startup-window class")
+was correct: `run_until_signal` used to install its SIGTERM/SIGINT handlers
+*after* `start_with` published the runtime descriptor, leaving a window —
+descriptor write to handler install — in which SIGTERM's default
+disposition simply killed the process: no `daemon.stopped`, no journal, a
+descriptor left pointing at a dead pid. That is exactly the wave-3 shape
+("the daemon's pid was already dead while `runtime.json` remained").
+Commit `439e218` (Cerberus, 2026-08-11, dated *after* #45 was filed but
+*before* this session and already an ancestor of this branch's `HEAD`)
+moved handler installation to the first act of `run_until_signal`, before
+the listener binds and before anything publishes, and pinned the ordering
+structurally with `the_daemon_installs_its_signal_handlers_before_it_
+publishes_anything` (byte-offset assertion on `daemon.rs`'s own source, not
+a flake-rate measurement — a future regression fails deterministically, not
+~2.5%-of-runs). This session's contribution is verification, not the fix:
+`the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown`
+(the behavioral pin) and the full `m6_surfaces` suite were run repeatedly
+under artificial load matching the issue's own repro method (16-way busy-spin
+on this host's 20 cores) — 40/40 isolated runs and 15/15 full-suite runs,
+0 failures, no reproduction of either the wave-1 or wave-3 shape. Combined
+with the wave-3 fixer's own pre-fix census (0 reproductions in 10 runs + 3
+isolated m6 runs — the bug was already rare pre-fix), this is enough
+evidence to close rather than merely "not reproduced yet": the mechanism is
+understood, the fix addresses that exact mechanism, and it is pinned
+structurally so a regression cannot silently reopen the window.
+**Closes #45.**
+
+**#22 (workspace discovery edge cases): the discovery-only fixtures
+R-MVP1-12 already landed (`src/domain/workspace.rs`) were extended to the
+"remaining, non-discovery edges" the MVP-1 contract explicitly deferred
+here — full daemon/API flow (correct binding record, work completes,
+teardown clean), per the issue's own proposed shape. Four new
+`tests/m3_execution.rs` acceptance tests: `t9` (a repository with a
+submodule), `t9b` (the *source* repository is itself a git worktree, not a
+main checkout), `t9c` (a symlinked repository root), `t9d` (a path with a
+space and a non-ASCII character). The worktree-as-source and symlinked-root
+shapes needed no code change — `materialize`/`teardown` already run every
+`git` invocation with `cwd` set to whatever `repository.path`/
+`binding.source_path` resolve to, and git itself correctly resolves the
+shared common dir from a linked worktree, so both already worked; the tests
+close the "untested" half of the issue honestly, without inventing a defect
+that was not there.**
+
+**The submodule shape surfaced a real, previously-unknown bug, in two
+parts, both fixed:**
+1. `git worktree add` (what `materialize` already used) checks out the
+   superproject's gitlinks but never populates a submodule's own content —
+   that is `git submodule update`'s job, and nothing called it. A
+   repository with a submodule silently materialized a surface with an
+   empty submodule directory: not a refusal, not a warning, just content
+   the rest of a run expected and did not have. Fixed:
+   `init_submodules_if_present` (`src/runtime/surface.rs`) runs `git
+   submodule update --init --recursive` after `add_worktree` whenever the
+   checked-out worktree has a `.gitmodules`, using the identical transport
+   allowlist (`file:http:https:ssh:git`) `git_clone` already uses for a
+   `sgt repo add --origin` — a submodule URL is exactly as untrusted, and
+   this is a widened *permission* (matching an existing precedent), never
+   an unbounded one. Pinned by
+   `runtime::surface::tests::a_submodule_is_populated_into_the_
+   materialized_worktree` (unit) and `t9` (end to end through the daemon);
+   revert-probed (reverting to a no-op strands the test on a missing file
+   with `NotFound`, confirmed by hand before landing the real fix).
+2. **Found while writing the *positive*-path test, not the negative one —
+   the more dangerous kind of gap.** Wiring the submodule step into
+   `materialize_one` (before restructuring, below) reintroduced exactly the
+   class of bug `materialize`'s own partial-failure rollback exists to
+   prevent: a failure *after* `add_worktree` already created a real
+   worktree, on the *first* (and, in the single-repo case, only)
+   repository, hit `materialize`'s `if bindings.is_empty() { return
+   Err(err) }` special case — which assumed, correctly until this change,
+   that nothing to roll back could exist yet on repository 1. It stopped
+   being correct the moment a post-checkout step could fail after a real
+   worktree existed. Fixed: `materialize`'s loop now runs
+   `init_submodules_if_present` on the binding `materialize_one` already
+   produced and folds that binding into the rollback set *before* deciding
+   whether anything needs tearing down, regardless of the repository's
+   position in the list — a submodule failure on repository 1 of 1 gets
+   the exact same recorded `SurfaceError::PartialFailure` + teardown report
+   a later repository's failure always got, never the silent, unrecorded,
+   un-journaled strand the naive wiring produced. Caught, not merely fixed
+   blind: `a_submodule_is_populated_into_the_materialized_worktree` failed
+   first with git's own "working trees containing submodules cannot be
+   moved or removed" once step 1 above worked — teardown's plain `git
+   worktree remove` turned out to refuse *any* submodule-bearing worktree
+   unconditionally, clean or not, which would have leaked one worktree per
+   successfully completed submodule-bearing work, forever. Fixed as its own
+   third part: `teardown_binding_locked` retries with `--force` exactly
+   when git's refusal names "containing submodules" — safe only because
+   the existing `git status --porcelain` cleanliness check just above it
+   already recurses into a registered submodule by default (measured, not
+   assumed: an untracked file, a modified tracked file, and an advanced
+   submodule `HEAD` all report as `M <path>` at the superproject level), so
+   reaching the force-retry at all already means nothing uncommitted exists
+   to destroy. A fourth test,
+   `a_dirty_submodule_still_blocks_teardown_despite_the_force_retry`, pins
+   that real uncommitted submodule content still blocks removal — proving
+   the force-retry path is unreachable for that case, not merely untested.
+   A fifth, `a_disallowed_submodule_transport_fails_closed_and_is_not_
+   stranded`, pins the fail-closed contract itself: a submodule over a
+   transport the allowlist refuses (`ext::`, instant and deterministic, no
+   network) fails materialization with the rolled-back-and-reported shape,
+   not a bare unrecorded error. All five new `runtime::surface` unit tests
+   plus `t9` were confirmed load-bearing by reverting the fix locally and
+   observing the expected failures before restoring it (L7).
+**Closes #22.**
+
+Both fixes are scoped narrowly and documented against what they
+deliberately leave alone: `rematerialize` (the retry re-attach path) also
+now re-initializes submodules for symmetry, but a failure there still
+propagates through `settle_rematerialize`'s pre-existing `Err(e) => return
+Err(e.into())` arm as an engine error rather than a journaled `blocked`
+state — true of *every* git failure on that path already, not a gap this
+change opens, and left alone rather than folded into this pass (noted on
+`rematerialize`'s own doc comment, not silently).
+
+**Environmental behavior.** No panel/critic loop run for this pass — direct
+build-and-verify against the two named issues, per the task's own scope (a
+Sonnet-executed hardening pass, not a milestone contract). Real bug found
+and fixed came from writing the *positive*-path test for #22's submodule
+shape first, not from hunting for one — worth naming as a pattern: the
+happy-path test found what the sad-path test alone would have missed twice
+over (empty-submodule-directory, then the teardown refusal it exposed).
+
+---
+
+### MVP-3 FIXER PASS — 2026-08-12, invariants/test-honesty panel findings closed
+
+**Mission outcome.** Fixer pass over the MVP-3 build's review panel: 11
+CONFIRMED findings (`invariants:MVP3-C1`…`C6`, `test-honesty:TH-1`…`TH-5`;
+2 warning, 9 info by severity), 0 PLAUSIBLE. **10 of 11 CONFIRMED touched
+and improved; 1 (TH-5) is a positive-coverage finding needing no
+change.** Nothing silently dropped: every finding below is either fixed
+with a revert-probed test, corrected in documentation, or registered as a
+deliberately deferred backlog item with a named trigger. One real
+correctness bug (duplicate transcript text) was found and fixed while
+building TH-1's closure — not itself a panel finding, so it is called out
+explicitly below rather than folded silently into TH-1's count. Gates
+green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+full `cargo test` (524 tests across the lib + 8 integration suites, 0
+failed, 4 opt-in ignored) all re-run clean after the last commit. Leak
+check clean: `pgrep -f "debug/sgt [-]-data-dir"` empty.
+
+**Warning-severity findings (2 of 2 closed).**
+- **MVP3-C1** — the estate manifest edit pens (`sgt init`/`repo add`/`repo
+  remove`/`group add`/`group remove`) validated every edit by resolving
+  ALL declared `[[repo]]` entries through git, failing closed at the
+  first one missing from disk — so one uncloned repository blocked every
+  *other* manifest edit too, including a freshly `git clone`d estate
+  (`sgt init` gitignores `repos/`), contradicting the design capture's
+  own "wrongness scoped per-entry" contract. Fixed: added
+  `Workspace::from_config_structural` (`src/domain/workspace.rs`) — every
+  schema-level check (legacy vocabulary, duplicate/invalid names, group
+  membership, profile validity) with the on-disk git resolution dropped —
+  and switched `domain::manifest::validate` to it. Pinned by
+  `domain::manifest::tests::a_missing_unrelated_repo_does_not_block_
+  edits_that_do_not_touch_it` (revert-probed: reverting to
+  `from_config_allow_empty` fails it with `RepositoryNotFound` naming the
+  untouched repo).
+- **MVP3-C2** — `sgt run --group`'s client-side expansion had the same
+  coupling: it read group membership through the strict
+  `Workspace::discover_scoped`, so an unrelated missing repository
+  refused the command before a daemon even spawned. Fixed: added
+  `Workspace::declared_groups`/`declared_groups_scoped` (same structural
+  parser) and switched `cli.rs`'s `--group` handling to it. The daemon's
+  own submit-time estate resolution is a separate, pre-existing,
+  *accepted* coupling (matches plain `--repo`, per the B4 register entry)
+  and is deliberately untouched — pinned by
+  `tests/m8_estate_cli.rs::run_group_expansion_itself_survives_an_
+  unrelated_declared_repo_missing_from_disk`, which asserts the daemon
+  actually spawns (proving the client-side refusal is gone) even though
+  the command as a whole still fails on the daemon's own, separate check.
+
+**Info-severity findings (9 of 9 addressed — 4 code-fixed, 2 doc-corrected,
+2 registered to the backlog for owner ratification, 1 needs no change).**
+- **MVP3-C3** — `.sergeant.toml.lock` (never removed by design) and
+  `sergeant.toml.validate-*` (removed on the happy path, left behind on a
+  mid-validate crash) were not gitignored, so `git status` on an
+  initialized estate showed sgt's own runtime scratch as untracked. Fixed:
+  added both to `GITIGNORE_ENTRIES`. Pinned by
+  `domain::manifest::tests::init_writes_every_gitignore_entry` (now
+  asserts every entry in the const, not two hardcoded strings).
+- **MVP3-C4** — the design capture's `[estate] data_dir` field was never
+  implemented (R-MVP1-1 ruled only `surfaces_dir`); a hand-written
+  `[estate] data_dir = "..."` fails closed with a `deny_unknown_fields`
+  parse refusal rather than overriding anything. Not implemented here —
+  new config surface wants explicit ratification, not a silent addition
+  inside a bug-fix pass. Design doc corrected in place ([v3] note,
+  `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`); registered
+  as backlog **B5**.
+- **MVP3-C5** — `sgt run --turns`/`--ceiling-secs` (commit 78e5da9) added
+  genuine new per-Work engine surface (a submit-time envelope override)
+  that R-MVP1-7 specified as daemon-wide only, with no deviation-register
+  entry. Counting integrity was never in question (not a bypass); the gap
+  is process. Kept as shipped (reverting a milestone feature inside a
+  fixer pass is a bigger unilateral move than registering it); registered
+  as backlog **B6** for owner ratification at MVP-3's own adjudication.
+- **MVP3-C6** — the manifest module's own doc claimed the advisory lock
+  makes "two concurrent editors serialize rather than tearing," but the
+  only test exercising that (`concurrent_repo_adds_do_not_lose_an_entry`)
+  uses two threads in one process, which take the wait-and-retry path
+  because the lock is already in that process's own `SELF_LOCKED` set —
+  two real `sgt` processes never share it, so the real cross-process
+  outcome is fail-closed refusal, not a queue. Fixed: corrected the
+  module doc, and added
+  `tests/m8_estate_cli.rs::two_real_sgt_processes_racing_repo_add_
+  serialize_dont_tear`, which holds the lock file itself (a genuinely
+  different process/file-description) and drives a real `sgt repo add`
+  against it — proving the documented refusal, its exact message, and
+  that a retry after release succeeds.
+- **TH-3** — the m8 transcript test's guard-map claimed to prove `sgt
+  work transcript` "decodes a completed work's conversation," but the fake
+  backend never produces a turn, so only the empty-conversation rendering
+  was ever checked. Fixed: corrected the guard-map to state what is and
+  is not covered, pointing at TH-1's new real test for the blob-decode
+  half.
+- **TH-4** — `daemon_stop_drains_admission_and_exits_cleanly`'s mutation-
+  kill list claimed to catch "the drain step never actually calling
+  `/v1/admission/pause`," but nothing in the test submits work
+  concurrently with a slow drain to observe that refusal — the claim was
+  false. Fixed the doc to say so honestly, and named what a real fix
+  needs (a scripted `SGT_FAKE_SCRIPT=hang` in-flight turn plus a
+  concurrent submit racing a backgrounded `sgt daemon stop`) rather than
+  building it inside this `info`-severity item's effort budget — left
+  open, not silently claimed.
+- **TH-5** — a positive-coverage finding (Q1/Q4 largely satisfied for the
+  m8 suite's non-transcript/non-concurrency pins). No change needed;
+  confirmed by inspection during this pass.
+
+**TH-1 (warning) — the biggest single item, plus a bonus fix found while
+closing it.** No test spanned producer (`backend::claude`'s
+`TurnReader`) → journal → `transcript_turns`'s blob-decode fallback; the
+only coverage fabricated both the `Event` and its payload by hand, so a
+producer-side rename of the `raw`/`result_envelope` payload keys would
+silently break recovery in production while both test suites stayed
+green. **While building the real e2e closure, found and fixed a genuine
+duplicate-reporting bug**: `ingest_line` emits `conversation.assistant.
+completed` for any complete, successfully parsed assistant text line —
+independent of whether the turn later gets a `result` line — so an
+ordinary interrupted turn that streamed text before being killed hit
+`transcript_turns`'s blob-decode branch too (gated only on
+`result_envelope`), reporting the same text twice. Fixed:
+`transcript_turns` now tracks, per `execution_id`, whether `conversation.
+assistant.completed` already reached the journal since that execution's
+last turn boundary, and skips the blob-decode fallback when it has —
+scoped so a *different* execution's archive is still recovered
+independently. Pinned by two new unit tests
+(`transcript_turns_never_double_reports_text_the_live_event_already_
+carried`, `transcript_turns_still_recovers_a_different_executions_
+archive`). The e2e closure itself —
+`transcript_turns_recovers_a_real_producers_text_across_a_simulated_
+adjacent_append_loss` (`src/api.rs`) — drives a real `ClaudeBackend`
+against a scripted `claude` CLI, converts its real `EventDraft`s into
+real journaled `Event`s exactly as `daemon::journaling_sink` does, but
+deliberately drops `conversation.assistant.completed` to model CLAUDE.md's
+own "adjacent-append crash window" (the one scenario in which the blob
+archive is not simply redundant with the live event, per the dedup fix
+above) — then calls the real `transcript_turns`. Revert-probed by hand:
+renaming the consumer's `raw` key read to `raw_x` (simulating a producer
+rename gone unnoticed) fails this test immediately; reverted after
+confirming.
+
+### MVP-2 D3 FIXER PASS — 2026-08-12, N4/M7 panel findings closed
+
+**Mission outcome.** Fixer pass over the N4 (Docker executor) build's
+review panel: 26 CONFIRMED findings (12 `invariants:INV-R1-*`, 14
+`test-honesty:TH-*` — 10 error, 10 warning, 6 info by severity), 0
+PLAUSIBLE, 4 mutation-probe SURVIVORS. **19 of 26 CONFIRMED touched and
+improved** — 14 fully closed as originally scoped, plus 5 explicitly
+scoped as partial closes (INV-R1-02, INV-R1-07, INV-R1-09, TH-07, TH-08)
+with the remaining ask named per finding below; **all 4 SURVIVORS
+strengthened**, each re-verified by re-executing its named mutation
+against this pass's own fix in a disposable worktree outside the tree
+(L5/L7) — every one now fails where it previously passed. **7 CONFIRMED
+findings investigated and left untouched**, named individually below with
+reasoning — nothing silently dropped. Gates
+green: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+full `cargo test` (496 tests, 0 failed, 4 opt-in ignored) all re-run
+clean after the last commit. Leak checks clean after the full suite:
+`pgrep -f "debug/sgt [-]-data-dir"` empty; `docker ps -a --filter
+label=io.sergeant.managed=true` empty.
+
+**Error-severity findings closed (5 of 10 — INV-R1-01, INV-R1-04, TH-01
+[covered under Survivors below], TH-02, TH-05; INV-R1-02, INV-R1-03,
+INV-R1-05, TH-03, TH-04 deferred, see below). TH-11 (warning) bundles
+into the INV-R1-04 bullet below since one fix closes both.**
+- **INV-R1-01** — `DockerBackend::stop`'s Docker Engine calls (`docker
+  inspect` + `docker rm -f`, measured ~40-70ms) ran synchronously under
+  the core lock via `Engine::stop_execution`, violating N4's own acceptance
+  gate verbatim. Fixed: the whole inspect+label-check+remove interaction
+  now runs as `Completion`'s deferred tail work (the same "kill now, join
+  later" split `ClaudeBackend::stop` already uses), so nothing Docker-side
+  runs under the lock. Pinned by a nonexistent-`docker_bin` unit test (the
+  call itself must not shell out) and a real-Docker test proving the
+  container survives until `.wait()` runs. `tests/m6_surfaces.rs` t11's
+  whitelist rationale, previously written only about the Claude adapter,
+  now names both backends' reviewed in-lock behavior.
+- **INV-R1-04 / TH-11** — §16.8, a contract-named Unknown never measured:
+  containers ran as image-default root, leaving root-owned files (and
+  *un-removable root-owned directories*, stronger than the finding's own
+  claim) in the user's worktree. Fixed: `--user <uid>:<gid>` sourced from
+  the mounted worktree's own host owner. Pinned by a real-Docker test
+  asserting both file and directory ownership, and that the host user can
+  actually `rm` what the container created. `docs/environments/cerberus.md`
+  now carries the measurement N4's Unknowns section required.
+- **TH-02** — m6 t3's "every doctor check must be `ok`" assertion silently
+  became Docker-reachability-dependent (measured: `warn` with no docker on
+  PATH), the exact probe-gating failure N4.md names for the GH
+  runner/cloud container — and `docker_check`, unlike `claude_check`, had
+  no `SGT_CLAUDE_BIN`-equivalent override to probe-gate it with. Fixed:
+  added `SGT_DOCKER_BIN` (`DockerConfig::new` honors it, mirroring
+  `CLAUDE_BIN_ENV`); threaded a scripted `docker` stub through every
+  `doctor()` call in the suite. Measured the fix directly (not just via
+  the test): `warn` without the override, `ok` with it, on the same
+  docker-less PATH.
+- **TH-05 / SURVIVOR 2** — §17.5's execute-stage submit preflight
+  (`ExecuteBackendUnavailable`) had zero tests despite the injection point
+  (`DaemonConfig::docker`'s scripted `docker_bin`) already existing and
+  being documented for exactly this. A mutation that swallows the routing
+  error and falls back to actor routing survived the whole suite. Fixed
+  with a test needing no live Docker: submits a `kind = "execute"`
+  workflow against a daemon whose docker backend cannot be routed to,
+  asserts 422/`execute_backend_unavailable`, no Work, no `surfaces` dir.
+  Mutation re-executed in a disposable worktree: without the fix the same
+  submission completes end to end (201) with the stage silently routed to
+  the fake actor backend.
+
+**Warning-severity findings (10 total; TH-11 already counted above as
+part of the INV-R1-04 bullet). 5 of the remaining 9 fully closed
+(INV-R1-06, INV-R1-08, TH-06, TH-09, plus TH-11 above), 4 explicitly
+partial (INV-R1-07, INV-R1-09, TH-07, TH-08 — TH-08's crash-injection
+half stays open, see Deferred), TH-10 untouched (see Deferred).**
+- **INV-R1-06** — §16.3's "a version ping proves only that something
+  answered" was not what `sgt doctor` shipped: `docker_check` called only
+  the cheap `probe()`; `DockerBackend::lifecycle_probe` (the real
+  bind-mount round trip) was dead code the module doc falsely claimed was
+  already wired in. Fixed: `docker_check` now runs the lifecycle probe
+  whenever the cheap ping succeeds and folds a failed round trip into
+  `Warn` with real evidence. Measured against real Docker on this host:
+  `"Docker Engine 29.7.2; bind-mount round trip confirmed"`, <1s added.
+- **INV-R1-07 (partial: 2 of 17 named tests + the ownership gap already
+  closed above via INV-R1-04).** Added `a_mount_path_containing_a_space_
+  round_trips_correctly` (test 2) and `a_launched_container_carries_no_
+  isolation_escape_hatches` (test 6 — the negative isolation posture
+  `create_container`'s own comment claims, never inspected on a real
+  container: exactly one mount, no `docker.sock`, not privileged, no
+  added capabilities, no devices). **Still open**: tests 1 (API
+  negotiation + server/platform evidence), 7 (mutable tag resolves to the
+  *journaled* identity, tied to INV-R1-05 below), 11/12 (restart-while-
+  running / restart-after-exit), 16 (pull-failure/registry-auth sanitized
+  evidence), and all of §22.9 (image/cache pressure) — see Deferred.
+- **INV-R1-08** — `observe()` pays for a full log capture (blob writes)
+  unconditionally on any exited container, even from restart
+  reconciliation's `reserved_identity_liveness`, which reads only
+  `.native` and discards the rest. Fixed: added `Backend::observe_liveness`
+  (default impl delegates to `observe`, correct as-is for fake/Claude);
+  `DockerBackend` overrides it to classify liveness without ever calling
+  `capture`. Pinned by a real-Docker test counting blob-store files
+  before/after both calls (liveness: no growth; full observe: growth).
+  Mutation (fall back to the default) re-executed in a disposable
+  worktree: the new test fails against it.
+- **TH-06** — the commit's explicit claim that `ExecuteSpec` participates
+  in `WorkflowDefinition::content_hash` had no test; deleting
+  `execute: s.execute.as_ref()` left the suite green. Fixed: added a case
+  to the existing hash test (two workflows differing only in an execute
+  stage's pinned image must hash differently). Mutation re-executed: fails
+  without the line.
+- **TH-07 (partial: the RSS-adjacent disk-cost measurement, not the
+  no-orphan-blob half).** [Rule B] names two acceptance items; only the
+  first ("measure blob disk cost beside §22.8's RSS budget") is closed —
+  the large-output test now also asserts the blob store grew by the
+  expected amount on disk. Fixture bug found and fixed in passing: stdout
+  and stderr previously wrote *identical* content, and the content-
+  addressed blob store correctly deduplicates that into one blob, which
+  would have failed the new assertion against a store working exactly as
+  designed. The second half ("no blob is written without a journal ref
+  naming it") is not pinned — see Deferred.
+- **TH-09** — `resume: true` is advertised (L8) but only its negative row
+  (missing container) was tested. Added a test driving both untested
+  rows: a live labeled container is re-adopted (`Ok(())`), a foreign one
+  under the deterministic name is refused.
+- **INV-R1-09 (partial: log-visible disclosure only).** D2's
+  `--setting-sources user,project,local` translation for `instructions =
+  "local"` authorizes repo-authored hooks/tool-permissions/MCP config —
+  "a materially larger risk than 'reads a text file'" by the adapter's
+  own measurement note — and the submit-time refusal that gated this on
+  an unmeasured claim was removed with no replacement operator signal.
+  Closed the log-visibility slice: `check_instruction_policy` now emits
+  `tracing::warn!` naming the repos and the widened surface. **Not
+  closed**: a first-class operator signal (doctor row, manifest
+  vocabulary) — see Deferred. Not test-pinned (a tracing-log-only change);
+  verified manually instead — a real `sgt run` against an `instructions =
+  "local"` manifest with `RUST_LOG=warn` produces exactly this line in
+  the auto-spawned daemon's `daemon.log`.
+
+**Info-severity findings closed (4 of 6 — INV-R1-10 and TH-14 deferred,
+see below).** INV-R1-12 (`--mount`'s CSV grammar (`,`/`=`-delimited)
+built by string interpolation from the worktree path; a `,`/`=`-bearing
+path splits into a malformed mount, measured — refused closed before
+image resolution, so the refusal needs no live Docker; pinned by a unit
+test with a nonexistent `docker_bin`); INV-R1-13 (`ResumeRequest.
+instruction_policy` widened to `Option`, matching its own doc's "not
+re-supplied" contract — `model`/`profile` were already `Option`, this
+field was the odd one out); TH-12 (the network-isolation test only
+discriminates on a host with egress; added a positive control — the same
+command over the default network must actually reach out first, or the
+test skips loudly rather than reporting a meaningless pass); TH-13 (the
+exit-mapping test's two fixtures paired neutral stdout with a matching
+exit code, so a stdout-scraping implementation would have passed too;
+added adversarially-paired cases, and fixed a latent bug the new cases
+exposed — the failure-arm assertion was hardcoded to exit code `7`
+regardless of which case was running).
+
+**Survivors, all 4 strengthened and mutation-reverified.**
+1. `large_captured_output_does_not_grow_this_process_proportionally`
+   (TH-01's own test) — same fix as TH-01 above (`VmHWM` not `VmRSS`).
+2. The execute-preflight swallow — same fix as TH-05 above.
+3. `latest_ask_withdrawal_version_picks_the_highest_seq_matching_event` —
+   its "out of order" case put the highest-seq record first in iterator
+   order, so "take the highest seq" and "take the first match" gave
+   identical answers; added the mirrored ordering (highest seq last).
+4. Composition probe C2 — `observe()`'s §16.10 identity check exists in
+   code but no test ever drove OBSERVE (only LAUNCH) against a container
+   occupying the deterministic name under foreign labels. Added
+   `observe_on_a_foreign_container_under_the_deterministic_name_fails_
+   closed`, forging a handle against a pre-created unlabeled container.
+
+**Deferred/partial (5 partial closes + 7 fully untouched — 12 CONFIRMED
+findings total, all investigated, none closed as originally scoped,
+named individually so nothing is silently dropped).**
+- **INV-R1-02 / TH-08 (partial)** — both named the §22.5 crash-injection
+  matrix over the Docker lifecycle (all create/start/exit/cancel windows)
+  and §22.6 lock-discipline coverage for Docker. The lock-discipline half
+  is now addressed (INV-R1-01's fix + the m6 t11 whitelist comment update
+  above); the crash-injection matrix itself — killing a daemon
+  mid-Docker-lifecycle and asserting recovery, the same shape m4's
+  `n10`-`n18` fixtures already build for the Claude/fake backends — is
+  real, substantial harness work (a daemon-kill rig driving real
+  container state) not attempted in this pass.
+- **INV-R1-03** — §16.11's "reserved, no recorded ID / one exact
+  name+label match → adopt" row is unimplemented:
+  `reconcile_unsettled_reservation` returns `Ambiguous` unconditionally
+  and never reaches Docker's own stronger evidence (name+label match).
+  Closing this means teaching engine-level restart reconciliation a
+  Docker-specific adoption path without leaking Docker knowledge into the
+  generic engine (§13.2) — an engine-level design change, not a local
+  fix, deferred to a build pass rather than attempted piecemeal here.
+- **INV-R1-05** — the image pin (`<data_dir>/docker-adapter/image-pins/`)
+  is the retry decision's actual source of truth but lives outside the
+  journal, best-effort-written, with no rebuild-from-journal path — a
+  real journal-only-truth gap. Fixing it properly (rebuild the pin cache
+  from `execute.image_resolved` events at startup, or make the pin write
+  itself journaled and synchronous before `docker start`) is a
+  daemon-startup-path change with its own crash-window analysis (L6)
+  this pass did not have room to do carefully.
+- **INV-R1-07 (remainder)** — tests 1, 7, 11, 12, 16 and all of §22.9;
+  see the partial-close note above for which two of seventeen landed.
+- **INV-R1-10** — `capture: "complete"` is asserted on any successful
+  `docker logs` read with no check of the container's own
+  `HostConfig.LogConfig`; a rotating `json-file` driver or `--log-driver
+  none` would misreport truncated/unavailable logs as complete. Fix is a
+  driver check at create time or a named `"truncated"`/`"driver_
+  unsupported"` outcome — not attempted.
+- **TH-03** — the suite's only environment gate is `docker version`; on a
+  host with Docker but no registry egress (the cloud container N4.md
+  names explicitly) every container-creating test fails hard instead of
+  probe-gating via a Sergeant-owned static (`FROM scratch`) probe image.
+  Cerberus itself has open egress, so this gap does not bite locally;
+  building and vendoring a static probe image plus an image-availability
+  gate is real work not attempted here.
+- **TH-04** — the `local` instruction policy's shipped
+  `--setting-sources user,project,local` value is asserted against a
+  stub, never measured against the real installed Claude CLI (no
+  `#[ignore]`/`SERGEANT_CLAUDE_TESTS` test drives a Local-policy turn).
+  Fixing this means spending real tokens against the live CLI, which — per
+  the MVP-1 fixer pass's own precedent (its I2) — a fixer pass does not
+  authorize itself; left for a session with owner-approved token spend.
+- **TH-14** — N4's "first real execute stage"
+  (`.sergeant/workflows/repo-to-icm/workflow.toml`'s `65-self-check`) is
+  validated only by a hand-run `docker run` recorded in a commit message;
+  no automated test loads and actually executes it (the automated m7
+  proof uses a synthetic `mixed-proof` workflow instead). Building this
+  properly means a test that materializes the real repo-to-icm workflow
+  and runs its execute stage end to end — moderate effort, not attempted
+  in this pass.
+- **TH-10** — R-H0-7's fake-fidelity work (`FakeBackend::settle_as`, the
+  interrupt-vs-terminal-signal fix) is pinned only by in-module unit
+  tests; `settle_as` has no caller outside its own test and the interrupt
+  fix has no engine-level consumer, so no test demonstrates either shape
+  ever changes an engine outcome. Needs an engine-level test built around
+  a scripted fake that would produce a different result with vs. without
+  the fix — not attempted; the underlying R-H0-7 bug fix itself is not in
+  question, only this coverage gap.
+
+**Evidence.** Every closed finding's commit (`git log --oneline
+fec2e3c..4e3f625` — 14 commits over this pass) carries its own
+measurement transcript, mutation re-execution, or manual-verification
+transcript inline; not restated here. `docs/environments/cerberus.md`
+gained the §16.8 measurement row N4.md's Unknowns section required.
+
+### MVP-1 SHIPPING GATE — 2026-08-12, passed (22→4→0); as-run note
+
+no-mistakes over the full MVP-1 diff: 22 findings, 12 fixed (headline:
+terminal-run replay under the CoreGuard past the 512 cache; the ceiling
+interrupt gaining §14.5 staleness discipline + its L7 pin on the gate's
+own insistence), 10 accepted as documented trades. Self-hosting
+checkpoint passed pre-gate: #50 fixed via a sergeant Work (2 turns of a
+12 cap; fix verified by independent reproduction; evidence in
+docs/gauntlet/runs/mvp1-selfhost/). As-run provenance note: the gate's
+fix round edited resources/n-series/mvp1-build.js (axis-misalignment
+correction) AFTER that script's run — the file carries a post-run
+correction marker; the version that drove the build is the parent of
+the fix commit. Owner ruling applied mid-pass: dollar figures are
+telemetry only, never guards — all bounds speak turns/wall-clock.
+
+
+### MVP-1 FIXER PASS — 2026-08-12, panel findings closed (I6)
+
+**Mission outcome.** Fixer pass over the MVP-1 build-panel review: 20
+CONFIRMED findings, 1 PLAUSIBLE, 1 mutation-probe SURVIVOR — every one closed
+or refuted with evidence, nothing silently dropped. Gates green (`cargo fmt
+--check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, repeated
+across runs, not single-run — L7); `pgrep -af "sergeant-rs/target/debug/sgt
+[-]-data-dir"` empty after every commit in this pass.
+
+**Errors closed.** E1 (`DEFAULT_TURN_CAP` 6→12, evidence-grounded in this
+repo's own longest admitted workflow's stage count, plus a real production
+config surface — `DaemonConfig::turn_cap`/`SGT_TURN_CAP`, the same pattern
+`turn_ceiling`/`surfaces_root` already use); E2/TH-02 (R-MVP1-2's shared
+finalize helper generalized to `.sergeant/lib/finalize.py`, repo-to-icm's own
+copy now a thin back-compat wrapper, R-MVP1-2's own L7 pin now has a real
+test); E3 (R-MVP1-10's exit door for the envelope-exhausted landing —
+`Engine::extend_turn_envelope`, `KIND_TURN_ENVELOPE_EXTENDED`,
+`POST /v1/work/{id}/extend`, `sgt extend` — `retry` alone was a revolving
+door; `extend` then `retry` now genuinely reopens the room).
+
+**Warnings closed.** W1/W2/TH-01/TH-09 (the fleet view — `GET /v1/work` —
+bypassed R-MVP1-9's re-derivation entirely for evicted works, and the
+re-derivation path itself replayed the *whole* journal per view; both fixed
+by a bounded (`TERMINAL_RUN_CACHE_CAPACITY = 512`), LRU-evicted
+`WorkRegistry::terminal_runs` cache populated at eviction time — flat under
+churn beyond its own bound, unlike an unbounded cache would be); W3
+(`SGT_SURFACES_DIR` now actually read, `Engine::with_surfaces_root` had zero
+production callers before this); W4 (the estate-discovery upward walk now
+bounded at an explicit `--data-dir`/`SGT_DATA_DIR` scope too, not only
+`$HOME`); W5 (a legacy-vocabulary or malformed `sergeant.toml` the walk steps
+over on the way up now fails the whole walk closed, matching R-MVP1-3's named
+refusal, instead of being silently skipped); W6 (`due_interrupts`'s doc
+corrected — it is not side-effect-free, it destructively dequeues — and the
+driver's interrupt-delivery loop no longer abandons an already-dequeued entry
+on a shutdown race); W7 (doc-only: the AGENTS.md identity hash is measured
+true only for `local`, which cannot currently reach a launch — `suppress`,
+the shipped default, hashes a file the adapter does not read); W8 (`sgt work
+show`'s human form now renders `output`/`teardown`, previously dropped by
+cli.rs's own key whitelist).
+
+**Info findings closed.** I1 (folded into E1 — the new default is evidence-
+grounded, not measured against live N-series turns; that gap is named
+honestly in the constant's own doc and here); I2 (addendum to
+`docs/gauntlet/notes/multirepo-measurement-2026-08-11.md`: its stated blocker
+is gone now that R-MVP1-7 has landed, but the actual real-Claude re-measure
+was not run in this pass — spending real tokens is not something a fixer
+pass authorizes itself); I3 (`IntentDetail::is_empty`, previously dead code,
+now normalizes an empty `intent_detail: {}` to absent at submit;
+`group`'s non-validation documented in place as R-MVP1-5(b)'s own scope, not
+a gap); I4 (`run_is_settled` gained the third eviction-safety condition —
+`surface_plan` recorded but `surface` not yet materialized — closing the
+cancel-during-materialize race the doc already claimed was covered); this
+entry (I6 — the ledger entry and evidence trail I6 itself named as missing).
+I5 (PLAUSIBLE) investigated: found and reaped a real, currently-running
+orphan daemon on this host (`sgt daemon --data-dir /tmp/sgt-demo-*`, PPID 1,
+its own data dir already deleted) — confirms the underlying concern
+(build-lane daemons do leak on this host) with independent evidence, though
+not the specific PID/path originally reported. Worth flagging structurally:
+this daemon's argv (`sgt daemon --data-dir <dir>`, subcommand before the
+flag) does not match the mandated bracketed leak-check pattern
+(`sgt [-]-data-dir`, which assumes the flag immediately follows the binary
+name) — a real blind spot in that convention, not fixed here (out of this
+pass's scope; flagged for whoever owns the housekeeping loop next).
+
+**Test-honesty findings closed.** TH-01/TH-02/TH-09 above; TH-03 (a standing
+hygiene gate — `no_committed_sergeant_toml_outside_reference_carries_
+legacy_vocabulary` — replaces the one-time manual grep R-MVP1-3's pin relied
+on); TH-05 (the ceiling test's budget was 37x its own claimed bound, and its
+`outcome.requested` assertion was vacuous on both `settle_interrupt` arms —
+both fixed); TH-06 (the `grilling` declaration pin now uses
+`CARGO_MANIFEST_DIR`, fails closed instead of silently `SKIPPED`ing outside
+the checkout root); TH-07 (the R-MVP1-1 in-checkout guard test now names the
+actual refusal diagnostic instead of a bare state check, and
+`surface.planned`'s own `root` is pinned); TH-08 (`scripts/perf/s2-churn.sh`
+actually run, for real, against this pass's own W1/W2 fix —
+`docs/perf/s2-churn-mvp1-fixer-2026-08-12.md`; decelerating per-wave RSS
+slope, not the pre-eviction monotonic climb, real fds, clean hygiene sweep;
+time-boxed to 60 works, not the full 200-work contract cell, named as such);
+TH-10 (widened the settle margin
+in the real-backend-refusal fault test — a genuine, not merely theoretical,
+scheduling race with the completion driver); TH-11 (R-MVP1-11's refusal now
+pinned through a real HTTP submit, matching its R-MVP1-4 siblings); TH-12
+(`intent_detail.repos`'s intentional inertness when `repositories` is absent
+now has a test in each direction); TH-13 (two broken intra-doc links fixed).
+
+**SURVIVOR strengthened.** `no_estate_anywhere_falls_back_to_zero_config_
+unchanged`'s own fixture now includes a non-estate `sergeant.toml` above
+`root`, so the named mutation (the estate-table check dropped from the
+walk's match predicate) actually reaches a file and the test now kills it —
+verified directly, not merely re-attributed to the sibling test that already
+caught it.
+
+**What this pass did not do.** A live-Claude re-measure for I2 (see above);
+retrofitting every admitted workflow's own closing stage to invoke the
+shared finalize helper (E2's own boundary: "Owner: workflow content" per
+R-MVP1-2 itself — core's job was the shared helper and the pointer, both
+done); a dedicated deterministic regression test for W6's shutdown-drop
+race specifically (fixed and verified by code inspection — the only
+`closing` check that could discard an already-dequeued interrupt is the one
+removed — but a reliable timing-controlled test for it was judged not worth
+the flakiness risk, TH-10's own class of hazard). B4 (the backlog row for
+R-MVP1-10's *pending*-origin landing) is untouched by this pass's E3 fix,
+which closed the *envelope-exhausted* landing specifically — B4 remains
+open, its own trigger unfired.
+
+**Deviation note (R-MVP1-2 / NORTH-STAR).** Already self-documented at
+`NORTH-STAR.md`'s own amendment line (2026-08-11, "R-MVP1-2 held:
+promote/finalize EXECUTION is workflow content... only the pointer is
+core") per that document's own "amended in place with a dated entry"
+convention — not duplicated into this file's deviation register, which is
+scoped to departures from `reference/proposal-depot-rust-execution-surface.md`
+specifically, a different governing document. The schema break (R-MVP1-3's
+`[workspace]`/`[[repository]]` → `[estate]`/`[[repo]]` rename) is likewise
+self-evident from the migration itself (`WorkspaceError::LegacyVocabulary`,
+the fixtures, TH-03's new standing gate above) rather than a second written
+record.
+
+---
 
 ### CERBERUS DAY 2 — 2026-08-11, direction: North Star adjudicated, MVP plan triple-reviewed, goal prompt cut
 
