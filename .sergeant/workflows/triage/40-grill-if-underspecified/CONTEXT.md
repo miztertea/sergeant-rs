@@ -18,9 +18,14 @@ Underspecified items are escalated to an interview.
 
 ## Behavior contract
 
-- **If the item is underspecified after verification, the actor invokes the grilling and domain-modeling procedures together to sharpen it into shape.**
+- **If the item is underspecified after verification, the actor invokes the grilling procedure to sharpen it into shape.**
   (trigger: verification shows the request needs fleshing out; outcome: the item's specification and domain terms are sharpened, with decisions captured inline)
-  — `BU-P3-068`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 76)
+  — `BU-P3-068`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 76). Upstream pairs this with a
+  separate `domain-modeling` procedure; no `domain-modeling` skill package
+  exists in this repo yet (only frozen upstream evidence — see
+  `docs/icm/agents-invariant-dispositions.md` BU-1064), so sharpening
+  domain terminology folds into the same `grilling` session below rather
+  than a second invocation.
 
 ## Judgment required
 

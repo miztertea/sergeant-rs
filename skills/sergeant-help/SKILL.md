@@ -63,7 +63,8 @@ above are sergeant-rs's real equivalents, not a copy of upstream's map.
    and links to repository-relative documentation paths.
 6. If sources disagree, use this precedence:
    - `sgt <cmd> --help` output and observed command behavior for released
-     syntax (CLAUDE.md L1: the CLI is measured, never assumed from docs);
+     syntax (`docs/DEVELOPMENT.md`, "the Claude adapter's behavior is
+     *measured*, never assumed from docs" — LESSONS L1);
    - `AGENTS.md` for always-on execution/safety policy;
    - the trigger-loaded skill or workflow's own `index.md`/`CONTEXT.md` for
      its procedure;

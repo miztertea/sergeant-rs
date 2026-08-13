@@ -39,8 +39,18 @@ sergeant-rs analog yet (sergeant-rs's estate model is `sergeant.toml`,
 per-directory, not a multi-project registry) — translating this package to
 that model is out of this re-homing pass's scope.
 
-**N1 adjudication A4 (finding N1-BH-02).** This package originally ended in two further stages, `30-sync-repositories` and `40-report-state`. `30-sync-repositories` carried no argument beyond the §6.5 boilerplate and demotes by default. `40-report-state` carried an Additional note that was weighed against §6.3's reimplementation test and failed (it is, in its own words, "closer to a query than a checkpoint"). Both fold into `20-register-or-edit` (now the workflow's terminal stage) as helper invocations. The behavior units survive — see that stage's "Helpers (folded per N1 adjudication A4)" section and `provenance.md`.
+**N1 adjudication A4 (finding N1-BH-02).** This package originally ended in two further stages, `30-sync-repositories` and `40-report-state`. `30-sync-repositories` carried no argument beyond the §6.5 boilerplate and demotes by default. `40-report-state` carried an Additional note that was weighed against §6.3's reimplementation test and failed (it is, in its own words, "closer to a query than a checkpoint"). Both originally folded into `20-register-or-edit` as helper invocations covering `list-projects`/`project-status`/`project-sync`/`project-task-list`.
+
+**Superseded by the SPLIT verdict above.** The MVP-5 F2 execution-surface
+re-triage retired those same four functions to CLI-SURFACE instead
+(`docs/icm/re-homing-record-2026-08-12.md`) — `20-register-or-edit` no
+longer carries a "Helpers (folded per N1 adjudication A4)" section; see
+its own "Retired helper content" section for what replaced it and where
+those behavior units actually live now.
 
 ## Provenance
 
-See `provenance.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.
+`provenance.md` (referenced above and historically in this package's own
+stage files) was never actually created for `load-project` — the real
+stage-to-behavior-unit trail is
+`docs/gauntlet/promoted-provenance/load-project.md`.
