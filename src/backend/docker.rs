@@ -305,10 +305,7 @@ impl DockerBackend {
             if stderr.to_lowercase().contains("no such") {
                 return Ok(None);
             }
-            return Err(self.failed(format!(
-                "docker inspect {name} failed: {}",
-                stderr.trim()
-            )));
+            return Err(self.failed(format!("docker inspect {name} failed: {}", stderr.trim())));
         }
         let parsed: Vec<Value> = serde_json::from_slice(&output.stdout)
             .map_err(|e| self.failed(format!("docker inspect {name}: unparseable JSON: {e}")))?;

@@ -1206,8 +1206,11 @@ mod tests {
         init_estate(root, Some("e")).expect("init");
         let manifest_path = root.join(WORKSPACE_FILE);
 
-        std::fs::write(&manifest_path, "[estate]\nname = \"e\"\n\n[group]\npair = \"oops\"\n")
-            .expect("hand-write malformed group section");
+        std::fs::write(
+            &manifest_path,
+            "[estate]\nname = \"e\"\n\n[group]\npair = \"oops\"\n",
+        )
+        .expect("hand-write malformed group section");
         let err = add_group(root, "pair", &[], None).expect_err("malformed [group.pair]");
         assert!(
             matches!(err, ManifestError::MalformedSection { .. }),
