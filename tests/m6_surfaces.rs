@@ -309,6 +309,7 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         let event = tokio::time::timeout(Duration::from_secs(5), stream.next_event())
             .await
             .expect("the live tail must deliver")
+            .expect("no malformed frame")
             .expect("the stream must stay open");
         let event = serde_json::to_value(event).expect("event as json");
         if app.observe(&event) {

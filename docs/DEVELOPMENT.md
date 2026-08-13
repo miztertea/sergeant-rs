@@ -16,7 +16,7 @@ unchanged in substance.
 cargo build                                          # debug build of the `sgt` binary
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
                                                      # the gates; all three must be green before any commit
-cargo test --test m4_backends                        # one suite (m1_event_core … m8_estate_cli)
+cargo test --test m4_backends                        # one suite (m1_event_core … m9_watch)
 cargo test --test m6_surfaces t5                     # one test by name substring
 SERGEANT_CLAUDE_TESTS=1 cargo test --test m4_backends -- --ignored
                                                      # opt-in tests against the real `claude` CLI (bills tokens)
@@ -25,6 +25,8 @@ scripts/gate.sh "<intent>"                           # shipping gate via the no-
 ```
 
 First build is slow: bundled DuckDB compiles ~500 C++ translation units (~10 min cold). `Cargo.toml` pins `[profile.dev.package.libduckdb-sys] debug = false` — removing it balloons `target/` from ~5 GB to ~15 GB. Never point an external pipeline's builds at this checkout's `CARGO_TARGET_DIR`: shared caches bake foreign `env!(CARGO_MANIFEST_DIR)` paths into reused test binaries (diagnosed 2026-08-09, see the ledger's M6 pause marker). The same hazard's other face: a disposable probe copy that shares this checkout's cache overwrites its binary slots — after any probe-copy build, rebuild the main checkout before measuring `target/debug/sgt` (bit twice, 2026-08-10, Bug Sprint 1 entry).
+
+Build-dir placement, not just contamination, is its own hazard: disposable worktrees and their `CARGO_TARGET_DIR`s for probe and verify-agent work belong on disk-backed storage such as `/var/tmp/<name>`, never on tmpfs `/tmp` or a session scratchpad. On Cerberus, `/tmp` is a 16 GB tmpfs; on 2026-08-13 the WATCH build gauntlet's agent build dirs filled it, and every subsequent `Bash` invocation across every session on that host started failing — the harness's output-capture write hit `EDQUOT` while the command underneath still ran, so the box looked like a broken shell rather than a full disk (incident row and evidence in `docs/environments/cerberus.md`; #70). Clean up disposable build dirs after use instead of leaving them to accumulate.
 
 ## What this is
 
@@ -38,11 +40,11 @@ A local agent execution daemon (`sgt`): durable Work items run staged workflows 
 - **Work state ≠ process state.** A Claude "session" is a durable conversation identity; the OS process exists per turn. Restart reconciliation (`src/runtime/recovery.rs`) resumes only on unambiguous evidence; ambiguity fails closed into `blocked` with a reason, never a guess.
 - **Adjacent-append crash windows** are this architecture's recurring hazard (LESSONS L6): any path appending two causally-linked events must tolerate the second one missing or write one compound event. Check for this class in review of any journal-touching change.
 
-Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integration tests need the lib target). `src/domain/` = types, `src/runtime/` = journal/projections/engine/recovery/router/analytics/graph, `src/backend/` = the §15 `Backend` trait + claude/fake/docker (docker runs `kind = "execute"` workflow stages; codex is a doc-stub per D6), `src/{api,cli,tui,web,daemon,telemetry}.rs` = surfaces.
+Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integration tests need the lib target). `src/domain/` = types, `src/runtime/` = journal/projections/engine/recovery/router/analytics/graph, `src/backend/` = the §15 `Backend` trait + claude/fake/docker (docker runs `kind = "execute"` workflow stages; codex is a doc-stub per D6), `src/{api,cli,tui,web,daemon,telemetry,watch}.rs` = surfaces.
 
 ## Testing rules specific to this repo
 
-- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m8_estate_cli.rs` (the count is a smoke check, not a budget — re-measure with `cargo test` rather than trusting any prose figure; coverage baseline convention: `docs/perf/baseline-mvp-2026-08-12.md`). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
+- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m9_watch.rs` (the count is a smoke check, not a budget — re-measure with `cargo test` rather than trusting any prose figure; coverage baseline convention: `docs/perf/baseline-mvp-2026-08-12.md`). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
 - A fix without a test that fails when the fix is reverted is not done (LESSONS L7). Every advertised backend capability flag needs a contract test against the installed harness (L8).
 - The Claude adapter's behavior is *measured*, never assumed from docs — exit codes lie, `subtype` lies, model aliases silently substitute (L1). The version gate is pinned in `src/backend/claude.rs`; re-measure on any CLI version bump.
 - **Code is code (R-S0-12).** Any diff that changes executable behavior — `src/`, `tests/`, `scripts/`, CI config, workflow `.js` — takes the full multi-axis loop (panel, adversarial verify, fix, adjudication). Measurement-template exemptions cover only phases that write no code; a builder's self-probe is panel input, never a substitute (L13).

@@ -49,6 +49,132 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### WATCH — 2026-08-13, `sgt watch` shipped: proposal → contract → build → gate → pilot, one day
+
+**Mission outcome: contract met, ship gate passed, product pilot PASS.**
+`sgt watch [WORK_ID] [--follow]` — the harness's return path after `sgt
+run` — landed on `cerberus/watch` (PR #69, owner merges). Six-state watch
+set, attention-identity fingerprint over `stage.detail`, three-branch
+no-auto-spawn (owner-ruled: observation must not materialize the daemon),
+JSONL `sergeant.watch/v1` notices carrying the verbatim Work view,
+EventStream's malformed-frame distinction (old silent-skip pin revised
+under R-WATCH-7's explicit ruling), and the `SGT_WATCH_TEST_HOLD`
+dead-man'd race seam. Suite 539 → **570 passed / 0 failed**.
+
+**The loop, with finding curves.** Owner proposal vendored
+(`reference/proposal-sgt-watch-v1.md`) → proposal-review gauntlet
+(wf_56a68808: 3 Sonnet critics + Opus refuter over 22 panel + 5
+orchestrator findings → 21 confirmed / 3 plausible / 3 refuted-as-dupes;
+2 errors: `waiting` wrongly excluded, fingerprint swallowing a second
+question) → WATCH contract, 10 rulings → its own L19 pass (wf_d1801972,
+2 Sonnet critics: 10/10 findings confirmed, incl. the missing-docket
+process error and the terminal teardown-lag race, the L6 class in the
+notice path) → build gauntlet (wf_f4cb393b: Sonnet builder 5 separable
+commits/29 tests; panel 2 findings + 1 process note, all confirmed;
+Sonnet fixer) → 3 L7 mutation probes, all pins have teeth → no-mistakes
+ship gate 01KZY9ZFTE (review/test/document/lint **passed**; 1 info
+finding approved after reading — the contract-authorized structural-test
+pattern; gate agent verified `--model sonnet` on the live process table;
+1 pipeline commit adopted via `axi sync --recover`) → §16.4 pilot
+(`docs/gauntlet/runs/watch-2026-08-13/pilot.md`): submit→notice 2m43s,
+4/8 turns, zero polling commands, R-WATCH-9's terminal lag observed live
+(`output: null` at emission, settled by collection).
+
+**Environmental behavior.** 12 agents, ~1.74M subagent tokens across the
+three workflows + probe agent; Fable spent only in the orchestrator seat.
+One incident, fully traced: the build gauntlet's verify agents filled
+Cerberus's 16 GB tmpfs `/tmp` (CARGO_TARGET_DIRs + gigabyte-scale blob
+rigs, #70), killing the host's entire Bash layer mid-fix — the fixer
+reported honestly instead of papering over, its uncommitted edits were
+gate-checked and committed after recovery, and the rule is now an
+environment row (`docs/environments/cerberus.md`) plus a Work-delivered
+`docs/DEVELOPMENT.md` subsection (`b33eccc` — written by the pilot's own
+dispatched Work: sergeant documenting the incident that its own build
+caused). Dockets: `docs/gauntlet/runs/watch-2026-08-13/`. Issues: #68
+(auto-spawn consistency sweep, scoped out), #70, #71 (pilot finding)
+filed; PR #69 closes #59/#61/#63.
+
+### WATCH FIXER PASS — 2026-08-13, F1/F2 closed by edit; PROC-1 re-confirmed and environment-blocked
+
+**Mission outcome.** Two of the three CONFIRMED findings from the WATCH
+gauntlet's fresh-eyes review closed by direct edit; the third investigated
+and found unfixable by any code change, per below.
+
+**contract-fidelity:F1 — closed.** R-WATCH-4 requires both `AGENTS.md` and
+`README.md` to state the attach-before-reconcile ordering and disclose the
+residual gap a bare one-shot estate watch still carries when invoked after
+reconciliation. `AGENTS.md` already carried both; `README.md` did not.
+`README.md`'s "Wait for it, instead of polling" section now carries the
+same ordering sentence and residual-gap disclosure, placed right after the
+existing no-auto-spawn paragraph.
+
+**contract-fidelity:F2 — closed.** The 60s test-only dead-man on
+`SGT_WATCH_TEST_HOLD` (`WatchError::TestHoldTimedOut`) was real but had no
+test exercising its timeout branch — only the happy path (hold engages,
+then releases) was pinned by W3/W4. `src/watch.rs`'s `test_hold_rendezvous`
+was split into a thin env-var reader plus a parameterized
+`test_hold_wait(path, deadman, poll)` helper; production behavior is
+unchanged — `test_hold_rendezvous` still always passes the real 60s/20ms
+constants. Two new unit tests exercise the helper directly with a
+millisecond-scale dead-man: one drives a release path that never appears
+and asserts `Err(WatchError::TestHoldTimedOut { path })` naming the exact
+path; its mirror releases the hold from a concurrent `tokio::spawn`ed task
+15ms in and asserts `Ok(())` through the same helper, so both branches of
+the parameterized code are pinned, not just the timeout one.
+
+**test-honesty:PROC-1 — investigated; not fixable by a code change;
+independently reconfirmed, more severely, this session.** PROC-1 recorded
+the prior review session's Bash tool becoming persistently unreliable
+partway through, blocking a requested revert-probe. This fixer session hit
+the identical failure class from its very first command: every `Bash`
+invocation that either invoked a real external binary or produced stdout
+returned a nonzero exit (1/128/2) with no captured output — `git status`,
+`git log`, `echo`, and `/bin/true` with the sandbox explicitly disabled all
+failed identically. Worse than the prior session's report: `grep` runs
+against `README.md` for a string ("edge-triggered") silently reported no
+match immediately after that exact string was written to that exact file
+and independently confirmed present via the `Read` tool — i.e. Bash's own
+output cannot be trusted even when it reports success. Only the shell
+builtin `exit N` (forks/execs nothing) ever succeeded. This rules out an
+intermittent, session-specific flake and confirms PROC-1's own caveat
+verbatim: "This is a tool/environment failure, not a finding about the code
+under review." No code fix applies to a broken exec environment.
+
+**Consequence for this pass, stated plainly (L15):** the requested
+revert-probe, the `cargo fmt`/`clippy`/`test` gate run, and `git commit` of
+the F1/F2 fixes above could not be executed from this session. The two
+fixes exist only as uncommitted working-tree edits (`README.md`,
+`src/watch.rs`), verified by direct `Read` of the edited files — not by
+compiling or running them. They are believed correct by inspection against
+this codebase's own existing patterns (`src/api.rs`'s `#[tokio::test]`
+loopback-TCP precedent for the analogous R-WATCH-7 malformed-frame test;
+`Cargo.toml`'s `tokio` features already include `macros`/`rt-multi-thread`/
+`time`, which both new tests need) but that belief is a hypothesis, not a
+measured fact, until a session with a working exec environment runs the
+gates and commits. **Findings disposition:** contract-fidelity:F1 CLOSED;
+contract-fidelity:F2 CLOSED; test-honesty:PROC-1 CONFIRMED and
+re-observed, disposition unfixable-by-code — recorded per L9 rather than
+silently dropped for lack of a code-shaped fix.
+
+**Orchestrator addendum (same day): PROC-1's root cause found, fixed, and
+closed as an environment rule.** The "broken exec environment" was `/tmp`:
+a 16 GB tmpfs that the gauntlet's probe/verify agents filled with
+disposable-worktree `CARGO_TARGET_DIR`s under the session scratchpad. Every
+`Bash` invocation then failed at the harness's output-capture layer with
+`EDQUOT` while the underlying command still executed (verified: an `rm`
+reported exit 1 yet deleted its target) — which is why `grep` looked
+untrustworthy and only no-output builtins "succeeded." Clearing the
+scratchpad restored the shell instantly. The fixer's uncommitted edits were
+then gate-checked for real: `cargo fmt` (one drift spot), `clippy -D
+warnings` clean, **`cargo test` 570 passed / 0 failed**, and committed
+separably per its own handoff. Environment rule recorded in
+`docs/environments/cerberus.md`: agent build dirs go on the ext4 root
+(`/var/tmp/<name>`), never tmpfs. The revert-probes PROC-1 originally asked
+for were re-run on disk-backed storage — results in the entry above this
+one at ship time.
+
+---
+
 ### MVP CLOSE-OUT — 2026-08-13, the ship: all five buckets landed, ship gate PASS, #19 closed
 
 **Mission outcome.** The North Star MVP is complete on cerberus/mvp-1

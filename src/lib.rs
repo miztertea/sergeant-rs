@@ -11,4 +11,5 @@ pub mod domain;
 pub mod runtime;
 pub mod telemetry;
 pub mod tui;
+pub mod watch;
 pub mod web;
