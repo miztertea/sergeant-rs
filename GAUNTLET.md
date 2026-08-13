@@ -49,6 +49,54 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### MVP CLOSE-OUT — 2026-08-13, the ship: all five buckets landed, ship gate PASS, #19 closed
+
+**Mission outcome.** The North Star MVP is complete on cerberus/mvp-1
+(PR #65, owner merges). Since the MVP-4 entries: (1) **Extended #19
+soak** (91ba140, Fixes #19): 2h36m unbroken daemon, 13 works, 10 real
+Docker execute stages digest-identical, settle driver reconfirmed 12×,
+envelope exit door proven live (blocked → extend → retry → completed —
+upstream's no-exit-door scar closed with journal evidence), and Rule A
+eviction's first sustained-load measurement (RSS 58.8→24.8 MB, flat
+62 min). Operator disclosed its own mid-run dormancy in the manifest.
+(2) **Ship gate PASS** (e5af0a6): a fresh clone walked the full
+colleague path on product surfaces alone — install, init, two repos,
+real intent, genuine 5-min detach, return to a verified diff via the
+output pointer, daemon-stop + respawn with zero loss. Four findings
+(dormancy/process; cargo-install collision; model-pin syntax
+undocumented — the sharpest product gap, backlog; cosmetic). (3) **CI
+exposed a real day-one bug this host could not**: init propagated
+doctor's claude-row failure as its own exit — a colleague without
+claude could not init (§17.5 violation). Fixed ace9b16/0c8650a
+(healthy_for_init: harness rows advisory at init, doctor keeps hard
+semantics), pinned via SGT_CLAUDE_BIN=/nonexistent both-environments,
+CI green on the fix commit. (4) **Residue sweep found two bugs**
+(trace-then-clean doctrine): #66 sgt-probe container leak past the
+harness sweep (postdates the launch-error fix — different path), #67
+doctor fresh-dir docker blob-store EPERM + unmeasurable disk_pressure.
+(5) **Final shipping gate passed** (5→2→1-approve): manifest
+malformed-TOML panic fixed (fail-closed means refusal, never panic),
+transcript full-replay-under-guard fixed after the gate caught its own
+first fix not releasing the guard, docker inspect absence/failure
+conflation fixed with its L7 pin on the gate's insistence. Suite at
+close: 539 passed + 4 opt-in, CI green, all sweeps clean.
+
+**Environmental behavior.** The recurring failure of this stretch was
+agent dormancy — the soak operator (twice), the first ship-gate seat
+(placeholder verdict), and the second ship-gate seat (80-min install
+wait) all ended turns to wait on nothing; watchdogs on artifacts (not
+agent claims) caught every instance, and the anti-dormancy rule
+(foreground sleeps, artifact watchers, process-table evidence for every
+"still running") is now standard workflow-prompt text. Owner
+corrections continued to be the highest-value input: dollars-are-
+telemetry (re-enforced twice), the repo-to-icm soak redirect (same
+adapter evidence at a fraction of the volume), residue-is-evidence
+(produced #66/#67), and verify-before-speaking (the "ten minutes" that
+measured 23 seconds). Model economy held: Sonnet workforce, Opus
+panels/refuters, no-mistakes pinned Sonnet (verified via the binary's
+per-agent override string), Fable one orchestrator seat.
+
+
 ### MVP-5 FIXER PASS — 2026-08-13, 15 vision-fidelity/content-honesty findings closed
 
 **Mission outcome.** All 15 findings from the panel review of MVP-5
