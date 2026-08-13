@@ -3031,17 +3031,47 @@ pub struct EventStream {
     pending: String,
 }
 
+/// A `data:` frame that is present but did not decode as a Sergeant [`Event`]
+/// (R-WATCH-7 / proposal §11.2).
+///
+/// Before this revision, [`EventStream::next_event`] collapsed this case and
+/// a harmless keep-alive comment to the same `None` — a subscriber could not
+/// tell "nothing to report yet" from "the daemon sent something this client
+/// could not read", which §11.2 calls out by name: "a frame containing
+/// `data:` that cannot decode as a Sergeant event is not a keep-alive and
+/// must not be silently skipped." This type is that distinction, carrying the
+/// raw payload for the diagnostic.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("malformed event frame: {0}")]
+pub struct MalformedFrame(pub String);
+
 impl EventStream {
-    /// The next journal event, or `None` once the stream ends.
-    pub async fn next_event(&mut self) -> Option<Event> {
+    /// The next journal event.
+    ///
+    /// Three outcomes, matching §11.2's four-way split minus the one pair
+    /// that collapses on purpose: `Ok(Some(event))` is a decoded [`Event`];
+    /// `Ok(None)` is the stream ending — cleanly (the daemon closed it) or
+    /// through a transport failure (`self.response.chunk()` erroring) — the
+    /// proposal names both "transport end/error" as one outcome, not two, and
+    /// a caller here has no durable cursor to act differently on the
+    /// distinction; keep-alive/comment frames are consumed silently inside
+    /// the loop, exactly as before, and never reach the caller as either
+    /// variant. `Err(MalformedFrame)` is R-WATCH-7's new, previously-missing
+    /// outcome: a `data:` frame that is not a keep-alive and does not parse
+    /// ends the read rather than being silently dropped.
+    pub async fn next_event(&mut self) -> Result<Option<Event>, MalformedFrame> {
         loop {
             while let Some(frame) = take_frame(&mut self.pending) {
-                if let Some(event) = decode_frame(&frame) {
-                    return Some(event);
+                match decode_frame(&frame) {
+                    FrameDecode::KeepAlive => continue,
+                    FrameDecode::Event(event) => return Ok(Some(*event)),
+                    FrameDecode::Malformed(raw) => return Err(MalformedFrame(raw)),
                 }
             }
-            let chunk = self.response.chunk().await.ok()??;
-            self.pending.push_str(&String::from_utf8_lossy(&chunk));
+            match self.response.chunk().await {
+                Ok(Some(chunk)) => self.pending.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(None) | Err(_) => return Ok(None),
+            }
         }
     }
 }
@@ -3054,8 +3084,27 @@ fn take_frame(pending: &mut String) -> Option<String> {
     Some(frame)
 }
 
-/// Decode one SSE frame's `data:` lines into an [`Event`].
-fn decode_frame(frame: &str) -> Option<Event> {
+/// The result of decoding one SSE frame's `data:` lines (R-WATCH-7): a
+/// comment/keep-alive frame, a frame that decodes as an [`Event`], and a
+/// `data:` frame that does not decode are three different outcomes, not two
+/// — see [`MalformedFrame`] for why the third one used to disappear into the
+/// first.
+#[derive(Debug)]
+enum FrameDecode {
+    /// No `data:` line at all: axum's keep-alive comment (`: keep-alive`), or
+    /// a frame with nothing in it.
+    KeepAlive,
+    /// A `data:` payload that did not parse as a Sergeant [`Event`]. Carries
+    /// the joined raw payload for the diagnostic.
+    Malformed(String),
+    /// A valid, decoded event. Boxed: `Event` is by far this enum's largest
+    /// variant, and every `Malformed`/`KeepAlive` decode would otherwise pay
+    /// its stack size for nothing.
+    Event(Box<Event>),
+}
+
+/// Decode one SSE frame's `data:` lines into a [`FrameDecode`].
+fn decode_frame(frame: &str) -> FrameDecode {
     let mut data = String::new();
     for line in frame.lines() {
         if let Some(rest) = line.strip_prefix("data:") {
@@ -3066,9 +3115,12 @@ fn decode_frame(frame: &str) -> Option<Event> {
         }
     }
     if data.is_empty() {
-        return None;
+        return FrameDecode::KeepAlive;
     }
-    serde_json::from_str(&data).ok()
+    match serde_json::from_str(&data) {
+        Ok(event) => FrameDecode::Event(Box::new(event)),
+        Err(_) => FrameDecode::Malformed(data),
+    }
 }
 
 #[cfg(test)]
@@ -3162,13 +3214,26 @@ mod tests {
     /// value `-5` when nothing is inserted between them, so a decoder that
     /// really joins with a newline must fail to parse that split rather than
     /// silently producing a value nobody sent.
+    ///
+    /// **R-WATCH-7 revision.** This test used to assert `decode_frame(..) ==
+    /// None` for the un-joined split — the exact silent-skip §11.2 forbids: a
+    /// `data:` frame that is present but does not parse is not a keep-alive,
+    /// and collapsing it to the same `None` a comment frame produces is what
+    /// this contract ruling revises `decode_frame`/`EventStream` to stop
+    /// doing. The second half now asserts `FrameDecode::Malformed`, not
+    /// `None` — the pin's *shape* (a joined split must fail to parse) is
+    /// unchanged; only what "fails to parse" is allowed to look like moved.
     #[test]
     fn decode_frame_coalesces_data_lines_with_a_real_newline() {
         // An ordinary split, at an object-member boundary, decodes into
         // exactly the event that boundary was cut from.
         let frame = "data: {\"schema\":\"sergeant.event/v1\",\"seq\":7,\"id\":\"01H7X8Y9Z\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\ndata: \"kind\":\"test.seeded\",\"payload\":{\"n\":3}}";
-        let event = decode_frame(frame)
-            .expect("a frame whose data: is split across two lines still decodes");
+        let event = match decode_frame(frame) {
+            FrameDecode::Event(event) => event,
+            other => {
+                panic!("a frame whose data: is split across two lines still decodes: {other:?}")
+            }
+        };
         assert_eq!(event.seq, 7);
         assert_eq!(event.id, "01H7X8Y9Z");
         assert_eq!(event.kind, "test.seeded");
@@ -3180,11 +3245,11 @@ mod tests {
         // `-` followed by whitespace then `5`, which is not a legal JSON
         // number.
         let split_number = "data: {\"schema\":\"sergeant.event/v1\",\"seq\":9,\"id\":\"01NEG\",\"timestamp\":\"2026-01-01T00:00:02.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\"kind\":\"test.seeded\",\"payload\":{\"n\":-\ndata: 5}}";
-        assert_eq!(
-            decode_frame(split_number),
-            None,
-            "the two data: lines must not be concatenated without the newline \
-             the SSE spec requires between them"
+        assert!(
+            matches!(decode_frame(split_number), FrameDecode::Malformed(_)),
+            "the two data: lines must not be concatenated without the newline the SSE spec \
+             requires between them — and (R-WATCH-7) the failure to parse must surface as \
+             Malformed, not silently collapse to the same outcome as a keep-alive comment"
         );
     }
 
@@ -3193,17 +3258,34 @@ mod tests {
     /// corrupting the real payload beside them.
     #[test]
     fn decode_frame_skips_comment_and_keep_alive_lines() {
-        assert_eq!(
-            decode_frame(": keep-alive"),
-            None,
+        assert!(
+            matches!(decode_frame(": keep-alive"), FrameDecode::KeepAlive),
             "a frame that is only a comment carries no event"
         );
         let single_line = "{\"schema\":\"sergeant.event/v1\",\"seq\":2,\"id\":\"01Z\",\"timestamp\":\"2026-01-01T00:00:01.000Z\",\"source\":{\"type\":\"test\",\"name\":\"harness\"},\"kind\":\"test.seeded\",\"payload\":{\"n\":2}}";
         let frame = format!(": keep-alive\ndata: {single_line}");
-        let event = decode_frame(&frame)
-            .expect("a comment line beside a data: line must not swallow the event");
+        let event = match decode_frame(&frame) {
+            FrameDecode::Event(event) => event,
+            other => {
+                panic!("a comment line beside a data: line must not swallow the event: {other:?}")
+            }
+        };
         assert_eq!(event.seq, 2);
         assert_eq!(event.id, "01Z");
+    }
+
+    /// R-WATCH-7's own new case: a `data:` frame present but undecodable is
+    /// neither a keep-alive nor silently dropped — it is `Malformed`, distinct
+    /// from both `KeepAlive` (no `data:` at all) and a clean stream end (which
+    /// only [`EventStream::next_event`], not `decode_frame`, can produce).
+    #[test]
+    fn decode_frame_reports_an_undecodable_data_frame_as_malformed_not_keep_alive() {
+        let malformed = decode_frame("data: not valid json at all");
+        assert!(
+            matches!(malformed, FrameDecode::Malformed(ref raw) if raw == "not valid json at all"),
+            "a present-but-undecodable data: frame must be Malformed, carrying the raw \
+             payload, not collapse into the same outcome as a comment frame: {malformed:?}"
+        );
     }
 
     /// The two `stage_label` arms besides "both known" and "nothing at

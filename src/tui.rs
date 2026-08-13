@@ -723,8 +723,8 @@ where
                 }
                 event = next_event(&mut stream) => {
                     match event {
-                        Some(event) => needs_refresh = app.observe(&event),
-                        None => {
+                        TailStep::Event(event) => needs_refresh = app.observe(&event),
+                        TailStep::Ended => {
                             // The tail ended (daemon restart or shutdown, a lagged
                             // subscriber the server dropped, a broken chunk). Keep
                             // the UI alive and say so — durably, in the header, not
@@ -732,6 +732,18 @@ where
                             stream = None;
                             app.live = Live::Detached;
                             app.status = "live tail closed — press r to refresh".to_string();
+                        }
+                        TailStep::Malformed(detail) => {
+                            // R-WATCH-7's new outcome, handled deliberately rather
+                            // than falling through to the same message as an
+                            // ordinary disconnect: the daemon sent a frame this
+                            // client could not decode, which is protocol drift
+                            // worth a distinct status line, not a quiet reconnect
+                            // prompt.
+                            stream = None;
+                            app.live = Live::Detached;
+                            app.status =
+                                format!("live tail error: {detail} — press r to refresh");
                         }
                     }
                 }
@@ -1142,14 +1154,36 @@ impl TerminationSignals {
     }
 }
 
+/// What one step of the live tail produced, for the caller to act on
+/// deliberately (R-WATCH-7: `EventStream::next_event` now distinguishes a
+/// decoded event, a clean/transport stream end, and a malformed frame — this
+/// audits that the TUI, the tail's other consumer besides `sgt watch`, does
+/// not let the new variant collapse back into "the tail ended" the way a
+/// naive `.ok()` would).
+enum TailStep {
+    /// A decoded event, as the JSON the rest of this module already expects.
+    Event(Value),
+    /// The stream ended — cleanly or via a transport failure; both leave the
+    /// screen in the same detached state, as before this revision.
+    Ended,
+    /// R-WATCH-7's new outcome: the daemon sent a `data:` frame this client
+    /// could not decode. Distinct from `Ended` so the status line says what
+    /// actually happened instead of quietly relabeling protocol drift as an
+    /// ordinary disconnect.
+    Malformed(String),
+}
+
 /// Await the next SSE event, or park forever when there is no stream — so
 /// `select!` keeps working on the keyboard arm alone.
-async fn next_event(stream: &mut Option<crate::api::EventStream>) -> Option<Value> {
+async fn next_event(stream: &mut Option<crate::api::EventStream>) -> TailStep {
     match stream {
-        Some(stream) => stream
-            .next_event()
-            .await
-            .and_then(|event| serde_json::to_value(event).ok()),
+        Some(stream) => match stream.next_event().await {
+            Ok(Some(event)) => serde_json::to_value(event)
+                .map(TailStep::Event)
+                .unwrap_or(TailStep::Ended),
+            Ok(None) => TailStep::Ended,
+            Err(malformed) => TailStep::Malformed(malformed.to_string()),
+        },
         None => std::future::pending().await,
     }
 }
