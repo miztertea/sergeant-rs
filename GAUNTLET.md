@@ -42,10 +42,151 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 | B4 | R-MVP1-10 (blocked exit-door invariant) build | A `pending → blocked` landing from a real start failure (a materialize permission fault, or `reconcile_crashed_start`'s crash-window block) has no working `retry` door: `begin_retry` requires `run.current_stage()` (`engine.rs`), and no stage is ever entered before `settle_materialize` fails or a crashed start is swept — `KIND_WORKFLOW_BOUND`/`KIND_STAGE_ENTERED` land together with `KIND_WORK_STARTED` in one group-committed guard hold, all *after* a successful materialize, so this is not a narrow timing window but the whole category. `retry` fails closed with `EngineError::NoRun` (404, `"no_run"`) — safe, structured, non-corrupting, never silently wrong — but not an open door. The real, working exit is `cancel` (`blocked → canceled`), proven instead. | Reopening it properly needs the full `StartPlan` (workflow resolution, routing, per-stage bindings) re-derivable from the journal alone, and today it is not: `origin.cwd` — needed to re-run `Workspace::discover` — is never persisted (`engine.rs`'s own `reconcile_crashed_start` comment says so), and guessing at a substitute `cwd` would silently re-plan against the wrong estate, which CLAUDE.md's fail-closed doctrine forbids. The honest fix is persisting enough of the submit-time plan to redo it — a bind-path change (`engine.rs`, `SurfacePlan`/`KIND_SURFACE_MATERIALIZING`'s payload) outside this ruling's own file scope (`projection.rs`/`recovery.rs`/`surface.rs`/`api.rs` views). Trigger: any MVP that needs `retry` to reopen a `pending`-origin block — the natural home is wherever the submit-time plan next gets a durable record (R-MVP1-1/R-MVP1-4's `workflow.bound` widening is adjacent territory). Pinned as *expected, safe* behavior by `tests/m2_daemon_api.rs`'s `r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_cancel` (revert-probed: removing the `NoRun`→404 mapping or the `no_run` code fails it). |
 | B5 | MVP-3 fixer pass, invariants finding MVP3-C4 | `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`'s `[estate]` shape lists `data_dir` defaulting `.sergeant/data`, but R-MVP1-1 ruled only `surfaces_dir`; `data_dir` was never implemented (`EstateSection` is `deny_unknown_fields` with no such field; `resolve_data_dir` hardcodes the estate-relative default and reads no manifest field at all). A hand-written `[estate] data_dir = "..."` following the design note literally fails closed with a parse refusal instead of overriding anything. | Not implemented in the fixer pass: this is new engine/config surface (an estate-level override of where the daemon's own data dir lives), R-NS-4 territory that wants explicit ratification, not a silent addition riding in on a bug-fix pass. Design doc corrected in place ([v3] note) so it no longer misdescribes shipped behavior. Trigger: any MVP that actually needs a non-default, manifest-declared data dir (today's only override is `--data-dir`/`SGT_DATA_DIR`, both already covered by R-MVP1-12's discovery-boundary rules). |
 | B6 | MVP-3 fixer pass, invariants finding MVP3-C5 | `sgt run --turns`/`--ceiling-secs` (commit 78e5da9) adds a per-Work `EnvelopeRequest{turn_cap, ceiling_secs}` the engine reads via `effective_turn_cap`/`effective_turn_ceiling` — genuinely new engine surface (submit-time envelope override) that R-MVP1-7 specified as daemon-wide only (`with_turn_cap`/`SGT_TURN_CAP`), and MVP-3's own bucketing plan does not list it. Counting integrity is intact (not a bypass: `check_turn_envelope` still gates on the effective values, `turns_spawned` stays journal-derived, submit rejects `turn_cap==0`/`ceiling_secs==0`) — the gap is process, not safety. | Shipped code kept as-is (it works, and reverting a MVP-3-milestone feature inside a fixer pass is a bigger unilateral move than registering it); registered here instead per R-NS-4 discipline, for owner ratification at the next adjudication rather than silently standing unregistered. Trigger: MVP-3's own adjudication — fold into the milestone's deviation record or explicitly ratify there. |
+| B7 | MVP-5 F2 execution-surface re-triage (`docs/icm/retriage-2026-08-11.md`, `load-project` verdict notes) | `sergeant-setup`'s `30-project-interview` stage duplicates `load-project`'s registration job wholesale (same "complete project definition... previewed... written only after confirmation" shape) instead of delegating to it — the retriage itself flags this as "a duplication defect, not a clean stage-boundary split," and it stood unresolved when the F2 pass executed the surrounding CLI-SURFACE verdicts around it. | Fixing it means editing `sergeant-setup`'s own package to delegate its interview stage to `load-project` instead of reimplementing it — a `.sergeant/workflows/` content edit outside the MVP-5 fixer pass's file scope (docs/`AGENTS.md`/`skills/` only). Trigger: any pass that next touches either `sergeant-setup` or `load-project`'s own package. |
+| B8 | MVP-5 Lane F1 dispositions, content-honesty CH-1 (fixer pass, 2026-08-13) | 17 `agents-invariant` units (BU-1033..1048's codebase-design vocabulary/deepening rules, BU-1064's domain-modeling CONTEXT.md file-role rule) have no live skill package to land in — only frozen upstream evidence under `reference/sergeant-upstream/.claude/skills/`, which `docs/DEVELOPMENT.md` forbids treating as live content. `docs/icm/agents-invariant-dispositions.md` previously (and wrongly) claimed both were already-published `.sergeant/workflows/` packages; corrected to `not-adopted` this pass, and the two live packages that named a "grilling/domain-modeling" pair (`triage/40-grill-if-underspecified`, `wayfinder/00-name-destination`) were corrected to name `grilling` alone rather than invent the second invocation. | Promoting either skill is new content, not a dispositioning correction — this fixer pass's job was to stop asserting they exist, not to build them. Trigger: an owner decision to actually promote `codebase-design` and/or `domain-modeling` as `skills/` packages (nearest precedent: `deepen-module` already cites `codebase-design`'s upstream `DEEPENING.md` directly, without a `skill:` indirection — see `00-classify-dependencies/CONTEXT.md`). |
 
 ---
 
 ## Ledger entries
+
+### MVP-5 FIXER PASS — 2026-08-13, 15 vision-fidelity/content-honesty findings closed
+
+**Mission outcome.** All 15 findings from the panel review of MVP-5
+CONTENT (below) closed by editing content, none rejected. Docs/content
+only — no `src/`/`tests/` change, so CLAUDE.md's "code is code" multi-axis
+loop does not apply; gates re-run anyway (`cargo fmt --check`, `cargo
+clippy --all-targets -- -D warnings`, `cargo test`) since the workflow-
+catalog and `m6_surfaces` t5 suites read `.sergeant/` and `AGENTS.md`
+directly and a content edit can break them. Leak check clean: `pgrep -f
+"debug/sgt [-]-data-dir"` empty.
+
+**vision-fidelity (4 findings, all closed).** VF-1/CH-4 (the colleague
+README path never delivers the OS layer — `sgt init` in a bare
+`~/my-estate` has no `AGENTS.md`/`skills/`/`.sergeant/`): `README.md`'s
+"Get it" section now keeps the reader in the clone itself
+(clone-is-distro, matching the A7 ship-gate happy path and
+`docs/gauntlet/notes/mvp-bucketing-2026-08-11.md`'s "gh repo clone → ...
+→ `sgt init` → open Claude" sequence) instead of sending them to an empty
+directory elsewhere. VF-2 (the standard loop never teaches walk-away →
+return, the product's whole differentiator): step 5 of `AGENTS.md`'s
+standard workflow loop now states `sgt run` returns on submission, not
+completion, and that the daemon outlives the terminal; step 7 states a
+`needs_input` you weren't watching for is exactly why the loop hands
+control back rather than blocking in-session; step 8 now asks for the
+spent-envelope report (`envelope.turns_spawned` vs. ceiling) as part of
+"collect", not merely the branch/artifacts. VF-3 (README states the wrong
+data-dir default, omitting the estate-resolved rung that is R-NS-3's whole
+mechanism): the "Using sgt day-to-day" section now states the full,
+correct precedence chain measured from `src/cli.rs`'s `resolve_data_dir`
+and names the first-`sgt-init`-reports-against-the-fallback wrinkle
+explicitly rather than leaving a reader to discover it. VF-4/CH-7 (the
+"see it first" demo path prescribes a discarded release build
+`scripts/demo.sh` never consults): the release-build line is gone; the
+walkthrough now just runs `scripts/demo.sh` (which builds its own debug
+binary) with a one-line note on pointing it at an already-installed `sgt`
+via `SGT_BIN` instead.
+
+**content-honesty (8 findings, all closed).** CH-1 (17 of 126
+`agents-invariant` units routed to `skill: codebase-design`/`skill:
+domain-modeling`, which don't exist as published packages — only frozen
+`reference/sergeant-upstream/` evidence): `docs/icm/agents-invariant-
+dispositions.md`'s 17 rows (BU-1033..1048, BU-1064) reclassified to
+`not-adopted` with the honest reason (nearest live host, `deepen-module`,
+already cites the upstream path directly rather than through a fabricated
+`skill:` indirection); `AGENTS.md`'s corpus-summary paragraph no longer
+names either as a workflow; the two live packages that named a
+"grilling/domain-modeling" pair (`triage/40-grill-if-underspecified`,
+`wayfinder/00-name-destination`) now name `grilling` alone, matching what
+was actually built. Backlog row B8 registers the promotion gap. CH-2 (10
+of 40 `AGENTS.md`-dispositioned units uncited, 5 with no satisfying text
+at all): `AGENTS.md` gained real cited text for BU-0004/BU-0005/BU-0009
+(the direct-vs-dispatch criteria, previously absent), BU-0109
+(single-developer-per-install, previously absent), and citations for the
+five that had satisfying text but no marker (BU-0020/BU-0037/BU-0056/
+BU-0172/BU-1262); BU-0003's inverted default-to-coordinate claim was
+reclassified `not-adopted` rather than forced into text that contradicts
+this repo's actual routing judgment. CH-3 (three dispositions cite a
+"`NORTH-STAR.md` 'One owner'" quotation that isn't in that file):
+corrected the BU-0054/BU-0109 citations to `docs/DEVELOPMENT.md`, where
+the phrase actually lives (and clarified it's an intra-process invariant,
+distinct from BU-0109's adoption-model claim); corrected BU-0110's
+dismissal, which had wrongly claimed `NORTH-STAR.md`'s Never list names
+tenancy/RBAC/credentials/leases — it doesn't; the real reasoning
+(sergeant-rs has no multi-tenant server surface at all) replaces it. CH-4:
+same fix as VF-1 above (single finding, two review passes). CH-5 (a new
+skill cites "CLAUDE.md L1", which the very next commit symlinked away
+from any such text): `skills/sergeant-help/SKILL.md`'s precedence-order
+citation now points at `docs/DEVELOPMENT.md`'s actual L1 sentence. CH-6
+(`load-project/CONTEXT.md` contradicts itself about whether the folded
+N1-A4 helpers still exist, and cites a `provenance.md` that never
+existed): rewrote the N1-adjudication-A4 paragraph to state the fold and
+its later supersession by the MVP-5 F2 SPLIT verdict in one consistent
+account, and named the real provenance trail
+(`docs/gauntlet/promoted-provenance/load-project.md`) instead of the
+dangling reference. CH-7: same fix as VF-4 above. CH-8 (no GAUNTLET entry
+for MVP-5, breaking the per-milestone register discipline every prior
+milestone followed): this entry, plus the MVP-5 CONTENT entry below it and
+backlog rows B7/B8 for this pass's own named-but-unfixed gaps
+(`sergeant-setup`'s `30-project-interview` duplication; the
+codebase-design/domain-modeling skill-promotion gap CH-1 surfaced).
+
+**Rejections: none.** Every finding was investigated to its cited
+evidence before fixing; none was found to already be correct as shipped.
+
+**Environmental behavior.** Direct fixer pass over a panel's 15 findings,
+no further panel/critic loop for this response (docs/content-only diff
+against CLAUDE.md's "code is code" scope rule — no `src/`/`tests/`
+executable-behavior change). Findings spanned five files' worth of
+cross-references (`README.md`, `AGENTS.md`, two workflow `CONTEXT.md`
+files, one skill file, one dispositions ledger) with real cross-file
+contradictions (CH-3's misquoted "One owner", CH-6's self-contradicting
+paragraphs) rather than single-file typos — each was traced to its actual
+source text before correcting, not patched at the symptom line alone.
+
+---
+
+### MVP-5 CONTENT — 2026-08-12, AgentOS layer shipped: `AGENTS.md` rewrite, symlink, execution-surface re-homing, README recenter
+
+**Mission outcome.** MVP-5's content lane landed: `docs/DEVELOPMENT.md`
+carries the dev rulebook moved out of `CLAUDE.md` (commit 9bb84fe);
+`AGENTS.md` rewritten as the canonical front door — trigger→skill/workflow
+routing table, an 8-step standard workflow loop, guardrails — consuming
+all 126 `agents-invariant`-classified units from N2 run 4 with every one
+dispositioned in `docs/icm/agents-invariant-dispositions.md` (commit
+cdfd2a5); `CLAUDE.md` retargeted to a symlink onto `AGENTS.md` with dev-
+rulebook citations across `src/`/`tests/`/`scripts/`/docs retargeted to
+`docs/DEVELOPMENT.md` (commit 2c4eb29); `README.md` recentered on
+clone-and-work (commit 0b87800); the MVP-5 F2 execution-surface re-triage
+executed — 12 of 35 draft/published packages retired to `skills/`
+(operator skills) or `docs/icm/re-homing-record-2026-08-12.md`
+(CLI-verb/engine-gap candidates), landing the 23-package catalog
+`.sergeant/index.md` now lists, plus the R-NS-6 `grilling`/
+`grill-with-docs` dissolution out of the WORKFLOW-IF-E3 category (commit
+774a372); two small pre-existing package defects fixed in passing
+(`validate-and-ship`'s S4 Inputs-table, `repo-to-icm`'s wrong resume verb).
+`#53`/`#57` closed in passing per the MVP-5 plan.
+
+**Gates.** `cargo fmt --check && cargo clippy --all-targets -- -D
+warnings && cargo test` green (re-confirmed at the fixer pass above, which
+touched only docs/content and re-ran the full gate rather than assume the
+milestone commit's own run still held). Leak check clean.
+
+**Deviation/backlog notes.** See backlog rows B7 (`sergeant-setup`'s
+`30-project-interview` duplicating `load-project` rather than delegating
+to it — retriage-flagged, left unresolved by this lane's file scope) and
+B8 (17 `agents-invariant` units this lane's own dispositions document
+initially — wrongly — claimed already had a published skill home; found
+and corrected at the MVP-5 FIXER PASS above).
+
+**Environmental behavior.** Multi-commit content lane (8 commits,
+9bb84fe..774a372) executing a plan (`docs/icm/agents-invariant-
+dispositions.md`'s own provenance note, `docs/icm/retriage-2026-08-11.md`,
+`docs/icm/re-homing-record-2026-08-12.md`) rather than a single fixer
+response; a follow-on panel review (findings closed above) is this
+milestone's fixer-pass discipline, matching every prior milestone's
+two-entry (ship + fixer) ledger shape.
+
+---
 
 ### MVP-4 FIXER PASS — 2026-08-12, review findings on the perf re-baseline and the #45 closure
 
