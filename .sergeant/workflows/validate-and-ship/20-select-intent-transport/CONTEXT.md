@@ -4,7 +4,6 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../CONTEXT.md | L1 | workflow orientation — this is the coordinator-launched entry point (see Additional note) |
 | ../00-check-scope/output/README.md | L4 | upstream artifact produced by `00-check-scope`, when entered via the directly-invoked path |
 | ../10-do-the-work/output/README.md | L4 | upstream artifact produced by `10-do-the-work`, when entered via the directly-invoked path |
 
