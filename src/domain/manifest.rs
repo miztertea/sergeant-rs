@@ -196,6 +196,20 @@ pub enum ManifestError {
         path: String,
         detail: String,
     },
+    /// `sergeant.toml` parses as valid TOML but the section this edit needs
+    /// to mutate (`[repo]`, `[group]`, or an individual `[group.<name>]`)
+    /// has a different shape than sgt's own writes ever produce — almost
+    /// always a hand edit. Refused here, before `validate()` gets a chance
+    /// to run, rather than assumed and panicked on.
+    #[error(
+        "{path} has {key:?} in a shape sgt does not recognize (expected {expected}); fix it by \
+         hand back into shape, or move the conflicting entry aside, then retry"
+    )]
+    MalformedSection {
+        path: String,
+        key: String,
+        expected: String,
+    },
 }
 
 /// RAII guard on the manifest's advisory lock — released on drop, including
@@ -480,7 +494,7 @@ pub fn add_repo(
     if let Some(origin) = origin {
         table.insert("origin", value(origin));
     }
-    repo_array_mut(&mut doc).push(table);
+    repo_array_mut(&mut doc, &manifest_path)?.push(table);
 
     validate(estate_root, &doc)?;
     commit(estate_root, &doc)
@@ -559,7 +573,7 @@ pub fn remove_repo(estate_root: &Path, name: &str) -> Result<(), ManifestError> 
         });
     }
 
-    let array = repo_array_mut(&mut doc);
+    let array = repo_array_mut(&mut doc, &manifest_path)?;
     let index = (0..array.len()).find(|&i| {
         array
             .get(i)
@@ -607,13 +621,17 @@ pub fn add_group(
         }
     }
 
-    let groups_table = groups_table_mut(&mut doc);
+    let groups_table = groups_table_mut(&mut doc, &manifest_path)?;
     let entry = groups_table
         .entry(name)
         .or_insert(Item::Table(Table::new()));
     let group_table = entry
         .as_table_mut()
-        .expect("groups_table_mut only ever inserts Item::Table entries");
+        .ok_or_else(|| ManifestError::MalformedSection {
+            path: manifest_path.display().to_string(),
+            key: name.to_string(),
+            expected: "a table ([group.<name>])".to_string(),
+        })?;
     group_table.set_implicit(false);
 
     let mut members: Vec<String> = group_table
@@ -652,7 +670,7 @@ pub fn remove_group(estate_root: &Path, name: &str, repos: &[String]) -> Result<
     let _lock = ManifestLock::acquire(estate_root)?;
     let (mut doc, _existed) = read_document(&manifest_path)?;
 
-    let groups_table = groups_table_mut(&mut doc);
+    let groups_table = groups_table_mut(&mut doc, &manifest_path)?;
     let declared: Vec<String> = groups_table.iter().map(|(k, _)| k.to_string()).collect();
     if !groups_table.contains_key(name) {
         return Err(ManifestError::GroupNotDeclared {
@@ -668,7 +686,11 @@ pub fn remove_group(estate_root: &Path, name: &str, repos: &[String]) -> Result<
         let group_table = groups_table
             .get_mut(name)
             .and_then(Item::as_table_mut)
-            .expect("just checked contains_key(name)");
+            .ok_or_else(|| ManifestError::MalformedSection {
+                path: manifest_path.display().to_string(),
+                key: name.to_string(),
+                expected: "a table ([group.<name>])".to_string(),
+            })?;
         let members: Vec<String> = group_table
             .get("repos")
             .and_then(|item| item.as_array())
@@ -702,22 +724,41 @@ pub fn remove_group(estate_root: &Path, name: &str, repos: &[String]) -> Result<
 
 /// The `[[repo]]` array of tables, creating it (as an explicit, non-inline
 /// array of tables — the on-disk `[[repo]]` shape, not `repo = [...]`) if
-/// absent.
-fn repo_array_mut(doc: &mut DocumentMut) -> &mut ArrayOfTables {
-    doc.entry("repo")
-        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
-        .as_array_of_tables_mut()
-        .expect("repo_array_mut always installs Item::ArrayOfTables")
+/// absent. Fails closed, rather than panicking, if a hand edit has already
+/// put something else under the `repo` key (e.g. `[repo]\nx = 1`, a plain
+/// table).
+fn repo_array_mut<'a>(
+    doc: &'a mut DocumentMut,
+    manifest_path: &Path,
+) -> Result<&'a mut ArrayOfTables, ManifestError> {
+    let item = doc
+        .entry("repo")
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
+    item.as_array_of_tables_mut()
+        .ok_or_else(|| ManifestError::MalformedSection {
+            path: manifest_path.display().to_string(),
+            key: "repo".to_string(),
+            expected: "an array of tables ([[repo]] entries)".to_string(),
+        })
 }
 
-/// The `[group.*]` table, creating it if absent.
-fn groups_table_mut(doc: &mut DocumentMut) -> &mut Table {
+/// The `[group.*]` table, creating it if absent. Fails closed, rather than
+/// panicking, if a hand edit has already put something else under the
+/// `group` key (e.g. `[group]\npair = "oops"`, a plain string value).
+fn groups_table_mut<'a>(
+    doc: &'a mut DocumentMut,
+    manifest_path: &Path,
+) -> Result<&'a mut Table, ManifestError> {
     let item = doc.entry("group").or_insert(Item::Table(Table::new()));
-    if let Item::Table(table) = item {
-        table.set_implicit(false);
-    }
-    item.as_table_mut()
-        .expect("groups_table_mut always installs Item::Table")
+    let table = item
+        .as_table_mut()
+        .ok_or_else(|| ManifestError::MalformedSection {
+            path: manifest_path.display().to_string(),
+            key: "group".to_string(),
+            expected: "a table ([group.<name>] entries)".to_string(),
+        })?;
+    table.set_implicit(false);
+    Ok(table)
 }
 
 /// Declared `[[repo]]` names, in file order — used by every op above that
@@ -1148,6 +1189,56 @@ mod tests {
         let err = remove_group(root, "pair", &[]).expect_err("already gone");
         assert!(
             matches!(err, ManifestError::GroupNotDeclared { .. }),
+            "got {err}"
+        );
+    }
+
+    /// guard-map: a hand-edited `sergeant.toml` whose `[group]`/`[repo]`
+    /// section (or an individual `[group.<name>]` entry) has an unexpected
+    /// shape is refused with a named [`ManifestError`], never a panic — the
+    /// module's own doc comment treats a foreign editor as first-class
+    /// input, so `add_group`/`remove_group`/`add_repo`/`remove_repo` must
+    /// fail closed on this rather than assume the shape they always write.
+    #[test]
+    fn malformed_hand_edited_sections_are_refused_not_panicked_on() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_estate(root, Some("e")).expect("init");
+        let manifest_path = root.join(WORKSPACE_FILE);
+
+        std::fs::write(&manifest_path, "[estate]\nname = \"e\"\n\n[group]\npair = \"oops\"\n")
+            .expect("hand-write malformed group section");
+        let err = add_group(root, "pair", &[], None).expect_err("malformed [group.pair]");
+        assert!(
+            matches!(err, ManifestError::MalformedSection { .. }),
+            "got {err}"
+        );
+        // A non-empty member list is what drives `remove_group` into the
+        // per-member branch that touches the malformed `[group.pair]` entry
+        // directly; an empty list takes the whole-group-removal branch,
+        // which never inspects the entry's shape.
+        let err =
+            remove_group(root, "pair", &["a".to_string()]).expect_err("malformed [group.pair]");
+        assert!(
+            matches!(err, ManifestError::MalformedSection { .. }),
+            "got {err}"
+        );
+
+        init_repo(&root.join("repos").join("a"));
+        std::fs::write(&manifest_path, "[estate]\nname = \"e\"\n\n[repo]\nx = 1\n")
+            .expect("hand-write malformed repo section");
+        let err = add_repo(root, "a", None, None).expect_err("malformed [repo]");
+        assert!(
+            matches!(err, ManifestError::MalformedSection { .. }),
+            "got {err}"
+        );
+        // `remove_repo` reads `repo_names` first, which reports no declared
+        // repos at all for a `[repo]` table shaped like this (it is not an
+        // array of tables) — so this fails closed via `RepoNotDeclared`
+        // before ever reaching the malformed section, never a panic either.
+        let err = remove_repo(root, "a").expect_err("no declared repos to remove");
+        assert!(
+            matches!(err, ManifestError::RepoNotDeclared { .. }),
             "got {err}"
         );
     }

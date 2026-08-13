@@ -287,7 +287,13 @@ impl DockerBackend {
     /// `docker inspect <name>`, parsed. `Ok(None)` means "no such container" —
     /// Docker's own "no such object" is not treated as this adapter's error,
     /// because "does the container exist" is a routine question every verb
-    /// below asks, not a failure.
+    /// below asks, not a failure. A nonzero exit that is *not* Docker's
+    /// stable "no such object"/"no such container" message (a daemon
+    /// hiccup, a socket blip) is a real failure, surfaced as `Err` rather
+    /// than conflated with absence — callers like `interrupt()` treat
+    /// `Ok(None)` as "already at goal state, nothing to do", so silently
+    /// downgrading a transient failure to `Ok(None)` would skip the actual
+    /// stop/removal work it was supposed to perform.
     fn inspect(&self, name: &str) -> Result<Option<Value>, BackendError> {
         let output = self
             .cmd()
@@ -295,12 +301,14 @@ impl DockerBackend {
             .output()
             .map_err(|e| self.failed(format!("docker inspect {name}: {e}")))?;
         if !output.status.success() {
-            // Docker's own message for a missing object is stable enough to
-            // gate on, but the exit code alone is sufficient and does not
-            // depend on English stderr text: `docker inspect` on an unknown
-            // name/id exits 1 and nothing else in this adapter's own usage
-            // produces a nonzero `inspect` exit.
-            return Ok(None);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.to_lowercase().contains("no such") {
+                return Ok(None);
+            }
+            return Err(self.failed(format!(
+                "docker inspect {name} failed: {}",
+                stderr.trim()
+            )));
         }
         let parsed: Vec<Value> = serde_json::from_slice(&output.stdout)
             .map_err(|e| self.failed(format!("docker inspect {name}: unparseable JSON: {e}")))?;
@@ -1151,7 +1159,21 @@ fn remove_owned_container(docker_bin: &str, name: &str, execution_id: &str) {
                 .ok()
                 .and_then(|v| v.into_iter().next())
         }
-        Ok(_) => None, // Docker's "no such object": nothing to remove.
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.to_lowercase().contains("no such") {
+                None // Docker's "no such object": nothing to remove.
+            } else {
+                tracing::warn!(
+                    container = name,
+                    execution_id,
+                    stderr = %stderr.trim(),
+                    "docker inspect returned a non-success exit while removing an owned \
+                     container (deferred stop); not assuming the container is already gone"
+                );
+                return;
+            }
+        }
         Err(e) => {
             tracing::warn!(
                 container = name,

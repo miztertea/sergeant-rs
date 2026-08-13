@@ -1713,7 +1713,7 @@ async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) 
             format!("no work with id {id}"),
         );
     }
-    let events = match core.events_after(0) {
+    let events = match blocking_sync(|| core.events_after(0)) {
         Ok(events) => events,
         Err(e) => return internal_error(e),
     };
