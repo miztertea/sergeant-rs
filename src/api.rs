@@ -3288,6 +3288,47 @@ mod tests {
         );
     }
 
+    /// The end-to-end half of R-WATCH-7: `decode_frame` classifying a frame
+    /// as `Malformed` is not, by itself, proof that `EventStream::next_event`
+    /// actually surfaces it as an error rather than silently `continue`-ing
+    /// past it (measured: a probe that changed only that one match arm back
+    /// to a skip left every `decode_frame`-level test above green, because
+    /// none of them call `next_event`). A bare loopback TCP listener stands
+    /// in for the daemon — enough to prove the real async read path, not
+    /// just the pure decoder.
+    #[tokio::test]
+    async fn next_event_surfaces_a_malformed_frame_as_an_error_not_a_silent_skip() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in server");
+        let addr = listener.local_addr().expect("local addr");
+        let body = "data: not valid json\n\n";
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf); // drain the client's request
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let client = ApiClient::new(&format!("http://{addr}"), "unused-token").expect("client");
+        let mut stream = client
+            .stream_events(0)
+            .await
+            .expect("connect to the stand-in server");
+        let outcome = stream.next_event().await;
+        match outcome {
+            Err(MalformedFrame(raw)) => assert_eq!(raw, "not valid json"),
+            other => {
+                panic!("a malformed data: frame must surface as Err(MalformedFrame), not {other:?}")
+            }
+        }
+    }
+
     /// The two `stage_label` arms besides "both known" and "nothing at
     /// all": an index with no known total still reads its one-based
     /// position, and the absence of an index drops the position segment
