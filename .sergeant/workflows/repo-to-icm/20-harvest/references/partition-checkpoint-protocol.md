@@ -107,12 +107,31 @@ partition:
   can tell real progress from a shortcut.
 - A ledger with any `pending` row at the end of an attempt is real signal —
   someone (a human operator, or an orchestrating caller of this Work) needs
-  to notice it and issue `sgt work retry` on this stage to continue. This
-  workflow does not have a way to trigger that retry itself (the same
-  actor-initiated-continuation gap `00-contract`'s fail-closed marker
-  already lives with) — record the incomplete ledger honestly and stop,
-  exactly as `00-contract` writes `# AMBIGUOUS — NOT RESOLVED` and stops
-  rather than guessing.
+  to notice it and cause another attempt of this stage. `sgt work retry` is
+  **not** that mechanism (fixes #53; measured at N2 run 4, 2026-08-11,
+  `docs/gauntlet/notes/n2-fake-backend-semantics.md`): retry is only legal
+  against a failed/blocked/waiting stage, and this stage is neither —
+  issuing it against a held or freshly-ended stage is refused (409 under
+  the fake-held harness) or has no state left to act on (under a real
+  backend). The two resume paths actually measured to work are:
+  - **Same-hold continuation** (measured under the fake-held harness): the
+    stage's `needs_input` hold persists across external actor attempts with
+    no engine command needed in between — each attempt re-reads this ledger
+    per "On stage entry" above, and the final attempt's single `respond`
+    (not `retry`) is what advances the stage past the hold.
+  - **Cross-run reseed** (measured under a real backend): a harvest turn
+    that ends with `pending` rows simply ends its turn — with BS2's settle
+    fix the stage completes or blocks and the workflow moves on. There is
+    no mid-protocol engine action to take; resumption is a **later,
+    independent attempt of this stage** (a fresh invocation of this
+    workflow, or an orchestrating caller re-entering it), which reads this
+    same ledger under "On stage entry" above and continues from the first
+    `pending` row exactly as a same-hold continuation would.
+
+  Either way, this stage — like `00-contract`'s fail-closed marker — has no
+  way to trigger its own continuation: record the incomplete ledger
+  honestly and stop, exactly as `00-contract` writes
+  `# AMBIGUOUS — NOT RESOLVED` and stops rather than guessing.
 
 ## Completion
 
