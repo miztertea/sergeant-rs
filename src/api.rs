@@ -1704,6 +1704,21 @@ async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Res
 /// archive into lines, parse each as JSON, and recover whatever assistant
 /// text blocks streamed before the cut. It deliberately does not replay tool
 /// calls or system/vendor plumbing — that stays raw-archive-only.
+///
+/// §22.6 tradeoff, disclosed rather than hidden: `events_after(0)` below
+/// runs a full from-seq-0 journal replay while `core` — the exclusive
+/// `CoreGuard` — is still held. `blocking_sync` only keeps the tokio
+/// scheduler's other, guard-independent tasks off this worker thread; it
+/// does not release the guard itself, so every call here still queues
+/// every other Core-guarded request (submit, cancel, retry, input,
+/// `/v1/system`) for the full replay duration, exactly as `events_after`'s
+/// own doc comment says every caller must expect. `resolve_run`'s
+/// `terminal_runs` cache accepts the identical shape only as a rare,
+/// capacity-bounded cache-miss fallback; there is no equivalent bound
+/// here, because a work's conversation history is unbounded and not
+/// capped by any terminal-state cache. Closing this for good needs a
+/// journal reader the core does not own — the same named follow-up
+/// `resolve_run` already defers, not this build's.
 async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
     if !core.registry.state().works.contains_key(&id) {

@@ -1425,6 +1425,47 @@ mod tests {
         completion.wait();
     }
 
+    /// guard-map: `inspect()` must not conflate a transient Docker daemon
+    /// hiccup (any nonzero exit whose stderr is not Docker's own "no such
+    /// object"/"no such container" message) with "no such container" —
+    /// otherwise `interrupt()` reads that as the goal state already
+    /// reached and returns `Completion::immediate()` without ever running
+    /// `docker stop`. Uses a scripted `docker_bin` (a shell script standing
+    /// in for a socket blip / daemon restart, exiting 1 with an unrelated
+    /// stderr message) rather than a real Docker Engine.
+    #[test]
+    fn inspect_reports_a_daemon_hiccup_as_an_error_not_as_absence() {
+        let (dir, mut config) = config();
+        let script_path = dir.path().join("docker-hiccup.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\necho 'Error response from daemon: Cannot connect to the Docker daemon \
+             at unix:///var/run/docker.sock: EOF' >&2\nexit 1\n",
+        )
+        .expect("write scripted docker_bin");
+        std::fs::set_permissions(
+            &script_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("chmod +x scripted docker_bin");
+        config.docker_bin = script_path.to_string_lossy().to_string();
+        let backend = DockerBackend::new(config).expect("backend");
+
+        let err = backend
+            .inspect("sgt-e1")
+            .expect_err("a daemon hiccup must not be conflated with \"no such container\"");
+        assert!(matches!(err, BackendError::Failed { .. }), "got {err:?}");
+
+        let handle = ExecutionHandle {
+            execution_id: "e1".into(),
+            native_id: Some("sgt-e1".into()),
+        };
+        let err = backend
+            .interrupt(&handle)
+            .expect_err("interrupt() must propagate the hiccup, not silently no-op");
+        assert!(matches!(err, BackendError::Failed { .. }), "got {err:?}");
+    }
+
     /// INV-R1-12 (MVP-2 D3 fixer pass): `--mount`'s value is a CSV
     /// `key=value` grammar; a worktree path containing `,` or `=` must be
     /// refused before it ever reaches Docker, never handed through as a
