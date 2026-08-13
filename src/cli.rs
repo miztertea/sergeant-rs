@@ -784,7 +784,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 println!();
                 report.print();
             }
-            if report.healthy() {
+            if report.healthy_for_init() {
                 Ok(())
             } else {
                 Err(CliError::silent())
@@ -1483,6 +1483,24 @@ mod doctor {
         /// installation unhealthy — they make it worth reading about.
         pub fn healthy(&self) -> bool {
             self.checks.iter().all(|c| c.status != Status::Fail)
+        }
+
+        /// `sgt init`'s narrower question: did init's own responsibilities —
+        /// scaffolding plus the estate-fundamental checks (`data_dir`,
+        /// `journal`, `projection`) — succeed. Harness rows (`claude`,
+        /// `docker`) are advisory at init time: §17.5's degraded-daemon
+        /// doctrine and NORTH-STAR's day-one loop both say a missing harness
+        /// narrows which backends can run work later, it must not brick
+        /// estate setup. A colleague without the `claude` CLI installed must
+        /// still be able to `sgt init` — the row still prints as `FAIL` with
+        /// its remedy (that part stays honest), it just does not gate this
+        /// exit code. `sgt doctor` run standalone keeps [`Self::healthy`]
+        /// unchanged: an operator asking "is everything healthy" deserves
+        /// the hard answer.
+        pub fn healthy_for_init(&self) -> bool {
+            self.checks
+                .iter()
+                .all(|c| c.status != Status::Fail || matches!(c.name, "claude" | "docker"))
         }
 
         /// The stable `--json` shape.
