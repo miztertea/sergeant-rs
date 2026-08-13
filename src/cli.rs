@@ -137,6 +137,33 @@ enum Command {
         /// Work id to cancel.
         id: String,
     },
+    /// Block until a Work needs attention or reaches a terminal state, then
+    /// print the current snapshot and exit — the harness's return path after
+    /// `sgt run` (`docs/gauntlet/contracts/WATCH.md`), replacing
+    /// `sgt work show` polling with one call. With no `WORK_ID`, watches
+    /// future matching transitions across the whole estate instead of one
+    /// Work (WATCH-02); either way this is silent until a match — no
+    /// heartbeat, no "connected" line. Deliberately does **not** auto-spawn a
+    /// daemon (R-WATCH-3, joining `sgt doctor`/`sgt daemon stop`'s own
+    /// no-auto-spawn set): observation must not materialize the thing
+    /// observed. The global `--json` flag means JSONL here — one
+    /// `sergeant.watch/v1` object per line, never a wrapping array.
+    Watch {
+        /// Work id to watch (omit for an estate-wide watch).
+        id: Option<String>,
+        /// Remain attached after a nonterminal match (`needs_input`,
+        /// `waiting`, `blocked`, `failed`) instead of exiting after the
+        /// first notice. A scoped `--follow` still exits once the Work
+        /// reaches `completed`/`canceled`; an estate-wide `--follow` stays
+        /// attached until interrupted, the stream closes, or an
+        /// unrecoverable error occurs. A Work that fails and is never
+        /// retried or canceled leaves a scoped `--follow` watcher attached
+        /// indefinitely after it has already emitted the `failed` notice
+        /// (R-WATCH-8) — a caller that wants to exit on `failed` uses
+        /// one-shot mode and re-arms.
+        #[arg(long)]
+        follow: bool,
+    },
     /// Ask the daemon one of the canned §22 analytical questions.
     ///
     /// With no name, list the questions this daemon can answer and the row
@@ -709,6 +736,31 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Watch { id, follow } => {
+            // R-WATCH-3: never `ensure_daemon` — this verb refuses rather
+            // than spawns.
+            let client = watch_connect(&data_dir).await?;
+            let options = crate::watch::WatchOptions {
+                work_id: id,
+                follow,
+            };
+            let json = sgt.json;
+            crate::watch::watch(&client, &options, |notice| {
+                if json {
+                    // §9.1: JSONL — one compact object per line, no wrapping
+                    // array, no keep-alive/heartbeat lines (§10).
+                    println!(
+                        "{}",
+                        serde_json::to_string(notice).expect("watch notice serializes")
+                    );
+                } else {
+                    println!("{}", crate::watch::render_human(notice));
+                }
+            })
+            .await
+            .map(|_exit| ())
+            .map_err(|e| CliError::new(e.to_string()))
+        }
         Command::Web { open } => {
             // §29's handoff. `sgt web` is a client command like any other, so
             // it auto-spawns the daemon: asking for the dashboard of a daemon
@@ -1179,6 +1231,54 @@ async fn ensure_daemon(data_dir: &Path) -> Result<ApiClient, CliError> {
 
 fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
     ApiClient::new(&descriptor.endpoint, &descriptor.token).map_err(CliError::from)
+}
+
+/// `sgt watch`'s own daemon connection (R-WATCH-3) — the three detection
+/// branches `sgt doctor`/`daemon_stop` already use (`src/cli.rs:1266-1293` is
+/// this ruling's own citation for the precedent), mirrored here rather than
+/// shared because `watch_connect` must do the one thing every other command
+/// in this file deliberately does not: **never call [`spawn_daemon`]**.
+/// Observation must not materialize the thing observed — fail-closed at both
+/// ends of the daemon's life, matching R-WATCH-3's own framing.
+///
+/// 1. A healthy descriptor → attach, exactly like [`ensure_daemon`].
+/// 2. No descriptor, or a descriptor whose PID is dead → refuse, naming the
+///    data dir and the remedy, exit nonzero, spawn nothing.
+/// 3. A descriptor naming a live PID that does not answer `/healthz` → the
+///    same ambiguous, fail-closed refusal `ensure_daemon` gives, spawn
+///    nothing.
+async fn watch_connect(data_dir: &Path) -> Result<ApiClient, CliError> {
+    let path = daemon::descriptor_path(data_dir);
+    let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
+        return Err(CliError::new(format!(
+            "no daemon is running for {}; start one with any dispatching verb (e.g. `sgt run`) \
+             or `sgt daemon`",
+            data_dir.display(),
+        )));
+    };
+    let http = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()?;
+    if healthz_ok(&http, &descriptor.endpoint).await {
+        return client_for(&descriptor);
+    }
+    if daemon::pid_alive(descriptor.pid) {
+        return Err(CliError::new(format!(
+            "daemon descriptor at {} names PID {} (alive) but {} does not answer /healthz; \
+             refusing to spawn a second daemon and refusing to guess. If it is truly gone, \
+             remove the descriptor file and retry.",
+            path.display(),
+            descriptor.pid,
+            descriptor.endpoint,
+        )));
+    }
+    Err(CliError::new(format!(
+        "no daemon is running for {} (descriptor at {} is stale — pid {} is gone); start one \
+         with any dispatching verb (e.g. `sgt run`) or `sgt daemon`",
+        data_dir.display(),
+        path.display(),
+        descriptor.pid,
+    )))
 }
 
 /// Whether `candidate` is still the exact descriptor already judged stale.
