@@ -133,6 +133,14 @@ here, it never auto-spawns a daemon: point it at a data dir with nothing
 running and it refuses with the remedy rather than starting one, because
 observing must not materialize the thing being observed.
 
+For an estate-wide watch (no Work id), attach the watcher *before* running
+`sgt status`/`sgt work list`, not after: an estate-wide watch is
+edge-triggered from the moment it attaches, so anything that lands after
+reconciliation but before an after-the-fact watch would otherwise fall in
+an unwatched gap. Stated honestly: a bare one-shot estate watch invoked
+*after* reconciliation still carries that gap — there is no `--from <seq>`
+replay in this version to close it after the fact.
+
 **Respond when a stage is waiting on you** (state `needs_input`):
 
 ```sh
