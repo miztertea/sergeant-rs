@@ -116,13 +116,16 @@ clone-and-work · the payments-style walkthrough as demo script.
 4. Live-turn stall detection, daemon-resident (the hung-but-alive class; a *process that exits* without an envelope already settles to `blocked` — BS2 Outcome 2's pre-envelope-exit shape — and MVP-1's wall-clock ceiling is the coarse bound, so what remains here is detection + bounded one-shot recovery) · G3 callbacks (on a consumer) · G1 scheduler (on a policy) 
 5. Release pipeline/prebuilt binaries + stranger onboarding (envelope exists by then) · clean-distro extraction 
 6. H-series remainder (gated on R-H0-3 probe — run the token-free probe during MVP as background fact-finding) · N5 platforms (#18) 
-7. Perf/backlog issues as budgets: #6 #7 #8 #10 #12; B2/#15 cookie handoff on non-loopback need; #21 dashboard tests; #26 pty window. 
+7. Perf/backlog issues as budgets: ~~#6 #7~~ (closed 2026-08-13, grooming pass) #8 #10 #12; B2/#15 cookie handoff on non-loopback need; #21 dashboard tests; #26 pty window. 
 8. Estate graph — the home NORTH-STAR already gates for retriage's `sgt project graph` NET-NEW-SURFACE (unblock: estate landed); its naming reconciliation against `sgt work show --graph` is settled there. `sgt project list/status/sync` does **not** get built: `sgt repo list` + `sgt doctor` answer status, and `sgt-sync` is a SKILL by owner pre-ruling — the source packages retire at MVP-5's re-homing.
 
 ## Explicitly closed by this plan
 
 E1 (re-scoped: turn envelope core, dollars adapter) · E2 (env contract,
-MVP-2/3) · E3 (the WORKFLOW-IF-E3 *category* dissolved by R-NS-6; its
+MVP-2/3 — **correction 2026-08-13:** not actually closed; only the
+docker-side fix (TH-02) landed, the daemon-launched actor subprocess
+still inherits the daemon's PATH unenriched, and #60 stays OPEN in
+Wave 0) · E3 (the WORKFLOW-IF-E3 *category* dissolved by R-NS-6; its
 cheap remainder, the submit-time preflight, ships in MVP-1 — the blanket
 "dissolved" was absorbing a live item) · E4/E5/E6/E7 (MVP-3 + core) ·
 **#4** (MVP-1) · **#23** (MVP-2) · "honest cost" as universal promise

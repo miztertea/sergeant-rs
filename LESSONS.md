@@ -116,8 +116,8 @@ panel, not a substitute for it.
 
 ## L12 — Authority lives in the artifact: re-read the governing text at decision time
 
-S0/S1, 2026-08-10 (numbered assuming the N-branch's L11 lands first; renumber
-at merge if it collides): three same-session orchestrator misses, one class.
+S0/S1, 2026-08-10 (L11 landed without collision — no renumbering was
+needed): three same-session orchestrator misses, one class.
 (1) S1 phase 1 launched as a single self-probing builder — P1-PERF's
 "no implementation to grade" exemption stretched over a code-writing phase
 from a *remembered summary* of the pattern doc, whose pipeline line is
