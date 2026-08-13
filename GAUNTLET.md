@@ -49,6 +49,51 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### WATCH — 2026-08-13, `sgt watch` shipped: proposal → contract → build → gate → pilot, one day
+
+**Mission outcome: contract met, ship gate passed, product pilot PASS.**
+`sgt watch [WORK_ID] [--follow]` — the harness's return path after `sgt
+run` — landed on `cerberus/watch` (PR #69, owner merges). Six-state watch
+set, attention-identity fingerprint over `stage.detail`, three-branch
+no-auto-spawn (owner-ruled: observation must not materialize the daemon),
+JSONL `sergeant.watch/v1` notices carrying the verbatim Work view,
+EventStream's malformed-frame distinction (old silent-skip pin revised
+under R-WATCH-7's explicit ruling), and the `SGT_WATCH_TEST_HOLD`
+dead-man'd race seam. Suite 539 → **570 passed / 0 failed**.
+
+**The loop, with finding curves.** Owner proposal vendored
+(`reference/proposal-sgt-watch-v1.md`) → proposal-review gauntlet
+(wf_56a68808: 3 Sonnet critics + Opus refuter over 22 panel + 5
+orchestrator findings → 21 confirmed / 3 plausible / 3 refuted-as-dupes;
+2 errors: `waiting` wrongly excluded, fingerprint swallowing a second
+question) → WATCH contract, 10 rulings → its own L19 pass (wf_d1801972,
+2 Sonnet critics: 10/10 findings confirmed, incl. the missing-docket
+process error and the terminal teardown-lag race, the L6 class in the
+notice path) → build gauntlet (wf_f4cb393b: Sonnet builder 5 separable
+commits/29 tests; panel 2 findings + 1 process note, all confirmed;
+Sonnet fixer) → 3 L7 mutation probes, all pins have teeth → no-mistakes
+ship gate 01KZY9ZFTE (review/test/document/lint **passed**; 1 info
+finding approved after reading — the contract-authorized structural-test
+pattern; gate agent verified `--model sonnet` on the live process table;
+1 pipeline commit adopted via `axi sync --recover`) → §16.4 pilot
+(`docs/gauntlet/runs/watch-2026-08-13/pilot.md`): submit→notice 2m43s,
+4/8 turns, zero polling commands, R-WATCH-9's terminal lag observed live
+(`output: null` at emission, settled by collection).
+
+**Environmental behavior.** 12 agents, ~1.74M subagent tokens across the
+three workflows + probe agent; Fable spent only in the orchestrator seat.
+One incident, fully traced: the build gauntlet's verify agents filled
+Cerberus's 16 GB tmpfs `/tmp` (CARGO_TARGET_DIRs + gigabyte-scale blob
+rigs, #70), killing the host's entire Bash layer mid-fix — the fixer
+reported honestly instead of papering over, its uncommitted edits were
+gate-checked and committed after recovery, and the rule is now an
+environment row (`docs/environments/cerberus.md`) plus a Work-delivered
+`docs/DEVELOPMENT.md` subsection (`b33eccc` — written by the pilot's own
+dispatched Work: sergeant documenting the incident that its own build
+caused). Dockets: `docs/gauntlet/runs/watch-2026-08-13/`. Issues: #68
+(auto-spawn consistency sweep, scoped out), #70, #71 (pilot finding)
+filed; PR #69 closes #59/#61/#63.
+
 ### WATCH FIXER PASS — 2026-08-13, F1/F2 closed by edit; PROC-1 re-confirmed and environment-blocked
 
 **Mission outcome.** Two of the three CONFIRMED findings from the WATCH

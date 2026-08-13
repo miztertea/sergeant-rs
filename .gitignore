@@ -10,3 +10,7 @@
 # bar never counted. This rule is about the next one, not that one.
 __pycache__/
 *.pyc
+.sergeant/data
+repos/
+.sergeant.toml.lock
+sergeant.toml.validate-*
