@@ -26,6 +26,11 @@ isolated git worktrees whether or not anyone is watching. The full
 destination and the rulings behind it are `NORTH-STAR.md` — read it before
 changing anything here.
 
+Sergeant is designed for one developer per installation: adoption by a
+larger organization means each developer clones and installs
+independently — it does not turn one installation into a shared team
+service. <!-- BU-0109 -->
+
 Documentation is layered by ownership: this file owns always-on operating
 policy for any harness acting in an estate; `.sergeant/workflows/*/index.md`
 and `SKILL.md` files own trigger-specific procedure; `docs/DEVELOPMENT.md`
@@ -49,7 +54,9 @@ that owns that topic wins. <!-- BU-0106 -->
 count, plus the `skills/` operator-skills layer below it) — this table is
 not a copy of it and will not be kept in sync with every addition; consult
 the catalog directly when the intent doesn't obviously match a row above.
-One entry worth knowing before you route to it: a task that wants a live
+Doc/help questions always route to `sergeant-help`, never a general setup
+skill — and setup/repair routes to `sgt init`/`sgt doctor`, not a skill,
+either way. <!-- BU-1262 --> One entry worth knowing before you route to it: a task that wants a live
 back-and-forth interview (`grilling`/`grill-with-docs`, formerly published
 workflows) is never `sgt run` material — North Star ruling R-NS-6
 ("execution ≠ dialogue") holds that conversation is the harness's job, not
@@ -82,7 +89,11 @@ session. <!-- honesty-vision:F2 / R-NS-6 -->
    profile), `--turns`/`--ceiling-secs` (override this Work's turn and
    wall-clock envelope). A workflow declaring an interactive-ask stage on a
    backend whose capability doesn't support it is refused at submit, not
-   discovered mid-run.
+   discovered mid-run. `sgt run` returns as soon as the intent is durably
+   submitted, not when the work finishes — the daemon it hands off to is
+   detached and outlives this terminal. Walking away (closing the session,
+   restarting the machine) after this step is the loop working as intended,
+   not an interruption of it; come back later and pick up at step 6.
 6. **Monitor.** `sgt work show <id>` (stage, execution, surface, output
    pointer, recent events) and `sgt work transcript <id>` (the decoded
    conversation) — a Work item isn't progressing merely because a process
@@ -93,11 +104,17 @@ session. <!-- honesty-vision:F2 / R-NS-6 -->
    for genuine human-judgment gates (product, security, destructive-action,
    ambiguity a mechanical check can't resolve), not relayed for findings a
    workflow could apply itself. `sgt retry`/`sgt extend` re-enter a stage
-   only after reading its actual current state, never blind. <!-- BU-0039, BU-0112 -->
+   only after reading its actual current state, never blind. A
+   `needs_input` you weren't watching for is exactly why this loop
+   returns to you rather than blocking in-session: resume by responding
+   once you're back. <!-- BU-0037, BU-0039, BU-0112 -->
 8. **Collect.** The output pointer in `sgt work show <id>` names the
    branch and every artifact's home; a plan, a dispatched Work item, or a
    status report is not the delivered outcome unless that's literally all
-   that was asked for. <!-- BU-0017, BU-0044, BU-0045 -->
+   that was asked for. Report the envelope actually spent too —
+   `sgt work show <id>`'s `envelope.turns_spawned` against its ceiling —
+   an honest, bounded cost is part of the delivered outcome, not an
+   optional aside. <!-- BU-0017, BU-0044, BU-0045 -->
 
 ## ICM procedure discipline
 
@@ -116,13 +133,18 @@ completion in prose that the journal doesn't actually contain.
 
 ## When NOT to use `sgt`
 
-A single-turn ask — answer a question, read a file, make a small edit in
-the current session with no need to survive a restart or run unattended —
-does not need the Work apparatus. The harness (this session) owns that
-routing judgment; sergeant's core makes no claim about it (North Star
-ruling 4). Reach for `sgt run` when the work should be durable, resumable,
-and reviewable independent of this conversation continuing — not by
-default for everything.
+Dispatch (`sgt run`) is for work that spans repositories, contains two or
+more independent repository-owned tasks, needs an isolated
+independent-review worker, or the user explicitly asks for workers.
+<!-- BU-0005 --> Direct, in-session implementation is used instead only
+when both hold: the user explicitly asks to work in-session (or says not
+to dispatch), and one repository owns the complete outcome — a
+single-turn ask, answering a question, reading a file, a small edit with
+no need to survive a restart or run unattended. <!-- BU-0004, BU-0009 -->
+The harness (this session) owns that routing judgment; sergeant's core
+makes no claim about it (North Star ruling 4). Reach for `sgt run` when
+the work should be durable, resumable, and reviewable independent of this
+conversation continuing — not by default for everything.
 
 ## Working on sergeant-rs itself
 
@@ -142,8 +164,9 @@ waives tests, review, or the shipping gate. <!-- BU-0018, BU-0113, BU-0114 -->
   Re-running `sgt init` on an already-initialized estate is a no-op, not a
   reset. <!-- BU-1263, BU-1264, BU-1295 -->
 - Prefer the `sgt` verbs above over ad hoc shell reconstructions of the
-  same operation; fall back to manual steps only when no verb covers it,
-  and say so plus the exact error when you do. <!-- BU-0019, BU-0021 -->
+  same operation, and over manual process/tmux/git/fleet-file recovery;
+  fall back to manual steps only when no verb covers it, and say so plus
+  the exact error when you do. <!-- BU-0019, BU-0020, BU-0021, BU-0056, BU-0172 -->
 - A missing tool or capability surfaces as `sgt doctor`'s named remedy,
   never a silent skip or an invented workaround. <!-- BU-0049, BU-0265, BU-1260, BU-1261 -->
 - Standing authorization to proceed without re-confirming every step never
@@ -163,7 +186,10 @@ itself is absent or unreadable; don't reconstruct the procedure from
 memory in that case. <!-- BU-0022, BU-0023, BU-0024 -->
 
 Most of the 126-unit corpus this rewrite consumed belongs to specific
-workflows (`tdd`, `codebase-design`, `prototype`, `wayfinder`, `to-tickets`,
-`triage`, `diagnose-bug`, `domain-modeling`) rather than to this always-on
-file — the full per-unit disposition, including everything ruled
-not-adopted and why, is `docs/icm/agents-invariant-dispositions.md`.
+published workflows (`tdd`, `prototype`, `wayfinder`, `to-tickets`,
+`triage`, `diagnose-bug`) rather than to this always-on file — the full
+per-unit disposition, including everything ruled not-adopted and why
+(among the not-adopted: two upstream skills this repo has no live package
+for yet, `codebase-design` and `domain-modeling` — only frozen evidence
+under `reference/sergeant-upstream/`), is
+`docs/icm/agents-invariant-dispositions.md`.

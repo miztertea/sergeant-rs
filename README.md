@@ -29,32 +29,41 @@ cargo install --path . --bin sgt   # first build compiles bundled DuckDB from sc
 ```
 
 That puts `sgt` on `$CARGO_HOME/bin` (usually `~/.cargo/bin`, already on
-`PATH` for most Rust installs). From here on you're working in *your*
-repos, not this checkout:
+`PATH` for most Rust installs). Sergeant is clone-is-distro: this checkout
+*is* the estate. `AGENTS.md`, `skills/`, and `.sergeant/workflows/` only
+exist here — stay in it rather than starting a bare directory elsewhere,
+which would leave a harness with nothing to read:
 
 ```sh
-mkdir ~/my-estate && cd ~/my-estate   # or wherever you keep your work
 sgt init                              # scaffold the estate: sergeant.toml [estate], repos/, .gitignore
 sgt repo add settlement-service --origin git@github.com:you/settlement-service.git
 ```
 
-Then open your harness (Claude Code or another agent CLI) in that
+(`sgt init` never touches sergeant-rs's own source — it only adds
+`sergeant.toml`, `repos/`, and a couple of `.gitignore` entries alongside
+it. Your added repos live under `repos/`, gitignored, separate from this
+checkout's own tracked files.)
+
+Then open your harness (Claude Code or another agent CLI) in this same
 directory and just say what you want. It reads `AGENTS.md`, shapes an
 intent, and drives `sgt run` on your behalf — see [`AGENTS.md`](AGENTS.md)
 for exactly how it routes and the loop it follows, and the [workflow
 catalog](#workflows) below for what a workflow actually is.
 
 Want to see the whole loop first, with no tokens spent and no estate to
-set up? `scripts/demo.sh` drives it end to end in a throwaway repo — submit
-→ worktree → stage runs and *stops to ask a question* → you answer →
-independent review stage → completed → retired — deterministically, on the
-fake backend, printing where the evidence lives at every step. It exits 0
-or the walkthrough is broken:
+set up? `scripts/demo.sh` builds the debug binary itself and drives it end
+to end in a throwaway repo — submit → worktree → stage runs and *stops to
+ask a question* → you answer → independent review stage → completed →
+retired — deterministically, on the fake backend, printing where the
+evidence lives at every step. It exits 0 or the walkthrough is broken:
 
 ```sh
-cargo build --release   # if you haven't already via cargo install
 scripts/demo.sh
 ```
+
+Already built a release binary above with `cargo install`? Point the
+script at it instead of paying for a second (debug) DuckDB build:
+`SGT_BIN=$(command -v sgt) scripts/demo.sh`.
 
 With no `claude` CLI installed, add `--backend fake` to any `sgt run` to
 try the loop without spending tokens.
@@ -71,7 +80,7 @@ try the loop without spending tokens.
 
 ## Using sgt day-to-day
 
-Every command below is copy-pasteable; every command takes `--json` for scripting and `--data-dir <dir>` to point at a non-default data directory (default: `$SGT_DATA_DIR`, else `~/.local/share/sergeant`).
+Every command below is copy-pasteable; every command takes `--json` for scripting and `--data-dir <dir>` to point at a non-default data directory. Default precedence: `--data-dir` → `$SGT_DATA_DIR` → this estate's own `.sergeant/data` (found by walking up from the current directory — this is the path `sgt init`'s `.gitignore` entry covers, and what keeps sergeant's state out of `~`) → `$XDG_DATA_HOME/sergeant` → `~/.local/share/sergeant`. One wrinkle: the very first `sgt init` in a fresh directory reports its health check against the pre-estate fallback (`$XDG_DATA_HOME`/`~/.local/share/sergeant`), since the estate doesn't exist yet at the instant that check runs — every command after that first one resolves to `<estate>/.sergeant/data` as expected.
 
 **Submit work**, from inside any git repository:
 
