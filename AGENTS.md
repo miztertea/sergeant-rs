@@ -94,12 +94,38 @@ session. <!-- honesty-vision:F2 / R-NS-6 -->
    detached and outlives this terminal. Walking away (closing the session,
    restarting the machine) after this step is the loop working as intended,
    not an interruption of it; come back later and pick up at step 6.
-6. **Monitor.** `sgt work show <id>` (stage, execution, surface, output
-   pointer, recent events) and `sgt work transcript <id>` (the decoded
-   conversation) — a Work item isn't progressing merely because a process
-   for it exists; trust the journal-backed state these surfaces read, not
-   liveness alone. `in_progress`, `needs_input`, and `blocked` are all
+6. **Monitor.** Use `sgt --json watch <id>` to wait for the next attention
+   or terminal transition instead of polling `sgt work show <id>` in a
+   loop (`docs/gauntlet/contracts/WATCH.md`) — it blocks silently until a
+   match, then reports one current, authoritative Work snapshot. A watch
+   notice is a trigger, not the state itself: adjudicate from its
+   snapshot and the ordinary surfaces below, never from a raw event
+   payload, and do not assume `needs_input` must be relayed to the
+   operator — Captain still decides whether existing intent, an
+   established contract, or delegated authority already resolves it.
+   `sgt work show <id>` (stage, execution, surface, output pointer,
+   recent events) and `sgt work transcript <id>` (the decoded
+   conversation) remain the surfaces to read from — a Work item isn't
+   progressing merely because a process for it exists; trust the
+   journal-backed state these surfaces read, not liveness alone.
+   `in_progress`, `needs_input`, `blocked`, and `waiting` are all
    nonterminal. <!-- BU-0036, BU-0038, BU-0047, BU-0111, BU-0115 -->
+   A one-shot foreground `sgt watch` call is for a short expected wait —
+   this pilot harness's own foreground tool calls cap at roughly ten
+   minutes. For a longer wait, or several Works in flight at once, run
+   `sgt --json watch --follow` under this harness's own background-command
+   facility instead and continue the conversation while it stays attached;
+   a Work that fails and is never retried or canceled leaves a `--follow`
+   watcher attached indefinitely after it has already emitted the
+   `failed` notice — re-arm with a fresh one-shot watch if that is not
+   what is wanted. When watching estate-wide (no Work id) alongside the
+   step-2 `sgt status`/`sgt work list` reconciliation, attach the watcher
+   *before* running those two, not after: an estate-wide watch is
+   edge-triggered from the moment it attaches, so anything that lands
+   after reconciliation but before an after-the-fact watch would
+   otherwise fall in an unwatched gap. `sgt watch` never auto-spawns a
+   daemon — if `sgt doctor`/`sgt status` shows none running, start one
+   first with any dispatching verb.
 7. **Respond to `needs_input`.** `sgt respond <id> "<answer>"` — reserved
    for genuine human-judgment gates (product, security, destructive-action,
    ambiguity a mechanical check can't resolve), not relayed for findings a

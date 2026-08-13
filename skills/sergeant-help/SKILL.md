@@ -30,6 +30,7 @@ workflow loop) instead of continuing to answer questions about it.
 | What Sergeant is, the product/ownership model | `README.md`, `NORTH-STAR.md` |
 | Install and first estate | `README.md` ("Get it") |
 | How a harness should route, the standard workflow loop, guardrails | `AGENTS.md` |
+| Waiting for a Work's next attention/result without polling, avoiding a `sgt work show` loop, subscribing to Work transitions | `docs/gauntlet/contracts/WATCH.md` (the `sgt watch` command), `AGENTS.md` step 6 |
 | Workflow authoring rules, the `.sergeant/` filesystem convention | `docs/icm/convention.md` |
 | What workflows exist | `.sergeant/index.md` (the catalog) |
 | A specific workflow's stages/inputs/outputs | `.sergeant/workflows/<name>/index.md` and `CONTEXT.md` |
@@ -55,10 +56,10 @@ above are sergeant-rs's real equivalents, not a copy of upstream's map.
    ```
 
 4. For flag or argument questions, run `sgt <command> --help` (every `sgt`
-   command supports it — verified 2026-08-12 against the built binary) rather
+   command supports it — verified 2026-08-13 against the built binary) rather
    than assuming syntax. Top-level: `sgt --help` lists `daemon`, `status`,
-   `run`, `work`, `respond`, `retry`, `extend`, `cancel`, `analytics`, `web`,
-   `doctor`, `init`, `repo`, `group`.
+   `run`, `work`, `respond`, `retry`, `extend`, `cancel`, `watch`,
+   `analytics`, `web`, `doctor`, `init`, `repo`, `group`.
 5. Answer with the exact command, required preconditions, expected evidence,
    and links to repository-relative documentation paths.
 6. If sources disagree, use this precedence:

@@ -106,6 +106,33 @@ sgt web                  # print the dashboard URL (tokenized, loopback-only)
 sgt web --open            # ...and open it in a browser
 ```
 
+**Wait for it, instead of polling** (`docs/gauntlet/contracts/WATCH.md`):
+
+```sh
+sgt watch <id>                # block until this Work needs attention or ends, then print it
+sgt --json watch <id>         # same, one sergeant.watch/v1 JSON object
+sgt --json watch <id> --follow  # stay attached across every nonterminal match too
+sgt --json watch --follow     # future attention/result transitions across the whole estate
+```
+
+`sgt watch` replaces a `sgt work show <id>` polling loop with one blocking
+call: it is silent while nothing has changed, and default mode emits
+exactly one notice and exits — `--json` makes that notice one compact
+JSON object per line (JSONL; no wrapping array, ever). No output means no
+matching transition has happened yet. Watched states are `needs_input`,
+`blocked`, `waiting`, `failed`, `completed`, `canceled`; `pending` and
+`active` never produce a notice. A scoped `--follow` watcher exits once
+the Work reaches `completed`/`canceled`, but stays attached through
+`needs_input`/`blocked`/`waiting`/`failed` — including `failed`: a Work
+that fails and is never retried or canceled leaves a `--follow` watcher
+attached indefinitely after it has already reported the failure, since
+nothing auto-resumes it. `sgt watch` does not wake or launch a harness —
+it is a quiet process contract a harness's own tool-call or
+background-command facility drives — and, unlike every other client verb
+here, it never auto-spawns a daemon: point it at a data dir with nothing
+running and it refuses with the remedy rather than starting one, because
+observing must not materialize the thing being observed.
+
 **Respond when a stage is waiting on you** (state `needs_input`):
 
 ```sh
