@@ -8469,38 +8469,41 @@ fn r_mvp1_7_a_send_that_internally_retries_through_resume_counts_one_turn() {
     );
 }
 
-/// R-MVP1-11's declaration, end to end: `grilling`'s own `workflow.toml`
-/// (`.sergeant/workflows/grilling/`) carries `requires_ask = true` on its
-/// interview stage — this is not a fixture standing in for the ruling, it
-/// is the ruling's own admitted workflow.
+/// R-MVP1-11's declaration, end to end, via a real on-disk package (not the
+/// in-memory `TomlWorkflow` unit fixture `src/domain/workflow.rs` already
+/// covers): `requires_ask = true` on a stage in a real
+/// `.sergeant/workflows/<name>/workflow.toml`, read through
+/// `WorkflowDefinition::resolve`'s actual filesystem/TOML path.
+///
+/// Until 2026-08-12 this test read the real, admitted `.sergeant/workflows/
+/// grilling/` package — "not a fixture standing in for the ruling, it is
+/// the ruling's own admitted workflow." `grilling` retired at MVP-5 F2's
+/// execution-surface re-triage (North Star ruling R-NS-6 dissolves the
+/// WORKFLOW-IF-E3 category grilling-class packages sat in; re-homed to
+/// `skills/grilling/SKILL.md`; see `docs/icm/re-homing-record-2026-08-12.md`).
+/// No package under `.sergeant/workflows/` declares `requires_ask = true`
+/// today — an honest consequence of that ruling, not a regression to paper
+/// over — so this test now proves the parse contract against
+/// `write_ask_workflow`'s synthetic on-disk fixture (the same technique the
+/// three preflight-behavior tests below already use) instead of asserting
+/// a currently-shipped package uses the field.
 #[test]
-fn r_mvp1_11_grillings_interview_stage_declares_requires_ask() {
-    // TH-06: `CARGO_MANIFEST_DIR` is exact for an integration test target —
-    // this crate root is where `.sergeant/` actually lives — unlike a
-    // cwd-ancestor search, which silently converts the exact regression
-    // this pin exists to catch (`.sergeant/workflows/grilling/workflow.toml`
-    // deleted, renamed, or moved) into `SKIPPED` rather than a failure the
-    // moment `cargo test`'s own working directory is anything but the
-    // checkout root.
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-    assert!(
-        root.join(".sergeant/workflows/grilling/workflow.toml")
-            .is_file(),
-        "{} has no .sergeant/workflows/grilling/workflow.toml — CARGO_MANIFEST_DIR must be \
-         this checkout's root for an integration test target, so this is a real regression, \
-         not an environment this pin should skip",
-        root.display()
-    );
-    let workflow = sergeant_rs::domain::workflow::WorkflowDefinition::resolve(&root, "grilling")
-        .expect("grilling resolves");
+fn r_mvp1_11_requires_ask_declares_on_a_real_on_disk_workflow_package() {
+    let repos = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_ask_workflow(&repo);
+
+    let workflow = sergeant_rs::domain::workflow::WorkflowDefinition::resolve(&repo, "asks")
+        .expect("asks resolves");
     let interview = workflow
         .stages
         .iter()
-        .find(|s| s.id == "00-interview-loop")
-        .expect("grilling has 00-interview-loop");
+        .find(|s| s.id == "00-interview")
+        .expect("asks has 00-interview");
     assert!(
         interview.requires_ask,
-        "grilling's interview stage must declare requires_ask = true"
+        "the fixture's interview stage must declare requires_ask = true"
     );
 }
 

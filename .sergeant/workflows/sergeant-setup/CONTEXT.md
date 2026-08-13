@@ -9,7 +9,11 @@ it is never delivered as a stage's instructions; each stage's own
 
 ## Purpose
 
-Bring an installation from any partial state to a verified-complete state without ever silently reconfiguring anything the operator did not consent to.
+Capture a complete project definition through interview, and track any
+capability gap discovered along the way as approved work — the judgment
+portion of "bring an installation from any partial state to a
+verified-complete state" that `sgt init`/`sgt doctor` don't already cover
+mechanically (see "Retired" note under Stages below).
 
 ## Trigger
 
@@ -19,14 +23,21 @@ First install, a new project/repository to register, a broken or incomplete inst
 
 | Stage | Ladder rung (as extracted) | Durable outcome |
 |---|---|---|
-| `00-detect-prerequisites` | actor-stage (§6.4, judgment; reclassified from §6.5 per A4 — see stage CONTEXT.md) | Every checked tool is classified present / installable / unsupported; required gaps stop the run unless the user accepts the risk. |
 | `05-file-capability-gaps` | actor-stage (§6.4, judgment) | Each unsupported capability becomes an approved tracked issue, or is reported as an unfilled gap. |
-| `10-install-commands` | actor-stage (§6.4, judgment) | Commands resolve on PATH, verified; failure stops with the expected source paths named. |
-| `20-global-config` | actor-stage (§6.4, judgment) | One machine-wide `dev_root` exists and parses; an existing file is never overwritten without backup + diff + confirmation. |
 | `30-project-interview` | actor-stage (§6.4, judgment) | A complete project definition is captured from the user, previewed in full, and written only after confirmation. |
-| `40-repair-existing` | actor-stage (§6.4, judgment) | An existing definition is validated, a minimal diff shown, and changes applied only after confirmation with a mandatory post-confirmation backup. |
-| `60-task-tracking-init` | actor-stage (§6.4, judgment; absorbs `50-sync-and-verify` per A4) | Tracked-work storage initialized per registered repo, each behind explicit consent. |
-| `70-optional-capabilities` | actor-stage (§6.4, judgment; absorbs `90-completion-summary` per A4) | Worktree pools and graph output initialized only where explicitly desired; declining never marks setup incomplete. |
+
+**Retired (MVP-5 F2 execution-surface re-triage, 2026-08-12):**
+`00-detect-prerequisites`, `10-install-commands`, `20-global-config`,
+`40-repair-existing`, `60-task-tracking-init`, `70-optional-capabilities` —
+the SPLIT verdict (`docs/icm/retriage-2026-08-11.md`) found this bootstrap/
+repair machinery collides with shipped `sgt init`/`sgt doctor` (§2a's "who
+drives" test: mechanical detection/repair reading `sgt` state, not
+alternative-weighing). Their content moved to
+`docs/icm/re-homing-record-2026-08-12.md`, not restated here; provenance
+for the retired stages is preserved in this repository's git history. The
+two surviving stages above are this package's SPLIT-verdict "workflow
+core" — see each one's own CONTEXT.md for how it now stands without the
+retired stages' upstream artifacts.
 
 ## Standing constraints (Layer 3, `_config/standing-constraints.md`)
 

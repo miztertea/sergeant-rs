@@ -5,7 +5,6 @@
 | File | Layer | Why |
 |---|---|---|
 | ../_config/standing-constraints.md | L3 | constraints binding every stage of this workflow |
-| ../00-detect-prerequisites/output/README.md | L4 | upstream artifact produced by `00-detect-prerequisites` |
 
 ## Purpose
 
@@ -22,6 +21,22 @@ Each unsupported capability becomes an approved tracked issue, or is reported as
 - **For each unsupported prerequisite, sergeant-setup drafts a td issue (title, description, acceptance criteria) and shows it for explicit y/yes approval before creating it; on decline it reports the gap in the summary and creates no tracked work.**
   (trigger: a required or optional prerequisite is classified unsupported; outcome: either a tracked issue exists or the gap is explicitly reported, never silently dropped or silently created)
   — `BU-P5-012`, `reference/sergeant-upstream/.agents/skills/sergeant-setup/SKILL.md` (lines 77-89)
+
+## Helper: detect prerequisites (retired MVP-5 F2, 2026-08-12)
+
+This stage previously consumed `00-detect-prerequisites`'s L4 artifact.
+That stage retired: the execution-surface re-triage
+(`docs/icm/retriage-2026-08-11.md`) and the upstream function map
+(`docs/gauntlet/notes/upstream-core-function-map-2026-08-11.md`) both found
+its prerequisite-detection job absorbed by shipped `sgt doctor` (git, the
+`claude` CLI + version gate, Docker, data dir, journal, projection, daemon,
+per-profile permission mode, and — inside an estate — manifest health and
+disk pressure; every failing check names its own remedy). This stage now
+runs `sgt doctor` itself as its own precondition step (a helper invocation
+per `docs/icm/convention.md` §5, not a declared L4 input — `sgt doctor`'s
+output is a live command result, not an upstream workflow artifact) and
+works from its findings directly: any failing check `sgt doctor` cannot
+itself remedy is this stage's "unsupported capability" to file or report.
 
 ## Judgment required
 

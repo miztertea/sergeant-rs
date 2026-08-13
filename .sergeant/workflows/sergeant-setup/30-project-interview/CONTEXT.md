@@ -5,7 +5,6 @@
 | File | Layer | Why |
 |---|---|---|
 | ../_config/standing-constraints.md | L3 | constraints binding every stage of this workflow |
-| ../20-global-config/output/README.md | L4 | upstream artifact produced by `20-global-config` |
 
 ## Purpose
 
@@ -38,6 +37,22 @@ A complete project definition is captured from the user, previewed in full, and 
 ## Judgment required
 
 This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+
+## Retired precondition (MVP-5 F2, 2026-08-12)
+
+This stage previously depended on `20-global-config`'s L4 artifact
+(upstream's one machine-wide `dev_root`). `20-global-config` retired per
+the execution-surface re-triage's SPLIT verdict for this package
+(`docs/icm/retriage-2026-08-11.md`, `docs/icm/re-homing-record-2026-08-12.md`)
+— sergeant-rs has no machine-wide `dev_root` concept; `sgt init` scaffolds
+one estate per directory instead. This stage's own interview/registration
+content is otherwise untouched — it still describes upstream's
+`~/.config/sergeant/<project>.yaml` mechanism, which translating to
+sergeant-rs's estate model is out of scope for this re-homing pass (see
+`load-project/CONTEXT.md`'s same note; this stage's own
+"duplicates load-project's registration job wholesale" defect,
+`docs/icm/retriage-2026-08-11.md`'s SPLIT verdict, is unresolved by this
+pass too — flagged, not fixed).
 
 ## Additional note
 

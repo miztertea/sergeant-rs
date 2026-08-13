@@ -38,20 +38,27 @@ that owns that topic wins. <!-- BU-0106 -->
 | Trigger | Load | Owns |
 |---|---|---|
 | A task names or implies work in a registered repo, and the outcome should be a durable, resumable Work item | `sgt run "<intent>"` (below) | Intent shaping, workflow selection, execution |
-| The user asks how to install, configure, use, or diagnose Sergeant itself (read-only, doc/help-shaped) | `sergeant-help` (`.sergeant/workflows/sergeant-help/`) | Documentation lookup, command verification, prerequisites |
+| The user asks how to install, configure, use, or diagnose Sergeant itself (read-only, doc/help-shaped) | `sergeant-help` (`skills/sergeant-help/SKILL.md`) | Documentation lookup, command verification, prerequisites |
 | The estate isn't set up yet, or `sgt doctor` reports a fixable install/config fault | `sgt init` / `sgt doctor` (not a skill — CLI verbs; see "When NOT to use `sgt`") | Estate scaffolding, install repair |
+| Before acting in an estate whose repos/groups/health aren't already confirmed this session | `estate-navigation` (`skills/estate-navigation/SKILL.md`) | Resolving declared repos/groups and syncing the working set — `sgt repo list`/`sgt group list`/`sgt doctor`/`sgt repo add` |
+| The user wants their plan/decision/idea interviewed and stress-tested, or invokes a "grill" trigger phrase | `grilling` (`skills/grilling/SKILL.md`), or `grill-with-docs` (`skills/grill-with-docs/SKILL.md`) when it should also produce ADRs/glossary entries | A live, in-session interview — never `sgt run` (R-NS-6) |
 | Substantive procedural work has a matching published workflow | the workflow's own `index.md` under `.sergeant/workflows/<name>/`, discovered via `.sergeant/index.md` | That workflow's stages, inputs, and outputs |
 | A `@@name` reference appears in an active stage's `CONTEXT.md` | `.sergeant/common/contexts/<name>.md` | Shared context text, resolved by this exact rule and no other |
 
-`.sergeant/index.md` is the full catalog (35 published workflows at last
-count) — this table is not a copy of it and will not be kept in sync with
-every addition; consult the catalog directly when the intent doesn't
-obviously match a row above. One entry worth knowing before you route to
-it: `grilling`/`grill-with-docs` are published workflows whose design calls
-for a live back-and-forth checkpoint, but this host's harness has been
-measured completing both stages autonomously with zero pauses for input —
-routing an intent that actually needs a mid-run human answer there gets you
-the workflow's best guess, not a conversation. <!-- honesty-vision:F2 / R-NS-6 -->
+`.sergeant/index.md` is the full catalog (23 published workflows at last
+count, plus the `skills/` operator-skills layer below it) — this table is
+not a copy of it and will not be kept in sync with every addition; consult
+the catalog directly when the intent doesn't obviously match a row above.
+One entry worth knowing before you route to it: a task that wants a live
+back-and-forth interview (`grilling`/`grill-with-docs`, formerly published
+workflows) is never `sgt run` material — North Star ruling R-NS-6
+("execution ≠ dialogue") holds that conversation is the harness's job, not
+engine work, and this host's harness has been measured completing an
+interview-shaped workflow stage autonomously with zero pauses for input
+when dispatched that way — a dispatched Work item gets you a workflow's
+best guess, not a conversation. Both retired to `skills/grilling/SKILL.md`
+and `skills/grill-with-docs/SKILL.md`: load and run them directly, in this
+session. <!-- honesty-vision:F2 / R-NS-6 -->
 
 ## Standard workflow loop
 
