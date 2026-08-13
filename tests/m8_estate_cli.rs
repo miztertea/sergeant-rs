@@ -178,6 +178,57 @@ fn init_scaffolds_and_is_idempotent() {
     );
 }
 
+/// guard-map: on a host with no `claude` CLI reachable, `sgt init` still
+/// exits 0 and still scaffolds the estate — the bug this pins (GH runner CI,
+/// all `m8_estate_cli` tests, run 31659419098): doctor's `claude` row FAILs
+/// there ("cannot run claude --version: No such file or directory"), and
+/// before this fix that FAIL flowed straight into init's own exit code, so a
+/// colleague without `claude` installed could never `sgt init` at all — even
+/// though the row's own remedy says "until then only the `fake` backend can
+/// run work". §17.5's degraded-daemon doctrine and NORTH-STAR's day-one loop
+/// both say a missing harness narrows capabilities, it must not brick estate
+/// setup. `SGT_CLAUDE_BIN` (`src/backend/claude.rs`) pointed at a path that
+/// does not exist reproduces the runner's "no claude on PATH" condition
+/// deterministically on any host, including this one where `claude` is
+/// actually installed.
+///
+/// Mutation this kills: reverting `Command::Init`'s exit-code check from
+/// `report.healthy_for_init()` back to `report.healthy()` (or widening
+/// `healthy_for_init`'s advisory set to swallow `data_dir`/`journal`/
+/// `projection` too) — either would flip this test's exit code, or would
+/// stop failing when a *real* estate-fundamental check breaks.
+#[test]
+fn init_succeeds_with_no_claude_cli_but_still_reports_the_fail_row() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+
+    let result = run(
+        estate.path(),
+        Some(&data_dir),
+        &[("SGT_CLAUDE_BIN", "/nonexistent/no-such-claude-binary")],
+        &["init"],
+    );
+    result.assert_ok("init with no claude CLI reachable");
+
+    // The scaffold happened — init's own responsibility, unaffected by the
+    // harness being unavailable.
+    assert!(estate.path().join("sergeant.toml").is_file());
+    assert!(estate.path().join("repos").is_dir());
+
+    // The row still prints as FAIL with its remedy — only the exit code
+    // changed, not the honesty of the report.
+    assert!(
+        result.stdout.contains("FAIL") && result.stdout.contains("claude"),
+        "the claude row must still print as a FAIL with its remedy, got:\n{}",
+        result.stdout
+    );
+    assert!(
+        result.stdout.contains("fake") && result.stdout.contains("backend"),
+        "the FAIL row's own remedy (fake backend still works) must still be visible, got:\n{}",
+        result.stdout
+    );
+}
+
 // ------------------------------------------------------------------ repo
 
 /// guard-map: `sgt repo add --origin` clones into `repos/<name>` when absent;
