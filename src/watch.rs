@@ -453,13 +453,24 @@ async fn test_hold_rendezvous() -> Result<(), WatchError> {
     let Ok(path) = std::env::var(WATCH_TEST_HOLD_ENV) else {
         return Ok(());
     };
+    test_hold_wait(path, WATCH_TEST_HOLD_DEADMAN, WATCH_TEST_HOLD_POLL).await
+}
+
+/// The waiting half of [`test_hold_rendezvous`], with the dead-man and poll
+/// durations taken as parameters rather than the production constants
+/// directly — so a unit test can exercise the dead-man's timeout branch
+/// (`WatchError::TestHoldTimedOut`) in milliseconds instead of the real
+/// [`WATCH_TEST_HOLD_DEADMAN`] (60s). `test_hold_rendezvous` is the only
+/// production caller and always passes the real constants; production
+/// behavior is unchanged by this split.
+async fn test_hold_wait(path: String, deadman: Duration, poll: Duration) -> Result<(), WatchError> {
     let ready = format!("{path}.ready");
     // Best-effort: a write failure here is a broken test harness, not a
     // production concern (the env var is never set in production), so it
     // falls through to the same bounded wait/timeout rather than a distinct
     // error variant.
     let _ = std::fs::write(&ready, b"");
-    let deadline = Instant::now() + WATCH_TEST_HOLD_DEADMAN;
+    let deadline = Instant::now() + deadman;
     loop {
         if std::path::Path::new(&path).exists() {
             return Ok(());
@@ -467,7 +478,7 @@ async fn test_hold_rendezvous() -> Result<(), WatchError> {
         if Instant::now() >= deadline {
             return Err(WatchError::TestHoldTimedOut { path });
         }
-        tokio::time::sleep(WATCH_TEST_HOLD_POLL).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -691,6 +702,83 @@ mod tests {
             value["trigger"],
             Value::Null,
             "an already-matching scoped Work's notice carries a null trigger (§9.2)"
+        );
+    }
+
+    // ---- R-WATCH-6: the test-hold dead-man ------------------------------
+
+    #[tokio::test]
+    async fn test_hold_wait_times_out_with_a_distinct_error_when_the_release_path_never_appears() {
+        // A path under the process-unique temp dir that this test never
+        // creates, so the hold can never be released — proving the dead-man
+        // branch (contract-fidelity:F2) rather than the happy path W3/W4
+        // already pin (wait_for_hold_ready followed by a prompt release).
+        let path = std::env::temp_dir()
+            .join(format!(
+                "sgt-watch-test-hold-never-released-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+
+        let result = test_hold_wait(
+            path.clone(),
+            Duration::from_millis(60),
+            Duration::from_millis(5),
+        )
+        .await;
+
+        match result {
+            Err(WatchError::TestHoldTimedOut {
+                path: timed_out_path,
+            }) => {
+                assert_eq!(
+                    timed_out_path, path,
+                    "the timeout error must name the exact path the hold was waiting on"
+                );
+            }
+            other => panic!(
+                "a hold whose release path never appears must return \
+                 Err(WatchError::TestHoldTimedOut), not {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hold_wait_returns_ok_once_the_release_path_appears() {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "sgt-watch-test-hold-released-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        // Release the hold from a concurrent task shortly after the wait
+        // starts, well inside the dead-man — the mirror image of the
+        // timeout test above, proving the non-error branch still returns
+        // Ok(()) through the same parameterized helper.
+        let release_path = path.clone();
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            let _ = std::fs::write(&release_path, b"");
+        });
+
+        let result = test_hold_wait(
+            path.clone(),
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+        )
+        .await;
+
+        releaser.await.expect("releaser task must not panic");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.ready"));
+
+        assert!(
+            result.is_ok(),
+            "the hold must resolve Ok(()) once the release path appears: {result:?}"
         );
     }
 
