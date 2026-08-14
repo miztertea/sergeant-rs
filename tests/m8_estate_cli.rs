@@ -867,6 +867,59 @@ fn sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir() {
     );
 }
 
+/// guard-map (regression): `resolve_data_dir` runs at the top of every
+/// `dispatch`, ahead of every command including `sgt doctor` — whose entire
+/// job is diagnosing a broken installation, up to and including a broken
+/// manifest. Finding a manifest's `data_dir` must not itself demand the
+/// rest of the manifest — here, two profiles sharing a name, a defect
+/// `sgt doctor` has nothing to do with — be structurally valid, or `doctor`
+/// could never run against the one manifest it most needs to. Mutation this
+/// kills: resolving `data_dir` via the full structural validator (duplicate
+/// repos/profiles, invalid permission modes, unknown group members all
+/// refuse) instead of a lookup scoped to `data_dir` alone — that would make
+/// `doctor` (and every other command) crash before ever running, on stderr,
+/// instead of producing its own JSON report.
+#[test]
+fn a_structurally_broken_manifest_does_not_stop_doctor_from_running() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+    declare_manifest_data_dir(estate.path(), "custom-durable-state");
+    let manifest_path = estate.path().join("sergeant.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).expect("read manifest");
+    manifest.push_str(
+        "\n[[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
+         [[profile]]\nname = \"same\"\nbackend = \"fake\"\n",
+    );
+    std::fs::write(&manifest_path, manifest).expect("write manifest");
+
+    let result = run(estate.path(), None, &[], &["--json", "doctor"]);
+    // `json()` itself asserts stdout parses as JSON — a pre-doctor crash on
+    // the duplicate profile would instead put a plain error string on
+    // stderr and leave stdout empty. Reaching doctor's own report (whatever
+    // its `healthy` verdict, which depends on the unrelated claude/docker
+    // harness rows) is the thing under test, so only structure is checked.
+    let report = result.json();
+    assert!(
+        report["checks"].is_array(),
+        "doctor must still produce its own report: {report}"
+    );
+    let expected_data_dir = std::fs::canonicalize(estate.path())
+        .expect("canonical estate root")
+        .join("custom-durable-state");
+    let reported = PathBuf::from(report["data_dir"].as_str().expect("data_dir"));
+    assert_eq!(
+        std::fs::canonicalize(&reported).unwrap_or(reported),
+        expected_data_dir,
+        "the manifest's data_dir must still be honored despite the unrelated profile defect"
+    );
+}
+
 // -------------------------------------------- work transcript / output pointer
 
 /// A minimal two-stage workflow — the same shape `m5_projections.rs` uses —

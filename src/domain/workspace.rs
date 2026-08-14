@@ -1083,13 +1083,22 @@ impl Workspace {
 
     /// [`Self::estate_root`]'s sibling for `src/cli.rs`'s `resolve_data_dir`
     /// (ADR 0008(b)): the discovered estate root together with its
-    /// manifest's `[estate] data_dir` override, if any — resolved via
-    /// [`Self::from_config_structural`] (disk-free, no per-repo git
-    /// resolution) so a data-dir lookup never fails on a declared repository
-    /// that happens not to exist on disk yet. `None` when no estate is
-    /// found; `Some((root, None))` when one is found but declares no
-    /// override, leaving the caller's own default in force exactly as
+    /// manifest's `[estate] data_dir` override, if any. `None` when no
+    /// estate is found; `Some((root, None))` when one is found but declares
+    /// no override, leaving the caller's own default in force exactly as
     /// `surfaces_dir` does.
+    ///
+    /// Deliberately **not** [`Self::from_config_structural`]:
+    /// `resolve_data_dir` runs at the top of every `dispatch`, ahead of
+    /// every command including `sgt doctor`, whose entire job is diagnosing
+    /// a broken manifest gracefully. A structural defect elsewhere in the
+    /// file — a duplicate profile, an unknown group member, an invalid
+    /// permission mode — has nothing to do with `data_dir` and must not
+    /// stop `doctor` from ever running. This reads only the one field it
+    /// needs, at the same tolerance [`estate_table_check`] already applies
+    /// to find the file in the first place: valid TOML syntax and no
+    /// legacy vocabulary are required, everything else about the manifest's
+    /// shape is not.
     pub fn estate_root_and_data_dir(
         start: &Path,
         data_dir_scope: Option<&Path>,
@@ -1097,8 +1106,12 @@ impl Workspace {
         let Some(config_path) = Self::find_estate_upward(start, data_dir_scope)? else {
             return Ok(None);
         };
-        let workspace = Self::from_config_structural(&config_path)?;
-        Ok(Some((workspace.root, workspace.data_dir)))
+        let root = config_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let data_dir = estate_data_dir_override(&config_path, &root)?;
+        Ok(Some((root, data_dir)))
     }
 
     /// Restrict the workspace to the named repositories (the submit request's
@@ -1168,6 +1181,43 @@ fn estate_table_check(config_path: &Path) -> Result<bool, WorkspaceError> {
     Ok(value
         .as_table()
         .is_some_and(|table| table.contains_key("estate")))
+}
+
+/// [`estate_table_check`]'s sibling for `data_dir` (ADR 0008(b)): the
+/// `[estate] data_dir` string, if any, resolved onto `root` exactly as
+/// [`Workspace::from_config_impl_structural`] resolves it — relative joins
+/// on, absolute passes through — but reached the same tolerant way
+/// `estate_table_check` finds the `[estate]` table itself: a raw TOML
+/// value, not a deserialize into [`WorkspaceFile`]. This is what lets
+/// [`Workspace::estate_root_and_data_dir`] read `data_dir` without also
+/// demanding the rest of the manifest — repos, profiles, groups — be
+/// structurally valid. Unreadable (permission, race) answers `None`, the
+/// same "indistinguishable from no file here" tolerance `estate_table_check`
+/// applies; by the time this runs, [`Workspace::find_estate_upward`] has
+/// already required the file to parse as TOML and carry no legacy
+/// vocabulary, so those two failure modes are not re-checked here.
+fn estate_data_dir_override(
+    config_path: &Path,
+    root: &Path,
+) -> Result<Option<PathBuf>, WorkspaceError> {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return Ok(None);
+    };
+    let file = config_path.display().to_string();
+    let value: toml::Value =
+        toml::from_str(&text).map_err(|source| WorkspaceError::Malformed { path: file, source })?;
+    Ok(value
+        .get("estate")
+        .and_then(|estate| estate.get("data_dir"))
+        .and_then(|data_dir| data_dir.as_str())
+        .map(PathBuf::from)
+        .map(|data_dir| {
+            if data_dir.is_absolute() {
+                data_dir
+            } else {
+                root.join(data_dir)
+            }
+        }))
 }
 
 #[cfg(test)]
@@ -1675,6 +1725,47 @@ mod tests {
         )
         .expect("no data_dir parses");
         assert_eq!(workspace.data_dir, None);
+    }
+
+    /// `resolve_data_dir` (`src/cli.rs`) calls
+    /// [`Workspace::estate_root_and_data_dir`] at the top of every command
+    /// dispatch, including `sgt doctor` — whose entire purpose is to
+    /// diagnose a broken manifest. A structural defect unrelated to
+    /// `data_dir` (here, a duplicate profile name — the same manifest both
+    /// [`Workspace::from_config`] and [`Workspace::from_config_structural`]
+    /// refuse) must not stop `data_dir` from being found, or `doctor` could
+    /// never run against the very manifest it exists to diagnose.
+    #[test]
+    fn estate_data_dir_is_found_even_when_the_rest_of_the_manifest_is_structurally_broken() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+        let config_path = root.join(WORKSPACE_FILE);
+        std::fs::write(
+            &config_path,
+            "[estate]\nname = \"w\"\ndata_dir = \"custom-data\"\n\n\
+             [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
+             [[profile]]\nname = \"same\"\nbackend = \"fake\"\n",
+        )
+        .expect("sergeant.toml");
+
+        // Both strict resolvers refuse this manifest outright.
+        assert!(Workspace::from_config(&config_path).is_err());
+        assert!(matches!(
+            Workspace::from_config_structural(&config_path),
+            Err(WorkspaceError::DuplicateProfile { .. })
+        ));
+
+        // But locating the estate and its `data_dir` override does not.
+        let (found_root, data_dir) = Workspace::estate_root_and_data_dir(root, None)
+            .expect("an unrelated structural defect must not fail data-dir lookup")
+            .expect("an estate is found");
+        assert_eq!(
+            std::fs::canonicalize(&found_root).ok(),
+            std::fs::canonicalize(root).ok()
+        );
+        assert_eq!(data_dir, Some(root.join("custom-data")));
     }
 
     // ---- R-MVP1-12: estate discovery past inner `.git` --------------------
