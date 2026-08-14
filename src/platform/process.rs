@@ -80,27 +80,31 @@ fn raw_process_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// **UNVERIFIED** — never executed against a real macOS host. There is no
-/// `/proc` to scan; `ps -axo pid=,command=` lists every process with its pid
-/// and full command line in one shot, tokenized here on whitespace. That
-/// tokenization is the one place this arm is weaker than Linux's byte-exact
-/// NUL-split argv: a quoted argument containing a space would defeat it. The
-/// launch grammar this fact is actually matched against — `--session-id
-/// <uuid>` / `--resume <uuid>`, see `backend::claude::cmdline_names_session`
-/// — never quotes, so this is judged sufficient for the fact this function
-/// serves, not offered as a general argv parser.
-#[cfg(target_os = "macos")]
-fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,command="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+/// `ps -axo pid=,command=` output, one process per line: pid then its full
+/// command line, tokenized here on whitespace. That tokenization is the one
+/// place this arm is weaker than Linux's byte-exact NUL-split argv: a quoted
+/// argument containing a space would defeat it. The launch grammar this fact
+/// is actually matched against — `--session-id <uuid>` / `--resume <uuid>`,
+/// see `backend::claude::cmdline_names_session` — never quotes, so this is
+/// judged sufficient for the fact this function serves, not offered as a
+/// general argv parser. A line whose first token is not a bare pid (`ps`'s
+/// own header, should the invocation ever regain one; a torn read's partial
+/// first line) is dropped rather than turned into a bogus entry.
+///
+/// This is the "decision logic" ADR 0002 D3 asks for: exercised by the tests
+/// below from whatever host builds this crate, without a macOS host in
+/// sight. Unlike [`disk::parse_avail_kb`](super::disk), the Linux arm above
+/// never has a production reason to call this — it reads `/proc` directly
+/// and produces no text to tokenize — so there is no unconditionally-live
+/// caller to keep it out of `cargo clippy`'s dead-code net on a Linux build.
+/// Gating on `cfg(any(test, target_os = "macos"))` (rather than leaving it
+/// fully unconditional) resolves that: on Linux it exists only for
+/// `cargo test`, where it does have a caller, and on macOS it exists in
+/// production too.
+#[cfg(any(test, target_os = "macos"))]
+fn parse_ps_output(stdout: &str) -> Vec<ProcessArgv> {
     let mut processes = Vec::new();
-    for line in text.lines() {
+    for line in stdout.lines() {
         let mut tokens = line.split_whitespace();
         let Some(pid) = tokens.next().and_then(|token| token.parse::<u32>().ok()) else {
             continue;
@@ -110,7 +114,23 @@ fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
             argv: tokens.map(str::to_string).collect(),
         });
     }
-    Some(processes)
+    processes
+}
+
+/// **UNVERIFIED** — never executed against a real macOS host. There is no
+/// `/proc` to scan; `ps -axo pid=,command=` lists every process with its pid
+/// and full command line in one shot. Parsing is [`parse_ps_output`], pinned
+/// by tests below.
+#[cfg(target_os = "macos")]
+fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_ps_output(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// **UNVERIFIED** — never executed against a real macOS host. `kill -0`
@@ -134,4 +154,67 @@ fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn raw_process_alive(_pid: u32) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_shape_parses_pid_and_argv() {
+        let stdout = "1234 /usr/bin/claude --session-id abc-123\n";
+        let processes = parse_ps_output(stdout);
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 1234);
+        assert_eq!(
+            processes[0].argv,
+            vec!["/usr/bin/claude", "--session-id", "abc-123"]
+        );
+    }
+
+    /// A header row (should `ps -axo pid=,command=` ever regain one) or a
+    /// torn read's partial first line both have a non-numeric or missing
+    /// leading token — neither may become a bogus pid entry the liveness
+    /// scan then reasons about.
+    #[test]
+    fn line_without_a_leading_pid_is_dropped_not_a_bogus_entry() {
+        let stdout = "  PID COMMAND\n5678 /usr/bin/claude --resume def-456\n";
+        let processes = parse_ps_output(stdout);
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 5678);
+    }
+
+    #[test]
+    fn empty_line_is_dropped_not_a_bogus_entry() {
+        assert!(parse_ps_output("\n").is_empty());
+        assert!(parse_ps_output("").is_empty());
+    }
+
+    /// Pins the tokenization weakness the doc comment above concedes: a
+    /// quoted argument containing a space is split into two argv entries
+    /// instead of surviving as one, unlike Linux's byte-exact NUL-split
+    /// `/proc` argv. This is judged sufficient today because the launch
+    /// grammar this fact is matched against —
+    /// `backend::claude::cmdline_names_session`'s `--session-id <uuid>` /
+    /// `--resume <uuid>` — never quotes its value. If that grammar ever
+    /// does gain a quoted argument, this assertion is where that surfaces:
+    /// it pins CURRENT (weaker) behavior, not desired behavior, so it must
+    /// fail the moment someone tries to rely on quoting surviving here.
+    #[test]
+    fn quoted_argument_with_a_space_is_split_current_known_weakness() {
+        let stdout = "1234 /usr/bin/claude --session-id \"abc def\"\n";
+        let processes = parse_ps_output(stdout);
+        assert_eq!(processes.len(), 1);
+        assert_eq!(
+            processes[0].argv,
+            vec!["/usr/bin/claude", "--session-id", "\"abc", "def\""]
+        );
+        assert_ne!(
+            processes[0].argv.get(2),
+            Some(&"abc def".to_string()),
+            "if this now passes, the tokenizer has been fixed to preserve \
+             quoted arguments — update this test and the doc comment above \
+             `parse_ps_output` to stop calling it a known weakness"
+        );
+    }
 }
