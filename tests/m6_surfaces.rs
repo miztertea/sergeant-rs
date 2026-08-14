@@ -509,6 +509,52 @@ fn t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy() {
     );
 }
 
+/// ADR 0009's no-spawn set, on the rest of it: `status`, `work list`,
+/// `work show`, `work transcript`, and `analytics` all refuse rather than
+/// auto-spawn with no daemon running, and each names `sgt doctor` as the
+/// remedy — the same shape `t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy`
+/// pins for the TUI. A build that still routed any one of these through
+/// `ensure_daemon` (the pre-ADR-0009 behavior every one of them used to
+/// share) would exit 0 here and leave a daemon behind instead.
+#[test]
+fn t1_observation_verbs_refuse_without_a_daemon_and_name_the_remedy() {
+    let data = DataDir::new();
+    for args in [
+        vec!["status"],
+        vec!["work", "list"],
+        vec!["work", "show", "01SOMENONEXISTENTWORKID000"],
+        vec!["work", "transcript", "01SOMENONEXISTENTWORKID000"],
+        vec!["analytics"],
+    ] {
+        let output = Command::new(SGT)
+            .arg("--data-dir")
+            .arg(data.path())
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("run sgt {}: {e}", args.join(" ")));
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(
+            !output.status.success(),
+            "sgt {} must refuse rather than auto-spawn with no daemon running",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains("sgt doctor"),
+            "sgt {}'s refusal must name the remedy: {stderr:?}",
+            args.join(" ")
+        );
+        assert!(
+            daemon::read_descriptor(data.path())
+                .expect("descriptor readable")
+                .is_none(),
+            "sgt {} must not have spawned a daemon on its way to refusing",
+            args.join(" ")
+        );
+    }
+}
+
 /// Issue #3, end to end and on a real terminal: a TUI whose pty hangs up
 /// exits, instead of outliving its screen at ~100% of a core.
 ///
@@ -1081,8 +1127,9 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     }
     // The daemon is gone now, but its descriptor may or may not have been
     // cleaned up on the way out; either way, a descriptor whose pid is gone is
-    // the *stale* case, and it is a warning, not a failure — the next client
-    // command republishes it.
+    // the *stale* case, and it is a warning, not a failure — a mutating verb
+    // (or `sgt daemon`) republishes it; observation verbs refuse instead
+    // (ADR 0009).
     let stale = TempDir::new().expect("tempdir");
     write_descriptor(stale.path(), dead_pid(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor(

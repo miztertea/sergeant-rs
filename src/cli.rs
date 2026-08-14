@@ -2400,7 +2400,9 @@ mod doctor {
                     path.display(),
                     descriptor.pid
                 ),
-                "harmless: the next client command spawns a daemon, which republishes it",
+                "harmless: a mutating verb (`run`, `respond`, `retry`, `extend`, `cancel`) or \
+                 `sgt daemon` spawns a fresh daemon, which republishes it — observation verbs \
+                 refuse instead rather than spawning one just to observe it (ADR 0009)",
             )
         }
     }
