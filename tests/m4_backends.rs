@@ -537,7 +537,12 @@ impl StubClaude {
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod stub");
-        let stub = Self {
+        // A file another process still holds open for writing cannot be
+        // exec'd; absorb the ETXTBSY window before handing it to the
+        // adapter (#83 — measured under `cargo test --lib`'s default thread
+        // parallelism: 3 failures in 40 runs, every one `os error 26`).
+        support::wait_until_executable(&path);
+        Self {
             path,
             record,
             replay,
@@ -546,40 +551,6 @@ impl StubClaude {
             release,
             stderr,
             exit_code,
-        };
-        stub.wait_until_executable();
-        stub
-    }
-
-    /// Run the stub once, retrying `ETXTBSY`, before handing it to a test.
-    ///
-    /// A file that some process still holds open for writing cannot be
-    /// `exec`'d — and every `Command::spawn` on a sibling test thread forks a
-    /// child that inherits this test binary's open descriptors for the
-    /// fork-to-exec window. Under load (four test threads, this gauntlet's
-    /// machine, CI) that window overlaps the write above often enough to turn
-    /// "the adapter refuses an unlaunchable CLI" into a false red in a test
-    /// about something else entirely. Absorbing it here, once, keeps the
-    /// flake out of every stub-based test without weakening any of them: the
-    /// adapter's own refusal path is still pinned, deliberately, by
-    /// `a_start_that_cannot_spawn_leaves_no_phantom_execution`.
-    fn wait_until_executable(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match std::process::Command::new(&self.path)
-                .arg("--version")
-                .output()
-            {
-                Ok(_) => return,
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the stub stayed ETXTBSY for 10s: {e}"
-                    );
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("the stub is not runnable: {e}"),
-            }
         }
     }
 

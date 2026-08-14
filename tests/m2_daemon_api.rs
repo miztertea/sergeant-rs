@@ -1473,6 +1473,64 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
     // the assertion every other test in this file gets for free.
 }
 
+/// #70: `DataDir::new()` must land on real disk by default, not wherever
+/// `TempDir::new()` would pick from `$TMPDIR`. On a host like Cerberus that
+/// default is a 16 GB tmpfs `/tmp`; a gigabyte-scale blob-store capture
+/// (`tests/m7_docker_executor.rs`'s
+/// `large_captured_output_does_not_grow_this_process_proportionally`,
+/// contract scale 1 GiB) filling it broke every `Bash` invocation's output
+/// capture across every session on the host — `EDQUOT` under a command that
+/// still ran underneath, so it looked like a broken shell rather than a
+/// full disk (evidence in `docs/environments/cerberus.md`). An operator
+/// remembering to export `$TMPDIR` does not close that: the incident was an
+/// unsafe *default*, so this pins a positive claim about where the rig
+/// actually lands — not merely "not literally /tmp" — which a revert to
+/// `TempDir::new()` fails every time (its default is `/tmp` on this host).
+///
+/// `/var/tmp/sgt-rs-tests`, not `target/tmp` under the crate root: a data
+/// dir nested inside this checkout sits under a directory `sgt run`'s own
+/// workspace-discovery walks upward through looking for `.git` (`fn sgt`'s
+/// doc comment above explains why these M2 tests need a data dir with no
+/// discoverable repository above it) — the first version of this fix
+/// nested it there and turned every `pending` in this file into `blocked`
+/// by accident.
+/// The environment probe below deliberately does **not** call
+/// `support::disk_backed_tmp_base` to decide what to expect: asking the
+/// function under test where it will land, then asserting it landed there,
+/// is a tautology that passes for any answer it gives — including `None`,
+/// which skips the body entirely. Measured: with `disk_backed_tmp_base`
+/// stubbed to `None`, that shape passes, while the independent probe below
+/// fails as it should. The probe reads the filesystem itself, and the skip
+/// is loud per `docs/DEVELOPMENT.md`'s two-environment rule rather than a
+/// silent early return.
+#[test]
+fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
+    if std::env::var_os("SGT_TEST_TMPDIR").is_some() {
+        eprintln!(
+            "SKIPPED-ENV: SGT_TEST_TMPDIR is set, so this run is not exercising the \
+             default this test pins — the override path is a different claim"
+        );
+        return;
+    }
+    let var_tmp = Path::new("/var/tmp");
+    if !var_tmp.is_dir() {
+        eprintln!(
+            "SKIPPED-ENV: /var/tmp is not a directory on this host, so the disk-backed \
+             default cannot be armed here (`disk_backed_tmp_base` falls back by design)"
+        );
+        return;
+    }
+
+    let expected_base = var_tmp.join("sgt-rs-tests");
+    let dir = DataDir::new();
+    assert!(
+        dir.path().starts_with(&expected_base),
+        "DataDir::new() must root its TempDir under {expected_base:?} (real disk, \
+         outside any git checkout) by default — got {:?}",
+        dir.path()
+    );
+}
+
 #[test]
 fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     let dir = DataDir::new();

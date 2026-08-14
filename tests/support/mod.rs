@@ -76,6 +76,32 @@ pub struct ReapedDaemon {
     pub signal: ReapSignal,
 }
 
+/// Where [`DataDir::new`] roots its `TempDir`.
+///
+/// Not `<crate root>/target/tmp`: several suites walk *up* from a spawned
+/// `sgt`'s working directory looking for a git repository (`fn sgt`'s own
+/// doc comment in `tests/m2_daemon_api.rs` explains why the data dir must
+/// stay outside one), and a data dir nested under this checkout's own
+/// `target/` sits inside that checkout — the walk finds this repo's `.git`
+/// and the daemon materializes a real workspace the test never asked for
+/// (measured: `t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed`
+/// and two siblings went from `pending` to `blocked` the moment the base
+/// moved under `target/`). `/var/tmp/<name>` is the already-established
+/// disk-backed, outside-any-checkout location for exactly this class of
+/// rig (`docs/DEVELOPMENT.md`, `docs/environments/cerberus.md`'s #70 row) —
+/// real disk on every measured Linux/macOS host, confirmed here via `df -h
+/// /var/tmp` matching the ext4 root rather than tmpfs. Its absence (e.g. an
+/// untested Windows host) falls back to `TempDir::new()`'s own default
+/// rather than failing outright — this fix targets the measured incident,
+/// not every platform this crate might someday run on.
+pub(crate) fn disk_backed_tmp_base() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("SGT_TEST_TMPDIR") {
+        return Some(PathBuf::from(dir));
+    }
+    let var_tmp = PathBuf::from("/var/tmp");
+    var_tmp.is_dir().then(|| var_tmp.join("sgt-rs-tests"))
+}
+
 /// A temporary sergeant data dir that reaps the daemons running on it.
 ///
 /// Construct one wherever a test points the `sgt` binary at a data dir: any
@@ -87,10 +113,30 @@ pub struct DataDir {
 }
 
 impl DataDir {
-    /// A fresh empty data dir.
+    /// A fresh empty data dir, disk-backed by default where that is safe.
+    ///
+    /// `TempDir::new()` honors `$TMPDIR`, which on a host like Cerberus is a
+    /// 16 GB tmpfs `/tmp` — fine for the small rigs most suites need, but a
+    /// gigabyte-scale blob-store capture (`tests/m7_docker_executor.rs`'s
+    /// `large_captured_output_does_not_grow_this_process_proportionally`,
+    /// contract scale 1 GiB) can fill it, and when it fills, every `Bash`
+    /// output capture on the host starts failing `EDQUOT` under a command
+    /// that still runs underneath — a broken shell, not an obvious full disk
+    /// (#70, evidence in `docs/environments/cerberus.md`). An operator
+    /// remembering to export `$TMPDIR` before running tests does not close
+    /// that: the incident was an unsafe *default*. So the default here is
+    /// real disk, when `disk_backed_tmp_base` finds one available; otherwise
+    /// this falls back to `TempDir::new()`'s own default rather than
+    /// failing a host this fix was never measured against.
     pub fn new() -> Self {
+        let Some(base) = disk_backed_tmp_base() else {
+            return Self {
+                temp: TempDir::new().expect("tempdir"),
+            };
+        };
+        std::fs::create_dir_all(&base).expect("create disk-backed test tmp base dir");
         Self {
-            temp: TempDir::new().expect("tempdir"),
+            temp: tempfile::Builder::new().tempdir_in(&base).expect("tempdir"),
         }
     }
 
@@ -255,5 +301,22 @@ fn wait_until_gone(data_dir: &Path, budget: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// #83: a freshly written, freshly `chmod +x`'d stand-in script can
+/// transiently fail `execve(2)` with `ETXTBSY` ("text file busy", `os error
+/// 26`) while another handle on the same inode is still open for writing —
+/// under `cargo test`'s default thread parallelism, a sibling test's
+/// fork-to-exec window can overlap this one's write. Retry until the exec
+/// stops being refused, or surface any other failure immediately.
+pub fn wait_until_executable(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Err(e) = std::process::Command::new(path).arg("--version").output() {
+        assert!(
+            e.raw_os_error() == Some(26) && Instant::now() < deadline,
+            "the stand-in at {path:?} is not runnable: {e}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

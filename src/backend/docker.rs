@@ -1445,6 +1445,11 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .expect("chmod +x scripted docker_bin");
+        // A file another process still holds open for writing cannot be
+        // exec'd; absorb the ETXTBSY window before handing it to the
+        // backend (#83 — measured under `cargo test --lib`'s default thread
+        // parallelism: 3 failures in 40 runs, every one `os error 26`).
+        crate::test_support::wait_until_executable(&script_path);
         config.docker_bin = script_path.to_string_lossy().to_string();
         let backend = DockerBackend::new(config).expect("backend");
 

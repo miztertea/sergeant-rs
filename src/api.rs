@@ -4005,6 +4005,11 @@ mod tests {
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod stub");
+        // A file another process still holds open for writing cannot be
+        // exec'd; absorb the ETXTBSY window before handing it to the
+        // adapter (#83 — measured under `cargo test --lib`'s default thread
+        // parallelism: 3 failures in 40 runs, every one `os error 26`).
+        crate::test_support::wait_until_executable(&path);
         path
     }
 
