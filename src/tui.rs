@@ -95,9 +95,9 @@ pub enum TuiError {
 /// at the bottom is overwritten by the next command outcome ("canceled …"), so
 /// a message-only signal would leave a screen that looks live long after a
 /// tail died two keystrokes ago — fixed data presented as live truth, which is
-/// the failure mode §7 cares about. The dashboard keeps a dedicated live
-/// indicator for the same reason (`#live` in `web/dashboard.js`); this is the
-/// TUI's. Recovery from a dead tail is automatic (issue #16: capped backoff,
+/// the failure mode §7 cares about. The embedded dashboard (deleted, ADR
+/// 0011) used to keep a dedicated live indicator for the same reason; this
+/// is the TUI's. Recovery from a dead tail is automatic (issue #16: capped backoff,
 /// `Reconnecting` below), but the durable indicator stays either way — an
 /// attempt still in flight, or one that has stopped for good on a rejected
 /// token, must never be reported as `live`.
@@ -1669,7 +1669,7 @@ mod tests {
                 backend: "-".to_string(),
                 intent: "-".to_string(),
             },
-            "missing fields read as `-`, the rule shared with the dashboard"
+            "missing fields read as `-`, the rule shared with the rest of the API surface"
         );
 
         // A body with no `works` array at all is an empty fleet, not a panic.

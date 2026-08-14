@@ -1702,7 +1702,12 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
     handle.shutdown().await;
     let _ = endpoint;
 
-    // The same answers through the CLI, over a daemon it spawns itself.
+    // The same answers through the CLI, over a freshly spawned external
+    // daemon rebuilding its projections from the same on-disk journal.
+    // `analytics`/`work show` no longer auto-spawn (ADR 0009), so the
+    // daemon this section reads through is started explicitly rather than
+    // by the first CLI call itself.
+    spawn_bare_daemon(&data);
     let listed = sgt(&data, &["analytics"]);
     for canned in CANNED_QUERIES {
         assert!(
@@ -1752,6 +1757,50 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
         shown.contains("retained_branch") && shown.contains(&format!("sergeant/{work_id}")),
         "`sgt work show` (human form) must render the output pointer's retained branch: {shown}"
     );
+}
+
+/// Spawn a bare `sgt daemon` directly, not through auto-spawn.
+///
+/// `status`/`work`/`analytics`/`tui` no longer auto-spawn (ADR 0009), so a
+/// scenario that wants to read through the CLI without submitting new work
+/// via it has to start the daemon this way first.
+///
+/// `DataDir`'s own Drop reaps this by /proc scan (SIGTERM, then SIGKILL) —
+/// never by waiting on this `Child`.
+#[allow(clippy::zombie_processes)]
+fn spawn_bare_daemon(data_dir: &DataDir) {
+    let child = std::process::Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sgt daemon");
+    // Reaped by a background thread, not left as an un-waited `Child`: a
+    // process nobody ever `wait()`s on becomes a zombie the instant it
+    // exits, and a zombie still answers `kill(pid, 0)` as alive — which is
+    // exactly what confused `sgt daemon stop`'s own liveness poll into
+    // reporting a clean SIGTERM as "did not exit" in a sibling suite
+    // (measured, `tests/m9_watch.rs`'s `w7_…`). Auto-spawn never hits this:
+    // its immediate parent is the short-lived CLI client, which exits and
+    // reparents the daemon to init, which reaps zombies for free.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon::read_descriptor(data_dir.path())
+        .expect("read descriptor")
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the bare daemon never published a descriptor"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Run `sgt` against a data dir, returning stdout (the CLI spawns and reuses
@@ -2517,8 +2566,8 @@ async fn work_transcript_endpoint_exists_and_answers_a_real_work_and_a_404() {
 
 /// W1/TH-01: R-MVP1-9's own pin is "an evicted Work's API view is byte-
 /// identical to a non-evicted one" — this must hold for the *fleet* view
-/// (`GET /v1/work`, what `sgt work list`/the TUI/the dashboard actually
-/// read), not only the single-work view. Before this fix `fleet_body` read
+/// (`GET /v1/work`, what `sgt work list`/the TUI actually read), not only
+/// the single-work view. Before this fix `fleet_body` read
 /// `registry.runs` directly and always saw `None` for an evicted
 /// (Completed/Canceled) work, so every finished work listed with
 /// `stage: null, resolved_backend: null` regardless of what its single-work

@@ -455,6 +455,40 @@ async fn t2_bearer_token_gates_v1_routes() {
         assert_eq!(resp.status(), 200, "expected 200 for {path}");
     }
 
+    // A query-string token authorizes a safe GET (this is what lets a
+    // browser-based `EventSource` — the embedded dashboard used to be one,
+    // ADR 0011 — subscribe without a header API) but never a mutation: the
+    // same forgeable-by-a-link shape a cross-site form post exploits.
+    // `presented_token`/`TOKEN_QUERY_PARAM` is the one copy of this rule.
+    let resp = http
+        .get(format!(
+            "{}/v1/work?token={}",
+            handle.endpoint, handle.token
+        ))
+        .send()
+        .await
+        .expect("query-token GET");
+    assert_eq!(
+        resp.status(),
+        200,
+        "a GET may be authorized by a query-string token"
+    );
+
+    let resp = http
+        .post(format!(
+            "{}/v1/work/01AN4Z07BY79KA1307SR9X4MV3/cancel?token={}",
+            handle.endpoint, handle.token
+        ))
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("query-token POST");
+    assert_eq!(
+        resp.status(),
+        401,
+        "a POST must not be authorized by a query-string token"
+    );
+
     handle.shutdown().await;
 }
 
@@ -1363,6 +1397,48 @@ fn sgt(data_dir: &DataDir, args: &[&str]) -> Output {
 
 fn descriptor_of(dir: &Path) -> Option<RuntimeDescriptor> {
     daemon::read_descriptor(dir).expect("read descriptor")
+}
+
+/// Spawn a bare `sgt daemon` directly, not through auto-spawn.
+///
+/// `status`/`work`/`analytics`/`tui` no longer auto-spawn (ADR 0009), so a
+/// scenario that wants "an already-running daemon with an empty fleet" — as
+/// opposed to "whatever `run` just auto-spawned and submitted onto" — has to
+/// start the daemon this way instead.
+///
+/// `DataDir`'s own Drop reaps this by /proc scan (SIGTERM, then SIGKILL) —
+/// never by waiting on this `Child`.
+#[allow(clippy::zombie_processes)]
+fn spawn_bare_daemon(dir: &DataDir) {
+    let child = std::process::Command::new(SGT)
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn sgt daemon");
+    // Reaped by a background thread, not left as an un-waited `Child`: a
+    // process nobody ever `wait()`s on becomes a zombie the instant it
+    // exits, and a zombie still answers `kill(pid, 0)` as alive — which is
+    // exactly what confused `sgt daemon stop`'s own liveness poll into
+    // reporting a clean SIGTERM as "did not exit" in a sibling suite
+    // (measured, `tests/m9_watch.rs`'s `w7_…`). Auto-spawn never hits this:
+    // its immediate parent is the short-lived CLI client, which exits and
+    // reparents the daemon to init, which reaps zombies for free.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while descriptor_of(dir.path()).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the bare daemon never published a descriptor"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Kill a daemon by pid (SIGTERM) and wait for its descriptor to disappear.
@@ -2283,6 +2359,9 @@ async fn sse_resume_after_a_disconnect_mid_history_replay_yields_exactly_the_rem
 #[test]
 fn work_list_human_form_prints_the_empty_and_populated_branches() {
     let dir = DataDir::new();
+    // `work list` no longer auto-spawns (ADR 0009), so the empty-fleet
+    // branch needs a daemon already running with nothing submitted to it.
+    spawn_bare_daemon(&dir);
 
     let output = sgt(&dir, &["work", "list"]);
     assert!(
@@ -2373,7 +2452,7 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     let home = TempDir::new().expect("tempdir");
     let _reap = ReapOnDrop(sgt_dir.path().to_path_buf());
     let output = Command::new(SGT)
-        .args(["work", "list", "--json"])
+        .args(["run", "resolve data dir fallback probe"])
         .env("SGT_DATA_DIR", sgt_dir.path())
         .env("XDG_DATA_HOME", xdg.path())
         .env("HOME", home.path())
@@ -2381,7 +2460,7 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
         .expect("run sgt with all three set");
     assert!(
         output.status.success(),
-        "sgt work list: {}",
+        "sgt run: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -2402,7 +2481,7 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     let resolved = xdg2.path().join("sergeant");
     let _reap = ReapOnDrop(resolved.clone());
     let output = Command::new(SGT)
-        .args(["work", "list", "--json"])
+        .args(["run", "resolve data dir fallback probe"])
         .current_dir(cwd2.path())
         .env_remove("SGT_DATA_DIR")
         .env("XDG_DATA_HOME", xdg2.path())
@@ -2411,7 +2490,7 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
         .expect("run sgt with XDG_DATA_HOME and HOME");
     assert!(
         output.status.success(),
-        "sgt work list: {}",
+        "sgt run: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
@@ -2428,7 +2507,7 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     let resolved = home3.path().join(".local/share/sergeant");
     let _reap = ReapOnDrop(resolved.clone());
     let output = Command::new(SGT)
-        .args(["work", "list", "--json"])
+        .args(["run", "resolve data dir fallback probe"])
         .current_dir(cwd3.path())
         .env_remove("SGT_DATA_DIR")
         .env_remove("XDG_DATA_HOME")
@@ -2437,7 +2516,7 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
         .expect("run sgt with only HOME");
     assert!(
         output.status.success(),
-        "sgt work list: {}",
+        "sgt run: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(

@@ -1075,9 +1075,16 @@ fn daemon_stop_drains_admission_and_exits_cleanly() {
     idle_stop.assert_ok("daemon stop (never started)");
     assert_eq!(idle_stop.json()["status"], "not_running");
 
-    // Auto-spawn a real daemon (any client command does this).
-    let status = run(cwd.path(), Some(data_dir.path()), &[], &["status"]);
-    status.assert_ok("status (auto-spawn)");
+    // Auto-spawn a real daemon. `status` no longer does this (ADR 0009: it
+    // joined the no-spawn set), so a mutating verb does the spawning here —
+    // `run` with no `--repo`/`--workflow` needs no estate to submit.
+    let submit = run(
+        cwd.path(),
+        Some(data_dir.path()),
+        &[],
+        &["run", "trigger the auto-spawn"],
+    );
+    submit.assert_ok("run (auto-spawn)");
     let pids_before = data_dir.daemon_pids();
     assert_eq!(
         pids_before.len(),

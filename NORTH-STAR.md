@@ -41,7 +41,7 @@ setup. (Stranger onboarding itself is gated — see Waves.)
 - **Estate (`repos/`, manifest, per-repo instructions)** owns the working
   set. `repos/` is a mount, never a dev_root; nothing of ours lives at
   `~/`; machine-local truth is in-estate and gitignored.
-- **Surfaces (CLI, TUI, dashboard, harnesses)** own presentation and
+- **Surfaces (CLI, TUI, harnesses)** own presentation and
   steering through the API only. **A surface adds usability, never
   functionality** (owner, 2026-08-11): the TUI's "conversation" is the
   journal rendered; its attention drawer is `needs_input` from the same

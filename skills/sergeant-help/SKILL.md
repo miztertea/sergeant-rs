@@ -59,7 +59,9 @@ above are sergeant-rs's real equivalents, not a copy of upstream's map.
    command supports it — verified 2026-08-13 against the built binary) rather
    than assuming syntax. Top-level: `sgt --help` lists `daemon`, `status`,
    `run`, `work`, `respond`, `retry`, `extend`, `cancel`, `watch`,
-   `analytics`, `web`, `doctor`, `init`, `repo`, `group`.
+   `analytics`, `tui`, `doctor`, `init`, `repo`, `group`. Bare `sgt` (no
+   subcommand) is a homepage, not a listed subcommand (ADR 0010); the
+   embedded dashboard and its `web` verb are gone (ADR 0011).
 5. Answer with the exact command, required preconditions, expected evidence,
    and links to repository-relative documentation paths.
 6. If sources disagree, use this precedence:
