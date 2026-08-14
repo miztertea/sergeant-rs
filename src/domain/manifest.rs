@@ -54,19 +54,25 @@ use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_
 use crate::runtime::git::{git_clone, git_succeeds};
 
 /// The `.gitignore` entries `sgt init` maintains (task's own naming): the
-/// estate-local data dir, the populated repository mounts, and this
-/// module's own scratch files. None belong in the estate's own history —
-/// `.sergeant/data` is machine-local runtime state (journal, blobs,
-/// projections), `repos/` is populated clones of *other* repositories' own
-/// histories, `.sergeant.toml.lock` is [`ManifestLock`]'s advisory-lock
-/// marker (never removed by design — see its own doc comment — so it
-/// outlives every edit and would otherwise sit untracked at the estate root
-/// forever), and `sergeant.toml.validate-*` is [`validate`]'s throwaway
-/// probe file, removed on the happy path but left behind if the process
-/// dies mid-validate (MVP-3 invariants finding MVP3-C3).
+/// estate-local data dir, the populated repository mounts, the manifest
+/// itself, and this module's own scratch files. None belong in the estate's
+/// own history — `.sergeant/data` is machine-local runtime state (journal,
+/// blobs, projections), `repos/` is populated clones of *other*
+/// repositories' own histories, `sergeant.toml` is [`WORKSPACE_FILE`] itself
+/// and is per-installation by design (#71: `sgt init` is what generates it,
+/// so a colleague's own checkout can never carry the same one — leaving it
+/// untracked left every subsequent `git status` in a clone-is-distro
+/// checkout showing `?? sergeant.toml` forever), `.sergeant.toml.lock` is
+/// [`ManifestLock`]'s advisory-lock marker (never removed by design — see
+/// its own doc comment — so it outlives every edit and would otherwise sit
+/// untracked at the estate root forever), and `sergeant.toml.validate-*` is
+/// [`validate`]'s throwaway probe file, removed on the happy path but left
+/// behind if the process dies mid-validate (MVP-3 invariants finding
+/// MVP3-C3).
 const GITIGNORE_ENTRIES: &[&str] = &[
     ".sergeant/data",
     "repos/",
+    "sergeant.toml",
     ".sergeant.toml.lock",
     "sergeant.toml.validate-*",
 ];
@@ -831,7 +837,11 @@ mod tests {
     /// reports nothing changed. Mutation this kills: dropping the
     /// `doc.contains_key("estate")` guard (always inserting a fresh table)
     /// or the `have.contains(entry)` guard in `ensure_gitignore` (always
-    /// appending) — both would corrupt or duplicate on a second run.
+    /// appending) — both would corrupt or duplicate on a second run. Also
+    /// pins #71: `sergeant.toml` itself must be one of the scaffolded
+    /// entries (it is per-installation, so a colleague's clone-is-distro
+    /// checkout must never show it as permanent untracked noise), and a
+    /// second run must not re-append it either.
     #[test]
     fn init_is_idempotent_on_a_second_run() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -848,6 +858,12 @@ mod tests {
             std::fs::read_to_string(root.join(WORKSPACE_FILE)).expect("read manifest");
         let gitignore_after_first =
             std::fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
+        assert!(
+            gitignore_after_first
+                .lines()
+                .any(|l| l.trim() == "sergeant.toml"),
+            "a fresh init must gitignore the per-installation manifest itself (#71), got {gitignore_after_first:?}"
+        );
 
         let second = init_estate(root, Some("different-name")).expect("second init");
         assert!(
