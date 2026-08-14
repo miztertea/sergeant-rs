@@ -2,9 +2,17 @@
 //! auto-spawn, and a thin HTTP client over the daemon's v1 API.
 //!
 //! The CLI never touches runtime state directly — every command except
-//! `sgt daemon` goes through the daemon's loopback API. When no daemon is
-//! running, the client spawns one detached (`sgt --data-dir <dir> daemon`),
-//! waits for the runtime descriptor plus a passing `/healthz`, and proceeds.
+//! `sgt daemon` goes through the daemon's loopback API. `sgt`'s verbs split
+//! into two sets (ADR 0009, D5): the ones that mutate durable state (`run`,
+//! `respond`, `retry`, `extend`, `cancel`) spawn a detached daemon
+//! (`sgt --data-dir <dir> daemon`) on demand, wait for the runtime
+//! descriptor plus a passing `/healthz`, and proceed; the ones that only
+//! observe (`status`, `work show`/`list`/`transcript`, `analytics`,
+//! `watch`, `tui`, `doctor`, `daemon stop`) never do — observation must not
+//! materialize the thing observed, so a cold estate gets a refusal naming
+//! `sgt doctor` as the remedy, not a daemon started just to have something
+//! to report. Bare `sgt` (no subcommand) is a third thing again: a static
+//! homepage that never touches the daemon at all (ADR 0010).
 //!
 //! Stale-descriptor policy (contract): endpoint refuses *and* PID is dead →
 //! stale, replace it; PID alive but endpoint unresponsive → ambiguous, fail
@@ -49,7 +57,10 @@ struct Sgt {
     /// Emit machine-readable JSON instead of human text.
     #[arg(long, global = true)]
     json: bool,
-    /// Subcommand to run. Omitted, `sgt` opens the TUI (§30).
+    /// Subcommand to run. Omitted, `sgt` prints the homepage (ADR 0010,
+    /// deviation from proposal §30 — see `GAUNTLET.md`'s deviation
+    /// register): a logo and a condensed quickstart, touching no daemon.
+    /// The TUI is `sgt tui`, an explicit verb like any other.
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -176,12 +187,11 @@ enum Command {
         /// Query name (omit to list what is available).
         name: Option<String>,
     },
-    /// Print the embedded dashboard's URL, token included (§29).
-    Web {
-        /// Also open it in a browser (`$BROWSER`, else `xdg-open`/`open`).
-        #[arg(long)]
-        open: bool,
-    },
+    /// Open the TUI cockpit (ADR 0010, D6): a client like any other, so it
+    /// never auto-spawns a daemon (ADR 0009's no-spawn set) — with none
+    /// running it refuses and names `sgt doctor` as the remedy, rather than
+    /// materializing one just to have something to render.
+    Tui,
     /// Diagnose this installation (§31): tools, data dir, journal, projection,
     /// daemon. Every failing check names the remedy.
     Doctor,
@@ -429,10 +439,13 @@ fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
 async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
     let data_dir = resolve_data_dir(sgt.data_dir)?;
     let Some(command) = sgt.command else {
-        // §30: bare `sgt` is the TUI. It is a client like any other, so it
-        // gets the same auto-spawn path the CLI commands get.
-        let client = ensure_daemon(&data_dir).await?;
-        return crate::tui::run(client).await.map_err(CliError::from);
+        // ADR 0010 (D6, deviation from proposal §30 registered in
+        // `GAUNTLET.md`): bare `sgt` is a homepage, not the TUI, and it
+        // contacts no daemon at all — that is what dissolves ADR 0009's
+        // hardest case (a human-facing surface with nothing to reconnect
+        // to) rather than answering it. `sgt tui` is the explicit verb.
+        print_homepage();
+        return Ok(());
     };
     match command {
         Command::Daemon { command: None } => {
@@ -444,7 +457,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             command: Some(DaemonCommand::Stop),
         } => daemon_stop(&data_dir, sgt.json).await,
         Command::Status => {
-            let client = ensure_daemon(&data_dir).await?;
+            let client = observe_connect(&data_dir).await?;
             let system = client.get("/v1/system").await?;
             let works = client.get("/v1/work").await?;
             let mut counts = std::collections::BTreeMap::<String, u64>::new();
@@ -623,7 +636,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Work { command } => {
-            let client = ensure_daemon(&data_dir).await?;
+            let client = observe_connect(&data_dir).await?;
             match command {
                 WorkCommand::List => {
                     let result = client.get("/v1/work").await?;
@@ -713,7 +726,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Analytics { name } => {
-            let client = ensure_daemon(&data_dir).await?;
+            let client = observe_connect(&data_dir).await?;
             let result = match &name {
                 Some(name) => client.get(&format!("/v1/analytics/{name}")).await?,
                 None => client.get("/v1/analytics").await?,
@@ -743,9 +756,9 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Watch { id, follow } => {
-            // R-WATCH-3: never `ensure_daemon` — this verb refuses rather
-            // than spawns.
-            let client = watch_connect(&data_dir).await?;
+            // R-WATCH-3 / ADR 0009: never `ensure_daemon` — this verb
+            // refuses rather than spawns.
+            let client = observe_connect(&data_dir).await?;
             let options = crate::watch::WatchOptions {
                 work_id: id,
                 follow,
@@ -767,25 +780,12 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             .map(|_exit| ())
             .map_err(|e| CliError::new(e.to_string()))
         }
-        Command::Web { open } => {
-            // §29's handoff. `sgt web` is a client command like any other, so
-            // it auto-spawns the daemon: asking for the dashboard of a daemon
-            // that is not running should start it, not lecture about it.
-            let client = ensure_daemon(&data_dir).await?;
-            let url = client.dashboard_url();
-            if sgt.json {
-                print_json(&json!({"url": url, "endpoint": client.endpoint()}));
-            } else {
-                println!("{url}");
-                println!(
-                    "the token is in that URL — it is a secret; loopback only, \
-                     and it changes every time the daemon restarts"
-                );
-            }
-            if open {
-                open_in_browser(&url)?;
-            }
-            Ok(())
+        Command::Tui => {
+            // ADR 0009/0010: the TUI never auto-spawns — it is in the
+            // no-spawn set like every other observation surface, and bare
+            // `sgt` no longer falls into it by default.
+            let client = observe_connect(&data_dir).await?;
+            crate::tui::run(client).await.map_err(CliError::from)
         }
         Command::Doctor => {
             let report = doctor::run(&data_dir).await;
@@ -993,28 +993,6 @@ async fn group_command(json: bool, data_dir: &Path, command: GroupCommand) -> Re
     }
 }
 
-/// Hand a URL to the user's browser: `$BROWSER` if set, else the platform
-/// opener. A failure here is reported, never silent — the URL has already
-/// been printed, so the user still has it.
-fn open_in_browser(url: &str) -> Result<(), CliError> {
-    let opener = std::env::var("BROWSER").unwrap_or_else(|_| {
-        if cfg!(target_os = "macos") {
-            "open".to_string()
-        } else {
-            "xdg-open".to_string()
-        }
-    });
-    let status = std::process::Command::new(&opener)
-        .arg(url)
-        .status()
-        .map_err(|e| CliError::new(format!("cannot run {opener}: {e}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(CliError::new(format!("{opener} exited with {status}")))
-    }
-}
-
 /// One line per edge: the relation, its endpoints, and — the point of §23 —
 /// the journal seq that justifies it, so a reader can go and check.
 fn print_graph(result: &Value) {
@@ -1167,12 +1145,70 @@ fn origin() -> Value {
     })
 }
 
+/// ASCII-art wordmark for the bare-`sgt` homepage (ADR 0010, D6).
+const LOGO: &str = r"
+   ___ ___ ___ __  __
+  / __/ __| __|  \/  |___
+  \__ \__ \ _|| |\/| / -_)   local agent execution surface
+  |___/___/___|_|  |_\___|
+";
+
+/// Bare `sgt` (no subcommand): a homepage, not the TUI (ADR 0010, D6 —
+/// deviation from proposal §30, registered in `GAUNTLET.md`'s deviation
+/// register).
+///
+/// Touches no daemon at all, which is the point: this is what dissolves ADR
+/// 0009's TUI carve-out debate instead of answering it — there is no daemon
+/// question to settle for a command that never asks the daemon anything.
+/// Reading `sergeant.toml` is not observing the daemon (ADR 0010's own
+/// framing), so this *is* estate-aware, resolving the ADR's open question in
+/// that direction: outside an estate it points at `sgt init`; inside one it
+/// names the estate and its declared repository count, the same client-side
+/// manifest read every other estate-aware verb in this binary does.
+fn print_homepage() {
+    println!("{}", LOGO.trim_end_matches('\n'));
+    println!();
+    let estate = std::env::current_dir().ok().and_then(|cwd| {
+        crate::domain::workspace::Workspace::estate_root(&cwd, None)
+            .ok()
+            .flatten()
+    });
+    match estate {
+        Some(root) => {
+            let manifest = root.join(crate::domain::workspace::WORKSPACE_FILE);
+            match crate::domain::workspace::Workspace::from_config_allow_empty(&manifest) {
+                Ok(workspace) => println!(
+                    "estate {:?} at {} — {} repositories declared",
+                    workspace.name,
+                    root.display(),
+                    workspace.repositories.len(),
+                ),
+                Err(e) => println!("estate at {} could not be read: {e}", root.display()),
+            }
+            println!();
+            println!("  sgt doctor              diagnose this installation");
+            println!("  sgt status              daemon health and work counts");
+            println!("  sgt run \"<intent>\"      submit work");
+            println!("  sgt tui                 open the cockpit");
+        }
+        None => {
+            println!("no estate found above the current directory");
+            println!();
+            println!("  sgt init                scaffold one here");
+            println!("  sgt doctor              diagnose this installation");
+        }
+    }
+    println!();
+    println!("sgt <command> --help for the full verb list");
+}
+
 /// Connect to the daemon for `data_dir`, auto-spawning one if needed.
 ///
 /// This is the CLI's half of the client contract — descriptor discovery,
 /// staleness judgement, detached spawn — and it hands back the crate's one
-/// API client ([`ApiClient`], defined next to the router it speaks to). Every
-/// front end in this binary, TUI included, comes through here.
+/// API client ([`ApiClient`], defined next to the router it speaks to). Only
+/// the mutating verbs (ADR 0009) come through here; every observation verb,
+/// TUI included, goes through [`observe_connect`] instead.
 async fn ensure_daemon(data_dir: &Path) -> Result<ApiClient, CliError> {
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -1239,26 +1275,30 @@ fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
     ApiClient::new(&descriptor.endpoint, &descriptor.token).map_err(CliError::from)
 }
 
-/// `sgt watch`'s own daemon connection (R-WATCH-3) — the three detection
-/// branches `sgt doctor`/`daemon_stop` already use (`src/cli.rs:1266-1293` is
-/// this ruling's own citation for the precedent), mirrored here rather than
-/// shared because `watch_connect` must do the one thing every other command
-/// in this file deliberately does not: **never call [`spawn_daemon`]**.
-/// Observation must not materialize the thing observed — fail-closed at both
-/// ends of the daemon's life, matching R-WATCH-3's own framing.
+/// Every observation verb's daemon connection (ADR 0009, D5; ruled first for
+/// `watch` alone by R-WATCH-3) — the three detection branches
+/// `sgt doctor`/`daemon_stop` already use (`src/cli.rs:1266-1293` is this
+/// ruling's own citation for the precedent), mirrored here rather than
+/// shared because `observe_connect` must do the one thing every mutating
+/// command in this file deliberately does not: **never call
+/// [`spawn_daemon`]**. Observation must not materialize the thing observed —
+/// fail-closed at both ends of the daemon's life, matching R-WATCH-3's own
+/// framing. Used by `watch`, `status`, `work show`/`list`/`transcript`,
+/// `analytics`, and `tui` — every verb ADR 0009 moved into the no-spawn set.
 ///
 /// 1. A healthy descriptor → attach, exactly like [`ensure_daemon`].
 /// 2. No descriptor, or a descriptor whose PID is dead → refuse, naming the
-///    data dir and the remedy, exit nonzero, spawn nothing.
+///    data dir and the remedy (`sgt doctor`), exit nonzero, spawn nothing.
 /// 3. A descriptor naming a live PID that does not answer `/healthz` → the
 ///    same ambiguous, fail-closed refusal `ensure_daemon` gives, spawn
 ///    nothing.
-async fn watch_connect(data_dir: &Path) -> Result<ApiClient, CliError> {
+async fn observe_connect(data_dir: &Path) -> Result<ApiClient, CliError> {
     let path = daemon::descriptor_path(data_dir);
     let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
         return Err(CliError::new(format!(
-            "no daemon is running for {}; start one with any dispatching verb (e.g. `sgt run`) \
-             or `sgt daemon`",
+            "no daemon is running for {}; observation commands refuse to start one \
+             (`sgt doctor` for the full picture) — start one with a mutating verb instead \
+             (e.g. `sgt run`) or `sgt daemon`",
             data_dir.display(),
         )));
     };
@@ -1272,15 +1312,16 @@ async fn watch_connect(data_dir: &Path) -> Result<ApiClient, CliError> {
         return Err(CliError::new(format!(
             "daemon descriptor at {} names PID {} (alive) but {} does not answer /healthz; \
              refusing to spawn a second daemon and refusing to guess. If it is truly gone, \
-             remove the descriptor file and retry.",
+             remove the descriptor file and retry, or run `sgt doctor` to check.",
             path.display(),
             descriptor.pid,
             descriptor.endpoint,
         )));
     }
     Err(CliError::new(format!(
-        "no daemon is running for {} (descriptor at {} is stale — pid {} is gone); start one \
-         with any dispatching verb (e.g. `sgt run`) or `sgt daemon`",
+        "no daemon is running for {} (descriptor at {} is stale — pid {} is gone); \
+         observation commands refuse to start one (`sgt doctor` for the full picture) — \
+         start one with a mutating verb instead (e.g. `sgt run`) or `sgt daemon`",
         data_dir.display(),
         path.display(),
         descriptor.pid,
@@ -1485,10 +1526,12 @@ fn report_daemon_stop(json: bool, status: &str, message: &str) {
 /// always the same names — because the first consumer of a doctor is a bug
 /// report and the second is a script.
 ///
-/// Doctor deliberately does **not** auto-spawn a daemon. Every other client
-/// command starts one on demand; this one is asking whether the installation
-/// is sound, and starting the thing under examination would answer a
-/// different question.
+/// Doctor deliberately does **not** auto-spawn a daemon — it joins the rest
+/// of ADR 0009's no-spawn set (`status`, `work`, `analytics`, `watch`,
+/// `tui`, `daemon stop`). Only the mutating verbs (`run`, `respond`,
+/// `retry`, `extend`, `cancel`) start one on demand; this one is asking
+/// whether the installation is sound, and starting the thing under
+/// examination would answer a different question.
 mod doctor {
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -2310,7 +2353,10 @@ mod doctor {
             Ok(None) => {
                 return Check::ok(
                     "daemon",
-                    "no daemon running; the next client command starts one",
+                    "no daemon running; a mutating verb (`run`, `respond`, `retry`, `extend`, \
+                     `cancel`) starts one on demand — `status`, `work`, `analytics`, `watch`, \
+                     and `tui` refuse instead rather than materializing one just to observe it \
+                     (ADR 0009)",
                 );
             }
             Err(e) => {
@@ -2362,7 +2408,9 @@ mod doctor {
                     path.display(),
                     descriptor.pid
                 ),
-                "harmless: the next client command spawns a daemon, which republishes it",
+                "harmless: a mutating verb (`run`, `respond`, `retry`, `extend`, `cancel`) or \
+                 `sgt daemon` spawns a fresh daemon, which republishes it — observation verbs \
+                 refuse instead rather than spawning one just to observe it (ADR 0009)",
             )
         }
     }

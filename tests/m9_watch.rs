@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
+use sergeant_rs::daemon;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::watch::WatchState;
 
@@ -103,6 +104,57 @@ impl Output {
             self.stderr
         );
         self
+    }
+}
+
+/// Spawn a bare `sgt daemon` directly, not through auto-spawn.
+///
+/// `status`/`work`/`analytics`/`tui` no longer auto-spawn (ADR 0009), so a
+/// scenario that wants an already-running, otherwise-untouched daemon (no
+/// work submitted, no state transitions to race a freshly attached watch
+/// against) has to start it this way instead.
+///
+/// `DataDir`'s own Drop reaps this by /proc scan (SIGTERM, then SIGKILL) —
+/// never by waiting on this `Child`.
+#[allow(clippy::zombie_processes)]
+fn spawn_bare_daemon(data_dir: &DataDir) {
+    let mut command = Command::new(SGT);
+    command
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command.spawn().expect("spawn sgt daemon");
+    // Reaped by a background thread rather than left as this test's `Child`
+    // handle: nothing here ever calls `wait()` otherwise, so the process
+    // becomes a zombie the instant it exits — invisible to `kill -0` as
+    // "gone" but not actually gone, which is exactly what confused `sgt
+    // daemon stop`'s own liveness poll into reporting a clean SIGTERM as
+    // "did not exit" (measured: this was the actual cause of a 15s-timeout
+    // failure in `w7_stream_closure_is_honest_and_never_restarts_the_daemon`
+    // before this fix). Auto-spawn never hits this: its immediate parent is
+    // the short-lived CLI client, which exits and reparents the daemon to
+    // init, which reaps zombies for free.
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon::read_descriptor(data_dir.path())
+        .expect("read descriptor")
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the bare daemon never published a descriptor"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -611,8 +663,10 @@ fn w7_stream_closure_is_honest_and_never_restarts_the_daemon() {
     let repo = TempDir::new().expect("tempdir");
     init_repo(repo.path());
 
-    let status_out = sgt(repo.path(), &data, &["status"]);
-    status_out.assert_ok("status (auto-spawn)");
+    // `status` no longer auto-spawns (ADR 0009); `run` would, but it would
+    // also leave an asynchronous state transition racing the watch attached
+    // just below. A bare daemon spawn avoids both.
+    spawn_bare_daemon(&data);
     assert_eq!(data.daemon_pids().len(), 1);
 
     let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch"]);
@@ -1098,8 +1152,7 @@ fn r_watch_10a_signals_end_the_watcher_natively_with_no_side_effects() {
 /// §16.3: `watch.rs` reaches the crate only through `crate::api` (never
 /// journal/projection/engine/backend/daemon internals), no new API mutation
 /// route exists, and no new event kind names watch/subscription/
-/// notification. Mirrors `tests/m6_surfaces.rs`'s `t5`/`t5b` for the TUI and
-/// dashboard.
+/// notification. Mirrors `tests/m6_surfaces.rs`'s `t5`/`t5b` for the TUI.
 #[test]
 fn structural_watch_reaches_the_crate_only_through_api() {
     let source = code_only(&read_source("watch.rs"));

@@ -11,7 +11,7 @@
 //! projection, engine, backend, or daemon internals: a long-running watch
 //! loop must stay a client, never grow into a second execution layer.
 //! `tests/m9_watch.rs`'s structural test pins this by source scan, mirroring
-//! `tests/m6_surfaces.rs`'s `t5`/`t5b` for the TUI and dashboard.
+//! `tests/m6_surfaces.rs`'s `t5`/`t5b` for the TUI.
 //!
 //! **Event doctrine (proposal §7, Decision WATCH-05).** An event is
 //! provenance, not meaning: it identifies that something changed and causes

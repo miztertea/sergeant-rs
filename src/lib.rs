@@ -13,7 +13,6 @@ pub mod runtime;
 pub mod telemetry;
 pub mod tui;
 pub mod watch;
-pub mod web;
 
 /// Fixtures shared across this crate's own unit tests (`cargo test --lib`),
 /// as opposed to `tests/support`, which serves the separately-compiled

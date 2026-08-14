@@ -380,12 +380,11 @@ pub struct ApiState {
     pub analytics: Arc<tokio::sync::Mutex<Analytics>>,
 }
 
-/// Build the axum router for the full v1 surface plus the embedded dashboard.
+/// Build the axum router for the full v1 surface.
 ///
-/// The dashboard is mounted here, but it is not part of `/v1`: it is a
-/// *client* of it, and it is handed [`ApiViews`] — the same response bodies
-/// the endpoints below return and nothing else (§29's "the dashboard is not a
-/// second backend; it is an API projection", made structural).
+/// The dashboard (`src/web.rs`) that used to be mounted alongside `/v1` here
+/// is gone (ADR 0011, D7) — the CLI, TUI and every future client reach state
+/// through this router and nothing else.
 pub fn router(state: ApiState) -> Router {
     let v1 = Router::new()
         .route("/work", post(submit_work).get(list_work))
@@ -406,20 +405,6 @@ pub fn router(state: ApiState) -> Router {
             state.clone(),
             require_bearer,
         ));
-    // The dashboard goes behind the *same* gate, rather than carrying a
-    // second one: `web.rs` renders pages, it does not decide authorization
-    // (R2 — the middleware is already here; reuse it). Its own
-    // `method_not_allowed_fallback` is set here because the outer one below
-    // only rewrites the routes the router already holds, and a merge brings
-    // these in afterwards: without this line `POST /ui` answered with axum's
-    // stock empty body while every other route on the listener answered
-    // structured JSON.
-    let ui = crate::web::routes(ApiViews::new(state.clone()))
-        .method_not_allowed_fallback(method_not_allowed)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer,
-        ));
     Router::new()
         .route("/healthz", get(healthz))
         .nest("/v1", v1)
@@ -429,7 +414,6 @@ pub fn router(state: ApiState) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
-        .merge(ui)
 }
 
 /// Run one blocking closure without occupying an async worker.
@@ -744,9 +728,8 @@ async fn method_not_allowed() -> Response {
 /// The 401 this listener answers with, wherever it is answered.
 ///
 /// One constructor, so a client cannot learn a different error vocabulary
-/// depending on which route it knocked on. The dashboard's extractor needs it
-/// for a rejection the gate makes unreachable; the gate itself uses it below.
-pub fn unauthorized_response() -> Response {
+/// depending on which route it knocked on.
+fn unauthorized_response() -> Response {
     error_response(
         StatusCode::UNAUTHORIZED,
         "unauthorized",
@@ -792,7 +775,7 @@ fn engine_error_status(e: &EngineError) -> StatusCode {
 }
 
 /// Name of the query parameter that may carry the token on safe requests.
-pub const TOKEN_QUERY_PARAM: &str = "token";
+const TOKEN_QUERY_PARAM: &str = "token";
 
 /// The bearer token presented by a request, if any.
 ///
@@ -801,17 +784,17 @@ pub const TOKEN_QUERY_PARAM: &str = "token";
 /// - `Authorization: Bearer <token>` — always accepted;
 /// - `?token=<token>` — accepted on **GET and HEAD only**.
 ///
-/// The query form exists because the browser is a client too and cannot set a
-/// header on a `<link>`, an `<img>`, or an `EventSource` (§29 requires the
-/// dashboard to live-update over the existing SSE endpoint, and `EventSource`
-/// has no header API at all). The tradeoff is real — a URL-borne secret lands
-/// in shell history, in the terminal scrollback `sgt web` printed it to, and
-/// in any log that records request lines — and it is accepted for P0 on the
-/// grounds that the listener is loopback-only, the token is regenerated on
-/// every daemon start, and the descriptor holding it is already 0600. The
-/// post-P0 alternative, for the ledger entry this milestone's MARK & LOG
-/// still owes (R1 — ship the cheapest thing that closes the P0 and name the
-/// better shape rather than build it): exchange the URL token once for a
+/// The query form exists because a browser-based client of `/v1/events/stream`
+/// cannot set a header on an `EventSource`, which has no header API at all —
+/// the embedded dashboard (deleted, ADR 0011) was the original such client,
+/// and any future one would need the same carve-out. The tradeoff is real —
+/// a URL-borne secret lands in shell history and in any log that records
+/// request lines — and it is accepted for P0 on the grounds that the
+/// listener is loopback-only, the token is regenerated on every daemon
+/// start, and the descriptor holding it is already 0600. The post-P0
+/// alternative, for the ledger entry this milestone's MARK & LOG still owes
+/// (R1 — ship the cheapest thing that closes the P0 and name the better
+/// shape rather than build it): exchange the URL token once for a
 /// `HttpOnly; SameSite=Strict` cookie and drop the query form. That entry is
 /// not written yet, and this comment does not claim it is.
 ///
@@ -821,16 +804,11 @@ pub const TOKEN_QUERY_PARAM: &str = "token";
 /// without ever reading a response. Mutations therefore keep requiring a
 /// header, which no cross-origin form can set.
 ///
-/// **This is the only copy of the rule.** The dashboard needs the same
-/// extraction — its pages have to put the token back on every link they
-/// render — and the second copy it used to keep had already drifted from this
-/// one: it took a query token on any method and percent-decoded it. Both
-/// clients call this function now.
-pub fn presented_token(
-    method: &Method,
-    headers: &HeaderMap,
-    query: Option<&str>,
-) -> Option<String> {
+/// **This is the only copy of the rule.** The dashboard used to need the same
+/// extraction for its own pages, and the second copy it kept had already
+/// drifted from this one: it took a query token on any method and
+/// percent-decoded it. `require_bearer` below is the one caller now.
+fn presented_token(method: &Method, headers: &HeaderMap, query: Option<&str>) -> Option<String> {
     if let Some(header) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -857,14 +835,14 @@ fn query_token(query: &str) -> Option<String> {
     })
 }
 
-/// Bearer-token gate for `/v1/*` **and for the dashboard**. `/healthz` is the
-/// only route mounted outside this layer.
+/// Bearer-token gate for `/v1/*`. `/healthz` is the only route mounted
+/// outside this layer.
 ///
-/// The dashboard used to re-implement this: its own extraction, its own
-/// comparison, and its own hand-written copy of the 401 body below. One gate
-/// decides for every route on this listener now — a second implementation of
-/// an authorization rule is a second rule, and it had already diverged on the
-/// safe-method bound.
+/// The embedded dashboard (deleted, ADR 0011) used to re-implement this: its
+/// own extraction, its own comparison, and its own hand-written copy of the
+/// 401 body below. One gate decides for every route on this listener now —
+/// a second implementation of an authorization rule is a second rule, and it
+/// had already diverged on the safe-method bound.
 async fn require_bearer(State(state): State<ApiState>, req: Request, next: Next) -> Response {
     let presented = presented_token(req.method(), req.headers(), req.uri().query());
     if presented.as_deref() == Some(state.token.as_str()) {
@@ -2470,8 +2448,8 @@ fn events_body(events: Vec<Event>, query: &EventsQuery) -> Value {
 ///
 /// `from` is the only bound on how much journal is read; `work_id` and `limit`
 /// shape the answer, not the scan. A client that wants a cheap tail should
-/// carry the `from` it already knows (the TUI and the dashboard both do, from
-/// the SSE stream's last id) rather than re-asking from 0.
+/// carry the `from` it already knows (the SSE stream's last id) rather than
+/// re-asking from 0.
 async fn event_history(
     State(state): State<ApiState>,
     query: Result<Query<EventsQuery>, QueryRejection>,
@@ -2694,97 +2672,14 @@ async fn send_sse(
 }
 
 // ---------------------------------------------------------------------------
-// The two client halves of this contract
-// ---------------------------------------------------------------------------
-
-/// The read surface the embedded dashboard is allowed to use.
-///
-/// §30's architectural test — "if the TUI needs a private shortcut, the API is
-/// incomplete" — applies to the dashboard too, but the dashboard is served
-/// *by* the daemon, so it cannot be held to it by "it only has a socket". This
-/// type is how it is held to it anyway: the [`ApiState`] inside is **private**,
-/// and every method below returns exactly the body a `/v1` endpoint returns,
-/// built by the same function the endpoint uses. `web.rs` therefore cannot
-/// reach the core, the engine, the journal or the projection *directly* — not
-/// by convention, but because there is no path to them from `web.rs` that the
-/// compiler will accept.
-///
-/// **What the compiler does not decide is this list.** The private field
-/// forecloses reaching *around* this type; it says nothing about a method
-/// added *to* it, and a `raw_journal_tail` here would hand `web.rs` the
-/// journal with every structural test still green (measured — that probe is
-/// why this paragraph exists). The list is therefore pinned as data by
-/// `t5_the_tui_and_the_dashboard_are_clients_like_any_other`, which reads the
-/// `pub fn`s of this block and requires them to be exactly the set below.
-/// Adding a method means changing that test, which is where a reviewer is
-/// asked whether the new method is a `/v1` body or a shortcut.
-///
-/// Extending the dashboard therefore means extending the API first, which is
-/// the rule §7 states and this milestone is meant to prove.
-#[derive(Clone)]
-pub struct ApiViews(ApiState);
-
-impl ApiViews {
-    /// Wrap a daemon's state as the dashboard's read surface.
-    pub fn new(state: ApiState) -> Self {
-        Self(state)
-    }
-
-    /// The `GET /v1/system` body.
-    pub async fn system(&self) -> Value {
-        let core = CoreGuard::acquire(&self.0.core).await;
-        let head = core.registry.last_seq();
-        let admission_paused = core.registry.state().admission_paused;
-        system_body(&self.0, head, admission_paused)
-    }
-
-    /// The `GET /v1/work` body.
-    pub async fn fleet(&self) -> Value {
-        let core = CoreGuard::acquire(&self.0.core).await;
-        fleet_body(&core, &self.0.engine)
-    }
-
-    /// The `GET /v1/work/{id}` body, or `None` for an unknown work (the 404
-    /// the endpoint would answer with).
-    pub async fn work(&self, id: &str) -> Option<Value> {
-        let core = CoreGuard::acquire(&self.0.core).await;
-        core.registry
-            .state()
-            .works
-            .contains_key(id)
-            .then(|| work_view(&core, &self.0.engine, id))
-    }
-
-    /// The `GET /v1/events?work_id=…&limit=…` body, or the structured error
-    /// body the endpoint would answer `500` with.
-    ///
-    /// The `Result` is the point. A journal that cannot be read is not an
-    /// empty journal, and a client that cannot tell those apart renders
-    /// "nothing happened" over a fault. The HTTP endpoint answers 500 here;
-    /// so must the dashboard, or the two clients are not equal (§7).
-    pub async fn work_events(&self, work_id: &str, limit: usize) -> Result<Value, Value> {
-        let query = EventsQuery {
-            from: 0,
-            work_id: Some(work_id.to_string()),
-            limit: Some(limit),
-        };
-        let core = CoreGuard::acquire(&self.0.core).await;
-        match core.events_after(0) {
-            Ok(events) => Ok(events_body(events, &query)),
-            Err(e) => Err(error_body("internal", e.to_string())),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Shared view helpers
 // ---------------------------------------------------------------------------
 //
-// Both clients project the same `/v1` bodies onto a screen, so the small rules
-// for *how a JSON field reads as text* belong to the API surface they share
-// rather than to either screen. Two copies of "a missing value is `-`" is two
-// chances for the TUI and the dashboard to tell a different story about the
-// same work.
+// The dashboard (`src/web.rs`, deleted — ADR 0011) used to share these with
+// the TUI so the two screens could not tell different stories about the same
+// field; the TUI is the sole client of them now, but the rule they encode —
+// "how a JSON field reads as text" belongs to the API surface, not to a
+// screen — still holds for whatever client reads next.
 
 /// A JSON value as human text: `-` when it is absent or an empty string, the
 /// string itself when it is one, its JSON form otherwise.
@@ -2944,15 +2839,6 @@ impl ApiClient {
         &self.endpoint
     }
 
-    /// The dashboard URL, token included (§29's `sgt web` handoff).
-    pub fn dashboard_url(&self) -> String {
-        format!(
-            "{}/ui?{TOKEN_QUERY_PARAM}={}",
-            self.endpoint,
-            urlencode(&self.token)
-        )
-    }
-
     /// Authenticated GET returning the parsed body.
     pub async fn get(&self, path: &str) -> Result<Value, ClientError> {
         let response = self
@@ -3077,13 +2963,9 @@ impl ApiClient {
 }
 
 /// Minimal percent-encoding for the few values this crate puts in a URL
-/// (work ids and the bearer token, both Crockford base32 today). Anything
-/// outside the unreserved set is escaped rather than trusted.
-///
-/// Public because the dashboard builds URLs into this same API and must
-/// escape them by the same rule; a second copy of an escaping rule is a
-/// second rule.
-pub fn urlencode(value: &str) -> String {
+/// (work ids, today). Anything outside the unreserved set is escaped rather
+/// than trusted.
+fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -3206,6 +3088,36 @@ mod tests {
     use crate::backend::BackendRegistry;
     use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
+
+    /// The `-`-for-missing rule, where it is defined. It used to be tested
+    /// beside the dashboard's renderers in `src/web.rs` (deleted, ADR 0011);
+    /// `tui.rs` is the sole reader of [`field_text`] now, but the rule
+    /// itself is an API-surface concern, so its test stays here.
+    #[test]
+    fn an_absent_field_reads_as_a_dash_and_a_present_one_as_itself() {
+        assert_eq!(field_text(&Value::Null), "-");
+        assert_eq!(
+            field_text(&json!("")),
+            "-",
+            "an empty string is absence too"
+        );
+        assert_eq!(field_text(&json!("fake")), "fake");
+        assert_eq!(
+            field_text(&json!(3)),
+            "3",
+            "a number reads as its JSON form"
+        );
+        assert_eq!(field_text(&json!(false)), "false");
+    }
+
+    /// Ditto for [`stage_label`], moved from `src/web.rs` alongside the test
+    /// above rather than dropped with the file that used to host it.
+    #[test]
+    fn a_stage_reads_as_position_and_status() {
+        let stage = json!({"stage_id": "10-implement", "index": 1, "of": 4, "status": "running"});
+        assert_eq!(stage_label(&stage), "10-implement 2/4 · running");
+        assert_eq!(stage_label(&Value::Null), "-");
+    }
 
     /// The one knob on the client, exercised. Its only production caller is
     /// `scripts/demo.sh --real-claude`, which the suite deliberately does not
