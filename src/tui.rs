@@ -1273,7 +1273,9 @@ async fn reconnected(
         Attach::Opened(stream) => {
             backoff.reset();
             if let Err(e) = app.refresh(client).await {
-                app.status = format!("reconnected, but refresh failed: {e}");
+                app.live = Live::Reconnecting;
+                app.status = format!("reconnected, but refresh failed: {e} — retrying…");
+                return None;
             }
             app.live = Live::Attached;
             Some(stream)
