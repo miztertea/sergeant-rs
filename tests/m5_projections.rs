@@ -1824,14 +1824,7 @@ fn stub_claude(dir: &Path) -> PathBuf {
     std::fs::set_permissions(&path, permissions).expect("chmod");
     // A file another process still holds open for writing cannot be exec'd;
     // absorb the ETXTBSY window before handing it to the adapter.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while let Err(e) = Command::new(&path).arg("--version").output() {
-        assert!(
-            e.raw_os_error() == Some(26) && Instant::now() < deadline,
-            "the stub is not runnable: {e}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    support::wait_until_executable(&path);
     path
 }
 

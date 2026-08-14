@@ -1497,13 +1497,14 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
 #[test]
 fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
     let dir = DataDir::new();
-    let expected_base = Path::new("/var/tmp/sgt-rs-tests");
-    assert!(
-        dir.path().starts_with(expected_base),
-        "DataDir::new() must root its TempDir under {expected_base:?} (real disk, \
-         outside any git checkout) by default — got {:?}",
-        dir.path()
-    );
+    if let Some(expected_base) = support::disk_backed_tmp_base() {
+        assert!(
+            dir.path().starts_with(&expected_base),
+            "DataDir::new() must root its TempDir under {expected_base:?} (real disk, \
+             outside any git checkout) by default — got {:?}",
+            dir.path()
+        );
+    }
 }
 
 #[test]

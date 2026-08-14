@@ -94,7 +94,7 @@ pub struct ReapedDaemon {
 /// untested Windows host) falls back to `TempDir::new()`'s own default
 /// rather than failing outright — this fix targets the measured incident,
 /// not every platform this crate might someday run on.
-fn disk_backed_tmp_base() -> Option<PathBuf> {
+pub(crate) fn disk_backed_tmp_base() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("SGT_TEST_TMPDIR") {
         return Some(PathBuf::from(dir));
     }
@@ -301,5 +301,22 @@ fn wait_until_gone(data_dir: &Path, budget: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// #83: a freshly written, freshly `chmod +x`'d stand-in script can
+/// transiently fail `execve(2)` with `ETXTBSY` ("text file busy", `os error
+/// 26`) while another handle on the same inode is still open for writing —
+/// under `cargo test`'s default thread parallelism, a sibling test's
+/// fork-to-exec window can overlap this one's write. Retry until the exec
+/// stops being refused, or surface any other failure immediately.
+pub fn wait_until_executable(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Err(e) = std::process::Command::new(path).arg("--version").output() {
+        assert!(
+            e.raw_os_error() == Some(26) && Instant::now() < deadline,
+            "the stand-in at {path:?} is not runnable: {e}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

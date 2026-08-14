@@ -2973,29 +2973,6 @@ mod tests {
         assert_eq!(latest_ask_withdrawal_version(noise).unwrap(), None);
     }
 
-    /// #83: a freshly written, freshly `chmod +x`'d stand-in script can
-    /// transiently fail `execve(2)` with `ETXTBSY` ("text file busy",
-    /// `os error 26`) under `cargo test --lib`'s default thread
-    /// parallelism — measured directly (3 failures in 40 runs, every one
-    /// this exact `io::ErrorKind::ExecutableFileBusy`) via the diagnostic
-    /// `run_probe` now surfaces. This is not a version-parsing bug; the
-    /// same absorb-and-retry idiom already fixed it in
-    /// `tests/m5_projections.rs` and `tests/m6_surfaces.rs` before this
-    /// call site existed. Retry until the exec stops being refused, or
-    /// surface any other failure immediately — the window is real but
-    /// bounded, never a reason to paper over an unrelated exec error.
-    #[cfg(unix)]
-    fn wait_until_executable(path: &std::path::Path) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while let Err(e) = std::process::Command::new(path).arg("--version").output() {
-            assert!(
-                e.raw_os_error() == Some(26) && std::time::Instant::now() < deadline,
-                "the stand-in is not runnable: {e}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-    }
-
     /// #83, direct proof rather than a re-run-until-it-flakes gamble:
     /// manufactures the exact condition `execve(2)` refuses with `ETXTBSY`
     /// — a second fd open for writing on the same inode — and confirms
@@ -3029,7 +3006,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        wait_until_executable(&script);
+        crate::test_support::wait_until_executable(&script);
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(100),
             "wait_until_executable returned before the manufactured busy \
@@ -3067,7 +3044,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod +x");
-            wait_until_executable(&script);
+            crate::test_support::wait_until_executable(&script);
         }
         config.executable = script;
         let backend = ClaudeBackend::new(config);
