@@ -1983,6 +1983,74 @@ mod tests {
         assert_eq!(app.rows.len(), 1, "the fleet refresh must have run too");
     }
 
+    /// Review found two bugs on this same success path that a mocked client
+    /// could not tell apart from correct behavior: a stream that opens but
+    /// whose refresh then fails must not be reported `Attached` (that would
+    /// show the pre-gap snapshot as live), and the backoff must not be reset
+    /// until the refresh actually succeeds — resetting on open alone would
+    /// make a reconnect that keeps opening a stream but failing its refresh
+    /// retry at `RECONNECT_BASE` forever instead of backing off.
+    #[tokio::test]
+    async fn a_failed_refresh_after_a_successful_attach_stays_reconnecting_and_keeps_the_backoff() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in daemon");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            fn respond(mut stream: std::net::TcpStream, status_line: &str, content_type: &str) {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            // 1: the reconnect's own attach succeeds — the tail itself
+            // carries nothing.
+            if let Ok((stream, _)) = listener.accept() {
+                respond(stream, "200 OK", "text/event-stream");
+            }
+            // 2: the refresh's first call (system) fails.
+            if let Ok((stream, _)) = listener.accept() {
+                respond(stream, "500 Internal Server Error", "application/json");
+            }
+        });
+
+        let client = ApiClient::new(&format!("http://{addr}"), "unused-token").expect("client");
+        let mut app = App::new();
+        app.live = Live::Reconnecting;
+        app.system = json!({"version": "pre-gap"});
+        let mut backoff = Backoff::new();
+        // Advance the backoff as a real outage would before this attempt, so
+        // a wrongful reset back to the base delay is observable below.
+        backoff.next_delay();
+        backoff.next_delay();
+
+        let attempt = try_attach(&client, 0).await;
+        let stream = reconnected(&client, &mut app, &mut backoff, attempt).await;
+
+        assert!(
+            stream.is_none(),
+            "a refresh failure must not hand back a stream to keep tailing"
+        );
+        assert_eq!(
+            app.live,
+            Live::Reconnecting,
+            "a stream that opened but whose refresh failed must not be reported \
+             Attached — the screen would show the pre-gap snapshot as live"
+        );
+        assert_eq!(
+            app.system["version"], "pre-gap",
+            "a failed refresh must not leave a half-updated system snapshot"
+        );
+        assert_eq!(
+            backoff.next_delay(),
+            RECONNECT_BASE * 4,
+            "the backoff must not reset on a refresh failure — it continues \
+             from where the outage's curve already was"
+        );
+    }
+
     /// The signal arm, exercised for real: install the handlers, send this
     /// process a SIGTERM, and require the future to resolve.
     ///
