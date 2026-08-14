@@ -470,6 +470,27 @@ fn footer_line(app: &App) -> Paragraph<'_> {
     ]))
 }
 
+/// Render `text` into a fixed-width fleet column: space-padded if it fits,
+/// truncated with a trailing `…` if it does not.
+///
+/// Padding alone (`{:<width$}`) only ever *adds* space — it never removes it,
+/// so a value longer than `width` overruns into the next column and the
+/// visual gap between them disappears (e.g. a long stage label running into
+/// the backend column). Truncating to `width` keeps every column exactly
+/// `width` cells wide regardless of content, so the next column always
+/// starts where its padding says it should.
+fn column(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        format!("{text:<width$}")
+    } else if width == 0 {
+        String::new()
+    } else {
+        let head: String = text.chars().take(width - 1).collect();
+        format!("{head}…")
+    }
+}
+
 fn draw_fleet(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered().title(format!("fleet — {} work", app.rows.len()));
     if app.rows.is_empty() {
@@ -484,10 +505,10 @@ fn draw_fleet(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|row| {
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{:<28}", row.id)),
-                Span::styled(format!("{:<12}", row.state), state_style(&row.state)),
-                Span::raw(format!("{:<26}", row.stage)),
-                Span::raw(format!("{:<10}", row.backend)),
+                Span::raw(column(&row.id, 28)),
+                Span::styled(column(&row.state, 12), state_style(&row.state)),
+                Span::raw(column(&row.stage, 26)),
+                Span::raw(column(&row.backend, 10)),
                 Span::raw(row.intent.clone()),
             ]))
         })
@@ -693,7 +714,15 @@ where
     let mut outcome: Result<Exit, TuiError> = Ok(Exit::Requested);
     'session: {
         if let Err(e) = terminal.draw(|frame| draw(frame, app)) {
-            outcome = Err(terminal_error(e));
+            // Same rule as the in-loop draw below: a write that fails because
+            // the pty already hung up is `TerminalGone`, not a reported
+            // error — this is the one draw site a hangup landing before the
+            // event loop starts would otherwise slip past.
+            outcome = if tty.hung_up() {
+                Ok(Exit::TerminalGone)
+            } else {
+                Err(terminal_error(e))
+            };
             break 'session;
         }
         loop {
@@ -1475,6 +1504,74 @@ mod tests {
         assert!(fleet_rows(&json!({})).is_empty());
     }
 
+    /// A stage value that overruns its column's padding is truncated, so the
+    /// backend column still starts exactly where the stage column's width
+    /// says it should — instead of the two columns running together.
+    ///
+    /// Issue #11: `draw_fleet` pads each cell with `format!("{:<N}")`, which
+    /// only ever *adds* space and never removes it, so a stage longer than
+    /// its 26-column width overruns into the backend column and the gap
+    /// between them disappears (`docs/img/tui-fleet.png` shows exactly this:
+    /// `needs_inputfake` with no separator). The existing fleet-row test
+    /// above asserts field *content* via substrings, which cannot see this —
+    /// a substring check passes whether or not the columns are padded to
+    /// width at all. This test instead asserts on column position: it finds
+    /// the fixed-width stage field on the rendered screen and checks the
+    /// backend field starts exactly 26 columns after it, not wherever the
+    /// stage text happened to end.
+    #[test]
+    fn an_overlong_stage_is_truncated_so_the_backend_column_still_starts_on_time() {
+        let mut app = App::new();
+        app.rows = vec![WorkRow {
+            id: "rowid1".to_string(),
+            state: "needs_input".to_string(),
+            // Well past the 26-column stage width.
+            stage: "10-implement 2/2 · running a very long stage label indeed".to_string(),
+            backend: "fake".to_string(),
+            intent: "an intent".to_string(),
+        }];
+
+        let screen = screen_text(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("rowid1"))
+            .expect("the fleet row is on screen");
+
+        let id_start = line.find("rowid1").expect("already checked it's there");
+        let after_id: Vec<char> = line[id_start..].chars().collect();
+        assert!(
+            after_id.len() >= 28 + 12 + 26 + 10,
+            "the row must be wide enough to hold every column: {line}"
+        );
+
+        let stage_field: String = after_id[28 + 12..28 + 12 + 26].iter().collect();
+        let backend_field: String = after_id[28 + 12 + 26..28 + 12 + 26 + 10].iter().collect();
+
+        assert_eq!(
+            stage_field.chars().count(),
+            26,
+            "the stage column is exactly 26 cells wide regardless of content: \
+             {line}"
+        );
+        assert!(
+            stage_field.ends_with('…'),
+            "a stage longer than the column must be truncated with an \
+             ellipsis, not overrun the column: {stage_field:?} in {line}"
+        );
+        assert!(
+            !stage_field.contains("running a very long"),
+            "the full stage text must not survive into the fixed-width \
+             column: {stage_field:?}"
+        );
+        assert!(
+            backend_field.trim_start().starts_with("fake"),
+            "the backend column must start exactly where the stage column's \
+             padding says it should, not wherever the untruncated stage text \
+             happened to end: stage={stage_field:?} backend={backend_field:?} \
+             in {line}"
+        );
+    }
+
     /// Liveness is durable state, not a message.
     ///
     /// The regression: the only sign that the SSE tail had died was
@@ -1880,6 +1977,122 @@ mod tests {
             Exit::TerminalGone,
             "the loop must name the hangup, so `run` knows there is nobody to \
              report to"
+        );
+    }
+
+    /// A backend whose `draw` always fails, wrapping a real `TestBackend` for
+    /// every other call. `TestBackend` itself cannot fail a draw (its error
+    /// type is `Infallible`), so a hangup landing on the very first,
+    /// pre-loop draw — the gap issue #26's grooming narrowed the report
+    /// to — is otherwise unreachable from a test.
+    struct FailingBackend(ratatui::backend::TestBackend);
+
+    impl ratatui::backend::Backend for FailingBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.0.hide_cursor().unwrap();
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.0.show_cursor().unwrap();
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            Ok(self.0.get_cursor_position().unwrap())
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.0.set_cursor_position(position).unwrap();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.0.clear().unwrap();
+            Ok(())
+        }
+
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+            self.0.clear_region(clear_type).unwrap();
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            Ok(self.0.size().unwrap())
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            Ok(self.0.window_size().unwrap())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush().unwrap();
+            Ok(())
+        }
+    }
+
+    /// A hangup landing on the pre-loop draw — before the event loop's
+    /// `select!` (and its own hung-up check) is ever reached — still exits
+    /// as `TerminalGone`, not as a reported error.
+    ///
+    /// Issue #26, as narrowed by its 2026-08-13 grooming comment: the reader
+    /// thread and `TtyWatch::install` now both arm synchronously before this
+    /// draw, closing the original 1-2 second startup window, but this one
+    /// call site still lacked the `tty.hung_up()` check every later draw
+    /// (line ~774) and the watch arm (line ~765) both consult. Without the
+    /// fix this test's `terminal.draw` failure is reported as a `TuiError`
+    /// instead of recognized as `Exit::TerminalGone`.
+    #[tokio::test]
+    async fn a_hangup_at_the_pre_loop_draw_exits_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _quiet = SIGNALS_QUIET.lock().await;
+        static PRESENT: AtomicBool = AtomicBool::new(true);
+        fn probe() -> bool {
+            PRESENT.load(Ordering::SeqCst)
+        }
+
+        PRESENT.store(true, Ordering::SeqCst);
+        let watch = TtyWatch::watching(probe);
+        // The terminal is already gone by the time the very first draw runs.
+        PRESENT.store(false, Ordering::SeqCst);
+        let probes = TerminalProbes {
+            watch,
+            tick: Box::new(|| ReaderTick::Idle),
+        };
+
+        let mut terminal =
+            ratatui::Terminal::new(FailingBackend(ratatui::backend::TestBackend::new(80, 24)))
+                .expect("a test terminal");
+        let mut app = App::new();
+        let client = ApiClient::new("http://127.0.0.1:1", "token").expect("client");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(20),
+            event_loop(&mut terminal, &mut app, &client, probes),
+        )
+        .await
+        .expect("a pre-loop hangup must not hang the session");
+        assert_eq!(
+            exit.expect(
+                "a hangup discovered on the pre-loop draw is not a failure — \
+                 there is nobody left to report one to"
+            ),
+            Exit::TerminalGone,
+            "the pre-loop draw must consult the same hung-up check every \
+             later draw site does"
         );
     }
 
