@@ -119,8 +119,17 @@ text below stands as the argument record.
 Install path, Work-vs-inline routing judgment (OS-owned), per-repo
 instruction contract, the recursion proof (self-hosting measured, not
 pledged), cross-repo Work spanning estate entries (the central value
-claim — currently unimplemented and uncontracted; MVP-1's
-group-expansion ruling must produce its design), soak evidence (#19),
+claim — **amended 2026-08-13:** the engine leg landed under
+R-MVP1-4/R-MVP1-5 — per-repository worktree bindings under one Work with
+partial-materialize rollback, an instruction-policy-agreement refusal at
+submit, and repeatable `--repo` plus client-side `--group` expansion,
+pinned by `tests/m3_execution.rs::t2_multi_repo_workspace_binds_one_worktree_per_repository`
+and `tests/m8_estate_cli.rs::run_group_expansion_itself_survives_an_unrelated_declared_repo_missing_from_disk`.
+What remains uncontracted is narrower: cross-repo *delivery ordering* is
+planned by hand in the `cross-repo-work` workflow with no engine-side
+dependency contract, and the multi-repo execution cwd —
+`WorkSurface::execution_cwd` falls back to the surface root for
+two-or-more repositories — is construction, not a ruling), soak evidence (#19),
 fake-backend timing fidelity, unsupervised-run safety envelope, backlog
 dedup scheme, estate trust model.
 
