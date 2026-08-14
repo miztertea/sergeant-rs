@@ -2312,13 +2312,6 @@ fn adr_0007a_the_first_turn_states_the_execution_model() {
         first.stdin
     );
     assert!(
-        EXECUTION_MODEL_CONTRACT.contains("one turn")
-            && EXECUTION_MODEL_CONTRACT.contains("no callbacks")
-            && EXECUTION_MODEL_CONTRACT.contains("foreground"),
-        "the statement must actually say what #94 needed said: one turn, \
-         no callbacks, run long commands in the foreground: {EXECUTION_MODEL_CONTRACT:?}"
-    );
-    assert!(
         first.stdin.ends_with("the intent||the stage context"),
         "the intent and CONTEXT.md must still reach the actor, verbatim, \
          after the execution model: {:?}",

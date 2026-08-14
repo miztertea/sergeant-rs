@@ -69,10 +69,12 @@ exactly as it did twice on 2026-08-14.
 
 ## Consequences
 
-This is a product change that does not exist yet in this codebase. The ADR
-records the two-part contract; it does not implement the context-
-composition addition in (a) or the closing-stage guard in (b). Both remain
-separate, not-yet-filed implementation work against issue #94.
+Implemented. (a) is `EXECUTION_MODEL_CONTRACT` in
+`src/backend/claude.rs`, composed ahead of the intent and the stage's
+CONTEXT.md on every headless turn's launch. (b) is `stranded_completion`
+and `reported_state` in `src/api.rs`, which report `completed_dirty`
+instead of plain `completed` when a closing stage's branch never actually
+advanced, surfaced through `sgt work show`/`work list`/`watch` and the TUI.
 
 Recording the orchestrator's own fault in the second #94 occurrence is
 itself a consequence worth stating plainly: this decision is not only
