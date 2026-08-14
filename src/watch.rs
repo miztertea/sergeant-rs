@@ -89,7 +89,13 @@ impl WatchState {
             "blocked" => Some(Self::Blocked),
             "waiting" => Some(Self::Waiting),
             "failed" => Some(Self::Failed),
-            "completed" => Some(Self::Completed),
+            // ADR 0007(b): a stranded completion is still terminal — the
+            // Work is done, not blocked or failed — so it belongs in the
+            // same watch bucket as an ordinary `completed`. `watch` forwards
+            // the snapshot verbatim (`emit`, below), so the notice an
+            // operator sees still reads `completed_dirty`; only whether the
+            // loop notices and exits changes here.
+            "completed" | "completed_dirty" => Some(Self::Completed),
             "canceled" => Some(Self::Canceled),
             _ => None,
         }

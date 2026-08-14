@@ -439,7 +439,10 @@ fn field(value: &Value, key: &str) -> String {
 fn state_style(state: &str) -> Style {
     let color = match state {
         "completed" => Color::Green,
-        "needs_input" | "waiting" => Color::Yellow,
+        // ADR 0007(b): a stranded completion is terminal, not a plain
+        // success — group it with the other "needs a look" states rather
+        // than the default Cyan bucket ordinary in-flight work falls into.
+        "needs_input" | "waiting" | "completed_dirty" => Color::Yellow,
         "failed" | "blocked" | "canceled" => Color::Red,
         _ => Color::Cyan,
     };
