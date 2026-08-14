@@ -41,7 +41,9 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
     about = "sergeant-rs: local agent execution surface"
 )]
 struct Sgt {
-    /// Data directory (default: $SGT_DATA_DIR, then ~/.local/share/sergeant).
+    /// Data directory (default: $SGT_DATA_DIR, then the discovered estate's
+    /// .sergeant/data, then $XDG_DATA_HOME/sergeant, then
+    /// ~/.local/share/sergeant).
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
     /// Emit machine-readable JSON instead of human text.

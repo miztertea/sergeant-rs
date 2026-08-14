@@ -2334,13 +2334,18 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     assert!(!home.path().join(".local").exists());
     drop(_reap);
 
-    // Absent SGT_DATA_DIR, `$XDG_DATA_HOME/sergeant` is next.
+    // Absent SGT_DATA_DIR, `$XDG_DATA_HOME/sergeant` is next. Run from a cwd
+    // outside any estate: an in-tree cwd would let step 3 (estate discovery,
+    // `resolve_data_dir`) resolve first and this fallback rung would never
+    // actually be exercised.
     let xdg2 = TempDir::new().expect("tempdir");
     let home2 = TempDir::new().expect("tempdir");
+    let cwd2 = TempDir::new().expect("tempdir");
     let resolved = xdg2.path().join("sergeant");
     let _reap = ReapOnDrop(resolved.clone());
     let output = Command::new(SGT)
         .args(["work", "list", "--json"])
+        .current_dir(cwd2.path())
         .env_remove("SGT_DATA_DIR")
         .env("XDG_DATA_HOME", xdg2.path())
         .env("HOME", home2.path())
@@ -2358,12 +2363,15 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     assert!(!home2.path().join(".local").exists());
     drop(_reap);
 
-    // Absent both, `$HOME/.local/share/sergeant` is the last resort.
+    // Absent both, `$HOME/.local/share/sergeant` is the last resort. Same
+    // cwd-isolation reasoning as the XDG case above.
     let home3 = TempDir::new().expect("tempdir");
+    let cwd3 = TempDir::new().expect("tempdir");
     let resolved = home3.path().join(".local/share/sergeant");
     let _reap = ReapOnDrop(resolved.clone());
     let output = Command::new(SGT)
         .args(["work", "list", "--json"])
+        .current_dir(cwd3.path())
         .env_remove("SGT_DATA_DIR")
         .env_remove("XDG_DATA_HOME")
         .env("HOME", home3.path())
