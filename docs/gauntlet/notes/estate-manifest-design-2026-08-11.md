@@ -9,18 +9,15 @@ dispositions; the owner's decisions stand except one ESCALATED fork.
 
 Extends the estate root's `sergeant.toml` (reuse the discovered config
 file, R1): `[estate]` (name, `data_dir` defaulting `.sergeant/data`),
-**[v3] `data_dir` was never carried into implementation and this line is
-stale.** R-MVP1-1 (the MVP-1 contract's own ruling on `[estate]`) named
-only `surfaces_dir`; `EstateSection` (`workspace.rs`) is
-`deny_unknown_fields` over `name`/`default_backend`/`default_workflow`/
-`surfaces_dir`, and `resolve_data_dir` (`cli.rs`) hardcodes
-`estate_root.join(DEFAULT_ESTATE_DATA_DIR)` reading no manifest field at
-all — so a hand-written `[estate] data_dir = "..."` following this line
-literally fails closed with a `deny_unknown_fields` parse refusal rather
-than overriding anything. Flagged, not implemented, at the MVP-3 fixer
-pass (invariants finding MVP3-C4; GAUNTLET.md backlog entry B5):
-per-Work-item scope, this is R-NS-4 new engine/config surface and wants
-its own ratification, not a silent addition inside a bug-fix pass.
+**[v3] `data_dir` was never carried into implementation and this line was
+stale** as of the MVP-3 fixer pass (invariants finding MVP3-C4; GAUNTLET.md
+backlog entry B5): flagged rather than implemented there, since it was
+R-NS-4 new engine/config surface wanting its own ratification, not a
+silent addition inside a bug-fix pass. **[v4] Ratified and implemented**:
+ADR 0008(b) added `[estate] data_dir` to `EstateSection`, resolved
+identically to `surfaces_dir`; see GAUNTLET.md's B5 row and its "ADR
+0008" ledger entry for the shipped shape and the still-open precedence
+question against `--data-dir`/`SGT_DATA_DIR`.
 `[[profile]]` (existing; **[v2]** array-of-tables per `workspace.rs:179`,
 unchanged here — the earlier `[profile.*]` shorthand was wrong),
 `[[repo]]` entries, `[group.<name>]` tables.
