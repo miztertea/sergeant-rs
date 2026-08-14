@@ -1647,12 +1647,18 @@ mod doctor {
 
     /// Run every check against `data_dir`.
     pub async fn run(data_dir: &Path) -> Report {
-        let mut checks = vec![
-            git_check(),
-            claude_check(data_dir),
-            docker_check(data_dir),
-            data_dir_check(data_dir),
-        ];
+        let mut checks = vec![git_check(), claude_check(data_dir)];
+        // #67: the data dir's own existence and writability is checked
+        // before anything that lives *inside* it — the docker adapter's
+        // blob store and disk-pressure's `df` call both fail the instant
+        // the data dir cannot be created, and running them first surfaced
+        // that single fault as two unrelated-looking downstream symptoms.
+        // Threading `data_dir_ok` down mirrors `journal_ok` below: the
+        // checks that depend on it decline by name instead of re-deriving
+        // (and re-explaining) the same root cause.
+        let (data_dir_check, data_dir_ok) = data_dir_check(data_dir);
+        checks.push(data_dir_check);
+        checks.push(docker_check(data_dir, data_dir_ok));
         // The journal is the only durable fact in the installation, so it is
         // checked before anything derived from it; a projection rebuild over
         // an unreadable journal would report the journal's fault under the
@@ -1667,7 +1673,7 @@ mod doctor {
         // after everything above regardless of their outcome — knowing "is
         // this installation about to run out of disk" does not depend on the
         // daemon, the journal, or Docker being reachable.
-        checks.push(disk_pressure_check(data_dir));
+        checks.push(disk_pressure_check(data_dir, data_dir_ok));
         Report {
             data_dir: data_dir.to_path_buf(),
             checks,
@@ -1934,7 +1940,20 @@ mod doctor {
     /// healthy either way. This row exists so an operator can tell *why* an
     /// execute submission would be refused before trying one, with real
     /// evidence rather than a ping's optimism.
-    fn docker_check(data_dir: &Path) -> Check {
+    fn docker_check(data_dir: &Path, data_dir_ok: bool) -> Check {
+        // #67: `DockerBackend::new` opens a blob store under `data_dir` and
+        // fails with the same EPERM the `data_dir` check above already
+        // named and gave a remedy for — re-running it here would just print
+        // that fault a second time under a different, more confusing name
+        // ("could not initialize the Docker adapter") without adding
+        // information.
+        if !data_dir_ok {
+            return Check::warn(
+                "docker",
+                "not attempted: the data dir is not writable",
+                "fix the data_dir check above first",
+            );
+        }
         let backend = match DockerBackend::new(DockerConfig::new(data_dir)) {
             Ok(backend) => backend,
             Err(e) => {
@@ -1986,7 +2005,20 @@ mod doctor {
     /// exists independent of any execute stage ever running), folded into
     /// this module because Docker-captured stdout/stderr is the evidence
     /// class most likely to grow it fast (§16.9, §22.8).
-    fn disk_pressure_check(data_dir: &Path) -> Check {
+    fn disk_pressure_check(data_dir: &Path, data_dir_ok: bool) -> Check {
+        // #67: when the data dir does not exist, `df` on it fails ENOENT and
+        // `free_space` reports `None` — which this check used to print as
+        // "free space could not be measured on this platform", a claim
+        // that's simply false (the platform is fine; the path is missing)
+        // and misdirects an operator away from the real, already-named
+        // fault above.
+        if !data_dir_ok {
+            return Check::warn(
+                "disk_pressure",
+                "not attempted: the data dir is not writable",
+                "fix the data_dir check above first",
+            );
+        }
         let report = docker::measure_disk_pressure(data_dir);
         let detail = format!(
             "data dir {} ({} blobs), {}",
@@ -2048,35 +2080,103 @@ mod doctor {
         }
     }
 
-    /// §31: the data dir exists and this user can write it.
+    /// §31/#67: the data dir exists and this user can write it — checked
+    /// before anything that lives *inside* it (`docker_check`,
+    /// `disk_pressure_check`), so the boolean this returns lets both decline
+    /// instead of re-diagnosing the same fault under a more confusing name.
     ///
     /// Probed by actually creating and removing a file. Permission *bits* are
     /// not the question — read-only mounts, full disks and SELinux all answer
     /// "writable" by inspection and "no" in practice.
-    fn data_dir_check(data_dir: &Path) -> Check {
-        let remedy = format!(
+    ///
+    /// #67: when `create_dir_all` fails, the leaf path named in the raw io
+    /// error is often not the directory an operator actually needs to fix —
+    /// it never got created, so the error is really about wherever the walk
+    /// stalled. Walking up to the nearest ancestor that *does* exist and
+    /// probing that instead turns "permission denied" on a path that was
+    /// never created into one remedy row naming the actual offending parent.
+    fn data_dir_check(data_dir: &Path) -> (Check, bool) {
+        let generic_remedy = format!(
             "create {} and make it writable by this user (or point --data-dir / SGT_DATA_DIR \
              somewhere that is)",
             data_dir.display()
         );
         if let Err(e) = std::fs::create_dir_all(data_dir) {
-            return Check::fail(
-                "data_dir",
-                format!("cannot create {}: {e}", data_dir.display()),
-                remedy,
+            if let Some(ancestor) = nearest_existing_ancestor(data_dir)
+                && !probe_writable(&ancestor)
+            {
+                return (
+                    Check::fail(
+                        "data_dir",
+                        format!(
+                            "{} does not exist and cannot be created: its nearest existing \
+                             parent, {}, is not writable by this user ({e})",
+                            data_dir.display(),
+                            ancestor.display()
+                        ),
+                        format!(
+                            "make {} writable by this user — e.g. `chmod u+w {}` — or point \
+                             --data-dir / SGT_DATA_DIR at a location under a writable parent",
+                            ancestor.display(),
+                            ancestor.display()
+                        ),
+                    ),
+                    false,
+                );
+            }
+            return (
+                Check::fail(
+                    "data_dir",
+                    format!("cannot create {}: {e}", data_dir.display()),
+                    generic_remedy,
+                ),
+                false,
             );
         }
         let probe = data_dir.join(".doctor-write-probe");
         match std::fs::write(&probe, b"doctor") {
             Ok(()) => {
                 let _ = std::fs::remove_file(&probe);
-                Check::ok("data_dir", format!("{} is writable", data_dir.display()))
+                (
+                    Check::ok("data_dir", format!("{} is writable", data_dir.display())),
+                    true,
+                )
             }
-            Err(e) => Check::fail(
-                "data_dir",
-                format!("cannot write inside {}: {e}", data_dir.display()),
-                remedy,
+            Err(e) => (
+                Check::fail(
+                    "data_dir",
+                    format!("cannot write inside {}: {e}", data_dir.display()),
+                    generic_remedy,
+                ),
+                false,
             ),
+        }
+    }
+
+    /// Walk up from `path` to the nearest ancestor that already exists on
+    /// disk — the directory `create_dir_all` actually stalled at, and the
+    /// one worth naming as the fault (`data_dir_check`, #67).
+    fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+        let mut current = path;
+        loop {
+            if current.exists() {
+                return Some(current.to_path_buf());
+            }
+            current = current.parent()?;
+        }
+    }
+
+    /// Same real-write probe `data_dir_check` uses on the data dir itself,
+    /// reused on an ancestor directory: permission bits are not the
+    /// question, actually creating and removing a file is.
+    fn probe_writable(dir: &Path) -> bool {
+        let probe = dir.join(format!(".sgt-doctor-writable-probe-{}", std::process::id()));
+        match std::fs::write(&probe, b"doctor") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                true
+            }
+            Err(_) => false,
         }
     }
 
