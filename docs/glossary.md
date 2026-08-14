@@ -44,17 +44,19 @@ survive" but "after an abrupt daemon death, does work actually resume, or
 does it land in `blocked`" — which is exactly the question macOS currently
 answers worse than Linux, per issue #18.
 
-**Use tier / develop tier.** Vocabulary for two audiences a measured
-target could in principle serve separately: a *develop tier* platform is
-one where sergeant-rs itself can be built and tested (what "measured
-target" above actually requires); a *use tier* platform would be one where
-a colleague runs `sgt` without necessarily building it themselves. As of
-this decision, per D1, no platform is currently use-only — every measured
-target is a develop-tier target, and there is no prebuilt-binary
-distribution yet for a use-only audience to exist against (`NORTH-STAR.md`'s
-Waves section gates "stranger onboarding + prebuilt binary" behind the
-dogfood round that hasn't happened yet). The distinction is recorded here
-because it's meaningful vocabulary, not because it's populated today.
+**Use tier / develop tier.** Vocabulary the 2026-08-14 interview named for
+two audiences a measured target could in principle serve separately —
+*develop tier* for a platform sergeant-rs itself is built and tested on,
+*use tier* for one where a colleague only runs `sgt` — but the interview
+record supplies only one fact about it, not a full definition: per D1, no
+platform is currently use-only; every measured target is a develop-tier
+target. The precise boundary between the two tiers (what would actually
+qualify a platform as use-only) was not specified in the interview; treat
+the gloss above as the terms' plain meaning, not a ratified definition.
+Background, not part of the decision itself: `NORTH-STAR.md`'s Waves
+section gates "stranger onboarding + prebuilt binary" behind "envelope +
+dogfood round 2" — consistent with no use-only audience existing yet, but
+not something D1 itself states.
 
 **Advisory-locking-unreliable filesystem.** A filesystem where `flock`-style
 advisory locking cannot be trusted to actually exclude a second holder —
