@@ -20,6 +20,14 @@ Design decisions and deviations log their **Ponytail rung** (`R1`–`R7`; ladder
 Deviations from `reference/proposal-depot-rust-execution-surface.md`, with
 rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
+This table's `D` numbers are its own namespace, permanent once assigned.
+Individual ADRs also label their own internal decisions `D1`, `D2`, ... —
+those are local to that ADR document and independent of this table; a
+citation crossing between the two always pairs the ADR number with the
+label (e.g. "ADR 0010 (D6)") rather than citing the letter alone, which is
+what keeps the two namespaces distinguishable when they land on the same
+letter by coincidence, as D6 and D7 do here.
+
 | # | Proposal says | We do | Why |
 |---|---|---|---|
 | D1 | Product named Depot; `depot.toml`; `depot` CLI | Product **sergeant-rs**; `sergeant.toml`; binary `sgt` | Owner decision 2026-08-08 |
