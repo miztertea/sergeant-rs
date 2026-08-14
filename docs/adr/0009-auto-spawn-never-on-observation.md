@@ -63,27 +63,23 @@ today conflates the two.
 
 ## Consequences
 
-`AGENTS.md`'s standard-loop step 2 ("Check running work. `sgt status`
-... and `sgt work list`," `AGENTS.md:76-77`) currently relies on
-auto-spawn to populate a fresh boot with something to check; it must
-change to account for a cold estate now reporting no daemon rather than
-silently starting one.
+Implemented. `AGENTS.md`'s standard-loop step 2 now states that neither
+`sgt status` nor `sgt work list` auto-spawns a daemon and treats a
+no-daemon refusal on a fresh boot as an empty fleet (`AGENTS.md:76-83`).
 
-Pinned contract tests change: `tests/m2_daemon_api.rs`'s
-`t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed` currently
-exercises auto-spawn through the general CLI path; `tests/m6_surfaces.rs:414`
-currently asserts "bare `sgt` must auto-spawn a daemon like every other
-client"; and `tests/m8_estate_cli.rs:1080` currently runs `status` and
-asserts "exactly one daemon must be running after auto-spawn." All three
-pin behavior this decision reverses for their respective verbs.
+Pinned contract tests changed accordingly: `tests/m2_daemon_api.rs`'s
+`t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed` stays
+scoped to the still-auto-spawning mutating verbs; `tests/m6_surfaces.rs`
+now pins `t1_observation_verbs_refuse_without_a_daemon_and_name_the_remedy`
+instead of the old "bare `sgt` must auto-spawn" assertion; and
+`tests/m8_estate_cli.rs` no longer asserts a daemon exists after a bare
+`status`.
 
-`sgt doctor`'s own message becomes false the moment this lands. Today,
-when no daemon is running, `sgt doctor` reports "no daemon running; the
-next client command starts one" (`src/cli.rs:2305`). Once `status`,
-`work`, `analytics`, and the TUI stop auto-spawning, that statement is no
-longer true for most client commands — the diagnostic surface whose whole
-job is telling an operator the truth would start lying about the exact
-rule this ADR establishes, unless its message changes alongside the code.
+`sgt doctor`'s own message changed alongside the code (`src/cli.rs`'s
+`doctor::daemon_check`): the no-descriptor case now reads "no daemon
+running; a mutating verb (`run`, `respond`, `retry`, `extend`, `cancel`)
+starts one on demand — `status`, `work`, `analytics`, `watch`, and `tui`
+refuse instead," and the stale-descriptor warning was corrected to match.
 
 ## Open questions
 

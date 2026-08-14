@@ -51,29 +51,25 @@ what forces the daemon question the moment someone types `sgt` alone.
 
 ## Consequences
 
-`sgt tui` is a new explicit verb; bare `sgt`'s behavior changes from
-launching the TUI to rendering the homepage. Neither is implemented by
-this ADR.
+Implemented. `sgt tui` is `Command::Tui` in `src/cli.rs`; bare `sgt`
+(no subcommand) calls `print_homepage`, which touches no daemon.
 
 This is a deviation from the founding proposal, and `docs/DEVELOPMENT.md`
 is explicit about what that requires: "Departures from either proposal
 live in GAUNTLET.md's deviation register and are settled there —
 re-litigate one only by arguing its ruling is wrong, not by noticing the
 deviation exists." §30 specifying bare `sgt` as the TUI is exactly such a
-departure once this decision lands, and it needs its own entry in
-`GAUNTLET.md`'s deviation register — a quiet code change without that
-entry would be the wrong way to land this.
+departure, registered as D10 in `GAUNTLET.md`'s deviation register.
 
 ## Open questions
 
 **Whether the homepage should be estate-aware was proposed, not ruled
-on.** The orchestrating session proposed making the homepage read
-`sergeant.toml` to report the estate's name and repo count when run from
-inside one — reading the manifest is not observing the daemon, so ADR
-0009's rule would not block it — versus a fixed "run `sgt init`" message
-when outside an estate. The owner did not rule on this refinement; it is
-recorded here as a live option, not a decision, and should not be
-implemented as though it were settled.
-
-The `GAUNTLET.md` deviation register entry this decision requires has not
-been written; this ADR names that it is owed, not its content.
+on — implemented in the estate-aware direction.** The orchestrating
+session proposed making the homepage read `sergeant.toml` to report the
+estate's name and repo count when run from inside one — reading the
+manifest is not observing the daemon, so ADR 0009's rule would not block
+it — versus a fixed "run `sgt init`" message when outside an estate. The
+owner did not rule on this refinement during the interview; `print_homepage`
+(`src/cli.rs`) implements the estate-aware option, recorded per
+`GAUNTLET.md`'s D10 entry as the option taken, not an owner ruling between
+the two.

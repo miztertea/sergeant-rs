@@ -66,11 +66,11 @@ to less than that stub would.
 
 ## Consequences
 
-This is a real deletion with real test fallout, not a documentation-only
-change once implemented: `src/web.rs` (779 lines) and `web/` (224 lines)
-are removed, `sgt web` stops being a verb, and `tests/m6_surfaces.rs`'s
-dashboard-specific tests go with it. None of this deletion is performed by
-this ADR, which records the decision only.
+Implemented. `src/web.rs` (779 lines) and `web/` are removed, `sgt web`
+is no longer a verb, and `tests/m6_surfaces.rs`'s dashboard-specific tests
+were removed or rewritten to exercise the two-client (CLI, TUI) surface
+instead. `README.md`, `skills/sergeant-help/SKILL.md`, `docs/DEVELOPMENT.md`,
+and `NORTH-STAR.md` were updated to drop the dashboard as a listed surface.
 
 ADR 0009's no-spawn sweep list loses `web` as an entry — there is no
 longer a dashboard verb for the no-auto-spawn rule to apply to.
