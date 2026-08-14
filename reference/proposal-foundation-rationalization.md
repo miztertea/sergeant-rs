@@ -55,9 +55,10 @@ having been right is worse than no record.
 
 ## 2.2 What surfaced the problems
 
-The 2026-08-14 cross-platform sprint, run through the engine. It closed six
-issues (#16, #70, #83, #86, #87, #91) and surfaced seven findings nobody was
-hunting: #90, #91, #94, #95, #96, #100, plus corrections filed against #90
+The 2026-08-14 cross-platform sprint, run through the engine. It fixed six
+issues (#16, #70, #83, #86, #87, #91) — landed and gated on the integration
+branch, which is unmerged, so all six remain **open** on the tracker until it
+reaches `main` — and surfaced seven findings nobody was hunting: #90, #91, #94, #95, #96, #100, plus corrections filed against #90
 and #91 where the original filing was wrong. Three of those degraded the
 engine every subsequent wave ran through.
 
@@ -188,9 +189,22 @@ Nothing here adds a second source of truth or a state that outlives a
 journal rebuild.
 
 ## 4.2 One owner
-The daemon exclusively owns the data dir. §5.1 does not weaken this — it
-replaces one ownership mechanism (no-mistakes' repo-wide branch lock) with
-one sergeant already enforces (a Work owns its surface).
+The daemon exclusively owns the data dir, and §5.1 must hold that regardless
+of which binding mechanism it ends up using.
+
+**Corrected after FOUNDATION-1** (`inv-one-owner-relocated`, confirmed at
+error severity): an earlier draft claimed §5.1 simply "replaces one ownership
+mechanism with one sergeant already enforces." That is false as stated. The
+two are different resources. no-mistakes locks *the branch under review*;
+sergeant's surface guarantee covers *a freshly-minted `sergeant/<work-id>`
+branch the Work itself creates* — and `src/runtime/surface.rs` has no path
+binding a surface to a branch it did not mint. Either the gate Work binds to
+the target branch, which git forbids while the target's own worktree exists,
+or it reviews a copy, which breaks no-mistakes' assumption that its auto-fix
+commits are recovered onto the branch being shipped. The *intent* is to fold
+gate ownership into the surface model; the binding mechanism is **open**, and
+tracked as such — ADR 0005's own Open Questions already say the shape of the
+gate Work is undecided. §8.6 carries it.
 
 ## 4.3 Ambiguity fails closed
 §5.5's sweep makes more surfaces fail closed, not fewer. §5.3's safety net
@@ -207,7 +221,8 @@ the issue stays open.
 
 ## 4.6 Procedure is data
 §5.1 moves gating into a workflow package rather than a script, which
-strengthens this rather than bending it.
+strengthens this rather than bending it — independent of §4.2's open binding
+question, since procedure-as-data holds whichever mechanism is chosen.
 
 ## 4.7 The Ponytail minimality ladder
 Each change should sit on its lowest viable rung. §5.7 is a deletion — the
@@ -226,15 +241,21 @@ that owns the surface, there is exactly one owner and nothing to break.
 
 `validate-and-ship`'s existing authority split is preserved unchanged:
 `auto-fix` findings are the actor's to authorize, `ask-user` findings are
-relayed verbatim and never resolved autonomously. In a dispatched gate,
-`ask-user` surfaces as `needs_input` and Captain answers via `sgt respond` —
-the engine's existing hold mechanism, not new machinery.
+relayed verbatim and never resolved autonomously. One plausible mechanism — **not decided
+here** — is that `ask-user` surfaces as `needs_input` with Captain answering
+via `sgt respond`, reusing the engine's existing hold rather than new
+machinery. ADR 0005 lists the findings-to-Work schema among its open
+questions; §8.6 carries it.
 
 **no-mistakes stays inside the gate Work initially.** Its review is the
 asset: on 2026-08-14 it found four real defects Captain's own review had
 passed, including a regression its own fix had introduced. A rebuilt ICM
 review is a new brief with no track record. Stages get rebuilt only where we
-can show we have matched them.
+can show we have matched them — and the cost of keeping it does not go away:
+sergeant stays dependent on an external tool whose ownership model is what
+forced this correction. **What "matched" means is not yet specified**, which
+ADR 0005 also flags; until it is, "rebuild only where matched" is a posture
+rather than a trigger.
 
 **Consequence accepted:** gating stops being Captain-serial and becomes
 durable and resumable. **Consequence to watch:** the gate Work reviewing a
@@ -245,7 +266,9 @@ the review valuable must not quietly become self-review.
 
 `sgt claude -- <args>`, `sgt codex`, `sgt opencode`, `sgt goose`. sgt
 composes the environment, binds the estate, and **execs** — replacing itself
-with the harness.
+with the harness. The `exec`-not-supervise shape is decided; **the contents
+of "the environment" are not** (§8.1), and a Work cannot build this until
+that list exists.
 
 This makes §3.2's environment half a guarantee instead of a ritual: the
 harness, the daemon it spawns, and every actor beneath inherit one
@@ -290,7 +313,11 @@ not a preference. §5.2's explicit launch binding removes most of the
 surprise that made it feel wrong.
 
 **Add `[estate] data_dir`**, for symmetry with `surfaces_dir`. The manifest
-is authority for both or neither.
+is authority for both or neither. Its rung in the ladder is **not decided
+here** — whether a manifest `data_dir` outranks `SGT_DATA_DIR` or sits below
+it is exactly the kind of precedence question §5.4's first part settles for
+estate-vs-XDG and this part does not settle for manifest-vs-env. §8.7 carries
+it; a Work must not guess.
 
 **Re-rule #64 rather than implement it.** The promised flip moved surfaces
 outside every checkout via `XDG_STATE_HOME`; with the estate as a
@@ -318,8 +345,8 @@ rejected, and rightly — materializing a daemon so the cockpit has something
 to show is precisely the lie the rule exists to prevent.
 
 **Blast radius, known:** `AGENTS.md`'s standard-loop step 2 relies on
-auto-spawn on a fresh boot; pinned contract tests change (m2 t7,
-`tests/m6_surfaces.rs:414`, `tests/m8_estate_cli.rs:1080`); and `sgt
+auto-spawn on a fresh boot; pinned contract tests change
+(`tests/m6_surfaces.rs:414`, `tests/m8_estate_cli.rs:1080`); and `sgt
 doctor`'s own message — "no daemon running; the next client command starts
 one" — becomes **false** the moment this lands. The diagnostic surface would
 begin lying about the rule this establishes, so it changes in the same
@@ -347,6 +374,14 @@ a quiet edit.
 
 Remove `src/web.rs`, `web/`, and the `sgt web` verb. #21 and #15 close as
 won't-do, and `web` leaves §5.5's sweep list.
+
+Two categories, both in scope and each with a different acceptance test:
+code **deleted outright** (`src/web.rs`, `web/`, the verb, m6's dashboard
+tests), and code **rewritten to drop `web.rs` from its loop** (anything that
+imports it, references the verb, or documents the surface — `README.md`,
+`sergeant-help`, `AGENTS.md` if it mentions it). A Work is done when
+`rg -i 'web\.rs|sgt web|dashboard'` returns only historical references in
+`GAUNTLET.md`, `docs/adr/`, and `docs/gauntlet/`.
 
 The human surfaces are `sgt init`, `sgt doctor`, `sgt tui` and the new
 homepage. The dashboard is not among them, and three hand-maintained
@@ -417,6 +452,18 @@ because they need live dialogue. If gating becomes a dispatched Work,
 `validate-and-ship` moves the other way — but its directly-invoked
 `/no-mistakes` entry variant, written when there was no engine to dispatch
 to, may now be dead weight. Not decided here.
+
+## 8.6 How a gate Work binds to the branch it reviews
+Raised by FOUNDATION-1's only surviving error (`inv-one-owner-relocated`).
+A sergeant surface mints its own `sergeant/<work-id>` branch; the gate needs
+the branch under review. Binding to the target directly is forbidden by git
+while the target's worktree exists; reviewing a copy breaks no-mistakes'
+recovery of auto-fix commits onto the shipped branch. Neither path is chosen
+here, and §5.1 must not be dispatched until one is.
+
+## 8.7 Where a manifest `data_dir` sits relative to `SGT_DATA_DIR`
+Raised by FOUNDATION-1. §5.4 settles estate-vs-XDG precedence and does not
+settle manifest-vs-env. A Work must not guess.
 
 ## 8.5 What replaces the dashboard's one genuine use
 §5.7 deletes a surface that could be opened on a phone or a second machine.

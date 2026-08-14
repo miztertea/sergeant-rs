@@ -49,6 +49,68 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 
 ## Ledger entries
 
+### FOUNDATION-1 — 2026-08-14, a proposal graded instead of an implementation: validated with findings
+
+**Mission outcome: validated with findings.** The foundation-rationalization
+proposal (`reference/proposal-foundation-rationalization.md`, §1–8) was
+graded by a four-axis blind panel with per-axis adversarial refuters. 13
+findings, 1 refuted, 12 confirmed, 3 severity downgrades, **1 surviving
+error**. Every verdict held that its section survives a local correction; no
+decision was invalidated and nothing was sent back. Corrections applied,
+two new Unknowns added, one item carried to the owner. Full record:
+`docs/gauntlet/runs/foundation-1/` (critics, refuters, adjudication).
+
+**Two adaptations, recorded rather than made silently.** The artifact was a
+**proposal, not an implementation** — a first for this ledger. `test-honesty`
+was therefore replaced by **`enactability`** (can a Work execute each section,
+or does it hide an undecided question behind confident prose), and simplicity
+folded into `invariants` via the Ponytail ladder to keep the panel at four.
+Critics and refuters ran as **dispatched sgt Works**, not ultracode workflows:
+the pattern doc predates the engine being able to run work. The model spread
+it fixes survived — Sonnet executes, the orchestrating session adjudicates.
+
+**The surviving error was the proposal's own architectural justification.**
+`inv-one-owner-relocated`: §4.2 claimed gating-as-a-Work "replaces one
+ownership mechanism with one sergeant already enforces." False — no-mistakes
+locks the branch *under review*; a sergeant surface guarantees a
+*freshly-minted* `sergeant/<work-id>` branch, and `src/runtime/surface.rs`
+has no path binding a surface to a branch it did not mint. The refuter
+attacked both legs and both held, having **empirically tested that git
+refuses two worktrees on one branch** rather than reasoning about it. Severity
+was challenged and defended: reviewing a copy breaks no-mistakes' recovery of
+auto-fix commits onto the shipped branch, yielding "a gate Work that *passes*
+its own copy while the actual shipping branch never received the pipeline's
+fixes." §4.2 narrowed to what holds regardless of mechanism; the binding
+question is now §8.6 and gates §5.1's dispatch.
+
+**The refuted finding is why refuters exist.** `fidelity F2` was struck as
+"style preference dressed as a fidelity defect, **plus a fabricated contract
+citation**" — the critic invented a contract quote to support it. Without an
+adversarial pass that finding would have been adjudicated on a citation that
+does not exist.
+
+**Environmental behavior.** 8 agents (4 critics, 4 refuters), all Sonnet, all
+1 turn of 15, ~1.7k lines of findings evidence. Contract Unknown 3 — whether
+a code gauntlet degrades into style commentary on prose — answered **no**: the
+strongest findings were mechanical facts about the repository (a git
+constraint, a branch-minting code path, six issues' real tracker state). The
+confirm rate (12/13) ran well above M0's 2/3, and the honest reading is not a
+lenient panel — refuters downgraded three severities and struck one finding
+after independent re-verification — but an artifact written in a single pass
+with no prior review, by the same session that then convened the panel. Every
+Work reviewed that day had a `tdd` stage, a `30-review` stage and a shipping
+gate before the orchestrator saw it; the proposal had none. Method note
+carried forward: the three axes whose refuter was given a **specific line of
+attack** produced the unit's only refutation and all three downgrades.
+
+**Carried to the owner, not adjudicated.** §6's sequencing justification
+argues the opposite of what it orders (enactability F1, confirmed): §5.3(a)'s
+environment guarantee is attributed to §5.2, not manufactured by §5.3. The
+halves are separable, but splitting a decision's implementation across two
+Works is a ruling, not a correction.
+
+---
+
 ### WATCH — 2026-08-13, `sgt watch` shipped: proposal → contract → build → gate → pilot, one day
 
 **Mission outcome: contract met, ship gate passed, product pilot PASS.**
