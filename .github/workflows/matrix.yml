@@ -1,0 +1,89 @@
+# The full-suite tier (ADR 0004, D9). ci.yml's per-push tier is cheap by
+# design (Linux fmt/clippy/test + a macOS `cargo check`); this workflow is
+# what actually runs the real test suite on every measured target (ADR 0001,
+# D1) and only on the events where the wall-clock cost is worth paying:
+# PR-to-main, nightly, and a published release. This repo is public, so
+# macOS/Windows runner minutes are free and unmetered (ADR 0004, D9) — the
+# constraint here is wall-clock, and matrix jobs run concurrently, so this
+# tier costs max(job), not sum(job).
+#
+# Targets covered: Linux and macOS, both as real `cargo test` runs. Windows
+# is measured only via WSL2, never natively (ADR 0001, D1) — wiring a WSL2
+# lane needs its own toolchain bootstrap inside the WSL guest and a caching
+# strategy that crosses the WSL/host filesystem boundary (Swatinem/rust-cache
+# runs on the Windows host and cannot see a cache rooted inside the WSL VM),
+# neither of which this change attempts to get right unverified. Left as
+# follow-up scope rather than shipped half-working — see the PR/commit note.
+#
+# Every job publishes ADR 0001's D8 "measured" skip count: the number of
+# `SKIPPED-ENV` probe-gated skips (docs/DEVELOPMENT.md's two-environment
+# rule) a run hit on that host, via `cargo test -- --nocapture` (plain
+# `cargo test` swallows stdout/stderr for passing tests, which is where
+# `SKIPPED-ENV` lines live). This is the count; it does not by itself make a
+# target "measured" under ADR 0001 — that also needs `scripts/probe-env.sh`'s
+# output recorded in `docs/environments/<host>.md`, a documentation step this
+# workflow does not do for the runner's own transient host.
+name: matrix
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    # Nightly, ahead of coverage.yml's weekly Monday 06:17 UTC run so the two
+    # heavy lanes don't contend for the same runner pool.
+    - cron: "30 5 * * *"
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel a superseded PR run's still-queued/running matrix instead of letting
+# it burn its full ~10-60 min wall-clock (2 OSes, cold DuckDB build): wall
+# clock, not runner cost, is this repo's real CI constraint (ADR 0004, D9).
+# Scoped to pull_request only — a scheduled nightly run and a release run
+# must never cancel each other or a concurrent PR run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  full-suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Cold DuckDB C++ build (~500 TUs, ~10 min) plus the real suites; wide
+    # margin on purpose, matching coverage.yml's posture for the same build.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # macOS's plain `bash` here resolves to the system-frozen 3.2.57 (ADR
+      # 0004, D7) — GitHub's macos-latest image does not preinstall a newer
+      # Homebrew bash ahead of it on PATH. `cargo test` includes
+      # tests/m6_surfaces.rs t4, which spawns `scripts/demo.sh` via
+      # `Command::new("bash")`, so this job's test run is what ADR 0004 means
+      # by "a macOS CI job actually running /bin/bash is the real
+      # enforcement" of the scripts/ bash-3.2 floor from #86 — no separate
+      # step needed.
+      - name: cargo test (full suite)
+        run: cargo test -- --nocapture 2>&1 | tee test-output.log
+
+      - name: publish skip count (ADR 0001 D8 measured bar)
+        if: always()
+        run: |
+          # `grep -o` exits 1 on zero matches, which under Actions' default
+          # `bash -eo pipefail` would abort this step on the fully-measured,
+          # all-green case (0 skips) instead of publishing "0 skips" — the
+          # `|| count=0` catches exactly that, and only that, case.
+          count=$(grep -o 'SKIPPED-ENV' test-output.log | wc -l | tr -d ' ') || count=0
+          {
+            echo "## Skip count — ${{ matrix.os }}"
+            echo "$count SKIPPED-ENV probe-gated skips this run (docs/DEVELOPMENT.md's two-environment rule)."
+          } >> "$GITHUB_STEP_SUMMARY"

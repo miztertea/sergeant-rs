@@ -27,11 +27,12 @@ scripts, not bash syntax, and don't count against the bash floor. There is
 exactly **one** bash-4.3+ dependency in the whole tree: `local -n` at
 `scripts/perf/common.sh:56`, a nameref that bash 3.2 does not support —
 this matches the interview's own figure exactly, down to the file and
-line. The interview also decided to wire `shellcheck` into CI: it is
+line. The interview also decided to wire `shellcheck` into CI: it was
 already installed on Cerberus (confirmed present at `/usr/bin/shellcheck`,
-version 0.11.0, on this host) but is currently absent from
-`.github/workflows/` (only `ci.yml` and `coverage.yml` exist there today,
-neither runs shellcheck).
+version 0.11.0, on this host) but at the time of this interview was
+absent from `.github/workflows/` (only `ci.yml` and `coverage.yml`
+existed there then, neither ran shellcheck) — since wired in, see D9's
+consequence below.
 
 **CI shape (D9).** This repo is public, and standard GitHub-hosted
 runners — including macOS and Windows — are free and unmetered for public
@@ -68,26 +69,31 @@ on, not a considered-and-rejected alternative in its own right.
 
 ## Consequences
 
-D7's practical consequence is that `scripts/perf/common.sh:56`'s `local -n`
-site is now a known, named incompatibility with the macOS-shipped bash —
-this ADR does not fix it (scope limits below), only records it as the one
-site that needs attention before a perf script can be measured to work
-under macOS's bash. Wiring `shellcheck` into CI is hygiene on top of that,
+D7's practical consequence was that `scripts/perf/common.sh:56`'s `local -n`
+site was a known, named incompatibility with the macOS-shipped bash — this
+ADR did not fix it itself (scope limits below), only recorded it as the one
+site needing attention before a perf script could be measured to work under
+macOS's bash. It has since been fixed (#86): `perf_mark` now hands its
+result back via `printf -v`, a bash-3.1 builtin, instead of the bash-4.3+
+`local -n` nameref. Wiring `shellcheck` into CI is hygiene on top of that,
 not a version gate in itself: per the interview's own framing, a macOS CI
 job actually running `/bin/bash` is the real enforcement of bash 3.2
 compatibility; `shellcheck` catches shell bugs and portability smells
 independent of that specific version floor.
 
-D9's consequence is that the compensating cross `cargo check` lane named
-in ADR 0002 has a concrete home — the per-push CI job — but is not yet
-implemented; `.github/workflows/ci.yml` today runs only a single
-`ubuntu-latest` job (`fmt`/`clippy`/`test`) with no macOS target check and
-no separate PR-to-main/nightly/release matrix tier. This ADR records the
-decided shape; building it — the macOS `cargo check` lane, the
-PR-to-main/nightly/release matrix tier, and `shellcheck` wiring — is
-separate, not-yet-filed implementation work, not something this ADR does.
+D9's consequence was that the compensating cross `cargo check` lane named
+in ADR 0002 had a concrete home — the per-push CI job — but was not yet
+implemented at the time of this interview: `.github/workflows/ci.yml` then
+ran only a single `ubuntu-latest` job (`fmt`/`clippy`/`test`) with no macOS
+target check and no separate PR-to-main/nightly/release matrix tier. This
+ADR recorded the decided shape; building it was filed and shipped as #87:
+`ci.yml` now also runs a `macos-latest` `cargo check` job and a
+`--severity=error` `shellcheck` job on every push, and `.github/workflows/matrix.yml`
+runs the full `cargo test` suite on Linux and macOS on PR-to-main, nightly,
+and release, publishing each run's ADR 0001 D8 `SKIPPED-ENV` count.
 
 ## Open questions
 
 None identified in the interview record beyond the implementation gap
-already named above as a consequence, not an unresolved decision.
+named above as a consequence — since closed by #86 and #87 — which was
+never an unresolved decision in its own right.
