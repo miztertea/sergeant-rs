@@ -1494,17 +1494,41 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
 /// discoverable repository above it) — the first version of this fix
 /// nested it there and turned every `pending` in this file into `blocked`
 /// by accident.
+/// The environment probe below deliberately does **not** call
+/// `support::disk_backed_tmp_base` to decide what to expect: asking the
+/// function under test where it will land, then asserting it landed there,
+/// is a tautology that passes for any answer it gives — including `None`,
+/// which skips the body entirely. Measured: with `disk_backed_tmp_base`
+/// stubbed to `None`, that shape passes, while the independent probe below
+/// fails as it should. The probe reads the filesystem itself, and the skip
+/// is loud per `docs/DEVELOPMENT.md`'s two-environment rule rather than a
+/// silent early return.
 #[test]
 fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
-    let dir = DataDir::new();
-    if let Some(expected_base) = support::disk_backed_tmp_base() {
-        assert!(
-            dir.path().starts_with(&expected_base),
-            "DataDir::new() must root its TempDir under {expected_base:?} (real disk, \
-             outside any git checkout) by default — got {:?}",
-            dir.path()
+    if std::env::var_os("SGT_TEST_TMPDIR").is_some() {
+        eprintln!(
+            "SKIPPED-ENV: SGT_TEST_TMPDIR is set, so this run is not exercising the \
+             default this test pins — the override path is a different claim"
         );
+        return;
     }
+    let var_tmp = Path::new("/var/tmp");
+    if !var_tmp.is_dir() {
+        eprintln!(
+            "SKIPPED-ENV: /var/tmp is not a directory on this host, so the disk-backed \
+             default cannot be armed here (`disk_backed_tmp_base` falls back by design)"
+        );
+        return;
+    }
+
+    let expected_base = var_tmp.join("sgt-rs-tests");
+    let dir = DataDir::new();
+    assert!(
+        dir.path().starts_with(&expected_base),
+        "DataDir::new() must root its TempDir under {expected_base:?} (real disk, \
+         outside any git checkout) by default — got {:?}",
+        dir.path()
+    );
 }
 
 #[test]
