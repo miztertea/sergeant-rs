@@ -2,9 +2,12 @@
 
 Terms fixed by the 2026-08-14 cross-platform decisions
 (`docs/adr/0001-platform-targets-and-measurement-posture.md` through
-`docs/adr/0004-cross-platform-development-constraints.md`). Definitions
-here are the vocabulary those ADRs use; read the ADR itself for the
-decision and its rationale.
+`docs/adr/0004-cross-platform-development-constraints.md`), and by a
+second, later interview the same day, the "grill-with-docs" round
+(`docs/adr/0005-gating-becomes-a-dispatched-work.md` through
+`docs/adr/0011-delete-the-dashboard.md`). Definitions here are the
+vocabulary those ADRs use; read the ADR itself for the decision and its
+rationale.
 
 **Measured target.** A platform (Linux, macOS, or Windows-via-WSL2 per
 `docs/adr/0001-platform-targets-and-measurement-posture.md`'s D1) that has
@@ -76,3 +79,42 @@ alongside a green run as part of what makes a platform "measured" under
 D8. Without a published count, a fully green run at four measured
 environments could have silently skipped most of what actually exercises
 each one — the count is what keeps "measured" honest.
+
+**Gate Work.** A dispatched Work whose durable outcome is a shipping-gate
+run, per `docs/adr/0005-gating-becomes-a-dispatched-work.md`'s D1. Because
+the gate is itself a Work with its own isolated surface, it is the sole
+owner of the branch it runs against for the duration of the run — the
+same single-owner posture `docs/DEVELOPMENT.md`'s data-dir invariant
+already enforces elsewhere, which is what let the old "an actor inside a
+worktree never invokes the gate" rule dissolve instead of needing an
+exception carved into it. Captain's role narrows to reading a gate Work's
+findings and deciding, not driving the pipeline by hand.
+
+**Harness passthrough.** `sgt <harness> -- <args>` (`sgt claude`,
+`sgt codex`, `sgt opencode`, `sgt goose`), per
+`docs/adr/0006-harness-passthrough.md`'s D2. `sgt` composes the actor
+environment and binds the estate, then **exec**s into the harness process
+— it never forks and supervises it. The exec-not-supervise boundary is
+load-bearing, not incidental: a passthrough that grew a process table, a
+pid file, or a restart policy would be the "reconstructed tmux-era
+supervision" `NORTH-STAR.md`'s "Never" list already rules out. A human
+surface (below), not something a workflow drives.
+
+**Human surface.** A command whose audience is a person sitting at a
+terminal, not an actor executing a Work — `sgt init`, `sgt doctor`, the
+harness passthrough (`sgt claude` and its siblings,
+`docs/adr/0006-harness-passthrough.md`), `sgt tui`, and the bare-`sgt`
+homepage (both `docs/adr/0010-bare-sgt-is-a-homepage.md`'s D6). The
+dashboard (`docs/adr/0011-delete-the-dashboard.md`) was considered and is
+not one of them — the owner's named human surfaces are exactly this list,
+and the dashboard's absence from it is part of why it was deleted rather
+than kept.
+
+**No-spawn set.** The verbs that must never auto-spawn a daemon just to
+observe it, per `docs/adr/0009-auto-spawn-never-on-observation.md`'s D5:
+`sgt doctor`, `sgt watch`, `sgt daemon stop` (ruled first for `watch` by
+`docs/gauntlet/contracts/WATCH.md`'s R-WATCH-3), and now also `status`,
+`work show`/`list`/`transcript`, `analytics`, and the TUI. Auto-spawn
+survives only on verbs that mutate durable state: `run`, `respond`,
+`retry`, `extend`, `cancel`. The principle behind the set, stated first in
+R-WATCH-3: "observation must not materialize the thing observed."
