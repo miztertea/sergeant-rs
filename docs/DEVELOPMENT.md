@@ -40,7 +40,7 @@ A local agent execution daemon (`sgt`): durable Work items run staged workflows 
 - **Work state ≠ process state.** A Claude "session" is a durable conversation identity; the OS process exists per turn. Restart reconciliation (`src/runtime/recovery.rs`) resumes only on unambiguous evidence; ambiguity fails closed into `blocked` with a reason, never a guess.
 - **Adjacent-append crash windows** are this architecture's recurring hazard (LESSONS L6): any path appending two causally-linked events must tolerate the second one missing or write one compound event. Check for this class in review of any journal-touching change.
 
-Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integration tests need the lib target). `src/domain/` = types, `src/runtime/` = journal/projections/engine/recovery/router/analytics/graph, `src/backend/` = the §15 `Backend` trait + claude/fake/docker (docker runs `kind = "execute"` workflow stages; codex is a doc-stub per D6), `src/{api,cli,tui,web,daemon,telemetry,watch}.rs` = surfaces.
+Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integration tests need the lib target). `src/domain/` = types, `src/runtime/` = journal/projections/engine/recovery/router/analytics/graph, `src/backend/` = the §15 `Backend` trait + claude/fake/docker (docker runs `kind = "execute"` workflow stages; codex is a doc-stub per D6), `src/platform/` = the ADR 0002 platform boundary (`#[cfg]`-selected modules, not a trait — disk/data_dir/process facts, each with an UNVERIFIED macOS arm), `src/{api,cli,tui,web,daemon,telemetry,watch}.rs` = surfaces.
 
 ## Testing rules specific to this repo
 
