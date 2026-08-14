@@ -470,6 +470,27 @@ fn footer_line(app: &App) -> Paragraph<'_> {
     ]))
 }
 
+/// Render `text` into a fixed-width fleet column: space-padded if it fits,
+/// truncated with a trailing `…` if it does not.
+///
+/// Padding alone (`{:<width$}`) only ever *adds* space — it never removes it,
+/// so a value longer than `width` overruns into the next column and the
+/// visual gap between them disappears (e.g. a long stage label running into
+/// the backend column). Truncating to `width` keeps every column exactly
+/// `width` cells wide regardless of content, so the next column always
+/// starts where its padding says it should.
+fn column(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len <= width {
+        format!("{text:<width$}")
+    } else if width == 0 {
+        String::new()
+    } else {
+        let head: String = text.chars().take(width - 1).collect();
+        format!("{head}…")
+    }
+}
+
 fn draw_fleet(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered().title(format!("fleet — {} work", app.rows.len()));
     if app.rows.is_empty() {
@@ -484,10 +505,10 @@ fn draw_fleet(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|row| {
             ListItem::new(Line::from(vec![
-                Span::raw(format!("{:<28}", row.id)),
-                Span::styled(format!("{:<12}", row.state), state_style(&row.state)),
-                Span::raw(format!("{:<26}", row.stage)),
-                Span::raw(format!("{:<10}", row.backend)),
+                Span::raw(column(&row.id, 28)),
+                Span::styled(column(&row.state, 12), state_style(&row.state)),
+                Span::raw(column(&row.stage, 26)),
+                Span::raw(column(&row.backend, 10)),
                 Span::raw(row.intent.clone()),
             ]))
         })
@@ -1473,6 +1494,74 @@ mod tests {
 
         // A body with no `works` array at all is an empty fleet, not a panic.
         assert!(fleet_rows(&json!({})).is_empty());
+    }
+
+    /// A stage value that overruns its column's padding is truncated, so the
+    /// backend column still starts exactly where the stage column's width
+    /// says it should — instead of the two columns running together.
+    ///
+    /// Issue #11: `draw_fleet` pads each cell with `format!("{:<N}")`, which
+    /// only ever *adds* space and never removes it, so a stage longer than
+    /// its 26-column width overruns into the backend column and the gap
+    /// between them disappears (`docs/img/tui-fleet.png` shows exactly this:
+    /// `needs_inputfake` with no separator). The existing fleet-row test
+    /// above asserts field *content* via substrings, which cannot see this —
+    /// a substring check passes whether or not the columns are padded to
+    /// width at all. This test instead asserts on column position: it finds
+    /// the fixed-width stage field on the rendered screen and checks the
+    /// backend field starts exactly 26 columns after it, not wherever the
+    /// stage text happened to end.
+    #[test]
+    fn an_overlong_stage_is_truncated_so_the_backend_column_still_starts_on_time() {
+        let mut app = App::new();
+        app.rows = vec![WorkRow {
+            id: "rowid1".to_string(),
+            state: "needs_input".to_string(),
+            // Well past the 26-column stage width.
+            stage: "10-implement 2/2 · running a very long stage label indeed".to_string(),
+            backend: "fake".to_string(),
+            intent: "an intent".to_string(),
+        }];
+
+        let screen = screen_text(&app);
+        let line = screen
+            .lines()
+            .find(|line| line.contains("rowid1"))
+            .expect("the fleet row is on screen");
+
+        let id_start = line.find("rowid1").expect("already checked it's there");
+        let after_id: Vec<char> = line[id_start..].chars().collect();
+        assert!(
+            after_id.len() >= 28 + 12 + 26 + 10,
+            "the row must be wide enough to hold every column: {line}"
+        );
+
+        let stage_field: String = after_id[28 + 12..28 + 12 + 26].iter().collect();
+        let backend_field: String = after_id[28 + 12 + 26..28 + 12 + 26 + 10].iter().collect();
+
+        assert_eq!(
+            stage_field.chars().count(),
+            26,
+            "the stage column is exactly 26 cells wide regardless of content: \
+             {line}"
+        );
+        assert!(
+            stage_field.ends_with('…'),
+            "a stage longer than the column must be truncated with an \
+             ellipsis, not overrun the column: {stage_field:?} in {line}"
+        );
+        assert!(
+            !stage_field.contains("running a very long"),
+            "the full stage text must not survive into the fixed-width \
+             column: {stage_field:?}"
+        );
+        assert!(
+            backend_field.trim_start().starts_with("fake"),
+            "the backend column must start exactly where the stage column's \
+             padding says it should, not wherever the untruncated stage text \
+             happened to end: stage={stage_field:?} backend={backend_field:?} \
+             in {line}"
+        );
     }
 
     /// Liveness is durable state, not a message.
