@@ -483,7 +483,7 @@ struct LaunchConfig {
     permission_args: Vec<String>,
 }
 
-/// What a `/proc` scan can say about a conversation's per-turn process.
+/// What a process scan can say about a conversation's per-turn process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Liveness {
     /// A running process carries this session id in its argv. Positive
@@ -492,13 +492,13 @@ pub enum Liveness {
     /// No running process carries this session id. Positive evidence that no
     /// turn of this conversation is running.
     Dead,
-    /// Liveness cannot be evidenced here (no `/proc`, or it is unreadable).
-    /// §25: the caller fails closed; it never assumes either direction.
+    /// Liveness cannot be evidenced here (this platform has no
+    /// process-listing mechanism, or reading it failed). §25: the caller
+    /// fails closed; it never assumes either direction.
     Unknowable(String),
 }
 
-/// Does this NUL-separated `/proc/<pid>/cmdline` belong to a turn of
-/// `session_id`?
+/// Does this process's argv belong to a turn of `session_id`?
 ///
 /// The rule is deliberately narrow: some argv element must be exactly
 /// `--session-id` or `--resume`, and the *next* element must be exactly the
@@ -510,14 +510,12 @@ pub enum Liveness {
 /// environment does) puts the id in *some* process's argv without any turn
 /// running, and the adapter then reported `NativeState::Running` with the
 /// evidence "pid N carries session id in argv". A quoted string is not a
-/// running turn. Tokenizing also makes the false positive structurally
-/// impossible rather than unlikely: a wrapper's whole command line is one
-/// argv element, so it can never *be* the id, only contain it.
-fn cmdline_names_session(cmdline: &[u8], session_id: &str) -> bool {
-    let mut argv = cmdline
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(String::from_utf8_lossy);
+/// running turn. Taking already-tokenized argv (never a joined command line)
+/// also makes the false positive structurally impossible rather than
+/// unlikely: a wrapper's whole command line is one argv element, so it can
+/// never *be* the id, only contain it.
+fn cmdline_names_session(argv: &[String], session_id: &str) -> bool {
+    let mut argv = argv.iter();
     while let Some(arg) = argv.next() {
         if (arg == "--session-id" || arg == "--resume")
             && argv.next().is_some_and(|value| value == session_id)
@@ -531,19 +529,15 @@ fn cmdline_names_session(cmdline: &[u8], session_id: &str) -> bool {
 /// Is a per-turn `claude` process for `session_id` still running?
 ///
 /// Every turn this adapter launches names its session in its own argv
-/// (`--session-id <uuid>` first, `--resume <uuid>` after), so scanning
-/// `/proc/<pid>/cmdline` for *that argv shape* is evidence about **this
-/// conversation** rather than about a pid — which matters precisely in the
-/// case that needs it: after a restart, when no in-memory record survives and
-/// a recorded pid (if anything had recorded one) could since have been
-/// recycled. What is matched is the flag-and-value pair
-/// ([`cmdline_names_session`]), not the id as a substring: the evidence this
-/// function returns is quoted verbatim into an execution-state claim, so it
-/// has to be about an execution.
-///
-/// Linux-only by construction. Elsewhere the answer is `Unknowable`, not a
-/// guess: an adapter that reported "exited" from the absence of a mechanism
-/// it does not have would be inventing execution state.
+/// (`--session-id <uuid>` first, `--resume <uuid>` after), so scanning every
+/// running process's argv for *that shape* ([`platform::process`]) is
+/// evidence about **this conversation** rather than about a pid — which
+/// matters precisely in the case that needs it: after a restart, when no
+/// in-memory record survives and a recorded pid (if anything had recorded
+/// one) could since have been recycled. What is matched is the
+/// flag-and-value pair ([`cmdline_names_session`]), not the id as a
+/// substring: the evidence this function returns is quoted verbatim into an
+/// execution-state claim, so it has to be about an execution.
 pub fn session_liveness(session_id: &str) -> Liveness {
     session_liveness_excluding(session_id, std::process::id())
 }
@@ -557,33 +551,36 @@ pub fn session_liveness(session_id: &str) -> Liveness {
 /// — excluding a bystander pid finds it, excluding the stand-in's own pid
 /// does not — which is the only way to pin a rule about "self" from outside.
 pub fn session_liveness_excluding(session_id: &str, skip_pid: u32) -> Liveness {
-    if !cfg!(target_os = "linux") {
+    session_liveness_among(
+        session_id,
+        skip_pid,
+        crate::platform::process::running_processes(),
+    )
+}
+
+/// [`session_liveness_excluding`]'s decision logic, taking the process scan
+/// as a parameter (ADR 0002 D3) instead of gathering it itself. Whatever
+/// platform gathered `processes` — or failed to, the `None` arm — this
+/// function's own behavior is identical and testable from any host: it is
+/// what proves the `Unknowable` fail-closed path a platform without any
+/// listing mechanism would take, without needing that platform to run it on.
+fn session_liveness_among(
+    session_id: &str,
+    skip_pid: u32,
+    processes: Option<Vec<crate::platform::process::ProcessArgv>>,
+) -> Liveness {
+    let Some(processes) = processes else {
         return Liveness::Unknowable(
-            "process liveness needs /proc; this platform has none".to_string(),
+            "process liveness needs a process-listing mechanism; none is available here"
+                .to_string(),
         );
-    }
-    let entries = match std::fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(e) => return Liveness::Unknowable(format!("/proc is unreadable: {e}")),
     };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == skip_pid {
+    for process in processes {
+        if process.pid == skip_pid {
             continue;
         }
-        // A vanished process between readdir and read is not evidence of
-        // anything; skip it. cmdline is NUL-separated argv.
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if cmdline_names_session(&cmdline, session_id) {
-            return Liveness::Alive(pid);
+        if cmdline_names_session(&process.argv, session_id) {
+            return Liveness::Alive(process.pid);
         }
     }
     Liveness::Dead
@@ -2602,7 +2599,7 @@ mod tests {
     #[test]
     fn liveness_matches_turn_argv_and_not_a_quoted_session_id() {
         let session = "11111111-2222-4333-8444-555555555555";
-        let argv = |args: &[&str]| args.join("\0").into_bytes();
+        let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
 
         for turn in [
             argv(&[
@@ -2620,8 +2617,7 @@ mod tests {
         ] {
             assert!(
                 cmdline_names_session(&turn, session),
-                "a real turn's argv must match: {:?}",
-                String::from_utf8_lossy(&turn)
+                "a real turn's argv must match: {turn:?}"
             );
         }
 
@@ -2644,10 +2640,49 @@ mod tests {
         ] {
             assert!(
                 !cmdline_names_session(&bystander, session),
-                "a quoted id is not a running turn: {:?}",
-                String::from_utf8_lossy(&bystander)
+                "a quoted id is not a running turn: {bystander:?}"
             );
         }
+    }
+
+    /// [`session_liveness_among`]'s own decision logic, injected-probe
+    /// tested per ADR 0002 D3: the `None` arm is the fail-closed path a
+    /// platform with no process-listing mechanism takes, exercised here
+    /// without needing such a platform to run it on.
+    #[test]
+    fn session_liveness_among_is_unknowable_with_no_process_listing() {
+        assert_eq!(
+            session_liveness_among("s", 0, None),
+            Liveness::Unknowable(
+                "process liveness needs a process-listing mechanism; none is available here"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn session_liveness_among_skips_the_excluded_pid() {
+        use crate::platform::process::ProcessArgv;
+        let session = "11111111-2222-4333-8444-555555555555";
+        let turn = ProcessArgv {
+            pid: 42,
+            argv: vec![
+                "claude".to_string(),
+                "-p".to_string(),
+                "--session-id".to_string(),
+                session.to_string(),
+            ],
+        };
+        assert_eq!(
+            session_liveness_among(session, 42, Some(vec![turn.clone()])),
+            Liveness::Dead,
+            "the excluded pid is not evidence about anyone else"
+        );
+        assert_eq!(
+            session_liveness_among(session, 0, Some(vec![turn])),
+            Liveness::Alive(42),
+            "an unexcluded pid whose argv matches is evidence of life"
+        );
     }
 
     /// `truncate` cuts on character boundaries. The inputs are CLI stderr and

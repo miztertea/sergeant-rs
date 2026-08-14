@@ -394,11 +394,15 @@ pub fn main() -> ExitCode {
 /// R-MVP1-12: filesystem-first, crossing git boundaries, bounded at `$HOME`.
 /// When one is found, the default is `<estate_root>/.sergeant/data` — the
 /// same path `sgt init` scaffolds a `.gitignore` entry for
-/// ([`crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR`]). This is a new
-/// fallback *rung*, not a replacement: only once no estate is found (or the
-/// current directory cannot even be read) does resolution fall through to
-/// the pre-estate default, `$XDG_DATA_HOME/sergeant` or
-/// `~/.local/share/sergeant`, unchanged.
+/// ([`crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR`]). This precedence —
+/// whether estate discovery should even come before the pre-estate fallback
+/// — is an owner ruling tracked separately in #80 and is not decided here.
+/// This is a new fallback *rung*, not a replacement: only once no estate is
+/// found (or the current directory cannot even be read) does resolution fall
+/// through to the pre-estate default, which is a platform fact
+/// ([`crate::platform::data_dir`], #82) — `$XDG_DATA_HOME/sergeant` or
+/// `~/.local/share/sergeant` on Linux, unchanged from before that boundary
+/// existed.
 fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
     if let Some(dir) = flag {
         return Ok(dir);
@@ -411,15 +415,7 @@ fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
     {
         return Ok(estate_root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR));
     }
-    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(xdg).join("sergeant"));
-    }
-    match std::env::var_os("HOME") {
-        Some(home) => Ok(PathBuf::from(home).join(".local/share/sergeant")),
-        None => Err(CliError::new(
-            "cannot resolve data dir: set --data-dir, SGT_DATA_DIR, or HOME",
-        )),
-    }
+    crate::platform::data_dir::fallback_dir(|name| std::env::var_os(name)).map_err(CliError::new)
 }
 
 async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
