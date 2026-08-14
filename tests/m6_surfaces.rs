@@ -1177,8 +1177,12 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         vec![
             "git",
             "claude",
-            "docker",
+            // #67: data_dir is checked before docker — the docker adapter's
+            // blob store and disk_pressure's `df` call both live inside the
+            // data dir, so this check runs first and both defer to it by
+            // name when it fails rather than re-diagnosing the same fault.
             "data_dir",
+            "docker",
             "journal",
             "projection",
             "daemon",
@@ -1728,6 +1732,122 @@ fn t3e_doctor_estate_check_names_file_and_line_on_a_malformed_manifest() {
     assert!(
         detail.to_lowercase().contains("line"),
         "the parse error must carry a line number, not just \"invalid\": {detail}"
+    );
+}
+
+/// #67: an unwritable *parent* of the data dir used to produce two
+/// confusing, apparently-independent downstream symptoms — `docker` failing
+/// to open its blob store under the data dir (EPERM) and `disk_pressure`'s
+/// `df` call failing because the data dir never got created (ENOENT,
+/// misreported as "could not be measured on this platform", which isn't
+/// even true — the platform can measure free space fine). Both are the same
+/// root cause. This drives `sgt doctor` against a data dir whose parent is
+/// stripped of write permission and requires that fault collapse into one
+/// `data_dir` FAIL row naming the actual offending parent directory, with
+/// `docker` and `disk_pressure` declining rather than re-diagnosing it under
+/// their own, more confusing names.
+///
+/// guard-map: reverting the fix restores the old check order (`docker`
+/// before `data_dir`) and the un-consolidated `docker`/`disk_pressure`
+/// bodies — this fails on the reverted code because `data_dir`'s detail
+/// never names the parent directory and `docker`/`disk_pressure` print
+/// their own confusing messages instead of deferring.
+#[test]
+fn t3f_doctor_names_an_unwritable_parent_as_one_remedy_row() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+
+    let parent = TempDir::new().expect("tempdir");
+    // The data dir itself must not exist yet — `create_dir_all` has to walk
+    // up past it and find this unwritable directory stalling the walk.
+    let data_dir = parent.path().join("child").join("data");
+
+    std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("chmod parent read+exec only");
+    struct RestorePerms(PathBuf);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestorePerms(parent.path().to_path_buf());
+
+    // Environment probe (docs/DEVELOPMENT.md's testing rules): the root dev
+    // container silently ignores permission-bit restrictions, so this
+    // fixture cannot be armed there — skip loudly rather than assert
+    // something that cannot hold in that environment.
+    if std::fs::create_dir(parent.path().join("probe")).is_ok() {
+        eprintln!(
+            "SKIPPED-ENV: permission bits are not enforced on this host (root container \
+             shape) — the unwritable-parent fault cannot be armed here"
+        );
+        return;
+    }
+
+    let (code, stdout, _) = doctor(
+        &data_dir,
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
+    assert_ne!(
+        code,
+        Some(0),
+        "an unwritable parent must exit nonzero:\n{stdout}"
+    );
+
+    let (_, json, _) = doctor(
+        &data_dir,
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+
+    let parent_str = parent.path().display().to_string();
+
+    let data_dir_check = named_check(&report, "data_dir");
+    assert_eq!(data_dir_check["status"], "fail", "{data_dir_check}");
+    let detail = data_dir_check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains(&parent_str),
+        "the data_dir check must name the actual offending parent directory, not just the \
+         data dir it could not create: {detail}"
+    );
+    let remedy = data_dir_check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains(&parent_str),
+        "the remedy must point at the parent directory to fix, not a generic instruction: \
+         {remedy}"
+    );
+
+    // The two downstream co-failures decline instead of re-diagnosing the
+    // same fault under their own, more confusing names.
+    let docker_check = named_check(&report, "docker");
+    assert_ne!(
+        docker_check["status"], "ok",
+        "docker cannot succeed when the data dir it opens a blob store under does not exist: \
+         {docker_check}"
+    );
+    assert!(
+        !docker_check["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not initialize the Docker adapter"),
+        "docker must defer to the data_dir check above rather than re-diagnosing the same \
+         EPERM under its own name: {docker_check}"
+    );
+
+    let disk_pressure_check = named_check(&report, "disk_pressure");
+    assert_ne!(disk_pressure_check["status"], "ok", "{disk_pressure_check}");
+    assert!(
+        !disk_pressure_check["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be measured on this platform"),
+        "disk_pressure must not claim the platform can't measure free space when the real \
+         cause is the parent directory data_dir already named: {disk_pressure_check}"
     );
 }
 
