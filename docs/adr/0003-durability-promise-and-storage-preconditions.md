@@ -32,20 +32,25 @@ therefore not "does the daemon survive" — nothing is supposed to guarantee
 that — but "after an abrupt daemon death, does work actually resume, or
 does it land in `blocked`?"
 
-That probe surfaces a known degradation on macOS today, and it must be
-recorded rather than left implicit: restart reconciliation gathers its
-liveness evidence from `/proc` (`src/backend/claude.rs`'s
-`session_liveness_excluding`, `src/backend/claude.rs:559-568` — "Linux-only
-by construction. Elsewhere the answer is `Unknowable`, not a guess"). With
-no `/proc` on macOS, every liveness check returns `Liveness::Unknowable`,
-and per the fail-closed contract restart reconciliation already applies
-("ambiguous states fail closed to blocked with evidence",
-`src/runtime/recovery.rs:76-77`), every *ambiguous* restart on macOS fails
-closed into `blocked` rather than resuming. This is tracked as **issue
-#18** — confirmed live in this repo as "/proc portability" (`GAUNTLET.md`
-line 1787, "P0 close-out... /proc portability #18"; `docs/gauntlet/contracts/N0.md`,
-"R-N0-5 — #18 (/proc portability): deferred to N5"). It is a real,
-already-known gap this ADR does not fix, only records.
+That probe surfaced a known degradation on macOS at the time of this
+interview: restart reconciliation gathered its liveness evidence from
+`/proc` alone (`src/backend/claude.rs`'s `session_liveness_excluding`), and
+with no `/proc` on macOS, every liveness check returned
+`Liveness::Unknowable`, so per the fail-closed contract restart
+reconciliation already applies ("ambiguous states fail closed to blocked
+with evidence", `src/runtime/recovery.rs:76-77`), every *ambiguous* restart
+on macOS failed closed into `blocked` rather than resuming. ADR 0002 has
+since moved this fact behind the platform boundary
+(`crate::platform::process::running_processes`,
+`session_liveness_excluding` at `src/backend/claude.rs:553-559`) and added a
+`ps`-based macOS arm, so a macOS restart is no longer *unconditionally*
+`Unknowable` — but that arm is marked **UNVERIFIED** (never run on a real
+macOS host), so the gap this paragraph records is narrowed, not closed.
+This is tracked as **issue #18** — confirmed live in this repo as "/proc
+portability" (`GAUNTLET.md` line 1787, "P0 close-out... /proc portability
+#18"; `docs/gauntlet/contracts/N0.md`, "R-N0-5 — #18 (/proc portability):
+deferred to N5"). It remains open until measured on a real macOS host, per
+ADR 0002's own UNVERIFIED marking.
 
 The interview record also corrects itself explicitly here: an earlier
 framing offered by the orchestrating session during the interview, that a
@@ -96,8 +101,9 @@ D5 is mostly a clarifying, non-code decision, but it fixes what "measured"
 in ADR 0001 has to actually mean for durability: a host isn't measured
 durable by observing that the daemon didn't crash, it's measured durable
 by observing that a killed daemon's work actually resumes. The known
-macOS `/proc`-liveness gap (#18) is a real, already-tracked cost of that
-standard, not a new one introduced here.
+macOS liveness gap (#18) — narrowed by ADR 0002's UNVERIFIED `ps`-based arm
+but not yet measured on a real host — is a real, already-tracked cost of
+that standard, not a new one introduced here.
 
 D6 implies work that **does not exist yet** in this codebase — there is no
 current check for advisory-locking-unreliable filesystems in `sgt init` or
