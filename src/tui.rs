@@ -439,7 +439,10 @@ fn field(value: &Value, key: &str) -> String {
 fn state_style(state: &str) -> Style {
     let color = match state {
         "completed" => Color::Green,
-        "needs_input" | "waiting" => Color::Yellow,
+        // ADR 0007(b): a stranded completion is terminal, not a plain
+        // success — group it with the other "needs a look" states rather
+        // than the default Cyan bucket ordinary in-flight work falls into.
+        "needs_input" | "waiting" | "completed_dirty" => Color::Yellow,
         "failed" | "blocked" | "canceled" => Color::Red,
         _ => Color::Cyan,
     };
@@ -1620,6 +1623,25 @@ mod tests {
             state_style("active").fg,
             Some(Color::Cyan),
             "and anything still in flight is not"
+        );
+    }
+
+    #[test]
+    fn adr_0007b_completed_dirty_is_not_painted_like_ordinary_in_flight_work() {
+        // Review of the first cut found `completed_dirty` fell through to
+        // the default arm and was painted the same Cyan as ordinary
+        // in-flight work — indistinguishable from a run still running, in
+        // the one place an operator scans a whole fleet at a glance.
+        assert_eq!(
+            state_style("completed_dirty").fg,
+            Some(Color::Yellow),
+            "a stranded completion needs a second look, so it belongs with \
+             needs_input/waiting, not the default Cyan in-flight bucket"
+        );
+        assert_ne!(
+            state_style("completed_dirty").fg,
+            state_style("active").fg,
+            "must be visually distinct from ordinary in-flight work"
         );
     }
 

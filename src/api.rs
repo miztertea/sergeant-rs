@@ -1459,6 +1459,54 @@ fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
     }
 }
 
+/// ADR 0007(b): a closing stage that declares a commit as its durable
+/// outcome must not be reported as plain `completed` when the branch never
+/// advanced and the worktree was left dirty — the safety net for when an
+/// actor guesses wrong about its own runtime model anyway
+/// (`docs/adr/0007-actor-runtime-contract.md`). The engine still learns
+/// nothing about what a commit *is* (NORTH-STAR: "the engine learns no
+/// output vocabulary; only the pointer is core"): this reads two facts the
+/// pointer already computes — a binding's teardown disposition, and whether
+/// its finalize commit ever moved past the surface's own base SHA — rather
+/// than asking any workflow what it meant to do.
+fn stranded_completion(work: &Work, run: &WorkRun) -> bool {
+    if work.state != WorkState::Completed {
+        return false;
+    }
+    let Some(teardown) = run.teardown.as_ref() else {
+        return false;
+    };
+    let Some(surface) = run.surface.as_ref() else {
+        return false;
+    };
+    teardown.bindings.iter().any(|binding| {
+        let never_advanced = surface
+            .bindings
+            .iter()
+            .find(|b| b.repository == binding.repository)
+            .is_some_and(|b| binding.final_sha.as_deref() == Some(b.base_sha.as_str()));
+        never_advanced
+            && matches!(
+                binding.disposition,
+                BindingDisposition::RetainedDirty { .. }
+            )
+    })
+}
+
+/// The `state` `work list`/`work show` report: verbatim for every ordinary
+/// case, but not plain `completed` when [`stranded_completion`] holds. The
+/// persisted [`WorkState`] this is derived from is untouched — the run is
+/// genuinely terminal, neither blocked nor failed — so retry, cancel, and
+/// every other state-machine consumer still see `Completed`; only the
+/// string an operator reads first changes.
+fn reported_state(work: &Work, run: Option<&WorkRun>) -> &'static str {
+    if run.is_some_and(|r| stranded_completion(work, r)) {
+        "completed_dirty"
+    } else {
+        work.state.as_str()
+    }
+}
+
 /// The full view of a work: the §10 record, plus the orthogonal run
 /// coordinates the M3 contract asks `work show` to include — current stage,
 /// surface, and execution state. They are siblings of `work`, not fields
@@ -1469,8 +1517,19 @@ fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
     let work = registry.works.get(work_id);
     let cached_run = registry.run_view(work_id);
     let run = work.and_then(|w| resolve_run(core, w, cached_run));
+    // ADR 0007(b): the persisted `Work` serializes with its true `state`
+    // (`Completed`) intact; only this view's own `state` key is overridden,
+    // so a work still in flight and every non-stranded completion look
+    // exactly as before.
+    let work_json = work.map(|w| {
+        let mut value = serde_json::to_value(w).unwrap_or(Value::Null);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("state".to_string(), json!(reported_state(w, run.as_ref())));
+        }
+        value
+    });
     json!({
-        "work": work,
+        "work": work_json,
         "stage": run.as_ref().and_then(run_stage_view),
         "surface": run.as_ref().and_then(|r| r.surface.clone()),
         "execution": run.as_ref().and_then(|r| r.execution.clone()),
@@ -1545,16 +1604,34 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
         .works
         .values()
         .map(|work| {
-            let run = registry.run_view(&work.id);
+                // `registry.run_view` alone only reaches the bounded
+                // in-memory cache (`TERMINAL_RUN_CACHE_CAPACITY`); once a
+                // terminal run ages out of it, `resolve_run`'s journal-
+                // replay fallback is what `work_view` already relies on to
+                // keep `sgt work show` correct for the identical work. This
+                // row must use the same fallback, or an evicted work's
+                // `state` here would silently fall back to plain
+                // `completed` (ADR 0007(b)) while `work show` still says
+                // `completed_dirty` for it.
+            let run = resolve_run(core, work, registry.run_view(&work.id));
             let mut row = serde_json::to_value(work).unwrap_or(Value::Null);
             if let Some(object) = row.as_object_mut() {
+                // ADR 0007(b): `sgt work list` is where an operator looks
+                // first, and its plain `state` column must not read
+                // `completed` for a closing stage that never actually
+                // advanced the branch and left the worktree dirty.
+                object.insert(
+                    "state".to_string(),
+                    json!(reported_state(work, run.as_ref())),
+                );
                 object.insert(
                     "stage".to_string(),
-                    run.and_then(run_stage_view).unwrap_or(Value::Null),
+                    run.as_ref().and_then(run_stage_view).unwrap_or(Value::Null),
                 );
                 object.insert(
                     "resolved_backend".to_string(),
-                    run.and_then(|r| r.backend.clone())
+                    run.as_ref()
+                        .and_then(|r| r.backend.clone())
                         .map_or(Value::Null, Value::String),
                 );
                 // MVP-3's envelope-visibility item, folded onto the fleet
@@ -1563,7 +1640,7 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
                 // turns-spent/cap/ceiling `sgt work show` does, no second
                 // request per work required.
                 let default_run = WorkRun::default();
-                let run_ref = run.unwrap_or(&default_run);
+                let run_ref = run.as_ref().unwrap_or(&default_run);
                 object.insert(
                     "envelope".to_string(),
                     json!({
@@ -4156,6 +4233,139 @@ mod tests {
         assert_eq!(
             decode_partial_assistant_text(archive.as_bytes()),
             "first second"
+        );
+    }
+
+    /// ADR 0007(b) hardening found in review of the feature's first cut:
+    /// `fleet_body` originally read a work's run straight out of
+    /// `registry.run_view`'s *bounded* terminal-run cache, with no fallback
+    /// once an entry aged out — the exact silent-revert gap `work_view`'s
+    /// own `resolve_run` call already closes for `sgt work show`. Left
+    /// unfixed, `sgt work list` would report plain `completed` for a
+    /// stranded completion the moment its run fell out of the cache, while
+    /// `sgt work show` for the identical id still said `completed_dirty`.
+    ///
+    /// Cheap at the unit level, the same way `projection.rs`'s own
+    /// `the_terminal_run_cache_itself_stays_bounded_under_churn_beyond_its_
+    /// capacity` is: journal commits directly against a bare `Core`, no
+    /// HTTP, no daemon.
+    #[test]
+    fn a_stranded_completion_survives_terminal_run_cache_eviction() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn stranded_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": false,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "retained_dirty",
+                    "changes": " M half-done.rs",
+                    // Never advanced past the base SHA `surface` recorded.
+                    "final_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn ordinary_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": true,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "removed",
+                }],
+            }})
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        let stranded_id = "01STRANDED0000000001";
+        testing::submit(&mut core, stranded_id, "declares a commit, never makes one");
+        testing::commit(
+            &mut core,
+            stranded_id,
+            KIND_SURFACE_MATERIALIZED,
+            surface(stranded_id),
+        );
+        testing::commit(&mut core, stranded_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            stranded_id,
+            KIND_SURFACE_TORN_DOWN,
+            stranded_teardown(stranded_id),
+        );
+
+        // Churn ordinary completions past the terminal-run cache's own bound
+        // (`projection.rs`'s `TERMINAL_RUN_CACHE_CAPACITY`, 512) so the
+        // stranded work above — submitted first, so it is the oldest —
+        // actually ages out of it.
+        for i in 0..600 {
+            let id = format!("01CACHECHURN{i:06}");
+            testing::submit(&mut core, &id, "cache churn");
+            testing::commit(&mut core, &id, KIND_SURFACE_MATERIALIZED, surface(&id));
+            testing::commit(&mut core, &id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &id,
+                KIND_SURFACE_TORN_DOWN,
+                ordinary_teardown(&id),
+            );
+        }
+
+        assert!(
+            core.registry.state().run_view(stranded_id).is_none(),
+            "the stranded work's run must actually have aged out of the \
+             bounded cache for this test to prove anything"
+        );
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        // `fleet_body` is what `sgt work list` actually serves. Before this
+        // fix it read the run straight out of the bounded cache and had no
+        // fallback once an entry aged out, so it would silently report
+        // plain `completed` here — exactly what `sgt work show` (`work_view`,
+        // via `resolve_run`) never does for the same work.
+        let fleet = fleet_body(&core, &engine);
+        let row = fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .find(|w| w["id"] == stranded_id)
+            .expect("the evicted work is still listed");
+        assert_eq!(
+            row["state"], "completed_dirty",
+            "an evicted stranded completion must not silently revert to plain \
+             completed in `sgt work list` just because its run cache entry \
+             aged out: {row}"
         );
     }
 }

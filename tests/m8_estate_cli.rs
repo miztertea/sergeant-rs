@@ -779,6 +779,147 @@ fn no_estate_anywhere_falls_back_to_the_pre_estate_default_unchanged() {
     assert_eq!(reported, xdg.join("sergeant"));
 }
 
+/// Append `data_dir = "<value>"` to the `[estate]` table `sgt init` already
+/// scaffolded — a direct manifest edit (mirroring how the domain-level
+/// `surfaces_dir` tests write TOML by hand) rather than going through a CLI
+/// verb, since `sgt init` itself has no flag for this key.
+fn declare_manifest_data_dir(root: &Path, value: &str) {
+    let manifest_path = root.join("sergeant.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).expect("read manifest");
+    assert!(
+        manifest.contains("[estate]"),
+        "expected an already-scaffolded [estate] table, got:\n{manifest}"
+    );
+    let updated = manifest.replacen(
+        "[estate]\n",
+        &format!("[estate]\ndata_dir = {value:?}\n"),
+        1,
+    );
+    std::fs::write(&manifest_path, updated).expect("write manifest");
+}
+
+/// guard-map (ADR 0008(b)): with no `--data-dir`/`SGT_DATA_DIR`, a manifest
+/// declaring `[estate] data_dir` is honored instead of the hardcoded
+/// `<estate_root>/.sergeant/data` default — the whole point of the ADR
+/// (the manifest is authority for repos, groups, profiles and
+/// `surfaces_dir`; this closes the same-shaped gap for its own state).
+/// Mutation this kills: `resolve_data_dir` finding the estate and still
+/// hardcoding `DEFAULT_ESTATE_DATA_DIR` regardless of what the manifest
+/// says — reverting the `cli.rs` change alone (leaving the domain parsing in
+/// place) reproduces exactly that and fails this test.
+#[test]
+fn manifest_data_dir_overrides_the_estate_local_default() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+    declare_manifest_data_dir(estate.path(), "custom-durable-state");
+
+    let expected = std::fs::canonicalize(estate.path())
+        .expect("canonical estate root")
+        .join("custom-durable-state");
+
+    let result = run(estate.path(), None, &[], &["--json", "doctor"]);
+    let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
+    let reported = std::fs::canonicalize(&reported).unwrap_or(reported);
+    assert_eq!(
+        reported, expected,
+        "a manifest-declared data_dir must be honored, not the hardcoded .sergeant/data default"
+    );
+}
+
+/// guard-map (ADR 0008(b), §8.7's open precedence question, resolved here):
+/// `SGT_DATA_DIR` still outranks a manifest-declared `data_dir` — the
+/// recommendation this Work is making, not an owner ruling (see the
+/// commit/PR summary for the argument and its counterargument). Pinned so a
+/// future change cannot silently flip which one wins without this test
+/// naming the flip. Mutation this kills: reordering `resolve_data_dir` so
+/// the estate walk (and the manifest `data_dir` it may carry) is consulted
+/// before `SGT_DATA_DIR`.
+#[test]
+fn sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+    declare_manifest_data_dir(estate.path(), "manifest-declared-data-dir");
+
+    let explicit_env = estate.path().join("explicit-env-dir");
+    let result = run(
+        estate.path(),
+        None,
+        &[("SGT_DATA_DIR", explicit_env.to_str().expect("utf8"))],
+        &["--json", "doctor"],
+    );
+    let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
+    assert_eq!(
+        std::fs::canonicalize(&reported).unwrap_or(reported),
+        std::fs::canonicalize(&explicit_env).unwrap_or(explicit_env),
+        "SGT_DATA_DIR must still win over a manifest-declared data_dir"
+    );
+}
+
+/// guard-map (regression): `resolve_data_dir` runs at the top of every
+/// `dispatch`, ahead of every command including `sgt doctor` — whose entire
+/// job is diagnosing a broken installation, up to and including a broken
+/// manifest. Finding a manifest's `data_dir` must not itself demand the
+/// rest of the manifest — here, two profiles sharing a name, a defect
+/// `sgt doctor` has nothing to do with — be structurally valid, or `doctor`
+/// could never run against the one manifest it most needs to. Mutation this
+/// kills: resolving `data_dir` via the full structural validator (duplicate
+/// repos/profiles, invalid permission modes, unknown group members all
+/// refuse) instead of a lookup scoped to `data_dir` alone — that would make
+/// `doctor` (and every other command) crash before ever running, on stderr,
+/// instead of producing its own JSON report.
+#[test]
+fn a_structurally_broken_manifest_does_not_stop_doctor_from_running() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+    declare_manifest_data_dir(estate.path(), "custom-durable-state");
+    let manifest_path = estate.path().join("sergeant.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).expect("read manifest");
+    manifest.push_str(
+        "\n[[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
+         [[profile]]\nname = \"same\"\nbackend = \"fake\"\n",
+    );
+    std::fs::write(&manifest_path, manifest).expect("write manifest");
+
+    let result = run(estate.path(), None, &[], &["--json", "doctor"]);
+    // `json()` itself asserts stdout parses as JSON — a pre-doctor crash on
+    // the duplicate profile would instead put a plain error string on
+    // stderr and leave stdout empty. Reaching doctor's own report (whatever
+    // its `healthy` verdict, which depends on the unrelated claude/docker
+    // harness rows) is the thing under test, so only structure is checked.
+    let report = result.json();
+    assert!(
+        report["checks"].is_array(),
+        "doctor must still produce its own report: {report}"
+    );
+    let expected_data_dir = std::fs::canonicalize(estate.path())
+        .expect("canonical estate root")
+        .join("custom-durable-state");
+    let reported = PathBuf::from(report["data_dir"].as_str().expect("data_dir"));
+    assert_eq!(
+        std::fs::canonicalize(&reported).unwrap_or(reported),
+        expected_data_dir,
+        "the manifest's data_dir must still be honored despite the unrelated profile defect"
+    );
+}
+
 // -------------------------------------------- work transcript / output pointer
 
 /// A minimal two-stage workflow — the same shape `m5_projections.rs` uses —

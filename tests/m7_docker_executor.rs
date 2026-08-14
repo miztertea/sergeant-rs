@@ -1426,7 +1426,17 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
             .json()
             .await
             .expect("json");
-        if polled["work"]["state"] == "completed" || polled["work"]["state"] == "blocked" {
+        // ADR 0007(b): this test's "20-close" stage is a bare fake actor
+        // that signals completion without ever running `git commit` — it
+        // exists to prove the execute stage's artifact reaches a following
+        // actor through the worktree, not to exercise a real closing
+        // stage's commit procedure. So the branch never advances and the
+        // container's `validated.txt` is left dirty, and the honest label
+        // for that is `completed_dirty`, not plain `completed`.
+        if polled["work"]["state"] == "completed"
+            || polled["work"]["state"] == "completed_dirty"
+            || polled["work"]["state"] == "blocked"
+        {
             last = polled;
             break;
         }
@@ -1438,8 +1448,10 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
     }
 
     assert_eq!(
-        last["work"]["state"], "completed",
-        "the mixed workflow must complete end to end: {last}"
+        last["work"]["state"], "completed_dirty",
+        "the mixed workflow completes end to end, but its stub closing stage \
+         never commits the execute stage's artifact, so it must not be \
+         reported as plain success (ADR 0007(b)): {last}"
     );
 
     // §12: sergeant never interprets the container's output — but the

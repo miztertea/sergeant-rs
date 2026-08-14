@@ -165,6 +165,27 @@ pub const CLAUDE_BIN_ENV: &str = "SGT_CLAUDE_BIN";
 /// (measured on 2.1.226 — see [`actor_question`]).
 pub const POST_TURN_SUMMARY_SUBTYPE: &str = "post_turn_summary";
 
+/// ADR 0007(a): the execution-model half of the actor runtime contract.
+/// Stated here, at the same composition step that builds the stage's first
+/// turn (`ClaudeAdapter::launch`), alongside — but never asserting — the
+/// environment guarantee ADR 0006 will eventually compose at this same
+/// seam; that half does not exist yet (#60) and is out of scope here.
+///
+/// This is *why* #94 happened twice on 2026-08-14: a headless `claude -p`
+/// turn is one process that runs to completion and exits. There is no
+/// notification, callback, or wakeup when something it backgrounded finishes
+/// after the turn ends — the actor considered exactly that mechanism,
+/// correctly ruled it inapplicable, and then acted as though it existed
+/// anyway, because nothing had ever told it otherwise. Composed into every
+/// stage's first turn rather than left to a dispatch brief to restate.
+pub const EXECUTION_MODEL_CONTRACT: &str = "\
+Execution model: this is a headless turn. You get one turn and no callbacks \
+— nothing wakes you when a command you backgrounded finishes after you end \
+your turn. If a command might take a while, run it in the foreground with \
+an adequate timeout and wait for it to finish before ending your turn. Do \
+not background a long-running command and end your turn expecting a \
+notification to resume you; none will come.";
+
 /// The actor's question from one `post_turn_summary` line, when it asked one.
 ///
 /// **Measured, 2.1.226** (`docs/gauntlet/notes/n3-claude-ask-measurement.md`),
@@ -1588,9 +1609,15 @@ impl Backend for ClaudeBackend {
                 },
             );
         }
-        // §12: procedure is data — intent plus the stage's CONTEXT.md,
-        // verbatim, uninterpreted.
-        let prompt = format!("{}\n\n{}", request.intent, request.context);
+        // ADR 0007(a) precedes both: sergeant's own execution-model
+        // statement, not stage content, so it is never subject to §12's
+        // "verbatim, uninterpreted" rule the way intent and CONTEXT.md are.
+        // §12 itself: procedure is data — intent plus the stage's
+        // CONTEXT.md, verbatim, uninterpreted.
+        let prompt = format!(
+            "{EXECUTION_MODEL_CONTRACT}\n\n{}\n\n{}",
+            request.intent, request.context
+        );
         if let Err(e) = self.spawn_turn(&request.execution_id, prompt) {
             // A failed launch must not leave a phantom execution that
             // OBSERVE would misread as an interrupted-but-resumable turn.
