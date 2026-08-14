@@ -4155,6 +4155,7 @@ mod tests {
                 profiles: Vec::new(),
                 config_path: None,
                 surfaces_dir: None,
+                data_dir: None,
                 repository_policy: std::collections::BTreeMap::new(),
                 groups: std::collections::BTreeMap::new(),
                 repository_origin: std::collections::BTreeMap::new(),

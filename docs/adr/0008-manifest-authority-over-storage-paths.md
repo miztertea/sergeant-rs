@@ -96,8 +96,9 @@ ADR 0006 establishes, not more.
 ## Consequences
 
 The manifest gains a new `[estate] data_dir` field, mirroring
-`surfaces_dir`'s shape — not yet implemented by this ADR, which records
-the decision rather than the code.
+`surfaces_dir`'s shape. Implemented; see GAUNTLET.md's "ADR 0008" ledger
+entry for the shipped shape, the precedence rung it chose, and
+verification.
 
 #64 closes on this ruling rather than on the implementation it originally
 proposed; the self-hosting contradiction it named stays real and is now an
@@ -116,5 +117,7 @@ The precedence and override behavior of a manifest-declared `data_dir`
 relative to `--data-dir` and `SGT_DATA_DIR` — whether it slots in at the
 same rung as estate discovery currently does, or somewhere else in the
 existing five-rung order — is not specified beyond "the manifest should be
-authority for both or neither"; the exact rung it occupies is
-implementation work this ADR does not perform.
+authority for both or neither." The implementation picked a rung
+(`SGT_DATA_DIR`/`--data-dir` still outrank a manifest `data_dir`) as a
+recommendation, not an owner ruling — argued and left open for
+adjudication in GAUNTLET.md's "ADR 0008" ledger entry.
