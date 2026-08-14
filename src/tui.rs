@@ -1271,12 +1271,12 @@ async fn reconnected(
 ) -> Option<crate::api::EventStream> {
     match outcome {
         Attach::Opened(stream) => {
-            backoff.reset();
             if let Err(e) = app.refresh(client).await {
                 app.live = Live::Reconnecting;
                 app.status = format!("reconnected, but refresh failed: {e} — retrying…");
                 return None;
             }
+            backoff.reset();
             app.live = Live::Attached;
             Some(stream)
         }
