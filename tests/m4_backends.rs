@@ -59,8 +59,8 @@ use tempfile::TempDir;
 
 use sergeant_rs::api::Core;
 use sergeant_rs::backend::claude::{
-    CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig, PinVerdict, preflight_model_pin,
-    verify_model_pin,
+    CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig, EXECUTION_MODEL_CONTRACT, PinVerdict,
+    preflight_model_pin, verify_model_pin,
 };
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
@@ -2257,8 +2257,10 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
         "adapter config env is applied"
     );
     assert_eq!(
-        first.stdin, "the intent||the stage context",
-        "§12: intent plus the stage's CONTEXT.md, verbatim, on stdin"
+        first.stdin,
+        format!("{EXECUTION_MODEL_CONTRACT}||the intent||the stage context"),
+        "ADR 0007(a) precedes it, then §12: intent plus the stage's \
+         CONTEXT.md, verbatim, on stdin"
     );
 
     let second = &launches[1];
@@ -2278,6 +2280,43 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
         second.argv
     );
     assert_eq!(second.stdin, "second turn");
+}
+
+/// ADR 0007(a): whatever composes an actor's context states what wakes it.
+/// A headless turn is one process that runs to completion and exits — there
+/// is no callback when a backgrounded command finishes after the turn ends
+/// — and #94 happened twice on 2026-08-14 because nothing told the actor
+/// that. This pins that the statement actually reaches the actor, on the
+/// stage's very first turn, ahead of the intent and the stage's own
+/// CONTEXT.md.
+#[test]
+fn adr_0007a_the_first_turn_states_the_execution_model() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-execmodel", cwd.path(), "the intent", None);
+    request.context = "the stage context".to_string();
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(1);
+    let first = &launches[0];
+    let stdin_lines: Vec<&str> = first.stdin.split('|').collect();
+    assert_eq!(
+        stdin_lines[0], EXECUTION_MODEL_CONTRACT,
+        "the execution model must precede the intent, not follow or replace it: {:?}",
+        first.stdin
+    );
+    assert!(
+        first.stdin.ends_with("the intent||the stage context"),
+        "the intent and CONTEXT.md must still reach the actor, verbatim, \
+         after the execution model: {:?}",
+        first.stdin
+    );
 }
 
 /// MVP-2 D2 item 1 (the `--setting-sources` de-leak), pinned against the

@@ -2341,6 +2341,129 @@ async fn a_dirty_worktree_is_retained_and_recorded_at_teardown() {
     handle.shutdown().await;
 }
 
+/// ADR 0007(b): a closing stage that declares a commit as its durable
+/// outcome must not be reported as plain `completed` when the branch never
+/// advanced and the worktree was left dirty — the safety net for when an
+/// actor guesses wrong about its own runtime model anyway (independent of
+/// ADR 0007(a), which is what a headless turn's own first-turn prompt
+/// states).
+///
+/// Reproduces the real shape: a stage parks in `waiting` (so its worktree is
+/// never torn down), the test dirties that worktree exactly the way an
+/// actor stranding mid-command would, and the run is then driven to a
+/// normal `StageCompleted` signal for every remaining stage — the fake
+/// backend never runs `git commit`, so the branch never advances past its
+/// base SHA either. The engine still learns nothing about what a commit
+/// *is*: the check only ever compares a teardown disposition and a SHA the
+/// pointer already computed (`docs/adr/0007-actor-runtime-contract.md`).
+#[tokio::test]
+async fn a_stranded_completion_is_not_reported_as_plain_completed() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([
+        FakeStep::waiting("needs a second look"),
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "declares a commit, never makes one",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(
+        body["work"]["state"], "waiting",
+        "the first script step parks the run without tearing anything down: {body}"
+    );
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // The stage's own actor would have run `git commit` here; it strands
+    // instead, exactly the shape #94 produced twice on 2026-08-14.
+    std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty the worktree");
+
+    // Retry re-enters the stage (waiting -> active is legal), and the
+    // scripted run then completes every remaining stage normally: the fake
+    // backend signals `StageCompleted` twice in a row and never touches
+    // git, so this one HTTP call drives the whole run to `completed` and
+    // through teardown.
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+
+    // The pointer's own facts prove the shape: the branch never advanced
+    // past its base SHA, and the worktree it left behind is still dirty.
+    assert_eq!(body["teardown"]["clean"], false, "{body}");
+    assert_eq!(
+        body["output"]["repositories"][0]["disposition"], "retained_dirty",
+        "{body}"
+    );
+    assert!(
+        worktree.join("half-done.rs").is_file(),
+        "a dirty worktree must survive teardown: {body}"
+    );
+
+    // The one thing an operator reads first must not say plain `completed`.
+    assert_ne!(
+        body["work"]["state"], "completed",
+        "a closing stage that declared a commit but never advanced the \
+         branch, leaving the worktree dirty, must not be reported as plain \
+         success: {body}"
+    );
+    assert_eq!(
+        body["work"]["state"], "completed_dirty",
+        "the honest label the pointer already supports: {body}"
+    );
+
+    // The same fact must be visible from `sgt work list` — the place an
+    // operator looks first, per the ADR's own framing of the problem — not
+    // only from `work show`'s fuller record.
+    let list = get(&client, &handle, "/v1/work").await;
+    let row = list["works"]
+        .as_array()
+        .expect("works")
+        .iter()
+        .find(|w| w["id"] == work_id)
+        .expect("the work is listed");
+    assert_ne!(row["state"], "completed", "{list}");
+    assert_eq!(row["state"], "completed_dirty", "{list}");
+
+    // The persisted lifecycle state is untouched: this run is genuinely
+    // terminal (retry refuses it, exactly as any other `completed` work),
+    // never blocked or failed. Only the reported label changed.
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "a stranded completion is still `Completed` underneath — terminal, not retryable"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A multi-repository submission where a later repository cannot be
 /// materialized: the earlier ones already have a real branch and worktree in
 /// the user's own checkouts. Those are rolled back and the report is
