@@ -88,3 +88,37 @@ load measurement).
 
 **Closed during planning**: #78 (stale `docs/img/tui-fleet.png`) — closed
 won't-do by the owner, superseded by a planned TUI redesign.
+
+---
+
+## Amendment, 2026-08-14 evening — the plan expanded
+
+Waves 1 and 2 landed as written. The board then changed under the plan:
+running it surfaced seven product findings nobody was looking for (#90,
+#91, #94, #95, #96, plus corrections on #90 and #91), three of which
+degrade the engine every remaining wave runs through.
+
+Owner direction: this is a fix-and-stabilization phase tuning the two
+foundational pieces — **Captain** (`AGENTS.md`, the human interface to
+using Sgt) and **Sgt** itself. New harness adapters and the TUI redesign
+are deliberately not started. The integration branch is unmerged, there
+are no users and no migration needs, so the whole package stages here and
+waves may be *added* rather than only executed.
+
+Re-prioritized on that basis — engine integrity before low-severity perf:
+
+| Wave | Contents | Rationale |
+|---|---|---|
+| 2.5 | #91 (fixed container names) | Active hazard: already invalidated gates twice on unrelated branches, and constrains dogfooding — the orchestrator cannot gate while a Work runs its suite |
+| — | **Grilling round** (in-session, R-NS-6) | #80, #64, #68, #60, the dashboard disposition, and the gate-procedure reconciliation. Two of those change *how* remaining work executes, so they precede it |
+| 2.75 | #90, #94 | Shaped by that round's rulings — where an interrupted turn should land, and what `completed` must guarantee |
+| 3 | #85 | Unchanged; no ruling dependency |
+| 4 | #12, #10 | Unchanged; lowest severity on the board |
+| 5 | #8 → #4 | Unchanged; measurement before fix. Opus earned at #4 |
+
+Also landed outside the wave structure: the ADR 0002 D3 conformance gap in
+`platform::process` (PR #99), found in review of G3 and dispatched as its
+own Work rather than fixed by the reviewer — see `lessons.md` §H1.
+
+Deferred with a named trigger rather than dropped: #95 (macOS perf clock)
+and #82/#81/#18 all close on a real macOS host, not here.
