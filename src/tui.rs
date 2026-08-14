@@ -1627,6 +1627,25 @@ mod tests {
     }
 
     #[test]
+    fn adr_0007b_completed_dirty_is_not_painted_like_ordinary_in_flight_work() {
+        // Review of the first cut found `completed_dirty` fell through to
+        // the default arm and was painted the same Cyan as ordinary
+        // in-flight work — indistinguishable from a run still running, in
+        // the one place an operator scans a whole fleet at a glance.
+        assert_eq!(
+            state_style("completed_dirty").fg,
+            Some(Color::Yellow),
+            "a stranded completion needs a second look, so it belongs with \
+             needs_input/waiting, not the default Cyan in-flight bucket"
+        );
+        assert_ne!(
+            state_style("completed_dirty").fg,
+            state_style("active").fg,
+            "must be visually distinct from ordinary in-flight work"
+        );
+    }
+
+    #[test]
     fn only_state_bearing_events_ask_for_a_refresh() {
         let mut app = App::new();
         assert!(app.observe(&json!({"seq": 7, "kind": "work.completed"})));

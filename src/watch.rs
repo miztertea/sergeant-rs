@@ -540,6 +540,29 @@ mod tests {
     }
 
     #[test]
+    fn adr_0007b_completed_dirty_classifies_as_completed_and_is_terminal() {
+        // ADR 0007(b) review fix: before this, `classify` only recognized
+        // plain `completed`, so a stranded completion's snapshot state
+        // fell into `None` ("not watched") and a scoped `--follow` watcher
+        // would never see it as terminal — it would hang forever
+        // (`classify_snapshot` feeds `snapshot["work"]["state"]` straight
+        // into this function).
+        assert_eq!(
+            WatchState::classify("completed_dirty"),
+            Some(WatchState::Completed),
+            "a stranded completion must classify into the same watch \
+             bucket as an ordinary completed run"
+        );
+        assert!(
+            WatchState::classify("completed_dirty")
+                .expect("classifies")
+                .is_terminal(),
+            "a scoped --follow watcher must exit on completed_dirty, not \
+             hang waiting for a notice that will never come"
+        );
+    }
+
+    #[test]
     fn only_completed_and_canceled_are_terminal_for_scoped_follow() {
         for (state, terminal) in [
             (WatchState::NeedsInput, false),
