@@ -714,7 +714,15 @@ where
     let mut outcome: Result<Exit, TuiError> = Ok(Exit::Requested);
     'session: {
         if let Err(e) = terminal.draw(|frame| draw(frame, app)) {
-            outcome = Err(terminal_error(e));
+            // Same rule as the in-loop draw below: a write that fails because
+            // the pty already hung up is `TerminalGone`, not a reported
+            // error — this is the one draw site a hangup landing before the
+            // event loop starts would otherwise slip past.
+            outcome = if tty.hung_up() {
+                Ok(Exit::TerminalGone)
+            } else {
+                Err(terminal_error(e))
+            };
             break 'session;
         }
         loop {
@@ -1969,6 +1977,122 @@ mod tests {
             Exit::TerminalGone,
             "the loop must name the hangup, so `run` knows there is nobody to \
              report to"
+        );
+    }
+
+    /// A backend whose `draw` always fails, wrapping a real `TestBackend` for
+    /// every other call. `TestBackend` itself cannot fail a draw (its error
+    /// type is `Infallible`), so a hangup landing on the very first,
+    /// pre-loop draw — the gap issue #26's grooming narrowed the report
+    /// to — is otherwise unreachable from a test.
+    struct FailingBackend(ratatui::backend::TestBackend);
+
+    impl ratatui::backend::Backend for FailingBackend {
+        type Error = std::io::Error;
+
+        fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            self.0.hide_cursor().unwrap();
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.0.show_cursor().unwrap();
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+            Ok(self.0.get_cursor_position().unwrap())
+        }
+
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> std::io::Result<()> {
+            self.0.set_cursor_position(position).unwrap();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.0.clear().unwrap();
+            Ok(())
+        }
+
+        fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+            self.0.clear_region(clear_type).unwrap();
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+            Ok(self.0.size().unwrap())
+        }
+
+        fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+            Ok(self.0.window_size().unwrap())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush().unwrap();
+            Ok(())
+        }
+    }
+
+    /// A hangup landing on the pre-loop draw — before the event loop's
+    /// `select!` (and its own hung-up check) is ever reached — still exits
+    /// as `TerminalGone`, not as a reported error.
+    ///
+    /// Issue #26, as narrowed by its 2026-08-13 grooming comment: the reader
+    /// thread and `TtyWatch::install` now both arm synchronously before this
+    /// draw, closing the original 1-2 second startup window, but this one
+    /// call site still lacked the `tty.hung_up()` check every later draw
+    /// (line ~774) and the watch arm (line ~765) both consult. Without the
+    /// fix this test's `terminal.draw` failure is reported as a `TuiError`
+    /// instead of recognized as `Exit::TerminalGone`.
+    #[tokio::test]
+    async fn a_hangup_at_the_pre_loop_draw_exits_cleanly() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _quiet = SIGNALS_QUIET.lock().await;
+        static PRESENT: AtomicBool = AtomicBool::new(true);
+        fn probe() -> bool {
+            PRESENT.load(Ordering::SeqCst)
+        }
+
+        PRESENT.store(true, Ordering::SeqCst);
+        let watch = TtyWatch::watching(probe);
+        // The terminal is already gone by the time the very first draw runs.
+        PRESENT.store(false, Ordering::SeqCst);
+        let probes = TerminalProbes {
+            watch,
+            tick: Box::new(|| ReaderTick::Idle),
+        };
+
+        let mut terminal =
+            ratatui::Terminal::new(FailingBackend(ratatui::backend::TestBackend::new(80, 24)))
+                .expect("a test terminal");
+        let mut app = App::new();
+        let client = ApiClient::new("http://127.0.0.1:1", "token").expect("client");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(20),
+            event_loop(&mut terminal, &mut app, &client, probes),
+        )
+        .await
+        .expect("a pre-loop hangup must not hang the session");
+        assert_eq!(
+            exit.expect(
+                "a hangup discovered on the pre-loop draw is not a failure — \
+                 there is nobody left to report one to"
+            ),
+            Exit::TerminalGone,
+            "the pre-loop draw must consult the same hung-up check every \
+             later draw site does"
         );
     }
 
