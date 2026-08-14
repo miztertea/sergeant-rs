@@ -88,16 +88,20 @@ WSL2-as-real-Linux is what makes D1 cheap: no second process model, no
 native-Windows-specific signal or lockfile handling to build or keep green.
 
 D10's leave-alone posture has a consequence that must survive review, not
-just theory: the `cfg(not(unix))` stubs can still produce misleading
-runtime messages on a platform outside the measured set. Concretely,
-`free_space` in `src/backend/docker.rs:1308-1311` returns `None`
-unconditionally when not `cfg(unix)`, and `src/cli.rs:2029` and `2059`
-render that as "free space could not be measured on this platform" in
-`sgt doctor`'s disk-pressure check — a message that (per the comment at
-`src/cli.rs:2009-2014`, added for a related but distinct fix, #67) has
-already been flagged once as potentially misdirecting an operator. This
-gap is tracked separately as **issue #81** and is explicitly not fixed by
-this ADR or D10's decision to leave the stubs standing.
+just theory: platform-fact stubs can still produce misleading runtime
+messages on a platform outside the measured set. At the time of this
+interview, `free_space` in `src/backend/docker.rs:1308-1311` returned
+`None` unconditionally when not `cfg(unix)`; ADR 0002 has since moved that
+fact to `src/platform/disk.rs` and added an UNVERIFIED macOS arm, so today
+the unconditional `None` is confined to platforms outside both Linux and
+macOS. `src/cli.rs:2025` and `2055` render a `None` result as "free space
+could not be measured on this platform" in `sgt doctor`'s disk-pressure
+check — a message that (per the comment at `src/cli.rs:2005-2010`, added
+for a related but distinct fix, #67) has already been flagged once as
+potentially misdirecting an operator. This gap is tracked separately as
+**issue #81**, not closed by ADR 0002's macOS arm since it remains
+unmeasured on a real host, and was explicitly not fixed by this ADR or
+D10's decision to leave the stubs standing.
 
 ## Open questions
 
