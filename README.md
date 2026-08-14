@@ -243,7 +243,7 @@ cargo test --test m4_backends              # one suite
 SERGEANT_CLAUDE_TESTS=1 cargo test --test m4_backends -- --ignored   # opt-in: real claude CLI, bills tokens
 ```
 
-The record that governs how this project decides things: [`NORTH-STAR.md`](NORTH-STAR.md) (the destination and the rulings), [`GAUNTLET.md`](GAUNTLET.md) (the append-only ledger — deviation register, backlog, per-milestone scorecards), [`LESSONS.md`](LESSONS.md) (binding lessons from what went wrong), and `docs/gauntlet/contracts/` (what each milestone actually promised).
+The record that governs how this project decides things: [`NORTH-STAR.md`](NORTH-STAR.md) (the destination and the rulings), [`GAUNTLET.md`](GAUNTLET.md) (the append-only ledger — deviation register, backlog, per-milestone scorecards), [`LESSONS.md`](LESSONS.md) (binding lessons from what went wrong), `docs/gauntlet/contracts/` (what each milestone actually promised), and [`docs/adr/`](docs/adr/README.md) (architecture decisions that fix a shape once, with [`docs/glossary.md`](docs/glossary.md) for the vocabulary they fix).
 
 ## Lineage & License
 
