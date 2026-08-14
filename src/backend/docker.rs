@@ -1445,6 +1445,25 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .expect("chmod +x scripted docker_bin");
+        // A file another process still holds open for writing cannot be
+        // exec'd; absorb the ETXTBSY window before handing it to the
+        // backend (#83 — this exact shape is already handled in
+        // tests/m5_projections.rs and tests/m6_surfaces.rs; measured under
+        // `cargo test --lib`'s default thread parallelism: 3 failures in 40
+        // runs, every one `os error 26`).
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while let Err(e) = std::process::Command::new(&script_path)
+                .arg("version")
+                .output()
+            {
+                assert!(
+                    e.raw_os_error() == Some(26) && std::time::Instant::now() < deadline,
+                    "the scripted docker_bin is not runnable: {e}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         config.docker_bin = script_path.to_string_lossy().to_string();
         let backend = DockerBackend::new(config).expect("backend");
 
