@@ -791,7 +791,10 @@ impl ClaudeBackend {
             Err(e) => {
                 return ProbeOutcome {
                     available: false,
-                    detail: format!("capability probe: cannot run {exe:?} --version: {e}"),
+                    detail: format!(
+                        "capability probe: cannot run {exe:?} --version: {e} (kind: {:?})",
+                        e.kind()
+                    ),
                     version: None,
                 };
             }
@@ -831,7 +834,10 @@ impl ClaudeBackend {
             Err(e) => {
                 return ProbeOutcome {
                     available: false,
-                    detail: format!("capability probe: cannot run {exe:?} --help: {e}"),
+                    detail: format!(
+                        "capability probe: cannot run {exe:?} --help: {e} (kind: {:?})",
+                        e.kind()
+                    ),
                     version: Some(canonical_version),
                 };
             }
@@ -2967,6 +2973,72 @@ mod tests {
         assert_eq!(latest_ask_withdrawal_version(noise).unwrap(), None);
     }
 
+    /// #83: a freshly written, freshly `chmod +x`'d stand-in script can
+    /// transiently fail `execve(2)` with `ETXTBSY` ("text file busy",
+    /// `os error 26`) under `cargo test --lib`'s default thread
+    /// parallelism — measured directly (3 failures in 40 runs, every one
+    /// this exact `io::ErrorKind::ExecutableFileBusy`) via the diagnostic
+    /// `run_probe` now surfaces. This is not a version-parsing bug; the
+    /// same absorb-and-retry idiom already fixed it in
+    /// `tests/m5_projections.rs` and `tests/m6_surfaces.rs` before this
+    /// call site existed. Retry until the exec stops being refused, or
+    /// surface any other failure immediately — the window is real but
+    /// bounded, never a reason to paper over an unrelated exec error.
+    #[cfg(unix)]
+    fn wait_until_executable(path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while let Err(e) = std::process::Command::new(path).arg("--version").output() {
+            assert!(
+                e.raw_os_error() == Some(26) && std::time::Instant::now() < deadline,
+                "the stand-in is not runnable: {e}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// #83, direct proof rather than a re-run-until-it-flakes gamble:
+    /// manufactures the exact condition `execve(2)` refuses with `ETXTBSY`
+    /// — a second fd open for writing on the same inode — and confirms
+    /// `wait_until_executable` retries through it instead of surfacing the
+    /// exec failure as if the file were simply unrunnable. Deterministic,
+    /// not load-dependent: the writer fd stays open for 150ms, so a single
+    /// attempt made at t=0 (i.e. no retry loop) always lands inside the
+    /// busy window and this test would fail every time the fix is
+    /// reverted, not just some fraction of runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_manufactured_etxtbsy_window_is_absorbed_not_surfaced_as_missing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let script = dir.path().join("busy-script");
+        std::fs::write(&script, "#!/bin/sh\necho ok\n").expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+
+        // A second fd open for writing on `script` is exactly what
+        // `execve(2)` refuses — this is the manufactured busy window, held
+        // open on another thread so `wait_until_executable` below observes
+        // it on its very first attempt.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("open second writer fd");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(writer);
+        });
+
+        let start = std::time::Instant::now();
+        wait_until_executable(&script);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(100),
+            "wait_until_executable returned before the manufactured busy \
+             window closed — it did not actually retry through ETXTBSY, it \
+             got lucky (or the busy window was never real)"
+        );
+        closer.join().expect("writer-closing thread");
+    }
+
     /// MVP-2 D2 item 2: the durability half. A record for the version this
     /// probe measures *right now* lowers the claim; a record for any other
     /// version (a CLI upgrade or downgrade since it was journaled) leaves
@@ -2995,13 +3067,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod +x");
+            wait_until_executable(&script);
         }
         config.executable = script;
         let backend = ClaudeBackend::new(config);
         assert_eq!(
             backend.probe_outcome().version.as_deref(),
             Some("2.1.226"),
-            "stand-in must parse as the version the test reasons about"
+            "stand-in must parse as the version the test reasons about (probe detail: {})",
+            backend.probe_outcome().detail
         );
 
         // A different version's withdrawal: stale, does not apply.
