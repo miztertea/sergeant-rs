@@ -14,3 +14,4 @@ __pycache__/
 repos/
 .sergeant.toml.lock
 sergeant.toml.validate-*
+sergeant.toml
