@@ -40,7 +40,7 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 | B2 | M6 adjudication | Dashboard auth delivers the bearer token in the `sgt web` URL query string (shoulder-surf/history exposure on a shared machine) | Accepted at R1 for the P0: the listener is loopback-only and the token already travels in the printed URL by design; the API refuses query tokens on non-GET/HEAD (CSRF bound), and `/ui` sits behind the same `require_bearer` gate as `/v1`. Post-P0 alternative recorded per the M6 contract: exchange the URL token once for an `HttpOnly; SameSite=Strict` cookie handoff. Trigger: any non-loopback binding or multi-user host. |
 | B3 | P0 final gate | `ClaudeBackend::stop` joins the turn's evidence-archive thread while API handlers hold the core lock, so a concurrent request waits out one transcript flush during a cancel/retry of an in-flight Claude turn | Orchestrator ruling at the final gate (three review rounds converged here): STOP's evidence promise (round-2 fix — the archive is durable before STOP returns) is kept; the lock-hold is rare-path and bounded by one local-disk write; the real fix is a §15 trait-shape change (`stop` returning a join token the caller awaits after releasing the core guard) — R7 machinery, not invented at gate-time without panel coverage. `block_in_place` (d82a6e2) keeps the executor healthy meanwhile; trade-off documented on `stop` itself (d20554d). Trigger: any measured multi-client stall, or the first §15 trait revision for other reasons. **CLOSED at N3**: the trigger fired exactly as registered — §14.3's `prepare`/`launch` split is the first §15 trait revision, and B3's own prescribed fix ("`stop` returning a join token the caller awaits after releasing the core guard") is what landed. `stop`/`interrupt` return a `Completion`; the engine collects them into a `Deferred`; `api::crank` drains it after dropping the guard. `block_in_place` removed. Pinned by `tests/m2_daemon_api.rs` t10 — a stalled evidence archive with an independent read answering in ~2 ms — and revert-probed (holding the guard across the drain fails the test in 1 s). Issue #14 closed. |
 | B4 | R-MVP1-10 (blocked exit-door invariant) build | A `pending → blocked` landing from a real start failure (a materialize permission fault, or `reconcile_crashed_start`'s crash-window block) has no working `retry` door: `begin_retry` requires `run.current_stage()` (`engine.rs`), and no stage is ever entered before `settle_materialize` fails or a crashed start is swept — `KIND_WORKFLOW_BOUND`/`KIND_STAGE_ENTERED` land together with `KIND_WORK_STARTED` in one group-committed guard hold, all *after* a successful materialize, so this is not a narrow timing window but the whole category. `retry` fails closed with `EngineError::NoRun` (404, `"no_run"`) — safe, structured, non-corrupting, never silently wrong — but not an open door. The real, working exit is `cancel` (`blocked → canceled`), proven instead. | Reopening it properly needs the full `StartPlan` (workflow resolution, routing, per-stage bindings) re-derivable from the journal alone, and today it is not: `origin.cwd` — needed to re-run `Workspace::discover` — is never persisted (`engine.rs`'s own `reconcile_crashed_start` comment says so), and guessing at a substitute `cwd` would silently re-plan against the wrong estate, which CLAUDE.md's fail-closed doctrine forbids. The honest fix is persisting enough of the submit-time plan to redo it — a bind-path change (`engine.rs`, `SurfacePlan`/`KIND_SURFACE_MATERIALIZING`'s payload) outside this ruling's own file scope (`projection.rs`/`recovery.rs`/`surface.rs`/`api.rs` views). Trigger: any MVP that needs `retry` to reopen a `pending`-origin block — the natural home is wherever the submit-time plan next gets a durable record (R-MVP1-1/R-MVP1-4's `workflow.bound` widening is adjacent territory). Pinned as *expected, safe* behavior by `tests/m2_daemon_api.rs`'s `r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_cancel` (revert-probed: removing the `NoRun`→404 mapping or the `no_run` code fails it). |
-| B5 | MVP-3 fixer pass, invariants finding MVP3-C4 | `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`'s `[estate]` shape lists `data_dir` defaulting `.sergeant/data`, but R-MVP1-1 ruled only `surfaces_dir`; `data_dir` was never implemented (`EstateSection` is `deny_unknown_fields` with no such field; `resolve_data_dir` hardcodes the estate-relative default and reads no manifest field at all). A hand-written `[estate] data_dir = "..."` following the design note literally fails closed with a parse refusal instead of overriding anything. | Not implemented in the fixer pass: this is new engine/config surface (an estate-level override of where the daemon's own data dir lives), R-NS-4 territory that wants explicit ratification, not a silent addition riding in on a bug-fix pass. Design doc corrected in place ([v3] note) so it no longer misdescribes shipped behavior. Trigger: any MVP that actually needs a non-default, manifest-declared data dir (today's only override is `--data-dir`/`SGT_DATA_DIR`, both already covered by R-MVP1-12's discovery-boundary rules). |
+| B5 | MVP-3 fixer pass, invariants finding MVP3-C4 | `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`'s `[estate]` shape lists `data_dir` defaulting `.sergeant/data`, but R-MVP1-1 ruled only `surfaces_dir`; `data_dir` was never implemented (`EstateSection` is `deny_unknown_fields` with no such field; `resolve_data_dir` hardcodes the estate-relative default and reads no manifest field at all). A hand-written `[estate] data_dir = "..."` following the design note literally fails closed with a parse refusal instead of overriding anything. | Not implemented in the fixer pass: this is new engine/config surface (an estate-level override of where the daemon's own data dir lives), R-NS-4 territory that wants explicit ratification, not a silent addition riding in on a bug-fix pass. Design doc corrected in place ([v3] note) so it no longer misdescribes shipped behavior. Trigger: any MVP that actually needs a non-default, manifest-declared data dir (today's only override is `--data-dir`/`SGT_DATA_DIR`, both already covered by R-MVP1-12's discovery-boundary rules). **CLOSED, ADR 0008(b)** (see the ledger entry below): the trigger fired — ADR 0008 ratified `[estate] data_dir` explicitly (R-NS-4's "explicit ratification, not a silent addition"), and it is now implemented, mirroring `surfaces_dir`'s shape exactly as this row anticipated. |
 | B6 | MVP-3 fixer pass, invariants finding MVP3-C5 | `sgt run --turns`/`--ceiling-secs` (commit 78e5da9) adds a per-Work `EnvelopeRequest{turn_cap, ceiling_secs}` the engine reads via `effective_turn_cap`/`effective_turn_ceiling` — genuinely new engine surface (submit-time envelope override) that R-MVP1-7 specified as daemon-wide only (`with_turn_cap`/`SGT_TURN_CAP`), and MVP-3's own bucketing plan does not list it. Counting integrity is intact (not a bypass: `check_turn_envelope` still gates on the effective values, `turns_spawned` stays journal-derived, submit rejects `turn_cap==0`/`ceiling_secs==0`) — the gap is process, not safety. | Shipped code kept as-is (it works, and reverting a MVP-3-milestone feature inside a fixer pass is a bigger unilateral move than registering it); registered here instead per R-NS-4 discipline, for owner ratification at the next adjudication rather than silently standing unregistered. Trigger: MVP-3's own adjudication — fold into the milestone's deviation record or explicitly ratify there. |
 | B7 | MVP-5 F2 execution-surface re-triage (`docs/icm/retriage-2026-08-11.md`, `load-project` verdict notes) | `sergeant-setup`'s `30-project-interview` stage duplicates `load-project`'s registration job wholesale (same "complete project definition... previewed... written only after confirmation" shape) instead of delegating to it — the retriage itself flags this as "a duplication defect, not a clean stage-boundary split," and it stood unresolved when the F2 pass executed the surrounding CLI-SURFACE verdicts around it. | Fixing it means editing `sergeant-setup`'s own package to delegate its interview stage to `load-project` instead of reimplementing it — a `.sergeant/workflows/` content edit outside the MVP-5 fixer pass's file scope (docs/`AGENTS.md`/`skills/` only). Trigger: any pass that next touches either `sergeant-setup` or `load-project`'s own package. |
 | B8 | MVP-5 Lane F1 dispositions, content-honesty CH-1 (fixer pass, 2026-08-13) | 17 `agents-invariant` units (BU-1033..1048's codebase-design vocabulary/deepening rules, BU-1064's domain-modeling CONTEXT.md file-role rule) have no live skill package to land in — only frozen upstream evidence under `reference/sergeant-upstream/.claude/skills/`, which `docs/DEVELOPMENT.md` forbids treating as live content. `docs/icm/agents-invariant-dispositions.md` previously (and wrongly) claimed both were already-published `.sergeant/workflows/` packages; corrected to `not-adopted` this pass, and the two live packages that named a "grilling/domain-modeling" pair (`triage/40-grill-if-underspecified`, `wayfinder/00-name-destination`) were corrected to name `grilling` alone rather than invent the second invocation. | Promoting either skill is new content, not a dispositioning correction — this fixer pass's job was to stop asserting they exist, not to build them. Trigger: an owner decision to actually promote `codebase-design` and/or `domain-modeling` as `skills/` packages (nearest precedent: `deepen-module` already cites `codebase-design`'s upstream `DEEPENING.md` directly, without a `skill:` indirection — see `00-classify-dependencies/CONTEXT.md`). |
@@ -48,6 +48,66 @@ rationale. The proposal is the idea as it stood in that moment, not a how-to.
 ---
 
 ## Ledger entries
+
+### ADR 0008 — 2026-08-14, manifest authority over its own state location: (b) implemented, (a) pinned unchanged, (c) re-ruled and #64 closed without code
+
+**Mission outcome: shipped.** Implements proposal §5.4 / ADR 0008, a Work
+dispatched off FOUNDATION-1's ruling (below). Three parts, one ruling, per
+the ADR:
+
+**(a) Estate-first precedence — untouched, pinned.** `resolve_data_dir`'s
+rung order (`--data-dir`, `SGT_DATA_DIR`, estate discovery, pre-estate
+platform fallback) is unchanged; already pinned by
+`tests/m8_estate_cli.rs`'s `explicit_data_dir_and_env_still_win_over_a_discovered_estate`
+and `no_estate_anywhere_falls_back_to_the_pre_estate_default_unchanged`, both
+re-run green with no edits needed.
+
+**(b) `[estate] data_dir` added, closing B5.** `Workspace` gains a
+`data_dir: Option<PathBuf>` field, parsed and resolved identically to
+`surfaces_dir` (relative declarations join onto the manifest's own
+directory; absolute ones pass through) — same shape, deliberately, per the
+ADR's "do not invent a second convention." `resolve_data_dir` consults it
+via the new `Workspace::estate_root_and_data_dir` (disk-free structural
+parse, so a data-dir lookup never fails on a declared repository missing
+from disk) only once an estate has already been found, narrowing the
+`<estate_root>/.sergeant/data` default exactly as `surfaces_dir` narrows the
+daemon's own. **Precedence rung — a recommendation, not an owner ruling
+(proposal §8.7 named this explicitly undecided):** `SGT_DATA_DIR` and
+`--data-dir` still outrank a manifest-declared `data_dir`; the manifest is
+consulted only inside the estate-discovery rung. Argument for: `--data-dir`
+and `SGT_DATA_DIR` are positioned as unconditional operator overrides that
+already skip estate discovery entirely, and `data_dir` is the daemon's
+single-owner boundary (journal, blob store, lock) — a bigger blast radius
+than `surfaces_dir`'s per-submission narrowing, so letting a checked-out
+manifest silently redirect an operator's own env-set override is the more
+surprising failure mode. Argument against, carried honestly: `surfaces_dir`
+already establishes manifest-over-env as this codebase's actual precedent
+(`workspace.surfaces_dir` always wins over the daemon's `SGT_SURFACES_DIR`-set
+default once a submission has a workspace), and ADR 0008(b)'s own framing —
+"the manifest should be authority for both or neither" — pulls toward
+manifest-over-`SGT_DATA_DIR`, not below it. Pinned by
+`sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir` so a
+future change cannot flip this silently; open for adjudication.
+
+**(c) #64 re-ruled, not implemented — closed on the ADR's reasoning.** No
+code was written for #64's filed `XDG_STATE_HOME` flip. The cost is carried
+rather than softened, per the ADR: surfaces under `.sergeant/data/surfaces/`
+do sit inside the sergeant-rs checkout when sergeant operates on itself,
+invisible today only because that path is gitignored and the engine's
+refusal checks the target repo rather than the outer one — re-ruling accepts
+that permanently. Closed via commit trailer (`Fixes #64`), reasoning
+recorded here and in the commit body, not softened into a silent close.
+
+**Verification.** `manifest_data_dir_overrides_the_estate_local_default`
+revert-probed: reverting only the `src/cli.rs` change (keeping the domain
+parsing) reproduces the old hardcoded default and fails the test, confirming
+it actually exercises the fix rather than passing vacuously. Full suite
+green (`cargo test`); one throughput test
+(`t12_submission_throughput_has_an_automated_floor`) flaked under host load
+in a full-suite run and passed clean in isolation — unrelated to this
+change (the submit path this Work touches, `resolve_data_dir`, runs once at
+CLI startup, never inside the daemon's hot submit path this test measures).
+`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` clean.
 
 ### FOUNDATION-1 — 2026-08-14, a proposal graded instead of an implementation: validated with findings
 

@@ -202,6 +202,16 @@ pub struct Workspace {
     /// `<data_dir>/surfaces`) in force — this field only ever narrows it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surfaces_dir: Option<PathBuf>,
+    /// `[estate] data_dir` (ADR 0008(b)): resolved the same way as
+    /// `surfaces_dir` above — an absolute path, relative declarations
+    /// joined onto `root`. Consulted only by `src/cli.rs`'s
+    /// `resolve_data_dir`, and only once an estate has already been
+    /// discovered (it narrows what that discovery would otherwise default
+    /// to, `<estate_root>/.sergeant/data`); it does not affect
+    /// `--data-dir`/`SGT_DATA_DIR`, which both still short-circuit before an
+    /// estate is ever looked for (ADR 0008(a), unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PathBuf>,
     /// Per-repository instruction policy (R-MVP1-4), keyed by repository
     /// name. A name absent from this map (including every repository in the
     /// zero-config single-repo fallback) resolves to
@@ -398,6 +408,10 @@ struct EstateSection {
     /// when not absolute.
     #[serde(default)]
     surfaces_dir: Option<PathBuf>,
+    /// ADR 0008(b): `data_dir` override, resolved the same way as
+    /// `surfaces_dir` above.
+    #[serde(default)]
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,6 +544,7 @@ impl Workspace {
                 profiles: Vec::new(),
                 config_path: None,
                 surfaces_dir: None,
+                data_dir: None,
                 repository_policy: BTreeMap::new(),
                 groups: BTreeMap::new(),
                 repository_origin: BTreeMap::new(),
@@ -871,7 +886,8 @@ impl Workspace {
             );
         }
 
-        let (name, default_backend, default_workflow, surfaces_dir) = match parsed.estate {
+        let (name, default_backend, default_workflow, surfaces_dir, data_dir) = match parsed.estate
+        {
             Some(estate) => (
                 estate.name,
                 estate.default_backend,
@@ -879,8 +895,11 @@ impl Workspace {
                 estate
                     .surfaces_dir
                     .map(|d| if d.is_absolute() { d } else { root.join(d) }),
+                estate
+                    .data_dir
+                    .map(|d| if d.is_absolute() { d } else { root.join(d) }),
             ),
-            None => (repo_name(&root), None, None, None),
+            None => (repo_name(&root), None, None, None, None),
         };
 
         Ok(Self {
@@ -892,6 +911,7 @@ impl Workspace {
             profiles: parsed.profile,
             config_path: Some(config_path.to_path_buf()),
             surfaces_dir,
+            data_dir,
             repository_policy,
             groups,
             repository_origin,
@@ -991,7 +1011,8 @@ impl Workspace {
             );
         }
 
-        let (name, default_backend, default_workflow, surfaces_dir) = match parsed.estate {
+        let (name, default_backend, default_workflow, surfaces_dir, data_dir) = match parsed.estate
+        {
             Some(estate) => (
                 estate.name,
                 estate.default_backend,
@@ -999,8 +1020,11 @@ impl Workspace {
                 estate
                     .surfaces_dir
                     .map(|d| if d.is_absolute() { d } else { root.join(d) }),
+                estate
+                    .data_dir
+                    .map(|d| if d.is_absolute() { d } else { root.join(d) }),
             ),
-            None => (repo_name(&root), None, None, None),
+            None => (repo_name(&root), None, None, None, None),
         };
 
         Ok(Self {
@@ -1012,6 +1036,7 @@ impl Workspace {
             profiles: parsed.profile,
             config_path: Some(config_path.to_path_buf()),
             surfaces_dir,
+            data_dir,
             repository_policy,
             groups,
             repository_origin,
@@ -1054,6 +1079,26 @@ impl Workspace {
     ) -> Result<Option<PathBuf>, WorkspaceError> {
         Ok(Self::find_estate_upward(start, data_dir)?
             .and_then(|config| config.parent().map(Path::to_path_buf)))
+    }
+
+    /// [`Self::estate_root`]'s sibling for `src/cli.rs`'s `resolve_data_dir`
+    /// (ADR 0008(b)): the discovered estate root together with its
+    /// manifest's `[estate] data_dir` override, if any — resolved via
+    /// [`Self::from_config_structural`] (disk-free, no per-repo git
+    /// resolution) so a data-dir lookup never fails on a declared repository
+    /// that happens not to exist on disk yet. `None` when no estate is
+    /// found; `Some((root, None))` when one is found but declares no
+    /// override, leaving the caller's own default in force exactly as
+    /// `surfaces_dir` does.
+    pub fn estate_root_and_data_dir(
+        start: &Path,
+        data_dir_scope: Option<&Path>,
+    ) -> Result<Option<(PathBuf, Option<PathBuf>)>, WorkspaceError> {
+        let Some(config_path) = Self::find_estate_upward(start, data_dir_scope)? else {
+            return Ok(None);
+        };
+        let workspace = Self::from_config_structural(&config_path)?;
+        Ok(Some((workspace.root, workspace.data_dir)))
     }
 
     /// Restrict the workspace to the named repositories (the submit request's
@@ -1271,6 +1316,7 @@ mod tests {
             profiles: Vec::new(),
             config_path: None,
             surfaces_dir: None,
+            data_dir: None,
             repository_policy: BTreeMap::new(),
             groups: BTreeMap::new(),
             repository_origin: BTreeMap::new(),
@@ -1589,6 +1635,46 @@ mod tests {
         )
         .expect("no surfaces_dir parses");
         assert_eq!(workspace.surfaces_dir, None);
+    }
+
+    // ---- ADR 0008(b): `[estate] data_dir` ---------------------------------
+
+    /// `data_dir` parses and resolves exactly like `surfaces_dir` above —
+    /// same shape, deliberately, per ADR 0008(b)'s "do not invent a second
+    /// convention".
+    #[test]
+    fn estate_data_dir_resolves_relative_and_keeps_absolute() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        let workspace = parse(
+            root,
+            "[estate]\nname = \"w\"\ndata_dir = \"../elsewhere-data\"\n\n\
+             [[repo]]\nname = \"solo\"\npath = \".\"\n",
+        )
+        .expect("relative data_dir parses");
+        assert_eq!(workspace.data_dir, Some(root.join("../elsewhere-data")));
+
+        let absolute = dir.path().join("abs-data");
+        let workspace = parse(
+            root,
+            &format!(
+                "[estate]\nname = \"w\"\ndata_dir = {:?}\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+                absolute.to_string_lossy()
+            ),
+        )
+        .expect("absolute data_dir parses");
+        assert_eq!(workspace.data_dir, Some(absolute));
+
+        // Unset stays `None` — `resolve_data_dir`'s own default is left in
+        // force.
+        let workspace = parse(
+            root,
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+        )
+        .expect("no data_dir parses");
+        assert_eq!(workspace.data_dir, None);
     }
 
     // ---- R-MVP1-12: estate discovery past inner `.git` --------------------

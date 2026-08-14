@@ -392,17 +392,22 @@ pub fn main() -> ExitCode {
 /// unconditional precedence — then (U-R2, MVP-3's estate-resolved default) an
 /// estate discovered by walking upward from the current directory, mirroring
 /// R-MVP1-12: filesystem-first, crossing git boundaries, bounded at `$HOME`.
-/// When one is found, the default is `<estate_root>/.sergeant/data` — the
-/// same path `sgt init` scaffolds a `.gitignore` entry for
-/// ([`crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR`]). This precedence —
-/// whether estate discovery should even come before the pre-estate fallback
-/// — is an owner ruling tracked separately in #80 and is not decided here.
-/// This is a new fallback *rung*, not a replacement: only once no estate is
-/// found (or the current directory cannot even be read) does resolution fall
-/// through to the pre-estate default, which is a platform fact
-/// ([`crate::platform::data_dir`], #82) — `$XDG_DATA_HOME/sergeant` or
-/// `~/.local/share/sergeant` on Linux, unchanged from before that boundary
-/// existed.
+/// When one is found, the default is the manifest's own `[estate] data_dir`
+/// if it declares one (ADR 0008(b)), else `<estate_root>/.sergeant/data` —
+/// the same path `sgt init` scaffolds a `.gitignore` entry for
+/// ([`crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR`]). Both `data_dir`
+/// and the hardcoded default sit *below* the flag and `SGT_DATA_DIR`: ADR
+/// 0008(a) upholds estate-first precedence over the pre-estate platform
+/// fallback unchanged, and does not touch the flag/env rungs above it — a
+/// manifest declaration is consulted only once estate discovery has already
+/// won that race, narrowing what it would otherwise default to, exactly as
+/// `surfaces_dir` narrows the daemon's own default rather than outranking an
+/// explicit override. This is a new fallback *rung*, not a replacement: only
+/// once no estate is found (or the current directory cannot even be read)
+/// does resolution fall through to the pre-estate default, which is a
+/// platform fact ([`crate::platform::data_dir`], #82) — `$XDG_DATA_HOME/sergeant`
+/// or `~/.local/share/sergeant` on Linux, unchanged from before that
+/// boundary existed.
 fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
     if let Some(dir) = flag {
         return Ok(dir);
@@ -411,9 +416,12 @@ fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
         return Ok(PathBuf::from(dir));
     }
     if let Ok(cwd) = std::env::current_dir()
-        && let Some(estate_root) = crate::domain::workspace::Workspace::estate_root(&cwd, None)?
+        && let Some((estate_root, data_dir)) =
+            crate::domain::workspace::Workspace::estate_root_and_data_dir(&cwd, None)?
     {
-        return Ok(estate_root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR));
+        return Ok(data_dir.unwrap_or_else(|| {
+            estate_root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR)
+        }));
     }
     crate::platform::data_dir::fallback_dir(|name| std::env::var_os(name)).map_err(CliError::new)
 }
