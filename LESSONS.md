@@ -6,6 +6,124 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L23 — Every reduction of output lied at least once: read the artifact, not the view of it
+
+Cerberus, 2026-08-14/15 sprint. Five instances in one session, four tool
+families, same shape — a view was narrowed and the narrowing, not the
+subject, produced the answer:
+
+| Reduction | False conclusion |
+|---|---|
+| `grep -v "^+.*///"` on a diff | "the worker left a dangling doc fragment" |
+| `grep -E "^\+\s+fn "` (leading whitespace) | "#70 has no test" — it was a top-level `fn` |
+| `grep -E "outcome:"` unanchored | "gate run terminal" — matched no-mistakes' *help text* |
+| guessed JSON path `run.surface` | "teardown never recorded" — the key is top-level |
+| `\| tail -1` on `gh pr edit` | "PR title updated" — the command had exited 1 |
+| `cmd \| head -3 && echo OK` | "patch applies" — `&&` saw `head`'s status, not the command's |
+| the path the harness reported | "edit `CLAUDE.md`" — it is a symlink; `AGENTS.md` is the file |
+
+The last row generalizes the rest past output-filtering, to **any indirection
+between you and the artifact.** The harness loads project instructions and
+names the path it opened; that path is mode `120000`, and the tracked file is
+`AGENTS.md`. A retrospective then proposed five changes to a symlink. The
+correction was on line 8 of `docs/DEVELOPMENT.md` — a file that same session
+had already edited twice without reading its first twelve lines — and this
+repo had been bitten once before (`GAUNTLET.md` CH-5: a skill citing
+"CLAUDE.md L1" after the symlink commit moved that text). Cite the file that
+holds the content, never the alias you were handed.
+
+The two pipe rows are the dangerous class, because the reduction ran on a
+*mutating* command and discarded the channel that reported failure —
+the same defect as `2>/dev/null` on a `git branch -D` that silently
+failed. Rules: a filtered view is evidence about the filter; anchor every
+monitor pattern (`^outcome:`); never place a pipe or a `&&` between a
+mutating command and its exit status; confirm a claimed absence
+against the unfiltered artifact before reporting it as a finding; and
+resolve a path before citing it — `git ls-files -s` names the mode.
+
+Calibration note worth keeping with the entry: three of these occurred
+*inside* the retrospective that documents the pattern, and the symlink one
+after the owner had to point it out. Naming a pattern does not stop it. Only
+a rule applied without judgment about whether this case needs it does.
+
+## L22 — A "we never destroy X" invariant is a disk leak until a verb disposes of X
+
+Cerberus, 2026-08-15. Post-merge sweep found **30 GB** in three
+`.sergeant/data/surfaces/<work-id>/` trees whose Works were all terminal
+(two `completed`, one `canceled`), each recording
+`teardown.disposition = retained_dirty`. The policy is right — sergeant
+preserves uncommitted work and never deletes a branch — but there is no
+`sgt` verb to list what is retained or dispose of it once banked, so
+correct retention is indistinguishable on disk from a leak, and the only
+route to the space is `rm -rf` around the engine: precisely the ad hoc
+shell reconstruction the guardrails forbid, aimed at preserved state.
+
+Essentially all of that space is `target/` directories — 11, 11 and 9 GB,
+against a 30 GB total for the three surfaces — build artifacts, gitignored,
+not "uncommitted work" under any reading. So retention scope is the second
+half of the lesson: **what gets preserved must be the thing the policy
+means, not the whole directory it happens to live in.** Filed as #109.
+Generalizes past sergeant: any never-delete guarantee ships incomplete
+without its companion inspect-and-reap verb, because operators route
+around the absence with something more dangerous than the verb would be.
+
+## L21 — Cleanup in a test body protects only the path that succeeds
+
+Cerberus, 2026-08-15. 198 zero-byte files named
+`sgt-watch-test-hold-never-released-*` had accumulated in `/tmp` — which
+on this host is a 16 GB tmpfs whose exhaustion has already caused one
+host-wide incident (#70). `test_hold_wait` writes `<path>.ready` as its
+rendezvous marker; the happy-path test removes it, and the dead-man test —
+whose whole premise is that the release path never appears — removes
+nothing. The failure-path test was the leaking one, which is the general
+shape: the test that exercises the abnormal path is the least likely to
+carry the cleanup, and the most likely to run often.
+
+Cleanup belongs in the code under test or an RAII guard, never only in the
+body of the test that happens to succeed. Related to L6 (an operation that
+fails after producing an unrecorded effect) — here the unrecorded effect is
+a file rather than a journal append. Filed as #108.
+
+## L20 — Stale-but-true is the state that never triggers its own supersession
+
+Cerberus, 2026-08-14. The orchestrating session drove `no-mistakes` by hand
+for a full day — `gate.sh`, `axi respond`, `axi sync --recover` —
+reimplementing `validate-and-ship`'s `40-drive-gates` and
+`50-reconcile-custody` badly, and inventing a workaround around
+`--keep-local` for a dirty-worktree refusal rather than using it, because it
+did not know the flag existed. `AGENTS.md`'s routing table is correct and was
+not ambiguous. But `docs/DEVELOPMENT.md`'s "Shipping gate" section restated
+the procedure in prose and never named the workflow, and a reader who finds
+the prose complete never reaches the catalog.
+
+Owner's framing, and it is the right one: **a document says what we knew when
+it was written; if it is wrong, supersede it and move on.** This repo already
+works that way — `reference/notes/` are living docs revised in place with
+dated entries, `GAUNTLET.md` is append-only, ADRs get refreshed once their
+decision ships.
+
+The sharpening this incident adds is about the *trigger*, not the action.
+That gate prose was never wrong. Every sentence in it was true on the day it
+was written and still true that morning — it predates the engine being able
+to run work at all, so it faithfully described the only flow that existed.
+Nothing contradicted it, so nothing prompted supersession. **Supersession
+fires on contradiction; staleness that keeps telling the truth produces no
+contradiction to fire on**, and the reader who stops there never learns what
+they were not told.
+
+So the mechanical hook cannot be "notice when a doc is wrong." It has to be:
+**when a capability ships, the prose that predates it is part of what ships.**
+That is the ADR-refresh rule this repo already enforces — and demonstrably
+enforces, since the shipping gate caught ADR staleness three separate times in
+one sprint — generalized past ADRs to any document describing a procedure the
+new capability now owns. Publishing a workflow includes asking what prose now
+summarizes it.
+
+Corollary for the layering rule ("the document that owns the topic wins"): it
+resolves *disagreements*, and this failure had none. Two documents both
+telling the truth, one of them written before the engine could run work at
+all, is outside what that rule can adjudicate.
+
 ## L19 — A governing document is an executable diff for the program: it takes the loop
 
 Cerberus day 2, 2026-08-11: the orchestrator authored the MVP bucketing

@@ -8,6 +8,13 @@ Product defects found during this sprint are filed separately (#90, #91,
 #94, #95) and are not repeated here. These are the ones about **how the
 operating instructions and the acting model fit together**.
 
+> **Superseded in part.** This is the capture written *during* the sprint.
+> `retrospective.md` in this directory is the post-merge pass: it carries the
+> residue sweep with measurements (two new product defects, #108 and #109), the
+> tool-call patterns visible only across the whole session, and the doc changes
+> those justify. Sections A–H below are unchanged — where the retrospective
+> disagrees, it is the later reading. Promotions landed as `LESSONS.md` L20–L23.
+
 ---
 
 ## A. Instruction was clear; the model drifted anyway
