@@ -117,8 +117,39 @@ fn write_owner_pid(dir: &Path) {
     let _ = std::fs::write(dir.join(RIG_OWNER_PID_FILE), std::process::id().to_string());
 }
 
+/// Whether `pid` is currently a live process, decided the same
+/// platform-correct way the product itself decides it — never a bare
+/// `/proc` read.
+///
+/// **W7 (#113 platform-correctness fixer).** This function used to read
+/// `Path::new("/proc").join(pid.to_string()).is_dir()` directly, with no
+/// `cfg` guard at all. macOS has no `/proc`, so on macOS that check is
+/// `false` for *every* pid, including live ones, and
+/// [`reap_orphaned_rigs`] would then delete the rig of a run that is still
+/// using it — exactly the "reaping a live run's state would be a worse
+/// defect than the leak this closes" failure that function's own doc
+/// comment calls out.
+///
+/// Ponytail rung **R1** (reuse existing machinery, not a new one):
+/// [`platform::process::process_alive`](sergeant_rs::platform::process::process_alive)
+/// (`src/platform/process.rs`) already solves this identical fact behind
+/// the ADR 0002 platform boundary — `#[cfg(target_os = "linux")]` reads
+/// `/proc` exactly as this function used to, `#[cfg(target_os = "macos")]`
+/// shells to `kill -0` (marked **UNVERIFIED** there — never run on a real
+/// macOS host; verified by running `src/platform/process.rs`'s suite, and
+/// this reaper's own suite, on one), and it is `pub`, so this integration
+/// test can reach it directly. Its own fail-closed direction — assume
+/// alive, never conclude a pid is gone, on a platform this cannot evidence
+/// — is exactly the direction this reaper needs, for free. **R7 (a second,
+/// locally `cfg`-gated copy) was considered and rejected**: duplicating the
+/// macOS arm here would be a second UNVERIFIED implementation to keep in
+/// sync with `process.rs`'s own — the reinvention this sprint's own review
+/// exists to catch (`LESSONS.md` L18; this is the third instance of it in
+/// this sprint alone). The module doc's "dependency-free" pledge above is
+/// about spending this crate's *external* dependency budget; reusing this
+/// crate's own already-public platform module is not that.
 fn pid_is_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).is_dir()
+    sergeant_rs::platform::process::process_alive(pid)
 }
 
 /// Reap rig directories directly under `base` whose owning process is no
