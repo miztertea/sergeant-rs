@@ -26,6 +26,13 @@
 //! direction the asymmetry below calls for (an inconclusive probe must never
 //! refuse). It closes only once someone measures a real detection path on a
 //! macOS host.
+//!
+//! Ponytail rung **R2**: this is a new file, but it reuses the platform
+//! boundary's already-established shape verbatim — the same `#[cfg]`-selected
+//! module plus injected-probe pattern `data_dir.rs`, `disk.rs`, and
+//! `process.rs` already use — rather than inventing a new mechanism, and it
+//! adds no new dependency (`detect_for_path` is called by `daemon.rs` and
+//! `cli.rs`'s doctor row; both are also R2 for the same reason).
 
 use std::path::{Path, PathBuf};
 
