@@ -349,6 +349,43 @@ technical outcome (which, as verified, already holds).
 
 ---
 
+## Finding 9 — T0 has no acceptance criterion of its own, unlike every other named phase
+
+**Severity:** warning
+**Section:** §20.1, cross-checked against §20.5 and §21
+
+**The claim:** §20.1 ends with "write T1 only after rulings." No other
+qualifier follows.
+
+**What I checked:** How the other phases state their own closing
+artifacts. §20.5 (T4) is explicit: "all responsive fixtures; visual
+pre-flight; repeated lifecycle/load/hygiene runs; real Ratatui
+screenshots; README and help updates; ledger/lessons/ADR/proposal
+supersession updates; explicit handoff to P2-JOURNAL." §21's 58-item list
+is the acceptance contract for the whole program, but its items map to
+T1–T4 deliverables (navigation, Fleet, Thread, Estate, geometry tests,
+screenshots) — none of them describe what T0 itself must produce beyond
+the general "rulings" language.
+
+**What I found:** "Write T1 only after rulings" doesn't say what a
+"ruling" is (a written decision? an amendment to this proposal? a new ADR?
+a ledger entry?), where it's recorded, or what a reviewer checks to confirm
+T0 is actually done. The repository has established conventions for
+exactly this (ADRs, `GAUNTLET.md`, the ledger T4 itself cites), but T0
+doesn't point to any of them. A Work dispatched to close out T0 has to
+invent the artifact shape for its own deliverable — the same "no
+operational trigger" gap the FOUNDATION-1 precedent flagged for that
+proposal's §5.1 rebuild-trigger clause, and distinct from Finding 7 (which
+is about §19/§21 items not being tagged per phase, not about T0 lacking a
+closure artifact of its own).
+
+**Survives the correction?** Yes, cheaply — name where T0's rulings land
+(e.g., "recorded as an amendment to this proposal and a `GAUNTLET.md`
+entry, per the repository's existing convention") the same way T4 names
+its own artifacts.
+
+---
+
 ## What I checked and found nothing on
 
 - §8.3's claim that Ratatui 0.30.2 already supplies `Tabs`, `Table`,
@@ -396,3 +433,17 @@ technical outcome (which, as verified, already holds).
   branch — enactable regardless of the PR's actual disposition, which is
   the assumptions axis's question, not this one's (the *re-check timing*
   gap across that same conditional is Finding 6).
+- §19.10's geometry matrix (80×24, 120×36, 180×48) against §18's
+  responsive breakpoints (Narrow 80-99, Medium 100-149, Wide 150+) and
+  §17.7's minimum-size floor: the three fixture sizes land cleanly inside
+  the three named bands with no gap or overlap. Not a finding.
+- §20's remaining phase-to-phase dependencies not already covered by
+  Finding 3 (T1's non-tab deliverables not requiring the T2 catalog
+  endpoint; T3's Estate extraction not requiring T2): checked for the same
+  "orders A before B while B's rationale needs A" pattern FOUNDATION-1
+  found in its own §6, and found none beyond Finding 3's tab-assignment
+  gap.
+- The Ponytail decision register (§22): T2-01 through T2-64 are gapless
+  and non-duplicated against every `Decision T2-NN` citation in the body.
+  Not a finding for this axis (register-content grading against ADR/#-cited
+  decisions belongs to the invariants axis).
