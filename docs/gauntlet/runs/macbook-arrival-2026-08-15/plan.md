@@ -34,6 +34,19 @@ WB/WC (§5) — in scope for this PR, not a Wave-2 gate dependency. Also added:
 **R6**, validate-and-ship is never run with any skip/reduced-profile flag —
 every stage runs in full, every time, no exceptions (§6, §7).
 
+**[v4] Revised after MACBOOK-ARRIVAL-1's four-axis panel — validated with
+findings, no section sent back.** Full record: `critics/`, `refuters/`,
+`adjudication.md` in this directory. Five corrections applied: §2 R6
+rewritten (the "medium profile" citation named the wrong tool as well as the
+wrong stage file — the real, narrower, confirmed risk is `no-mistakes axi
+run --skip`, not a default-profile trap); §5 "disjoint" → "largely
+non-overlapping" (three axes converged on the same misattribution
+separately; the overlap claim itself was independently measured, not just
+reworded); §6 gives WC the same adjacent-append crash-window instruction WB
+already had; §7 gets an explicit WC carve-out; §4 gets a one-line honesty
+note about Wave 0's fetch+checkout not being literally covered by the
+estate-navigation skill's two documented paths.
+
 ---
 
 ## 1. Destination
@@ -58,7 +71,7 @@ Established this conversation, not invented by the orchestrator:
 | R3 | "Task tool" means the harness's own built-in task/todo tracker, not `sgt run` and not a generic subagent | Withheld by default for this session's model (Sonnet 5) per Claude Code's own docs (`Task tool availability`); needs `CLAUDE_CODE_ENABLE_TODO_TOOLS=1` at next restart, which is a settings change only the owner makes. Tracked here as a plain-text checklist meanwhile |
 | R4 | Prior in-session work (macbook.md's measurement, the #18/#81/#82/#95/#127 fixes already committed to `integration/macbook-arrival-2026-08-15`, PR #126) is **evidence**, independently re-verified against live git/GitHub state — not a substitute for this process | Cited as settled fact in the Works below; not redone from scratch, and not treated as needing this panel's re-approval since it is not this plan's output |
 | R5 | This plan itself is the thing under review, not the code it will produce | Panel grades `plan.md`, per the same shape as `PATH-TO-MAC-1` |
-| R6 | `validate-and-ship` is never deferred, skipped, or run at a reduced profile — every stage runs in full, every time | WD's brief and dispatch carry no `--skip`/reduced-profile flag of any kind; if `no-mistakes` itself offers a "medium profile skips review/document stages" option (seen referenced in `20-select-intent-transport`'s own citations), WD's brief explicitly refuses it |
+| R6 | `validate-and-ship` is never deferred, skipped, or run at a reduced profile — every stage runs in full, every time | **[v4]** WD's brief carries an explicit instruction never to pass `--skip` to `no-mistakes axi run` (a real, confirmed flag — `no-mistakes axi run --help`); this is an executor-honesty control, not a mechanical one, since no stage file in `validate-and-ship` structurally prevents it. §7's existing post-dispatch check (every stage actually ran) is the operational backstop. (The plan originally worried about a "medium profile" default skipping stages; that citation named the wrong stage file *and* the wrong tool — `sgt-validate`, a separate upstream script `validate-and-ship`'s stages never invoke — MACBOOK-ARRIVAL-1 panel, invariants F2/refuter.) |
 
 ## 3. Scope
 
@@ -123,6 +136,13 @@ plan) — so the estate clone must sit on `integration/macbook-arrival-2026-08-1
 before Wave 1 dispatches, or Works would cut from `main` and never see R4's
 prior fixes.
 
+**[v4]** Honesty note (MACBOOK-ARRIVAL-1 panel, invariants F1): the `git
+fetch`/`checkout` steps above are functionally correct but not literally
+documented by `skills/estate-navigation/SKILL.md`, whose two named paths are
+`sgt repo add` (new repos) and `git pull --ff-only` (an already-declared
+repo behind its remote) — a fresh-clone branch switch is a gap in what the
+skill writes down, not in what the commands do.
+
 ## 5. Waves
 
 | Wave | Work | Scope | Cut from | Depends on |
@@ -134,13 +154,18 @@ prior fixes.
 | 2 | **WD · gate** | `validate-and-ship`, dispatched (ADR 0005), full pipeline, no skipped stages (R6) | Wave-1 tip (WB+WC merged; WA merged too if already landed, but not waited on) | WB, WC both `completed` and merged to the integration branch |
 | 3 | *(orchestrator)* | Adjudicate WD's findings; update PR #126's body with full provenance | — | WD |
 
-WA/WB/WC touch disjoint file sets (`scripts/gate.sh` ·
-`src/runtime/{recovery,engine}.rs` + `tests/m3_execution.rs` ·
-`tests/m2_daemon_api.rs` + `src/runtime/{engine,surface}.rs` + `docs/perf/`)
-— each Work gets its own isolated worktree by construction (`sgt`'s
-one-Work-one-surface model), so parallel dispatch is safe; residual risk is
-an ordinary merge conflict if WC's profiling touches the same submit-path
-lines WB's fix does, flagged in §8.
+WA/WB/WC touch **largely non-overlapping** file sets — **[v4]** corrected
+from "disjoint," which self-contradicted the very next clause (both WB and
+WC list `src/runtime/engine.rs`). Measured, not just reworded: WB's
+plausible fix region is the reconciliation cluster (`reconcile_work`,
+`reconcile_unsettled_reservation`, `reconcile_crashed_start`, ≈ lines
+2383–2800); WC's is the submit path (`plan`, `start`/`begin_start`,
+`settle_surface`/`settle_materialize`, `reserve_stage`, `settle_launch`, ≈
+lines 1089–1692 and 2848–3183). No function appears in both regions
+(MACBOOK-ARRIVAL-1 panel, assumptions refuter). Each Work gets its own
+isolated worktree by construction (`sgt`'s one-Work-one-surface model), so
+parallel dispatch is safe; residual risk is an ordinary merge conflict only
+near the ≈2799/2848 boundary, flagged in §8.
 
 ## 6. Dispatch
 
@@ -158,13 +183,18 @@ replacement, not a manifest edit invented to route around the refusal.
 Each brief states: the issue's full body (not just its title) as **settled**
 prior art; the exact acceptance test (the issue's own repro command where one
 exists); a `Fixes #NN` trailer requirement, argued for, not assumed; evidence-
-vs-belief labels (**L15**); and — for WA/WB specifically, since they touch
-`scripts/` and `src/runtime/` respectively — WA gets the bash-3.2-clean
-constraint (`docs/handoff/path-to-mac.md` step 8) and WB gets the
-adjacent-append crash-window check (**L6**, `docs/DEVELOPMENT.md:41`). WC's
-brief states explicitly that "profiled, no safe fix found, documented
-instead" is an acceptable stage-30 outcome, not a failed Work — its own
-issue text says so.
+vs-belief labels (**L15**); and — for WA/WB/WC, since all three can touch
+`src/runtime/` or `scripts/` — WA gets the bash-3.2-clean constraint
+(`docs/handoff/path-to-mac.md` step 8), and **both WB and WC** get the
+adjacent-append crash-window check (**L6**, `docs/DEVELOPMENT.md:41`) —
+**[v4]** WC's file scope (§3) includes `src/runtime/engine.rs`/`surface.rs`
+too, and the plan's "documented instead is acceptable" language establishes
+a no-fix outcome is *allowed*, not that a fix is *forbidden*; if WC does land
+a code change there, L6 applies exactly as it does to WB (MACBOOK-ARRIVAL-1
+panel, invariants F3, confirmed by both critic and refuter). WC's brief
+states explicitly that "profiled, no safe fix found, documented instead" is
+an acceptable stage-30 outcome, not a failed Work — its own issue text says
+so.
 
 `--workflow implement` for WA/WB/WC (bounded, single-outcome code fixes,
 each with a named acceptance test — `implement`'s `10-implement-with-tdd`
@@ -201,7 +231,17 @@ files specifically).
   (`sgt --json watch <id>` / `--follow` for the parallel Wave 1 trio).
 - No `completed` believed on its own: verify `git log base..sergeant/<id>`
   is non-empty and the named acceptance test actually passes, independently,
-  the same discipline the prior sprint's #94 finding demands.
+  the same discipline the prior sprint's #94 finding demands. **[v4] WC
+  carve-out**: this rule is satisfied for WC specifically by *either* the
+  named test passing *or* a measured, justified disposition committed and
+  reviewed at stage 30 — "documented, no fix" is a legitimate WC outcome per
+  §6, and `implement`'s own stage contracts (`10-implement-with-tdd`,
+  `30-review`) carry no requirement that a test go green before a Work
+  completes (MACBOOK-ARRIVAL-1 panel, enactability E1/refuter — the
+  suggested alternative of dispatching WC via `--workflow research` instead
+  was considered and rejected: `research`'s single stage has no
+  implementation capacity, and WC's primary expected outcome is still a code
+  fix or floor revision).
 - A Wave-1 Work landing `failed`: retry once against the same base. For WB/WC
   a second failure blocks Wave 2 and escalates to the owner. For WA (not a
   Wave-2 dependency) a second failure is recorded and escalated but does not
@@ -243,8 +283,13 @@ files specifically).
 
 ## 9. How this plan was reviewed
 
-*Filled in after the panel runs — see `critics/`, `refuters/`, and
-`adjudication.md` in this same directory.*
+`MACBOOK-ARRIVAL-1` — 4 blind critic seats dispatched as real `sgt` Work
+items (`--workflow research`), 4 batched per-axis refuters, all Sonnet, all
+via `--backend claude`. **13 findings · 11 confirmed · 0 outright refutations
+· 2 partial refutations narrowing a WARNING to INFO · 0 sections sent back.**
+Full record in `critics/`, `refuters/`, and `adjudication.md`. Outcome:
+**validated with findings** — this document, v4, carries every correction
+applied.
 
 ## 10. What this sprint closes
 

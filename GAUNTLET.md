@@ -58,6 +58,63 @@ letter by coincidence, as D6 and D7 do here.
 
 ## Ledger entries
 
+### MACBOOK-ARRIVAL-1 — 2026-08-15, a plan graded before it governed: validated with findings, no section sent back
+
+**Mission outcome: validated with findings.** Artifact:
+`docs/gauntlet/runs/macbook-arrival-2026-08-15/plan.md` — a three-Work sprint
+(WA/WB/WC) plus a dependent gate Work (WD), closing out the three genuinely
+open findings from the MacBook arrival trip (#128, #129, #130). Authored
+in-session after the owner ruled the session's own prior conduct that trip
+**draft evidence, not delivered process**: no plan filed, no workflow named,
+no dispatched Work tracking the effort, and the shipping gate hand-driven in
+direct contradiction of ADR 0005. This unit is the correction. Contract:
+`docs/gauntlet/contracts/MACBOOK-ARRIVAL-1.md`. Full record in
+`docs/gauntlet/runs/macbook-arrival-2026-08-15/` (`critics/`, `refuters/`,
+`adjudication.md`).
+
+**Verdicts.** 13 findings across four axes: 11 confirmed, 0 outright
+refutations, 2 partial refutations (each narrowing a WARNING to INFO by
+disproving the feared mechanism while confirming a real, narrower one in its
+place).
+
+| Axis | Findings | Refuted | Confirmed | Moves |
+|---|---|---|---|---|
+| fidelity | 5 (1 + 4 PLAUSIBLE) | 0 | 5 | none |
+| assumptions | 2 | 0 | 2 | none |
+| enactability | 3 | 1 (structural arm) | 3, one narrowed | 1 down |
+| invariants | 3 | 1 (structural arm) | 3, one narrowed | 1 down |
+
+**Three axes converged on one citation, independently.** Fidelity,
+enactability, and invariants each separately found the plan's R6 misattributed
+a stage-30 citation to stage 20. The invariants refuter went one step further
+and found the citation also named the wrong *tool* — an unrelated upstream
+script (`sgt-validate`) that `validate-and-ship`'s actual stages never invoke.
+The real, narrower, surviving risk: `no-mistakes axi run --skip` is a real
+flag with no mechanical guard against it, an executor-honesty risk rather
+than a default-path trap — both refuters landed on the same downgrade
+independently.
+
+**A plan-review panel this small still earned its full four axes** (this
+unit's own contract Unknown #2, quoting the "small diffs batch into the next
+larger panel" economy revision's own text: *"the review still happens; the
+ceremony doesn't multiply"* — misapplied by the orchestrator mid-session as
+grounds to skip review outright, corrected before dispatch). Third
+plan-shaped unit on this repo (`FOUNDATION-1`, `PATH-TO-MAC-1` precede it);
+third all-Sonnet panel, second data point with a Sonnet-5 (not Fable)
+orchestrator.
+
+**Environmental behavior.** 8 dispatched Works (4 blind critics, 4 batched
+refuters), all `--workflow research`, all `completed` on first attempt, zero
+`needs_input`, zero failures. Every "completed" claim independently verified
+against `git log`/`git diff --stat` on the Work's own branch before being
+trusted — none accepted on the Work's self-report alone. Estate-wide
+`sgt --json watch --follow`, armed via the harness's `Monitor` tool rather
+than a bare backgrounded shell command specifically because the prior
+sprint's own retrospective records that exact failure mode (backgrounded
+`sgt watch` killed at ~160s). This estate had never been set up on this host
+before this unit — `sgt repo add` + a branch-pointed clone were this unit's
+own Wave 0, a first-contact step the prior sprint's plan didn't need.
+
 ### PATH-TO-MAC-1 — 2026-08-15, a plan graded before it governed: two sections sent back, premise disproved
 
 **Mission outcome: sent back on §4/§5, validated with findings elsewhere.** The
