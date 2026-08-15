@@ -3487,6 +3487,42 @@ fn data_dir_new_reaps_an_orphaned_rig_left_by_a_prior_killed_run() {
     );
 }
 
+/// W7 (#113 platform-correctness fixer): `pid_is_alive` must decide macOS
+/// liveness through the platform boundary's own, already-cfg-gated
+/// `process_alive` (`src/platform/process.rs`), not a bare, unguarded
+/// `/proc` read. The bug this pins: `Path::new("/proc").join(pid.to_string())
+/// .is_dir()` with no `cfg` guard is `false` for *every* pid on a host with
+/// no `/proc` at all — macOS — so the reaper would delete the rig of a run
+/// that is still using it, on exactly the platform this sprint exists to
+/// reach.
+///
+/// This can't be pinned by running the suite here: this host *has* `/proc`,
+/// so the old bare read and the fixed `process_alive` delegation answer
+/// identically for any real pid on Linux (the sibling test above already
+/// exercises that shared behavior). What differs only on a platform this
+/// suite cannot run on is not observable by any assertion over live
+/// process state — so, same shape as `t5` above pinning `tui.rs`'s client
+/// boundary via a source scan rather than a runtime probe, this pins the
+/// *wiring*: revert `pid_is_alive` back to the bare `/proc` read (verified
+/// in a disposable `/var/tmp` worktree per L7) and this fails, because the
+/// source no longer names `process_alive`.
+#[test]
+fn the_reaper_liveness_check_goes_through_the_platform_boundary_not_a_bare_proc_read() {
+    let source = read_test_support_source();
+    assert!(
+        source.contains("platform::process::process_alive"),
+        "tests/support/mod.rs's pid_is_alive must delegate to \
+         sergeant_rs::platform::process::process_alive (src/platform/process.rs), \
+         whose macOS arm is cfg-gated — a bare, unguarded `/proc` read reports \
+         every pid dead on a platform with no `/proc`"
+    );
+}
+
+fn read_test_support_source() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/mod.rs");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"))
+}
+
 // -------------------------------------------------- perf clock guard pin
 
 /// #95: `scripts/perf/common.sh`'s `perf_now_ns`/`perf_mark` must fail
