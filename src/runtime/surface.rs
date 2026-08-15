@@ -1828,6 +1828,89 @@ mod tests {
         ));
     }
 
+    /// Mirrors `materialize`'s own
+    /// `a_disallowed_submodule_transport_fails_closed_and_is_not_stranded`,
+    /// but pins the regression this fix closes in `attach`'s own code path:
+    /// before it, `init_submodules_if_present` ran *inside* `attach_one`, so
+    /// a failure there returned `attach_one`'s bare `Err` without the binding
+    /// the worktree add had already produced — `attach`'s "nothing to roll
+    /// back, this is the first repository" case fired unconditionally on
+    /// position (this is the only repository) and stranded the worktree with
+    /// no teardown, no report, nothing journaled.
+    #[test]
+    fn attach_disallowed_submodule_transport_fails_closed_and_is_not_stranded() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let inner = repo(&dir.path().join("inner"));
+        let spec = repo(&dir.path().join("solo"));
+
+        let target = materialize(data.path(), "01SUBTARGET", std::slice::from_ref(&spec))
+            .expect("materialize target");
+        let worktree = target.bindings[0].worktree_path.clone();
+
+        // Declare a submodule over a transport `init_submodules_if_present`'s
+        // allowlist refuses (`ext::`, the same allowlist `git_clone` uses),
+        // committed onto the target's own work branch so `attach` inherits
+        // it when it checks that branch out fresh into the gate surface.
+        let inner_head = git(&inner.path, &["rev-parse", "HEAD"]).expect("inner HEAD");
+        std::fs::write(
+            worktree.join(".gitmodules"),
+            "[submodule \"vendored\"]\n\tpath = vendored\n\turl = ext::false\n",
+        )
+        .expect(".gitmodules");
+        std::fs::create_dir_all(worktree.join("vendored")).expect("placeholder");
+        git_as_test_identity(&worktree, &["add", ".gitmodules"]);
+        git_as_test_identity(
+            &worktree,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &inner_head,
+                "vendored",
+            ],
+        );
+        git_as_test_identity(&worktree, &["commit", "-m", "an unreachable submodule"]);
+
+        let target_report = teardown(&target);
+        assert!(
+            target_report.clean,
+            "the fixture must reach the clean-teardown precondition: {target_report:?}"
+        );
+
+        let err = attach(data.path(), "01GATE", "01SUBTARGET", &target.bindings)
+            .expect_err("a disallowed submodule transport must refuse the takeover");
+        let SurfaceError::PartialFailure {
+            source,
+            teardown: rollback,
+        } = err
+        else {
+            panic!(
+                "expected the same rolled-back-and-reported shape a later repository's \
+                 failure gets, got a bare {err} — the worktree add_worktree already created \
+                 would be left with no report at all"
+            );
+        };
+        assert!(
+            source.to_string().contains("ext"),
+            "git's own transport diagnostic must survive: {source}"
+        );
+        assert_eq!(rollback.bindings.len(), 1);
+        assert_eq!(rollback.bindings[0].repository, "solo");
+        assert_eq!(
+            rollback.bindings[0].disposition,
+            BindingDisposition::Removed,
+            "a submodule that never checked anything out has nothing to retain: {:?}",
+            rollback.bindings[0].disposition
+        );
+        assert!(
+            !data.path().join("01GATE").join("solo").exists(),
+            "the worktree add_worktree created before the submodule failure must not survive"
+        );
+        assert!(rollback.clean);
+    }
+
     /// `attach` needs at least one target binding — the same rule
     /// `materialize` enforces for repositories, for the same reason: a
     /// surface with no worktrees could never execute anything.
