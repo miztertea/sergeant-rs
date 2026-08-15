@@ -1075,6 +1075,123 @@ fn work_transcript_and_output_pointer_are_reachable_from_the_real_cli() {
     data_dir.reap();
 }
 
+/// guard-map: `sgt work retained` and `sgt work reap` (#109), reachable end
+/// to end through the real CLI/daemon. `sgt work reap <id>` without `--yes`
+/// previews and destroys nothing; `--yes` actually disposes of the captured
+/// patch a dirty teardown left behind, and the entry drops out of `sgt work
+/// retained` afterward.
+#[test]
+fn work_retained_and_reap_are_reachable_from_the_real_cli() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_two_stage_workflow(repo.path());
+
+    // `hang` keeps the first stage in flight so the worktree can be dirtied
+    // before anything tears it down — the env reaches the auto-spawned
+    // daemon this `run` call spawns, the same way `SGT_FAKE_SCRIPT` reaches
+    // it in the §39 walkthrough.
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[("SGT_FAKE_SCRIPT", "hang")],
+        &[
+            "--json",
+            "run",
+            "--workflow",
+            "tiny",
+            "leaves a mess for #109",
+        ],
+    );
+    submitted.assert_ok("run");
+    let work_id = submitted.json()["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    let worktree = PathBuf::from(
+        submitted.json()["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+    std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty the worktree");
+
+    run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["cancel", &work_id],
+    )
+    .assert_ok("cancel");
+    wait_for_state(repo.path(), data_dir.path(), &work_id, "canceled");
+
+    // `sgt work retained` names it.
+    let retained = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "work", "retained"],
+    );
+    retained.assert_ok("work retained");
+    let entries = retained.json()["retained"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let entry = entries
+        .iter()
+        .find(|e| e["work_id"] == work_id)
+        .unwrap_or_else(|| panic!("the dirty binding must be listed: {:?}", retained.json()));
+    assert_eq!(entry["disposition"], "retained_dirty");
+    let patch_path = PathBuf::from(entry["path"].as_str().expect("patch path"));
+    assert!(patch_path.is_file(), "the named patch must actually exist");
+
+    // Without `--yes`, reap previews and destroys nothing.
+    let preview = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "reap", &work_id],
+    );
+    preview.assert_ok("work reap (preview)");
+    assert!(
+        preview.stdout.contains("--yes"),
+        "an unconfirmed reap must point at --yes: {}",
+        preview.stdout
+    );
+    assert!(patch_path.is_file(), "a preview must not touch anything");
+
+    // `--yes` actually disposes of it.
+    let reaped = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "reap", &work_id, "--yes"],
+    );
+    reaped.assert_ok("work reap --yes");
+    assert!(
+        !patch_path.exists(),
+        "reap --yes must actually delete the patch"
+    );
+
+    let retained_after = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["--json", "work", "retained"],
+    );
+    retained_after.assert_ok("work retained (after reap)");
+    assert!(
+        retained_after.json()["retained"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|e| e["work_id"] != work_id),
+        "a reaped binding must not still be listed: {:?}",
+        retained_after.json()
+    );
+
+    data_dir.reap();
+}
+
 // -------------------------------------------------- envelope / daemon stop
 
 /// guard-map: `sgt run --turns N --ceiling-secs S` (checkpoint-friction

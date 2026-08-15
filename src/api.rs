@@ -63,7 +63,7 @@ use crate::runtime::projection::{
 };
 use crate::runtime::surface::{
     BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
-    KIND_SURFACE_TORN_DOWN,
+    KIND_SURFACE_TORN_DOWN, reap, retained_bindings,
 };
 
 /// API revision served by this build (`GET /v1/system`, runtime descriptor).
@@ -394,6 +394,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/work/{id}/input", post(work_input))
         .route("/work/{id}/retry", post(work_retry))
         .route("/work/{id}/extend", post(work_extend))
+        .route("/work/{id}/reap", post(reap_work))
+        .route("/retained", get(list_retained))
         .route("/admission/pause", post(pause_admission))
         .route("/graph/work/{id}", get(work_graph))
         .route("/analytics", get(analytics_index))
@@ -2282,6 +2284,146 @@ async fn work_extend(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ReapRequest {
+    command_id: String,
+    /// Must be `true`, or the request is refused (#109: reap has no undo,
+    /// so intent is never guessed).
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `POST /v1/work/{id}/reap` — #109's dispose verb: permanently discard
+/// whatever `RetainedDirty` bindings still hold for this Work's teardown
+/// (`crate::runtime::surface::reap`'s own doc has the full contract — the
+/// captured patch, or the submodule/capture-failure fallback directory;
+/// never the retained branch, which stays outside anything this verb can
+/// reach).
+///
+/// Refuses without `{"confirm": true}` in the body: unlike `cancel`/
+/// `retry`/`extend`, there is no journaled state this can safely undo by
+/// resubmitting a different command, so a bare or malformed body is
+/// ambiguity, not an implicit yes (`AGENTS.md`'s fail-closed rule). An
+/// operator reviews `GET /v1/retained` first — that is the read half of
+/// this same pair — then re-sends with confirmation.
+async fn reap_work(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    body: Result<Json<ReapRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = CoreGuard::acquire(&state.core).await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if !req.confirm {
+        let result = error_body(
+            "confirmation_required",
+            "reap destroys retained dirty state with no undo; review GET /v1/retained for \
+             this work, then resend with \"confirm\": true",
+        );
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.reap",
+            Some(&id),
+            StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    let Some(work) = core.registry.state().works.get(&id).cloned() else {
+        let result = error_body("work_not_found", format!("no work with id {id}"));
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.reap",
+            None,
+            StatusCode::NOT_FOUND,
+            result,
+        );
+    };
+    let run = resolve_run(&core, &work, core.registry.state().run_view(&id));
+    let bound = run.and_then(|r| match (r.surface.clone(), r.teardown.clone()) {
+        (Some(surface), Some(teardown)) => Some((surface, teardown)),
+        _ => None,
+    });
+    let Some((surface, teardown)) = bound else {
+        let result = error_body(
+            "nothing_to_reap",
+            format!("work {id} has no recorded teardown to reap"),
+        );
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.reap",
+            Some(&id),
+            StatusCode::NOT_FOUND,
+            result,
+        );
+    };
+    // §22.6 tradeoff, same disclosure as `work_transcript`'s: this runs git
+    // and filesystem calls (potentially a real, if small, worktree removal)
+    // while the core guard is held, queueing every other guarded request for
+    // its duration. Reap is rare and explicit, never on a hot path, so this
+    // is accepted rather than plumbed through the async effect system the
+    // way `teardown` itself is.
+    let report = blocking_sync(|| reap(&surface, &teardown));
+    let result = json!({"report": report});
+    record_and_respond(
+        &mut core,
+        &req.command_id,
+        "work.reap",
+        Some(&id),
+        StatusCode::OK,
+        result,
+    )
+}
+
+/// `GET /v1/retained` — #109's inspect verb: every repository binding any
+/// terminal Work's teardown left something on disk for, across the whole
+/// estate — a captured patch, the submodule/capture-failure fallback
+/// directory, or a `RetainedError`. Correct retention is otherwise
+/// indistinguishable from a leak (#109); this is the read side of that
+/// pair, `POST /v1/work/{id}/reap` the write side.
+///
+/// Same `resolve_run` journal-replay fallback `fleet_body`/`work_view`
+/// already rely on for an evicted terminal work — and the same accepted
+/// tradeoff `work_transcript` discloses: a terminal work not already in the
+/// bounded cache costs a full journal replay under the guard. Inspecting
+/// retained state is an occasional, operator-driven action, not a hot path.
+async fn list_retained(State(state): State<ApiState>) -> Response {
+    let core = CoreGuard::acquire(&state.core).await;
+    let registry = core.registry.state();
+    let entries: Vec<Value> = registry
+        .works
+        .values()
+        .filter_map(|work| {
+            let run = resolve_run(&core, work, registry.run_view(&work.id))?;
+            let teardown = run.teardown?;
+            Some((work.id.clone(), retained_bindings(&teardown)))
+        })
+        .flat_map(|(work_id, bindings)| {
+            bindings.into_iter().map(move |b| {
+                json!({
+                    "work_id": work_id,
+                    "repository": b.repository,
+                    "path": b.path,
+                    "disposition": b.reason,
+                    "detail": b.detail,
+                    "bytes": b.bytes,
+                })
+            })
+        })
+        .collect();
+    Json(json!({"retained": entries})).into_response()
+}
+
 /// Catch the analytical projection up to the journal, then hand it to `f`.
 ///
 /// The projection is folded lazily, at read time, rather than on every
@@ -2909,6 +3051,26 @@ impl ApiClient {
             &json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "input": input,
+            }),
+        )
+        .await
+    }
+
+    /// `GET /v1/retained` — #109's inspect verb: every repository binding
+    /// any terminal Work's teardown left something on disk for, estate-wide.
+    pub async fn retained(&self) -> Result<Value, ClientError> {
+        self.get("/v1/retained").await
+    }
+
+    /// `POST /v1/work/{id}/reap` with a fresh command id (§26) — #109's
+    /// dispose verb. `confirm` must be `true` or the daemon refuses (fail
+    /// closed: reap has no undo).
+    pub async fn reap(&self, id: &str, confirm: bool) -> Result<Value, ClientError> {
+        self.post(
+            &format!("/v1/work/{id}/reap"),
+            &json!({
+                "command_id": ulid::Ulid::generate().to_string(),
+                "confirm": confirm,
             }),
         )
         .await

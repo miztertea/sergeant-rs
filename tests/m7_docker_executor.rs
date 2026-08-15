@@ -1476,6 +1476,14 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
     assert_no_containers_for_work(&work_id);
 }
 
+/// Looks for `validated.txt` as a plain file (a clean worktree, or a
+/// `RetainedError`/submodule-fallback directory still standing whole), or —
+/// #109's retention-scope change — inside a captured `*.dirty.patch`: an
+/// uncommitted execute-stage artifact is exactly the "dirty state" R4 says
+/// teardown retains as a patch rather than the whole directory, so the
+/// evidence this test is proving survives teardown now travels in that
+/// form. Either way the evidence handed to the following actor was not
+/// lost, which is the actual N4/§21.5 claim this test pins.
 fn walk_for_marker(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -1488,8 +1496,15 @@ fn walk_for_marker(dir: &Path) -> bool {
             }
         } else if path.file_name().and_then(|n| n.to_str()) == Some("validated.txt")
             && let Ok(content) = std::fs::read_to_string(&path)
+            && content.trim() == "container-produced-evidence"
         {
-            return content.trim() == "container-produced-evidence";
+            return true;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("patch")
+            && let Ok(content) = std::fs::read_to_string(&path)
+            && content.contains("validated.txt")
+            && content.contains("container-produced-evidence")
+        {
+            return true;
         }
     }
     false
