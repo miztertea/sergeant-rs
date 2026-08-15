@@ -3504,18 +3504,49 @@ fn data_dir_new_reaps_an_orphaned_rig_left_by_a_prior_killed_run() {
 /// process state — so, same shape as `t5` above pinning `tui.rs`'s client
 /// boundary via a source scan rather than a runtime probe, this pins the
 /// *wiring*: revert `pid_is_alive` back to the bare `/proc` read (verified
-/// in a disposable `/var/tmp` worktree per L7) and this fails, because the
-/// source no longer names `process_alive`.
+/// in a disposable `/var/tmp` worktree per L7) and this fails.
+///
+/// Scoped to the function *body*, not the whole file: an earlier version of
+/// this test scanned the full source, which made it pass against a reverted
+/// body anyway, because `pid_is_alive`'s own doc comment (this file,
+/// `tests/support/mod.rs`) names `platform::process::process_alive` in a
+/// rustdoc link — a revert that leaves that comment in place, which is what
+/// a real revert of just the function body does, left the substring in the
+/// file and the test green. Caught by actually reverting in a disposable
+/// `/var/tmp` worktree per L7, not by inspection.
 #[test]
 fn the_reaper_liveness_check_goes_through_the_platform_boundary_not_a_bare_proc_read() {
     let source = read_test_support_source();
+    let body = pid_is_alive_body(&source);
     assert!(
-        source.contains("platform::process::process_alive"),
+        body.contains("process_alive"),
         "tests/support/mod.rs's pid_is_alive must delegate to \
          sergeant_rs::platform::process::process_alive (src/platform/process.rs), \
          whose macOS arm is cfg-gated — a bare, unguarded `/proc` read reports \
-         every pid dead on a platform with no `/proc`"
+         every pid dead on a platform with no `/proc`. Body was: {body:?}"
     );
+    assert!(
+        !body.contains("/proc"),
+        "tests/support/mod.rs's pid_is_alive must not read /proc directly — that bare \
+         read is the bug this test pins. Body was: {body:?}"
+    );
+}
+
+/// The braces-delimited body of `fn pid_is_alive(pid: u32) -> bool { ... }`,
+/// so the assertions above scan only the implementation and not any doc
+/// comment above it (see the test's own doc comment for why that distinction
+/// is load-bearing). Assumes a body with no nested braces, true of both the
+/// delegating form and the bare-`/proc`-read form this test must catch.
+fn pid_is_alive_body(source: &str) -> &str {
+    let sig = "fn pid_is_alive(pid: u32) -> bool {";
+    let start = source
+        .find(sig)
+        .unwrap_or_else(|| panic!("tests/support/mod.rs must declare `{sig}`"));
+    let after_sig = &source[start + sig.len()..];
+    let end = after_sig
+        .find('}')
+        .expect("pid_is_alive's body must close with a `}`");
+    &after_sig[..end]
 }
 
 fn read_test_support_source() -> String {
