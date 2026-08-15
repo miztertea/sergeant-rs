@@ -163,7 +163,16 @@ sgt analytics blocked_time_per_work  # answer one of them
 sgt doctor
 ```
 
-Checks git, the `claude` CLI (presence and version gate), the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, and disk pressure inside the data directory — in that order, so a fault is reported under the right name; an unwritable data directory makes Docker and disk pressure decline with a pointer back to the `data_dir` row instead of re-diagnosing the same fault under their own name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon, because it's diagnosing the installation, not priming it — it joins `status`, `work`, `analytics`, `watch`, `tui`, and `daemon stop` in never materializing a daemon just to observe it (only `run`/`respond`/`retry`/`extend`/`cancel` do that).
+Checks git, the `claude` CLI (presence and version gate), whether the toolchain directories `sgt claude` (and its siblings) would add to `PATH` are already on it, the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, and disk pressure inside the data directory — in that order, so a fault is reported under the right name; an unwritable data directory makes Docker and disk pressure decline with a pointer back to the `data_dir` row instead of re-diagnosing the same fault under their own name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon, because it's diagnosing the installation, not priming it — it joins `status`, `work`, `analytics`, `watch`, `tui`, and `daemon stop` in never materializing a daemon just to observe it (only `run`/`respond`/`retry`/`extend`/`cancel` do that).
+
+**Launch a harness bound to this estate:**
+
+```sh
+sgt claude                     # or codex / opencode / goose
+sgt claude -- --model opus     # everything after `--` passes through verbatim
+```
+
+Composes an environment (enriches `PATH` with `~/.cargo/bin` and `~/.local/bin` when they exist, binds `SGT_DATA_DIR` to this invocation's resolved data dir) and **exec**s into the harness — replacing the `sgt` process, never forking and supervising it (`docs/adr/0006-harness-passthrough.md`).
 
 **Manage the estate** — the directory declaring the repositories and groups a work item can target with `--repo`/`--group`:
 

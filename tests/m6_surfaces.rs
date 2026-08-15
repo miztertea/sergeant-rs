@@ -863,13 +863,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // --- healthy -------------------------------------------------------------
     let (code, stdout, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
     let (code, healthy_json, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     assert_eq!(code, Some(0));
@@ -934,7 +942,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     seed_journal(used.path(), 5);
     let (code, stdout, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(
@@ -944,7 +956,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, used_json, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&used_json).expect("json");
@@ -969,13 +985,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     corrupt_journal(used.path());
     let (code, stdout, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(code, Some(0), "an unreplayable journal must exit nonzero");
     let (_, torn_json, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&torn_json).expect("json");
@@ -1004,7 +1028,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // order, statuses) — only details may move.
     let (_, first_again, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let first_again: Value = serde_json::from_str(&first_again).expect("json");
@@ -1106,7 +1134,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
         let (code, stdout, _) = doctor(
             live_data.path(),
-            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+            &[
+                ("SGT_CLAUDE_BIN", &claude),
+                ("SGT_DOCKER_BIN", &docker),
+                ("HOME", &home),
+            ],
             false,
         );
         assert_eq!(
@@ -1116,7 +1148,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         );
         let (_, live_json, _) = doctor(
             live_data.path(),
-            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+            &[
+                ("SGT_CLAUDE_BIN", &claude),
+                ("SGT_DOCKER_BIN", &docker),
+                ("HOME", &home),
+            ],
             true,
         );
         let report: Value = serde_json::from_str(&live_json).expect("json");
@@ -1144,7 +1180,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     write_descriptor(stale.path(), dead_pid(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor(
         stale.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(
@@ -1154,7 +1194,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, stale_json, _) = doctor(
         stale.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&stale_json).expect("json");
@@ -1181,7 +1225,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     write_descriptor(occupied.path(), squatter.id(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor(
         occupied.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(
@@ -1191,7 +1239,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, wedged_json, _) = doctor(
         occupied.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&wedged_json).expect("json");
@@ -1221,13 +1273,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     std::fs::write(&blocked, b"this is a file").expect("write file");
     let (code, stdout, _) = doctor(
         &blocked,
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(code, Some(0), "an unusable data dir must exit nonzero");
     let (_, broken_json, _) = doctor(
         &blocked,
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker), ("HOME", &home)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&broken_json).expect("json");
