@@ -3387,6 +3387,135 @@ fn the_coverage_harness_grades_its_own_accounting() {
     );
 }
 
+// ---------------------------------------------------- rig-reaper self-test
+
+/// #113: eight `TempDir`-shaped rigs, 1.7 GB, left behind by suite runs that
+/// got `SIGKILL`ed mid-run — `Drop` never runs for those, so the fix is a
+/// reaper that runs at the start of the *next* run rather than another
+/// destructor. `support::reap_orphaned_rigs` is what does that sweep; this
+/// grades it directly rather than trusting a mechanism nothing exercises.
+#[test]
+fn the_rig_reaper_removes_only_orphans_whose_owner_process_is_actually_dead() {
+    let base = TempDir::new().expect("scratch base for the reaper test");
+    let base = base.path();
+
+    // An orphan: its marker names a pid this test can prove is dead, because
+    // it spawned and `wait()`ed on it itself — no ambiguity about whether
+    // the process table still holds it.
+    let mut dead = Command::new("true")
+        .spawn()
+        .expect("spawn a short-lived process");
+    let dead_pid = dead.id();
+    dead.wait()
+        .expect("wait for the short-lived process to exit");
+    let orphan = base.join("orphan-rig");
+    std::fs::create_dir_all(&orphan).expect("create fake orphaned rig");
+    std::fs::write(
+        orphan.join(support::RIG_OWNER_PID_FILE),
+        dead_pid.to_string(),
+    )
+    .expect("write dead owner-pid marker");
+
+    // A live rig: its marker names this very test process, which is alive
+    // for the whole test — reaping it would be exactly the "eats a live
+    // run's state" defect the issue calls out as worse than the leak.
+    let live = base.join("live-rig");
+    std::fs::create_dir_all(&live).expect("create fake live rig");
+    std::fs::write(
+        live.join(support::RIG_OWNER_PID_FILE),
+        std::process::id().to_string(),
+    )
+    .expect("write live owner-pid marker");
+
+    // A pre-#113 rig: no marker at all. Left alone rather than guessed
+    // about.
+    let unmarked = base.join("unmarked-rig");
+    std::fs::create_dir_all(&unmarked).expect("create fake unmarked rig");
+
+    let reaped = support::reap_orphaned_rigs(base);
+
+    assert_eq!(
+        reaped,
+        vec![orphan.clone()],
+        "exactly the dead-owner rig must be reaped"
+    );
+    assert!(!orphan.exists(), "the orphaned rig must be gone");
+    assert!(
+        live.exists(),
+        "a rig with a live owner must survive the sweep"
+    );
+    assert!(unmarked.exists(), "an unmarked rig must survive the sweep");
+}
+
+/// The same sweep, exercised through `DataDir::new()` itself rather than the
+/// bare function — proving the wiring, not just the mechanism. Runs against
+/// the real disk-backed base (or its `SGT_TEST_TMPDIR` override) because
+/// that is what every suite's `DataDir::new()` actually sweeps; the planted
+/// orphan's pid is independently proven dead the same way as above, so this
+/// is safe to run alongside any other suite sharing that base.
+#[test]
+fn data_dir_new_reaps_an_orphaned_rig_left_by_a_prior_killed_run() {
+    let Some(base) = support::disk_backed_tmp_base() else {
+        eprintln!("SKIPPED-ENV: no disk-backed tmp base on this host");
+        return;
+    };
+    std::fs::create_dir_all(&base).expect("create disk-backed test tmp base dir");
+
+    let mut dead = Command::new("true")
+        .spawn()
+        .expect("spawn a short-lived process");
+    let dead_pid = dead.id();
+    dead.wait()
+        .expect("wait for the short-lived process to exit");
+    let orphan = base.join(format!("sgt-rs-tests-orphan-pin-{}", std::process::id()));
+    std::fs::create_dir_all(&orphan).expect("create fake orphaned rig");
+    std::fs::write(
+        orphan.join(support::RIG_OWNER_PID_FILE),
+        dead_pid.to_string(),
+    )
+    .expect("write dead owner-pid marker");
+
+    let _data_dir = DataDir::new();
+
+    assert!(
+        !orphan.exists(),
+        "DataDir::new() must reap an orphaned rig left under its base at start"
+    );
+}
+
+// -------------------------------------------------- perf clock guard pin
+
+/// #95: `scripts/perf/common.sh`'s `perf_now_ns`/`perf_mark` must fail
+/// loudly when neither clock branch works (macOS: `EPOCHREALTIME` needs
+/// bash 5.0+, BSD `date` has no `%N`), instead of feeding a value like
+/// `"1786728341N"` into arithmetic. Picking the replacement clock is out of
+/// scope (needs real macOS timing); this only pins the guard, exercised on
+/// Linux by forcing the fallback branch (`scripts/perf/common-selftest.sh`'s
+/// own header explains the reproduction). Same pattern as the coverage
+/// harness self-test above: a shell script outside the gate is a script
+/// whose checks are claims, and this suite already owns `scripts/`.
+#[test]
+fn the_perf_clock_guard_fails_loudly_instead_of_a_malformed_timestamp() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/perf/common-selftest.sh");
+    assert!(
+        script.exists(),
+        "scripts/perf/common-selftest.sh must exist"
+    );
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/perf/common-selftest.sh");
+    assert!(
+        output.status.success(),
+        "the perf clock guard's selftest must pass\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ------------------------------------------------------- spawned-daemon rig
 
 /// How the rig's own daemon ended, and what the kernel said about it.

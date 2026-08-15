@@ -102,6 +102,66 @@ pub(crate) fn disk_backed_tmp_base() -> Option<PathBuf> {
     var_tmp.is_dir().then(|| var_tmp.join("sgt-rs-tests"))
 }
 
+/// Marker `[DataDir::new]` writes into every rig it creates, naming the pid
+/// of the process that owns it.
+///
+/// #113: a suite process that gets `SIGKILL`ed mid-run (the R-MVP1-7
+/// ceiling, or the harness killing a backgrounded `cargo test`) never runs
+/// `Drop` — no destructor of any kind reaches a rig left behind that way, so
+/// this marker plus [`reap_orphaned_rigs`] is the mechanism that does,
+/// checked at the start of the *next* run rather than relied on from the
+/// dead one.
+pub(crate) const RIG_OWNER_PID_FILE: &str = ".owner-pid";
+
+fn write_owner_pid(dir: &Path) {
+    let _ = std::fs::write(dir.join(RIG_OWNER_PID_FILE), std::process::id().to_string());
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).is_dir()
+}
+
+/// Reap rig directories directly under `base` whose owning process is no
+/// longer alive, returning the paths removed.
+///
+/// This is the start-of-run reaper #113 asks for, not another `Drop` guard —
+/// `Drop` is structurally incapable of running for a `SIGKILL`ed process, so
+/// the only cleanup that survives the way these processes actually die is
+/// one that runs when the *next* run starts. [`DataDir::new`] calls this
+/// before creating its own rig, so it sweeps up whatever the last run left.
+///
+/// A directory with no readable [`RIG_OWNER_PID_FILE`] marker (predates this
+/// fix, or is mid-write) is left alone rather than guessed about, and so is
+/// one whose marker names a pid still present in `/proc` — that second check
+/// is what makes this safe to call from a suite running concurrently with
+/// others sharing the same base directory: reaping a live run's state would
+/// be a worse defect than the leak this closes.
+pub(crate) fn reap_orphaned_rigs(base: &Path) -> Vec<PathBuf> {
+    let mut reaped = Vec::new();
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return reaped;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(path.join(RIG_OWNER_PID_FILE)) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            reaped.push(path);
+        }
+    }
+    reaped
+}
+
 /// A temporary sergeant data dir that reaps the daemons running on it.
 ///
 /// Construct one wherever a test points the `sgt` binary at a data dir: any
@@ -135,9 +195,13 @@ impl DataDir {
             };
         };
         std::fs::create_dir_all(&base).expect("create disk-backed test tmp base dir");
-        Self {
-            temp: tempfile::Builder::new().tempdir_in(&base).expect("tempdir"),
-        }
+        // #113: sweep up whatever a prior, SIGKILLed run left behind before
+        // adding this run's own rig — the only cleanup point that survives
+        // how those processes actually die.
+        reap_orphaned_rigs(&base);
+        let temp = tempfile::Builder::new().tempdir_in(&base).expect("tempdir");
+        write_owner_pid(temp.path());
+        Self { temp }
     }
 
     /// The path to hand to `--data-dir`.
