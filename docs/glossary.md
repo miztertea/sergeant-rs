@@ -114,7 +114,9 @@ than kept.
 observe it, per `docs/adr/0009-auto-spawn-never-on-observation.md`'s D5:
 `sgt doctor`, `sgt watch`, `sgt daemon stop` (ruled first for `watch` by
 `docs/gauntlet/contracts/WATCH.md`'s R-WATCH-3), and now also `status`,
-`work show`/`list`/`transcript`, `analytics`, and the TUI. Auto-spawn
-survives only on verbs that mutate durable state: `run`, `respond`,
-`retry`, `extend`, `cancel`. The principle behind the set, stated first in
+`work show`/`list`/`transcript`/`retained`, `work reap`'s unconfirmed
+preview (its `--yes` disposal path still mutates and stays outside this
+set), `analytics`, and the TUI. Auto-spawn survives only on verbs that
+mutate durable state: `run`, `respond`, `retry`, `extend`, `cancel`, and
+`work reap --yes`. The principle behind the set, stated first in
 R-WATCH-3: "observation must not materialize the thing observed."
