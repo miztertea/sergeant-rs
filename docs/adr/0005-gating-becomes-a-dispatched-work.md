@@ -81,6 +81,48 @@ would start with none.
 
 ## Consequences
 
+**Partially implemented.** The branch-binding mechanism this ADR's own Open
+Questions deferred to §8.6 is now resolved and shipped: a sergeant surface
+mints its own `sergeant/<work-id>` branch and cannot bind to a branch it did
+not mint (confirmed by gauntlet FOUNDATION-1's `inv-one-owner-relocated`,
+error severity), so a gate Work reviewing another Work's real branch needs a
+mechanism that does not exist merely by gating becoming a Work.
+`docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md` investigated the
+alternatives and recommended Mechanism A (sequenced branch takeover): dispatch
+the gate Work only once the target Work is terminal and its surface has torn
+down clean, then materialize the gate Work's surface by *attaching* to the
+target's existing branch instead of minting a new one. That investigation's
+items 1 and 2 now ship: `crate::runtime::engine::branch_takeover_precondition`
+reads journaled state to answer, fail-closed and with a named reason, whether
+a target Work's branch is safe to take over — terminal (absorbing: completed
+or canceled; `failed` is deliberately excluded, since it is retryable and a
+retry would rematerialize the target's own worktree back onto the branch a
+gate surface just attached to) and its surface's teardown reported every
+binding `Removed`. `crate::runtime::surface::attach` performs the takeover
+itself, checking a gate Work's worktree out onto the target's real branch via
+the same `create_branch: false` git-level operation `rematerialize` already
+uses in a different context, with its own `RepositoryBinding::origin` field
+(`BindingOrigin::Cut` vs `Attached { target_work_id }`) recording which shape
+produced a binding — additive, so every binding journaled before this field
+existed still deserializes as the `Cut` it always was. `materialize`'s own
+minting path for an ordinary Work is untouched by any of this.
+
+Investigation items 3 and 4 — a submission shape for "this Work reviews
+`<target-work-id>`", and the fail-closed behavior for each of the three named
+precondition-failure cases (target not terminal, target terminal but
+surface retained-dirty, target's branch attached elsewhere for an unrelated
+reason) — remain open, deliberately: they are product decisions (what
+Captain's dispatch call looks like; whether a retained-dirty target blocks
+for a human or routes through the target's own retry path) that a branch-
+binding mechanism does not, by itself, answer. `branch_takeover_precondition`
+already refuses each of those three cases with a distinctly-named
+`BranchTakeoverError` and a stated reason (`TargetNotTerminal`,
+`SurfaceNotClean`, and — for the git-level race the journal cannot see —
+`surface::attach`'s own `SurfaceError`), so the *fail-closed answer* to "may
+this proceed" exists; what is still undecided is who acts on a refusal and
+how, which is exactly what items 3 and 4 were always scoped to settle, not a
+gap this shipment introduced.
+
 Gating stops being Captain-serial: each gate previously blocked the
 orchestrator for roughly eight minutes, and durability was not free —
 one of the three gates run on 2026-08-14 was lost entirely to a harness
@@ -116,3 +158,18 @@ invokes `scripts/gate.sh`/no-mistakes, what its own findings-to-Work
 schema looks like, whether it is a new named ICM workflow or a stage
 folded into an existing one — are not decided here; this ADR records that
 gating becomes a dispatched Work, not the shape of that Work.
+
+**Narrowed.** One piece of that mechanics question is no longer open: how a
+gate Work's surface reaches the branch it needs to review is answered and
+implemented (§8.6, Consequences above). What remains open is everything
+about *specifying* the gate Work itself — a submission shape for "this Work
+reviews `<target-work-id>`" (no field on `SubmitContext`/`StartPlan` carries
+that today), and the operational response to each of
+`branch_takeover_precondition`'s fail-closed refusals (block and wait for the
+target to go terminal; block and escalate a retained-dirty target to Captain
+rather than auto-retrying the target's own run; treat a git-level takeover
+race the same as an ordinary `materialize` failure). Both are product
+decisions this investigation's own sizing (§8.6, "items 3 and 4") declined to
+invent, and still should not be invented without an owner ruling — see
+`reference/proposal-foundation-rationalization.md` §8.6 for the standing
+recommendation.
