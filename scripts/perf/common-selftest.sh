@@ -11,6 +11,12 @@
 #
 # R-S0-12 "code is code": common.sh's clock functions changed executable
 # behavior and need a test that fails when the fix is reverted (LESSONS L7).
+#
+# Ponytail rung R2 (new file, existing pattern): this is a new file, but it
+# reuses scripts/coverage/selftest.sh's already-established shape verbatim —
+# a standalone bash self-test wired into `cargo test` via a subprocess check
+# (see tests/m6_surfaces.rs's the_coverage_harness_grades_its_own_accounting)
+# rather than a new harness invented for this one guard.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

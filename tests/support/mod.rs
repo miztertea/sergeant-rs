@@ -136,6 +136,14 @@ fn pid_is_alive(pid: u32) -> bool {
 /// is what makes this safe to call from a suite running concurrently with
 /// others sharing the same base directory: reaping a live run's state would
 /// be a worse defect than the leak this closes.
+///
+/// Ponytail rung **R7** (new machinery): R2 (reuse `DataDir`'s existing
+/// `Drop`-based daemon reaper) fails outright — `Drop` cannot run for a
+/// `SIGKILL`ed process, which is the whole premise of #113. R4 (a bare
+/// `/proc` liveness check) is necessary but not sufficient alone; it supplies
+/// no reap-at-start trigger without the marker file pairing it to a rig. R5
+/// doesn't apply — this stays dependency-free per the module doc above. The
+/// marker-plus-scan pair is the minimum that works.
 pub(crate) fn reap_orphaned_rigs(base: &Path) -> Vec<PathBuf> {
     let mut reaped = Vec::new();
     let Ok(entries) = std::fs::read_dir(base) else {

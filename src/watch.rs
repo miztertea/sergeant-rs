@@ -482,6 +482,11 @@ async fn test_hold_wait(path: String, deadman: Duration, poll: Duration) -> Resu
     // involved), so `Drop` runs every time and an RAII guard is sufficient;
     // relying on the caller to remember cleanup only covers whichever path
     // that particular caller happens to exercise.
+    //
+    // Ponytail rung R2: reuses the RAII-guard-on-Drop idiom this crate
+    // already relies on elsewhere for exactly this shape of problem
+    // (tests/support/mod.rs's DataDir reaps its daemons the same way) rather
+    // than inventing a new cleanup mechanism for one call site.
     struct ReadyMarker(String);
     impl Drop for ReadyMarker {
         fn drop(&mut self) {
