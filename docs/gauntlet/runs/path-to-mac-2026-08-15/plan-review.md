@@ -1,319 +1,329 @@
 # Path-to-Mac sprint plan — review (two-axis code-review pass)
 
 **Fixed point:** `main` (`242abe3`) → `d86885f`, one file:
-`docs/gauntlet/runs/path-to-mac-2026-08-15/plan.md`, 221 insertions.
+`docs/gauntlet/runs/path-to-mac-2026-08-15/plan.md`, 221 insertions. Confirmed
+via `git diff main..d86885f --stat` and `git diff d86885f..HEAD -- .../plan.md`
+(empty — the file is unchanged since that commit).
 
-**This supersedes commit `3de1266`'s review of the same file, and says so
-rather than silently overwriting it.** That review's own text was correct in
-structure (Standards/Spec, evidence-vs-belief labeling, four lines of attack
-closed) but **finding 1's verification claim was itself false**: it asserted
-`grep -rn "libc-binding\|one syscall" docs/ reference/ .` returns "exactly one
-hit — the plan's own line," and concluded the objection "does not exist... in
-any form." Re-running that exact command this session returns two more hits —
-`src/platform/disk.rs:5` and `src/cli.rs:1531` — because `.` as a grep path
-argument covers the whole repo, `src/` included, and the prior review's own
-narrative ("No ADR, ledger entry, or note contains this objection") did not
-match its own command's actual output. The objection is real; it just isn't
-where the plan says it is. Full analysis under Spec finding 1 below. This is
-the same class of failure LESSONS L19 exists to catch, applied one level up —
-a review is itself executable through the program that trusts it, so a review
-that ships an unverified verification is exactly as dangerous as an unreviewed
-plan.
+**Scope note.** This is a fresh-context review, per `LESSONS.md` L19: the plan
+directs Work dispatch and is therefore executable through the sessions that
+obey it, so it takes the review loop before it governs. Per L3, `GAUNTLET.md`'s
+deviation register and ledger rulings were read before filing; no finding
+below re-litigates a registered deviation without arguing the ruling itself is
+wrong. Per L15, every claim below is marked **VERIFIED** (checked in-session
+against the cited file/line) or **BELIEVE** (inference not independently
+re-run). No script or gate was run; no crate measurement was re-derived; the
+artifact itself was not edited.
 
-**Scope note.** This is the narrower `code-review` pass named in
-`docs/gauntlet/contracts/PATH-TO-MAC-1.md` (that contract lives on
-`integration/path-to-mac-2026-08-15`, dispatched separately) — input to that
-unit's own four-axis panel, not a substitute for it.
-
-**Method.** Standards and Spec were run as two genuinely parallel,
-context-isolated sub-agents (neither given sight of the other, or of the prior
-`3de1266` review — both were explicitly instructed not to open it), per the
-reviewed skill's own design
-(`reference/sergeant-upstream/.agents/skills/code-review/SKILL.md`). Findings
-below are the sub-agents' verified output, cross-checked directly against the
-cited files by the orchestrating pass before being written up here (the
-`sergeant.toml`, ADR 0005 quote-wording, and #108 retrospective-section checks
-were re-run independently rather than taken on the sub-agent's word). Every
-finding distinguishes **VERIFIED** (checked in-session against the cited
-file/line or a grep run this session) from **BELIEVE** (reasoned, not
-directly checked), per L15. The nine owner rulings in plan §2 are not
-re-litigated; findings are about the plan's stated *justification* for a
-ruling, or about text outside §2.
+Spec sources consulted: `NORTH-STAR.md`, ADR 0001, ADR 0002, ADR 0005,
+`docs/DEVELOPMENT.md`, `LESSONS.md`, `GAUNTLET.md` (deviation register,
+backlog, FOUNDATION-1 entry).
 
 ---
 
 ## Standards
 
-Checked against `docs/DEVELOPMENT.md` and `LESSONS.md`'s own meta-rules for
-how a governing artifact in this repo cites evidence — not Fowler's smell
-baseline, which targets code and doesn't transfer to sprint-planning prose.
+Findings about this repo's own documentation and process conventions — the
+plan's stated citation/evidence discipline (its own preamble: "Where a claim
+is a measurement taken this session, it is marked **[measured]**; where it is
+read from a repo artifact, the artifact is cited; where it is a belief, it
+says so (**L15**)") — as distinct from whether its factual claims are true.
 
-**No hard violations of the symlink-citation rule.** VERIFIED: `grep -n
-"CLAUDE.md" plan.md` returns nothing — the plan never cites the symlink path;
-every `docs/DEVELOPMENT.md` reference names the real file.
+### S1 — Medium: the plan's central wave-sequencing claim is asserted with none of the plan's own evidence tags, and is the one claim in the document that turns out to be checkable and wrong
 
-### 1. [warning] The `[measured]` tag on §5's `surface.rs` citation is mislabeled by the plan's own stated convention
+**Plan text at issue** (`plan.md:129-130`):
+> W1 and W3 are the only parallel pair; their file sets are disjoint (`src/` +
+> `Cargo.toml` vs `tests/` + `scripts/perf/`).
 
-**Plan text (line 111):** *"**[measured]** `src/runtime/surface.rs:332` and
-`431-441`: a work branch is cut from the repository's **current HEAD**."*
+This sentence carries no `[measured]` tag, no artifact citation, and no belief
+label — it reads as settled fact, in a document whose own preamble commits to
+labeling every claim one of those three ways. It is exactly the kind of
+claim the plan's own discipline exists to catch: a two-bucket file-ownership
+assertion, checkable in seconds against the plan's own §4 table, that does not
+hold (see Spec finding P2 — the same file, `tests/support/mod.rs`, is named in
+§4 as part of W1's edit and is the natural landing site for W3's #108 fix).
+The lapse is procedural, independent of which direction the fact turns out to
+run: a claim load-bearing enough to justify skipping conflict resolution for
+the sprint's only parallel wave pair should have carried the same evidentiary
+weight the document applies everywhere else.
 
-**Plan's own rule (line 10-12, the preamble):** *"Where a claim is a
-measurement taken this session, it is marked **[measured]**; where it is read
-from a repo artifact, the artifact is cited."*
+**Governing text:** `plan.md:9-12` (the plan's own stated discipline, itself
+grounded in `LESSONS.md` L15, `LESSONS.md:186`).
 
-Reading `surface.rs:332`'s doc comment and the `431-441` code range is exactly
-"read from a repo artifact" — no runtime behavior was observed or timed this
-session for this claim; the plan's own paragraph immediately after (line
-112-113) is the actual observation ("`repos/sergeant-rs` is a separate clone
-... clean on `main` at `242abe3`"), and that part legitimately could carry the
-tag. Tagging the source-read half `[measured]` blurs the plan's own
-declared distinction between "I observed this" and "I read this," which is
-the exact distinction L15 exists to preserve elsewhere in the same document
-(§4's careful separation of measured binary-size deltas from the unmeasured
-`sysinfo` runtime cost is the standard this line falls short of).
+**Correction:** Tag the disjointness claim `[measured]` with the check shown
+(`grep -rn 'tests/support/mod.rs' plan.md`, or diff the two Works' expected
+file lists) — or drop the "conflicts do not arise" framing to "expected to
+be low-conflict, unverified" until that check is actually run.
 
-**Correction:** drop the `[measured]` tag from the `surface.rs` citation
-itself, or split the sentence so the tag attaches only to the HEAD-of-clone
-observation.
+**VERIFIED** — read `plan.md:1-14` for the stated discipline and `plan.md:129-130` for the untagged claim.
 
-### 2. [info] R7's `sergeant.toml:4-7` citation is imprecise
+### S2 — Low: DEVELOPMENT.md citation cites a single line for a rule spanning four
 
-**Plan text (line 44):** *"R7 | Sonnet for every dispatched Work |
-`--profile sonnet`, declared at `sergeant.toml:4-7`."*
+**Plan text at issue** (`plan.md:48-49`):
+> `docs/DEVELOPMENT.md` line 71 states the rule; **ADR 0005 (Accepted,
+> 2026-08-14)** dissolved it
 
-VERIFIED: `sergeant.toml` lives at the estate root
-(`/home/miztertea/sergeant-rs/sergeant.toml`), not inside this repo checkout.
-Lines 4-7 are a comment explaining why `default_backend = "claude"` was set,
-which mentions the phrase "`--profile sonnet`" in passing. The actual
-declaration — `[[profile]] name = "sonnet"` — is at lines 10-13. The cited
-range contains the phrase but not the declaration it's attributed to.
+`docs/DEVELOPMENT.md`'s "an actor never invokes the gate" rule spans lines
+70-73 (`- A workflow stage or actor executing inside a worktree never invokes` /
+`` `scripts/gate.sh`/no-mistakes itself — only the top-level orchestrating `` /
+`session owns a shipping-gate run, matching the single-owner posture the` /
+`engine itself enforces on the data dir.`). Line 71 alone is a sentence
+fragment ("`scripts/gate.sh`/no-mistakes itself — only the top-level
+orchestrating"); the clause the plan is citing only completes across all four
+lines. This repo's own convention elsewhere (`docs/DEVELOPMENT.md:85`'s D-number
+citation rule: "a citation crossing between the two always pairs...") treats
+precise citation as something worth getting right; a single-line pointer into
+a four-line rule sends a reader to an incomplete sentence.
 
-**Correction:** cite `sergeant.toml:10-13` (the `[[profile]]` block) as where
-the profile is declared; lines 4-7 can still be cited separately as the
-rationale for `default_backend`.
+**Governing text:** `docs/DEVELOPMENT.md:70-73`.
 
-### 3. [info] §8's `"this Work reviews that Work"` is a paraphrase presented as a quotation
+**Correction:** Cite the range, "lines 70-73," not a single line.
 
-**Plan text (line 185):** *"a submission shape for `"this Work reviews that
-Work"` — remain unbuilt..."*
+**VERIFIED** — `grep -n` against `docs/DEVELOPMENT.md` confirms the rule's exact line span.
 
-VERIFIED: ADR 0005 (`docs/adr/0005-gating-becomes-a-dispatched-work.md:110`)
-reads *"a submission shape for 'this Work reviews `<target-work-id>`'"* —
-different wording, inside quotation marks in both documents. The plan's
-substitution of "that Work" for the literal `<target-work-id>` placeholder
-changes a citation from a quote into a paraphrase without dropping the quote
-marks.
-
-**Correction:** either quote ADR 0005 verbatim or drop the quotation marks
-around the paraphrase.
-
-**Summary — Standards: 3 findings (0 error, 1 warning, 2 info).** All three
-are citation-precision issues, none change what a Work would do differently;
-contrast with Spec finding 1 below, which is the same *class* of defect
-(misattributing a claim to a source that doesn't say it) but with real
-downstream consequence because it assigns a Work to correct the wrong
-document.
+**Standards summary: 2 findings (0 high, 1 medium, 1 low). Worst: S1 (medium) — the plan's own evidence-labeling discipline lapses on exactly the claim that turns out to be false.**
 
 ---
 
 ## Spec
 
-Checked against `NORTH-STAR.md`, ADR 0001/0002/0005, `docs/DEVELOPMENT.md`,
-`LESSONS.md`, `GAUNTLET.md`'s deviation register and FOUNDATION-1 entry, and
-`AGENTS.md` — plus, where a claim is about the codebase itself, the cited
-source directly (`src/runtime/surface.rs`, `src/platform/disk.rs`,
-`src/backend/docker.rs`'s history, `tests/support/mod.rs`).
+Findings about whether the plan's claims are actually true against the cited
+governing documents and repository ground truth.
 
-### 1. [error] §4's "ADR 0002 (D4)" citation names the wrong document — the objection is real but lives in code, not the ADR
+### P1 — High: the plan attributes a quoted objection to ADR 0002 (D4) that does not appear anywhere in ADR 0002, and skips the document that actually makes it
 
-**Plan text (lines 93-95):** *"This retires ADR 0002 (D4)'s objection on its
-own terms. That decision declined 'adding a libc-binding dependency for one
-syscall.'"*
+**Plan text at issue** (`plan.md:93-98`):
+> **This retires ADR 0002 (D4)'s objection on its own terms.** That decision
+> declined "adding a libc-binding dependency for one syscall." `libc` and
+> `rustix` are already dependency edges this crate carries, and the count is
+> now four facts rather than one. **An ADR refresh is owed** [...] Assigned to
+> **W1**.
 
-**Governing text it contradicts:** `docs/adr/0002-platform-boundary-shape.md`,
-decision D4 ("What is behind the boundary," lines 46-56), is entirely about
-scoping Docker/`claude` CLI behavior out of the platform-fact boundary. It
-says nothing about libc, syscalls, or dependency cost.
+I read ADR 0002 in full. D4 ("What is behind the boundary") is about which
+facts belong to the platform boundary versus remaining `Backend` capabilities
+(Docker/claude CLI semantics) — it says nothing about a libc-binding
+dependency, one syscall, or `#81`/disk-space measurement at all. I then
+searched the repository for the exact quoted phrase:
 
-**VERIFIED**, corrected from the prior review's version of this finding: `grep
--rn "libc-binding\|one syscall"` across the *whole* repository (not just
-`docs/` and `reference/`) surfaces the real source —
-`src/platform/disk.rs:1-8`'s module doc comment: *"`df` remains the
-mechanism — not a `libc`/`statvfs` binding. The module this fact used to live
-in (`src/backend/docker.rs`) explicitly declined that binding 'for one
-syscall' in favor of the same shell-out posture the rest of this crate already
-takes."* This is a real, specific, previously-made engineering decision about
-`#81` — it is simply not in ADR 0002, and never was.
+```
+grep -rn "libc-binding\|one syscall" docs/ src/ reference/ *.md
+```
 
-**Why this matters:** the paragraph uses this citation to justify "An ADR
-refresh is owed... Assigned to **W1**" (lines 96-98). If W1 goes looking in
-ADR 0002 for the objection it's meant to retire, it won't find it there — the
-actual decision to revisit lives in `src/platform/disk.rs`'s doc comment
-(originally `src/backend/docker.rs`), which is source code, not an ADR at all.
-"Retiring ADR 0002 (D4)" is a category error: D4 was never an objection to a
-libc-binding dependency, so nothing about D4 is retired by adding
-`fs4`/`rustix`. The actual question — does the `disk.rs`-documented tradeoff
-still hold given `#81`'s measured GNU-`--output` portability failure — goes
-unaddressed by a paragraph that thinks it already answered it.
+The only real match is `src/platform/disk.rs:1-20`'s module doc:
 
-**Correction:** cite `src/platform/disk.rs`'s doc comment (and, if traceable,
-whatever decision record — if any — the `src/backend/docker.rs` predecessor
-comment pointed to) as the source of the "one syscall" objection, not "ADR
-0002 (D4)." If no ADR ever recorded this, say so explicitly rather than
-implying one did.
+> Free disk space (#81).
+>
+> `df` remains the mechanism — not a `libc`/`statvfs` binding. The module
+> this fact used to live in (`src/backend/docker.rs`) explicitly declined
+> that binding "for one syscall" [...] #81 asks whether that tradeoff still
+> holds now that the shell-out has a *measured* portability cost [...] **It
+> still holds**: the fix below is a second, POSIX-portable invocation shape
+> (`df -k <path>`, no `--output`) [...]
 
-### 2. [error] §8 risk 3's "no attach needed" claim reproduces, not sidesteps, FOUNDATION-1's finding
+(`src/cli.rs:1528-1531` contains the phrase "for one syscall" too, but about
+`kill(1)` vs. a signals crate for process termination — an unrelated
+objection, not the disk/libc one the plan is citing.)
 
-**Plan text (lines 184-188):** *"Review is Captain-serial. ADR 0005's items 3
-and 4... remain unbuilt, so a gate Work cannot be bound to another Work's
-branch. This sprint sidesteps it: W6 cuts from the integration tip and
-therefore already holds the content, never needing `surface::attach`. That
-works here and does not generalize."*
+Two problems follow from this:
 
-**Governing text it contradicts:** `docs/adr/0005-gating-becomes-a-dispatched-work.md`'s
-Consequences section built `surface::attach` specifically so *"a fix commit
-made in the resulting worktree lands on the branch that will actually
-ship."* `GAUNTLET.md`'s FOUNDATION-1 entry names the exact failure mode this
-fixes: reviewing a copy breaks no-mistakes' recovery of auto-fix commits onto
-the shipped branch, yielding "a gate Work that passes its own copy while the
-actual shipping branch never received the pipeline's fixes."
+1. **The citation is wrong.** ADR 0002 (D4) has no objection to retire; the
+   plan is quoting `src/platform/disk.rs`'s own module doc and mislabeling it
+   as an ADR ruling. If W1's brief instructs it to update "ADR 0002 (D4)"
+   based on this text, the Work will not find the passage there.
+2. **The actual objection is current and still affirmed, not stale.** The
+   real source — `src/platform/disk.rs`'s module doc, which is live code
+   documentation, not a frozen ADR — explicitly re-examined this exact
+   question and concluded "It still holds," with a specific, dated argument
+   (BSD/macOS `df --output` failure is a *measured* cost now, but the
+   POSIX-portable `df -k` reparse is judged the better trade over adding a
+   dependency). The plan's crate-adoption case for `fs4`/`statvfs` (§4) does
+   not engage with that argument at all — it treats the objection as an ADR
+   artifact awaiting a "refresh," when it is instead a currently-standing,
+   reasoned decision in the code the Work is about to reverse.
 
-**VERIFIED** against `src/runtime/surface.rs`: `materialize()` (doc comment,
-line 332) always cuts a *fresh* `sergeant/<work-id>` branch from current
-HEAD — including when W6 cuts from the integration tip. `attach()` (line 561)
-is the only path that checks a surface's worktree onto an *existing* branch
-instead of minting one. Plan §5's wave table has W6 cut "from: integration
-tip" via ordinary `materialize()`, not `attach()`.
+The plan's own point — that `libc`/`rustix` being pre-existing dependency
+edges changes the calculus — may well be a sufficient answer to
+`disk.rs`'s argument. But that argument has to be made against the text
+that actually holds the objection, not against an ADR clause that does not
+exist.
 
-Plan §7 explicitly grants W6 auto-fix authority ("The Work may authorize
-`auto-fix`"), and §7/R9 name the persistent `integration/…` branch with an
-early-opened head PR as what "the owner merges." If W6's gate run authorizes
-an auto-fix commit, that commit lands on W6's own freshly-minted branch — not
-on the integration branch with the open PR. "Already holds the content"
-answers the *review-reads-correct-content* question `attach` was never needed
-for; it does not answer the *auto-fix write-back* question `attach` was built
-for. Cutting from the tip is a fix for staleness, not for branch identity —
-the two are different axes, and the plan conflates them.
+**Governing text:** `docs/adr/0002-platform-boundary-shape.md` (full text, no
+"one syscall" passage anywhere) vs. `src/platform/disk.rs:1-20` (the actual,
+currently-affirmed objection).
 
-**Correction:** either W6 attaches to the integration branch itself
-(reintroducing the unbuilt-mechanism problem this risk already names), or the
-plan needs an explicit reconciliation step — fast-forward/merge W6's branch
-onto integration before "the owner merges" — or W6 is restricted to
-`no-op`/`ask-user` findings only, with `auto-fix` withheld until attach is
-wired up for this shape. Left as written, W6 can pass its own gate while
-shipping nothing back to the branch under review — the sprint's final wave
-does not work as specified.
+**Correction:** Retarget the citation from "ADR 0002 (D4)" to
+`src/platform/disk.rs`'s module doc; have W1's brief require directly
+answering "It still holds" rather than treating the change as an ADR
+refresh. If an ADR update is still warranted once that argument is made, it
+is a new decision, not the "retirement" of an existing one.
 
-### 3. [error] W1/W3 file-disjointness claim is contradicted by the plan's own §4 table
+**VERIFIED** — read `docs/adr/0002-platform-boundary-shape.md` in full;
+`grep -rn "libc-binding\|one syscall" docs/ src/ reference/ *.md` run this
+session; read `src/platform/disk.rs:1-20` and `src/cli.rs:1520-1536`.
 
-**Plan text (lines 129-130):** *"W1 and W3 are the only parallel pair; their
-file sets are disjoint (`src/` + `Cargo.toml` vs `tests/` + `scripts/perf/`)."*
+### P2 — High: W1 and W3's file sets are not disjoint — both touch `tests/support/mod.rs`, contradicting the plan's own no-conflict argument for its only parallel wave pair
 
-**Governing text it contradicts:** the plan's own §4 crate table (line 77)
-names `tests/support/mod.rs` as one of three call sites `#18` (W1's scope)
-replaces. `docs/DEVELOPMENT.md:47` describes that file's `DataDir` guard as
-reaping "by `/proc` argv scan on Drop." The cross-platform retrospective's own
-recommendation for `#108` (W3's scope), §1.3/§3.3.3, is explicit: *"A
-start-of-run reaper, not another `Drop` guard... Extending `DataDir`'s
-`/proc`-scan reaping to run at suite start... closes the class."* **VERIFIED**:
-that is the same file W1 is already documented as editing.
+**Plan text at issue** (`plan.md:106-118, 129-130`):
+> Waves exist because of **file ownership**, not logic. [...] Advancing *its*
+> HEAD to the integration tip between waves means every later Work cuts from
+> the previous wave's result — so conflicts do not arise rather than being
+> resolved. [...] W1 and W3 are the only parallel pair; their file sets are
+> disjoint (`src/` + `Cargo.toml` vs `tests/` + `scripts/perf/`).
 
-Both W1 (`#18`, replacing `/proc` reads in `tests/support/mod.rs`) and W3
-(`#108`, plausibly extending that same file's reaping to start-of-run) have a
-plan-documented reason to touch the same file — directly contradicting the
-"disjoint" claim used to justify running them in parallel. This is
-load-bearing, not cosmetic: the plan's stated reason waves exist at all is
-"file ownership, not logic... Three Works editing `Cargo.toml` would conflict
-by construction" (§5 opening) — W1/W3 risk exactly the class of conflict the
-wave structure exists to prevent. (Rated error rather than warning: unlike
-finding 4 below, this isn't a citation mismatch with no operational
-consequence — a real concurrent edit to the same file is the specific outcome
-the plan says waves were designed to avoid. It is a less severe error than
-finding 2, though: a same-file conflict is a recoverable merge/rebase, not a
-silently stranded commit.)
+The plan's own §4 lists W1's #18 scope as replacing "direct `/proc` reads in
+`daemon.rs`, `backend/claude.rs`, **`tests/support/mod.rs`**" (`plan.md:77`).
+That is a `tests/` file, not a `src/`+`Cargo.toml` one — it falls inside the
+bucket §5 assigns exclusively to W3.
 
-**Correction:** name the actual target regions of `tests/support/mod.rs` for
-`#18`'s edit and `#108`'s reaper before dispatch; if they collide, resequence
-W1/W3 rather than running them in parallel.
+Separately, W3 owns #108 (R6: "fixed by a start-of-run reaper, using standard
+patterns"). I checked where that fix actually lands. `tests/support/mod.rs`
+*is* the file: its own module doc says "Kept deliberately dependency-free
+(`kill(1)` and `/proc`" and it already implements `DataDir`'s `Drop`-based
+`/proc` argv-scan reaper (`reap_daemons`, `tests/support/mod.rs:158,193-244`).
+The cross-platform retrospective's own recommendation for #108, which the
+plan cites elsewhere, names this exact mechanism: "Extending `DataDir`'s
+`/proc`-scan reaping to run at suite start [...] closes the class"
+(`docs/gauntlet/runs/cross-platform-2026-08-14/retrospective.md:319-322`).
+There is no other plausible home for a start-of-run reaper than the file that
+already defines `DataDir`.
 
-### 4. [warning] R6's stated cause for #108 is borrowed from a different retrospective row
+So both W1 (per the plan's own §4) and W3 (per the plan's own R6 and the
+retrospective it cites) edit `tests/support/mod.rs`. The two are dispatched
+in the same wave, "‖" (parallel), both cut from `main` (§5's table). If both
+touch that file — which, per §4, W1 explicitly intends to rewrite the `/proc`
+reads inside — advancing the estate clone's HEAD between waves does not make
+the conflict "not arise"; it just defers a real content conflict in that file
+to whichever of the two lands second, requiring the hand-merge the plan's own
+reasoning ("buys zero hand-authored merges") says this scheme avoids.
 
-**Plan text (line 43, R6):** *"#108 is fixed by a **start-of-run reaper**,
-using standard patterns | `Drop` does not survive `SIGKILL`, and SIGKILL is
-how these die."*
+I could not fully verify from the plan text alone whether W1's edit and W3's
+edit would touch overlapping *lines* within `tests/support/mod.rs` (that
+depends on how each Work is actually briefed) — but the plan's claim is
+narrower and stronger than "low risk of overlap": it asserts the file *sets*
+are disjoint, which is false on the plan's own evidence, independent of where
+in the file each edit lands.
 
-**Governing text it contradicts:** `docs/gauntlet/runs/cross-platform-2026-08-14/retrospective.md`
-§1.2 (lines 77-86) — the section that names `#108` and generalizes it as
-`LESSONS.md` L21 — attributes the leak entirely to the dead-man test's
-premise: *"The dead-man test — whose premise is that the release path never
-appears — removes nothing... the abnormal path is the least likely to carry
-cleanup."* **VERIFIED**: neither that section nor L21 itself mentions SIGKILL
-or `Drop` anywhere. The "`Drop` does not survive `SIGKILL`" reasoning is
-§1.3/§3.3.3 (lines 90-100, 319-322) — explicitly about a *different* row, the
-1.7 GB `/var/tmp/sgt-rs-tests` rig leak generalized from `#91`, not `#108`.
+**Governing text:** `plan.md:77` (W1's stated file scope) vs. `plan.md:129-130`
+(the disjointness claim) — an internal contradiction — corroborated against
+`tests/support/mod.rs:1-244` (VERIFIED) and
+`docs/gauntlet/runs/cross-platform-2026-08-14/retrospective.md:319-322`
+(VERIFIED, the #108 fix's named mechanism) and `docs/DEVELOPMENT.md:47`
+(VERIFIED, `tests/support/mod.rs`'s role as the shared `DataDir` guard every
+daemon-spawning suite must go through).
 
-**VERIFIED, not merely believed** (upgraded from the prior review's BELIEVE
-label after re-reading both sections directly): a start-of-run reaper is
-still a defensible fix for `#108` on independent grounds (it would catch the
-dead-man test's leaked marker regardless of cause), but R6's given rationale
-is the wrong row's reasoning attached to the right row's fix.
+**Correction:** Either serialize W1 and W3 (breaking the "only parallel pair"
+claim and its wall-clock justification), or scope the two Works' briefs to
+touch non-overlapping regions of `tests/support/mod.rs` explicitly and say so
+in the wave table — the current table's bucket labels (`src/` + `Cargo.toml`
+vs `tests/` + `scripts/perf/`) are not accurate as written.
 
-**Correction:** state `#108`'s actual cause (test premise, not process
-death), or keep the SIGKILL/Drop reasoning attached to the `#91`-derived
-residue item it actually describes and give R6 its own correct rationale.
+**VERIFIED** — read `plan.md` §4 and §5 in full; read
+`tests/support/mod.rs:1-244`; read
+`docs/gauntlet/runs/cross-platform-2026-08-14/retrospective.md:90-105,
+319-322`; read `docs/DEVELOPMENT.md:47`.
 
-### No finding — §6/§8's ceiling-size ("mitigated only by envelope sizing") framing
+### Lines of attack checked with no finding
 
-Reconsidered against the prior review's info-level critique of this same
-text. **VERIFIED**: plan lines 136-140 state plainly, in the same breath as
-the claim, that "a genuinely stuck turn burns 90 minutes before it surfaces"
-and that fewer firings is "the only lever available tonight"; §8 risk 1 says
-"Mitigated **only** by envelope sizing" — the word "only" is doing honest
-work, not overclaiming. The plan does not claim `#90`'s defect is fixed, and
-discloses the limitation adjacent to the claim rather than separately from
-it. No finding.
+Per the review brief, a clean result on a targeted line of attack is reported
+as such rather than omitted.
 
-### No finding — R8 (ADR 0005 supersedes `DEVELOPMENT.md:71`)
+- **Ruling R8 / ADR 0005 (`plan.md:45,48-55`).** ADR 0005's Decision section
+  quotes `docs/DEVELOPMENT.md`'s rule near-verbatim and states "The rule
+  dissolves rather than being amended (D1)," and its Consequences section
+  ("Captain's job changes shape... instead of driving `axi respond` and
+  `axi sync --recover` plumbing by hand for every gate") confirms the
+  orchestrator no longer invokes the gate directly. R8's claim that ADR 0005
+  supersedes `docs/DEVELOPMENT.md`'s line-70-73 rule holds up; it is not an
+  over-reading of a narrower ADR. (**VERIFIED** — read
+  `docs/adr/0005-gating-becomes-a-dispatched-work.md` in full.) See Standards
+  S2 for a citation-precision nit on the line number only.
+- **The attach claim (`plan.md:186-188`, risk 3).** `surface::materialize`
+  (`src/runtime/surface.rs:353-456`) cuts a Work's branch from
+  `git rev-parse HEAD` on the source repository path at dispatch time
+  (`surface.rs:431-441`) — an ordinary fresh cut, not `attach`
+  (`surface.rs:561-`, the branch-takeover mechanism ADR 0005 describes for a
+  gate Work reviewing *another Work's own* branch). If W6 is dispatched after
+  the orchestrator's local clone HEAD has been advanced to the integration
+  tip, its fresh-cut branch already contains everything merged so far, and
+  `attach` genuinely is not needed for that specific case. The plan's own
+  caveat ("That works here and does not generalize") is accurate — this
+  reasoning does not extend to a gate Work reviewing an arbitrary other
+  Work's un-merged branch, which is exactly the gap ADR 0005's open questions
+  describe. (**VERIFIED** — read `src/runtime/surface.rs:327-460, 561-`.)
+- **#85 / sysinfo Disks API labeling (`plan.md:78, 100-105, 216-218`).** The
+  plan frames the whole crate table as "Researched via Context7 against the
+  crates' own documentation rather than from training data" (`plan.md:70-71`)
+  and separately states in §10 that macOS behavior is unmeasured: "the crates
+  make the claim cheap, they do not make it measured." That is an honest
+  label, not an overclaim. I went further than the plan's own citation and
+  checked the vendored crate source
+  (`~/.cargo/registry/src/.../sysinfo-0.37.2`): `Disk::file_system()`
+  (`src/common/disk.rs:63`) is backed by a real, non-stub macOS
+  implementation reading `libc::statfs.f_fstypename`
+  (`src/unix/apple/disk.rs:55, 450-455`) — the capability the plan is relying
+  on genuinely exists in the crate, beyond what "documentation says so" would
+  guarantee on its own. (**VERIFIED**, beyond what the plan itself claims to
+  have checked.)
+- **R4 vs. AGENTS.md's preserved-state guardrail (`plan.md:41`).** The
+  cross-platform retrospective — which the plan draws R4 from — already
+  worked through this exact tension: "Teardown preserves uncommitted work and
+  never deletes a branch, and `AGENTS.md` puts preserved state outside
+  anything standing authorization may destroy. **The gap is the other
+  half:**... Essentially the whole 30 GB is `target/`: build artifacts,
+  gitignored, not 'uncommitted work' under any reading"
+  (`docs/gauntlet/runs/cross-platform-2026-08-14/retrospective.md:44-56`).
+  AGENTS.md's guardrail (`AGENTS.md:202-205`) names three protected
+  categories — "a retained branch, a journal, a Work record" — none of which
+  is a gitignored build directory. R4 ("retain the dirty state, never the
+  directory") is also an explicit owner ruling from a live interview, not
+  autonomous action the "standing authorization" clause is scoped to govern.
+  I found no conflict. (**VERIFIED** — read `AGENTS.md:189-207` and the
+  retrospective section cited above.)
+- **Envelope reasoning / `--ceiling-secs 5400` (`plan.md:134-141`).** The
+  plan's own text already separates the two effects a longer ceiling has —
+  fewer false-positive kills of turns that would have finished ("Fewer
+  ceiling firings is the only lever available tonight") against a larger
+  blast radius on a genuinely stuck turn ("a genuinely stuck turn burns 90
+  minutes before it surfaces") — and states the tradeoff plainly rather than
+  claiming the ceiling change fixes #90. That is a defensible
+  frequency-vs-severity trade, honestly captioned as a mitigation, not a fix.
+  I found no unstated logical gap. (**VERIFIED**, read against #90's
+  description in `docs/gauntlet/runs/cross-platform-2026-08-14/close-out.md:45`
+  and `plan.md` §8 risk 1, which itself says "Mitigated only by envelope
+  sizing.")
+- **Scope vs. NORTH-STAR gating (`plan.md:57-66`).** None of the plan's ten
+  in-scope issues (#18, #81, #82, #85, #90, #94, #95, #96, #108, #109) match
+  anything on `NORTH-STAR.md`'s Gated ("not yet") or Never lists (stranger
+  onboarding, T-series full spec, H1 contract-v2 remainder, N4 Docker, G3
+  callbacks, G1 scheduler, estate graph, clean-distro extraction, fleet as a
+  domain object, PM semantics, etc. — `NORTH-STAR.md:105-115`). All ten read
+  as bug/hygiene fixes against an already-shipped MVP surface (engine
+  honesty, platform facts, harness cleanup), not features the North Star
+  explicitly sequences later. I found no gating violation. (**VERIFIED** —
+  read `NORTH-STAR.md` in full and cross-checked each issue's description
+  against the Gated/Never lists.)
+- **FOUNDATION-1 method-note citation (`plan.md:205-210`).** The plan's claim
+  — "the three axes whose refuter was given a *specific line of attack*
+  produced the unit's only refutation and all three severity downgrades" —
+  matches `GAUNTLET.md:171-173` nearly verbatim ("Method note carried
+  forward: the three axes whose refuter was given a **specific line of
+  attack** produced the unit's only refutation and all three downgrades").
+  Accurate citation. (**VERIFIED** — read `GAUNTLET.md:121-179`.)
 
-**VERIFIED**: `docs/DEVELOPMENT.md:69-72`'s session-conduct bullet is quoted
-near-verbatim (identical `BU-0041, BU-0122, BU-1196` citations) in ADR 0005's
-own Context section, and ADR 0005's Decision states plainly: "The rule
-dissolves rather than being amended (D1)." Direct, on-point supersession, not
-an over-read of a narrower document.
+**Spec summary: 2 findings (2 high, 0 medium, 0 low). Worst: P1 and P2 (tied,
+high) — one misattributes a currently-affirmed code-level objection to an ADR
+that never made it, the other falsifies the file-disjointness claim the
+sprint's only parallel-wave pair depends on. Six additional lines of attack
+(R8/ADR 0005, the attach claim, #85's crate labeling, R4 vs. the AGENTS.md
+guardrail, the envelope reasoning, and scope vs. NORTH-STAR) were checked and
+returned no finding.**
 
-### No finding — #85's sysinfo Disks API claim
+---
 
-**VERIFIED**: §4's crate table is explicitly framed as "researched via
-Context7 against the crates' own documentation," distinct from the
-`[measured]` bullets that follow, and §10 defers macOS verification to the
-Mac trip ("the crates make the claim cheap, they do not make it measured").
-Honestly labeled at both points where it matters.
+## Closing summary
 
-### No finding — R4 vs. `AGENTS.md`'s guardrail against destroying preserved state
-
-**VERIFIED**: `AGENTS.md:203-205` protects "a retained branch, a journal, a
-Work record" from destruction under standing authorization. R4 ("retain the
-dirty **state**, never the **directory**; `target/` is never in scope")
-narrows retention to exactly that class and excludes only gitignored build
-artifacts — the retrospective's own #109 analysis reaches the same
-conclusion. No conflict.
-
-### No finding — scope vs. `NORTH-STAR.md`'s gating
-
-**VERIFIED**: `grep` for all ten in-scope issue numbers (`#18, #81, #82, #85,
-#90, #94, #96, #108, #109, #95`) against `NORTH-STAR.md` returns zero matches.
-**BELIEVE** (this checkout's `sergeant-rs` origin has no GitHub remote, so
-issue titles can't be independently cross-checked here): by category, none of
-the ten — platform crates, engine honesty, operator surfaces, harness
-hygiene — obviously fall under NORTH-STAR's "Gated" or "Never" lists. They
-postdate the wave plan the North Star superseded with MVP bucketing.
-
-**Summary — Spec: 4 findings (3 error, 1 warning); 4 lines of attack closed
-with no finding.** Worst issue: finding 2 (the `attach` claim) — if
-uncorrected, W6 can pass its own gate without the integration branch ever
-receiving the fixes it authorized, the exact failure mode ADR 0005 built
-`attach` to prevent. Finding 1 is a correction to the *prior* review of this
-plan, not a new discovery this session invented — the underlying citation
-defect was already flagged in `3de1266`, but that review's own verification
-step was wrong about where the true source lives, which would have sent W1
-looking in the wrong document.
+**Standards: 2 findings (worst: S1, medium).** **Spec: 2 findings (worst: P1
+and P2, tied at high).** The two axes are not merged or reranked against each
+other; no overall winner is picked. Both Spec findings should be resolved
+before W1 and W6's briefs are written — P1 changes what W1 is actually being
+asked to answer, and P2 changes whether W1/W3 can run in parallel at all.
