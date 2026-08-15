@@ -24,4 +24,5 @@
 
 pub mod data_dir;
 pub mod disk;
+pub mod fs_locking;
 pub mod process;
