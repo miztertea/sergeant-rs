@@ -604,13 +604,32 @@ fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
     // terminal; killing `script` closes the master, which is what a terminal
     // emulator dying does. Wrapped so that an assertion failing before the
     // planned kill does not leave the pty (and the session on it) running.
-    let mut pty = Reaped(
-        Command::new("script")
-            .arg("-q")
+    //
+    // **First-contact macOS fix (path-to-mac.md trip, 2026-08-15).** `-f -c
+    // <command> <file>` is util-linux `script`'s syntax; BSD/macOS `script`
+    // has no `-c` or `-f` flag at all and refuses both outright ("illegal
+    // option"). Its own usage is `script [-aeFkpqr] [-t time] [file
+    // [command ...]]` — the typescript file is positional and comes first,
+    // and the command follows as trailing positional args (measured
+    // directly against this host's `/usr/bin/script`).
+    let sgt_tui_command = format!("{SGT} --data-dir {} tui", data.display());
+    let mut script_command = Command::new("script");
+    script_command.arg("-q");
+    if cfg!(target_os = "macos") {
+        script_command
+            .arg(&typescript)
+            .arg("sh")
+            .arg("-c")
+            .arg(&sgt_tui_command);
+    } else {
+        script_command
             .arg("-f")
             .arg("-c")
-            .arg(format!("{SGT} --data-dir {} tui", data.display()))
-            .arg(&typescript)
+            .arg(&sgt_tui_command)
+            .arg(&typescript);
+    }
+    let mut pty = Reaped(
+        script_command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -692,43 +711,57 @@ impl Drop for Reaped {
 /// which this deliberately mirrors rather than extends: the reaper's job is
 /// daemons, and widening it would make every suite's cleanup depend on a
 /// classification only this test needs.
+///
+/// **First-contact macOS fix (path-to-mac.md trip, 2026-08-15).** This used
+/// to read `/proc` directly with no macOS arm — same bug `support::daemon_pids`
+/// had (this function's own doc comment already names that one as the
+/// pattern being mirrored, but the fix landed there without also reaching
+/// this copy). `.ok()?` on the failed `read_dir("/proc")` made it return
+/// `None` silently on macOS rather than panic, which is the more dangerous
+/// failure shape: every caller here reads "no TUI client pid" instead of
+/// "this platform can't answer that". Reuses
+/// [`sergeant_rs::platform::process::running_processes`], the same
+/// Ponytail R1 fix applied to `support::daemon_pids`.
 #[cfg(unix)]
 fn tui_pid(data_dir: &Path) -> Option<u32> {
     let wanted = data_dir.to_string_lossy().to_string();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let argv: Vec<String> = String::from_utf8_lossy(&raw)
-            .split('\0')
-            .filter(|arg| !arg.is_empty())
-            .map(str::to_string)
-            .collect();
-        let is_sgt = argv
+    let processes = sergeant_rs::platform::process::running_processes()?;
+    for process in processes {
+        let is_sgt = process
+            .argv
             .first()
             .map(PathBuf::from)
             .and_then(|program| program.file_name().map(|name| name == "sgt"))
             .unwrap_or(false);
-        let names_dir = argv
+        let names_dir = process
+            .argv
             .windows(2)
             .any(|pair| pair[0] == "--data-dir" && pair[1] == wanted);
-        if is_sgt && names_dir && !argv.iter().any(|arg| arg == "daemon") {
-            return Some(pid);
+        if is_sgt && names_dir && !process.argv.iter().any(|arg| arg == "daemon") {
+            return Some(process.pid);
         }
     }
     None
 }
 
-/// Whether a pid is still *running* — `/proc`, like everything else in this
-/// rig, so nothing has to be signalled to find out.
+/// Whether a pid is still *running* — `/proc` on Linux, like everything else
+/// in this rig, so nothing has to be signalled to find out; `ps` on macOS,
+/// which has no `/proc`.
 ///
 /// A zombie is not alive: once the pty's owner is killed the session is
 /// reparented, and whether its exit status has been collected yet is the
 /// reaper's business, not evidence that the process is still there.
-#[cfg(unix)]
+///
+/// **First-contact macOS arm (path-to-mac.md trip, 2026-08-15).** This used
+/// to read `/proc/{pid}/stat` unconditionally — on macOS that path never
+/// exists, so every pid read as dead, including the TUI this test had just
+/// confirmed was up (`the TUI must come up under the pty` passing right
+/// before this check fails is the tell: the process is there, the read
+/// isn't). Unlike `platform::process::process_alive` (existence only, no
+/// zombie distinction — this test needs the distinction, so that helper
+/// isn't a fit here), there is no existing production fact to reuse; this is
+/// new decision logic, not a second copy of one that already exists.
+#[cfg(target_os = "linux")]
 fn pid_alive(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
@@ -738,6 +771,23 @@ fn pid_alive(pid: u32) -> bool {
     stat.rsplit_once(") ")
         .and_then(|(_, rest)| rest.split_whitespace().next())
         .is_some_and(|state| state != "Z")
+}
+
+/// macOS arm: `ps -o state= -p <pid>` prints just the state column (no
+/// header, `-o state=`), one word like `Ss` or `Z` — a zombie's state starts
+/// with `Z` on BSD `ps` too. Empty output (nothing printed at all) means `ps`
+/// found no such pid.
+#[cfg(target_os = "macos")]
+fn pid_alive(pid: u32) -> bool {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    let state = String::from_utf8_lossy(&output.stdout);
+    let state = state.trim();
+    !state.is_empty() && !state.starts_with('Z')
 }
 
 /// The API extension the detail screens needed, tested where it lives: this
@@ -930,14 +980,31 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         "the --json check list and its order are the stable part of this contract"
     );
     for check in report["checks"].as_array().expect("checks") {
-        assert_eq!(
-            check["status"], "ok",
-            "every check must be green on a healthy install: {check}"
-        );
-        assert!(
-            check["remedy"].is_null(),
-            "a green check has nothing to remedy: {check}"
-        );
+        // #85: `filesystem` is the one check this repo cannot make report
+        // `ok` on a healthy macOS install today. `src/platform/fs_locking.rs`
+        // always answers `Unknown` there by design (its own doc comment: the
+        // fail-closed-*safe* direction, since guessing at unmeasured
+        // `statfs`/`getmntinfo`/`diskutil` detection would be worse than
+        // admitting it can't tell) — `doctor` surfaces that as `warn`, not a
+        // fault to remedy. First measured end-to-end on the MacBook Pro M3
+        // Pro arrival trip, 2026-08-15; #85 stays open until real macOS
+        // detection ships, which is separate feature work, not this
+        // measurement pass.
+        if check["name"] == "filesystem" && cfg!(target_os = "macos") {
+            assert_eq!(
+                check["status"], "warn",
+                "the filesystem check must warn, not fail, when detection is merely unmeasured: {check}"
+            );
+        } else {
+            assert_eq!(
+                check["status"], "ok",
+                "every check must be green on a healthy install: {check}"
+            );
+            assert!(
+                check["remedy"].is_null(),
+                "a green check has nothing to remedy: {check}"
+            );
+        }
         assert!(
             check["detail"].as_str().is_some_and(|d| !d.is_empty()),
             "every check must say what it measured: {check}"
