@@ -64,14 +64,35 @@ with no verb on either side to reap it. Sergeant's disk-footprint contract
 (#109's larger item) covers what a Work writes to disk; it says nothing
 about state a Work creates in a third-party daemon.
 
-### 1.3 Branch residue is now two classes, not one
+### 1.3 Branch residue is three classes, and the merge check earned its keep
 
-Twelve local branches. Eleven are ordinary gauntlet/lane debris, safe under
-`git branch -d`'s own merge check, same class the previous sweep found.
+Twelve local branches. Ten were ordinary gauntlet/lane debris and deleted
+cleanly under `git branch -d`'s own merge check — including
+`sergeant/01M02VBSZ945TPHGDK6TJEHGPT`, which was **pushed into the primary
+checkout by the gate pipeline** rather than created by any local command
+(§3.1 — its presence is the symptom, not the defect).
 
-The twelfth is different: `sergeant/01M02VBSZ945TPHGDK6TJEHGPT` was **pushed
-into the primary checkout by the gate pipeline**, not created by any local
-command. See §3.1 — its presence is the symptom, not the defect.
+**Two refused deletion as "not fully merged", and they were right to.**
+`lane/w6-gate-escalation` and `lane/w6b-gate-escalation` hold the gate Work's
+five-dispatch diagnostic record — the false-pass discovery, the corrected
+root cause, and the escalations that produced #120. That evidence was taken
+into custody locally and **never landed on the integration branch**, so it
+existed on exactly one machine. A `-D` in the same sweep as the other ten
+would have destroyed it silently.
+
+Pushed to `archive/w6-gate-escalation` and `archive/w6b-gate-escalation`
+rather than merged: five near-duplicate ledger entries documenting one
+saga would bury the ledger, but the evidence has to survive somewhere
+durable.
+
+The general lesson is about the **sweep**, not the branches: a cleanup that
+treats a session's artifacts as one homogeneous class will eventually delete
+the one that mattered. Here git's own merge check was the only thing
+distinguishing them, and it worked because the deletion used `-d` rather
+than `-D`. The previous retrospective recorded a session bundling four
+destructive operations into one un-reviewable command; this is the same
+hazard at a smaller scale, caught by a safer default rather than by
+judgment.
 
 ---
 
