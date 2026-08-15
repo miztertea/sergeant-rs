@@ -99,10 +99,20 @@ daemon_env_ok() {
     fi
     return 0
   fi
-  # No /proc (macOS and any other non-Linux host): the OS does not expose
-  # another process's environment to same-user readers without debugger-level
-  # entitlements — measured directly on macOS 26.6.1: both `ps -E -p <pid>`
-  # and `ps eww -p <pid>` return empty for a same-user child process (#130).
+  # /proc/<pid>/environ is absent.  Two distinct cases:
+  #
+  # (a) /proc IS mounted on this host (Linux) but the daemon's entry is gone:
+  #     the daemon died in the window between daemon_pid() reading the pid file
+  #     and this check.  Return 1 so the caller's restart block fires.
+  if [ -d /proc ]; then
+    return 1
+  fi
+  #
+  # (b) /proc does NOT exist at all (macOS and any other non-Linux host): the
+  #     OS does not expose another process's environment to same-user readers
+  #     without debugger-level entitlements — measured directly on macOS 26.6.1:
+  #     both `ps -E -p <pid>` and `ps eww -p <pid>` return empty for a
+  #     same-user child process (#130).
   #
   # The hazard this check guards against is a *supervisor* (systemd) stripping
   # env vars before the daemon sees them.  On hosts where systemd manages the
