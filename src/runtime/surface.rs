@@ -579,9 +579,21 @@ pub fn attach(
 
     let mut bindings: Vec<RepositoryBinding> = Vec::with_capacity(target_bindings.len());
     for target in target_bindings {
-        match attach_one(&root, &canonical_root, target_work_id, target) {
+        let outcome = match attach_one(&root, &canonical_root, target_work_id, target) {
+            Ok(binding) => init_submodules_if_present(&binding.worktree_path)
+                .map(|()| binding.clone())
+                .map_err(|err| (Some(binding), err)),
+            Err(err) => Err((None, err)),
+        };
+        match outcome {
             Ok(binding) => bindings.push(binding),
-            Err(err) => {
+            Err((created, err)) => {
+                // A binding was created for *this* repository before the
+                // failure (the submodule case) — fold it into the set being
+                // rolled back so its worktree, checked out onto the target's
+                // real branch, is torn down exactly like every earlier
+                // repository's, mirroring `materialize`'s own handling.
+                bindings.extend(created);
                 // Nothing to roll back if no repository ever produced a
                 // binding: surface the original error as-is, exactly like
                 // `materialize`'s own first-repository case.
@@ -648,7 +660,6 @@ fn attach_one(
             &target.work_branch,
             false,
         )?;
-        init_submodules_if_present(&worktree_path)?;
         Ok(git(&worktree_path, &["rev-parse", "HEAD"])?)
     })?;
 
