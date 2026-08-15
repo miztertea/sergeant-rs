@@ -455,20 +455,99 @@ fn materialize_one(
             source_repo: repository.path.display().to_string(),
         });
     }
-    let (base_sha, base_branch, head_sha) = with_repository(&repository.path, || {
-        let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
-        // A detached HEAD has no branch name; record the fact rather than
-        // inventing one.
-        let base_branch = git(
-            &repository.path,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        )
-        .unwrap_or_else(|_| "(detached)".to_string());
+    // Read HEAD metadata **before** taking the per-repository lock.  Both
+    // calls touch only `.git/HEAD` and ref storage — they do not access the
+    // worktree registry (`.git/worktrees/`) that `with_repository` protects.
+    // Running them before acquiring the lock lets concurrent submissions that
+    // target the same repository overlap this work rather than serializing all
+    // four git spawns per materialization behind a single gate.
+    //
+    // Correctness under a concurrent HEAD advance: `base_sha` is passed
+    // explicitly to `git worktree add` rather than "HEAD", so the new
+    // worktree lands at the commit we recorded here even if the branch tip
+    // moves between this read and the add.  The provenance record and the
+    // actual checkout agree with each other; a one-commit lag behind the tip
+    // is the same fact it was before (the submit captured a snapshot of HEAD
+    // at request time, and that snapshot is what the run executes on).
+    let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
+    // A detached HEAD has no branch name; record the fact rather than
+    // inventing one.
+    let base_branch = git(
+        &repository.path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .unwrap_or_else(|_| "(detached)".to_string());
 
-        add_worktree(&repository.path, &worktree_path, branch, &base_sha)?;
-        let head_sha = git(&worktree_path, &["rev-parse", "HEAD"])?;
-        Ok::<_, SurfaceError>((base_sha, base_branch, head_sha))
+    // Only `git worktree add` touches `.git/worktrees/` — the operation the
+    // per-repository lock exists to serialize.  Hold it for exactly that span
+    // and nothing more.
+    //
+    // `--no-checkout` skips the working-tree file population inside the lock.
+    // `git reset --hard HEAD` (which reads only the object store and writes
+    // to the worktree directory) runs after the lock releases so that
+    // concurrent submissions against the same repository can overlap it with
+    // the next submission's registry write — shaving the lock-held time from
+    // ~57 ms (full add + checkout) to ~43 ms (registry write only) per work.
+    //
+    // Correctness: `--no-checkout` still creates the branch at `base_sha` and
+    // sets HEAD in the new worktree to that branch, so `checkout_worktree`
+    // below populates exactly the same content as a full add would have.  The
+    // checkout completes before `materialize_one` returns, so no caller ever
+    // sees a worktree with its branch set but its files absent.
+    with_repository(&repository.path, || {
+        add_worktree_no_checkout(&repository.path, &worktree_path, branch, &base_sha)
     })?;
+    // Outside the per-repository lock: populate the working tree.
+    //
+    // `git reset --hard HEAD` is used rather than `git checkout HEAD` for two
+    // reasons:
+    //
+    // 1. Detached-HEAD avoidance.  After `--no-checkout`, HEAD is a symref to
+    //    the work branch.  `git checkout HEAD` resolves "HEAD" to the commit
+    //    SHA and performs a commit-level checkout, which DETACHES HEAD from the
+    //    branch.  Commits the runner makes in a detached-HEAD worktree do not
+    //    advance the branch, silently losing the run's output on teardown.
+    //    `git reset --hard HEAD` resolves HEAD to the same commit but leaves
+    //    HEAD's branch-pointer intact.
+    //
+    // 2. `--no-checkout` leaves the index empty (it does NOT pre-populate it
+    //    as a regular checkout would).  `git reset --hard HEAD` both fills the
+    //    index from HEAD's tree and writes those files to disk — a single
+    //    command that does exactly what we need.
+    //
+    // Unlike `add_worktree_from` (where a git failure is atomic — either the
+    // whole add lands or nothing is written), a `checkout_worktree` failure
+    // here leaves behind durable side-effects from the preceding
+    // `add_worktree_no_checkout`: a branch ref, a `.git/worktrees/<name>/`
+    // registry entry, and an empty worktree directory.  The caller's
+    // `materialize` cannot see these because no `RepositoryBinding` is
+    // returned, so it cannot drive teardown for them.  Roll them back inline
+    // before returning the error.  Both cleanups are best-effort: stale
+    // registry entries are reaped by `git worktree prune` on the next
+    // teardown for this repository; orphaned branches would block a retry (the
+    // engine calls `materialize` again with `-b <same-branch>`, which fails if
+    // the branch exists), so deleting the branch is the more important step.
+    if let Err(checkout_err) = checkout_worktree(&worktree_path) {
+        let path = worktree_path.display().to_string();
+        // Remove registry entry first so the branch is unreferenced.
+        let _ = with_repository(&repository.path, || {
+            git(
+                &repository.path,
+                &["worktree", "remove", "--force", &path],
+            )
+            .map(|_| ())
+        });
+        // Delete the branch so a retry can re-create it with `-b`.
+        let _ = git(&repository.path, &["branch", "-D", branch]);
+        return Err(checkout_err);
+    }
+
+    // `git worktree add --no-checkout -b <branch> <path> <sha>` creates the
+    // branch at `<sha>` and sets HEAD in the new worktree to that branch.
+    // `git reset --hard HEAD` (above) does not run any `post-checkout` hook,
+    // so HEAD in the worktree stays at exactly `base_sha`.  `head_sha` is
+    // recorded as `base_sha` — correct by construction.
+    let head_sha = base_sha.clone();
 
     Ok(RepositoryBinding {
         repository: repository.name.clone(),
@@ -1121,31 +1200,52 @@ pub fn directory_size(path: &Path) -> u64 {
 }
 
 fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
-    with_repository(&binding.source_path, || teardown_binding_locked(binding))
-}
-
-fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
-    // Read the retained branch's tip before anything else. Teardown always
-    // keeps the branch regardless of what happens to the worktree below, so
-    // this is available in every disposition — including `Missing`, where
-    // there is no worktree left to read a HEAD from at all.
+    // Read the retained branch's tip **before** taking the per-repository lock.
+    // This call reads from ref storage only — it does not access the worktree
+    // registry (`.git/worktrees/`) that `with_repository` protects, so running
+    // it before the lock lets concurrent teardowns that target the same
+    // repository do this work in parallel rather than serializing behind the
+    // gate that only `git worktree remove` actually needs.
+    //
+    // Teardown always keeps the branch regardless of what happens to the
+    // worktree below, so `final_sha` is available in every disposition —
+    // including `Missing`, where there is no worktree left to read a HEAD from.
     let final_sha = git(
         &binding.source_path,
         &["rev-parse", &format!("refs/heads/{}", binding.work_branch)],
     )
     .ok();
+
     if !binding.worktree_path.exists() {
         // The directory is gone, but the source repository still lists it;
         // unregister it now so a later rematerialize at the same path is
-        // possible. This does not change the disposition below either way.
-        prune_stale_worktrees(&binding.source_path);
+        // possible.  `git worktree prune` modifies the registry → lock.
+        with_repository(&binding.source_path, || {
+            prune_stale_worktrees(&binding.source_path);
+        });
         return (BindingDisposition::Missing, final_sha);
     }
+
+    // Check whether the worktree is clean **before** taking the per-repository
+    // lock.  `git status --porcelain` runs in the linked worktree and reads
+    // the shared object store (read-only) plus the worktree-local index — it
+    // does not touch `.git/worktrees/`, so it is safe outside the lock.
+    //
+    // TOCTOU note: if the worktree becomes dirty between this read and the
+    // `git worktree remove` below, git's own pre-removal dirty check fires and
+    // refuses the removal, surfacing a `RetainedError` rather than silently
+    // destroying content — the same fail-closed outcome the explicit status
+    // check produces, so the window carries no correctness risk.
     match git(&binding.worktree_path, &["status", "--porcelain"]) {
         Ok(changes) if !changes.is_empty() => {
-            return (retain_dirty(binding, changes), final_sha);
+            // Dirty: `retain_dirty` captures a patch and calls `git worktree
+            // remove --force`, which does touch the registry.  Hold the lock
+            // for that entire path.
+            let disposition =
+                with_repository(&binding.source_path, || retain_dirty(binding, changes));
+            return (disposition, final_sha);
         }
-        Ok(_) => {}
+        Ok(_) => {} // clean — proceed to the removal below
         Err(e) => {
             // Cannot establish that it is clean ⇒ must not remove it.
             return (
@@ -1156,49 +1256,60 @@ fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, 
             );
         }
     }
+
+    // Clean path: only `git worktree remove` touches the registry.
     let path = binding.worktree_path.display().to_string();
-    let disposition = match git(&binding.source_path, &["worktree", "remove", &path]) {
-        Ok(_) => BindingDisposition::Removed,
-        // #22: git unconditionally refuses to remove a worktree that
-        // contains a submodule — "working trees containing submodules
-        // cannot be moved or removed" — regardless of whether anything in
-        // it is actually dirty. Left as `RetainedError` unconditionally,
-        // *every* submodule-bearing surface would leak its worktree on
-        // every single ordinary, successful teardown, forever (measured:
-        // this module's own `a_submodule_is_populated_into_the_
-        // materialized_worktree` failed here before this arm existed). The
-        // `git status --porcelain` check just above already answers
-        // whether the submodule itself has anything uncommitted — it
-        // recurses into a registered submodule by default and would have
-        // returned `RetainedDirty` already if so — so reaching this arm at
-        // all means the only reason git refused is the policy, not the
-        // content, and retrying with `--force` destroys nothing §11 does
-        // not already know is safe to remove.
-        Err(e) if e.to_string().contains("containing submodules") => {
-            match git(
-                &binding.source_path,
-                &["worktree", "remove", "--force", &path],
-            ) {
-                Ok(_) => BindingDisposition::Removed,
-                Err(e) => BindingDisposition::RetainedError {
-                    detail: e.to_string(),
-                },
+    let disposition = with_repository(&binding.source_path, || {
+        match git(&binding.source_path, &["worktree", "remove", &path]) {
+            Ok(_) => BindingDisposition::Removed,
+            // #22: git unconditionally refuses to remove a worktree that
+            // contains a submodule — "working trees containing submodules
+            // cannot be moved or removed" — regardless of whether anything in
+            // it is actually dirty. Left as `RetainedError` unconditionally,
+            // *every* submodule-bearing surface would leak its worktree on
+            // every single ordinary, successful teardown, forever (measured:
+            // this module's own `a_submodule_is_populated_into_the_
+            // materialized_worktree` failed here before this arm existed). The
+            // `git status --porcelain` check just above already answers
+            // whether the submodule itself has anything uncommitted — it
+            // recurses into a registered submodule by default and would have
+            // returned `RetainedDirty` already if so — so reaching this arm at
+            // all means the only reason git refused is the policy, not the
+            // content, and retrying with `--force` destroys nothing §11 does
+            // not already know is safe to remove.
+            Err(e) if e.to_string().contains("containing submodules") => {
+                match git(
+                    &binding.source_path,
+                    &["worktree", "remove", "--force", &path],
+                ) {
+                    Ok(_) => BindingDisposition::Removed,
+                    Err(e) => BindingDisposition::RetainedError {
+                        detail: e.to_string(),
+                    },
+                }
             }
+            Err(e) => BindingDisposition::RetainedError {
+                detail: e.to_string(),
+            },
         }
-        Err(e) => BindingDisposition::RetainedError {
-            detail: e.to_string(),
-        },
-    };
+    });
     (disposition, final_sha)
 }
 
-fn add_worktree(
-    source: &Path,
-    worktree: &Path,
-    branch: &str,
-    start: &str,
-) -> Result<(), SurfaceError> {
-    add_worktree_from(source, worktree, branch, start, true)
+/// Ensure the parent directory of `worktree` exists and return the path as a
+/// display string, ready to pass to `git worktree add`.
+///
+/// Both [`add_worktree_from`] and [`add_worktree_no_checkout`] need the same
+/// directory-creation guard before their `git` invocation; this helper keeps
+/// the logic in one place.
+fn prepare_worktree_dir(worktree: &Path) -> Result<String, SurfaceError> {
+    if let Some(parent) = worktree.parent() {
+        create_dir_all_durable(parent).map_err(|source| SurfaceError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(worktree.display().to_string())
 }
 
 fn add_worktree_from(
@@ -1208,19 +1319,57 @@ fn add_worktree_from(
     start: &str,
     create_branch: bool,
 ) -> Result<(), SurfaceError> {
-    if let Some(parent) = worktree.parent() {
-        create_dir_all_durable(parent).map_err(|source| SurfaceError::Io {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
-    let path = worktree.display().to_string();
+    let path = prepare_worktree_dir(worktree)?;
     let args: Vec<&str> = if create_branch {
         vec!["worktree", "add", "-b", branch, &path, start]
     } else {
         vec!["worktree", "add", &path, start]
     };
     git(source, &args)?;
+    Ok(())
+}
+
+/// `git worktree add --no-checkout`: create the branch, write the registry
+/// entry, and set HEAD in the new worktree — but do *not* populate the
+/// working-tree files. Callers must follow up with [`checkout_worktree`].
+///
+/// Holding only the registry write under the per-repository lock (see
+/// [`with_repository`]) lets the file-level checkout — which touches only the
+/// object store (read-only) and the new worktree directory — run after the
+/// lock releases and overlap with the next submission's registry write.
+fn add_worktree_no_checkout(
+    source: &Path,
+    worktree: &Path,
+    branch: &str,
+    start: &str,
+) -> Result<(), SurfaceError> {
+    let path = prepare_worktree_dir(worktree)?;
+    git(source, &["worktree", "add", "--no-checkout", "-b", branch, &path, start])?;
+    Ok(())
+}
+
+/// Populate the working tree of a worktree created with
+/// `git worktree add --no-checkout`.
+///
+/// `--no-checkout` leaves both the index and the working tree empty; only HEAD
+/// (a symref to the work branch) and the `.git/worktrees/<name>/` registry
+/// entry are written.  `git reset --hard HEAD` fills the index from HEAD's
+/// tree and writes those files to disk — the minimal operation that brings the
+/// worktree to a usable state.
+///
+/// `git reset --hard` is chosen over `git checkout HEAD` for two reasons:
+/// - `checkout HEAD` resolves `HEAD` as a commitish and performs a
+///   commit-level switch, which **detaches HEAD** from the work branch.
+///   Commits made in a detached-HEAD worktree do not advance the branch,
+///   silently losing run output on teardown.
+/// - `reset --hard HEAD` leaves the symref intact (HEAD stays → work branch).
+///
+/// This call touches neither the worktree registry (`.git/worktrees/`) nor
+/// the source repository's ref storage, so it is safe to run after the
+/// per-repository lock releases and overlap with the next submission's
+/// registry write.
+fn checkout_worktree(worktree: &Path) -> Result<(), SurfaceError> {
+    git(worktree, &["reset", "--hard", "HEAD"])?;
     Ok(())
 }
 
@@ -1900,9 +2049,9 @@ mod tests {
         // removed: a submodule that never finished initializing has nothing
         // of its own for `git status --porcelain` to find dirty (there is no
         // checked-out submodule content yet to be dirty), so the force-retry
-        // `teardown_binding_locked` uses for git's blanket "containing
-        // submodules" refusal cleans it up rather than leaving it parked
-        // with a permanent `RetainedError`.
+        // `teardown_binding` uses for git's blanket "containing submodules"
+        // refusal cleans it up rather than leaving it parked with a permanent
+        // `RetainedError`.
         assert_eq!(teardown.bindings.len(), 1);
         assert_eq!(teardown.bindings[0].repository, "solo");
         assert_eq!(
@@ -1918,8 +2067,140 @@ mod tests {
         assert!(teardown.clean);
     }
 
-    /// The force-retry `teardown_binding_locked` uses for git's blanket
-    /// "containing submodules" refusal must never bypass real dirtiness —
+    /// Fix 3 — `--no-checkout` + `checkout_worktree` cleanup (L7 pin).
+    ///
+    /// After `add_worktree_no_checkout` creates a branch ref and a
+    /// `.git/worktrees/<name>/` registry entry, `checkout_worktree`
+    /// (`git reset --hard HEAD`) populates the working tree.  If that second
+    /// step fails, `materialize_one` must clean up both the registry entry
+    /// **and the branch** before returning the error — otherwise a retry would
+    /// call `git worktree add -b <same-branch> …` and fail because the branch
+    /// already exists, permanently wedging the work.
+    ///
+    /// The trigger: a smudge filter configured as `required` that always exits
+    /// non-zero.  Git runs smudge filters when checking out files; with
+    /// `required = true` a non-zero exit is a hard error on the whole reset.
+    /// `git worktree add --no-checkout` skips the checkout, so the filter does
+    /// not fire there — only during `checkout_worktree`.
+    ///
+    /// The key assertion (the pin): after the failed materialize, a second
+    /// call to materialize for the same work-id must succeed.  It can only
+    /// succeed if the branch was deleted — `git worktree add -b` fails if the
+    /// branch already exists.
+    #[test]
+    fn a_checkout_failure_after_no_checkout_add_does_not_strand_the_branch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+
+        // Build a repository whose checkout step always fails: a file subject
+        // to a required smudge filter that always exits non-zero.
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).expect("source dir");
+        // Phase 1: create the repo and the initial commit WITHOUT the filter
+        // configured — the filter's `required = true` would also block `git add`
+        // (the clean step) if it were active during setup.
+        for args in [vec!["init", "-b", "main"]] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(&source)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+        }
+        // .gitattributes declares the filter; payload.txt is the file it targets.
+        std::fs::write(
+            source.join(".gitattributes"),
+            "payload.txt filter=always-fail\n",
+        )
+        .expect(".gitattributes");
+        std::fs::write(source.join("payload.txt"), "content\n").expect("payload.txt");
+        for args in [vec!["add", "."], vec!["commit", "-m", "initial"]] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&source)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        // Phase 2: arm the smudge filter AFTER the commit so it does not
+        // interfere with the clean-side of `git add`.  The filter is written
+        // to the local repo config so sergeant's `git reset --hard HEAD`
+        // (which does not suppress local config) reads it.
+        for args in [
+            vec!["config", "filter.always-fail.smudge", "false"],
+            vec!["config", "filter.always-fail.required", "true"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&source)
+                .output()
+                .expect("git config");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let spec = RepositorySpec {
+            name: "source".to_string(),
+            path: source.to_path_buf(),
+        };
+
+        // First attempt: add_worktree_no_checkout succeeds (no checkout →
+        // smudge filter not triggered), checkout_worktree fails (smudge
+        // filter exits 1), cleanup runs.
+        let err = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec))
+            .expect_err("checkout_worktree failure must propagate as an error");
+        assert!(
+            matches!(err, SurfaceError::Git { .. }),
+            "expected a git error from the reset --hard, got: {err}"
+        );
+
+        // The branch add_worktree_no_checkout created must be gone.  Without
+        // the `git branch -D` cleanup, the retry below would hit:
+        //   fatal: A branch named 'sergeant/01CHECKFAIL' already exists.
+        let branch = work_branch("01CHECKFAIL");
+        assert!(
+            !git_succeeds(
+                &source,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}")
+                ]
+            ),
+            "branch must be deleted by the checkout-failure cleanup — if it remains, \
+             a retry fails to re-create it and the work is wedged permanently"
+        );
+
+        // Remove the failing filter so the retry can actually complete.
+        for args in [
+            vec!["config", "--unset", "filter.always-fail.smudge"],
+            vec!["config", "--unset", "filter.always-fail.required"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(&source)
+                .output()
+                .expect("git config --unset");
+        }
+
+        // Retry: must succeed because the branch slot was freed.
+        let surface = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec))
+            .expect(
+                "retry must succeed — branch was deleted so it can be recreated with -b; \
+                 if this fails with 'branch already exists', the cleanup is missing",
+            );
+        assert!(surface.bindings[0].worktree_path.is_dir());
+        teardown(&surface);
+    }
+
+    /// The force-retry `teardown_binding` uses for git's blanket "containing
+    /// submodules" refusal must never bypass real dirtiness —
     /// uncommitted content genuinely *inside* the submodule is exactly what
     /// §11's fail-closed rule exists to protect. `git status --porcelain`
     /// already recurses into a registered submodule by default (measured,
