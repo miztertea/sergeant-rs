@@ -48,6 +48,36 @@ the four issues this sprint tracked as blocking, but the full suite run
 below exercises it too, and it gets the same "flip on measurement" treatment
 as a matter of course.
 
+## Pre-flight — before step 1
+
+This checklist has a gap: it tells you to "install cargo/rustc if missing"
+in passing (step 2) and discusses Docker Desktop's *semantics* (step 9), but
+it never states what must already be true before you start. Without it, a
+session can reach step 4 — after the ~10-minute cold DuckDB build in step 3
+— before discovering a missing dependency it could have caught in seconds.
+
+Run **`docs/handoff/pre-flight.md`** top to bottom first. It's written as a
+generic checklist (it's meant to serve the next new host too, per ADR 0001
+D1's Hades/WSL2 target, not just this one), so two of its judgment calls are
+worth restating in this trip's specific terms:
+
+- **Docker is not optional here.** This trip's step 4 runs the full suite,
+  and six of its suites are Docker-gated (`m2`, `m3`, `m4`, `m6`, `m7`,
+  `m8` — the pre-flight file's Docker row names them). If Docker Desktop is
+  installed but not running, those suites probe-gate to `SKIPPED-ENV`
+  instead of failing — the run goes green having quietly skipped most of
+  what actually matters on this host, which is the exact failure mode ADR
+  0001 (D8)(b) exists to catch. Treat the pre-flight file's Docker
+  reachability row as a hard stop for this trip, and re-check it right
+  before step 4 starts, not only at session start.
+- **`claude`/`gh` auth are degrade-not-hard-stop for this trip specifically**,
+  because closing #18/#81/#82 and choosing #95's clock (this file's whole
+  point) only need `cargo build`/`cargo test` to succeed — not a live
+  `claude` turn or `gh` working. If you do plan to also read #18/#81/#82/#95
+  through `gh` (the natural way to orient before step 1), the pre-flight
+  file's `gh` row already covers the `--repo miztertea/sergeant-rs` fix for
+  #112's misleading auth remedy.
+
 ## Steps
 
 1. **Land and orient.** Check out the branch you were handed. Read
