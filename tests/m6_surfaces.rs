@@ -1,34 +1,32 @@
 //! M6 acceptance tests (docs/gauntlet/contracts/M6.md).
 //!
+//! Acceptance 2 (the embedded dashboard) and its tests are gone: ADR 0011
+//! (D7) deletes `src/web.rs`, `web/`, and the `sgt web` verb outright — a
+//! disabled stub carrying open reactivation issues was rejected as a
+//! maintenance claim this repo would not honor, deletion is the lower rung.
+//! What is left, renumbered:
+//!
 //! 1. TUI data/render: against a live daemon with seeded work, the fleet and
 //!    detail screens render the contracted fields (ratatui `TestBackend`,
 //!    content assertions rather than pixels); an SSE-driven update is
 //!    reflected in a re-render; the TUI's write keys actually work through
 //!    the API; and `tui.rs` imports nothing but the API client.
-//! 2. Dashboard: Fleet and Work-detail pages over HTTP with the token carry
-//!    the seeded work's real data; without the token → 401; the assets are
-//!    embedded — the contract's probe (serve from a binary run in an empty
-//!    cwd, which rules out a cwd-relative read) plus the asset bytes being
-//!    found inside the `sgt` executable itself, which is what "embedded"
-//!    means. Neither probe can rule out a read through an absolute path, and
-//!    the comments at the probe say so rather than claiming otherwise.
-//! 3. Doctor: a healthy environment exits 0 with every check green; a broken
+//! 2. Doctor: a healthy environment exits 0 with every check green; a broken
 //!    data dir and an absent claude each produce their named failing check,
 //!    a remedy line, and a nonzero exit; `--json` is stable.
-//! 4. Demo: `scripts/demo.sh` exits 0 in a clean temp environment and its
-//!    printed evidence pointers resolve — the journal, the graph answer, the
-//!    fetched dashboard page and the analytics answer are all re-read from
-//!    the kept directory, and the graph's cited seqs are checked against the
-//!    journal, rather than the script being graded on the prose it printed.
-//!    The non-pausing arc `--real-claude` takes is run too, with a fake
-//!    backend, so the flag's control flow is exercised without tokens.
-//! 5. Clients-are-equal: `tui.rs` and `web.rs` reach state only through the
-//!    API's own types — a path scan over every crate-rooted path they name
-//!    (`crate::` and `super::`, brace groups walked), plus the compile-time
-//!    half (`ApiViews`'s state is a private field). The scan is itself
-//!    tested, because an instrument nobody has tried to fool is a claim
-//!    rather than a measurement: `use crate::{…}` and `use super::daemon::…`
-//!    each hid a real reach into daemon internals from the earlier version.
+//! 3. Demo: `scripts/demo.sh` exits 0 in a clean temp environment and its
+//!    printed evidence pointers resolve — the journal, the graph answer, and
+//!    the analytics answer are all re-read from the kept directory, and the
+//!    graph's cited seqs are checked against the journal, rather than the
+//!    script being graded on the prose it printed. The non-pausing arc
+//!    `--real-claude` takes is run too, with a fake backend, so the flag's
+//!    control flow is exercised without tokens.
+//! 4. Clients-are-equal: `tui.rs` reaches state only through the API's own
+//!    types — a path scan over every crate-rooted path it names (`crate::`
+//!    and `super::`, brace groups walked). The scan is itself tested,
+//!    because an instrument nobody has tried to fool is a claim rather than
+//!    a measurement: `use crate::{…}` and `use super::daemon::…` each hid a
+//!    real reach into daemon internals from the earlier version.
 //!
 //! **TUI test approach** (the contract's Unknown). Content assertions on a
 //! `TestBackend` buffer proved workable and are used as the primary
@@ -46,10 +44,9 @@
 //!   navigation, the two-keystroke write keys), `App::observe`'s
 //!   refresh-worthy set, and the durable liveness indicator in the header;
 //! - `stage_label` and `field_text` are *not* the TUI's — they live in
-//!   `src/api.rs` because both clients share them, and they are unit tested
-//!   next to the dashboard's renderers in `src/web.rs`. The point of the
-//!   sharing is that the two screens cannot tell different stories about the
-//!   same field, so one unit test for the rule is the right number.
+//!   `src/api.rs`, unit tested there next to their own definitions (moved
+//!   from `src/web.rs`'s tests when the dashboard was deleted, ADR 0011 —
+//!   the rule they encode outlives the second client that used to share it).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,7 +65,6 @@ use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::tui::{self, App, Screen};
-use sergeant_rs::web::{DASHBOARD_CSS, DASHBOARD_JS};
 
 mod support;
 use support::DataDir;
@@ -389,44 +385,174 @@ fn t1_the_tui_has_no_private_shortcut() {
     );
 }
 
-/// Acceptance 1's wiring, end to end: `sgt` with no subcommand *is* the TUI,
-/// and it is a client like any other — it auto-spawns a daemon on the way in.
-///
-/// The session cannot be driven from a test harness (there is no terminal),
-/// and that is precisely what makes this falsifiable: with stdio piped, the
-/// run must fail at terminal setup — after the client work is done. A build
-/// that had wired the bare command to something else would either not spawn
-/// a daemon or not fail here.
+/// ADR 0010 (D6): bare `sgt` is a homepage now, not the TUI, and it must
+/// touch no daemon at all — that is what dissolves ADR 0009's TUI carve-out
+/// debate instead of answering it. A build that still wired bare `sgt` to
+/// the TUI (§30, the prior behavior) would either spawn a daemon here or
+/// fail at terminal setup; this build must do neither.
 #[test]
-fn t1_bare_sgt_opens_the_tui_as_a_client() {
+fn t1_bare_sgt_prints_the_homepage_and_touches_no_daemon() {
+    let data = DataDir::new();
+    // Outside any estate: this checkout is itself an estate (clone-is-distro,
+    // per README.md), so a cwd inside it would exercise the estate-aware
+    // branch instead — the same cwd-isolation reasoning
+    // `resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home`
+    // (`tests/m2_daemon_api.rs`) already documents for estate discovery.
+    let cwd = TempDir::new().expect("tempdir outside any estate");
+    let output = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .current_dir(cwd.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run bare sgt");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        output.status.success(),
+        "the homepage must not fail (status {:?}, stderr {:?})",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("sgt init") && stdout.contains("sgt doctor"),
+        "outside an estate, the homepage must orient a stranger toward \
+         `sgt init`/`sgt doctor`: {stdout:?}"
+    );
+    assert!(
+        daemon::read_descriptor(data.path())
+            .expect("descriptor readable")
+            .is_none(),
+        "bare `sgt` must not spawn a daemon — it is a homepage, not a client (ADR 0010)"
+    );
+}
+
+/// ADR 0010's open question (estate-aware vs. static banner) resolved in the
+/// estate-aware direction: inside an estate, the homepage names it and its
+/// declared repository count — reading `sergeant.toml` is not observing the
+/// daemon, so this still must not spawn one.
+#[test]
+fn t1_bare_sgt_inside_an_estate_names_it_and_touches_no_daemon() {
+    let data = DataDir::new();
+    let estate = TempDir::new().expect("tempdir");
+    let init = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .current_dir(estate.path())
+        .arg("init")
+        .arg("--name")
+        .arg("probe-estate")
+        .output()
+        .expect("run sgt init");
+    assert!(
+        init.status.success(),
+        "sgt init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let output = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .current_dir(estate.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run bare sgt inside the estate");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        output.status.success(),
+        "the homepage must not fail (status {:?}, stderr {:?})",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("probe-estate"),
+        "inside an estate, the homepage must name it: {stdout:?}"
+    );
+    assert!(
+        daemon::read_descriptor(data.path())
+            .expect("descriptor readable")
+            .is_none(),
+        "bare `sgt` must not spawn a daemon even inside an estate (ADR 0010)"
+    );
+}
+
+/// ADR 0009's no-spawn set, on the TUI specifically: `sgt tui` with no
+/// daemon running refuses rather than materializing one just to have
+/// something to render, and names `sgt doctor` as the remedy the way every
+/// other fail-closed path in this codebase does.
+#[test]
+fn t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy() {
     let data = DataDir::new();
     let output = Command::new(SGT)
         .arg("--data-dir")
         .arg(data.path())
+        .arg("tui")
         .stdin(std::process::Stdio::null())
         .output()
-        .expect("run bare sgt");
+        .expect("run sgt tui");
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // Whatever else happened, a daemon was started for it: the TUI took the
-    // shared client path rather than a private one.
-    let descriptor = daemon::read_descriptor(data.path())
-        .expect("descriptor readable")
-        .expect("bare `sgt` must auto-spawn a daemon like every other client");
-    // Reaped through the guard rather than by an unwaited `kill` of the pid
-    // in the descriptor: the guard waits for the process to actually be gone,
-    // and it runs even if the assertion below fails first.
     assert!(
-        dir_reap_contains(&data, descriptor.pid),
-        "the daemon the descriptor names must be the one on this data dir"
+        !output.status.success(),
+        "sgt tui must refuse rather than auto-spawn with no daemon running"
     );
+    assert!(
+        stderr.contains("sgt doctor"),
+        "the refusal must name the remedy: {stderr:?}"
+    );
+    assert!(
+        daemon::read_descriptor(data.path())
+            .expect("descriptor readable")
+            .is_none(),
+        "sgt tui must not have spawned a daemon on its way to refusing"
+    );
+}
 
-    assert!(
-        !output.status.success() && stderr.contains("terminal"),
-        "with no terminal attached, the TUI must fail at terminal setup and say so \
-         (status {:?}, stderr {stderr:?})",
-        output.status.code()
-    );
+/// ADR 0009's no-spawn set, on the rest of it: `status`, `work list`,
+/// `work show`, `work transcript`, and `analytics` all refuse rather than
+/// auto-spawn with no daemon running, and each names `sgt doctor` as the
+/// remedy — the same shape `t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy`
+/// pins for the TUI. A build that still routed any one of these through
+/// `ensure_daemon` (the pre-ADR-0009 behavior every one of them used to
+/// share) would exit 0 here and leave a daemon behind instead.
+#[test]
+fn t1_observation_verbs_refuse_without_a_daemon_and_name_the_remedy() {
+    let data = DataDir::new();
+    for args in [
+        vec!["status"],
+        vec!["work", "list"],
+        vec!["work", "show", "01SOMENONEXISTENTWORKID000"],
+        vec!["work", "transcript", "01SOMENONEXISTENTWORKID000"],
+        vec!["analytics"],
+    ] {
+        let output = Command::new(SGT)
+            .arg("--data-dir")
+            .arg(data.path())
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("run sgt {}: {e}", args.join(" ")));
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        assert!(
+            !output.status.success(),
+            "sgt {} must refuse rather than auto-spawn with no daemon running",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains("sgt doctor"),
+            "sgt {}'s refusal must name the remedy: {stderr:?}",
+            args.join(" ")
+        );
+        assert!(
+            daemon::read_descriptor(data.path())
+                .expect("descriptor readable")
+                .is_none(),
+            "sgt {} must not have spawned a daemon on its way to refusing",
+            args.join(" ")
+        );
+    }
 }
 
 /// Issue #3, end to end and on a real terminal: a TUI whose pty hangs up
@@ -458,6 +584,12 @@ fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
         return;
     }
     let data = DataDir::new();
+    let cwd = TempDir::new().expect("tempdir");
+    // ADR 0009: `sgt tui` is in the no-spawn set now, so a daemon has to
+    // already be running for it to attach to — a bare `sgt tui` with none
+    // would refuse before ever touching the terminal, which is not what
+    // this measures.
+    let _daemon = SpawnedDaemon::start(&data, cwd.path(), &[]);
     let typescript_dir = TempDir::new().expect("tempdir");
     let typescript = typescript_dir.path().join("session");
 
@@ -470,7 +602,7 @@ fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
             .arg("-q")
             .arg("-f")
             .arg("-c")
-            .arg(format!("{SGT} --data-dir {}", data.display()))
+            .arg(format!("{SGT} --data-dir {} tui", data.display()))
             .arg(&typescript)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -479,11 +611,9 @@ fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
             .expect("allocate a pty with script(1)"),
     );
 
-    // Wait until the session is actually up — the TUI is a client, so it
-    // reads the API and starts a daemon before it ever touches the terminal,
-    // and hanging up before that would test the wrong thing entirely. The
-    // alternate-screen switch in the typescript is the terminal half; the
-    // process itself is found the same way the daemon reaper finds daemons.
+    // Wait until the session is actually up — the alternate-screen switch in
+    // the typescript is the terminal half; the process itself is found the
+    // same way the daemon reaper finds daemons.
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut tui = None;
     while Instant::now() < deadline {
@@ -652,312 +782,7 @@ async fn t1_the_events_endpoint_filters_and_tails_by_work() {
     handle.shutdown().await;
 }
 
-// ------------------------------------------------------------- 2. dashboard
-
-/// Acceptance 2. The embedded dashboard serves the seeded work's real data
-/// over HTTP with the token, refuses without it, and needs no filesystem.
-#[tokio::test]
-async fn t2_the_dashboard_serves_real_data_and_is_embedded() {
-    let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_workflow(repo.path());
-
-    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("which budget?")]).await;
-    let work_id = submit(&handle, repo.path(), "dashboard subject", "tiny").await;
-
-    // --- fleet page ---------------------------------------------------------
-    let fleet = get_text(
-        &format!("{}/ui?token={}", handle.endpoint, handle.token),
-        200,
-    )
-    .await;
-    assert!(fleet.contains(&work_id), "fleet page must list the work");
-    assert!(
-        fleet.contains("dashboard subject"),
-        "fleet page must carry the real intent"
-    );
-    assert!(
-        fleet.contains("needs_input"),
-        "fleet page must carry the real state"
-    );
-    assert!(
-        fleet.contains("00-first 1/2"),
-        "fleet page must carry the stage coordinate"
-    );
-    assert!(
-        fleet.contains("/v1/events/stream") || fleet.contains("dashboard.js"),
-        "the fleet page must wire up the live tail"
-    );
-
-    // --- work detail page ---------------------------------------------------
-    let detail = get_text(
-        &format!(
-            "{}/ui/work/{}?token={}",
-            handle.endpoint, work_id, handle.token
-        ),
-        200,
-    )
-    .await;
-    for needle in [
-        work_id.as_str(),
-        "dashboard subject",
-        "needs_input",
-        "which budget?",
-        "tiny",
-        "00-first",
-        "fake-session-",
-        "sergeant/",
-    ] {
-        assert!(
-            detail.contains(needle),
-            "the work page must carry {needle:?}:\n{detail}"
-        );
-    }
-
-    // The three event-driven sections, asserted on their *content*.
-    //
-    // Each of `conversation and tool activity`, `state transitions` and
-    // `usage` is an `<h2>` the renderer writes unconditionally, before and
-    // independently of the rows beneath it — so a needle list that named the
-    // headings would be satisfied by a page with nothing in any of them.
-    // Probed: stubbing all three filters to `Vec::new()` left the heading
-    // assertions green. What follows asserts what this scenario actually
-    // produces.
-    let transitions = section(&detail, "<h2>state transitions</h2>", "<h2>usage</h2>");
-    for kind in [
-        "work.submitted",
-        "stage.entered",
-        "stage.needs_input",
-        "work.needs_input",
-    ] {
-        assert!(
-            transitions.contains(kind),
-            "the transitions table must carry the real transition {kind:?} — the same arc \
-             the TUI's tail asserts on:\n{transitions}"
-        );
-    }
-    assert!(
-        transitions.matches("<tr>").count() >= 4,
-        "the transitions table must have rows, not just a heading:\n{transitions}"
-    );
-    assert!(
-        transitions.contains("which budget?"),
-        "the needs_input transition must carry the prompt that caused it:\n{transitions}"
-    );
-    // The fake backend narrates no conversation and reports no usage on this
-    // arc, so the honest assertion for those two sections is the empty state
-    // they are *supposed* to show — which is a different string from the
-    // heading, and would not survive the section being dropped.
-    assert!(
-        section(
-            &detail,
-            "<h2>conversation and tool activity</h2>",
-            "<h2>state transitions</h2>"
-        )
-        .contains("no normalized conversation events yet"),
-        "the activity section must say it is empty rather than be absent:\n{detail}"
-    );
-    assert!(
-        section(&detail, "<h2>usage</h2>", "<p class=\"pointer\">")
-            .contains("no usage reported by this backend"),
-        "the usage section must say it is empty rather than be absent:\n{detail}"
-    );
-
-    // The live tail's vocabulary reaches the browser from the server, because
-    // `EventSource` can only subscribe to frame names it can enumerate — and
-    // a list kept by hand in the JavaScript was already five kinds stale.
-    let advertised: Vec<&str> = section(&detail, " data-kinds=\"", "\"")
-        .split_whitespace()
-        .collect();
-    assert_eq!(
-        advertised,
-        sergeant_rs::api::SSE_EVENT_KINDS.to_vec(),
-        "the page must hand the browser exactly the frame names the daemon can send"
-    );
-
-    // --- auth ---------------------------------------------------------------
-    for path in [
-        "/ui".to_string(),
-        format!("/ui/work/{work_id}"),
-        "/ui/assets/dashboard.css".to_string(),
-        "/ui/assets/dashboard.js".to_string(),
-    ] {
-        let response = http()
-            .get(format!("{}{path}", handle.endpoint))
-            .send()
-            .await
-            .expect("request");
-        assert_eq!(
-            response.status(),
-            401,
-            "{path} must refuse an unauthenticated request"
-        );
-        let body: Value = response.json().await.expect("structured error body");
-        assert_eq!(body["error"]["code"], "unauthorized");
-    }
-    let response = http()
-        .get(format!("{}/ui?token=not-the-token", handle.endpoint))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(response.status(), 401, "a wrong token must not be accepted");
-
-    // A URL token is accepted only on safe methods: a mutation authorized by
-    // a URL alone is the shape a cross-site form post can forge.
-    let response = http()
-        .post(format!(
-            "{}/v1/work/{}/cancel?token={}",
-            handle.endpoint, work_id, handle.token
-        ))
-        .json(&json!({"command_id": ulid()}))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(
-        response.status(),
-        401,
-        "a POST must not be authorized by a query-string token"
-    );
-
-    // …and the dashboard is behind the *same* gate, not a copy of it. The
-    // rule the copy used to omit was exactly this safe-method bound, so it is
-    // checked here on a `/ui` route as well as on `/v1`.
-    let response = http()
-        .post(format!("{}/ui?token={}", handle.endpoint, handle.token))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(
-        response.status(),
-        401,
-        "a query token must not authorize a POST to the dashboard either"
-    );
-
-    // A wrong-method request that *is* authorized gets the router's own
-    // structured 405 — the same error vocabulary /v1 answers with. A `/ui`
-    // mounted outside the shared layers answered these with an empty body.
-    for path in ["/ui", "/v1/system"] {
-        let response = http()
-            .post(format!("{}{path}", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .send()
-            .await
-            .expect("request");
-        assert_eq!(response.status(), 405, "POST {path} is not a route");
-        let body: Value = response.json().await.expect("structured error body");
-        assert_eq!(
-            body["error"]["code"], "method_not_allowed",
-            "every route on this listener answers with one error vocabulary: {body}"
-        );
-    }
-
-    handle.shutdown().await;
-
-    // --- the assets are in the binary ---------------------------------------
-    //
-    // Two probes, because the contract's own one measures less than it sounds
-    // like.
-    //
-    // (a) The probe the contract names: a *spawned* `sgt daemon` whose working
-    //     directory is an empty temp dir. That rules out a *cwd-relative*
-    //     read — and only that. It does not make this checkout's `web/`
-    //     unreachable: the daemon still runs as this user on this filesystem,
-    //     and a build that read `concat!(env!("CARGO_MANIFEST_DIR"),
-    //     "/web/dashboard.css")` at request time would sail through it
-    //     (probed: it does). Claiming otherwise would be the test lying about
-    //     its own reach.
-    //
-    // (b) So the embedding itself is checked where it is decidable: the asset
-    //     bytes must be *in the executable*. `include_str!` puts them there;
-    //     a runtime read does not.
-    let binary = std::fs::read(SGT).expect("read the sgt binary");
-    for (name, asset) in [
-        ("dashboard.css", DASHBOARD_CSS),
-        ("dashboard.js", DASHBOARD_JS),
-    ] {
-        assert!(
-            binary
-                .windows(asset.len())
-                .any(|window| window == asset.as_bytes()),
-            "{name} must be compiled into the sgt binary (§29: the binary stays \
-             self-contained), but its bytes are not in {SGT}"
-        );
-    }
-
-    let data = DataDir::new();
-    let empty = TempDir::new().expect("tempdir");
-    let daemon = SpawnedDaemon::start(&data, empty.path(), &[]);
-    let css = get_text(
-        &format!(
-            "{}/ui/assets/dashboard.css?token={}",
-            daemon.endpoint, daemon.token
-        ),
-        200,
-    )
-    .await;
-    let js = get_text(
-        &format!(
-            "{}/ui/assets/dashboard.js?token={}",
-            daemon.endpoint, daemon.token
-        ),
-        200,
-    )
-    .await;
-    assert_eq!(
-        css, DASHBOARD_CSS,
-        "the stylesheet must come from the binary"
-    );
-    assert_eq!(js, DASHBOARD_JS, "the script must come from the binary");
-    assert!(
-        !css.is_empty() && !js.is_empty(),
-        "an empty asset would satisfy the comparison above vacuously"
-    );
-    let page = get_text(
-        &format!("{}/ui?token={}", daemon.endpoint, daemon.token),
-        200,
-    )
-    .await;
-    assert!(
-        page.contains("sergeant"),
-        "the page itself must render from an empty cwd too"
-    );
-
-    // `sgt web` is how a human gets that URL, and its `--json` form is how a
-    // script does.
-    let printed = daemon.sgt(&["--json", "web"]);
-    let printed: Value = serde_json::from_str(&printed).expect("sgt web --json is json");
-    let url = printed["url"].as_str().expect("url");
-    assert!(
-        url.starts_with(&daemon.endpoint) && url.contains(&daemon.token),
-        "sgt web must print the tokenized dashboard URL, got {url}"
-    );
-    assert!(
-        !get_text(url, 200).await.is_empty(),
-        "the URL sgt web printed must actually serve a page"
-    );
-
-    // `--open` hands that URL to $BROWSER, and nothing else.
-    let opened = empty.path().join("opened.txt");
-    let opener = write_script(
-        empty.path(),
-        "browser-stub",
-        &format!("#!/bin/sh\necho \"$1\" > {}\n", opened.display()),
-    );
-    let status = Command::new(SGT)
-        .args([
-            "--data-dir",
-            &data.path().display().to_string(),
-            "web",
-            "--open",
-        ])
-        .env("BROWSER", &opener)
-        .status()
-        .expect("run sgt web --open");
-    assert!(status.success(), "sgt web --open must succeed");
-    let handed = std::fs::read_to_string(&opened).expect("the browser stub was invoked");
-    assert_eq!(handed.trim(), url, "--open must hand over the same URL");
-}
+// ------------------------------------------------------------ TUI resilience
 
 /// A TUI holding a detail screen for a work the daemon no longer has falls
 /// back to the fleet instead of painting a corpse.
@@ -1013,129 +838,7 @@ async fn a_detail_screen_whose_work_vanished_falls_back_to_the_fleet() {
     handle.shutdown().await;
 }
 
-/// The work page's two fault answers, which the happy path never reaches.
-///
-/// A dashboard is where a person looks when something is already wrong, so
-/// its own failures have to be legible: a work id that is not there is a 404
-/// carrying the dashboard's chrome (not a bare axum body, and not a 200 page
-/// full of empty sections), and a journal the daemon cannot read is a 500
-/// that *names the fault* — the failure mode this arm exists for is a page
-/// that renders "no transitions recorded" over a read error and tells the
-/// browser a different story than `/v1/events` tells an HTTP client.
-#[tokio::test]
-async fn the_dashboard_answers_a_missing_work_and_an_unreadable_journal_as_faults() {
-    let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_workflow(repo.path());
-
-    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("which budget?")]).await;
-    let work_id = submit(&handle, repo.path(), "readable, then not", "tiny").await;
-
-    // --- a work id that is not there ---------------------------------------
-    let missing = get_text(
-        &format!(
-            "{}/ui/work/01NOSUCHWORKATALL?token={}",
-            handle.endpoint, handle.token
-        ),
-        404,
-    )
-    .await;
-    assert!(
-        missing.contains("no work with id 01NOSUCHWORKATALL"),
-        "the 404 page must name the id that is not there: {missing}"
-    );
-    assert!(
-        missing.contains("dashboard.js") && missing.contains("id=\"ticker\""),
-        "…and still be the dashboard, so the reader can navigate on: {missing}"
-    );
-    assert!(
-        !missing.contains("no transitions recorded"),
-        "a work that does not exist must not be dressed as one with no history: {missing}"
-    );
-
-    // --- a journal the daemon cannot read ----------------------------------
-    //
-    // A well-formed JSON line that is not a well-formed Event, appended in
-    // place: what a torn or bit-flipped append looks like on replay (the
-    // shape m2 uses for the same class).
-    let journal_dir = data.path().join("journal");
-    let mut segments: Vec<_> = std::fs::read_dir(&journal_dir)
-        .expect("journal dir")
-        .filter_map(|entry| {
-            let path = entry.expect("entry").path();
-            (path.extension().is_some_and(|ext| ext == "ndjson")).then_some(path)
-        })
-        .collect();
-    segments.sort();
-    let segment = segments.last().expect("a segment exists").clone();
-    let mut text = std::fs::read_to_string(&segment).expect("read segment");
-    text.push_str("{ \"not\": \"an event\" }\n");
-    std::fs::write(&segment, text).expect("append malformed line");
-
-    let broken = get_text(
-        &format!(
-            "{}/ui/work/{}?token={}",
-            handle.endpoint, work_id, handle.token
-        ),
-        500,
-    )
-    .await;
-    assert!(
-        broken.contains("this work's events could not be read"),
-        "the read failure must be named on the page: {broken}"
-    );
-    assert!(
-        broken.contains("sgt doctor"),
-        "…with the thing to do about it: {broken}"
-    );
-    for green in [
-        "no transitions recorded",
-        "no normalized conversation events yet",
-        "no usage reported by this backend",
-    ] {
-        assert!(
-            !broken.contains(green),
-            "a read failure must never be rendered as an empty section ({green:?}): {broken}"
-        );
-    }
-
-    handle.shutdown().await;
-}
-
-/// `--open`'s failure path (`open_in_browser`): a `$BROWSER` that runs and
-/// exits nonzero must fail the command with the exit status named, not
-/// swallow it — the URL was already printed before the browser was asked to
-/// open it, so a silent failure here would leave the user unsure whether the
-/// pointer they were just given is even good.
-#[test]
-fn web_open_reports_a_browser_that_refuses_to_open_it() {
-    let data = DataDir::new();
-    let output = Command::new(SGT)
-        .arg("--data-dir")
-        .arg(data.path())
-        .arg("web")
-        .arg("--open")
-        .env("BROWSER", "/bin/false")
-        .output()
-        .expect("run sgt web --open");
-    assert!(
-        !output.status.success(),
-        "a browser opener that refuses must fail the command"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("/bin/false") && stderr.contains("exited with"),
-        "the failure must name the opener and how it failed: {stderr}"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("http://127.0.0.1"),
-        "the dashboard URL must still be printed even though --open failed: {stdout}"
-    );
-}
-
-// ---------------------------------------------------------------- 3. doctor
+// ---------------------------------------------------------------- 2. doctor
 
 /// Acceptance 3. Doctor is green on a healthy install, names the failing
 /// check and its remedy on a broken one, and its `--json` shape is stable.
@@ -1150,17 +853,31 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // have a reachable Docker Engine (N4.md's own probe-gating rule for
     // Docker facts on the GH runner / cloud container).
     let docker = stub_docker(bin.path());
+    // Same treatment for the `environment` check's own `$HOME`: a fixture
+    // dir with neither `.cargo/bin` nor `.local/bin` on disk, so it reads a
+    // deterministic "ok" regardless of what toolchain directories the
+    // test-running host's real $HOME happens to have missing from PATH.
+    let home = TempDir::new().expect("tempdir");
+    let home = home.path().display().to_string();
 
     // --- healthy -------------------------------------------------------------
     let (code, stdout, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
     let (code, healthy_json, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     assert_eq!(code, Some(0));
@@ -1177,6 +894,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         vec![
             "git",
             "claude",
+            // ADR 0006's residual hole (#100): whether *this* process's own
+            // environment carries the toolchain PATH enrichment `sgt
+            // claude`/etc. compose, independent of the data dir below.
+            "environment",
             // #67: data_dir is checked before docker — the docker adapter's
             // blob store and disk_pressure's `df` call both live inside the
             // data dir, so this check runs first and both defer to it by
@@ -1221,7 +942,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     seed_journal(used.path(), 5);
     let (code, stdout, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(
@@ -1231,7 +956,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, used_json, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&used_json).expect("json");
@@ -1256,13 +985,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     corrupt_journal(used.path());
     let (code, stdout, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(code, Some(0), "an unreplayable journal must exit nonzero");
     let (_, torn_json, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&torn_json).expect("json");
@@ -1291,7 +1028,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // order, statuses) — only details may move.
     let (_, first_again, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let first_again: Value = serde_json::from_str(&first_again).expect("json");
@@ -1393,7 +1134,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
         let (code, stdout, _) = doctor(
             live_data.path(),
-            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            &[
+                ("SGT_CLAUDE_BIN", &claude),
+                ("SGT_DOCKER_BIN", &docker),
+                ("HOME", &home),
+            ],
             false,
         );
         assert_eq!(
@@ -1403,7 +1148,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         );
         let (_, live_json, _) = doctor(
             live_data.path(),
-            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            &[
+                ("SGT_CLAUDE_BIN", &claude),
+                ("SGT_DOCKER_BIN", &docker),
+                ("HOME", &home),
+            ],
             true,
         );
         let report: Value = serde_json::from_str(&live_json).expect("json");
@@ -1424,13 +1173,18 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     }
     // The daemon is gone now, but its descriptor may or may not have been
     // cleaned up on the way out; either way, a descriptor whose pid is gone is
-    // the *stale* case, and it is a warning, not a failure — the next client
-    // command republishes it.
+    // the *stale* case, and it is a warning, not a failure — a mutating verb
+    // (or `sgt daemon`) republishes it; observation verbs refuse instead
+    // (ADR 0009).
     let stale = TempDir::new().expect("tempdir");
     write_descriptor(stale.path(), dead_pid(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor(
         stale.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(
@@ -1440,7 +1194,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, stale_json, _) = doctor(
         stale.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&stale_json).expect("json");
@@ -1467,7 +1225,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     write_descriptor(occupied.path(), squatter.id(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor(
         occupied.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(
@@ -1477,7 +1239,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, wedged_json, _) = doctor(
         occupied.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&wedged_json).expect("json");
@@ -1507,13 +1273,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     std::fs::write(&blocked, b"this is a file").expect("write file");
     let (code, stdout, _) = doctor(
         &blocked,
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(code, Some(0), "an unusable data dir must exit nonzero");
     let (_, broken_json, _) = doctor(
         &blocked,
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&broken_json).expect("json");
@@ -1851,6 +1625,83 @@ fn t3f_doctor_names_an_unwritable_parent_as_one_remedy_row() {
     );
 }
 
+/// ADR 0006's residual hole (#100): a toolchain directory that exists on
+/// disk but is missing from `PATH` is #60's exact failure shape — an actor
+/// that cannot find `cargo` and misreads it as a permissions fault. This
+/// arms it deterministically by pointing `HOME` at a fixture directory that
+/// has `.cargo/bin` on disk but never touching `PATH`, so the real test
+/// process's PATH (which does not contain this fresh tempdir) still cannot
+/// see it.
+///
+/// guard-map: a mutation that always reports `ok` regardless of PATH, or one
+/// that checks a different directory than
+/// `harness::toolchain_path_dirs` actually composes, survives every other
+/// doctor test but fails this one.
+#[test]
+fn t3g_doctor_environment_check_flags_a_toolchain_dir_missing_from_path() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let home = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(home.path().join(".cargo").join("bin")).expect("mkdir cargo bin");
+
+    let (_, json, _) = doctor(
+        data.path(),
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home.path().display().to_string()),
+        ],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "environment");
+    assert_eq!(check["status"], "warn", "{check}");
+    let cargo_bin = home.path().join(".cargo").join("bin").display().to_string();
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains(&cargo_bin),
+        "the missing directory must be named: {detail}"
+    );
+    let remedy = check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("sgt claude"),
+        "the remedy must name the passthrough that would have composed it: {remedy}"
+    );
+}
+
+/// The control for [`t3g_doctor_environment_check_flags_a_toolchain_dir_missing_from_path`]:
+/// when neither toolchain directory exists on disk at all, there is nothing
+/// to enrich and the check must read `ok`, not warn about a directory the
+/// host never had in the first place.
+#[test]
+fn t3h_doctor_environment_check_is_ok_when_no_toolchain_dirs_exist() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    // A fresh tempdir with nothing under it — no `.cargo/bin`, no `.local/bin`.
+    let home = TempDir::new().expect("tempdir");
+
+    let (_, json, _) = doctor(
+        data.path(),
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home.path().display().to_string()),
+        ],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "environment");
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["remedy"].is_null(),
+        "a green check has nothing to remedy: {check}"
+    );
+}
+
 /// The journal check's *other* failure arm: `corrupt_journal` above only
 /// ever reaches "replay failed after N events" (a line the replay gets to
 /// and cannot parse). `Journal::replay_data_dir` can also fail before it
@@ -2063,7 +1914,7 @@ fn doctor_in_opt(
     )
 }
 
-// ------------------------------------------------------------------ 4. demo
+// ------------------------------------------------------------------ 3. demo
 
 /// Acceptance 4. The §39 walkthrough runs, exits 0, and the evidence it
 /// pointed at is really there.
@@ -2208,13 +2059,6 @@ fn t4_the_section_39_demo_runs_and_its_evidence_resolves() {
              not in the journal the run kept"
         );
     }
-
-    let dashboard =
-        std::fs::read_to_string(demo_dir.join("dashboard.html")).expect("the fleet page was kept");
-    assert!(
-        dashboard.contains(&work_id),
-        "the fleet page the run fetched must name work {work_id}"
-    );
 
     let analytics: Value = serde_json::from_str(
         &std::fs::read_to_string(demo_dir.join("analytics.json"))
@@ -2386,10 +2230,15 @@ fn t4_the_demo_and_the_client_name_the_same_timeout_knob() {
 fn t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob() {
     let data = DataDir::new();
     let knob = sergeant_rs::api::CLIENT_TIMEOUT_ENV;
+    // `run` rather than `status`: ADR 0009 moved `status` into the no-spawn
+    // set, and with no daemon running it would refuse before ever
+    // constructing the `ApiClient` this warning comes from. A mutating verb
+    // still auto-spawns and reaches the same `ApiClient::new` call.
     let output = Command::new(SGT)
         .arg("--data-dir")
         .arg(data.path())
-        .arg("status")
+        .arg("run")
+        .arg("timeout knob probe")
         .env(knob, "5")
         .stdin(std::process::Stdio::null())
         .output()
@@ -2422,10 +2271,12 @@ fn t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob() {
 fn t4_a_client_that_applies_the_knob_is_quiet_about_it() {
     let data = DataDir::new();
     let knob = sergeant_rs::api::CLIENT_TIMEOUT_ENV;
+    // Same reasoning as the sibling test above: `run`, not `status`.
     let output = Command::new(SGT)
         .arg("--data-dir")
         .arg(data.path())
-        .arg("status")
+        .arg("run")
+        .arg("timeout knob probe")
         .env(knob, "300")
         .stdin(std::process::Stdio::null())
         .output()
@@ -2438,155 +2289,51 @@ fn t4_a_client_that_applies_the_knob_is_quiet_about_it() {
     );
 }
 
-// -------------------------------------------------------- 5. clients equal
+// -------------------------------------------------------- 4. clients equal
 
-/// Acceptance 5. §7/§30's clients-are-equal rule, enforced on both surfaces:
-/// `tui.rs` and `web.rs` reach state only through the API's own types.
+/// Acceptance 4. §7/§30's clients-are-equal rule: `tui.rs` reaches state
+/// only through the API's own types.
 ///
-/// Two halves, because a scan alone can be argued with:
-///
-/// - a path scan over every crate-rooted path either file names — the same
-///   shape M5's t2 used for the DuckDB owner — which catches an import
-///   however it is spelled (see [`crate_paths`], and the test that fools it);
-/// - the compile-time half: the dashboard's state handle is a *newtype with a
-///   private field*, so even inside the daemon's own process there is no
-///   expression `web.rs` can write that reaches the core, the engine, the
-///   journal or the projection. A reviewer does not have to trust the scan.
+/// `web.rs` used to be scanned alongside it here, with a second,
+/// compile-time half pinning `ApiViews`'s private field and exact method
+/// set — both gone with the dashboard (ADR 0011). What remains is the path
+/// scan alone, the same shape M5's t2 used for the DuckDB owner, which
+/// catches an import however it is spelled (see [`crate_paths`], and the
+/// test that fools it, `t5b` below).
 ///
 /// The trailing token denylist is a backstop only. It is not the net: the net
 /// is the path scan, because a name-based list can only forbid the daemon
 /// internals somebody thought to name, and `BlobStore` was not one of them.
 #[test]
-fn t5_the_tui_and_the_dashboard_are_clients_like_any_other() {
-    for module in ["tui.rs", "web.rs"] {
-        let source = code_only(&read_source(module));
-        let paths = crate_paths(&source);
-        assert_eq!(
-            paths,
-            vec!["api".to_string()],
-            "{module} may reach the crate only through `crate::api` — the API client \
-             surface — but names: {paths:?}"
-        );
-        for forbidden in [
-            "ApiState",
-            "registry",
-            "Journal",
-            "Analytics",
-            "Engine",
-            "blocking_lock",
-        ] {
-            assert!(
-                !names_token(&source, forbidden),
-                "{module} names {forbidden}: a client must not know the daemon's insides"
-            );
-        }
-    }
-
-    // The positive half: each file must actually be a client, or the rule
-    // above is satisfied by a module that renders nothing.
-    assert!(
-        names_token(&code_only(&read_source("tui.rs")), "ApiClient"),
-        "tui.rs must reach state through the API client"
+fn t5_the_tui_is_a_client_like_any_other() {
+    let source = code_only(&read_source("tui.rs"));
+    let paths = crate_paths(&source);
+    assert_eq!(
+        paths,
+        vec!["api".to_string()],
+        "tui.rs may reach the crate only through `crate::api` — the API client \
+         surface — but names: {paths:?}"
     );
-    let web = code_only(&read_source("web.rs"));
-    assert!(
-        names_token(&web, "ApiViews"),
-        "web.rs must reach state through the dashboard's read surface"
-    );
-
-    // The compile-time half.
-    let api = read_source("api.rs");
-    assert!(
-        api.contains("pub struct ApiViews(ApiState);"),
-        "ApiViews must wrap the daemon state in a private field — that private \
-         field is what makes the rule a compile error rather than a convention"
-    );
-    assert!(
-        !api.contains("pub struct ApiViews(pub ApiState)"),
-        "a public field would hand the whole daemon to the dashboard"
-    );
-    // Every ApiViews method must hand back a `/v1` body, never a daemon type.
-    for signature in [
-        "pub async fn system(&self) -> Value",
-        "pub async fn fleet(&self) -> Value",
-        "pub async fn work(&self, id: &str) -> Option<Value>",
-        "pub async fn work_events(&self, work_id: &str, limit: usize) -> Result<Value, Value>",
+    for forbidden in [
+        "ApiState",
+        "registry",
+        "Journal",
+        "Analytics",
+        "Engine",
+        "blocking_lock",
     ] {
         assert!(
-            api.contains(signature),
-            "the dashboard's read surface must stay plain API bodies: {signature} is gone"
+            !names_token(&source, forbidden),
+            "tui.rs names {forbidden}: a client must not know the daemon's insides"
         );
     }
-    // …and there must be no *others*. Requiring four signatures to still exist
-    // says nothing about a fifth, and the fifth is where the rule actually
-    // breaks: a `pub async fn raw_journal_tail(&self, n: usize) -> Vec<String>`
-    // added to this impl and called from `web.rs` is an ordinary-looking
-    // feature addition that hands the dashboard the journal, and it left the
-    // path scan, this test and t5b all green (measured, in a disposable copy).
-    // The private field forecloses reaching *around* `ApiViews`; only this
-    // pins the surface `ApiViews` itself offers.
-    assert_eq!(
-        public_methods_of(&code_only(&api), "impl ApiViews {"),
-        vec![
-            "fleet".to_string(),
-            "new".to_string(),
-            "system".to_string(),
-            "work".to_string(),
-            "work_events".to_string(),
-        ],
-        "the dashboard's read surface is exactly these methods. Adding one is \
-         adding a client capability that no `/v1` endpoint has to justify — if \
-         the new method returns a body an endpoint already returns, say so here; \
-         if it does not, §30 says the API is what is incomplete."
-    );
-}
 
-/// The `pub fn`/`pub async fn` names declared directly inside an `impl` block,
-/// sorted.
-///
-/// Brace-counted from the header so it stops at the end of *that* block, and
-/// depth-checked so a `pub fn` nested inside a method body (a closure's
-/// module, a helper `impl`) is not counted as part of the surface. Fed
-/// comment-stripped source, because a doc comment is free to contain a lone
-/// brace and the count is what decides where the block ends.
-fn public_methods_of(source: &str, header: &str) -> Vec<String> {
-    let start = source
-        .find(header)
-        .unwrap_or_else(|| panic!("no {header:?} in the source to scan"))
-        + header.len();
-    let mut depth = 1usize;
-    let mut names = Vec::new();
-    for line in source[start..].lines() {
-        if depth == 1
-            && let Some(rest) = line.trim().strip_prefix("pub ")
-        {
-            let rest = rest.strip_prefix("async ").unwrap_or(rest);
-            if let Some(rest) = rest.strip_prefix("fn ") {
-                names.push(
-                    rest.split(['(', '<', ' '])
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
-                );
-            }
-        }
-        for c in line.chars() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            if depth == 0 {
-                break;
-            }
-        }
-        if depth == 0 {
-            break;
-        }
-    }
-    assert_eq!(depth, 0, "the {header:?} block is never closed");
-    names.sort();
-    names
+    // The positive half: the file must actually be a client, or the rule
+    // above is satisfied by a module that renders nothing.
+    assert!(
+        names_token(&source, "ApiClient"),
+        "tui.rs must reach state through the API client"
+    );
 }
 
 /// The guard above, guarded. An instrument nobody has tried to fool is a
@@ -2594,8 +2341,8 @@ fn public_methods_of(source: &str, header: &str) -> Vec<String> {
 /// daemon internals are stated here as data and required to be visible.
 ///
 /// Each of these was first written into a disposable copy of `src/tui.rs`,
-/// where it compiled and ran; the braced form in particular left both
-/// structural tests green while the TUI held a handle on the daemon's blob
+/// where it compiled and ran; the braced form in particular left the
+/// structural test green while the TUI held a handle on the daemon's blob
 /// store. That is the regression this locks down.
 #[test]
 fn t5b_the_structural_scan_sees_every_spelling_of_a_path() {
@@ -2624,37 +2371,10 @@ fn t5b_the_structural_scan_sees_every_spelling_of_a_path() {
         );
     }
     // …and it must not invent a reach out of a test module's `use super::*`,
-    // which both clients have.
+    // which the client has.
     assert!(
         crate_paths("mod tests { use super::*; use super::field; }").is_empty(),
         "`super::` inside a module's own tests names that module, not the crate"
-    );
-
-    // The surface scan, tried on the shape it exists to catch: a method added
-    // to the dashboard's read surface that is not a `/v1` body. It must see
-    // the addition, and it must not see either a `pub fn` from a later impl
-    // block or one nested inside a method body.
-    let widened = "\
-impl ApiViews {
-    pub fn new(state: ApiState) -> Self { Self(state) }
-    pub async fn system(&self) -> Value { json!({}) }
-    pub async fn raw_journal_tail(&self, n: usize) -> Vec<String> {
-        pub fn helper() {}
-        vec![]
-    }
-}
-impl Other {
-    pub fn not_part_of_the_surface(&self) {}
-}
-";
-    assert_eq!(
-        public_methods_of(widened, "impl ApiViews {"),
-        vec![
-            "new".to_string(),
-            "raw_journal_tail".to_string(),
-            "system".to_string()
-        ],
-        "the surface scan must see a widened surface, and stop at the block it was asked about"
     );
 }
 
@@ -2662,9 +2382,10 @@ impl Other {
 ///
 /// `send_sse` names every frame with the journal's event kind, so a client
 /// that wants the whole tail must enumerate the kinds. Before this test the
-/// dashboard kept its own copy of the list and it was five kinds stale —
-/// `surface.materializing` reached no listener at all. The list now lives in
-/// `api::SSE_EVENT_KINDS` and the page hands it to the browser; this is what
+/// embedded dashboard (deleted, ADR 0011) kept its own copy of the list and
+/// it was five kinds stale — `surface.materializing` reached no listener at
+/// all. The list lives in `api::SSE_EVENT_KINDS`, stated once for every
+/// current and future browser-based consumer of the stream; this is what
 /// keeps it complete: add a `KIND_*` to the crate without adding it here and
 /// this fails.
 #[test]
@@ -3237,8 +2958,8 @@ fn code_only(source: &str) -> String {
 /// - `use crate::{api::…, runtime::blob::…}` — a brace group names *several*
 ///   modules, and a scan that read one identifier after `crate::` saw an
 ///   empty string and dropped it. Groups are walked, at any nesting.
-/// - `use super::daemon::…` — `tui.rs` and `web.rs` are top-level modules, so
-///   `super::` is `crate::` with a different name. Both roots are scanned.
+/// - `use super::daemon::…` — `tui.rs` is a top-level module, so `super::`
+///   is `crate::` with a different name. Both roots are scanned.
 /// - `super::` inside these files' own `mod tests` means the module itself,
 ///   not the crate, so a `super::` head only counts when it names a real
 ///   crate-root module — read from `src/lib.rs`, not listed here.
@@ -3751,21 +3472,6 @@ impl SpawnedDaemon {
         }
     }
 
-    fn sgt(&self, args: &[&str]) -> String {
-        let output = Command::new(SGT)
-            .arg("--data-dir")
-            .arg(&self.data_dir)
-            .args(args)
-            .output()
-            .expect("run sgt");
-        assert!(
-            output.status.success(),
-            "sgt {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).to_string()
-    }
-
     /// Stop the daemon the way an operator stops it — SIGTERM, a bounded
     /// wait, SIGKILL only if the wait runs out — and report which of the two
     /// it took. Idempotent; `Drop` calls it for tests that do not.
@@ -3831,33 +3537,6 @@ impl Drop for SpawnedDaemon {
     }
 }
 
-/// Reap a guarded data dir's daemons, reporting whether `pid` was among them.
-fn dir_reap_contains(data_dir: &DataDir, pid: u32) -> bool {
-    data_dir.reap().iter().any(|daemon| daemon.pid == pid)
-}
-
-/// The slice of a page between two markers, so an assertion about one section
-/// cannot be satisfied by a string that lives in another.
-fn section<'a>(html: &'a str, from: &str, to: &str) -> &'a str {
-    let start = html
-        .find(from)
-        .unwrap_or_else(|| panic!("the page has no {from:?} section:\n{html}"))
-        + from.len();
-    let rest = &html[start..];
-    let end = rest
-        .find(to)
-        .unwrap_or_else(|| panic!("the {from:?} section is never closed by {to:?}:\n{rest}"));
-    &rest[..end]
-}
-
-async fn get_text(url: &str, expect: u16) -> String {
-    let response = http().get(url).send().await.expect("request");
-    let status = response.status();
-    let body = response.text().await.expect("body");
-    assert_eq!(status.as_u16(), expect, "GET {url} → {status}: {body}");
-    body
-}
-
 fn write_script(dir: &Path, name: &str, body: &str) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
@@ -3867,14 +3546,7 @@ fn write_script(dir: &Path, name: &str, body: &str) -> String {
     std::fs::set_permissions(&path, permissions).expect("chmod");
     // A file another process still holds open for writing cannot be exec'd;
     // absorb the ETXTBSY window before handing it over.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while let Err(e) = Command::new(&path).arg("--version").output() {
-        assert!(
-            e.raw_os_error() == Some(26) && Instant::now() < deadline,
-            "the script is not runnable: {e}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    support::wait_until_executable(&path);
     path.display().to_string()
 }
 

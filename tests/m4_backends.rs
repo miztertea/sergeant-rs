@@ -59,8 +59,8 @@ use tempfile::TempDir;
 
 use sergeant_rs::api::Core;
 use sergeant_rs::backend::claude::{
-    CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig, PinVerdict, preflight_model_pin,
-    verify_model_pin,
+    CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig, ENVIRONMENT_CONTRACT,
+    EXECUTION_MODEL_CONTRACT, PinVerdict, preflight_model_pin, verify_model_pin,
 };
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
@@ -537,7 +537,12 @@ impl StubClaude {
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod stub");
-        let stub = Self {
+        // A file another process still holds open for writing cannot be
+        // exec'd; absorb the ETXTBSY window before handing it to the
+        // adapter (#83 — measured under `cargo test --lib`'s default thread
+        // parallelism: 3 failures in 40 runs, every one `os error 26`).
+        support::wait_until_executable(&path);
+        Self {
             path,
             record,
             replay,
@@ -546,40 +551,6 @@ impl StubClaude {
             release,
             stderr,
             exit_code,
-        };
-        stub.wait_until_executable();
-        stub
-    }
-
-    /// Run the stub once, retrying `ETXTBSY`, before handing it to a test.
-    ///
-    /// A file that some process still holds open for writing cannot be
-    /// `exec`'d — and every `Command::spawn` on a sibling test thread forks a
-    /// child that inherits this test binary's open descriptors for the
-    /// fork-to-exec window. Under load (four test threads, this gauntlet's
-    /// machine, CI) that window overlaps the write above often enough to turn
-    /// "the adapter refuses an unlaunchable CLI" into a false red in a test
-    /// about something else entirely. Absorbing it here, once, keeps the
-    /// flake out of every stub-based test without weakening any of them: the
-    /// adapter's own refusal path is still pinned, deliberately, by
-    /// `a_start_that_cannot_spawn_leaves_no_phantom_execution`.
-    fn wait_until_executable(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match std::process::Command::new(&self.path)
-                .arg("--version")
-                .output()
-            {
-                Ok(_) => return,
-                Err(e) if e.raw_os_error() == Some(26) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the stub stayed ETXTBSY for 10s: {e}"
-                    );
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => panic!("the stub is not runnable: {e}"),
-            }
         }
     }
 
@@ -2286,8 +2257,12 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
         "adapter config env is applied"
     );
     assert_eq!(
-        first.stdin, "the intent||the stage context",
-        "§12: intent plus the stage's CONTEXT.md, verbatim, on stdin"
+        first.stdin,
+        format!(
+            "{EXECUTION_MODEL_CONTRACT}||{ENVIRONMENT_CONTRACT}||the intent||the stage context"
+        ),
+        "ADR 0007(a) precedes it, both statements together, then §12: intent \
+         plus the stage's CONTEXT.md, verbatim, on stdin"
     );
 
     let second = &launches[1];
@@ -2307,6 +2282,79 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
         second.argv
     );
     assert_eq!(second.stdin, "second turn");
+}
+
+/// ADR 0007(a): whatever composes an actor's context states what wakes it.
+/// A headless turn is one process that runs to completion and exits — there
+/// is no callback when a backgrounded command finishes after the turn ends
+/// — and #94 happened twice on 2026-08-14 because nothing told the actor
+/// that. This pins that the statement actually reaches the actor, on the
+/// stage's very first turn, ahead of the intent and the stage's own
+/// CONTEXT.md.
+#[test]
+fn adr_0007a_the_first_turn_states_the_execution_model() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-execmodel", cwd.path(), "the intent", None);
+    request.context = "the stage context".to_string();
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(1);
+    let first = &launches[0];
+    let stdin_lines: Vec<&str> = first.stdin.split('|').collect();
+    assert_eq!(
+        stdin_lines[0], EXECUTION_MODEL_CONTRACT,
+        "the execution model must precede the intent, not follow or replace it: {:?}",
+        first.stdin
+    );
+    assert!(
+        first.stdin.ends_with("the intent||the stage context"),
+        "the intent and CONTEXT.md must still reach the actor, verbatim, \
+         after the execution model: {:?}",
+        first.stdin
+    );
+}
+
+/// ADR 0006/0007(a): the environment-guarantee statement is composed at the
+/// exact same seam as the execution-model statement (`ClaudeAdapter::launch`)
+/// — this pins that the two cooperate rather than one overwriting the other.
+/// A turn that lost either statement would silently regress: dropping the
+/// execution model reopens #94 (an actor backgrounds a command and loses its
+/// work waiting for a notification that never comes); dropping the
+/// environment guarantee reopens #60 (an actor misreads a PATH gap as a
+/// permissions fault). Reverting either half of the `format!` in `launch`
+/// alone — without touching the other — must fail this test.
+#[test]
+fn adr_0006_and_0007a_both_contracts_reach_the_first_turn_together() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-envmodel", cwd.path(), "the intent", None);
+    request.context = "the stage context".to_string();
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(1);
+    let first = &launches[0];
+    assert_eq!(
+        first.stdin,
+        format!(
+            "{EXECUTION_MODEL_CONTRACT}||{ENVIRONMENT_CONTRACT}||the intent||the stage context"
+        ),
+        "both ADR 0007(a) statements must reach the actor, in this order, \
+         with the intent and CONTEXT.md still intact after them: {:?}",
+        first.stdin
+    );
 }
 
 /// MVP-2 D2 item 1 (the `--setting-sources` de-leak), pinned against the

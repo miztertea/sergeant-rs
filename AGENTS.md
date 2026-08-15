@@ -76,7 +76,11 @@ session. <!-- honesty-vision:F2 / R-NS-6 -->
 2. **Check running work.** `sgt status` (daemon health, counts by state)
    and `sgt work list` (the fleet: id, state, intent) — reuse or resume a
    matching Work item instead of creating a duplicate for the same intent.
-   <!-- BU-0046, BU-0048 -->
+   Neither auto-spawns a daemon (ADR 0009: observation must not materialize
+   the thing observed) — a refusal naming no daemon running on a fresh boot
+   means no work is running either; treat that as an empty fleet, not a
+   fault, and let step 5's `sgt run` start the daemon when there is a real
+   intent to submit. <!-- BU-0046, BU-0048 -->
 3. **Shape the intent.** Free text is legal and sufficient at the CLI;
    structured fields (objective, repos-or-group, acceptance, exclusions,
    workflow) are progressive elaboration you add when they sharpen the

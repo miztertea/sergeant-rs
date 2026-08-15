@@ -15,8 +15,8 @@ intent and hands it to the engine: `sgt` cuts a git worktree, drives a
 staged agent workflow on Claude (or a deterministic fake backend for
 testing), and records every state change in an append-only journal. Close
 the terminal — the daemon keeps running the work. Come back later and `sgt
-work show <id>`, the TUI, or the dashboard show exactly where it got to;
-if it stopped to ask you something, `sgt respond` answers it.
+work show <id>` or `sgt tui` show exactly where it got to; if it stopped to
+ask you something, `sgt respond` answers it.
 
 ## Get it
 
@@ -72,13 +72,9 @@ try the loop without spending tokens.
 
 ## See it
 
-| TUI — work detail with live journal tail | Dashboard — fleet |
+| TUI — work detail with live journal tail | TUI — fleet |
 |---|---|
-| ![TUI work detail](docs/img/tui-detail.png) | ![Dashboard fleet](docs/img/dashboard-fleet.png) |
-
-| TUI — fleet | Dashboard — work detail |
-|---|---|
-| ![TUI fleet](docs/img/tui-fleet.png) | ![Dashboard work detail](docs/img/dashboard-work-detail.png) |
+| ![TUI work detail](docs/img/tui-detail.png) | ![TUI fleet](docs/img/tui-fleet.png) |
 
 ## Using sgt day-to-day
 
@@ -93,7 +89,7 @@ sgt run "add retry handling" --backend claude --workflow software-change --repo 
 
 `run` takes an intent plus optional `--workflow <name>`, `--backend <claude|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), `--group <name>` (a declared estate group, expanded into the same repo selection), `--workspace <name>`, and `--turns <n>`/`--ceiling-secs <n>` (override this one work item's turn envelope instead of the daemon-wide default).
 
-**Watch it** — three equal clients, same daemon state, pick whichever fits:
+**Watch it** — CLI or TUI, same daemon state through the same API, pick whichever fits:
 
 ```sh
 sgt status              # daemon health + work counts, by state
@@ -101,9 +97,8 @@ sgt work list            # the fleet: id, state, intent
 sgt work show <id>       # one item: stage, execution, surface, output pointer, recent events
 sgt work show <id> --graph   # the work's provenance graph instead of its record
 sgt work transcript <id> # decode the work's conversation from the journal, in causal order
-sgt                       # no subcommand: the TUI — fleet + detail, live over SSE
-sgt web                  # print the dashboard URL (tokenized, loopback-only)
-sgt web --open            # ...and open it in a browser
+sgt tui                   # fleet + detail, live over SSE
+sgt                       # no subcommand: a homepage — logo, quickstart, no daemon contact
 ```
 
 **Wait for it, instead of polling** (`docs/gauntlet/contracts/WATCH.md`):
@@ -168,7 +163,16 @@ sgt analytics blocked_time_per_work  # answer one of them
 sgt doctor
 ```
 
-Checks git, the `claude` CLI (presence and version gate), the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, and disk pressure inside the data directory — in that order, so a fault is reported under the right name; an unwritable data directory makes Docker and disk pressure decline with a pointer back to the `data_dir` row instead of re-diagnosing the same fault under their own name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon (every other command does), because it's diagnosing the installation, not priming it.
+Checks git, the `claude` CLI (presence and version gate), whether the toolchain directories `sgt claude` (and its siblings) would add to `PATH` are already on it, the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, and disk pressure inside the data directory — in that order, so a fault is reported under the right name; an unwritable data directory makes Docker and disk pressure decline with a pointer back to the `data_dir` row instead of re-diagnosing the same fault under their own name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon, because it's diagnosing the installation, not priming it — it joins `status`, `work`, `analytics`, `watch`, `tui`, and `daemon stop` in never materializing a daemon just to observe it (only `run`/`respond`/`retry`/`extend`/`cancel` do that).
+
+**Launch a harness bound to this estate:**
+
+```sh
+sgt claude                     # or codex / opencode / goose
+sgt claude -- --model opus     # everything after `--` passes through verbatim
+```
+
+Composes an environment (enriches `PATH` with `~/.cargo/bin` and `~/.local/bin` when they exist, binds `SGT_DATA_DIR` to this invocation's resolved data dir) and **exec**s into the harness — replacing the `sgt` process, never forking and supervising it (`docs/adr/0006-harness-passthrough.md`).
 
 **Manage the estate** — the directory declaring the repositories and groups a work item can target with `--repo`/`--group`:
 
@@ -212,9 +216,8 @@ Full authoring rules — the four-layer context model (workflow orientation, sta
 ## How it works
 
 ```
-   sgt CLI ──┐
-   sgt TUI ──┤            ┌────────────────────────── daemon (one per user) ──┐
-   dashboard ┴─ HTTP/SSE ─┤  engine → workflows → routing → Backend trait     │
+   sgt CLI ──┐            ┌────────────────────────── daemon (one per user) ──┐
+   sgt TUI ──┴─ HTTP/SSE ─┤  engine → workflows → routing → Backend trait     │
                           │      │                    ├── claude (headless    │
                           │  append-only journal      │     print-mode turns) │
                           │  + blob store             └── fake (deterministic)│
@@ -223,7 +226,7 @@ Full authoring rules — the four-layer context model (workflow orientation, sta
                           └──── work surfaces: git worktrees, one per work ───┘
 ```
 
-Every state change — submit, worktree binding, stage entry, each model turn's raw output, the question the agent asked, your answer — is an event in a crash-tolerant journal (large payloads in a BLAKE3 content-addressed blob store). Everything else — the in-memory work state, the DuckDB analytics tables, the graph projection, every client screen — is a disposable projection rebuilt from it; there is no snapshot loading. The daemon exclusively owns the data directory and every process handle; clients (CLI, TUI, dashboard) hold no state of their own and reach it only through the same loopback HTTP/SSE API — a structural test fails if one gets a private shortcut. A Claude "session" is a durable conversation identity, not a process: the OS process exists per turn, so killing the daemon mid-execution and restarting it resumes on unambiguous evidence, or fails closed into `blocked` with a stated reason — never a guess. Each work item gets its own git worktree on its own branch (`sergeant/<work-id>`), outside your checkout, so agents never fight over a working tree. A third `Backend` — `docker` — runs `kind = "execute"` workflow stages (pinned, offline containers) rather than agent turns; it isn't user-selectable via `--backend`, since a workflow's own stages declare their kind.
+Every state change — submit, worktree binding, stage entry, each model turn's raw output, the question the agent asked, your answer — is an event in a crash-tolerant journal (large payloads in a BLAKE3 content-addressed blob store). Everything else — the in-memory work state, the DuckDB analytics tables, the graph projection, every client screen — is a disposable projection rebuilt from it; there is no snapshot loading. The daemon exclusively owns the data directory and every process handle; clients (CLI, TUI) hold no state of their own and reach it only through the same loopback HTTP/SSE API — a structural test fails if one gets a private shortcut. A Claude "session" is a durable conversation identity, not a process: the OS process exists per turn, so killing the daemon mid-execution and restarting it resumes on unambiguous evidence, or fails closed into `blocked` with a stated reason — never a guess. Each work item gets its own git worktree on its own branch (`sergeant/<work-id>`), outside your checkout, so agents never fight over a working tree. A third `Backend` — `docker` — runs `kind = "execute"` workflow stages (pinned, offline containers) rather than agent turns; it isn't user-selectable via `--backend`, since a workflow's own stages declare their kind.
 
 This — the engine described above — is the core `sgt` carries; everything under `.sergeant/`, `AGENTS.md`, and this repo's own skills is the OS layered on top of it. The full destination for both halves, and the rulings that shape them, is [`NORTH-STAR.md`](NORTH-STAR.md).
 

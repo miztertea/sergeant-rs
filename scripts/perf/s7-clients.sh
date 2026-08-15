@@ -6,8 +6,7 @@
 #
 #   * TUI CPU while idle-but-live — a busy render loop is a finding;
 #   * the SSE tail stays live through a burst (the fleet screen sees new work);
-#   * the dashboard fetched during the burst stays correct;
-#   * `sgt web` / `doctor` / `status` latency under load;
+#   * `doctor` / `status` latency under load;
 #   * `q` exits, and the pane's exit status says it exited cleanly;
 #   * the 2026-08-09 orphan observation: a TUI whose pty is destroyed
 #     (`tmux kill-server`) must die on SIGTERM — reproduced or refuted, with
@@ -60,7 +59,7 @@ perf_kv seed_work "${SEED_WORK:-none}"
 # ---------------------------------------------------------------- attach
 perf_step "attaching the TUI under tmux"
 tmux -L "$SOCK_MAIN" new-session -d -s tui -x 200 -y 50 \
-  "exec '$SGT_BIN' --data-dir '$DD'"
+  "exec '$SGT_BIN' --data-dir '$DD' tui"
 tmux -L "$SOCK_MAIN" set-option -t tui remain-on-exit on >/dev/null 2>&1 || true
 sleep 3
 TUI_PID="$(tmux -L "$SOCK_MAIN" list-panes -t tui -F '#{pane_pid}' 2>/dev/null | head -1)"
@@ -95,7 +94,7 @@ DAEMON_CPU_IDLE="$(perf_proc_cpu_sec "$PERF_DAEMON_PID")"
 perf_kv daemon_cpu_during_tui_idle_s "$DAEMON_CPU_IDLE"
 
 # ---------------------------------------------------------------- burst
-perf_step "burst of $BURST with the TUI attached and the dashboard fetched"
+perf_step "burst of $BURST with the TUI attached"
 FLEET_BEFORE="$(perf_api GET /v1/work | jq '.works | length')"
 tui_cpu_before="$(perf_proc_cpu_sec "$TUI_PID")"
 tui_rss_before="$(perf_proc_rss "$TUI_PID")"
@@ -106,16 +105,8 @@ perf_mark b0
 perf_burst "$BURST" "$BURST" "$calls" s7b &
 burst_job=$!
 
-# Dashboard and the diagnostic commands, concurrent with the burst.
+# The diagnostic commands, concurrent with the burst.
 sleep 0.3
-read -r w code bytes total <<< "$(perf_timed_get "/ui" "$PERF_OUT/s7-dashboard.html")"
-perf_kv dashboard_under_load_ms "$(perf_ms "$w")"
-perf_kv dashboard_under_load_http "$code"
-perf_kv dashboard_under_load_bytes "$bytes"
-
-perf_mark w0; WEB_URL="$("$SGT_BIN" --data-dir "$DD" --json web 2>/dev/null | jq -r '.url // empty')"; perf_mark w1
-perf_kv sgt_web_ms "$(perf_ms $((w1 - w0)))"
-perf_kv sgt_web_url_ok "$([ -n "$WEB_URL" ] && echo yes || echo no)"
 perf_mark st0; "$SGT_BIN" --data-dir "$DD" --json status > "$PERF_OUT/s7-status.json" 2>/dev/null || true; perf_mark st1
 perf_kv sgt_status_ms "$(perf_ms $((st1 - st0)))"
 perf_mark d0; "$SGT_BIN" --data-dir "$DD" --json doctor > "$PERF_OUT/s7-doctor.json" 2>/dev/null || true; perf_mark d1
@@ -144,18 +135,6 @@ perf_kv tui_pane_shows_new_work "$([ -n "$NEW_ID" ] && grep -qF "$NEW_ID" "$PERF
 # The fleet screen truncates ids; a live SSE tail is also visible as a changed
 # pane and a count that moved. Both are recorded, neither is asserted here.
 perf_kv tui_pane_changed "$(cmp -s "$PERF_OUT/s7-pane-attached.txt" "$PERF_OUT/s7-pane-after-burst.txt" && echo no || echo yes)"
-perf_kv dashboard_names_new_work "$([ -n "$NEW_ID" ] && grep -qF "$NEW_ID" "$PERF_OUT/s7-dashboard.html" && echo yes || echo "no (fetched mid-burst)")"
-
-# The dashboard fetched *after* the burst must name the work — correctness of
-# the page, separated from the mid-burst timing question above.
-read -r w2 code2 bytes2 _ <<< "$(perf_timed_get "/ui" "$PERF_OUT/s7-dashboard-after.html")"
-perf_kv dashboard_after_http "$code2"
-perf_kv dashboard_after_names_new_work "$([ -n "$NEW_ID" ] && grep -qF "$NEW_ID" "$PERF_OUT/s7-dashboard-after.html" && echo yes || echo no)"
-if [ -n "$NEW_ID" ]; then
-  read -r w3 code3 bytes3 _ <<< "$(perf_timed_get "/ui/work/$NEW_ID" "$PERF_OUT/s7-dashboard-work.html")"
-  perf_kv dashboard_work_page_http "$code3"
-  perf_kv dashboard_work_page_ms "$(perf_ms "$w3")"
-fi
 
 # ---------------------------------------------------------------- q exits
 perf_step "q exits and restores the terminal"
@@ -182,7 +161,7 @@ perf_kv daemon_fds_after_tui "$(perf_proc_fds "$PERF_DAEMON_PID")"
 # ------------------------------------------------- orphan SIGTERM repro
 perf_step "orphan repro: tmux kill-server, then SIGTERM the surviving TUI"
 tmux -L "$SOCK_ORPHAN" new-session -d -s orphan -x 200 -y 50 \
-  "exec '$SGT_BIN' --data-dir '$DD'"
+  "exec '$SGT_BIN' --data-dir '$DD' tui"
 sleep 3
 ORPHAN_PID="$(tmux -L "$SOCK_ORPHAN" list-panes -t orphan -F '#{pane_pid}' 2>/dev/null | head -1)"
 perf_kv orphan_tui_pid "${ORPHAN_PID:-none}"

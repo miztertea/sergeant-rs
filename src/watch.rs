@@ -11,7 +11,7 @@
 //! projection, engine, backend, or daemon internals: a long-running watch
 //! loop must stay a client, never grow into a second execution layer.
 //! `tests/m9_watch.rs`'s structural test pins this by source scan, mirroring
-//! `tests/m6_surfaces.rs`'s `t5`/`t5b` for the TUI and dashboard.
+//! `tests/m6_surfaces.rs`'s `t5`/`t5b` for the TUI.
 //!
 //! **Event doctrine (proposal §7, Decision WATCH-05).** An event is
 //! provenance, not meaning: it identifies that something changed and causes
@@ -89,7 +89,13 @@ impl WatchState {
             "blocked" => Some(Self::Blocked),
             "waiting" => Some(Self::Waiting),
             "failed" => Some(Self::Failed),
-            "completed" => Some(Self::Completed),
+            // ADR 0007(b): a stranded completion is still terminal — the
+            // Work is done, not blocked or failed — so it belongs in the
+            // same watch bucket as an ordinary `completed`. `watch` forwards
+            // the snapshot verbatim (`emit`, below), so the notice an
+            // operator sees still reads `completed_dirty`; only whether the
+            // loop notices and exits changes here.
+            "completed" | "completed_dirty" => Some(Self::Completed),
             "canceled" => Some(Self::Canceled),
             _ => None,
         }
@@ -531,6 +537,29 @@ mod tests {
                 "state {state:?} must classify to {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn adr_0007b_completed_dirty_classifies_as_completed_and_is_terminal() {
+        // ADR 0007(b) review fix: before this, `classify` only recognized
+        // plain `completed`, so a stranded completion's snapshot state
+        // fell into `None` ("not watched") and a scoped `--follow` watcher
+        // would never see it as terminal — it would hang forever
+        // (`classify_snapshot` feeds `snapshot["work"]["state"]` straight
+        // into this function).
+        assert_eq!(
+            WatchState::classify("completed_dirty"),
+            Some(WatchState::Completed),
+            "a stranded completion must classify into the same watch \
+             bucket as an ordinary completed run"
+        );
+        assert!(
+            WatchState::classify("completed_dirty")
+                .expect("classifies")
+                .is_terminal(),
+            "a scoped --follow watcher must exit on completed_dirty, not \
+             hang waiting for a notice that will never come"
+        );
     }
 
     #[test]

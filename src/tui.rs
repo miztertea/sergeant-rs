@@ -67,6 +67,14 @@ const TTY_WATCH: Duration = Duration::from_millis(500);
 /// How long shutdown waits for the key reader before leaving it behind.
 const READER_JOIN_GRACE: Duration = Duration::from_secs(1);
 
+/// The delay before the first reconnect attempt, and the unit the backoff
+/// curve doubles from (see [`Backoff`]).
+const RECONNECT_BASE: Duration = Duration::from_millis(250);
+
+/// Where the backoff curve stops growing: a long-dead tail is retried every
+/// 30s forever rather than backing off without bound.
+const RECONNECT_CAP: Duration = Duration::from_secs(30);
+
 /// A TUI failure that reaches the caller.
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
@@ -84,20 +92,32 @@ pub enum TuiError {
 ///
 /// This is *screen state*, not a transient message, and it is rendered in the
 /// header next to the seq counter for exactly that reason. The one-line status
-/// at the bottom is overwritten by the next command outcome ("canceled …"),
-/// so a tail that died two keystrokes ago would leave a screen that looks
-/// live and never reconnects — fixed data presented as live truth, which is
-/// the failure mode §7 cares about. The dashboard keeps a dedicated live
-/// indicator for the same reason (`#live` in `web/dashboard.js`); this is the
-/// TUI's.
+/// at the bottom is overwritten by the next command outcome ("canceled …"), so
+/// a message-only signal would leave a screen that looks live long after a
+/// tail died two keystrokes ago — fixed data presented as live truth, which is
+/// the failure mode §7 cares about. The embedded dashboard (deleted, ADR
+/// 0011) used to keep a dedicated live indicator for the same reason; this
+/// is the TUI's. Recovery from a dead tail is automatic (issue #16: capped backoff,
+/// `Reconnecting` below), but the durable indicator stays either way — an
+/// attempt still in flight, or one that has stopped for good on a rejected
+/// token, must never be reported as `live`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Live {
     /// Attached: the daemon's SSE tail is feeding this screen.
     #[default]
     Attached,
-    /// Detached: the tail ended or could not be opened. The data on screen is
-    /// as of the last read, and `r` re-reads *and* re-attaches.
-    Detached,
+    /// The tail died and the loop is retrying with capped backoff — the
+    /// completion of the M6 fix (issue #16): recovery no longer waits on a
+    /// keystroke, but the screen still says so rather than looking live
+    /// through the gap. `r` forces an attempt now instead of waiting on the
+    /// backoff.
+    Reconnecting,
+    /// The daemon flatly rejected this client's token (issue #16's other
+    /// half): retrying automatically cannot help — the token this process
+    /// holds is not one the daemon will ever accept again — so the loop
+    /// stopped rather than spend its backoff budget on a door that will
+    /// never open. `r` still tries once, honestly.
+    AuthFailed,
 }
 
 impl Live {
@@ -105,7 +125,8 @@ impl Live {
     fn label(self) -> &'static str {
         match self {
             Live::Attached => "live",
-            Live::Detached => "TAIL CLOSED (r reconnects)",
+            Live::Reconnecting => "RECONNECTING… (r retries now)",
+            Live::AuthFailed => "AUTH FAILED — token rejected (r retries)",
         }
     }
 }
@@ -418,7 +439,10 @@ fn field(value: &Value, key: &str) -> String {
 fn state_style(state: &str) -> Style {
     let color = match state {
         "completed" => Color::Green,
-        "needs_input" | "waiting" => Color::Yellow,
+        // ADR 0007(b): a stranded completion is terminal, not a plain
+        // success — group it with the other "needs a look" states rather
+        // than the default Cyan bucket ordinary in-flight work falls into.
+        "needs_input" | "waiting" | "completed_dirty" => Color::Yellow,
         "failed" | "blocked" | "canceled" => Color::Red,
         _ => Color::Cyan,
     };
@@ -707,7 +731,28 @@ where
     // pty to a library that would spin on it.
     let reader = KeyReader::spawn(tick, keys_tx);
 
-    let mut stream = attach(client, app).await;
+    let mut backoff = Backoff::new();
+    let mut stream = reconnected(
+        client,
+        app,
+        &mut backoff,
+        try_attach(client, app.last_seq).await,
+    )
+    .await;
+    // A resettable one-shot timer for the next automatic reconnect attempt,
+    // reused across loop iterations rather than recreated (the standard
+    // shape for a `Sleep` awaited from inside `select!`). Its `select!` arm
+    // below is guarded on `Live::Reconnecting`, so it is simply never polled
+    // while the tail is up or while it has stopped retrying for good on an
+    // auth failure — the same "disarm rather than fire uselessly" idea
+    // `TerminalProbes` uses for signals nobody installed.
+    let reconnect_at = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(reconnect_at);
+    if app.live == Live::Reconnecting {
+        reconnect_at
+            .as_mut()
+            .reset(tokio::time::Instant::now() + backoff.next_delay());
+    }
     let mut signals = TerminationSignals::install();
     let mut watch = tokio::time::interval(TTY_WATCH);
 
@@ -739,9 +784,17 @@ where
                             // re-attaches the tail as well as re-reading: an `r`
                             // that repainted stale data and left the screen
                             // permanently detached would answer the wrong
-                            // question.
+                            // question. This is the same attempt the backoff
+                            // timer below makes on its own schedule — `r` just
+                            // makes one happen now instead of waiting for it.
                             if stream.is_none() {
-                                stream = attach(client, app).await;
+                                let attempt = try_attach(client, app.last_seq).await;
+                                stream = reconnected(client, app, &mut backoff, attempt).await;
+                                if app.live == Live::Reconnecting {
+                                    reconnect_at.as_mut().reset(
+                                        tokio::time::Instant::now() + backoff.next_delay(),
+                                    );
+                                }
                             }
                         }
                         _ => {}
@@ -755,25 +808,49 @@ where
                         TailStep::Event(event) => needs_refresh = app.observe(&event),
                         TailStep::Ended => {
                             // The tail ended (daemon restart or shutdown, a lagged
-                            // subscriber the server dropped, a broken chunk). Keep
-                            // the UI alive and say so — durably, in the header, not
-                            // only in a status line the next command overwrites.
+                            // subscriber the server dropped, a broken chunk —
+                            // reachable on *any* chunk error, not just a restart,
+                            // per the M6 refuter's finding). Keep the UI alive and
+                            // say so durably, and start retrying with backoff
+                            // instead of waiting on a keystroke (issue #16): this
+                            // is the completion of the M6 fix, not a new direction.
                             stream = None;
-                            app.live = Live::Detached;
-                            app.status = "live tail closed — press r to refresh".to_string();
+                            app.live = Live::Reconnecting;
+                            app.status = "live tail closed — reconnecting…".to_string();
+                            reconnect_at
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + backoff.next_delay());
                         }
                         TailStep::Malformed(detail) => {
                             // R-WATCH-7's new outcome, handled deliberately rather
                             // than falling through to the same message as an
                             // ordinary disconnect: the daemon sent a frame this
                             // client could not decode, which is protocol drift
-                            // worth a distinct status line, not a quiet reconnect
-                            // prompt.
+                            // worth a distinct status line — but it still gets the
+                            // same automatic reconnect, since whatever answers the
+                            // next attempt need not be the process that sent the
+                            // bad frame.
                             stream = None;
-                            app.live = Live::Detached;
+                            app.live = Live::Reconnecting;
                             app.status =
-                                format!("live tail error: {detail} — press r to refresh");
+                                format!("live tail error: {detail} — reconnecting…");
+                            reconnect_at
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + backoff.next_delay());
                         }
+                    }
+                }
+                // The other half of the auto-reconnect: retried on its own
+                // schedule rather than only when the user asks. The `if` guard
+                // is what disarms this arm once the tail is live again or has
+                // stopped retrying for good on an auth failure.
+                _ = &mut reconnect_at, if app.live == Live::Reconnecting => {
+                    let attempt = try_attach(client, app.last_seq).await;
+                    stream = reconnected(client, app, &mut backoff, attempt).await;
+                    if app.live == Live::Reconnecting {
+                        reconnect_at
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + backoff.next_delay());
                     }
                 }
                 // A terminal left in raw mode + alternate screen is the one
@@ -1106,19 +1183,117 @@ fn controlling_terminal_present() -> bool {
     true
 }
 
-/// Open the live tail and record the outcome where the screen can show it.
+/// Capped exponential backoff between reconnect attempts.
 ///
-/// Used for the first attach and for every reconnect, so "attached" is
-/// decided in one place and cannot drift from what the header says.
-async fn attach(client: &ApiClient, app: &mut App) -> Option<crate::api::EventStream> {
-    match client.stream_events(app.last_seq).await {
-        Ok(stream) => {
+/// Pure — computing the next delay never sleeps and never reads a clock —
+/// so the growth curve and the cap are asserted directly rather than by
+/// waiting one out. `TtyWatch` and `guarded_tick` follow the same shape:
+/// keep the decision pure, let the loop be the only place that is genuinely
+/// async.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    attempt: u32,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { attempt: 0 }
+    }
+
+    /// The delay before the next attempt, advancing the counter by one.
+    ///
+    /// The first call already returns [`RECONNECT_BASE`], never zero: a dead
+    /// tail retried with no delay at all is the reader-thread spin issue #3
+    /// fixed once, reintroduced in a different loop.
+    fn next_delay(&mut self) -> Duration {
+        let shift = self.attempt.min(16); // 250ms << 16 already clears the cap
+        self.attempt += 1;
+        RECONNECT_BASE
+            .saturating_mul(1u32 << shift)
+            .min(RECONNECT_CAP)
+    }
+
+    /// Back to the first attempt's delay — called once a reconnect succeeds,
+    /// so the *next* time the tail dies it is retried quickly again rather
+    /// than resuming at whatever this outage's backoff had grown to.
+    fn reset(&mut self) {
+        self.attempt = 0;
+    }
+}
+
+/// Whether a failed attach is the daemon flatly rejecting this client's
+/// token, rather than being unreachable or mid-restart.
+///
+/// The distinction is what issue #16 asks for by name: a stale token (the
+/// daemon restarted and rotated it) will never start working just because
+/// this process asks again, so the auto-reconnect loop must stop instead of
+/// spending its backoff budget on a door that will never open.
+fn is_auth_failure(err: &ClientError) -> bool {
+    matches!(err, ClientError::Api { status: 401, .. })
+}
+
+/// What one attach attempt produced.
+enum Attach {
+    /// The tail is open. The caller still owes a refresh before treating it
+    /// as resumed — see [`reconnected`].
+    Opened(crate::api::EventStream),
+    /// Failed for a reason another attempt might fix.
+    Retry(String),
+    /// Failed because the token this client holds is not one the daemon
+    /// will ever accept — see [`is_auth_failure`].
+    AuthFailed(String),
+}
+
+/// Try to open the live tail from `from`, without touching [`App`] — every
+/// caller (first attach, `r`, and the backoff loop) reacts to the outcome
+/// differently, through [`reconnected`].
+async fn try_attach(client: &ApiClient, from: u64) -> Attach {
+    match client.stream_events(from).await {
+        Ok(stream) => Attach::Opened(stream),
+        Err(e) if is_auth_failure(&e) => Attach::AuthFailed(e.to_string()),
+        Err(e) => Attach::Retry(e.to_string()),
+    }
+}
+
+/// Fold one attach attempt's outcome into the screen, and hand back the
+/// stream to keep tailing (`None` if there is none).
+///
+/// Used for the first attach and for every reconnect — manual or automatic —
+/// so "attached" is decided in one place and cannot drift from what the
+/// header says. The success arm is where issue #16's subtle requirement
+/// lives: **refresh before resuming the tail**. An SSE gap means events were
+/// missed, so handing the stream back before re-reading the API would leave
+/// the screen confidently wrong about everything that happened during the
+/// gap — a reconnect that skips this is worse than no reconnect, because it
+/// looks live while lying.
+async fn reconnected(
+    client: &ApiClient,
+    app: &mut App,
+    backoff: &mut Backoff,
+    outcome: Attach,
+) -> Option<crate::api::EventStream> {
+    match outcome {
+        Attach::Opened(stream) => {
+            if let Err(e) = app.refresh(client).await {
+                app.live = Live::Reconnecting;
+                app.status = format!("reconnected, but refresh failed: {e} — retrying…");
+                return None;
+            }
+            backoff.reset();
             app.live = Live::Attached;
             Some(stream)
         }
-        Err(e) => {
-            app.live = Live::Detached;
-            app.status = format!("live tail unavailable: {e}");
+        Attach::Retry(detail) => {
+            app.live = Live::Reconnecting;
+            app.status = format!("live tail unavailable: {detail} — reconnecting…");
+            None
+        }
+        Attach::AuthFailed(detail) => {
+            app.live = Live::AuthFailed;
+            app.status = format!(
+                "live tail auth failed: {detail} — the token this session holds \
+                 is stale; restart sgt to pick up a fresh one"
+            );
             None
         }
     }
@@ -1452,6 +1627,25 @@ mod tests {
     }
 
     #[test]
+    fn adr_0007b_completed_dirty_is_not_painted_like_ordinary_in_flight_work() {
+        // Review of the first cut found `completed_dirty` fell through to
+        // the default arm and was painted the same Cyan as ordinary
+        // in-flight work — indistinguishable from a run still running, in
+        // the one place an operator scans a whole fleet at a glance.
+        assert_eq!(
+            state_style("completed_dirty").fg,
+            Some(Color::Yellow),
+            "a stranded completion needs a second look, so it belongs with \
+             needs_input/waiting, not the default Cyan in-flight bucket"
+        );
+        assert_ne!(
+            state_style("completed_dirty").fg,
+            state_style("active").fg,
+            "must be visually distinct from ordinary in-flight work"
+        );
+    }
+
+    #[test]
     fn only_state_bearing_events_ask_for_a_refresh() {
         let mut app = App::new();
         assert!(app.observe(&json!({"seq": 7, "kind": "work.completed"})));
@@ -1497,7 +1691,7 @@ mod tests {
                 backend: "-".to_string(),
                 intent: "-".to_string(),
             },
-            "missing fields read as `-`, the rule shared with the dashboard"
+            "missing fields read as `-`, the rule shared with the rest of the API surface"
         );
 
         // A body with no `works` array at all is an empty fleet, not a panic.
@@ -1589,11 +1783,11 @@ mod tests {
             header_text(&app)
         );
 
-        app.live = Live::Detached;
-        app.status = "live tail closed — press r to refresh".to_string();
+        app.live = Live::Reconnecting;
+        app.status = "live tail closed — reconnecting…".to_string();
         assert!(
-            header_text(&app).contains("TAIL CLOSED"),
-            "a detached tail is named in the header: {}",
+            header_text(&app).contains("RECONNECTING"),
+            "a reconnecting tail is named in the header: {}",
             header_text(&app)
         );
 
@@ -1607,11 +1801,275 @@ mod tests {
             app.status
         );
         // …and the header still says the screen is not live.
-        assert_eq!(app.live, Live::Detached);
+        assert_eq!(app.live, Live::Reconnecting);
         assert!(
-            header_text(&app).contains("TAIL CLOSED"),
+            header_text(&app).contains("RECONNECTING"),
             "the indicator must outlive the status line: {}",
             header_text(&app)
+        );
+    }
+
+    /// Backoff never fires the first retry instantly (that is the reader
+    /// thread's spin, issue #3, reintroduced in a different loop) and never
+    /// grows past its cap — reverting either half of `Backoff::next_delay`
+    /// fails one of these two assertions.
+    #[test]
+    fn reconnect_backoff_starts_above_zero_and_stops_growing() {
+        let mut backoff = Backoff::new();
+        let first = backoff.next_delay();
+        assert!(
+            first > Duration::ZERO,
+            "an instant first retry is the reader-thread spin (issue #3) in a new loop"
+        );
+        assert_eq!(first, RECONNECT_BASE);
+        assert_eq!(
+            backoff.next_delay(),
+            RECONNECT_BASE * 2,
+            "the curve doubles"
+        );
+        assert_eq!(backoff.next_delay(), RECONNECT_BASE * 4);
+
+        // A long outage must not make the delay grow without bound.
+        for _ in 0..30 {
+            backoff.next_delay();
+        }
+        assert_eq!(
+            backoff.next_delay(),
+            RECONNECT_CAP,
+            "backoff must stop growing at the cap, not keep doubling forever \
+             (that is the spin this test guards, just paced instead of tight)"
+        );
+    }
+
+    /// Reconnecting resets the curve, so the *next* outage is retried
+    /// quickly again rather than picking up where a long-past one left off.
+    #[test]
+    fn reconnect_backoff_resets_after_a_success() {
+        let mut backoff = Backoff::new();
+        backoff.next_delay();
+        backoff.next_delay();
+        backoff.next_delay();
+        backoff.reset();
+        assert_eq!(backoff.next_delay(), RECONNECT_BASE);
+    }
+
+    /// Only the daemon's own 401 reads as "this token will never work" — a
+    /// transport failure or any other status is something a later attempt
+    /// might still fix, so it must not be mistaken for the terminal case.
+    #[test]
+    fn only_a_401_reads_as_an_auth_failure() {
+        assert!(is_auth_failure(&ClientError::Api {
+            status: 401,
+            code: "unauthorized".to_string(),
+            message: "missing or invalid bearer token".to_string(),
+        }));
+        assert!(!is_auth_failure(&ClientError::Api {
+            status: 500,
+            code: "internal".to_string(),
+            message: "oops".to_string(),
+        }));
+        assert!(!is_auth_failure(&ClientError::Transport(
+            "connection refused".to_string()
+        )));
+    }
+
+    /// A retryable attach failure is `Reconnecting`, not a silent retry and
+    /// not a stale `Attached` — the header must say so distinctly from both
+    /// "live" and the terminal auth-failure state.
+    #[tokio::test]
+    async fn a_retryable_attach_failure_is_reconnecting_not_silent_or_stale_live() {
+        let mut app = App::new();
+        app.live = Live::Attached;
+        let client = ApiClient::new("http://127.0.0.1:1", "t").expect("client");
+        let mut backoff = Backoff::new();
+
+        let stream = reconnected(
+            &client,
+            &mut app,
+            &mut backoff,
+            Attach::Retry("connection refused".to_string()),
+        )
+        .await;
+
+        assert!(stream.is_none(), "a failed attempt hands back no stream");
+        assert_eq!(app.live, Live::Reconnecting);
+        let header = header_text(&app);
+        assert!(
+            !header.contains("live"),
+            "must not look attached while retrying: {header}"
+        );
+        assert!(
+            header.contains("RECONNECTING"),
+            "must say it is retrying, not just that the tail is closed: {header}"
+        );
+    }
+
+    /// A daemon that rejects the token (e.g. reissued on restart) stops the
+    /// loop instead of looping forever against a door that will never open.
+    #[tokio::test]
+    async fn an_auth_failure_surfaces_instead_of_retrying_forever() {
+        let mut app = App::new();
+        let client = ApiClient::new("http://127.0.0.1:1", "t").expect("client");
+        let mut backoff = Backoff::new();
+
+        let stream = reconnected(
+            &client,
+            &mut app,
+            &mut backoff,
+            Attach::AuthFailed("missing or invalid bearer token".to_string()),
+        )
+        .await;
+
+        assert!(stream.is_none());
+        assert_eq!(
+            app.live,
+            Live::AuthFailed,
+            "an auth failure must not be reported as an ordinary retrying tail"
+        );
+        assert!(
+            header_text(&app).contains("AUTH FAILED"),
+            "the durable indicator must name the auth failure, not just say \
+             the tail is retrying: {}",
+            header_text(&app)
+        );
+    }
+
+    /// The subtle half of issue #16: a successful reconnect refreshes state
+    /// *before* the caller can resume tailing. An SSE gap means events were
+    /// missed — resuming the read alone would leave the screen confidently
+    /// wrong about everything that happened during the gap.
+    ///
+    /// Driven against a real socket, not a mock: `reconnected` awaiting its
+    /// own `App::refresh` internally is exactly the ordering a mocked
+    /// `ApiClient` could not tell apart from "returns the stream, refreshes
+    /// later, if ever."
+    #[tokio::test]
+    async fn a_successful_reconnect_refreshes_state_before_handing_back_the_tail() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in daemon");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            fn respond(mut stream: std::net::TcpStream, content_type: &str, body: &str) {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            // 1: the reconnect's own attach — the tail itself carries nothing.
+            if let Ok((stream, _)) = listener.accept() {
+                respond(stream, "text/event-stream", "");
+            }
+            // 2 & 3: the refresh `reconnected` owes before handing the tail
+            // back, in `App::refresh`'s own call order (system, then fleet).
+            if let Ok((stream, _)) = listener.accept() {
+                respond(
+                    stream,
+                    "application/json",
+                    r#"{"version":"post-gap","api_revision":"v1","data_dir":"/tmp/d","journal_head":9}"#,
+                );
+            }
+            if let Ok((stream, _)) = listener.accept() {
+                respond(
+                    stream,
+                    "application/json",
+                    r#"{"works":[{"id":"w1","state":"running","intent":"post-gap work","stage":{"stage_id":"10-implement","status":"running"},"resolved_backend":"fake"}]}"#,
+                );
+            }
+        });
+
+        let client = ApiClient::new(&format!("http://{addr}"), "unused-token").expect("client");
+        let mut app = App::new();
+        app.live = Live::Reconnecting;
+        app.system = json!({"version": "pre-gap"});
+        let mut backoff = Backoff::new();
+
+        let attempt = try_attach(&client, 0).await;
+        let stream = reconnected(&client, &mut app, &mut backoff, attempt).await;
+
+        assert!(
+            stream.is_some(),
+            "a clean 200 on the stream route must attach"
+        );
+        assert_eq!(app.live, Live::Attached);
+        assert_eq!(
+            app.system["version"], "post-gap",
+            "the reconnect must refresh state before the caller can resume the \
+             tail — a stream handed back with the pre-gap snapshot still in \
+             `app.system` is exactly the invariant this guards"
+        );
+        assert_eq!(app.rows.len(), 1, "the fleet refresh must have run too");
+    }
+
+    /// Review found two bugs on this same success path that a mocked client
+    /// could not tell apart from correct behavior: a stream that opens but
+    /// whose refresh then fails must not be reported `Attached` (that would
+    /// show the pre-gap snapshot as live), and the backoff must not be reset
+    /// until the refresh actually succeeds — resetting on open alone would
+    /// make a reconnect that keeps opening a stream but failing its refresh
+    /// retry at `RECONNECT_BASE` forever instead of backing off.
+    #[tokio::test]
+    async fn a_failed_refresh_after_a_successful_attach_stays_reconnecting_and_keeps_the_backoff() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stand-in daemon");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            fn respond(mut stream: std::net::TcpStream, status_line: &str, content_type: &str) {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+            // 1: the reconnect's own attach succeeds — the tail itself
+            // carries nothing.
+            if let Ok((stream, _)) = listener.accept() {
+                respond(stream, "200 OK", "text/event-stream");
+            }
+            // 2: the refresh's first call (system) fails.
+            if let Ok((stream, _)) = listener.accept() {
+                respond(stream, "500 Internal Server Error", "application/json");
+            }
+        });
+
+        let client = ApiClient::new(&format!("http://{addr}"), "unused-token").expect("client");
+        let mut app = App::new();
+        app.live = Live::Reconnecting;
+        app.system = json!({"version": "pre-gap"});
+        let mut backoff = Backoff::new();
+        // Advance the backoff as a real outage would before this attempt, so
+        // a wrongful reset back to the base delay is observable below.
+        backoff.next_delay();
+        backoff.next_delay();
+
+        let attempt = try_attach(&client, 0).await;
+        let stream = reconnected(&client, &mut app, &mut backoff, attempt).await;
+
+        assert!(
+            stream.is_none(),
+            "a refresh failure must not hand back a stream to keep tailing"
+        );
+        assert_eq!(
+            app.live,
+            Live::Reconnecting,
+            "a stream that opened but whose refresh failed must not be reported \
+             Attached — the screen would show the pre-gap snapshot as live"
+        );
+        assert_eq!(
+            app.system["version"], "pre-gap",
+            "a failed refresh must not leave a half-updated system snapshot"
+        );
+        assert_eq!(
+            backoff.next_delay(),
+            RECONNECT_BASE * 4,
+            "the backoff must not reset on a refresh failure — it continues \
+             from where the outage's curve already was"
         );
     }
 

@@ -22,7 +22,7 @@ it, prints a distilled summary block, and ends with the hygiene sweep.
 | `s4-sse.sh` | 25 SSE subscribers through a burst; 10 killed mid-flight |
 | `s5-journal.sh` | grow to 10k/25k/50k events; cold-start rebuild + analytics |
 | `s6-crash.sh` | `kill -9` mid-burst ×3, restart, recovery assertions |
-| `s7-clients.sh` | TUI under tmux, dashboard, `web`/`doctor`/`status`, orphan SIGTERM |
+| `s7-clients.sh` | TUI under tmux, `doctor`/`status`, orphan SIGTERM |
 
 `common.sh` holds the shared helpers (daemon control, `/proc` sampling, seed
 repo, percentiles, hygiene sweep); `_submit-one.sh` and `_get-one.sh` are the

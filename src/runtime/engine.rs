@@ -52,11 +52,12 @@ use crate::domain::workflow::{
 use crate::domain::workspace::{
     InstructionIdentity, InstructionPolicy, RepositorySpec, Workspace, WorkspaceError,
 };
-use crate::runtime::projection::WorkRun;
+use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
 use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage};
 use crate::runtime::surface::{
-    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SURFACES_DIR,
-    SurfaceError, SurfacePlan, TeardownReport, WorkSurface, materialize, rematerialize, teardown,
+    KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
+    RepositoryBinding, SURFACES_DIR, SurfaceError, SurfacePlan, TeardownReport, WorkSurface,
+    materialize, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
@@ -107,6 +108,131 @@ pub struct StartPlan {
     /// Pinned into `workflow.bound` and read by every later stage entry, so a
     /// retry and a restart reconstruct the same decision.
     pub stage_bindings: Vec<StageBinding>,
+}
+
+/// Why `target_work_id`'s branch cannot (yet) be taken over by a gate Work
+/// attaching to it (§8.6 investigation, Mechanism A —
+/// `docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`). Every
+/// variant is a fail-closed refusal named with a reason: dispatch must never
+/// guess or race the target's own teardown (ADR 0005 §4.3, "ambiguity fails
+/// closed").
+#[derive(Debug, thiserror::Error)]
+pub enum BranchTakeoverError {
+    /// No such Work.
+    #[error("work {work_id} does not exist")]
+    TargetNotFound {
+        /// The Work id that was looked up.
+        work_id: String,
+    },
+    /// The target has not reached an *absorbing* terminal state
+    /// ([`is_absorbing`]) — `pending`/`active`/`waiting`/etc. mean it may
+    /// still be writing to its worktree, and `failed` is deliberately
+    /// excluded even though `WorkState`'s own doc comment calls it
+    /// "terminal": `failed` is retryable, and a retry rematerializes the
+    /// target's own worktree back onto the very branch a gate surface would
+    /// already have attached to — the exact race this precondition exists to
+    /// prevent, not a state this check happens to have overlooked.
+    #[error(
+        "work {work_id} is {state}, not completed or canceled; a gate cannot take over a branch \
+         that may still be written to (active/waiting/etc.) or resurrected onto by a retry \
+         (failed)"
+    )]
+    TargetNotTerminal {
+        /// The Work id that was checked.
+        work_id: String,
+        /// Its actual state.
+        state: WorkState,
+    },
+    /// The target never materialized a surface — there is no branch to take
+    /// over. (A Work submitted with no repository context, or one that
+    /// never got far enough to bind a workflow, both read this way: no `run`
+    /// projected, or a `run` with `surface: None`.)
+    #[error("work {work_id} never materialized a surface; there is no branch to take over")]
+    NoSurface {
+        /// The Work id that was checked.
+        work_id: String,
+    },
+    /// The target reached a terminal state but its surface has not been torn
+    /// down — yet, or possibly ever. `Engine::retire_run`'s own ordering
+    /// (Work state committed, then the stage marked, then the backend asked
+    /// to stop, then the surface torn down) makes this a real window, not a
+    /// hypothetical one: a terminal Work whose teardown crashed or is still
+    /// in flight reads exactly like this.
+    #[error("work {work_id} is terminal but its surface has not been torn down yet")]
+    SurfaceNotTornDown {
+        /// The Work id that was checked.
+        work_id: String,
+    },
+    /// Teardown ran but did not report every binding `Removed` — at least
+    /// one worktree is still attached to (or missing/errored on) the branch
+    /// a gate surface would need. Never forced past: teardown's own
+    /// fail-closed disposition retained it, and takeover fails closed on top
+    /// of that rather than overriding it.
+    #[error("work {work_id}'s surface teardown was not clean: {report:?}")]
+    SurfaceNotClean {
+        /// The Work id that was checked.
+        work_id: String,
+        /// The teardown report explaining what was retained.
+        report: TeardownReport,
+    },
+}
+
+/// Whether `target_work_id`'s branch is safe for a gate Work to take over by
+/// [`crate::runtime::surface::attach`] instead of minting its own — §8.6's
+/// Mechanism A. Fails closed, naming the reason, unless the target reached
+/// an absorbing terminal state and its surface's teardown reported every
+/// binding `Removed`. On success, returns the target's own bindings —
+/// everything `surface::attach` needs to know which branch(es), in which
+/// repositories, to attach to.
+///
+/// **This is necessary, not sufficient.** It answers "does the journal say
+/// this branch should be free", which is exactly what the §8.6 investigation
+/// found the engine had no way to ask before now. It cannot answer "is the
+/// branch still free at the moment of the attempt" — a target could, in
+/// principle, be rematerialized by something else between this check
+/// returning `Ok` and `surface::attach` actually running `git worktree add`.
+/// Git itself is the final arbiter of that instant, exactly as it is today
+/// for `materialize`'s own branch-collision case; `surface::attach`'s own
+/// failure paths (branch reattached elsewhere, branch missing, worktree path
+/// collision) are exactly the cases this function cannot see from journaled
+/// state alone.
+pub fn branch_takeover_precondition(
+    registry: &WorkRegistry,
+    target_work_id: &str,
+) -> Result<Vec<RepositoryBinding>, BranchTakeoverError> {
+    let work =
+        registry
+            .works
+            .get(target_work_id)
+            .ok_or_else(|| BranchTakeoverError::TargetNotFound {
+                work_id: target_work_id.to_string(),
+            })?;
+    if !is_absorbing(work.state) {
+        return Err(BranchTakeoverError::TargetNotTerminal {
+            work_id: target_work_id.to_string(),
+            state: work.state,
+        });
+    }
+    let run = registry
+        .run_view(target_work_id)
+        .filter(|run| run.surface.is_some())
+        .ok_or_else(|| BranchTakeoverError::NoSurface {
+            work_id: target_work_id.to_string(),
+        })?;
+    let surface = run.surface.as_ref().expect("filtered above");
+    let report = run
+        .teardown
+        .as_ref()
+        .ok_or_else(|| BranchTakeoverError::SurfaceNotTornDown {
+            work_id: target_work_id.to_string(),
+        })?;
+    if !report.clean {
+        return Err(BranchTakeoverError::SurfaceNotClean {
+            work_id: target_work_id.to_string(),
+            report: report.clone(),
+        });
+    }
+    Ok(surface.bindings.clone())
 }
 
 /// An external effect the engine has committed to and must now perform
@@ -4155,6 +4281,7 @@ mod tests {
                 profiles: Vec::new(),
                 config_path: None,
                 surfaces_dir: None,
+                data_dir: None,
                 repository_policy: std::collections::BTreeMap::new(),
                 groups: std::collections::BTreeMap::new(),
                 repository_origin: std::collections::BTreeMap::new(),
@@ -4571,5 +4698,256 @@ mod tests {
             WorkState::Blocked,
             "§25: ambiguity fails closed"
         );
+    }
+
+    // ------------------- §8.6 Mechanism A: branch_takeover_precondition
+
+    mod branch_takeover {
+        use super::*;
+        use crate::runtime::surface::{BindingDisposition, BindingOrigin, BindingTeardown};
+
+        fn work(id: &str, state: WorkState) -> Work {
+            Work {
+                id: id.to_string(),
+                workspace: None,
+                intent: "review this".to_string(),
+                repositories: Vec::new(),
+                workflow: None,
+                backend: None,
+                origin_client: None,
+                profile: None,
+                intent_detail: None,
+                envelope: None,
+                state,
+                created_by: "test".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            }
+        }
+
+        fn binding(work_id: &str) -> RepositoryBinding {
+            RepositoryBinding {
+                repository: "solo".to_string(),
+                source_path: PathBuf::from("/repos/solo"),
+                base_branch: "main".to_string(),
+                base_sha: "0".repeat(40),
+                worktree_path: PathBuf::from(format!("/data/surfaces/{work_id}/solo")),
+                work_branch: format!("sergeant/{work_id}"),
+                head_sha: "1".repeat(40),
+                origin: BindingOrigin::Cut,
+            }
+        }
+
+        fn surface(work_id: &str) -> WorkSurface {
+            WorkSurface {
+                work_id: work_id.to_string(),
+                root: PathBuf::from(format!("/data/surfaces/{work_id}")),
+                bindings: vec![binding(work_id)],
+            }
+        }
+
+        fn teardown_report(work_id: &str, clean: bool) -> TeardownReport {
+            let disposition = if clean {
+                BindingDisposition::Removed
+            } else {
+                BindingDisposition::RetainedDirty {
+                    changes: "M solo/wip.rs".to_string(),
+                }
+            };
+            TeardownReport {
+                work_id: work_id.to_string(),
+                bindings: vec![BindingTeardown {
+                    repository: "solo".to_string(),
+                    worktree_path: PathBuf::from(format!("/data/surfaces/{work_id}/solo")),
+                    work_branch: format!("sergeant/{work_id}"),
+                    final_sha: Some("1".repeat(40)),
+                    disposition,
+                }],
+                clean,
+            }
+        }
+
+        /// A target that does not exist at all is refused, named, rather
+        /// than panicking on a missing lookup.
+        #[test]
+        fn refuses_when_the_target_does_not_exist() {
+            let registry = WorkRegistry::default();
+            let err = branch_takeover_precondition(&registry, "01GHOST")
+                .expect_err("a nonexistent work must be refused");
+            assert!(matches!(
+                err,
+                BranchTakeoverError::TargetNotFound { work_id } if work_id == "01GHOST"
+            ));
+        }
+
+        /// Every non-absorbing state refuses — including `failed`, which
+        /// `WorkState`'s own doc comment calls "terminal" but which
+        /// `is_absorbing` deliberately excludes because it is retryable. A
+        /// retry would rematerialize the target's own worktree back onto the
+        /// branch a gate surface may have already attached to, which is
+        /// exactly the race this precondition exists to prevent. Each
+        /// state's error names that exact state, not a generic refusal
+        /// reused across every non-terminal case.
+        #[test]
+        fn each_non_terminal_state_is_refused_with_its_own_reason() {
+            for state in [
+                WorkState::Pending,
+                WorkState::Active,
+                WorkState::Waiting,
+                WorkState::NeedsInput,
+                WorkState::Blocked,
+                WorkState::Failed,
+            ] {
+                let mut registry = WorkRegistry::default();
+                registry
+                    .works
+                    .insert("01TARGET".to_string(), work("01TARGET", state));
+                let err = branch_takeover_precondition(&registry, "01TARGET")
+                    .expect_err("must be refused");
+                assert!(
+                    matches!(
+                        err,
+                        BranchTakeoverError::TargetNotTerminal { ref work_id, state: s }
+                            if work_id == "01TARGET" && s == state
+                    ),
+                    "state {state}: expected TargetNotTerminal naming it, got {err:?}"
+                );
+            }
+        }
+
+        /// A Work in an absorbing terminal state that never had a run at
+        /// all — no repositories, never bound a workflow — has no surface to
+        /// take over.
+        #[test]
+        fn refuses_when_the_target_has_no_run_at_all() {
+            let mut registry = WorkRegistry::default();
+            registry
+                .works
+                .insert("01NORUN".to_string(), work("01NORUN", WorkState::Completed));
+            let err =
+                branch_takeover_precondition(&registry, "01NORUN").expect_err("must be refused");
+            assert!(matches!(
+                err,
+                BranchTakeoverError::NoSurface { work_id } if work_id == "01NORUN"
+            ));
+        }
+
+        /// A run exists (e.g. a workflow was bound) but no surface was ever
+        /// materialized — also no branch to take over.
+        #[test]
+        fn refuses_when_the_target_has_a_run_but_no_surface() {
+            let mut registry = WorkRegistry::default();
+            registry.works.insert(
+                "01NOSURFACE".to_string(),
+                work("01NOSURFACE", WorkState::Completed),
+            );
+            registry
+                .runs
+                .insert("01NOSURFACE".to_string(), WorkRun::default());
+            let err = branch_takeover_precondition(&registry, "01NOSURFACE")
+                .expect_err("must be refused");
+            assert!(matches!(
+                err,
+                BranchTakeoverError::NoSurface { work_id } if work_id == "01NOSURFACE"
+            ));
+        }
+
+        /// A surface exists but teardown has not run yet — the real window
+        /// `retire_run`'s own ordering (state, then stage, then backend
+        /// stop, then teardown) leaves open between a Work going terminal
+        /// and its surface actually tearing down.
+        #[test]
+        fn refuses_when_the_surface_has_not_torn_down_yet() {
+            let mut registry = WorkRegistry::default();
+            registry.works.insert(
+                "01NOTEARDOWN".to_string(),
+                work("01NOTEARDOWN", WorkState::Completed),
+            );
+            registry.runs.insert(
+                "01NOTEARDOWN".to_string(),
+                WorkRun {
+                    surface: Some(surface("01NOTEARDOWN")),
+                    ..Default::default()
+                },
+            );
+            let err = branch_takeover_precondition(&registry, "01NOTEARDOWN")
+                .expect_err("must be refused");
+            assert!(matches!(
+                err,
+                BranchTakeoverError::SurfaceNotTornDown { work_id } if work_id == "01NOTEARDOWN"
+            ));
+        }
+
+        /// Teardown ran but was not clean — a worktree is still retained
+        /// (dirty, missing, or errored). Takeover must not force past
+        /// teardown's own fail-closed disposition.
+        #[test]
+        fn refuses_when_teardown_was_not_clean() {
+            let mut registry = WorkRegistry::default();
+            registry
+                .works
+                .insert("01DIRTY".to_string(), work("01DIRTY", WorkState::Completed));
+            registry.runs.insert(
+                "01DIRTY".to_string(),
+                WorkRun {
+                    surface: Some(surface("01DIRTY")),
+                    teardown: Some(teardown_report("01DIRTY", false)),
+                    ..Default::default()
+                },
+            );
+            let err =
+                branch_takeover_precondition(&registry, "01DIRTY").expect_err("must be refused");
+            assert!(matches!(
+                err,
+                BranchTakeoverError::SurfaceNotClean { work_id, .. } if work_id == "01DIRTY"
+            ));
+        }
+
+        /// The permit side: a terminal target whose surface tore down
+        /// clean returns exactly its own bindings — everything
+        /// `surface::attach` needs.
+        #[test]
+        fn permits_a_terminal_cleanly_torn_down_target() {
+            for state in [WorkState::Completed, WorkState::Canceled] {
+                let mut registry = WorkRegistry::default();
+                registry
+                    .works
+                    .insert("01CLEAN".to_string(), work("01CLEAN", state));
+                registry.runs.insert(
+                    "01CLEAN".to_string(),
+                    WorkRun {
+                        surface: Some(surface("01CLEAN")),
+                        teardown: Some(teardown_report("01CLEAN", true)),
+                        ..Default::default()
+                    },
+                );
+                let bindings = branch_takeover_precondition(&registry, "01CLEAN")
+                    .unwrap_or_else(|e| panic!("state {state} must be permitted, got {e:?}"));
+                assert_eq!(bindings, vec![binding("01CLEAN")]);
+            }
+        }
+
+        /// The permit side also holds for a run the terminal-run eviction
+        /// cache has already reclaimed (`WorkRegistry::terminal_runs`) —
+        /// `run_view` falls back to it transparently, and this function must
+        /// not bypass that by reading `registry.runs` directly.
+        #[test]
+        fn permits_a_target_whose_run_was_already_evicted_to_the_terminal_cache() {
+            let mut registry = WorkRegistry::default();
+            registry.works.insert(
+                "01EVICTED".to_string(),
+                work("01EVICTED", WorkState::Completed),
+            );
+            registry.terminal_runs.insert(
+                "01EVICTED".to_string(),
+                WorkRun {
+                    surface: Some(surface("01EVICTED")),
+                    teardown: Some(teardown_report("01EVICTED", true)),
+                    ..Default::default()
+                },
+            );
+            let bindings = branch_takeover_precondition(&registry, "01EVICTED")
+                .expect("an evicted-but-cached terminal run must still be readable");
+            assert_eq!(bindings, vec![binding("01EVICTED")]);
+        }
     }
 }

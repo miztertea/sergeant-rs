@@ -28,5 +28,5 @@ or no subprocess flushed and the suite's real coverage is missing"
 
 cov_stage_begin c3-m6_surfaces
 cov_run cargo llvm-cov --no-report --test m6_surfaces || cov_fail "m6_surfaces failed under instrumentation"
-cov_stage_end 2 "m6 spawns daemons (dashboard, doctor) and runs scripts/demo.sh; more than the test \
+cov_stage_end 2 "m6 spawns daemons (TUI, doctor) and runs scripts/demo.sh; more than the test \
 binary's own profile must arrive, or no subprocess flushed"

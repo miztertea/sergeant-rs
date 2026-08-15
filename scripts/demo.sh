@@ -32,8 +32,8 @@
 # without spending tokens.
 #
 # With KEEP_DEMO_DIR=1 the throwaway directory survives, holding the artifacts
-# every evidence pointer below was resolved from: graph.json, dashboard.html,
-# analytics.json, and the data dir itself.
+# every evidence pointer below was resolved from: graph.json, analytics.json,
+# and the data dir itself.
 
 set -euo pipefail
 
@@ -375,13 +375,7 @@ GRAPH_CODE="$(curl -s -o "$WORKDIR/graph.json" -w '%{http_code}' \
 EDGES="$(json edges.0.relation < "$WORKDIR/graph.json")"
 say "           200 — $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["edges"]))' "$WORKDIR/graph.json") edges, each carrying the journal seq that justifies it (first: $EDGES)"
 
-DASHBOARD="$(sgt --json web | json url)"
-DASH_CODE="$(curl -s -o "$WORKDIR/dashboard.html" -w '%{http_code}' "$DASHBOARD")"
-[ "$DASH_CODE" = "200" ] || fail "the dashboard answered $DASH_CODE"
-grep -q "$WORK_ID" "$WORKDIR/dashboard.html" || fail "the dashboard does not show work $WORK_ID"
-say "dashboard: $DASHBOARD"
-say "           200 — the fleet page names work $WORK_ID"
-say "tui:       sgt   (no subcommand — same daemon, same state, no private shortcuts)"
+say "tui:       sgt tui   (explicit verb, ADR 0010 — same daemon, same state, no private shortcuts)"
 
 # ---------------------------------------------------------------------------
 step "the walkthrough held"

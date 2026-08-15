@@ -52,17 +52,23 @@ perf_now_ns() {
 }
 
 # perf_mark VAR — assign "now" in ns to VAR without forking a subshell.
+# bash 3.2 (macOS's frozen system bash) has no `local -n` nameref (4.3+), so
+# the value is handed back via `printf -v` instead — also fork-free, and
+# (like the nameref) assigns straight into the caller's variable, local or
+# global. Namespaced locals below so this never shadows the caller's own
+# variable when $1 happens to be a short name like "t" or "sec".
 perf_mark() {
-  local -n __perf_mark_out=$1
-  local t=${EPOCHREALTIME:-}
-  if [ -n "$t" ]; then
-    t=${t/,/.}
-    local sec=${t%.*} frac=${t#*.}
-    while [ ${#frac} -lt 9 ]; do frac="${frac}0"; done
-    __perf_mark_out="${sec}${frac:0:9}"
+  local __perf_mark_t=${EPOCHREALTIME:-}
+  local __perf_mark_val
+  if [ -n "$__perf_mark_t" ]; then
+    __perf_mark_t=${__perf_mark_t/,/.}
+    local __perf_mark_sec=${__perf_mark_t%.*} __perf_mark_frac=${__perf_mark_t#*.}
+    while [ ${#__perf_mark_frac} -lt 9 ]; do __perf_mark_frac="${__perf_mark_frac}0"; done
+    __perf_mark_val="${__perf_mark_sec}${__perf_mark_frac:0:9}"
   else
-    __perf_mark_out="$(date +%s%N)"
+    __perf_mark_val="$(date +%s%N)"
   fi
+  printf -v "$1" '%s' "$__perf_mark_val"
 }
 
 perf_die() { printf '\033[31mperf: %s\033[0m\n' "$*" >&2; exit 1; }

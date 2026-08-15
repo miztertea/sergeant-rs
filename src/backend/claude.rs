@@ -165,6 +165,50 @@ pub const CLAUDE_BIN_ENV: &str = "SGT_CLAUDE_BIN";
 /// (measured on 2.1.226 — see [`actor_question`]).
 pub const POST_TURN_SUMMARY_SUBTYPE: &str = "post_turn_summary";
 
+/// ADR 0007(a): the execution-model half of the actor runtime contract.
+/// Stated here, at the same composition step that builds the stage's first
+/// turn (`ClaudeAdapter::launch`), alongside — but never asserting — the
+/// environment guarantee ADR 0006 will eventually compose at this same
+/// seam; that half does not exist yet (#60) and is out of scope here.
+///
+/// This is *why* #94 happened twice on 2026-08-14: a headless `claude -p`
+/// turn is one process that runs to completion and exits. There is no
+/// notification, callback, or wakeup when something it backgrounded finishes
+/// after the turn ends — the actor considered exactly that mechanism,
+/// correctly ruled it inapplicable, and then acted as though it existed
+/// anyway, because nothing had ever told it otherwise. Composed into every
+/// stage's first turn rather than left to a dispatch brief to restate.
+pub const EXECUTION_MODEL_CONTRACT: &str = "\
+Execution model: this is a headless turn. You get one turn and no callbacks \
+— nothing wakes you when a command you backgrounded finishes after you end \
+your turn. If a command might take a while, run it in the foreground with \
+an adequate timeout and wait for it to finish before ending your turn. Do \
+not background a long-running command and end your turn expecting a \
+notification to resume you; none will come.";
+
+/// ADR 0007(a)'s other half: the environment-guarantee statement, composed
+/// at the same seam as [`EXECUTION_MODEL_CONTRACT`] (`ClaudeAdapter::launch`)
+/// so both statements always reach a launched turn together — this text was
+/// deliberately deferred until ADR 0006's `sgt <harness>` passthrough
+/// existed to make it true; asserting it earlier would have been a promise
+/// nothing in the product kept.
+///
+/// This is the second reading #60's own history shows an actor never got: an
+/// actor that inherited a daemon's bare environment found no `cargo` and
+/// diagnosed a permissions fault, not a PATH gap. Stating the guarantee (and
+/// the escape hatch when it does not hold) gives the actor that second
+/// reading before it needs it, the same way the execution model gave one to
+/// the actor that lost work backgrounding a command.
+pub const ENVIRONMENT_CONTRACT: &str = "\
+Environment: if this session was reached through `sgt claude` (or `sgt codex`/`opencode`/\
+`goose`), your PATH was deliberately composed before this turn was launched to include your \
+toolchain (e.g. `~/.cargo/bin`, `~/.local/bin`), and you are bound to the estate that launch \
+discovered — sergeant's daemon and every actor beneath it inherit that same environment. This \
+does not hold for a daemon reached any other way: a terminal that never went through `sgt \
+<harness>` inherits whatever environment it happened to have. If a tool you expect is missing, \
+that is more likely an unenriched PATH than a permissions fault — run `sgt doctor` to check what \
+this installation's environment actually guarantees before assuming otherwise.";
+
 /// The actor's question from one `post_turn_summary` line, when it asked one.
 ///
 /// **Measured, 2.1.226** (`docs/gauntlet/notes/n3-claude-ask-measurement.md`),
@@ -483,7 +527,7 @@ struct LaunchConfig {
     permission_args: Vec<String>,
 }
 
-/// What a `/proc` scan can say about a conversation's per-turn process.
+/// What a process scan can say about a conversation's per-turn process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Liveness {
     /// A running process carries this session id in its argv. Positive
@@ -492,13 +536,13 @@ pub enum Liveness {
     /// No running process carries this session id. Positive evidence that no
     /// turn of this conversation is running.
     Dead,
-    /// Liveness cannot be evidenced here (no `/proc`, or it is unreadable).
-    /// §25: the caller fails closed; it never assumes either direction.
+    /// Liveness cannot be evidenced here (this platform has no
+    /// process-listing mechanism, or reading it failed). §25: the caller
+    /// fails closed; it never assumes either direction.
     Unknowable(String),
 }
 
-/// Does this NUL-separated `/proc/<pid>/cmdline` belong to a turn of
-/// `session_id`?
+/// Does this process's argv belong to a turn of `session_id`?
 ///
 /// The rule is deliberately narrow: some argv element must be exactly
 /// `--session-id` or `--resume`, and the *next* element must be exactly the
@@ -510,14 +554,12 @@ pub enum Liveness {
 /// environment does) puts the id in *some* process's argv without any turn
 /// running, and the adapter then reported `NativeState::Running` with the
 /// evidence "pid N carries session id in argv". A quoted string is not a
-/// running turn. Tokenizing also makes the false positive structurally
-/// impossible rather than unlikely: a wrapper's whole command line is one
-/// argv element, so it can never *be* the id, only contain it.
-fn cmdline_names_session(cmdline: &[u8], session_id: &str) -> bool {
-    let mut argv = cmdline
-        .split(|byte| *byte == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(String::from_utf8_lossy);
+/// running turn. Taking already-tokenized argv (never a joined command line)
+/// also makes the false positive structurally impossible rather than
+/// unlikely: a wrapper's whole command line is one argv element, so it can
+/// never *be* the id, only contain it.
+fn cmdline_names_session(argv: &[String], session_id: &str) -> bool {
+    let mut argv = argv.iter();
     while let Some(arg) = argv.next() {
         if (arg == "--session-id" || arg == "--resume")
             && argv.next().is_some_and(|value| value == session_id)
@@ -531,19 +573,15 @@ fn cmdline_names_session(cmdline: &[u8], session_id: &str) -> bool {
 /// Is a per-turn `claude` process for `session_id` still running?
 ///
 /// Every turn this adapter launches names its session in its own argv
-/// (`--session-id <uuid>` first, `--resume <uuid>` after), so scanning
-/// `/proc/<pid>/cmdline` for *that argv shape* is evidence about **this
-/// conversation** rather than about a pid — which matters precisely in the
-/// case that needs it: after a restart, when no in-memory record survives and
-/// a recorded pid (if anything had recorded one) could since have been
-/// recycled. What is matched is the flag-and-value pair
-/// ([`cmdline_names_session`]), not the id as a substring: the evidence this
-/// function returns is quoted verbatim into an execution-state claim, so it
-/// has to be about an execution.
-///
-/// Linux-only by construction. Elsewhere the answer is `Unknowable`, not a
-/// guess: an adapter that reported "exited" from the absence of a mechanism
-/// it does not have would be inventing execution state.
+/// (`--session-id <uuid>` first, `--resume <uuid>` after), so scanning every
+/// running process's argv for *that shape* ([`platform::process`]) is
+/// evidence about **this conversation** rather than about a pid — which
+/// matters precisely in the case that needs it: after a restart, when no
+/// in-memory record survives and a recorded pid (if anything had recorded
+/// one) could since have been recycled. What is matched is the
+/// flag-and-value pair ([`cmdline_names_session`]), not the id as a
+/// substring: the evidence this function returns is quoted verbatim into an
+/// execution-state claim, so it has to be about an execution.
 pub fn session_liveness(session_id: &str) -> Liveness {
     session_liveness_excluding(session_id, std::process::id())
 }
@@ -557,33 +595,36 @@ pub fn session_liveness(session_id: &str) -> Liveness {
 /// — excluding a bystander pid finds it, excluding the stand-in's own pid
 /// does not — which is the only way to pin a rule about "self" from outside.
 pub fn session_liveness_excluding(session_id: &str, skip_pid: u32) -> Liveness {
-    if !cfg!(target_os = "linux") {
+    session_liveness_among(
+        session_id,
+        skip_pid,
+        crate::platform::process::running_processes(),
+    )
+}
+
+/// [`session_liveness_excluding`]'s decision logic, taking the process scan
+/// as a parameter (ADR 0002 D3) instead of gathering it itself. Whatever
+/// platform gathered `processes` — or failed to, the `None` arm — this
+/// function's own behavior is identical and testable from any host: it is
+/// what proves the `Unknowable` fail-closed path a platform without any
+/// listing mechanism would take, without needing that platform to run it on.
+fn session_liveness_among(
+    session_id: &str,
+    skip_pid: u32,
+    processes: Option<Vec<crate::platform::process::ProcessArgv>>,
+) -> Liveness {
+    let Some(processes) = processes else {
         return Liveness::Unknowable(
-            "process liveness needs /proc; this platform has none".to_string(),
+            "process liveness needs a process-listing mechanism; none is available here"
+                .to_string(),
         );
-    }
-    let entries = match std::fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(e) => return Liveness::Unknowable(format!("/proc is unreadable: {e}")),
     };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == skip_pid {
+    for process in processes {
+        if process.pid == skip_pid {
             continue;
         }
-        // A vanished process between readdir and read is not evidence of
-        // anything; skip it. cmdline is NUL-separated argv.
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if cmdline_names_session(&cmdline, session_id) {
-            return Liveness::Alive(pid);
+        if cmdline_names_session(&process.argv, session_id) {
+            return Liveness::Alive(process.pid);
         }
     }
     Liveness::Dead
@@ -791,7 +832,10 @@ impl ClaudeBackend {
             Err(e) => {
                 return ProbeOutcome {
                     available: false,
-                    detail: format!("capability probe: cannot run {exe:?} --version: {e}"),
+                    detail: format!(
+                        "capability probe: cannot run {exe:?} --version: {e} (kind: {:?})",
+                        e.kind()
+                    ),
                     version: None,
                 };
             }
@@ -831,7 +875,10 @@ impl ClaudeBackend {
             Err(e) => {
                 return ProbeOutcome {
                     available: false,
-                    detail: format!("capability probe: cannot run {exe:?} --help: {e}"),
+                    detail: format!(
+                        "capability probe: cannot run {exe:?} --help: {e} (kind: {:?})",
+                        e.kind()
+                    ),
                     version: Some(canonical_version),
                 };
             }
@@ -1585,9 +1632,17 @@ impl Backend for ClaudeBackend {
                 },
             );
         }
-        // §12: procedure is data — intent plus the stage's CONTEXT.md,
-        // verbatim, uninterpreted.
-        let prompt = format!("{}\n\n{}", request.intent, request.context);
+        // ADR 0007(a) precedes both: sergeant's own execution-model and
+        // environment-guarantee statements, not stage content, so neither is
+        // ever subject to §12's "verbatim, uninterpreted" rule the way
+        // intent and CONTEXT.md are. §12 itself: procedure is data — intent
+        // plus the stage's CONTEXT.md, verbatim, uninterpreted. The two
+        // contracts are composed together, in this fixed order, so a test
+        // can pin that adding one never overwrites the other.
+        let prompt = format!(
+            "{EXECUTION_MODEL_CONTRACT}\n\n{ENVIRONMENT_CONTRACT}\n\n{}\n\n{}",
+            request.intent, request.context
+        );
         if let Err(e) = self.spawn_turn(&request.execution_id, prompt) {
             // A failed launch must not leave a phantom execution that
             // OBSERVE would misread as an interrupted-but-resumable turn.
@@ -2596,7 +2651,7 @@ mod tests {
     #[test]
     fn liveness_matches_turn_argv_and_not_a_quoted_session_id() {
         let session = "11111111-2222-4333-8444-555555555555";
-        let argv = |args: &[&str]| args.join("\0").into_bytes();
+        let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
 
         for turn in [
             argv(&[
@@ -2614,8 +2669,7 @@ mod tests {
         ] {
             assert!(
                 cmdline_names_session(&turn, session),
-                "a real turn's argv must match: {:?}",
-                String::from_utf8_lossy(&turn)
+                "a real turn's argv must match: {turn:?}"
             );
         }
 
@@ -2638,10 +2692,49 @@ mod tests {
         ] {
             assert!(
                 !cmdline_names_session(&bystander, session),
-                "a quoted id is not a running turn: {:?}",
-                String::from_utf8_lossy(&bystander)
+                "a quoted id is not a running turn: {bystander:?}"
             );
         }
+    }
+
+    /// [`session_liveness_among`]'s own decision logic, injected-probe
+    /// tested per ADR 0002 D3: the `None` arm is the fail-closed path a
+    /// platform with no process-listing mechanism takes, exercised here
+    /// without needing such a platform to run it on.
+    #[test]
+    fn session_liveness_among_is_unknowable_with_no_process_listing() {
+        assert_eq!(
+            session_liveness_among("s", 0, None),
+            Liveness::Unknowable(
+                "process liveness needs a process-listing mechanism; none is available here"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn session_liveness_among_skips_the_excluded_pid() {
+        use crate::platform::process::ProcessArgv;
+        let session = "11111111-2222-4333-8444-555555555555";
+        let turn = ProcessArgv {
+            pid: 42,
+            argv: vec![
+                "claude".to_string(),
+                "-p".to_string(),
+                "--session-id".to_string(),
+                session.to_string(),
+            ],
+        };
+        assert_eq!(
+            session_liveness_among(session, 42, Some(vec![turn.clone()])),
+            Liveness::Dead,
+            "the excluded pid is not evidence about anyone else"
+        );
+        assert_eq!(
+            session_liveness_among(session, 0, Some(vec![turn])),
+            Liveness::Alive(42),
+            "an unexcluded pid whose argv matches is evidence of life"
+        );
     }
 
     /// `truncate` cuts on character boundaries. The inputs are CLI stderr and
@@ -2967,6 +3060,49 @@ mod tests {
         assert_eq!(latest_ask_withdrawal_version(noise).unwrap(), None);
     }
 
+    /// #83, direct proof rather than a re-run-until-it-flakes gamble:
+    /// manufactures the exact condition `execve(2)` refuses with `ETXTBSY`
+    /// — a second fd open for writing on the same inode — and confirms
+    /// `wait_until_executable` retries through it instead of surfacing the
+    /// exec failure as if the file were simply unrunnable. Deterministic,
+    /// not load-dependent: the writer fd stays open for 150ms, so a single
+    /// attempt made at t=0 (i.e. no retry loop) always lands inside the
+    /// busy window and this test would fail every time the fix is
+    /// reverted, not just some fraction of runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_manufactured_etxtbsy_window_is_absorbed_not_surfaced_as_missing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let script = dir.path().join("busy-script");
+        std::fs::write(&script, "#!/bin/sh\necho ok\n").expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+
+        // A second fd open for writing on `script` is exactly what
+        // `execve(2)` refuses — this is the manufactured busy window, held
+        // open on another thread so `wait_until_executable` below observes
+        // it on its very first attempt.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("open second writer fd");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(writer);
+        });
+
+        let start = std::time::Instant::now();
+        crate::test_support::wait_until_executable(&script);
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(100),
+            "wait_until_executable returned before the manufactured busy \
+             window closed — it did not actually retry through ETXTBSY, it \
+             got lucky (or the busy window was never real)"
+        );
+        closer.join().expect("writer-closing thread");
+    }
+
     /// MVP-2 D2 item 2: the durability half. A record for the version this
     /// probe measures *right now* lowers the claim; a record for any other
     /// version (a CLI upgrade or downgrade since it was journaled) leaves
@@ -2995,13 +3131,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod +x");
+            crate::test_support::wait_until_executable(&script);
         }
         config.executable = script;
         let backend = ClaudeBackend::new(config);
         assert_eq!(
             backend.probe_outcome().version.as_deref(),
             Some("2.1.226"),
-            "stand-in must parse as the version the test reasons about"
+            "stand-in must parse as the version the test reasons about (probe detail: {})",
+            backend.probe_outcome().detail
         );
 
         // A different version's withdrawal: stale, does not apply.

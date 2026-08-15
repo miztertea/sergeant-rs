@@ -1255,7 +1255,7 @@ pub struct DiskPressureReport {
 pub fn measure_disk_pressure(data_dir: &Path) -> DiskPressureReport {
     let data_dir_bytes = dir_size(data_dir);
     let blob_bytes = dir_size(&data_dir.join("blobs"));
-    let free_bytes = free_space(data_dir);
+    let free_bytes = crate::platform::disk::free_space(data_dir);
     DiskPressureReport {
         data_dir_bytes,
         blob_bytes,
@@ -1282,32 +1282,6 @@ fn dir_size(path: &Path) -> u64 {
         }
     }
     total
-}
-
-#[cfg(unix)]
-fn free_space(path: &Path) -> Option<u64> {
-    // `statvfs` is the portable POSIX call for this; sergeant is Linux-first
-    // (`docs/DEVELOPMENT.md`) and this crate otherwise reaches such facts through
-    // `std`, so a `df`-equivalent shell-out is used instead of adding a
-    // libc-binding dependency for one syscall — the same "smaller direct
-    // client" posture the module docs already take for Docker itself. `df`
-    // is present on every measured environment (`docs/environments/`).
-    let output = Command::new("df")
-        .args(["-k", "--output=avail"])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let last_line = text.lines().last()?.trim();
-    last_line.parse::<u64>().ok().map(|kb| kb * 1024)
-}
-
-#[cfg(not(unix))]
-fn free_space(_path: &Path) -> Option<u64> {
-    None
 }
 
 /// Build a doctor report: the cheap probe, the lifecycle round trip when the
@@ -1445,6 +1419,11 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .expect("chmod +x scripted docker_bin");
+        // A file another process still holds open for writing cannot be
+        // exec'd; absorb the ETXTBSY window before handing it to the
+        // backend (#83 — measured under `cargo test --lib`'s default thread
+        // parallelism: 3 failures in 40 runs, every one `os error 26`).
+        crate::test_support::wait_until_executable(&script_path);
         config.docker_bin = script_path.to_string_lossy().to_string();
         let backend = DockerBackend::new(config).expect("backend");
 

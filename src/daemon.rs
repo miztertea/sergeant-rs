@@ -926,15 +926,11 @@ pub fn read_descriptor(data_dir: &Path) -> Result<Option<RuntimeDescriptor>, Dae
     Ok(Some(descriptor))
 }
 
-/// Whether a PID currently names a live process (Linux: `/proc/<pid>`;
-/// elsewhere this is unknowable without more machinery, so report alive —
-/// the fail-closed direction for spawn decisions).
+/// Whether a PID currently names a live process. Platform fact — see
+/// [`crate::platform::process::process_alive`] (#18) for the per-platform
+/// mechanism and its fail-closed posture elsewhere.
 pub fn pid_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        Path::new(&format!("/proc/{pid}")).exists()
-    } else {
-        true
-    }
+    crate::platform::process::process_alive(pid)
 }
 
 /// Convenience: the descriptor path for a data dir.

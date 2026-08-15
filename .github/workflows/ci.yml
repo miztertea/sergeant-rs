@@ -1,5 +1,10 @@
 name: CI
 
+# ADR 0004 (D9): this is the cheap per-push tier — Linux fmt/clippy/test plus
+# a macOS lane, run on every push so wall-clock stays low (matrix jobs run
+# concurrently, so cost is max(job) not sum(job)). The full real-suite matrix
+# across all measured targets (ADR 0001 D1) runs only on PR-to-main, nightly,
+# and release — see matrix.yml.
 on:
   # `on: [push, pull_request]` ran this battery twice for every push to a PR
   # branch — same commit, same result, twice the wait. Pushes are checked on
@@ -31,3 +36,46 @@ jobs:
 
       - name: cargo test
         run: cargo test
+
+  shellcheck:
+    # ADR 0004 (D7): hygiene, not a version gate — shellcheck has no bash-3.2
+    # target mode, so it cannot enforce the scripts/ floor. The macos-check
+    # job below only runs `cargo check` (type-check, no test execution), so
+    # it does NOT exercise scripts/demo.sh; the real enforcement of the
+    # bash-3.2 floor is matrix.yml's full-suite `cargo test` on macos-latest
+    # (via tests/m6_surfaces.rs t4's scripts/demo.sh subprocess), which runs
+    # on PR-to-main, nightly, and release — not on every push. Gated at
+    # --severity=error only: a 2026-08-14 sweep of all 25 scripts/**/*.sh
+    # found the tree clean at that threshold but carrying ~84 pre-existing
+    # warning/note/style findings (mostly SC2154 false positives from the
+    # perf harness's `perf_mark VAR` return-by-name convention, plus SC2034
+    # on intentionally-external vars). Triaging those individually is out of
+    # scope here; this still gives every future change a real,
+    # currently-clean gate against actual shell bugs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck (errors only — see comment above for the warning backlog)
+        run: find scripts -name '*.sh' -print0 | xargs -0 shellcheck --severity=error
+
+  macos-check:
+    # ADR 0004 (D9) / ADR 0002 (D2): the macOS module is `#[cfg]`-selected and
+    # not compiled at all on Linux, so breaking it is invisible locally — this
+    # is the compensating lane, run per push. `cargo check` on an actual
+    # macos-latest runner rather than a literal Linux->macOS cross-compile:
+    # the `duckdb` dependency's `bundled` feature compiles DuckDB's C++ from
+    # source via its own build script, which needs a real Apple toolchain
+    # (cross-compiling that from Linux needs an osxcross-style Apple SDK
+    # extraction that hosted runners don't carry). Since this repo is public,
+    # a real macos-latest runner is free and unmetered (ADR 0004 D9), so it's
+    # both cheaper and more faithful than fighting a cross C++ toolchain.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --all-targets

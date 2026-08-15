@@ -118,6 +118,55 @@ fn force_remove(name: &str) {
     let _ = Command::new("docker").args(["rm", "-f", name]).output();
 }
 
+/// A per-test-*run*-unique execution id built from a human-readable base
+/// (#91). `DockerBackend::container_name` derives the container name
+/// deterministically from `execution_id` (`sgt-<execution_id>`) — that
+/// determinism is itself under contract
+/// (`container_name_is_deterministic_from_execution_id` in
+/// `src/backend/docker.rs`) and must not change, since resume/retry rely on
+/// it (§16.10). So this fixes the name collision on the *test* side instead:
+/// mixing a fresh ULID into every fixture's execution id makes the resulting
+/// container name unique to this run, so a container leaked by an
+/// interrupted prior run — or one a concurrent suite run on the same host is
+/// using right now — can never collide with this run's name again.
+fn unique_id(base: &str) -> String {
+    format!("{base}-{}", ulid::Ulid::generate())
+}
+
+/// Failure-proof belt-and-suspenders cleanup for fixture containers (#91).
+///
+/// Every test also asserts cleanup explicitly via [`assert_containers_gone`]
+/// right after its own `stop()`/`wait()` — that assertion is what actually
+/// pins the no-leak contract, and stays exactly as strict as before. This
+/// guard is the other half: its `Drop` runs during unwinding too (Rust runs
+/// `Drop` while a panic unwinds the stack), so a fixture that panics
+/// *before* reaching `stop()` — as every test in this file's assertions can
+/// — still gets its container force-removed instead of leaking it forever.
+/// Construct it as soon as a container's name is known and before anything
+/// that can panic; on the happy path its `Drop` only fires after the
+/// function's own `assert_containers_gone` call already ran (locals drop at
+/// the end of their scope, after the statements that precede them), so it
+/// never weakens that check into a no-op.
+struct ContainerGuard(Vec<String>);
+
+impl ContainerGuard {
+    fn new<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self(names.into_iter().map(Into::into).collect())
+    }
+}
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        for name in &self.0 {
+            force_remove(name);
+        }
+    }
+}
+
 fn backend(data_dir: &Path) -> DockerBackend {
     DockerBackend::new(DockerConfig::new(data_dir)).expect("docker backend")
 }
@@ -168,7 +217,8 @@ fn exit_zero_completes_and_nonzero_fails_with_captured_evidence() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
-    for (execution_id, command, expect_completed, expect_exit) in [
+    let mut names = Vec::new();
+    for (base_id, command, expect_completed, expect_exit) in [
         (
             "m7-exit0",
             vec!["sh", "-c", "echo this text must never be read; exit 0"],
@@ -205,9 +255,14 @@ fn exit_zero_completes_and_nonzero_fails_with_captured_evidence() {
             3,
         ),
     ] {
+        let execution_id = unique_id(base_id);
+        let name = format!("sgt-{execution_id}");
+        let _guard = ContainerGuard::new([name.clone()]);
+        names.push(name);
+
         let req = request(
             "w1",
-            execution_id,
+            &execution_id,
             cwd.path(),
             spec(command, WorkspaceAccess::ReadOnly),
         );
@@ -234,12 +289,8 @@ fn exit_zero_completes_and_nonzero_fails_with_captured_evidence() {
         }
         backend.stop(&handle).expect("stop").wait();
     }
-    assert_containers_gone(&[
-        "sgt-m7-exit0",
-        "sgt-m7-exit1",
-        "sgt-m7-exit-adversarial-ok",
-        "sgt-m7-exit-adversarial-fail",
-    ]);
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert_containers_gone(&name_refs);
 }
 
 // -------------------------------------------------------- 2. mount contract
@@ -255,9 +306,12 @@ fn workspace_access_governs_writes_both_ways() {
     let backend = backend(data.path());
 
     // Read-only: the write must fail inside the container.
+    let ro_execution_id = unique_id("m7-ro");
+    let ro_name = format!("sgt-{ro_execution_id}");
+    let _ro_guard = ContainerGuard::new([ro_name.clone()]);
     let ro_req = request(
         "w2",
-        "m7-ro",
+        &ro_execution_id,
         cwd.path(),
         spec(
             vec!["sh", "-c", "echo nope > /workspace/should-not-exist"],
@@ -280,9 +334,12 @@ fn workspace_access_governs_writes_both_ways() {
     );
 
     // Read-write: the write succeeds and lands on the host.
+    let rw_execution_id = unique_id("m7-rw");
+    let rw_name = format!("sgt-{rw_execution_id}");
+    let _rw_guard = ContainerGuard::new([rw_name.clone()]);
     let rw_req = request(
         "w2",
-        "m7-rw",
+        &rw_execution_id,
         cwd.path(),
         spec(
             vec!["sh", "-c", "echo yes > /workspace/should-exist"],
@@ -301,7 +358,7 @@ fn workspace_access_governs_writes_both_ways() {
     let written = std::fs::read_to_string(cwd.path().join("should-exist")).expect("host file");
     assert_eq!(written.trim(), "yes");
 
-    assert_containers_gone(&["sgt-m7-ro", "sgt-m7-rw"]);
+    assert_containers_gone(&[&ro_name, &rw_name]);
 }
 
 /// §22.7 test 6 (INV-R1-07's named coverage gap, MVP-2 D3 fixer pass): the
@@ -320,9 +377,12 @@ fn a_launched_container_carries_no_isolation_escape_hatches() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
+    let execution_id = unique_id("m7-isolation");
+    let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     let req = request(
         "w2c",
-        "m7-isolation",
+        &execution_id,
         cwd.path(),
         spec(vec!["sleep", "60"], WorkspaceAccess::ReadOnly),
     );
@@ -330,7 +390,7 @@ fn a_launched_container_carries_no_isolation_escape_hatches() {
     let handle = launch(&backend, &prepared);
 
     let output = Command::new("docker")
-        .args(["inspect", "sgt-m7-isolation"])
+        .args(["inspect", &name])
         .output()
         .expect("docker inspect");
     assert!(output.status.success());
@@ -369,7 +429,7 @@ fn a_launched_container_carries_no_isolation_escape_hatches() {
     backend.interrupt(&handle).expect("interrupt").wait();
     let _ = wait_for_exit(&backend, &handle);
     backend.stop(&handle).expect("stop").wait();
-    assert_containers_gone(&["sgt-m7-isolation"]);
+    assert_containers_gone(&[&name]);
 }
 
 /// §22.7 test 2 (INV-R1-07's named coverage gap, MVP-2 D3 fixer pass): a
@@ -387,9 +447,12 @@ fn a_mount_path_containing_a_space_round_trips_correctly() {
     std::fs::create_dir_all(&cwd).expect("mkdir with a space");
     let backend = backend(data.path());
 
+    let execution_id = unique_id("m7-space");
+    let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     let req = request(
         "w2b",
-        "m7-space",
+        &execution_id,
         &cwd,
         spec(
             vec!["sh", "-c", "echo yes > /workspace/should-exist"],
@@ -408,7 +471,7 @@ fn a_mount_path_containing_a_space_round_trips_correctly() {
     backend.stop(&handle).expect("stop").wait();
     let written = std::fs::read_to_string(cwd.join("should-exist")).expect("host file");
     assert_eq!(written.trim(), "yes");
-    assert_containers_gone(&["sgt-m7-space"]);
+    assert_containers_gone(&[&name]);
 }
 
 // ------------------------------------------------------------- 3. isolation
@@ -453,9 +516,12 @@ fn network_none_has_no_usable_external_path() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
+    let execution_id = unique_id("m7-net");
+    let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     let req = request(
         "w3",
-        "m7-net",
+        &execution_id,
         cwd.path(),
         spec(
             vec![
@@ -478,7 +544,7 @@ fn network_none_has_no_usable_external_path() {
         observation.signal
     );
     backend.stop(&handle).expect("stop").wait();
-    assert_containers_gone(&["sgt-m7-net"]);
+    assert_containers_gone(&[&name]);
 }
 
 // ------------------------------------------------- 4. identity + collisions
@@ -491,8 +557,9 @@ fn a_name_collision_with_mismatched_labels_fails_closed() {
     let data = support::DataDir::new();
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
-    let execution_id = "m7-collide";
+    let execution_id = unique_id("m7-collide");
     let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
 
     // Pre-occupy the deterministic name with an unrelated, unlabeled
     // container.
@@ -505,7 +572,7 @@ fn a_name_collision_with_mismatched_labels_fails_closed() {
 
     let req = request(
         "w4",
-        execution_id,
+        &execution_id,
         cwd.path(),
         spec(vec!["true"], WorkspaceAccess::ReadOnly),
     );
@@ -516,7 +583,7 @@ fn a_name_collision_with_mismatched_labels_fails_closed() {
     assert!(matches!(err, BackendError::Failed { .. }));
 
     force_remove(&name);
-    assert_containers_gone(&["sgt-m7-collide"]);
+    assert_containers_gone(&[&name]);
 }
 
 /// §16.11's recovery matrix, the shape this adapter's `resume` can prove
@@ -528,9 +595,12 @@ fn resume_on_a_missing_container_fails_closed_as_unknown_execution() {
     let data = support::DataDir::new();
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
+    let execution_id = unique_id("m7-vanished");
+    let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     let req = request(
         "w5",
-        "m7-vanished",
+        &execution_id,
         cwd.path(),
         spec(vec!["true"], WorkspaceAccess::ReadOnly),
     );
@@ -546,7 +616,7 @@ fn resume_on_a_missing_container_fails_closed_as_unknown_execution() {
         .resume(&handle, &resume_request)
         .expect_err("a missing container must not be adopted or fabricated");
     assert!(matches!(err, BackendError::UnknownExecution { .. }));
-    assert_containers_gone(&["sgt-m7-vanished"]);
+    assert_containers_gone(&[&name]);
 }
 
 /// COMPOSITION PROBE C2 survivor (m7 fixer panel): §16.10's identity check
@@ -561,8 +631,9 @@ fn resume_on_a_missing_container_fails_closed_as_unknown_execution() {
 #[test]
 fn observe_on_a_foreign_container_under_the_deterministic_name_fails_closed() {
     require_docker!();
-    let execution_id = "m7-observe-collide";
+    let execution_id = unique_id("m7-observe-collide");
     let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     force_remove(&name);
     let status = Command::new("docker")
         .args(["create", "--name", &name, PROBE_IMAGE, "true"])
@@ -599,9 +670,12 @@ fn resume_adopts_a_live_labeled_container_and_refuses_a_foreign_one() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
+    let live_execution_id = unique_id("m7-resume-live");
+    let live_name = format!("sgt-{live_execution_id}");
+    let _live_guard = ContainerGuard::new([live_name.clone()]);
     let req = request(
         "w4c",
-        "m7-resume-live",
+        &live_execution_id,
         cwd.path(),
         spec(vec!["sleep", "60"], WorkspaceAccess::ReadOnly),
     );
@@ -620,11 +694,12 @@ fn resume_adopts_a_live_labeled_container_and_refuses_a_foreign_one() {
     backend.interrupt(&handle).expect("interrupt").wait();
     let _ = wait_for_exit(&backend, &handle);
     backend.stop(&handle).expect("stop").wait();
-    assert_containers_gone(&["sgt-m7-resume-live"]);
+    assert_containers_gone(&[&live_name]);
 
     // The refusal row: a foreign container under the deterministic name.
-    let execution_id = "m7-resume-foreign";
+    let execution_id = unique_id("m7-resume-foreign");
     let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     force_remove(&name);
     let status = Command::new("docker")
         .args(["create", "--name", &name, PROBE_IMAGE, "true"])
@@ -661,9 +736,12 @@ fn stop_defers_the_actual_removal_until_the_completion_is_waited_on() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
+    let execution_id = unique_id("m7-deferred-stop");
+    let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     let req = request(
         "w4b",
-        "m7-deferred-stop",
+        &execution_id,
         cwd.path(),
         spec(vec!["true"], WorkspaceAccess::ReadOnly),
     );
@@ -675,7 +753,7 @@ fn stop_defers_the_actual_removal_until_the_completion_is_waited_on() {
     // The container must still be there: `stop()` returning is not the
     // same event as the container being removed.
     let still_there = Command::new("docker")
-        .args(["inspect", "sgt-m7-deferred-stop"])
+        .args(["inspect", &name])
         .output()
         .expect("docker inspect");
     assert!(
@@ -684,7 +762,7 @@ fn stop_defers_the_actual_removal_until_the_completion_is_waited_on() {
     );
 
     completion.wait();
-    assert_containers_gone(&["sgt-m7-deferred-stop"]);
+    assert_containers_gone(&[&name]);
 }
 
 // --------------------------------------------------------- 5. cancellation
@@ -698,18 +776,24 @@ fn interrupt_stops_only_the_named_container() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
+    let long_execution_id = unique_id("m7-cancel-me");
+    let long_name = format!("sgt-{long_execution_id}");
+    let _long_guard = ContainerGuard::new([long_name.clone()]);
     let long = request(
         "w6",
-        "m7-cancel-me",
+        &long_execution_id,
         cwd.path(),
         spec(vec!["sleep", "300"], WorkspaceAccess::ReadOnly),
     );
     let long_prepared = backend.prepare(&long).expect("prepare");
     let long_handle = launch(&backend, &long_prepared);
 
+    let bystander_execution_id = unique_id("m7-bystander");
+    let bystander_name = format!("sgt-{bystander_execution_id}");
+    let _bystander_guard = ContainerGuard::new([bystander_name.clone()]);
     let bystander = request(
         "w6",
-        "m7-bystander",
+        &bystander_execution_id,
         cwd.path(),
         spec(vec!["sleep", "300"], WorkspaceAccess::ReadOnly),
     );
@@ -739,7 +823,7 @@ fn interrupt_stops_only_the_named_container() {
         .wait();
     let _ = wait_for_exit(&backend, &bystander_handle);
     backend.stop(&bystander_handle).expect("stop").wait();
-    assert_containers_gone(&["sgt-m7-cancel-me", "sgt-m7-bystander"]);
+    assert_containers_gone(&[&long_name, &bystander_name]);
 }
 
 // -------------------------------------------------------- 6. image pinning
@@ -756,9 +840,12 @@ fn retry_uses_the_pinned_image_identity_not_a_fresh_resolution() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
+    let first_execution_id = unique_id("m7-pin-1");
+    let first_name = format!("sgt-{first_execution_id}");
+    let _first_guard = ContainerGuard::new([first_name.clone()]);
     let first = request(
         "w7",
-        "m7-pin-1",
+        &first_execution_id,
         cwd.path(),
         spec(vec!["true"], WorkspaceAccess::ReadOnly),
     );
@@ -777,7 +864,10 @@ fn retry_uses_the_pinned_image_identity_not_a_fresh_resolution() {
     // authored image that cannot resolve on its own.
     let mut bogus_spec = spec(vec!["true"], WorkspaceAccess::ReadOnly);
     bogus_spec.image = "sergeant-test/this-image-does-not-exist:nope".to_string();
-    let retry = request("w7", "m7-pin-2", cwd.path(), bogus_spec);
+    let retry_execution_id = unique_id("m7-pin-2");
+    let retry_name = format!("sgt-{retry_execution_id}");
+    let _retry_guard = ContainerGuard::new([retry_name.clone()]);
+    let retry = request("w7", &retry_execution_id, cwd.path(), bogus_spec);
     let prepared = backend.prepare(&retry).expect("prepare");
     let handle = launch(&backend, &prepared);
     let observation = wait_for_exit(&backend, &handle);
@@ -788,7 +878,7 @@ fn retry_uses_the_pinned_image_identity_not_a_fresh_resolution() {
         observation.signal
     );
     backend.stop(&handle).expect("stop").wait();
-    assert_containers_gone(&["sgt-m7-pin-1", "sgt-m7-pin-2"]);
+    assert_containers_gone(&[&first_name, &retry_name]);
 }
 
 // -------------------------------------------- 7. §22.8 large-output budget
@@ -817,9 +907,12 @@ fn large_captured_output_does_not_grow_this_process_proportionally() {
         let backend = backend(data.path());
 
         const BYTES: u64 = 256 * 1024 * 1024;
+        let execution_id = unique_id("m7-large-output");
+        let name = format!("sgt-{execution_id}");
+        let _guard = ContainerGuard::new([name.clone()]);
         let req = request(
             "w8",
-            "m7-large-output",
+            &execution_id,
             cwd.path(),
             spec(
                 vec![
@@ -886,7 +979,7 @@ fn large_captured_output_does_not_grow_this_process_proportionally() {
         );
 
         backend.stop(&handle).expect("stop").wait();
-        assert_containers_gone(&["sgt-m7-large-output"]);
+        assert_containers_gone(&[&name]);
 
         let increment_kb = after.saturating_sub(before);
         const BUDGET_KB: u64 = 64 * 1024; // §22.8's 64 MiB
@@ -967,9 +1060,12 @@ fn container_written_files_and_directories_are_owned_by_the_host_worktree_owner(
         let host_uid = std::fs::metadata(cwd.path()).expect("stat cwd").uid();
         let host_gid = std::fs::metadata(cwd.path()).expect("stat cwd").gid();
 
+        let execution_id = unique_id("m7-ownership");
+        let name = format!("sgt-{execution_id}");
+        let _guard = ContainerGuard::new([name.clone()]);
         let req = request(
             "w7b",
-            "m7-ownership",
+            &execution_id,
             cwd.path(),
             spec(
                 vec![
@@ -991,7 +1087,7 @@ fn container_written_files_and_directories_are_owned_by_the_host_worktree_owner(
             observation.signal
         );
         backend.stop(&handle).expect("stop").wait();
-        assert_containers_gone(&["sgt-m7-ownership"]);
+        assert_containers_gone(&[&name]);
 
         let file_meta = std::fs::metadata(cwd.path().join("owned-file.txt")).expect("file meta");
         assert_eq!(
@@ -1127,9 +1223,12 @@ fn observe_liveness_answers_without_writing_a_blob_and_observe_still_does() {
     let cwd = TempDir::new().expect("cwd");
     let backend = backend(data.path());
 
+    let execution_id = unique_id("m7-liveness-only");
+    let name = format!("sgt-{execution_id}");
+    let _guard = ContainerGuard::new([name.clone()]);
     let req = request(
         "w7d",
-        "m7-liveness-only",
+        &execution_id,
         cwd.path(),
         spec(
             vec!["sh", "-c", "echo some captured evidence; exit 0"],
@@ -1191,7 +1290,7 @@ fn observe_liveness_answers_without_writing_a_blob_and_observe_still_does() {
     );
 
     backend.stop(&handle).expect("stop").wait();
-    assert_containers_gone(&["sgt-m7-liveness-only"]);
+    assert_containers_gone(&[&name]);
 }
 
 fn walkdir_count(dir: &Path) -> usize {
@@ -1327,7 +1426,17 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
             .json()
             .await
             .expect("json");
-        if polled["work"]["state"] == "completed" || polled["work"]["state"] == "blocked" {
+        // ADR 0007(b): this test's "20-close" stage is a bare fake actor
+        // that signals completion without ever running `git commit` — it
+        // exists to prove the execute stage's artifact reaches a following
+        // actor through the worktree, not to exercise a real closing
+        // stage's commit procedure. So the branch never advances and the
+        // container's `validated.txt` is left dirty, and the honest label
+        // for that is `completed_dirty`, not plain `completed`.
+        if polled["work"]["state"] == "completed"
+            || polled["work"]["state"] == "completed_dirty"
+            || polled["work"]["state"] == "blocked"
+        {
             last = polled;
             break;
         }
@@ -1339,8 +1448,10 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
     }
 
     assert_eq!(
-        last["work"]["state"], "completed",
-        "the mixed workflow must complete end to end: {last}"
+        last["work"]["state"], "completed_dirty",
+        "the mixed workflow completes end to end, but its stub closing stage \
+         never commits the execute stage's artifact, so it must not be \
+         reported as plain success (ADR 0007(b)): {last}"
     );
 
     // §12: sergeant never interprets the container's output — but the
