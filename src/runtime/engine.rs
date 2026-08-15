@@ -4987,6 +4987,7 @@ mod tests {
             } else {
                 BindingDisposition::RetainedDirty {
                     changes: "M solo/wip.rs".to_string(),
+                    patch: None,
                 }
             };
             TeardownReport {

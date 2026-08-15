@@ -355,6 +355,29 @@ enum WorkCommand {
         /// Work id whose conversation to decode.
         id: String,
     },
+    /// #109's inspect verb: every repository binding any terminal work's
+    /// teardown left something on disk for — a captured dirty-state patch,
+    /// or, in the submodule/capture-failure fallback, the whole worktree
+    /// directory — with why and how large. Read-only: never mutates daemon
+    /// state, and never destroys anything by itself. `sgt work reap`
+    /// disposes of what this names.
+    Retained,
+    /// #109's dispose verb: permanently discard a work's retained dirty
+    /// state (the captured patch, or — the submodule/capture-failure
+    /// fallback — the worktree directory itself). Never touches the
+    /// retained *branch*: teardown's branch-retention guarantee is
+    /// unconditional (§11) and this verb has no path that reaches it.
+    /// Refuses without `--yes`: instead of guessing intent, it prints
+    /// exactly what `--yes` would destroy (`sgt work retained`'s own view,
+    /// scoped to this work) and stops there.
+    Reap {
+        /// Work id whose retained dirty state to reap.
+        id: String,
+        /// Actually perform the deletion. Without it, this only previews
+        /// what would be destroyed.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// CLI error: a message for stderr and a nonzero exit.
@@ -677,6 +700,49 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Work {
+            command: WorkCommand::Reap { id, yes },
+        } => {
+            // #109's dispose verb mutates durable state (it deletes retained
+            // artifacts and journals the outcome), so it joins
+            // `cancel`/`retry`/`extend`'s bucket rather than the read-only
+            // `work list`/`show`/`transcript`/`retained` one.
+            let client = ensure_daemon(&data_dir).await?;
+            if !yes {
+                let retained = client.retained().await?;
+                let mine: Vec<&Value> = retained["retained"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| r["work_id"].as_str() == Some(id.as_str()))
+                    .collect();
+                if sgt.json {
+                    print_json(&json!({"would_reap": mine}));
+                } else if mine.is_empty() {
+                    println!("nothing retained for {id}");
+                } else {
+                    println!("--yes would permanently discard:");
+                    for r in &mine {
+                        println!(
+                            "  {}  {}  {}  {}",
+                            r["repository"].as_str().unwrap_or("?"),
+                            r["disposition"].as_str().unwrap_or("?"),
+                            doctor::human_bytes(r["bytes"].as_u64().unwrap_or(0)),
+                            r["path"].as_str().unwrap_or("?"),
+                        );
+                    }
+                    println!("re-run with --yes to actually reap this");
+                }
+                return Ok(());
+            }
+            let result = client.reap(&id, true).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_reap_report(&result);
+            }
+            Ok(())
+        }
         Command::Work { command } => {
             let client = observe_connect(&data_dir).await?;
             match command {
@@ -765,6 +831,18 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     }
                     Ok(())
                 }
+                WorkCommand::Retained => {
+                    let result = client.retained().await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_retained(&result);
+                    }
+                    Ok(())
+                }
+                // Handled by the dedicated `ensure_daemon` arm above, since
+                // reap mutates durable state — never reachable here.
+                WorkCommand::Reap { .. } => unreachable!("reap is matched before this arm"),
             }
         }
         Command::Analytics { name } => {
@@ -1092,12 +1170,31 @@ fn print_graph(result: &Value) {
 /// its own journaled event) is called out, since it is lower-fidelity than
 /// the rest — never presented as if it were an ordinary completed turn.
 fn print_transcript(result: &Value) {
+    print!("{}", render_transcript(result));
+}
+
+/// #96: the journal timestamps every conversation event
+/// (`transcript_turns`'s `"ts"` field, read straight off `event.timestamp`);
+/// the human rendering used to drop it, so an operator reading assistant text
+/// with no wall-clock anchor mistook "recent-looking" for "recent" and missed
+/// a turn that had already been ceiling-interrupted two minutes earlier (#90).
+///
+/// Prints the RFC3339 timestamp the journal already carries, verbatim — no
+/// elapsed-time arithmetic against "now": that would be *deriving* a fact
+/// this surface has no business computing, not reading one the journal
+/// already recorded. `--json` (`transcript_turns`) already carries the same
+/// field per entry, so only this rendering needed the fix.
+///
+/// Factored out from `print_transcript` (matching `watch::render_human`'s
+/// split) so the rendering is a pure function a test can pin without a
+/// daemon.
+fn render_transcript(result: &Value) -> String {
     let empty = Vec::new();
     let turns = result["turns"].as_array().unwrap_or(&empty);
     if turns.is_empty() {
-        println!("no conversation recorded for this work");
-        return;
+        return "no conversation recorded for this work\n".to_string();
     }
+    let mut out = String::new();
     for turn in turns {
         let label = match turn["role"].as_str().unwrap_or("?") {
             "user" => "User",
@@ -1110,9 +1207,70 @@ fn print_transcript(result: &Value) {
         } else {
             ""
         };
-        println!("{label}{recovered}:");
-        println!("{}", turn["text"].as_str().unwrap_or(""));
-        println!();
+        let ts = turn["ts"].as_str().unwrap_or("?");
+        out.push_str(&format!("[{ts}] {label}{recovered}:\n"));
+        out.push_str(turn["text"].as_str().unwrap_or(""));
+        out.push_str("\n\n");
+    }
+    out
+}
+
+/// #109's inspect verb (`GET /v1/retained`, `sgt work retained`): every
+/// repository binding some terminal work's teardown left something on disk
+/// for, with a running total so "how much disk is this actually costing me"
+/// is answerable at a glance — the question #109 itself was filed over.
+fn print_retained(result: &Value) {
+    let empty = Vec::new();
+    let entries = result["retained"].as_array().unwrap_or(&empty);
+    if entries.is_empty() {
+        println!("nothing retained");
+        return;
+    }
+    let mut total = 0u64;
+    for entry in entries {
+        let bytes = entry["bytes"].as_u64().unwrap_or(0);
+        total += bytes;
+        println!(
+            "{}  {}  {}  {}  {}",
+            entry["work_id"].as_str().unwrap_or("?"),
+            entry["repository"].as_str().unwrap_or("?"),
+            entry["disposition"].as_str().unwrap_or("?"),
+            doctor::human_bytes(bytes),
+            entry["path"].as_str().unwrap_or("?"),
+        );
+    }
+    println!("total: {}", doctor::human_bytes(total));
+}
+
+/// #109's dispose verb's own result (`POST /v1/work/{id}/reap`, `sgt work
+/// reap --yes`): what actually happened to each binding, not just that the
+/// call succeeded.
+fn print_reap_report(result: &Value) {
+    let empty = Vec::new();
+    let bindings = result["report"]["bindings"].as_array().unwrap_or(&empty);
+    if bindings.is_empty() {
+        println!("nothing to reap");
+        return;
+    }
+    for binding in bindings {
+        let outcome = &binding["outcome"];
+        let repository = binding["repository"].as_str().unwrap_or("?");
+        match outcome["outcome"].as_str() {
+            Some("reaped") => println!(
+                "{repository}: reaped {}",
+                doctor::human_bytes(outcome["bytes"].as_u64().unwrap_or(0)),
+            ),
+            Some("nothing_retained") => println!("{repository}: nothing retained"),
+            Some("skipped") => println!(
+                "{repository}: skipped — {}",
+                outcome["reason"].as_str().unwrap_or("?"),
+            ),
+            Some("failed") => println!(
+                "{repository}: failed — {}",
+                outcome["detail"].as_str().unwrap_or("?"),
+            ),
+            _ => println!("{repository}: {outcome}"),
+        }
     }
 }
 
@@ -2230,8 +2388,10 @@ mod doctor {
 
     /// Render a byte count the way an operator reading a terminal wants it,
     /// not the raw integer `disk_pressure_check`'s JSON already carries
-    /// losslessly.
-    fn human_bytes(bytes: u64) -> String {
+    /// losslessly. `pub(super)`: `sgt work retained`/`sgt work reap` (#109)
+    /// reuse this rather than a second byte formatter — one declaration,
+    /// one resolution.
+    pub(super) fn human_bytes(bytes: u64) -> String {
         const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
         let mut value = bytes as f64;
         let mut unit = 0;
@@ -2632,5 +2792,76 @@ mod doctor {
             assert_eq!(check.status, Status::Ok);
             assert!(check.remedy.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #96: a human-rendered transcript must show *when* each turn
+    /// happened, not just what it said — the exact gap that let a
+    /// ceiling-interrupted turn (#90) read as still in progress.
+    /// Reverting `render_transcript` to drop the `[{ts}]` prefix passes
+    /// every other assertion here and fails only this one.
+    #[test]
+    fn render_transcript_prints_each_turns_timestamp() {
+        let result = json!({
+            "turns": [
+                {
+                    "seq": 1,
+                    "ts": "2026-08-14T15:24:00.000Z",
+                    "role": "user",
+                    "text": "let's wait for both background runs to complete",
+                    "source": "event",
+                },
+                {
+                    "seq": 2,
+                    "ts": "2026-08-14T15:26:55.874Z",
+                    "role": "assistant",
+                    "text": "still waiting",
+                    "source": "event",
+                },
+            ],
+        });
+        let rendered = render_transcript(&result);
+        assert!(
+            rendered.contains("[2026-08-14T15:24:00.000Z] User:"),
+            "missing user timestamp: {rendered}"
+        );
+        assert!(
+            rendered.contains("[2026-08-14T15:26:55.874Z] Assistant:"),
+            "missing assistant timestamp: {rendered}"
+        );
+    }
+
+    /// A turn recovered from the interrupted raw archive still needs its
+    /// timestamp — that is the exact turn #90's transcript misdiagnosis
+    /// involved (a `blob_decode` entry from a ceiling-interrupted turn).
+    #[test]
+    fn render_transcript_timestamps_a_recovered_turn_too() {
+        let result = json!({
+            "turns": [{
+                "seq": 3,
+                "ts": "2026-08-14T15:26:55.874Z",
+                "role": "assistant",
+                "text": "partial output before the cut",
+                "source": "blob_decode",
+                "interrupted": true,
+            }],
+        });
+        let rendered = render_transcript(&result);
+        assert!(
+            rendered.contains(
+                "[2026-08-14T15:26:55.874Z] Assistant (recovered from the interrupted turn's raw archive):"
+            ),
+            "missing recovered-turn timestamp: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_transcript_reports_no_conversation_without_a_timestamp_line() {
+        let rendered = render_transcript(&json!({"turns": []}));
+        assert_eq!(rendered, "no conversation recorded for this work\n");
     }
 }

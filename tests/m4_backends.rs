@@ -3997,9 +3997,22 @@ fn a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept(
         "…with git's own evidence for why: {}",
         torn[0]["report"]
     );
+    // #109: recovery's sweep goes through the same `teardown` this
+    // repository's ordinary path does, so the dirty *state* survives as a
+    // captured patch, never the worktree directory it was found in.
     assert!(
-        worktree.join("half-done.txt").is_file(),
-        "recovery must never delete uncommitted work it found on disk"
+        !worktree.exists(),
+        "#109: the reclaimed worktree directory must be gone"
+    );
+    let patch_path = PathBuf::from(
+        torn[0]["report"]["bindings"][0]["patch"]["path"]
+            .as_str()
+            .expect("a captured patch path"),
+    );
+    let patch_text = std::fs::read_to_string(&patch_path).expect("read the captured patch");
+    assert!(
+        patch_text.contains("half-done.txt") && patch_text.contains("not committed anywhere"),
+        "recovery must never actually lose uncommitted work it found on disk: {patch_text}"
     );
     assert!(
         surface.root.is_dir(),
