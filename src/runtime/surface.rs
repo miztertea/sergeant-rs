@@ -746,8 +746,9 @@ pub struct RetainedBinding {
     /// Repository name.
     pub repository: String,
     /// Where the retained content actually lives: the patch file when
-    /// [`retain_dirty`] captured one, otherwise the worktree directory
-    /// itself (the submodule/capture-failure fallback, or a
+    /// [`retain_dirty`] captured one *and* removed the worktree, otherwise
+    /// the worktree directory itself (the submodule/capture-failure
+    /// fallback, a captured patch whose worktree removal then failed, or a
     /// `RetainedError`).
     pub path: PathBuf,
     /// `retained_dirty` or `retained_error` — the same bare-tag spelling
@@ -877,7 +878,8 @@ pub struct ReapReport {
 
 /// #109's dispose verb: permanently discard whatever `RetainedDirty`
 /// bindings still hold for this Work — the captured patch, or, in the
-/// submodule/capture-failure fallback, the worktree directory itself.
+/// submodule/capture-failure fallback (or a captured patch whose worktree
+/// removal then failed), the worktree directory itself.
 ///
 /// A deliberate, explicit, human-invoked action, never run on its own:
 /// `AGENTS.md`'s guardrail puts preserved state (a retained branch, a
@@ -2397,6 +2399,74 @@ mod tests {
             patch.bytes,
             patch_text.len() as u64,
             "the recorded size must match what was actually written"
+        );
+    }
+
+    /// no-mistakes review fix: if `retain_dirty` captures the patch but the
+    /// `git worktree remove --force` that follows fails, the worktree
+    /// directory is still on disk — reporting `patch: Some` in that case (the
+    /// pre-fix behavior) would make the directory invisible to
+    /// [`retained_bindings`]/`reap_binding`, which only look for it when
+    /// `patch` is `None`, leaking it permanently. `git worktree lock` makes
+    /// the removal fail deterministically, without needing root or a
+    /// filesystem-specific immutable bit.
+    #[test]
+    fn a_dirty_worktree_whose_removal_fails_falls_back_to_the_directory_not_a_leaked_patch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01LOCKED", std::slice::from_ref(&spec)).expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty");
+        // A single `--force` (what `retain_dirty` actually passes) refuses on
+        // a locked worktree — "use 'remove -f -f' to override" — so this
+        // reliably fails the removal after the patch capture already
+        // succeeded, without touching filesystem permissions.
+        git(
+            &spec.path,
+            &["worktree", "lock", &worktree.display().to_string()],
+        )
+        .expect("lock the worktree");
+
+        let report = teardown(&surface);
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert!(
+            patch.is_none(),
+            "a failed removal must fall back to patch: None, not report a patch over a \
+             directory that never actually went away: {patch:?}"
+        );
+        assert!(
+            worktree.exists(),
+            "the directory git refused to remove must still be there"
+        );
+
+        // The fix's whole point: `retained_bindings` must still find it, via
+        // the directory rather than a patch file that (best-effort) no
+        // longer exists.
+        let retained = retained_bindings(&report);
+        let entry = retained
+            .iter()
+            .find(|r| r.repository == "solo")
+            .unwrap_or_else(|| {
+                panic!("the locked binding must still be discoverable: {retained:?}")
+            });
+        assert_eq!(
+            entry.path, worktree,
+            "must point at the surviving directory"
+        );
+
+        // Cleanup: unlock so the tempdir's own teardown can remove it.
+        let _ = git(
+            &spec.path,
+            &["worktree", "unlock", &worktree.display().to_string()],
         );
     }
 

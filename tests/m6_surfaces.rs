@@ -510,12 +510,17 @@ fn t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy() {
 }
 
 /// ADR 0009's no-spawn set, on the rest of it: `status`, `work list`,
-/// `work show`, `work transcript`, and `analytics` all refuse rather than
+/// `work show`, `work transcript`, `work retained`, `work reap` (its
+/// unconfirmed preview only — the `--yes` disposal path still mutates and
+/// still belongs to `ensure_daemon`), and `analytics` all refuse rather than
 /// auto-spawn with no daemon running, and each names `sgt doctor` as the
 /// remedy — the same shape `t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy`
 /// pins for the TUI. A build that still routed any one of these through
 /// `ensure_daemon` (the pre-ADR-0009 behavior every one of them used to
-/// share) would exit 0 here and leave a daemon behind instead.
+/// share) would exit 0 here and leave a daemon behind instead. `work reap`
+/// specifically pins the no-mistakes review fix that had its unconfirmed
+/// preview path calling `ensure_daemon` — auto-spawning a daemon just to
+/// preview a disposal nothing asked to happen yet.
 #[test]
 fn t1_observation_verbs_refuse_without_a_daemon_and_name_the_remedy() {
     let data = DataDir::new();
@@ -524,6 +529,8 @@ fn t1_observation_verbs_refuse_without_a_daemon_and_name_the_remedy() {
         vec!["work", "list"],
         vec!["work", "show", "01SOMENONEXISTENTWORKID000"],
         vec!["work", "transcript", "01SOMENONEXISTENTWORKID000"],
+        vec!["work", "retained"],
+        vec!["work", "reap", "01SOMENONEXISTENTWORKID000"],
         vec!["analytics"],
     ] {
         let output = Command::new(SGT)

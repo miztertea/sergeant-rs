@@ -1503,8 +1503,10 @@ fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
 /// command in this file deliberately does not: **never call
 /// [`spawn_daemon`]**. Observation must not materialize the thing observed —
 /// fail-closed at both ends of the daemon's life, matching R-WATCH-3's own
-/// framing. Used by `watch`, `status`, `work show`/`list`/`transcript`,
-/// `analytics`, and `tui` — every verb ADR 0009 moved into the no-spawn set.
+/// framing. Used by `watch`, `status`, `work show`/`list`/`transcript`/
+/// `retained`, `work reap`'s unconfirmed preview (its `--yes` disposal path
+/// still mutates and still goes through [`ensure_daemon`]), `analytics`,
+/// and `tui` — every verb ADR 0009 moved into the no-spawn set.
 ///
 /// 1. A healthy descriptor → attach, exactly like [`ensure_daemon`].
 /// 2. No descriptor, or a descriptor whose PID is dead → refuse, naming the
