@@ -293,42 +293,46 @@ impl Drop for DataDir {
     }
 }
 
-/// The pids of `sgt … --data-dir <dir> … daemon` processes, from `/proc`.
+/// The pids of `sgt … --data-dir <dir> … daemon` processes.
 ///
 /// Matched on argv, not on a substring of the joined command line: the data
 /// dir has to be the actual value of `--data-dir`, and `daemon` an actual
 /// argument, so a test *client* command that merely mentions the path (or a
 /// grep of this very file) is not mistaken for a daemon.
+///
+/// **First-contact macOS fix (path-to-mac.md trip, 2026-08-15).** This used
+/// to read `/proc` directly with no `cfg` guard at all — on macOS
+/// `std::fs::read_dir("/proc")` simply errors, so this silently returned an
+/// empty `Vec` for every call, on every host, including ones with a live
+/// daemon: `DataDir::Drop`'s survivor assertion never fires (masking a real
+/// leak), and any test asserting a specific spawned count (e.g.
+/// `the_data_dir_guard_reaps_the_daemon_a_client_command_spawns`) sees `[]`
+/// and fails. Same Ponytail **R1** reuse [`pid_is_alive`] above already
+/// applies: [`sergeant_rs::platform::process::running_processes`]
+/// (`src/platform/process.rs`) is the same pid+argv fact behind the ADR 0002
+/// platform boundary, `#[cfg]`-correct on both Linux (`/proc`) and macOS
+/// (`ps -axo pid=,command=`) — reusing it here rather than adding a second,
+/// locally `cfg`-gated copy is the same R7-rejection reasoning `pid_is_alive`
+/// already argues.
 pub fn daemon_pids(data_dir: &Path) -> Vec<u32> {
     let wanted = data_dir.to_string_lossy().to_string();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Some(processes) = sergeant_rs::platform::process::running_processes() else {
         return Vec::new();
     };
     let mut pids = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let argv: Vec<String> = String::from_utf8_lossy(&raw)
-            .split('\0')
-            .filter(|arg| !arg.is_empty())
-            .map(str::to_string)
-            .collect();
-        let Some(program) = argv.first() else {
+    for process in processes {
+        let Some(program) = process.argv.first() else {
             continue;
         };
         let is_sgt = PathBuf::from(program)
             .file_name()
             .is_some_and(|name| name == "sgt");
-        let names_dir = argv
+        let names_dir = process
+            .argv
             .windows(2)
             .any(|pair| pair[0] == "--data-dir" && pair[1] == wanted);
-        if is_sgt && names_dir && argv.iter().any(|arg| arg == "daemon") {
-            pids.push(pid);
+        if is_sgt && names_dir && process.argv.iter().any(|arg| arg == "daemon") {
+            pids.push(process.pid);
         }
     }
     pids.sort_unstable();

@@ -149,17 +149,40 @@ fn spawn_turn_stand_in(session_id: &str) -> std::process::Child {
         .spawn()
         .expect("spawn a stand-in for a turn");
     // `spawn` returns before the child has exec'd, and until it does its
-    // /proc entry still shows this test binary's argv. Wait for the real
-    // thing, so a test measures the adapter and not the fork.
-    let cmdline = PathBuf::from(format!("/proc/{}/cmdline", child.id()));
+    // argv still shows this test binary's own. Wait for the real thing, so a
+    // test measures the adapter and not the fork.
+    wait_until_execd(child.id(), session_id, "the stand-in");
+    child
+}
+
+/// Block until `pid`'s argv contains `needle`, or panic naming `what` if it
+/// never does within 30s.
+///
+/// **First-contact macOS fix (path-to-mac.md trip, 2026-08-15).** This used
+/// to read `/proc/{pid}/cmdline` directly with no `cfg` guard — on macOS that
+/// path never exists, so `std::fs::read(..).unwrap_or_default()` silently
+/// returned empty bytes forever and every caller spun to its 30s deadline
+/// and panicked, even though the child had already exec'd correctly. Reuses
+/// [`sergeant_rs::platform::process::running_processes`]
+/// (`src/platform/process.rs`) — already `#[cfg]`-correct on both Linux
+/// (`/proc`) and macOS (`ps`), and already what the adapter code these tests
+/// exercise (`backend::claude::session_liveness`) is built on — rather than
+/// a second, locally `/proc`-only copy.
+fn wait_until_execd(pid: u32, needle: &str, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !String::from_utf8_lossy(&std::fs::read(&cmdline).unwrap_or_default())
-        .contains(session_id)
-    {
-        assert!(Instant::now() < deadline, "the stand-in never exec'd");
+    loop {
+        let execd = sergeant_rs::platform::process::running_processes()
+            .into_iter()
+            .flatten()
+            .any(|process| {
+                process.pid == pid && process.argv.iter().any(|arg| arg.contains(needle))
+            });
+        if execd {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{what} never exec'd");
         std::thread::sleep(Duration::from_millis(10));
     }
-    child
 }
 
 /// What the installed CLI says about authentication (`claude auth status
@@ -4237,14 +4260,7 @@ fn liveness_reads_turn_argv_and_ignores_processes_that_merely_quote_the_id() {
         .stdin(std::process::Stdio::piped())
         .spawn()
         .expect("spawn a bystander");
-    let bystander_cmdline = PathBuf::from(format!("/proc/{}/cmdline", bystander.id()));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !String::from_utf8_lossy(&std::fs::read(&bystander_cmdline).unwrap_or_default())
-        .contains(&session_id)
-    {
-        assert!(Instant::now() < deadline, "the bystander never exec'd");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_until_execd(bystander.id(), &session_id, "the bystander");
     assert_eq!(
         session_liveness(&session_id),
         Liveness::Dead,
