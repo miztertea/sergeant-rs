@@ -1,284 +1,282 @@
 # T-SERIES-1 — fidelity critic
 
 Axis: does the proposal say what the repository actually contains and
-decided, and only that? Every consumed-surface claim (shipped MVP, WATCH,
-Estate, `completed_dirty`, dashboard deletion, the integration branch behind
-PR #111) was checked directly against the repository — `src/cli.rs`,
-`src/api.rs`, `src/tui.rs`, `src/runtime/engine.rs`, ADRs 0005–0011,
-`docs/gauntlet/contracts/WATCH.md`, `NORTH-STAR.md`, `.sergeant/index.md`, and
-`gh issue`/`gh pr` state — never trusted from the proposal's own prose. Every
-§23 (Dispositions) label was checked against the 2026-08-11 predecessor's
-actual text, read at the commit that actually contains it
-(`a9a25fa68938323d9585edc687fbf0e965084c2e`), not summarized from memory.
-
-## The predecessor-location problem (found before the disposition sweep)
-
-The proposal's front matter and body both cite the predecessor at
-`a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6`:
-
-```yaml
-supersedes:
-  path: reference/proposal-tui-t-series.md
-  revision: a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6
-```
-
-> **Supersedes:** [`reference/proposal-tui-t-series.md@a5fb875`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/proposal-tui-t-series.md)
-
-`git show a5fb875:reference/proposal-tui-t-series.md` fails: `fatal: path
-'reference/proposal-tui-t-series.md' exists on disk, but not in
-'a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6'`. That commit (Tue Aug 11 00:58:23
-2026, merge of PR #43, "ideaos-agent-prototype-gauntlet") predates the
-predecessor file's existence in this repository entirely — it is the
-predecessor's own self-declared `audit_revision` (the state of the repo *it*
-was audited against), copied forward into `supersedes.revision` rather than
-the commit that actually contains its text. The predecessor was vendored six
-hours later at `a9a25fa` (Tue Aug 11 15:28:30 2026, "Execution-surface test
-(owner ruling)... T-series TUI proposal vendored... via the inbox"). See F1.
-
-This meant the disposition sweep below had to locate the real predecessor
-independently before any `§23` label could be checked — the citation the
-proposal itself provides does not resolve.
+decided, and *only* that? Every claim about the shipped MVP, WATCH, Estate,
+`completed_dirty`, the dashboard deletion, and the integration branch behind
+PR #111 was checked directly against source (`src/`, `tests/`, `Cargo.toml`/
+`Cargo.lock`, `GAUNTLET.md`, ADRs 0009–0011, `docs/gauntlet/contracts/
+WATCH.md`) and against GitHub (`gh pr view/diff 111`, `gh issue view`), not
+against the proposal's own prose. Every §23 (Dispositions) label was checked
+against the 2026-08-11 predecessor's actual text, read in full at the commit
+that actually contains it (`a9a25fa68938323d9585edc687fbf0e965084c2e`,
+1943 lines), not summarized from this proposal.
 
 ## Findings
 
-### F1 — "Supersedes" citation (front matter and body) points to a commit that does not contain the predecessor
+### F1 — The proposal's own "Supersedes" citation points to a commit that never contained the predecessor
 
 - **severity:** warning
-- **section:** front matter `supersedes.revision`; body "Supersedes" line
-- **claim/text at issue:** `reference/proposal-tui-t-series.md@a5fb875` — both
-  as a YAML revision pin and as a clickable GitHub blob link.
-- **what I checked:** `git cat-file -t a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6`
-  (a valid commit), then `git show a5fb875...:reference/proposal-tui-t-series.md`
-  (fails — path does not exist at that commit), then `git log --follow` on the
-  file to find where it actually enters history.
-- **what I found:** `a5fb875` is real but is the predecessor's own
-  `audit_revision` field (what state of the repo the 2026-08-11 proposal was
-  written against), not a commit that contains the proposal file. The file
-  was committed six-plus hours later at `a9a25fa`. The new proposal follows
-  the same "cite my own audit_revision, not my commit" convention for
-  itself (`audit_revision: 242abe3...`, no self-referential commit hash
-  given at all) — internally consistent, but the "Supersedes" line is framed
-  as a locator ("blob/.../reference/proposal-tui-t-series.md") that a reader
-  or refuter clicking through gets a GitHub 404 from, and `git show` on the
-  literal citation fails the same way. The contract itself hit this: its own
-  Axes §1 text says "check each disposition against that predecessor's
-  actual text rather than trusting the label," which requires locating that
-  text — the citation given does not get a reader there.
+- **section:** front matter (`supersedes.revision`) and the header's
+  **Supersedes** line
+- **claim/text at issue:** Front matter: `supersedes: path:
+  reference/proposal-tui-t-series.md, revision:
+  a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6`. Header: "**Supersedes:**
+  [`reference/proposal-tui-t-series.md@a5fb875`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/proposal-tui-t-series.md)".
+- **what I checked:** `git show a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6:reference/proposal-tui-t-series.md`
+  and the equivalent GitHub contents API call; `git log --all --oneline --
+  reference/proposal-tui-t-series.md`, which shows the file has exactly two
+  commits in its whole history.
+- **what I found:** `a5fb875` is a real commit (merge of PR #43,
+  "ideaos-agent-prototype-gauntlet," 2026-08-11 00:58) but does not contain
+  `reference/proposal-tui-t-series.md` at all — `git show` fails with
+  "exists on disk, but not in …" and the GitHub contents API returns a 404.
+  It is the predecessor's own `audit_revision` field
+  (`/tmp/predecessor.md` line 26: `audit_revision:
+  a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6` — the state of the repo the old
+  proposal was written *against*), copied forward into `supersedes.revision`
+  instead of the commit that actually contains the old proposal's text. The
+  predecessor document was itself committed roughly 14.5 hours later, at
+  `a9a25fa68938323d9585edc687fbf0e965084c2e` ("Execution-surface test (owner
+  ruling): workflow vs CLI surface vs operator skill," 2026-08-11 15:28).
+  This is exactly the citation the contract directs a critic to follow ("check
+  each disposition against that predecessor's actual text") — as written, it
+  does not resolve, and a reader clicking the header's GitHub link gets a
+  live 404.
 - **does the section survive the correction:** yes. The predecessor is
-  locatable (`a9a25fa`), its content is exactly what a proposal superseding
-  the 2026-08-11 T-series document should be citing, and every disposition
-  checked below against the real text holds up except F3. The fix is
-  mechanical: point `supersedes.revision` and the body link at `a9a25fa`,
-  or keep `a5fb875` as a separate "predecessor's own audit basis" note if
-  that provenance detail is worth preserving, but not present it as the
-  file's location.
+  locatable at `a9a25fa` (or via its live path at the proposal's own pinned
+  `242abe3`, since `a9a25fa` is an ancestor of `242abe3` — confirmed with
+  `git merge-base --is-ancestor`), and every §23 disposition I checked
+  against that real text holds up except F3 below. The fix is mechanical:
+  point `supersedes.revision` and the header link at `a9a25fa`.
 
-### F2 — §12.3's Doctor check list does not match the actual check names `DoctorReport` produces
+### F2 — §12.3's Doctor check list names checks that do not exist and omits two that do
 
 - **severity:** warning
 - **section:** §12.3 (Health)
-- **claim/text at issue:** "Current checks include installation, environment,
-  data directory, Docker, journal, projection, daemon, estate, profiles, and
-  disk pressure."
-- **what I checked:** `Report::run` in `src/cli.rs@242abe3` (the function
-  that assembles every `Check` Doctor emits) and each check function's own
-  `Check::ok`/`Check::warn`/`Check::fail` name literal
-  (`git_check`, `claude_check`, `environment_check`, `data_dir_check`,
-  `docker_check`, `journal_check`, `projection_check`, `daemon_check`,
-  `permission_mode_check`, `estate_check`, `disk_pressure_check`,
-  `src/cli.rs:1750-1777`).
-- **what I found:** the real, emitted check names are `git`, `claude`,
-  `environment`, `data_dir`, `docker`, `journal`, `projection`, `daemon`,
-  `permission_mode`, `estate`, `disk_pressure` — eleven checks. There is no
-  check named `installation` (the two checks that plausibly correspond to
-  that word, `git` and `claude`, are dropped from the proposal's list
-  entirely and folded into an invented umbrella name). There is no check
-  named `profiles`; the real check is `permission_mode`. Since T2-45 commits
-  Health to rendering the shared `DoctorReport` unmodified ("Extract Doctor's
-  structured `Check`/`Report` result… let both CLI and TUI consume it"), the
-  check names §12.3's prose promises are not the names an operator will
-  actually see.
+- **claim/text at issue:** "Current checks include installation,
+  environment, data directory, Docker, journal, projection, daemon, estate,
+  profiles, and disk pressure."
+- **what I checked:** every `Check::ok`/`Check::warn`/`Check::fail` call
+  site in `src/cli.rs`'s `mod doctor` (the module `Report::run` assembles
+  from), grepping each check function and its literal name string.
+- **what I found:** the eleven real check names, straight from the source,
+  are `git`, `claude`, `environment`, `data_dir`, `docker`, `journal`,
+  `projection`, `daemon`, `permission_mode`, `estate`, `disk_pressure`.
+  There is no check named `installation` — the two checks that plausibly
+  correspond to that umbrella word, `git` and `claude`, are dropped from
+  the proposal's list entirely. There is no check named `profiles`; the
+  real check that covers profile-adjacent state is `permission_mode`. Since
+  Decision T2-45 commits Health to rendering the shared `DoctorReport`
+  unmodified ("Extract Doctor's structured `Check`/`Report` result… let
+  both CLI and TUI consume it"), the check names this prose promises are
+  not the names an operator will actually see in either surface.
 - **does the section survive the correction:** yes. T2-45's mechanism
   (render whatever `DoctorReport.checks` contains, not a hand-picked list)
-  means the implementation is unaffected regardless of what this prose
-  calls the checks — this is a proposal-text accuracy defect, not a scope
-  or behavior error. An operator reading §12.3 to know what Health will
-  show would expect `profiles` and `installation` rows and get
-  `permission_mode`, `git`, and `claude` instead.
+  means the implementation itself is unaffected by what this prose calls
+  the checks — this is a proposal-text accuracy defect, not a scope or
+  behavior error. An operator reading §12.3 to predict what Health shows
+  would expect `installation` and `profiles` rows and get `git`, `claude`,
+  and `permission_mode` instead.
 
-### F3 — §23.2 presents the predecessor's silence on repo/group as a "previous decision"
+### F3 — §23.2 labels the predecessor's silence on repo/group as a "previous decision" being revised
 
 - **severity:** warning
 - **section:** §23.2 (Revised), row "Repo/group outside TUI"
-- **claim/text at issue:** the Revised table lists, under "Previous
-  decision": "Repo/group outside TUI," revised to "Full current lifecycle
-  included through extract-on-contact."
-- **what I checked:** the full predecessor text (`a9a25fa`, 1943 lines) for
-  every mention of `repo`, `group`, `Estate`, `sgt repo`, `sgt group` —
-  including its explicit non-goals list (§5.2, 22 bulleted exclusions) and
-  its in-scope list (§5.1, 15 items).
-- **what I found:** zero mentions. The predecessor's §5.2 non-goals list
-  names journal search, new Work states, workflow authoring, file/diff
-  views, host metrics, OpenTelemetry, mouse, web redesign, graph canvas, a
-  plugin framework, archival semantics, and two specific issues (#26, #45)
-  — repo and group management appear nowhere, neither in scope nor
-  excluded. The predecessor simply never considered estate administration;
-  "Estate" as a concept does not exist in it (confirmed separately — its
-  top nav is exactly `Home Fleet Workflows`, §6.1). Labeling this absence a
-  "previous decision" that the new proposal now "revises" overstates what
-  was actually decided in 2026-08-11 — there was no ruling to revise, only
-  a gap to fill. (Contrast with genuine revisions in the same table, e.g.
-  "Doctor CLI-only," which the predecessor states explicitly as **Decision
-  T-18 (R1)**: "Doctor remains a CLI-only diagnostic. The TUI has a small
-  connection overlay, not a System dashboard" — that row's label is
-  accurate because a real decision exists to check it against.)
-- **does the section survive the correction:** yes. The substantive change
-  — Estate becoming a first-class destination with full repo/group/Doctor
-  lifecycle — is real, current, and correctly scoped elsewhere in the
-  proposal (§12, §16.2). Only the disposition-table framing is wrong: this
-  row belongs under "new scope the predecessor never addressed," not
-  "revised decision." A one-word fix (e.g. "Repo/group unaddressed" instead
-  of "outside TUI") would close this without touching any normative
-  content.
+- **claim/text at issue:** the Revised table's "Previous decision" column
+  states "Repo/group outside TUI," which the new proposal now revises to
+  "Full current lifecycle included through extract-on-contact."
+- **what I checked:** the predecessor's full text (`a9a25fa`, all 1943
+  lines) for every mention of `repo`, `group`, or `Estate` — including its
+  explicit non-goals list and its top-level navigation.
+- **what I found:** zero mentions. The predecessor's top nav is exactly
+  `Home    Fleet    Workflows` (confirmed at four separate places in the
+  document, e.g. lines 78, 484, 496, 723) — no Estate tab, no repo/group
+  screen, and its non-goals enumeration (journal search, host metrics,
+  OpenTelemetry, mouse, web redesign, graph canvas, plugin framework,
+  archival semantics, issues #26/#45) never names repository or group
+  management either as excluded or in scope. The predecessor did not
+  address estate administration at all — it is not that the predecessor
+  decided repo/group belonged "outside the TUI" and this proposal now
+  overturns that call; there was no ruling on the question in 2026-08-11.
+  Contrast this row with a genuine revision in the same table — "Doctor
+  CLI-only" — which the predecessor states as an explicit, named decision
+  (T-18, R1: "Doctor remains a CLI-only diagnostic. The TUI has a small
+  connection overlay, not a System dashboard," line 417) that this proposal
+  can accurately say it revises.
+- **does the section survive the correction:** yes. The substantive
+  change — Estate becoming a first-class destination with full repo/group/
+  Doctor lifecycle — is real, current, and correctly scoped elsewhere in
+  the proposal (§12, §16.2). Only the disposition-table framing overstates
+  what 2026-08-11 actually settled: this row belongs under "new scope the
+  predecessor never addressed," not "revised decision." Fixable without
+  touching any normative content.
 
-### F4 — §5.5 credits ADR 0009 with moving Doctor and Watch into the no-auto-spawn set, when ADR 0009's own text says they were already there
+### F4 — §5.5 credits ADR 0009 with moving two surfaces that were already in the no-spawn set before it
 
 - **severity:** info
 - **section:** §5.5 (Observation never materializes the daemon)
 - **claim/text at issue:** "ADR 0009 moved `status`, Work reads, analytics,
   Watch, Doctor, and TUI into the no-auto-spawn set."
-- **what I checked:** ADR 0009's Decision section verbatim against this
-  sentence.
-- **what I found:** ADR 0009's own Decision text: "`status`, `work
-  show`/`list`/`transcript`, `analytics`, and the TUI **join** `sgt doctor`,
-  `sgt watch`, and `sgt daemon stop` **in** the no-spawn set." Its Context
-  section is explicit that Doctor and Watch's membership predates this ADR:
-  "`docs/gauntlet/contracts/WATCH.md`'s R-WATCH-3 already ruled this
-  principle for one verb... owner-ruled 2026-08-13... This decision is that
-  follow-on being resolved" (ADR 0009 itself is dated 2026-08-14). So ADR
-  0009 is the ruling that added `status`/Work-reads/analytics/TUI to a set
-  Doctor and Watch already belonged to a day earlier — not the ruling that
-  moved all six. The proposal's sentence lists all six as things "ADR 0009
-  moved," conflating pre-existing membership with the new ruling.
-- **does the section survive the correction:** yes, cleanly. The
-  operative claim — all six verbs are in the no-auto-spawn set today, which
-  is what Decision T2-16 depends on — is correct and independently verified
-  (`src/cli.rs:1341`: "`analytics`, and `tui` — every verb ADR 0009 moved
-  into the no-spawn set" is the repository's own comment, so the proposal's
-  phrasing actually echoes an imprecision already present in the codebase
-  comment it was likely drawing from, not an invention). This is a
-  precision nit about attribution, not a scope or behavior error.
+- **what I checked:** ADR 0009's Decision and Context sections verbatim
+  against this sentence.
+- **what I found:** ADR 0009's own Decision text is "`status`, `work
+  show`/`list`/`transcript`, `analytics`, and the TUI **join** `sgt
+  doctor`, `sgt watch`, and `sgt daemon stop` **in** the no-spawn set" —
+  Doctor and Watch are the pre-existing set being joined, not surfaces this
+  ADR moved. Its Context section is explicit that Watch's membership
+  predates it by a day: "`docs/gauntlet/contracts/WATCH.md`'s R-WATCH-3
+  already ruled this principle for one verb… owner-ruled 2026-08-13…" while
+  ADR 0009 itself is "Accepted, 2026-08-14." So ADR 0009 is the ruling that
+  added four surfaces to a set Doctor and Watch already belonged to, not
+  the ruling that moved all six. Notably, this exact imprecision already
+  exists in the repository's own code: `src/cli.rs:1341`'s doc comment
+  reads "`analytics`, and `tui` — every verb ADR 0009 moved into the
+  no-spawn set" — the proposal's phrasing echoes an existing codebase
+  comment rather than inventing a new error.
+- **does the section survive the correction:** yes, cleanly. The operative
+  claim — all six surfaces are no-spawn today, which is what Decision
+  T2-16 depends on — is correct and independently verified. This is an
+  attribution imprecision, not a wrong end state, and it isn't even novel
+  to this proposal.
 
 ## What I checked and found clean
 
-**MVP/shipped-surface claims (§3.1, §3.2), verified at the pinned
-`242abe3c4a889c2b666c7ce34b32812dd1ee8d61`:**
+**§3.1's stale-assumption table**, row by row, against source at the
+proposal's own pinned audit revision (`242abe3`) and `gh issue view` state:
 
-- `sgt tui` is an explicit, no-auto-spawn verb; bare `sgt` prints a static
-  homepage (`src/cli.rs:64,198,821-826,1210`) — matches ADR 0010.
-- The current TUI's `Screen` enum has exactly `Fleet` and `Detail`
-  (`src/tui.rs:136-141`); its footer keymap is `j/k move · enter detail ·
-  r refresh · i respond · c cancel · q quit` — no retry/extend bound,
-  matching the Executive Summary's "small response/cancel keymap."
-  `DETAIL_EVENT_TAIL: usize = 40` (`src/tui.rs:58`) matches "forty recent
-  events" exactly.
-- `GET /v1/work/{id}/transcript` exists and is wired
-  (`src/api.rs:392,1777`); `POST /v1/work/{id}/extend` exists and is
-  distinct from `retry` (`src/api.rs:396,2214-2276`); `completed_dirty` is
-  a real reported state (`src/api.rs:1504`, `4365`); `sgt watch` is
-  implemented and documented as adjudicated (`src/cli.rs:159-179`,
-  `WATCH.md`'s "Ruled." language throughout).
-- The root workflow catalog (`.sergeant/index.md@242abe3`) lists exactly
-  **23** published workflows — matches "23 admitted workflows" precisely.
-- `Cargo.toml` pins `ratatui = "0.30.2"`; its own comment confirms
-  Crossterm is reached only through Ratatui's re-export, matching §3.2 and
-  §8.3's claims about the dependency graph.
-- `sgt repo`/`sgt group` subcommands exist (`src/cli.rs:216,222,889-890`);
-  Doctor's `filesystem_check` did not yet exist at `242abe3` and is
-  correctly described in §12.4/§12.3 as landing only if PR #111 merges.
-- Issues #11, #16, #26 are `CLOSED` (`gh issue view`) — matches "shipped
-  fixes that T-Series must preserve." Issues #15, #21 (dashboard
-  reactivation) are `CLOSED` — matches "closed when the dashboard was
-  deleted." No `src/web.rs`, no `web/` directory, no web-tagged test file,
-  and no `web` verb exist at `242abe3` — the dashboard is in fact fully
-  gone, not disabled-and-retained (the predecessor's actual 2026-08-11
-  disposition, §15, Decision T-50).
+- Bare `sgt` opens the TUI → confirmed false today: `src/cli.rs`'s
+  `Command::Tui` is explicit (`src/cli.rs:198,821`), bare `sgt` calls
+  `print_homepage` — matches ADR 0010 and `GAUNTLET.md`'s D10 entry.
+- Web disposition → confirmed: `docs/adr/0011-delete-the-dashboard.md`
+  records outright deletion (D7); no `src/web.rs`, `web/`, or `sgt web`
+  verb exist in the tree — the dashboard is fully gone, not
+  disabled-and-retained (which was the predecessor's own actual
+  2026-08-11 position, its Decision T-50).
+- #11/#16/#26 → the predecessor's own §16.1–16.3 (`/tmp/predecessor.md:
+  1449-1463`) shows it owned and closed #11 and #16 but explicitly did
+  **not** claim #26 ("does not claim to close #26 without its specific …
+  fix"); all three issues are `CLOSED` per `gh issue view` (26 closed
+  2026-08-14, before this proposal's 2026-08-15 timestamp) — the table's
+  "current fact" column adds #26 as newly fixed without contradicting the
+  predecessor's own exclusion of it.
+- Thread from event history vs. dedicated transcript → confirmed;
+  `GET /v1/work/{id}/transcript` and `work_transcript` exist in
+  `src/api.rs` (lines 392, 1777); predecessor has no transcript endpoint.
+- No output/envelope UI → confirmed; predecessor never mentions an output
+  pointer or turn-envelope UI field; `src/api.rs` has both
+  (`output_pointer`, `envelope`/`turn_cap`/`ceiling_secs`).
+- submit/respond/retry/cancel vs. extend → confirmed; predecessor has zero
+  matches for "extend" as a mutation verb; `src/cli.rs` has
+  `Command::Extend`, distinct from retry.
+- completed only vs. `completed_dirty` → confirmed; predecessor has zero
+  mentions of `completed_dirty`; it is real and current (`src/api.rs:1504`,
+  `src/tui.rs:445,1630+`, `src/watch.rs:98`).
+- No headless return path vs. `sgt watch` shipped → confirmed;
+  `docs/gauntlet/contracts/WATCH.md` is adjudicated, `src/watch.rs` exists.
+- Estate outside TUI discussion vs. mature repo/group/Doctor CLI →
+  confirmed; `src/cli.rs` has full `RepoCommand`/`GroupCommand` lifecycles
+  (this is the same underlying gap F3 flags as mislabeled elsewhere).
 
-**PR #111 / integration-branch technical content**, verified at the
-proposal's own pinned `251a6f1c09caee95fcac30f724dab0ece166cae0` (not just
-the branch's later head) to make sure nothing being described was added only
-after the pin:
+**§23.1 (Adopted from the previous proposal):** all twelve items —
+Work-centered Home/Fleet/Workflows, canonical Work surface, Attention
+drawer, deliberate multiline composer, local slash palette, workflow
+chooser/reference, endpoint-backed workflow catalog, ordinal workflow rail,
+Work-local Evidence and graph, separate Journal proposal, API invalidation
+discipline, `TestBackend` semantic testing — independently traced to a
+named predecessor decision (canonical Work surface at line 97; Attention
+drawer at line 87; slash palette at §7.3; ordinal rail at Decision T-44,
+"never a percentage gauge"; separate Journal at Decision T-19; invalidation
+discipline at line 300; `TestBackend` at Decision T-54). No invented
+provenance.
 
-- `GET /v1/retained` and `POST /v1/work/{id}/reap`, plus `sgt work
-  retained`/`sgt work reap`, both exist at the pinned revision
-  (`src/api.rs:397-398`, `src/cli.rs:362-373`).
-- The ceiling-interrupted-lands-in-`blocked` behavior exists at the pinned
-  revision, named by its own regression test:
-  `a_ceiling_interrupt_lands_the_work_in_blocked_not_wedged_active`
-  (`src/runtime/engine.rs:4781`).
-- Doctor's `filesystem_check` exists at the pinned revision
-  (`src/cli.rs:1935,2497`).
-- Human transcript rendering gains timestamps at the pinned revision, via
-  `sgt work transcript`'s CLI rendering (not the API — the diff lands in
-  `src/cli.rs`, not `src/api.rs`), matching #96's framing in the PR body.
-- The branch name (`integration/path-to-mac-2026-08-15`) and PR number
-  (111) are correct. `#120` is confirmed still `OPEN` via `gh issue view`,
-  matching §3.3's "and #120 remains open."
+**§23.2 (Revised), remaining rows beyond F3/F4:** "Bare `sgt` is the TUI"
+(predecessor line 73: "This proposal makes bare `sgt` the primary
+interactive surface"), "Doctor CLI-only" (predecessor Decision T-18,
+verbatim above), "Local custom editor" (predecessor line 1377's
+local-editor-vs-vetted-dependency framing, which already names the
+override condition this proposal exercises), "Submit/respond/retry/cancel"
+(predecessor's exact mutation list, no extend), "Event-derived
+conversation" (predecessor Decision T-14: "a pure presentation fold over
+known event kinds"), "no output/envelope UI" and "completed only" (both
+absent from predecessor, confirmed above) — all check out as genuine
+revisions of real predecessor positions.
 
-**WATCH vocabulary (§14):** `WATCH.md`'s ruled set is exactly `needs_input,
-blocked, waiting, failed, completed, canceled`, with `pending`/`active`
-excluded — matches the proposal's six-state list and exclusion claim
-verbatim (order differs, content does not).
+**PR #111's actually-diffed content**, checked with `gh pr diff 111`
+against §3.3's five bullets — all five confirmed present in the real diff:
 
-**R-NS-6 (§5.6):** `NORTH-STAR.md`'s R-NS-6 text ("execution ≠ dialogue...
-sgt owns message mechanics... the harness owns the conversation") matches
-the proposal's restatement in substance.
+- ceiling interruption lands in `blocked` (closes #90): the PR's own body
+  and `src/cli.rs`'s `Extend` doc-comment diff both describe this.
+- transcript timestamps (closes #96): `render_transcript` in `src/cli.rs`
+  adds `[{ts}] {label}` formatting, reading the journal's existing `"ts"`
+  field, not deriving one.
+- Doctor filesystem-reliability check (closes #85):
+  `src/platform/fs_locking.rs` diff adds `sgt doctor`'s `filesystem` row.
+- `GET /v1/retained` and `sgt work retained`: present verbatim
+  (`list_retained` route/handler, `WorkCommand::Retained`).
+- `POST /v1/work/{id}/reap` and `sgt work reap --yes`: present verbatim
+  (`reap_work`, `WorkCommand::Reap { id, yes }`), refuses without
+  confirmation, and never touches the retained branch — matching the
+  proposal's "explicit confirmation" / "retained branches remain outside
+  the deletion path" claims exactly.
 
-**§23.1 (Adopted from the previous proposal):** every one of its twelve
-items — Work-centered Home/Fleet/Workflows, canonical Work surface,
-Attention drawer, deliberate multiline composer, local slash palette,
-workflow chooser/reference, endpoint-backed workflow catalog, ordinal
-workflow rail, Work-local Evidence and graph, separate Journal proposal, API
-invalidation discipline, `TestBackend` semantic testing — is independently
-present in the predecessor (`a9a25fa`) under a named decision (T-21, T-22,
-Attention drawer §6.2, T-48, §7.3, §7.4, T-17, T-37/T-44, §4.6/T-15, T-19,
-T-47, T-54). No invented provenance.
+None of these four surfaces (`GET /v1/retained`, `sgt work retained`,
+`POST /v1/work/{id}/reap`, `sgt work reap`) exist in `src/api.rs`/
+`src/cli.rs` at the proposal's own pinned main revision (`242abe3`) —
+grepping `retained`/`reap` there turns up only unrelated prose ("retained
+branch," "test rig … reap_daemons"), confirming these genuinely are
+PR #111-only candidate surfaces, not already-shipped main behavior the
+proposal is hiding behind a false conditional.
 
-**§23.2 (Revised), remaining rows beyond F2:** "Bare `sgt` is the TUI"
-(predecessor: "This proposal makes bare `sgt` the primary interactive
-surface," line 73), "Home/Fleet/Workflows → Estate added" (predecessor's nav
-is exactly `Home Fleet Workflows`, no Estate concept anywhere), "Doctor
-CLI-only" (Decision T-18, quoted above), "Local custom editor" (Decision
-T-48, R7, explicitly bounded and explicitly open to override by "a narrowly
-vetted text-area dependency" — the new proposal's revision is the predecessor's
-own named escape hatch, not a contradiction of it), "Submit/respond/retry/
-cancel" (predecessor §4.4's exact mutation list, no `extend`), "Event-derived
-conversation" (Decision T-14: "a pure presentation fold over known event
-kinds"), "no output/envelope UI" (predecessor's §4.3 "N3 facts" list has
-neither), "completed only" (zero `completed_dirty` mentions in predecessor)
-— all check out.
+**Other verified-accurate facts:** `ratatui = "0.30.2"` (`Cargo.toml`);
+Crossterm is reached only through `ratatui-crossterm`'s own dependency on
+`crossterm 0.29.0` (`Cargo.lock`), matching both the §3.2 claim and the
+0.29.0 Crossterm docs cited in §8.8/§24.3 — a second, unrelated `crossterm
+0.28.1` in the lockfile is pulled in by `comfy-table`, not the TUI stack,
+and `GAUNTLET.md`'s D8 deviation-register entry independently confirms
+"crossterm is reached exclusively through `ratatui::crossterm`
+re-exports." The workflow root catalog lists exactly 23 published entries
+(`.sergeant/index.md`), matching §11.1/§3.2's "23 admitted workflows"
+precisely. The current TUI's `Screen` enum (`src/tui.rs:136`) is exactly
+`Fleet`/`Detail`, matching §3.2's "the TUI still has only Fleet and Detail
+screens." WATCH's real state set is the six states §14 lists
+(`needs_input, waiting, blocked, failed, completed, canceled`, excluding
+`pending`/`active`) per `WATCH.md`'s R-WATCH-1 ruling, and §14 correctly
+labels its own attention-drawer bucketing of `completed_dirty` as the
+cockpit's own choice rather than something WATCH itself does ("Watch does
+not treat `pending` or `active` as notice-producing states, but the
+cockpit may show them under Running because the drawer is a fleet view,
+not the Watch protocol itself" — correctly hedged, not a fidelity issue).
+The integration branch's cited head commit `251a6f1` matches both the
+local `integration/path-to-mac-2026-08-15` branch tip and PR #111's real
+merge-commit second parent on GitHub. The executive summary's "a
+successful walk-away ship gate" traces to `GAUNTLET.md`'s real 2026-08-13
+MVP close-out entry ("ship gate 01KZY9ZFTE … passed," "ship gate PASS, #19
+closed") — a different, already-shipped milestone from PR #111's own
+sprint's later-discovered `#120` gate defect, and the proposal correctly
+keeps the two separate rather than conflating them (§19.12 names the PR
+#111 gate defect specifically and by number without walking back the
+MVP's own earlier, independently passed gate).
 
-No finding invalidates any section's premise. F1, F2, and F3 are warning
-severity (a broken/misleading citation, a mismatched check-name list, and an
-overstated disposition label — all mechanically fixable without touching any
-normative decision); F4 is info severity and echoes an imprecision already
-present in the repository's own code comments rather than inventing one.
-Every other consumed-surface claim I independently verified against `src/`,
-ADRs, `WATCH.md`, `.sergeant/`, and GitHub issue/PR state — MVP shipped
-behavior, WATCH's vocabulary, Estate's CLI basis, `completed_dirty`, the
-dashboard's actual deletion, and PR #111's technical content at its pinned
-revision — matched the proposal's description exactly.
+No finding invalidates any section's premise. F1–F3 are warning severity
+(a broken/misleading citation, a mismatched Doctor check-name list, and an
+overstated disposition label) — all mechanically fixable without touching
+any normative decision. F4 is info severity and echoes an imprecision
+already present in the repository's own code comments rather than
+inventing one. Every other consumed-surface claim I independently verified
+against `src/`, ADRs, `WATCH.md`, `.sergeant/`, `Cargo.lock`, and GitHub
+issue/PR state matched the proposal's description exactly.
 
-**Scope note:** whether PR #111's current `MERGED` state (confirmed via `gh
-pr view 111`) makes the proposal's pervasive "conditional, not yet merged"
-framing (§3.3, T2-06/T2-07, §12.4, §19.8, falsifiers, acceptance #54/#55)
-stale prose is a real, checkable question — but the contract's own Axes §3
-(`assumptions`) names it explicitly as that axis's starting point ("is
-every factual claim true *as of this session*, not as of the proposal's own
-audit timestamp"), which is a staleness question, not a fidelity one. I
-independently confirmed the branch's *technical content* (retained/reap
-routes, the ceiling→`blocked` fix, the filesystem Doctor check, transcript
-timestamps) matches what the proposal describes — that is this axis's
-remit, and it is clean. I did not grade whether the branch's merge status
-should now change the proposal's conditional framing; that is left to
-whichever critic owns `assumptions`.
+**Scope note:** whether PR #111's current `MERGED` state (confirmed via
+`gh pr view 111`, merged into the real GitHub `main` at `3a46b87`, itself
+an ancestor of the actual current `main` tip) makes the proposal's
+pervasive "conditional, not yet merged" framing (§3.3, T2-06/T2-07, §12.4,
+§19.8, the falsifiers, acceptance items #54/#55) stale prose is a real,
+checkable question — but the contract's own Axes §3 (`assumptions`) names
+it explicitly as that axis's starting point ("is every factual claim true
+*as of this session*, not as of the proposal's own audit timestamp"),
+which is a currency/staleness question, not a fidelity one. I independently
+confirmed the branch's *technical content* — the retained/reap routes, the
+ceiling→`blocked` fix, the filesystem Doctor check, transcript timestamps —
+matches what the proposal describes; that is this axis's remit, and it is
+clean. Whether the branch's now-merged status should change the proposal's
+conditional framing is left to whichever critic owns `assumptions`.
