@@ -6,6 +6,90 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L23 — Every reduction of output lied at least once: read the artifact, not the view of it
+
+Cerberus, 2026-08-14/15 sprint. Five instances in one session, four tool
+families, same shape — a view was narrowed and the narrowing, not the
+subject, produced the answer:
+
+| Reduction | False conclusion |
+|---|---|
+| `grep -v "^+.*///"` on a diff | "the worker left a dangling doc fragment" |
+| `grep -E "^\+\s+fn "` (leading whitespace) | "#70 has no test" — it was a top-level `fn` |
+| `grep -E "outcome:"` unanchored | "gate run terminal" — matched no-mistakes' *help text* |
+| guessed JSON path `run.surface` | "teardown never recorded" — the key is top-level |
+| `\| tail -1` on `gh pr edit` | "PR title updated" — the command had exited 1 |
+| `cmd \| head -3 && echo OK` | "patch applies" — `&&` saw `head`'s status, not the command's |
+
+The last two are the dangerous class, because the reduction ran on a
+*mutating* command and discarded the channel that reported failure —
+the same defect as `2>/dev/null` on a `git branch -D` that silently
+failed. Rules: a filtered view is evidence about the filter; anchor every
+monitor pattern (`^outcome:`); never place a pipe or a `&&` between a
+mutating command and its exit status; and confirm a claimed absence
+against the unfiltered artifact before reporting it as a finding.
+
+## L22 — A "we never destroy X" invariant is a disk leak until a verb disposes of X
+
+Cerberus, 2026-08-15. Post-merge sweep found **30 GB** in three
+`.sergeant/data/surfaces/<work-id>/` trees whose Works were all terminal
+(two `completed`, one `canceled`), each recording
+`teardown.disposition = retained_dirty`. The policy is right — sergeant
+preserves uncommitted work and never deletes a branch — but there is no
+`sgt` verb to list what is retained or dispose of it once banked, so
+correct retention is indistinguishable on disk from a leak, and the only
+route to the space is `rm -rf` around the engine: precisely the ad hoc
+shell reconstruction the guardrails forbid, aimed at preserved state.
+
+Essentially all of that space is `target/` directories — 11, 11 and 9 GB,
+against a 30 GB total for the three surfaces — build artifacts, gitignored,
+not "uncommitted work" under any reading. So retention scope is the second
+half of the lesson: **what gets preserved must be the thing the policy
+means, not the whole directory it happens to live in.** Filed as #109.
+Generalizes past sergeant: any never-delete guarantee ships incomplete
+without its companion inspect-and-reap verb, because operators route
+around the absence with something more dangerous than the verb would be.
+
+## L21 — Cleanup in a test body protects only the path that succeeds
+
+Cerberus, 2026-08-15. 198 zero-byte files named
+`sgt-watch-test-hold-never-released-*` had accumulated in `/tmp` — which
+on this host is a 16 GB tmpfs whose exhaustion has already caused one
+host-wide incident (#70). `test_hold_wait` writes `<path>.ready` as its
+rendezvous marker; the happy-path test removes it, and the dead-man test —
+whose whole premise is that the release path never appears — removes
+nothing. The failure-path test was the leaking one, which is the general
+shape: the test that exercises the abnormal path is the least likely to
+carry the cleanup, and the most likely to run often.
+
+Cleanup belongs in the code under test or an RAII guard, never only in the
+body of the test that happens to succeed. Related to L6 (an operation that
+fails after producing an unrecorded effect) — here the unrecorded effect is
+a file rather than a journal append. Filed as #108.
+
+## L20 — An owning document that summarizes a workflow's procedure guarantees readers stop there
+
+Cerberus, 2026-08-14. The orchestrating session drove `no-mistakes` by hand
+for a full day — `gate.sh`, `axi respond`, `axi sync --recover` —
+reimplementing `validate-and-ship`'s `40-drive-gates` and
+`50-reconcile-custody` badly, and inventing a workaround around
+`--keep-local` for a dirty-worktree refusal rather than using it, because
+it did not know the flag existed. `AGENTS.md`'s routing table is correct
+and was not ambiguous: substantive procedural work with a matching
+published workflow loads that workflow. But `docs/DEVELOPMENT.md`'s
+"Shipping gate" section restated the procedure in prose and never named the
+workflow, and a reader who finds the prose complete never reaches the
+catalog.
+
+Root cause is documentation coupling, not model behavior — the prose
+predates the engine being able to run work at all, so it faithfully
+describes the only flow that existed when it was written. Every owning
+document that summarizes a published procedure must cite it and mark itself
+the summary; the fix is a pointer, not a rewrite. Corollary for this repo's
+layering rule: "the document that owns the topic wins" fails silently when
+the non-owning document is merely *stale* rather than contradictory,
+because nothing disagrees.
+
 ## L19 — A governing document is an executable diff for the program: it takes the loop
 
 Cerberus day 2, 2026-08-11: the orchestrator authored the MVP bucketing
