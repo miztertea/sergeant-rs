@@ -1042,18 +1042,32 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
         };
     };
     let path = binding.worktree_path.display().to_string();
-    // Whether or not the removal below succeeds, the patch is already
-    // durable, so nothing captured can be lost. A removal failure just means
-    // the directory did not get reclaimed this round — the next teardown
-    // retry, or `sgt work reap`, tries again (idempotent, same as every
-    // other disposition here).
-    let _ = git(
+    // The patch is already durable regardless of what happens next, so
+    // nothing captured can be lost. But if the worktree removal below fails,
+    // the directory is still on disk — reporting `patch: Some` in that case
+    // would make it invisible to `retained_bindings`/`reap_binding`, which
+    // only look for the worktree directory when `patch` is `None`. Falling
+    // back to the same `patch: None` shape the submodule/capture-failure
+    // paths above already use keeps that directory discoverable and
+    // reclaimable (`reap_binding`'s `patch: None` arm retries the same `git
+    // worktree remove`); the now-redundant patch file (its content already
+    // sitting uncommitted in the still-present directory) is removed
+    // best-effort so it does not become its own untracked leak.
+    match git(
         &binding.source_path,
         &["worktree", "remove", "--force", &path],
-    );
-    BindingDisposition::RetainedDirty {
-        changes,
-        patch: Some(patch),
+    ) {
+        Ok(_) => BindingDisposition::RetainedDirty {
+            changes,
+            patch: Some(patch),
+        },
+        Err(_) => {
+            let _ = std::fs::remove_file(&patch.path);
+            BindingDisposition::RetainedDirty {
+                changes,
+                patch: None,
+            }
+        }
     }
 }
 

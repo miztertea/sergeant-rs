@@ -706,9 +706,12 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // #109's dispose verb mutates durable state (it deletes retained
             // artifacts and journals the outcome), so it joins
             // `cancel`/`retry`/`extend`'s bucket rather than the read-only
-            // `work list`/`show`/`transcript`/`retained` one.
-            let client = ensure_daemon(&data_dir).await?;
+            // `work list`/`show`/`transcript`/`retained` one. The preview
+            // path below never mutates, though, so it connects like
+            // `retained` (ADR 0009: observation must not materialize the
+            // thing observed) rather than auto-spawning a daemon.
             if !yes {
+                let client = observe_connect(&data_dir).await?;
                 let retained = client.retained().await?;
                 let mine: Vec<&Value> = retained["retained"]
                     .as_array()
@@ -735,6 +738,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
                 return Ok(());
             }
+            let client = ensure_daemon(&data_dir).await?;
             let result = client.reap(&id, true).await?;
             if sgt.json {
                 print_json(&result);
