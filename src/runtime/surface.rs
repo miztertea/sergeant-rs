@@ -89,6 +89,40 @@ pub fn work_branch(work_id: &str) -> String {
     format!("sergeant/{work_id}")
 }
 
+/// How a binding's worktree came to exist on `work_branch`.
+///
+/// Every binding before this variant existed was implicitly `Cut` — the
+/// only shape `materialize` could ever produce — so this defaults to `Cut`
+/// on deserialize (`#[serde(default)]` on `RepositoryBinding::origin`) and
+/// every journaled binding from before this field existed reads back
+/// exactly the fact it recorded.
+///
+/// `base_branch`/`base_sha` mean something different depending on which
+/// variant they sit beside. For `Cut` they are what *this* branch was cut
+/// from — the only meaning they have ever had. For `Attached` (§8.6
+/// investigation, Mechanism A) they are carried over unchanged from the
+/// *target*'s own binding: what the branch this binding attached to was
+/// itself cut from. Reusing them to mean "attached to `target_work_id`'s
+/// branch" instead would blur a provenance distinction the journal
+/// otherwise makes cleanly (the investigation's own cost note) — `origin`
+/// is what carries that fact instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BindingOrigin {
+    /// `materialize` cut a fresh `sergeant/<work-id>` branch from
+    /// `base_branch`/`base_sha`. The only shape that existed before
+    /// `attach`.
+    #[default]
+    Cut,
+    /// `attach` checked this binding out onto a branch a different,
+    /// already-terminal Work materialized — never minting a branch of its
+    /// own.
+    Attached {
+        /// The Work whose branch this binding attached to.
+        target_work_id: String,
+    },
+}
+
 /// What §11 requires each repository binding to record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryBinding {
@@ -106,6 +140,12 @@ pub struct RepositoryBinding {
     pub work_branch: String,
     /// HEAD of the worktree as last recorded.
     pub head_sha: String,
+    /// How this binding came to be on `work_branch`: cut fresh, or attached
+    /// to another Work's branch. `#[serde(default)]` so a binding journaled
+    /// before this field existed — every one of them a `Cut`, the only
+    /// shape that could exist then — deserializes as exactly that.
+    #[serde(default)]
+    pub origin: BindingOrigin,
 }
 
 /// What materialization is about to create, recorded before it creates any of
@@ -411,6 +451,7 @@ fn materialize_one(
         worktree_path,
         work_branch: branch.to_string(),
         head_sha,
+        origin: BindingOrigin::Cut,
     })
 }
 
@@ -485,6 +526,154 @@ pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError>
     Ok(WorkSurface {
         bindings,
         ..surface.clone()
+    })
+}
+
+/// Materialize a gate Work's surface by *attaching* to another, already-
+/// terminal Work's branches instead of minting fresh ones (§8.6
+/// investigation, Mechanism A —
+/// `docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`).
+///
+/// Every attached binding's `work_branch` is `target_bindings`'s own — this
+/// *is* `target_work_id`'s real branch, not a copy, which is what lets
+/// `axi sync --recover`'s fast-forward-in-place custody model (§8.6
+/// investigation §4) keep working unmodified: a fix commit made in the
+/// resulting worktree lands on the branch that will actually ship.
+///
+/// **Callers must have already established the precondition this mechanism
+/// depends on** — the target is terminal and its surface's teardown
+/// reported every binding `Removed` (`engine::branch_takeover_precondition`
+/// computes exactly that from journaled state and returns the bindings this
+/// function wants as `target_bindings`). This function does not re-derive
+/// that precondition; it only re-verifies what git itself can check at the
+/// moment of the attempt — an ordinary, non-forced `git worktree add`
+/// refuses cleanly if a worktree is (still, or again) attached to the
+/// branch, if the branch no longer exists, or if the target path collides
+/// with something already there. Those refusals surface as this function's
+/// own `Err`, not a panic or a forced takeover.
+///
+/// Same partial-failure discipline as [`materialize`]: a later repository's
+/// attach failing after earlier ones already produced a real binding rolls
+/// every binding *this call* created back through [`teardown`], so a failed
+/// gate-surface attach never leaves an orphaned worktree in the caller's
+/// repositories — same as an ordinary `materialize` failure, and using the
+/// identical [`SurfaceError::PartialFailure`] shape.
+pub fn attach(
+    surfaces_root: &Path,
+    work_id: &str,
+    target_work_id: &str,
+    target_bindings: &[RepositoryBinding],
+) -> Result<WorkSurface, SurfaceError> {
+    if target_bindings.is_empty() {
+        return Err(SurfaceError::NoRepositories);
+    }
+    let root = surface_root(surfaces_root, work_id);
+    create_dir_all_durable(&root).map_err(|source| SurfaceError::Io {
+        path: root.display().to_string(),
+        source,
+    })?;
+    // Same symlink-smuggling guard `materialize` applies, for the same
+    // reason: §11's "outside every checkout" is about directories, not
+    // about how a path happens to be spelled.
+    let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+
+    let mut bindings: Vec<RepositoryBinding> = Vec::with_capacity(target_bindings.len());
+    for target in target_bindings {
+        let outcome = match attach_one(&root, &canonical_root, target_work_id, target) {
+            Ok(binding) => init_submodules_if_present(&binding.worktree_path)
+                .map(|()| binding.clone())
+                .map_err(|err| (Some(binding), err)),
+            Err(err) => Err((None, err)),
+        };
+        match outcome {
+            Ok(binding) => bindings.push(binding),
+            Err((created, err)) => {
+                // A binding was created for *this* repository before the
+                // failure (the submodule case) — fold it into the set being
+                // rolled back so its worktree, checked out onto the target's
+                // real branch, is torn down exactly like every earlier
+                // repository's, mirroring `materialize`'s own handling.
+                bindings.extend(created);
+                // Nothing to roll back if no repository ever produced a
+                // binding: surface the original error as-is, exactly like
+                // `materialize`'s own first-repository case.
+                if bindings.is_empty() {
+                    return Err(err);
+                }
+                let partial = WorkSurface {
+                    work_id: work_id.to_string(),
+                    root,
+                    bindings,
+                };
+                let report = teardown(&partial);
+                return Err(SurfaceError::PartialFailure {
+                    source: Box::new(err),
+                    teardown: report,
+                });
+            }
+        }
+    }
+    Ok(WorkSurface {
+        work_id: work_id.to_string(),
+        root,
+        bindings,
+    })
+}
+
+fn attach_one(
+    root: &Path,
+    canonical_root: &Path,
+    target_work_id: &str,
+    target: &RepositoryBinding,
+) -> Result<RepositoryBinding, SurfaceError> {
+    let worktree_path = root.join(&target.repository);
+    let canonical_repo_path =
+        std::fs::canonicalize(&target.source_path).unwrap_or_else(|_| target.source_path.clone());
+    if canonical_root
+        .join(&target.repository)
+        .starts_with(&canonical_repo_path)
+    {
+        return Err(SurfaceError::InsideSourceCheckout {
+            worktree: worktree_path.display().to_string(),
+            source_repo: target.source_path.display().to_string(),
+        });
+    }
+    let head_sha = with_repository(&target.source_path, || -> Result<String, SurfaceError> {
+        // `create_branch: false`: the git-level operation `rematerialize`
+        // already performs in a different context (re-attaching a surface's
+        // own retained branch), invoked here from a new caller with a
+        // branch this surface did not mint. Git itself enforces the
+        // exclusivity this depends on — see the doc comment on [`attach`].
+        //
+        // Deliberately *not* `rematerialize`'s own "branch missing, fall
+        // back to base_sha" leniency (verified by reverting to it and
+        // watching `attach_refuses_when_the_target_branch_is_missing` fail):
+        // that fallback is safe for a `Cut` binding re-attaching to its own
+        // branch, but a missing branch here means the *target*'s real
+        // branch is gone — silently substituting its base commit would
+        // materialize a gate surface that reviews stale, wrong content
+        // instead of refusing.
+        add_worktree_from(
+            &target.source_path,
+            &worktree_path,
+            &target.work_branch,
+            &target.work_branch,
+            false,
+        )?;
+        Ok(git(&worktree_path, &["rev-parse", "HEAD"])?)
+    })?;
+
+    Ok(RepositoryBinding {
+        repository: target.repository.clone(),
+        source_path: target.source_path.clone(),
+        base_branch: target.base_branch.clone(),
+        base_sha: target.base_sha.clone(),
+        worktree_path,
+        work_branch: target.work_branch.clone(),
+        head_sha,
+        origin: BindingOrigin::Attached {
+            target_work_id: target_work_id.to_string(),
+        },
     })
 }
 
@@ -1380,5 +1569,357 @@ mod tests {
             worktree.exists() && worktree.join("vendored").join("actors-work.txt").is_file(),
             "the uncommitted file must still be there — nothing destroyed it"
         );
+    }
+
+    // -------------------------------------------- §8.6 Mechanism A: `attach`
+
+    /// The whole point of Mechanism A, proven end to end rather than assumed:
+    /// once a target's surface has torn down clean, `attach` checks its
+    /// branch out into a *second* Work's surface, and a commit made there —
+    /// standing in for a no-mistakes auto-fix — lands on the exact same
+    /// branch ref the target left behind. This is the property Mechanism B
+    /// (reviewing a copy) was rejected for lacking: `axi sync --recover`
+    /// fast-forwards whatever is checked out in the worktree it runs
+    /// against, so the branch a fix actually reaches must *be* the real
+    /// branch, not a lookalike.
+    #[test]
+    fn attach_checks_out_the_targets_real_branch_and_a_fix_commit_lands_on_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let target = materialize(data.path(), "01TARGET", std::slice::from_ref(&spec))
+            .expect("materialize target");
+        let target_branch = target.bindings[0].work_branch.clone();
+        assert_eq!(target_branch, work_branch("01TARGET"));
+
+        // The target commits its own work before finishing.
+        std::fs::write(
+            target.bindings[0].worktree_path.join("feature.rs"),
+            "fn feature() {}\n",
+        )
+        .expect("write feature");
+        git_as_test_identity(&target.bindings[0].worktree_path, &["add", "."]);
+        git_as_test_identity(
+            &target.bindings[0].worktree_path,
+            &["commit", "-m", "feature"],
+        );
+        let pre_gate_tip =
+            git(&target.bindings[0].worktree_path, &["rev-parse", "HEAD"]).expect("target head");
+
+        let target_report = teardown(&target);
+        assert!(
+            target_report.clean,
+            "the fixture must reach the clean-teardown precondition: {target_report:?}"
+        );
+
+        let gate = attach(data.path(), "01GATE", "01TARGET", &target.bindings)
+            .expect("attach must succeed once the target has torn down clean");
+        assert_eq!(gate.bindings.len(), 1);
+        assert_eq!(gate.bindings[0].work_branch, target_branch);
+        assert_eq!(
+            gate.bindings[0].origin,
+            BindingOrigin::Attached {
+                target_work_id: "01TARGET".to_string()
+            }
+        );
+        assert_eq!(gate.bindings[0].head_sha, pre_gate_tip);
+        // Provenance is carried over from the target's own binding, not
+        // reinvented as of gate-dispatch time.
+        assert_eq!(gate.bindings[0].base_branch, target.bindings[0].base_branch);
+        assert_eq!(gate.bindings[0].base_sha, target.bindings[0].base_sha);
+
+        // The gate Work commits a fix, standing in for a no-mistakes
+        // auto-fix round.
+        std::fs::write(
+            gate.bindings[0].worktree_path.join("fix.rs"),
+            "fn fix() {}\n",
+        )
+        .expect("write fix");
+        git_as_test_identity(&gate.bindings[0].worktree_path, &["add", "."]);
+        git_as_test_identity(&gate.bindings[0].worktree_path, &["commit", "-m", "fix"]);
+        let fix_commit = git(&gate.bindings[0].worktree_path, &["rev-parse", "HEAD"])
+            .expect("gate head after fix");
+
+        // The real branch — read from the source repository, independent of
+        // either worktree — has the fix. Not a copy that never moved it.
+        let branch_tip = git(
+            &spec.path,
+            &["rev-parse", &format!("refs/heads/{target_branch}")],
+        )
+        .expect("branch tip in source repo");
+        assert_eq!(
+            branch_tip, fix_commit,
+            "a commit made in the attached worktree must land on the target's real branch"
+        );
+
+        let gate_report = teardown(&gate);
+        assert!(gate_report.clean, "gate teardown: {gate_report:?}");
+        // Teardown always retains the branch — including one it only ever
+        // attached to, never minted.
+        assert!(
+            git_succeeds(
+                &spec.path,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{target_branch}")
+                ]
+            ),
+            "the branch survives the gate surface's own teardown"
+        );
+    }
+
+    /// Git's own exclusivity check (verified directly in the §8.6
+    /// investigation) is the mechanism Mechanism A's ordering constraint
+    /// depends on: `attach` must fail, not force, when the target's
+    /// worktree is still attached to the branch — i.e., when the caller
+    /// dispatched a gate Work without actually waiting for the target's
+    /// teardown to report clean.
+    #[test]
+    fn attach_refuses_when_the_target_worktree_is_still_attached() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let target = materialize(data.path(), "01LIVE", std::slice::from_ref(&spec))
+            .expect("materialize target");
+        // No teardown: the target's worktree is still live on its branch.
+
+        let err = attach(data.path(), "01GATE", "01LIVE", &target.bindings)
+            .expect_err("attach must refuse while the target's worktree still holds the branch");
+        assert!(
+            matches!(err, SurfaceError::Git(_)),
+            "expected git's own exclusivity refusal, got {err}"
+        );
+        assert!(
+            !data.path().join("01GATE").join("solo").exists(),
+            "a refused attach must leave no worktree behind"
+        );
+
+        // Reverting the fix (attempting the takeover before teardown) is
+        // exactly the race Mechanism A's precondition exists to prevent —
+        // pin it the other way too: once the target *does* tear down clean,
+        // the identical call succeeds.
+        let report = teardown(&target);
+        assert!(report.clean);
+        attach(data.path(), "01GATE2", "01LIVE", &target.bindings)
+            .expect("attach must succeed once the target's worktree is actually gone");
+    }
+
+    /// A branch that no longer exists — deleted out of band after a clean
+    /// teardown, since teardown itself never deletes a branch — is a git
+    /// refusal `attach` must surface as an error, not a panic or a silent
+    /// fresh branch.
+    #[test]
+    fn attach_refuses_when_the_target_branch_is_missing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let target = materialize(data.path(), "01GONEBRANCH", std::slice::from_ref(&spec))
+            .expect("materialize target");
+        let report = teardown(&target);
+        assert!(report.clean);
+
+        let branch = target.bindings[0].work_branch.clone();
+        git(&spec.path, &["branch", "-D", &branch]).expect("delete the branch out of band");
+
+        let err = attach(data.path(), "01GATE", "01GONEBRANCH", &target.bindings)
+            .expect_err("attach must refuse when the branch no longer exists");
+        assert!(
+            matches!(err, SurfaceError::Git(_)),
+            "expected a git refusal naming the missing branch, got {err}"
+        );
+        assert!(!data.path().join("01GATE").join("solo").exists());
+    }
+
+    /// A worktree path collision — something already at the exact path
+    /// `attach` would create — is git's own refusal to add a worktree onto a
+    /// non-empty directory. `attach` must surface it, not overwrite or
+    /// destroy whatever is already there.
+    #[test]
+    fn attach_refuses_on_worktree_path_collision() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let target = materialize(data.path(), "01COLLIDE", std::slice::from_ref(&spec))
+            .expect("materialize target");
+        let report = teardown(&target);
+        assert!(report.clean);
+
+        let colliding_path = data.path().join("01GATE").join("solo");
+        std::fs::create_dir_all(&colliding_path).expect("pre-create the colliding directory");
+        std::fs::write(colliding_path.join("occupied.txt"), "already here\n")
+            .expect("occupy the path");
+
+        let err = attach(data.path(), "01GATE", "01COLLIDE", &target.bindings)
+            .expect_err("attach must refuse a worktree path collision");
+        assert!(
+            matches!(err, SurfaceError::Git(_)),
+            "expected git's own refusal to add a worktree onto a non-empty path, got {err}"
+        );
+        assert!(
+            colliding_path.join("occupied.txt").is_file(),
+            "the pre-existing content must survive a refused attach"
+        );
+    }
+
+    /// Same partial-failure discipline as `materialize`'s own
+    /// `a_later_repository_failing_rolls_back_the_earlier_ones`: a second
+    /// repository's attach failing after the first already succeeded must
+    /// roll the first back through `teardown` and report it, never leave it
+    /// stranded in the caller's checkout.
+    #[test]
+    fn a_later_repositorys_failed_attach_rolls_back_the_earlier_one() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mut first = repo(&dir.path().join("first"));
+        first.name = "first".to_string();
+        let mut second = repo(&dir.path().join("second"));
+        second.name = "second".to_string();
+
+        let target = materialize(
+            data.path(),
+            "01PARTIALATTACH",
+            &[first.clone(), second.clone()],
+        )
+        .expect("materialize target");
+        let report = teardown(&target);
+        assert!(report.clean);
+
+        // The second repository's branch is gone by the time the gate
+        // attaches — attach_one for "second" must fail after "first" already
+        // succeeded.
+        let branch = work_branch("01PARTIALATTACH");
+        git(&second.path, &["branch", "-D", &branch]).expect("delete second's branch");
+
+        let err = attach(data.path(), "01GATE", "01PARTIALATTACH", &target.bindings)
+            .expect_err("the second repository's attach must fail");
+        let SurfaceError::PartialFailure {
+            teardown: rollback, ..
+        } = err
+        else {
+            panic!("expected a partial failure with a rollback report");
+        };
+        assert_eq!(rollback.bindings.len(), 1, "only the first got that far");
+        assert_eq!(rollback.bindings[0].repository, "first");
+        assert_eq!(
+            rollback.bindings[0].disposition,
+            BindingDisposition::Removed
+        );
+        assert!(rollback.clean);
+        assert!(
+            !data.path().join("01GATE").join("first").exists(),
+            "the rolled-back gate worktree must be gone"
+        );
+        // And the target's own branches are untouched by the failed attach —
+        // attach never deletes anything it did not itself create.
+        assert!(git_succeeds(
+            &first.path,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}")
+            ]
+        ));
+    }
+
+    /// Mirrors `materialize`'s own
+    /// `a_disallowed_submodule_transport_fails_closed_and_is_not_stranded`,
+    /// but pins the regression this fix closes in `attach`'s own code path:
+    /// before it, `init_submodules_if_present` ran *inside* `attach_one`, so
+    /// a failure there returned `attach_one`'s bare `Err` without the binding
+    /// the worktree add had already produced — `attach`'s "nothing to roll
+    /// back, this is the first repository" case fired unconditionally on
+    /// position (this is the only repository) and stranded the worktree with
+    /// no teardown, no report, nothing journaled.
+    #[test]
+    fn attach_disallowed_submodule_transport_fails_closed_and_is_not_stranded() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let inner = repo(&dir.path().join("inner"));
+        let spec = repo(&dir.path().join("solo"));
+
+        let target = materialize(data.path(), "01SUBTARGET", std::slice::from_ref(&spec))
+            .expect("materialize target");
+        let worktree = target.bindings[0].worktree_path.clone();
+
+        // Declare a submodule over a transport `init_submodules_if_present`'s
+        // allowlist refuses (`ext::`, the same allowlist `git_clone` uses),
+        // committed onto the target's own work branch so `attach` inherits
+        // it when it checks that branch out fresh into the gate surface.
+        let inner_head = git(&inner.path, &["rev-parse", "HEAD"]).expect("inner HEAD");
+        std::fs::write(
+            worktree.join(".gitmodules"),
+            "[submodule \"vendored\"]\n\tpath = vendored\n\turl = ext::false\n",
+        )
+        .expect(".gitmodules");
+        std::fs::create_dir_all(worktree.join("vendored")).expect("placeholder");
+        git_as_test_identity(&worktree, &["add", ".gitmodules"]);
+        git_as_test_identity(
+            &worktree,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &inner_head,
+                "vendored",
+            ],
+        );
+        git_as_test_identity(&worktree, &["commit", "-m", "an unreachable submodule"]);
+
+        let target_report = teardown(&target);
+        assert!(
+            target_report.clean,
+            "the fixture must reach the clean-teardown precondition: {target_report:?}"
+        );
+
+        let err = attach(data.path(), "01GATE", "01SUBTARGET", &target.bindings)
+            .expect_err("a disallowed submodule transport must refuse the takeover");
+        let SurfaceError::PartialFailure {
+            source,
+            teardown: rollback,
+        } = err
+        else {
+            panic!(
+                "expected the same rolled-back-and-reported shape a later repository's \
+                 failure gets, got a bare {err} — the worktree add_worktree already created \
+                 would be left with no report at all"
+            );
+        };
+        assert!(
+            source.to_string().contains("ext"),
+            "git's own transport diagnostic must survive: {source}"
+        );
+        assert_eq!(rollback.bindings.len(), 1);
+        assert_eq!(rollback.bindings[0].repository, "solo");
+        assert_eq!(
+            rollback.bindings[0].disposition,
+            BindingDisposition::Removed,
+            "a submodule that never checked anything out has nothing to retain: {:?}",
+            rollback.bindings[0].disposition
+        );
+        assert!(
+            !data.path().join("01GATE").join("solo").exists(),
+            "the worktree add_worktree created before the submodule failure must not survive"
+        );
+        assert!(rollback.clean);
+    }
+
+    /// `attach` needs at least one target binding — the same rule
+    /// `materialize` enforces for repositories, for the same reason: a
+    /// surface with no worktrees could never execute anything.
+    #[test]
+    fn attach_needs_at_least_one_target_binding() {
+        let data = tempfile::TempDir::new().expect("tempdir");
+        assert!(matches!(
+            attach(data.path(), "01EMPTY", "01TARGET", &[]),
+            Err(SurfaceError::NoRepositories)
+        ));
     }
 }

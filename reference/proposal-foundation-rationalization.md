@@ -202,9 +202,10 @@ binding a surface to a branch it did not mint. Either the gate Work binds to
 the target branch, which git forbids while the target's own worktree exists,
 or it reviews a copy, which breaks no-mistakes' assumption that its auto-fix
 commits are recovered onto the branch being shipped. The *intent* is to fold
-gate ownership into the surface model; the binding mechanism is **open**, and
-tracked as such — ADR 0005's own Open Questions already say the shape of the
-gate Work is undecided. §8.6 carries it.
+gate ownership into the surface model; the binding mechanism itself is now
+**answered and implemented** — §8.6 has the mechanism and what still remains
+open around it (a submission shape and fail-closed dispatch behavior, neither
+of which this one-owner invariant depends on).
 
 ## 4.3 Ambiguity fails closed
 §5.5's sweep makes more surfaces fail closed, not fewer. §5.3's safety net
@@ -454,12 +455,49 @@ because they need live dialogue. If gating becomes a dispatched Work,
 to, may now be dead weight. Not decided here.
 
 ## 8.6 How a gate Work binds to the branch it reviews
-Raised by FOUNDATION-1's only surviving error (`inv-one-owner-relocated`).
-A sergeant surface mints its own `sergeant/<work-id>` branch; the gate needs
-the branch under review. Binding to the target directly is forbidden by git
-while the target's worktree exists; reviewing a copy breaks no-mistakes'
-recovery of auto-fix commits onto the shipped branch. Neither path is chosen
-here, and §5.1 must not be dispatched until one is.
+**Answered.** Raised by FOUNDATION-1's only surviving error
+(`inv-one-owner-relocated`). A sergeant surface mints its own
+`sergeant/<work-id>` branch; the gate needs the branch under review. Binding
+to the target directly is forbidden by git while the target's worktree
+exists; reviewing a copy breaks no-mistakes' recovery of auto-fix commits
+onto the shipped branch.
+
+`docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md` investigated
+both paths directly (not merely reasoned about them — git's own exclusivity
+refusal was reproduced against scratch repositories) and recommended
+Mechanism A, sequenced branch takeover: dispatch the gate Work only once the
+target Work is terminal and its surface has torn down clean, then
+materialize the gate Work's surface by *attaching* to the target's existing
+branch rather than minting a new one. That recommendation's items 1 and 2 are
+now implemented: `crate::runtime::engine::branch_takeover_precondition`
+answers, from journaled state alone, fail-closed and with a named reason,
+whether a target's branch is safe to take over (terminal in the *absorbing*
+sense — completed or canceled, never `failed`, which is retryable and would
+race a takeover already in progress); `crate::runtime::surface::attach`
+performs the takeover, reusing the same `create_branch: false` git operation
+`rematerialize` already runs in a different context, with its own
+`RepositoryBinding::origin` field distinguishing an attached binding from an
+ordinarily-cut one. Ordinary `materialize` is unchanged. §5.1 may now be
+dispatched for the binding mechanism's sake; it still needs items 3 and 4
+below before it can be dispatched *end to end*.
+
+**Still open, and deliberately not answered here:** a submission shape for
+"this Work reviews `<target-work-id>`" (no field on `SubmitContext`/
+`StartPlan` carries this yet — a sibling entry point to `Engine::plan` that
+derives its workspace from the target's own bindings rather than from a
+caller's `cwd`, reachable through a dedicated CLI/API verb rather than a mode
+flag on ordinary `sgt work submit`, is the shape this work recommends but did
+not implement), and the operational response to each precondition failure:
+block and wait (not poll) for a not-yet-terminal target to go terminal;
+block and escalate a retained-dirty target's teardown to Captain rather than
+silently re-driving the target's own retry path (which would let a gate
+Work's dispatch implicitly resurrect and re-execute a *different* Work — a
+larger authority than "review this output" implies, and a risk to the
+independence §8.2 already flags); and treat the residual git-level takeover
+race (`surface::attach`'s own `Err`) the same way an ordinary `materialize`
+failure is already treated — fail the gate Work closed to `blocked`, never
+retried automatically. These are product decisions an owner ruling should
+make, not inventions of this work.
 
 ## 8.7 Where a manifest `data_dir` sits relative to `SGT_DATA_DIR`
 Raised by FOUNDATION-1. §5.4 settles estate-vs-XDG precedence and does not
