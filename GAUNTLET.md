@@ -58,6 +58,101 @@ letter by coincidence, as D6 and D7 do here.
 
 ## Ledger entries
 
+### PATH-TO-MAC-1 — 2026-08-15, a plan graded before it governed: two sections sent back, premise disproved
+
+**Mission outcome: sent back on §4/§5, validated with findings elsewhere.** The
+first unit in this ledger to reach *sent back* on any section. Artifact:
+`docs/gauntlet/runs/path-to-mac-2026-08-15/plan.md` at `d86885f` — a six-Work
+sprint plan, authored in one pass by the orchestrating session from an owner
+interview, with no prior review. Contract:
+`docs/gauntlet/contracts/PATH-TO-MAC-1.md`. Full record in that run directory
+(`critics/`, `refuters/`, `adjudication.md`).
+
+FOUNDATION-1's own test is why this is *sent back* rather than *validated with
+findings*: that unit's outcome held because every finding's verdict was that its
+section survived a local correction. Not true here. §4 and §5 rested on the
+premise that #18, #81 and #82 needed building. **All three were already built** —
+complete, dual-platform, unit-tested implementations shipping in the binary,
+each blocked only on a macOS host to flip an `UNVERIFIED` marker
+(`src/platform/{process,disk,data_dir}.rs`, landed in `4eadc50`). No local
+correction repairs a section whose subject does not exist. Only #85 was
+genuinely unbuilt.
+
+**Root cause is L18, and it recurred within the same sprint.** The plan was
+derived from the issue tracker and the authoring session's memory of it, never
+from the current `src/platform/`. Then wave 1 found **#94 already fixed too**
+(ADR 0007's `stranded_completion`/`reported_state` shipping `completed_dirty`,
+commits `90b8c23`/`1c27a54`, both ancestors) — and `completed_dirty` had been
+printed by the **first `sgt status` of the session**. The panel caught the
+platform case only because the brief happened to ask about that module; nothing
+asked about #94. **Consequence for method: "does the product already do this?"
+must be a mechanical planning step with a named artifact to check, not a
+question someone thinks to ask.** L18 already says the comparison list is
+re-derived from the product every pass; what it lacked was a trigger.
+
+**Verdicts.** 22 findings across four axes: 18 confirmed, 6 PLAUSIBLE, 1 central
+claim refuted, 2 sub-claims refuted inside otherwise-confirmed findings, 5
+severity moves (2 up, 2 down, 1 non-finding upgraded to a finding).
+
+| Axis | Findings | Refuted | Confirmed | Moves |
+|---|---|---|---|---|
+| fidelity | 4 | 0 outright (1 partial) | 3 + 1 PLAUSIBLE | reasoning downgraded |
+| invariants | 4 | 1 sub-claim | 2 + 2 PLAUSIBLE | none |
+| enactability | 6 | 0 | 6 | 1 upgrade |
+| assumptions | 8 | 1 central | 7 + 3 PLAUSIBLE | 1 down, 2 up |
+
+**The false absence is the method finding.** Two blind seats independently
+reported a quoted objection as *invented*, both from greps scoped to `docs/`,
+`reference/`, `GAUNTLET.md`, `LESSONS.md` — excluding `src/`, where it lives
+verbatim. The fidelity refuter re-ran the critic's own stated command, got three
+hits where the critic reported one, and traced the phrase into
+`src/backend/docker.rs`'s git history. **Both critics proposed deleting the
+claim; applying that would have removed a true, sourced statement.** This is L23
+occurring inside two reports that themselves cite L23 — the third recorded
+instance of a pattern surviving being named, and the first where the correction
+itself would have caused the damage.
+
+**A panel disagreement was signal, not noise.** `enactability` explicitly
+declined to find on the plan's #108 ruling; `assumptions` graded the same text
+an error. The enactability refuter settled it by reading `src/watch.rs` rather
+than reasoning: the dead-man test returns an ordinary `Err` and completes
+normally, so no `SIGKILL` is involved and `Drop` runs. A "nothing found" from
+one seat is not evidence of nothing. The plan's ruling was corrected and the
+mis-attached rationale became its own issue (#113).
+
+**Contract Unknowns, answered.** (1) A four-axis document panel earned its
+seats twice — `assumptions` alone produced the platform-state table that sent
+§4/§5 back. (2) **An all-Sonnet panel held**: 8 seats, all Sonnet, all 1 turn of
+25, ~2,300 lines of findings and verdicts, producing a refutation, an upgrade,
+two downgrades, and a refutation of the orchestrator's own hypothesis. Second
+data point after FOUNDATION-1; `gauntlet-pattern.md`'s reservation of Opus for
+blind adversarial review has now not been needed twice. (3) `research` served as
+a critic seat — its durable outcome (primary sources only, every claim traced,
+one cited Markdown file) is a critic's contract nearly verbatim. Friction worth
+recording: it carries no notion of a *verdict*, so refuters invented
+CONFIRMED/REFUTED/DOWNGRADED from the brief. A dedicated seat workflow would
+carry that vocabulary and the probe-hygiene rules structurally.
+
+**A specific line of attack moved every outcome, again.** All four refuters were
+given one; all four moved something. FOUNDATION-1 recorded this from three axes;
+two units now show it, and it should be treated as standing refuter-brief
+practice rather than a per-unit choice.
+
+**Environmental behavior.** 9 dispatched Works: 1 two-axis `code-review` first
+pass (5/25 turns, owner-ruled "a good first pass but not the right instrument"),
+4 blind critics and 4 batched refuters (1/25 turns each). Zero `needs_input`,
+zero failures, zero leaked surfaces. One product defect surfaced by running the
+loop: **a dispatched Work cannot resolve GitHub issue numbers** — the estate
+clone's only remote is a local path, so `gh` fails with a misdirecting auth
+remedy while `gh auth status` shows a valid account; one seat honestly recorded
+an issue as PLAUSIBLE rather than guessing. Filed as **#112**; worked around in
+this estate by adding a `github` remote. The orchestrator's own instruments
+failed twice in the same class the unit was studying — three backgrounded
+watchers killed at ~160s, and a replacement monitor that failed silently on a
+shell syntax error — recorded because *an observer that fails quietly is
+indistinguishable from a subject that has not moved*, which is #90 and #94's
+shape pointed at the harness.
+
 ### ADR 0008 — 2026-08-14, manifest authority over its own state location: (b) implemented, (a) pinned unchanged, (c) re-ruled and #64 closed without code
 
 **Mission outcome: shipped.** Implements proposal §5.4 / ADR 0008, a Work
