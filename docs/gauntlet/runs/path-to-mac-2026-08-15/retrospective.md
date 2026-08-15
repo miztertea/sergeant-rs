@@ -80,19 +80,39 @@ into custody locally and **never landed on the integration branch**, so it
 existed on exactly one machine. A `-D` in the same sweep as the other ten
 would have destroyed it silently.
 
-Pushed to `archive/w6-gate-escalation` and `archive/w6b-gate-escalation`
-rather than merged: five near-duplicate ledger entries documenting one
-saga would bury the ledger, but the evidence has to survive somewhere
-durable.
+They were first pushed to `archive/w6-gate-escalation` and
+`archive/w6b-gate-escalation` rather than merged, on the reasoning that five
+near-duplicate ledger entries would bury the ledger but the evidence had to
+survive somewhere durable.
 
-The general lesson is about the **sweep**, not the branches: a cleanup that
-treats a session's artifacts as one homogeneous class will eventually delete
-the one that mattered. Here git's own merge check was the only thing
-distinguishing them, and it worked because the deletion used `-d` rather
-than `-D`. The previous retrospective recorded a session bundling four
+**That was wrong, and the owner caught it within the hour.** Checked
+properly, both branches contain **only `GAUNTLET.md` prose** — 166 and 155
+insertions, nothing else — and that prose is the Work's own account of a
+saga already recorded in three more discoverable places: **five first-person
+comments from the same Work on #120**, this retrospective's §1.2 and §3.1,
+and PR #122's body. The Works themselves remain journaled and their full
+intents retrievable. The branches preserved nothing unique, in the least
+findable location available. Both deleted.
+
+**This is L22 in miniature, committed roughly twenty minutes after writing
+§1.2 about it.** *"Correct retention is indistinguishable on disk from a
+leak"* — two permanent refs were created because deleting felt risky,
+without first asking whether the thing being preserved was actually the
+artifact. It was #120 all along.
+
+What *was* right: `git branch -d`'s merge check correctly flagged that those
+commits were not on the integration branch, and that was real signal. The
+error was inferring **"unmerged ⇒ must preserve"** instead of **"unmerged ⇒
+check whether it matters."** A safe default tells you to stop and look; it
+does not tell you what you are looking at.
+
+The general lesson is still about the **sweep**: a cleanup that treats a
+session's artifacts as one homogeneous class will eventually delete the one
+that mattered, and using `-d` rather than `-D` is what created the moment to
+check. The previous retrospective recorded a session bundling four
 destructive operations into one un-reviewable command; this is the same
-hazard at a smaller scale, caught by a safer default rather than by
-judgment.
+hazard at smaller scale, caught by a safer default — and then nearly
+converted into a leak by over-correcting.
 
 ---
 
