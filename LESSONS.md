@@ -20,14 +20,31 @@ subject, produced the answer:
 | guessed JSON path `run.surface` | "teardown never recorded" — the key is top-level |
 | `\| tail -1` on `gh pr edit` | "PR title updated" — the command had exited 1 |
 | `cmd \| head -3 && echo OK` | "patch applies" — `&&` saw `head`'s status, not the command's |
+| the path the harness reported | "edit `CLAUDE.md`" — it is a symlink; `AGENTS.md` is the file |
 
-The last two are the dangerous class, because the reduction ran on a
+The last row generalizes the rest past output-filtering, to **any indirection
+between you and the artifact.** The harness loads project instructions and
+names the path it opened; that path is mode `120000`, and the tracked file is
+`AGENTS.md`. A retrospective then proposed five changes to a symlink. The
+correction was on line 8 of `docs/DEVELOPMENT.md` — a file that same session
+had already edited twice without reading its first twelve lines — and this
+repo had been bitten once before (`GAUNTLET.md` CH-5: a skill citing
+"CLAUDE.md L1" after the symlink commit moved that text). Cite the file that
+holds the content, never the alias you were handed.
+
+The two pipe rows are the dangerous class, because the reduction ran on a
 *mutating* command and discarded the channel that reported failure —
 the same defect as `2>/dev/null` on a `git branch -D` that silently
 failed. Rules: a filtered view is evidence about the filter; anchor every
 monitor pattern (`^outcome:`); never place a pipe or a `&&` between a
-mutating command and its exit status; and confirm a claimed absence
-against the unfiltered artifact before reporting it as a finding.
+mutating command and its exit status; confirm a claimed absence
+against the unfiltered artifact before reporting it as a finding; and
+resolve a path before citing it — `git ls-files -s` names the mode.
+
+Calibration note worth keeping with the entry: three of these occurred
+*inside* the retrospective that documents the pattern, and the symlink one
+after the owner had to point it out. Naming a pattern does not stop it. Only
+a rule applied without judgment about whether this case needs it does.
 
 ## L22 — A "we never destroy X" invariant is a disk leak until a verb disposes of X
 
@@ -67,28 +84,45 @@ body of the test that happens to succeed. Related to L6 (an operation that
 fails after producing an unrecorded effect) — here the unrecorded effect is
 a file rather than a journal append. Filed as #108.
 
-## L20 — An owning document that summarizes a workflow's procedure guarantees readers stop there
+## L20 — Stale-but-true is the state that never triggers its own supersession
 
 Cerberus, 2026-08-14. The orchestrating session drove `no-mistakes` by hand
 for a full day — `gate.sh`, `axi respond`, `axi sync --recover` —
 reimplementing `validate-and-ship`'s `40-drive-gates` and
 `50-reconcile-custody` badly, and inventing a workaround around
-`--keep-local` for a dirty-worktree refusal rather than using it, because
-it did not know the flag existed. `AGENTS.md`'s routing table is correct
-and was not ambiguous: substantive procedural work with a matching
-published workflow loads that workflow. But `docs/DEVELOPMENT.md`'s
-"Shipping gate" section restated the procedure in prose and never named the
-workflow, and a reader who finds the prose complete never reaches the
-catalog.
+`--keep-local` for a dirty-worktree refusal rather than using it, because it
+did not know the flag existed. `AGENTS.md`'s routing table is correct and was
+not ambiguous. But `docs/DEVELOPMENT.md`'s "Shipping gate" section restated
+the procedure in prose and never named the workflow, and a reader who finds
+the prose complete never reaches the catalog.
 
-Root cause is documentation coupling, not model behavior — the prose
-predates the engine being able to run work at all, so it faithfully
-describes the only flow that existed when it was written. Every owning
-document that summarizes a published procedure must cite it and mark itself
-the summary; the fix is a pointer, not a rewrite. Corollary for this repo's
-layering rule: "the document that owns the topic wins" fails silently when
-the non-owning document is merely *stale* rather than contradictory,
-because nothing disagrees.
+Owner's framing, and it is the right one: **a document says what we knew when
+it was written; if it is wrong, supersede it and move on.** This repo already
+works that way — `reference/notes/` are living docs revised in place with
+dated entries, `GAUNTLET.md` is append-only, ADRs get refreshed once their
+decision ships.
+
+The sharpening this incident adds is about the *trigger*, not the action.
+That gate prose was never wrong. Every sentence in it was true on the day it
+was written and still true that morning — it predates the engine being able
+to run work at all, so it faithfully described the only flow that existed.
+Nothing contradicted it, so nothing prompted supersession. **Supersession
+fires on contradiction; staleness that keeps telling the truth produces no
+contradiction to fire on**, and the reader who stops there never learns what
+they were not told.
+
+So the mechanical hook cannot be "notice when a doc is wrong." It has to be:
+**when a capability ships, the prose that predates it is part of what ships.**
+That is the ADR-refresh rule this repo already enforces — and demonstrably
+enforces, since the shipping gate caught ADR staleness three separate times in
+one sprint — generalized past ADRs to any document describing a procedure the
+new capability now owns. Publishing a workflow includes asking what prose now
+summarizes it.
+
+Corollary for the layering rule ("the document that owns the topic wins"): it
+resolves *disagreements*, and this failure had none. Two documents both
+telling the truth, one of them written before the engine could run work at
+all, is outside what that rule can adjudicate.
 
 ## L19 — A governing document is an executable diff for the program: it takes the loop
 

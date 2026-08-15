@@ -42,7 +42,7 @@ Three surfaces survived teardown, all recording
 empty, so teardown *ran*; the directories were retained deliberately.
 
 That policy is right. Teardown preserves uncommitted work and never deletes a
-branch, and `CLAUDE.md` puts preserved state outside anything standing
+branch, and `AGENTS.md` puts preserved state outside anything standing
 authorization may destroy. **The gap is the other half:** no verb lists what is
 retained, explains why, or disposes of it once the work is banked. So the only
 route to 30 GB is `rm -rf` inside the engine's data dir — an ad hoc shell
@@ -54,6 +54,21 @@ Essentially the whole 30 GB is `target/`: build artifacts, gitignored, not
 what is genuinely worth retaining is a few hundred KB of tracked diff. The
 retention decision is made at *directory* granularity while the thing being
 protected is defined at *git* granularity.
+
+**The rate is the finding, not the total.** 30 GB came from **three** Works.
+This estate ran 28 in a single session; had every one torn down dirty, that is
+roughly 280 GB from one night's work on one repository, on a machine nobody
+warned. Retention is unbounded in the dimension that matters — it scales with
+Works dispatched, which is precisely the number sergeant exists to make large.
+Nothing in the engine samples, caps, or reports the total.
+
+Owner's ruling, and it reframes this issue: **what a run writes to disk is a
+contract, not hygiene.** Sergeant currently has no stated disk-footprint
+boundary — no declaration of what a Work may write, where, whose it is when the
+Work ends, or who is permitted to reclaim it. `retained_dirty` is an
+*implementation* of half of that contract with the other half unwritten, which
+is why 30 GB accumulated without a single surface reporting anything wrong.
+Recorded in #109; the missing contract is the larger item behind it.
 
 Generalized as `LESSONS.md` **L22**: a never-delete guarantee ships incomplete
 without its inspect-and-reap verb, because the absence gets routed around with
@@ -180,7 +195,7 @@ to say so. The framing "I forgot to set a monitor" is wrong and unfixable; the
 accurate framing is that **the monitor was armed after the wait began**, so
 anything landing in the gap was invisible and the only recovery was polling.
 
-`CLAUDE.md` step 6 already states the correct rule for the estate-wide case —
+`AGENTS.md` step 6 already states the correct rule for the estate-wide case —
 attach the watcher *before* reconciliation, because an estate-wide watch is
 edge-triggered from the moment it attaches. The same reasoning covers a gate
 run and it is not written there, because the gate is an external tool.
@@ -192,7 +207,7 @@ response, never as a follow-up.
 
 Foreground tool calls cap around ten minutes on this harness. Several gate runs
 and suite runs exceeded that, and each overrun cost a re-check cycle. The rule
-already in `CLAUDE.md` — background `--follow` for long or multiple waits — is
+already in `AGENTS.md` — background `--follow` for long or multiple waits — is
 right; what was missing is that **the estimate is the decision point**, and any
 wait that *might* exceed ten minutes should be backgrounded from the start
 rather than promoted after it stalls.
@@ -245,10 +260,22 @@ cost: pipeline-owned means *do not write to the worktree at all*, and undo on a
 gated branch is `revert`, never `reset`.
 
 Root cause is documentation coupling, not model behavior — the prose predates
-the engine being able to run work at all. Promoted as **L20**, whose corollary
-matters beyond this file: `CLAUDE.md`'s layering rule ("the document that owns
-the topic wins") fails silently when the non-owning document is merely *stale*
-rather than contradictory, because nothing disagrees.
+the engine being able to run work at all.
+
+Promoted as **L20**, reframed on the owner's ruling: a document says what we
+knew when it was written; if it is wrong, supersede it and move on. The
+sharpening the incident adds is about the *trigger*, not the action. **That
+prose was never wrong** — every sentence in it was true, which is exactly why
+nothing prompted supersession. Supersession fires on contradiction, and
+staleness that keeps telling the truth produces no contradiction to fire on.
+
+So the hook cannot be "notice when a doc is wrong." It has to be: **when a
+capability ships, the prose that predates it is part of what ships** — the
+ADR-refresh rule this repo already enforces (the gate caught ADR staleness
+three separate times this sprint), generalized past ADRs to any document
+describing a procedure the new capability now owns. And the layering rule
+("the document that owns the topic wins") could not have caught this: it
+resolves disagreements, and there was none.
 
 **`docs/DEVELOPMENT.md` — test artifacts follow the build-dir placement rule.**
 Nothing a suite creates may be left in `std::env::temp_dir()`, and cleanup goes
@@ -256,15 +283,38 @@ in the code under test or a guard rather than a test body.
 
 **`LESSONS.md` L20–L23.**
 
-### 3.2 Proposed, not made — these are the owner's to rule on
+### 3.2 The proposals named the wrong file — corrected
+
+As first written, §3.2 proposed two changes to **`CLAUDE.md`**. There is no
+such file. It is a git symlink (mode `120000`) to `AGENTS.md`, which is the
+tracked artifact; the harness loads project instructions and reports the path
+it opened, and that path was cited all session without ever being resolved.
+
+The correction was on **line 8 of `docs/DEVELOPMENT.md`** — "This file used to
+be `CLAUDE.md`; that path is now a git symlink to `AGENTS.md`" — in a document
+this session edited twice tonight without reading its first twelve lines. It
+is also not the first time: `GAUNTLET.md` CH-5 records a skill citing
+"CLAUDE.md L1" after the symlink commit had moved that text away.
+
+Repo-wide the drift is live: 145 files cite `AGENTS.md`, 48 cite `CLAUDE.md`.
+Citations through the alias resolve correctly for a reader with a checkout, so
+this is not urgent — but it is the reason a proposal was addressed to a
+symlink, and it is worth a decision on whether `CLAUDE.md` is ever a valid
+citation target or only an entry point.
+
+Folded into **L23** as its last row, because it is that lesson's shape rather
+than a new one: an indirection sat between the artifact and the reader, and
+the indirection got cited instead of the artifact.
+
+### 3.3 Proposed, not made — these are the owner's to rule on
 
 Deliberately not enacted: they change governing text or product behavior.
 
-1. **`CLAUDE.md` step 6 — generalize the watcher-before-wait rule.** It is
+1. **`AGENTS.md` step 6 — generalize the watcher-before-wait rule.** It is
    currently written for the estate-wide `sgt watch` case. The same
    edge-triggered reasoning covers any long external wait, including a gate run.
    (§2.2)
-2. **`CLAUDE.md` — brief transport.** Make file-passed briefs the documented
+2. **`AGENTS.md` — brief transport.** Make file-passed briefs the documented
    default over inline strings, given the command-substitution hazard. (§2.4)
 3. **A start-of-run reaper, not another `Drop` guard.** `Drop` does not survive
    `SIGKILL`, and SIGKILL is how these processes actually die. Extending
