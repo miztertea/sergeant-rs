@@ -6,6 +6,37 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L24 — A quiet observer and a stalled subject look identical; and a false absence's *correction* is where the damage lands **[world-delta]**
+
+Cerberus, 2026-08-15, PATH-TO-MAC-1. Two halves of one shape, both found in a
+single unit.
+
+**The correction is the dangerous end of a false absence.** Two blind critic
+seats independently reported a quoted objection as *invented* — "appears nowhere
+in this repo except the plan itself" — each from a `grep` scoped to `docs/`,
+`reference/`, `GAUNTLET.md`, `LESSONS.md`, excluding `src/`, where it sits
+verbatim at `src/platform/disk.rs:5` and, originally, in
+`src/backend/docker.rs`'s git history. Both proposed **deleting the claim.**
+L23 already covers why the absence was reported; what it did not cover is that
+here the *remedy* was the destructive act. A wrong finding costs a turn; a wrong
+finding whose correction deletes a true, sourced statement costs the record
+itself. Rule: **before acting on a claimed absence, re-run the search unscoped,
+and prefer a correction that re-cites over one that removes.** The adversarial
+pass is what caught it — the refuter re-ran the critic's own stated command and
+got three hits where the critic reported one.
+
+**An instrument that fails silently is indistinguishable from a subject that
+has not moved.** In the same session: three backgrounded watchers were killed by
+the harness at ~160s each, and their replacement monitor died instantly on a
+shell syntax error. Every one of those failures presents as *silence*, which is
+exactly what "the Work is still running" also looks like. This is #90's shape
+(a ceiling-interrupted Work wedged in `active` where no verb reaches it) and
+#94's (a Work reporting `completed` with nothing committed) pointed at the
+observer rather than the observed. Rule: **an observer needs its own liveness
+proof.** A monitor's first emission should be its self-test; a watcher's death
+is a prompt to read journal state, never information about the subject; and any
+filter must match every terminal state, because silence is not success.
+
 ## L23 — Every reduction of output lied at least once: read the artifact, not the view of it
 
 Cerberus, 2026-08-14/15 sprint. Five instances in one session, four tool
@@ -156,6 +187,20 @@ pass re-derives from the product, never from memory. The owner caught
 it from one package description; the fix (convention §2a bucket 4) cost
 a paragraph. The 10M-token library build did not catch it at any of
 its five review gates because no gate's brief included the engine.
+
+**Sharpened 2026-08-15 (PATH-TO-MAC-1): this lesson needs a trigger, not just
+a principle.** A sprint plan scoped a Work to build cross-platform support for
+#18, #81 and #82; all three already shipped, dual-platform and unit-tested, in
+`src/platform/`, and `src/platform/disk.rs`'s own doc comment argued against the
+change the plan proposed. A four-axis blind panel caught it — but only because
+one brief happened to name that module. Wave 1 then found **#94 already fixed
+too**, and `completed_dirty` had been printed by the session's **first `sgt
+status`**. Twice in one sprint, from a plan derived off the issue tracker and
+memory of it. "Re-derive the comparison list from the product" is correct and
+was not enough, because nothing fired. The mechanical form: **for every issue a
+plan proposes to close, name the artifact you read to confirm it is still open —
+the file, the test, the surface — before the plan is allowed to govern.** A
+tracker says an issue is open; it does not say the code has not moved.
 
 ## L17 — Stopping a coordinator does not stop its dispatched effects
 

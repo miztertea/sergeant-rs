@@ -3493,13 +3493,50 @@ impl Engine {
 
     /// §14.2's third phase for INTERRUPT: journal what was asked and what it
     /// produced. Unconditional — an interrupt request and its outcome are
-    /// journaled regardless of whether the backend actually complied, and
-    /// nothing here touches Work or stage state: the ordinary OBSERVE path
-    /// (`due_observations`/`drive`) is what settles the turn, on whatever
-    /// native evidence the interrupt (or its absence) eventually produces.
-    /// Staleness is the *middle* phase's question for this verb
-    /// ([`Self::interrupt_is_stale`]), already answered by the time the
-    /// perform ran.
+    /// journaled regardless of whether the backend actually complied.
+    ///
+    /// **Issue #90.** This also lands the Work in `blocked`, and that part is
+    /// *not* deferred to the ordinary OBSERVE path the way the doc here used
+    /// to promise. The reason is §25 itself: a killed turn's own adapter
+    /// reports the ambiguity honestly and invents nothing —
+    /// `observe_in_memory`'s interrupted-with-no-envelope arm
+    /// (`src/backend/claude.rs`) returns `BackendSignal::Running` forever,
+    /// on purpose, because "the conversation is resumable" is all a single
+    /// OBSERVE can support. `drive`'s `Running` arm parks without journaling
+    /// anything, so waiting for OBSERVE to resolve this specific ambiguity
+    /// means waiting for an answer the adapter has already declared it will
+    /// never give — that was the whole of the wedge: `active` forever, no
+    /// operator verb able to reach it, only `cancel` (destructive) reachable.
+    ///
+    /// So this settle takes the decision itself, from the one fact already
+    /// in hand — the ceiling crossing it is about to journal — rather than
+    /// waiting on native evidence that cannot arrive. That is
+    /// [`Self::check_turn_envelope`]'s own shape (`KIND_STAGE_BLOCKED` then
+    /// [`Self::block`]) reused for a different §25 trigger, and it opens the
+    /// same door R-MVP1-10 already built and tests: `retry` re-enters the
+    /// stage (turns_spawned is almost never at cap from a wall-clock
+    /// ceiling alone, so `extend` is available but rarely required), or
+    /// `cancel` still works and — per #90's own correction — never discards
+    /// the retained worktree.
+    ///
+    /// Guarded on the Work still being `active`: a concurrent cancel or
+    /// failure that retired it in the collection→perform→settle window must
+    /// keep whatever verb got there first, not be overridden by a crossing
+    /// that is now stale in every sense but the timer.
+    ///
+    /// **L6 audit.** This makes the settle a three-append sequence
+    /// (`execution.turn_ceiling_interrupted`, `stage.blocked`,
+    /// `work.blocked`) where before it was one. A crash between any two of
+    /// them leaves the Work `active` with a partial trail — but that is
+    /// exactly the shape [`crate::runtime::recovery::reconcile`] already
+    /// finds and re-derives from scratch on the next restart (`in_flight`
+    /// is keyed on `WorkState::Active`, and `reconcile_work` never trusts
+    /// what a prior run partially wrote); the restart path's own
+    /// `classify_restart` (`src/backend/claude.rs`) fails every ambiguous
+    /// case closed to `Blocked` independently of what this method managed
+    /// to commit, so no new unrecoverable window is opened here — only the
+    /// same "stage event, then work event" idiom [`Self::check_turn_envelope`]
+    /// and `drive`'s `Blocked`/`Failed`/`StageCompleted` arms already rely on.
     pub fn settle_interrupt(
         &self,
         core: &mut Core,
@@ -3507,12 +3544,18 @@ impl Engine {
         outcome: InterruptOutcome,
     ) -> Result<Step, EngineError> {
         let mut deferred = Deferred::new();
-        let recorded = match outcome.outcome {
+        let (recorded, request_error) = match outcome.outcome {
             Ok(completion) => {
                 deferred.push(completion);
-                json!({"requested": true})
+                (json!({"requested": true}), None)
             }
-            Err(e) => json!({"requested": true, "error": e.to_string()}),
+            Err(e) => {
+                let detail = e.to_string();
+                (
+                    json!({"requested": true, "error": detail.clone()}),
+                    Some(detail),
+                )
+            }
         };
         self.commit(
             core,
@@ -3527,6 +3570,16 @@ impl Engine {
                 "outcome": recorded,
             }),
         )?;
+        if self.work_state(core, &pending.work_id)? == WorkState::Active {
+            let reason = format!("turn ceiling exceeded ({}s)", pending.ceiling_secs);
+            self.commit(
+                core,
+                &pending.work_id,
+                KIND_STAGE_BLOCKED,
+                json!({"stage_id": pending.execution.stage_id, "detail": reason}),
+            )?;
+            self.block(core, &pending.work_id, &reason, request_error)?;
+        }
         Ok(Step {
             next: Next::Parked,
             deferred,
@@ -4700,6 +4753,189 @@ mod tests {
         );
     }
 
+    /// Issue #90: a ceiling interrupt must land the Work somewhere an
+    /// operator verb can reach, not park it in `active` forever.
+    ///
+    /// Before this fix, `settle_interrupt` only journaled
+    /// `execution.turn_ceiling_interrupted` and returned `Next::Parked`,
+    /// trusting the next OBSERVE to resolve things. It never can: the real
+    /// adapter's own interrupted-with-no-envelope arm
+    /// (`observe_in_memory`, `src/backend/claude.rs`) reports
+    /// `BackendSignal::Running` forever on purpose — "no conclusion about
+    /// the stage is invented" — and `drive`'s `Running` arm parks without
+    /// journaling anything. The work never left `active`, and `retry`
+    /// refuses anything but `failed`/`blocked`/`waiting`, so the only
+    /// reachable verb was the destructive `cancel`.
+    ///
+    /// This fault-injection test drives the real `due_interrupts` →
+    /// `settle_interrupt` sequence (never synthesizing the landing) and
+    /// asserts the work reaches `blocked` with the ceiling named as the
+    /// reason, the stage record carries the same decision (so `retry` has a
+    /// current stage to re-enter), and `retry` — R-MVP1-10's existing exit
+    /// door, reused for a different §25 trigger — actually reopens it.
+    ///
+    /// Mutation target (L7): reverting the `WorkState::Active` block added to
+    /// `settle_interrupt` leaves the work `active` after this test's
+    /// interrupt settles, failing the first assertion below directly.
+    #[test]
+    fn a_ceiling_interrupt_lands_the_work_in_blocked_not_wedged_active() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+        let backends = BackendRegistry::new().with(Arc::new(fake.clone()));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        )
+        .with_turn_ceiling(Duration::ZERO);
+
+        let work_id = "01CEILINGWEDGE";
+        testing::submit(&mut core, work_id, "run past the ceiling");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORKFLOW_BOUND,
+            json!({
+                "workflow": {"name": "tiny", "version": "1", "source": "test",
+                             "stages": [{"id": "00-first", "context": "c"}]},
+                "backend": FAKE_BACKEND_NAME,
+            }),
+        );
+        // A surface is recorded so the retry proof at the end has something
+        // real to re-enter into — `reserve_stage` refuses `NoRun` without
+        // one, on the very first launch as much as on a retry.
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            json!({"surface": {
+                "work_id": work_id,
+                "root": dir.path(),
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": dir.path(),
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": dir.path(),
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }}),
+        );
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_STAGE_ENTERED,
+            json!({"stage_id": "00-first", "index": 0, "attempt": 1}),
+        );
+
+        // A real execution the fake backend actually knows about — INTERRUPT
+        // below must exercise the same `resolve`-then-kill path the daemon's
+        // own crank loop does, not a synthetic identity nothing can answer
+        // for.
+        let start_request = StartRequest {
+            work_id: work_id.to_string(),
+            execution_id: "e1".to_string(),
+            stage_id: "00-first".to_string(),
+            attempt: 1,
+            cwd: dir.path().to_path_buf(),
+            intent: "run past the ceiling".to_string(),
+            context: "c".to_string(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: InstructionPolicy::default(),
+        };
+        let handle = fake.start(&start_request).expect("fake backend start");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_EXECUTION_STARTED,
+            json!({"execution": {
+                "execution_id": "e1",
+                "backend": FAKE_BACKEND_NAME,
+                "native_id": handle.native_id,
+                "stage_id": "00-first",
+                "attempt": 1,
+                "stop_requested": false,
+            }}),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+        engine.record_turn_start(work_id);
+        let mut overdue = engine.due_interrupts(&core, Instant::now());
+        assert_eq!(
+            overdue.len(),
+            1,
+            "a zero ceiling makes the turn overdue on the first sweep"
+        );
+        let pending = overdue.pop().expect("the one collected crossing");
+        // Driven through `run_inline` rather than `pending.perform()` called
+        // directly here: t11 (`tests/m6_surfaces.rs`) statically scans this
+        // file and only permits an external effect's perform inside a
+        // reviewed single-owner block. `run_inline` is already on that list
+        // (deterministic tests hold the only reference to `Core`, same as
+        // every other entry there) — this test adds nothing to it.
+        engine
+            .run_inline(
+                &mut core,
+                Step {
+                    next: Next::Interrupt(pending),
+                    deferred: Deferred::new(),
+                },
+            )
+            .expect("run the interrupt inline");
+
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Blocked,
+            "the interrupted work must land somewhere `retry`/`cancel` can \
+             reach, never wedged in `active` forever"
+        );
+        assert_eq!(
+            core.registry.state().runs[work_id]
+                .current_stage()
+                .expect("a stage")
+                .status,
+            StageStatus::Blocked,
+            "the stage record must carry the same decision, or `retry` has \
+             no current stage to re-enter"
+        );
+        let blocked: Vec<Value> = core
+            .journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .filter(|e| e.kind == KIND_WORK_BLOCKED && e.work_id.as_deref() == Some(work_id))
+            .map(|e| e.payload)
+            .collect();
+        assert_eq!(blocked.len(), 1);
+        assert!(
+            blocked[0]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("ceiling")),
+            "the reason names the actual trigger: {:?}",
+            blocked[0]
+        );
+
+        // R-MVP1-10's door, reused: `retry` is legal from here and produces a
+        // genuine re-entry effect — never `NotRetryable` (409), which is
+        // exactly what a still-`active` work would have refused with. The
+        // effect itself (`Next::Surface`'s rematerialize) is real git work
+        // this synthetic fixture cannot perform end to end — that plumbing
+        // is R-MVP1-10's own, proven elsewhere — so this stops at `begin_retry`,
+        // the phase that proves the door opened.
+        let reopened = engine
+            .begin_retry(&mut core, work_id)
+            .expect("retry must reopen a ceiling-interrupted block, not refuse it");
+        assert!(
+            matches!(reopened.next, Next::Surface(_)),
+            "retry must produce a real re-entry effect, not a silent no-op: {:?}",
+            reopened.next
+        );
+    }
+
     // ------------------- §8.6 Mechanism A: branch_takeover_precondition
 
     mod branch_takeover {
@@ -4751,6 +4987,7 @@ mod tests {
             } else {
                 BindingDisposition::RetainedDirty {
                     changes: "M solo/wip.rs".to_string(),
+                    patch: None,
                 }
             };
             TeardownReport {
