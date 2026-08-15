@@ -1,1943 +1,2305 @@
 ---
 type: proposal
-title: "Sergeant-rs T-Series: Work-Centered Terminal Interface"
+title: "Sergeant-rs T-Series: Work-Centered Operator Cockpit"
 description: >-
-  Proposal to replace Sergeant-rs's deliberately minimal P0 Ratatui fleet/detail
-  stub with a work-centered terminal interface for setting intent, operating
-  durable Work, discovering repository-owned workflows, and responding to
-  agent-initiated questions. The program preserves existing Work and execution
-  semantics, adds one narrow read-only workflow-catalog projection required by
-  the equal-client boundary, closes the known TUI layout and reconnect gaps, and
-  disables the embedded web dashboard until the terminal interaction model is
-  proven. Full journal and DuckDB exploration is reserved for a separate
-  proposal.
+  Revised T-Series proposal to replace Sergeant-rs's deliberately minimal
+  Ratatui Fleet/Detail proof with a modern, keyboard-first operator cockpit
+  for setting intent, operating durable Work, discovering admitted workflows,
+  managing the estate, and reading health and evidence. This revision
+  supersedes the 2026-08-11 T-Series proposal, consumes the shipped North Star
+  MVP and WATCH surfaces, accounts for the current open integration branch,
+  and constrains implementation through the Taste design audit and the
+  repository's Ponytail ladder.
 status: proposed
 resource: sergeant-rs
 tags:
   - sergeant-rs
   - tui
   - ratatui
-  - usability
-  - workflows
+  - operator-cockpit
   - work-centered
+  - estate
+  - usability
   - proposal
-timestamp: 2026-08-11
+timestamp: 2026-08-15
 repository: https://github.com/miztertea/sergeant-rs
-audit_revision: a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6
+audit_revision: 242abe3c4a889c2b666c7ce34b32812dd1ee8d61
+integration_review:
+  pull_request: 111
+  branch: integration/path-to-mac-2026-08-15
+  revision: 251a6f1c09caee95fcac30f724dab0ece166cae0
+supersedes:
+  path: reference/proposal-tui-t-series.md
+  revision: a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6
 relationship: >-
-  Presentation successor/addendum to sections 7, 29-31, and 34 of
-  reference/proposal-depot-rust-execution-surface.md, the M6 client-surface
-  contract, and the now-merged N3 executor-aware workflow surface. It replaces
-  the P0 presentation while preserving the journal-first runtime and existing
-  mutation semantics. A separate future proposal owns the global Journal and
-  DuckDB query surface.
+  Complete revision of the existing T-Series proposal, not a competing
+  proposal. It preserves the journal-first daemon, Work-centered domain,
+  API-only boundary for daemon-owned facts, terminal-lifecycle guarantees,
+  and separate P2-JOURNAL program. It updates the proposed interface for the
+  shipped MVP, explicit sgt tui entry point, WATCH, transcript, output,
+  envelope, Estate, dashboard deletion, completed_dirty, and the current
+  integration branch's candidate retained-state surfaces.
 ---
 
 # Sergeant-rs T-Series
-## Work-Centered Terminal Interface
+## Work-Centered Operator Cockpit
 
 **Status:** Proposed  
-**Audit basis:** [`miztertea/sergeant-rs@a5fb875`](https://github.com/miztertea/sergeant-rs/tree/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6)  
-**Relationship to P0:** Replace the P0 presentation; preserve the P0 contracts  
-**Relationship to N3:** Consume the merged actor-initiated ask, execution-reservation, and per-stage executor surfaces; add no new execution semantics  
-**Primary objective:** Make setting intent, understanding Work, selecting admitted procedure, and supplying human decisions natural from bare `sgt`  
-**Mutation boundary:** Submit, respond, retry, and cancel retain their existing API and engine meanings  
-**Additive read boundary:** One read-only workflow-catalog route exposes existing `.sergeant/` procedure through the equal-client API boundary  
-**Journal boundary:** Global journal/DuckDB search and exploration belongs to a separate proposal  
-**Web disposition:** `/ui` is unmounted; `sgt web` reports the dashboard disabled; source remains as a dormant future stub  
+**Main audit basis:** [`miztertea/sergeant-rs@242abe3`](https://github.com/miztertea/sergeant-rs/tree/242abe3c4a889c2b666c7ce34b32812dd1ee8d61)  
+**Concurrent integration review:** [PR #111 at `251a6f1`](https://github.com/miztertea/sergeant-rs/pull/111)  
+**Supersedes:** [`reference/proposal-tui-t-series.md@a5fb875`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/proposal-tui-t-series.md)  
+**Interactive entry point:** `sgt tui`; bare `sgt` remains the static estate-aware homepage  
+**Primary objective:** Make the existing durable delegation loop obvious, beautiful, and operable from one keyboard-first terminal cockpit  
+**Daemon mutation boundary:** Submit, respond, retry, extend, cancel, and any accepted retained-state disposal retain their daemon/API meanings  
+**Local estate boundary:** Repository, group, and Doctor behavior is shared through narrow typed operations extracted on contact, never duplicated in the TUI  
+**Journal boundary:** Global journal/DuckDB query and exploration remains owned by P2-JOURNAL  
+**Web disposition:** The dashboard has been deleted; this proposal adds no browser surface or parity obligation  
+**Scope discipline:** A surface adds usability, not hidden engine behavior; this is not a repository-wide CLI refactor  
 
-Sections are numbered for contract citation (§N), following the repository's proposal convention.
+Sections are numbered for contract citation. Every normative decision names its lowest viable Ponytail rung. The complete register is §22.
 
 ---
 
 # 1. Executive Summary
 
-Sergeant-rs already has the difficult product beneath the interface.
+Sergeant now proves its North Star claim:
 
-A user states an intent. The daemon discovers the repository or workspace, resolves and pins procedure, creates an isolated Git worktree, routes each actor stage to a measured native harness, records every transition in an append-only journal, and resumes or fails closed from evidence. The daemon—not the terminal—is the application. Work—not the process, conversation, TUI, or web page—is the durable center. Every projection can be rebuilt from the journal, and every client reaches the daemon through the same loopback HTTP/SSE boundary.
+> A developer can hand Sergeant meaningful work and stop babysitting it.
 
-The current TUI is not a failed interface. It is a successful P0 proof. The M6 contract intentionally required only a live Fleet screen, a Work-detail screen, response and cancellation actions, and terminal-safe lifecycle behavior. The implementation therefore renders the API almost literally: fixed-width Fleet rows, a property sheet, and a reverse-chronological raw event tail. That proved the architecture. It did not yet answer the ordinary human questions:
+The MVP has shipped the hard parts underneath the interface: estate topology, isolated multi-repository surfaces, pinned workflows, bounded turns and wall-clock ceilings, actor and deterministic execute stages, durable transcript and evidence, output pointers, recovery, Watch, Doctor, and a successful walk-away ship gate. The current TUI remains intentionally close to its original M6 proof: a Fleet list, a property sheet, forty recent events, and a small response/cancel keymap. The proof is architecturally strong and humanly thin.
 
-```text
-What should Sergeant do next?
-What needs me right now?
-What is this Work trying to accomplish?
-Where is it in its procedure?
-What did the agent ask?
-What can I safely do from here?
-What evidence explains what happened?
-```
+The revised T-Series makes `sgt tui` the **operator cockpit for durable Work**.
 
-The current main revision strengthens the case for a real operator interface. N3 has shipped actor-initiated questions, per-stage actor selection, execution reservations, and current-stage executor details. The public event vocabulary now includes `conversation.ask`, `execution.reserved`, and `execution.abandoned`; the Work view exposes the current reservation and the executor pinned for the current stage. These are existing facts that the P0 screen does not yet arrange into a human-usable experience.
-
-This proposal makes bare `sgt` the primary interactive surface.
-
-The top navigation is intentionally small:
+The top-level destinations are:
 
 ```text
-Home    Fleet    Workflows
+Home    Fleet    Workflows    Estate
 ```
 
-- **Home** is the front door: state intent, choose admitted procedure when needed, see the Work requiring attention, and return to current Work.
+- **Home** combines intent, attention, active Work, and recent outputs.
 - **Fleet** is the complete browser over durable Work.
-- **Workflows** is the read-only catalog of admitted repository procedure discovered through `.sergeant/index.md`, each workflow's `index.md`, and its authoritative `workflow.toml`.
+- **Workflows** is the admitted procedure catalog and launch surface.
+- **Estate** is the full repository, group, and health destination.
 
-A later **Journal** surface is deliberately absent. Sergeant's journal and DuckDB projection deserve their own proposal, query contract, evidence model, and performance review. This program keeps Work-local Evidence, the existing one-Work graph, and current canned analytics reachable, but it does not disguise a bounded event tail as the historical exploration product.
-
-A collapsible **Attention drawer**, toggled by `~`, is available across the TUI. It groups existing Work states into human-relevant queues: needs input, trouble, in flight, waiting, and terminal. A static gold `? N` indicator in the header makes pending human decisions visible when the drawer is closed. The drawer stores no notifications and creates no new state; it is a client-side view over the Fleet.
-
-Opening a Work from Home, Fleet, the Attention drawer, a graph result, or an analytics row always opens one canonical Work surface. That surface intentionally borrows the interaction grammar people already know from agent harnesses and modern developer tools:
+Opening a Work from any destination always enters one canonical Work surface:
 
 ```text
-horizontal navigation
-optional left drawer
-Work header and workflow rail
-scrolling semantic thread
-fixed composer/action region at the bottom
-secondary Workflow, Evidence, Graph, and Details views
+Thread    Workflow    Evidence    Graph    Details
 ```
 
-The resemblance is an affordance, not an architectural claim. The scrolling thread renders only journaled facts: Work intent, workflow binding, stage transitions, current executor, execution lifecycle, agent messages, tool activity, actor-authored questions, human responses, usage, blockers, failures, and terminal outcomes. It never presents hidden chain-of-thought, inferred file changes, invented artifacts, or guessed progress.
+The default Thread is now a real journal-backed conversation surface because `GET /v1/work/{id}/transcript` exists. It interleaves transcript turns with only those semantic system lines that the journal can prove. It never invents hidden reasoning, files, progress, or process activity.
 
-The bottom composer is persistent, but its behavior is state-aware:
+The cockpit uses the interaction grammar people already know from modern agent harnesses:
 
 ```text
-Home              ordinary text submits new Work
-Work.needs_input  ordinary text answers the current request
-all other Work    ordinary text is disabled; / opens valid local commands
+top navigation
+optional attention drawer
+scrolling conversation or list body
+fixed state-aware composer
+contextual actions and help
 ```
 
-`Enter` inserts a newline. `Ctrl+Enter` deliberately submits when the terminal reports the modifier. A visible Send action, reached by `Tab` and activated by ordinary `Enter`, is the universal fallback for terminals that cannot distinguish `Ctrl+Enter`. This makes durable submission and resumption harder to trigger by accident without depending on terminal-specific keyboard extensions.
+The resemblance is intentional and bounded. Work, not chat, remains the durable center. The composer creates Work on Home and answers genuine `needs_input` requests inside Work. It does not become an unruled active-turn guidance channel.
 
-Two lightweight TUI grammars make the interface discoverable without changing Sergeant's CLI or engine:
+The visual direction is an evolved modern terminal application:
 
 ```text
-/command     navigate the TUI or invoke an existing Sergeant operation
-@workflow    select or reference admitted repository procedure
+DESIGN_VARIANCE   4 / 10
+MOTION_INTENSITY  3 / 10
+VISUAL_DENSITY    7 / 10
 ```
 
-Slash commands are a fixed local enum over existing views and operations; they are not new `sgt` subcommands and are never sent to an actor. On Home, selecting `@repo-to-icm` sets the existing `workflow` submission field and appears as a chip outside the durable intent. Inside an existing Work, the pinned workflow cannot change; an `@workflow` selection merely inserts a textual reference into an answer.
+It is dark, calm, dense, and information-rich without becoming cramped. It uses fewer full boxes, more whitespace and single dividers, one cyan/cool-blue focus accent, semantic gold/red/green state color, and motion only where something is actually active. The one honest progress bar is the Work's turn-envelope consumption. Workflow progress remains ordinal.
 
-The workflow catalog is the proposal's one narrow additive read surface. The repository already defines the catalog and publication boundary: `.sergeant/index.md` lists admitted workflows, each admitted workflow owns an `index.md`, and `workflow.toml` owns executable identity, version, stage order, and N3 executor metadata. The TUI may not read those files directly because clients are equal. The daemon therefore exposes one side-effect-free catalog endpoint using the same workspace discovery and workflow loader that submission already trusts. It adds no workflow grammar, mutation, publication, or durable state.
+This proposal deliberately refuses the architectural detour that surfaced during design discussion. It does **not** refactor the whole CLI into a universal service layer. It follows an **extract-on-contact** rule:
 
-The embedded web dashboard is disabled for this program. Its source and assets remain as a future stub; `/ui` is not mounted, and `sgt web` reports that the browser surface is unavailable while the terminal interaction model is being proven. Dashboard issues [#15](https://github.com/miztertea/sergeant-rs/issues/15) and [#21](https://github.com/miztertea/sergeant-rs/issues/21) remain visible reactivation prerequisites rather than becoming a parallel usability lane.
+```text
+daemon-owned Work facts      existing ApiClient only
+workflow discovery           one narrow read-only daemon projection
+repo/group behavior          small shared local operations used by CLI and TUI
+Doctor checks                one shared structured report used by CLI and TUI
+everything else              remains where it is until a second surface needs it
+```
 
-The central design rule is:
+The result is a full-fledged cockpit without turning a usability milestone into a multi-day platform rewrite.
 
-> **Make the existing work domain perceptible. Add only the smallest read surface required to expose repository-owned procedure through the architecture that already exists.**
+**Decision T2-01 (R2):** Revise the existing T-Series proposal in place conceptually. Do not create a parallel TUI program with competing decisions.
 
-Every normative decision in this proposal carries its Ponytail rung. The complete register is §20.
+**Decision T2-02 (R2):** The TUI is a Work-centered operator cockpit. It is not a process monitor, terminal multiplexer, system dashboard, or replacement agent harness.
 
 ---
 
-# 2. Audit Basis and Method
+# 2. Problem Statement and Outcome
 
-This proposal is based on a read-only audit of main at [`a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6`](https://github.com/miztertea/sergeant-rs/commit/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6).
+## 2.1 The human problem
 
-**Decision T-01 (R1):** The audit revision is pinned. “Current” means `a5fb875`, not an unqualified moving branch.
+General-purpose coding harnesses are capable conversational actors, but durable work requires more than a conversation. Intent, estate context, procedure, execution bounds, outputs, human gates, and evidence must remain coherent after the harness turn or terminal session ends.
 
-That revision contains the completed workstreams that were still open during the first design pass:
+Sergeant solves that durable-work problem. The current TUI does not yet make the solution perceptible.
 
-- [PR #28](https://github.com/miztertea/sergeant-rs/pull/28), the S-series coverage and stabilization program, merged at `6a7bedf`; its close-out reports 94.63% line coverage and 294 tests plus two opt-in at its own ship point.
-- [PR #43](https://github.com/miztertea/sergeant-rs/pull/43), N3 and generator v2, merged as the audit commit; N3 shipped the two-phase external-effect boundary, tagged stage definitions, per-stage actor selection, current-stage executor details, actor-initiated ask, and new reservation events.
-- [PR #48](https://github.com/miztertea/sergeant-rs/pull/48), merged into the N3 branch before #43 landed, promoting binding development rules and moving gauntlet scripts into visible `resources/` paths.
-
-The audit included:
-
-- [`CLAUDE.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/CLAUDE.md), especially journal truth, single ownership, equal clients, Work/process separation, current test discipline, and the instruction to extend the API rather than give a client a private shortcut;
-- [`AGENTS.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/AGENTS.md), including discovery through `.sergeant/index.md` and the instruction to use real respond, retry, cancel, and inspection surfaces;
-- [`reference/proposal-depot-rust-execution-surface.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/proposal-depot-rust-execution-surface.md), especially §§7, 10, 21–31, 34, and 40;
-- [`reference/proposal-next-iteration-icm-workflows.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/proposal-next-iteration-icm-workflows.md), plus the N0–N3 contracts and rulings that now govern stage executors and actor asks;
-- [`docs/gauntlet/contracts/N3.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/docs/gauntlet/contracts/N3.md), particularly the explicit statement that actor-authored questions resume through today's `respond` operation;
-- the current TUI in [`src/tui.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/tui.rs), CLI in [`src/cli.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/cli.rs), API and client in [`src/api.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/api.rs), and embedded browser stub in [`src/web.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/web.rs);
-- the current workflow model in [`src/domain/workflow.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/domain/workflow.rs), including tagged actor stages, per-stage harness/profile fields, pinned stage bindings, and content identity;
-- the repository-owned catalog in [`.sergeant/index.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/.sergeant/index.md), [`repo-to-icm/index.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/.sergeant/workflows/repo-to-icm/index.md), and its [`workflow.toml`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/.sergeant/workflows/repo-to-icm/workflow.toml);
-- the normative [ICM filesystem convention](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/docs/icm/convention.md), which defines `.sergeant/index.md` as the discovery surface, requires every admitted workflow to be listed, and excludes `.sergeant/drafts/workflows/` from runnable procedure;
-- the current analytical and graph projections in [`src/runtime/analytics.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/runtime/analytics.rs) and [`src/runtime/graph.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/runtime/graph.rs);
-- [`GAUNTLET.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/GAUNTLET.md), [`LESSONS.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/LESSONS.md), [`reference/notes/ideaos-agent-contract.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/notes/ideaos-agent-contract.md), and [`reference/notes/gauntlet-pattern.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/notes/gauntlet-pattern.md);
-- the M6 Ratatui test strategy in [`tests/m6_surfaces.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/tests/m6_surfaces.rs);
-- the measured P1 baseline and current open client/runtime issues that constrain the presentation: [#11](https://github.com/miztertea/sergeant-rs/issues/11), [#16](https://github.com/miztertea/sergeant-rs/issues/16), [#26](https://github.com/miztertea/sergeant-rs/issues/26), [#45](https://github.com/miztertea/sergeant-rs/issues/45), [#46](https://github.com/miztertea/sergeant-rs/issues/46), [#47](https://github.com/miztertea/sergeant-rs/issues/47), [#15](https://github.com/miztertea/sergeant-rs/issues/15), and [#21](https://github.com/miztertea/sergeant-rs/issues/21);
-- the repo screenshots in `docs/img/` and the owner-reviewed, Ratatui-tempered mockups produced during the design conversation.
-
-The IdeaOS/Notion review included:
-
-- [Ponytail Minimality Ladder](https://app.notion.com/p/39a27ada618f8100babadb321a70de9b);
-- [IdeaOS Agent Instructions](https://app.notion.com/p/39a27ada618f815aab89daafc635514f);
-- [Sergeant](https://app.notion.com/p/3ad27ada618f8175a6afc0dcd1707799);
-- [Work-Centered Intelligence](https://app.notion.com/p/3ac27ada618f81728a73fbd7ac90c61c);
-- [WorkPacket](https://app.notion.com/p/39a27ada618f818cba42f5efe8ffe1f0);
-- [Work Filesystem](https://app.notion.com/p/3ac27ada618f819d8196fa78ab420224);
-- [Shared-Engine Human-Agent Workbench](https://app.notion.com/p/39a27ada618f81999694e0fbb019ca50);
-- [Ecological Interface Design: Theoretical Foundations](https://app.notion.com/p/3ac27ada618f81909dd5d48e1f9b9912);
-- [Intelligent Work Environments Research and Prior Art Map](https://app.notion.com/p/3ac27ada618f817b8418e50151dd7015);
-- [The new rules of context engineering for Claude 5 generation models](https://app.notion.com/p/3af27ada618f8188806de090bd721054);
-- [Bugle](https://app.notion.com/p/3ab27ada618f81158b63ff644f4ac548);
-- the deliberately parked [Garrison Business User Workspace](https://app.notion.com/p/3ab27ada618f812db874fbebc0eaf9d8).
-
-The evidence hierarchy is:
+The operator still has to translate a flat table and a raw event tail into answers:
 
 ```text
-current implementation at a5fb875
-        ↓
-committed contracts, ledger, lessons, measured baselines, and open issues
-        ↓
-current README and admitted .sergeant content
-        ↓
-adjudicated reference corpus and vendored historical evidence
-        ↓
-IdeaOS research and adjacent-system concepts
-        ↓
-owner-reviewed mockups and interaction preferences
+What needs me?
+What is running?
+What is waiting, blocked, or failed?
+Which Work should I open?
+What did the actor actually say?
+Which stage and attempt am I looking at?
+How much of the turn envelope has been spent?
+Where did the output land?
+Which action is legal now?
+What repositories and groups make up this estate?
+Is the installation healthy?
 ```
 
-## 2.1 Owner amendments after the strict draft
+The TUI's job is to answer those questions without owning the underlying facts.
 
-The first written draft deliberately excluded every capability without an existing endpoint. Review exposed that this collapsed cheap client affordances, existing repository-owned procedure, and genuine new runtime behavior into one bucket.
+This matches the work-centered theory already recorded in Notion:
 
-**Decision T-02 (R1/R2):** The settled proposal supersedes that strict boundary in exactly three ways:
+- [Work-Centered Intelligence](https://app.notion.com/p/3ac27ada618f81728a73fbd7ac90c61c) argues that systems should be designed from durable work outward, with the prompt as a portal into Work rather than the container for it.
+- [WorkPacket](https://app.notion.com/p/39a27ada618f818cba42f5efe8ffe1f0) states the interface boundary directly: surfaces show packet state and human decisions but do not own Work state.
+- [Intelligent Work Environments](https://app.notion.com/p/3ac27ada618f817b8418e50151dd7015) connects ecological interface design to making work-domain constraints perceptible rather than forcing the operator to reconstruct them mentally.
 
-1. `/` is admitted as a local TUI palette over existing views and operations.
-2. `@` is admitted as a local workflow-selection/reference affordance.
-3. One read-only workflow-catalog endpoint is admitted because the catalog already exists in `.sergeant/`, and the equal-client invariant forbids the TUI from reading it privately.
+**Decision T2-03 (R2):** The interface is organized around the questions an operator asks of durable Work, not around internal tables, processes, or module boundaries.
 
-The owner also settled the following boundaries:
+## 2.2 The product outcome
 
-- global journal/DuckDB exploration receives its own proposal;
-- top navigation is `Home / Fleet / Workflows`, not `Work / Workflows`;
-- the web dashboard is disabled rather than developed in parallel;
-- CPU, memory, disk, OpenTelemetry query integration, and mouse operation are not part of this work;
-- issue #16 auto-reconnect belongs in the TUI usability program;
-- `Enter` inserts a newline and `Ctrl+Enter` is the deliberate send chord, with a visible Send fallback.
+A successful T-Series session feels like this:
 
-These are current proposal inputs, not implementation afterthoughts.
+```text
+sgt tui
+  ↓
+Home shows what needs attention and what is already moving
+  ↓
+The operator selects a repo/group, workflow, profile, and bounded intent
+  ↓
+Work appears in Fleet and the global drawer
+  ↓
+Opening it shows one coherent thread, procedure, evidence, and output
+  ↓
+The actor asks a question
+  ↓
+The operator answers deliberately from the fixed composer
+  ↓
+The Work resumes
+  ↓
+The operator returns later and sees either:
+    trustworthy output
+    an honest, actionable stop
+    or retained state requiring explicit review
+```
+
+The cockpit also makes the estate operable:
+
+```text
+Estate / Repositories
+Estate / Groups
+Estate / Health
+```
+
+The operator can inspect and manage the working set through the same validated semantics the CLI already uses.
+
+**Decision T2-04 (R2):** The acceptance unit is the complete operator loop, not the existence of individual screens.
 
 ---
 
-# 3. Doctrine
+# 3. Supersession and Audit Basis
 
-## 3.1 Work is the durable center
+## 3.1 Why the 2026-08-11 proposal must be revised
 
-**Decision T-03 (R2):** The interface is organized around durable Work, not processes, harnesses, sessions, panes, or raw events.
+The original T-Series proposal was correct about Work-centered presentation, the canonical Work surface, local `/` and `@` grammars, deliberate multiline submission, and the separate Journal program. Its audit point predates the MVP and several owner rulings.
 
-This directly reuses the implemented domain boundary. Work carries intent and durable lifecycle state. Workflow stage is an orthogonal coordinate. Execution is a native context. A per-turn OS process is evidence rather than Work state. N3 adds reservation and current-stage executor details without collapsing those coordinates.
+The following assumptions are now stale:
 
-Work-Centered Intelligence supplies the broader design language:
+| Previous proposal assumption | Current fact |
+|---|---|
+| Bare `sgt` opens the TUI | Bare `sgt` is a static estate-aware homepage; `sgt tui` is explicit |
+| Web should be unmounted but retained as a stub | Dashboard source, routes, assets, command, and tests were deleted under ADR 0011 |
+| T-Series owns issues #11 and #16 | #11, #16, and #26 have shipped fixes that T-Series must preserve |
+| Thread must be synthesized mainly from event history | A dedicated Work transcript endpoint and CLI exist |
+| Work exposes no output pointer or envelope | Work views expose output and enforced turn-envelope facts |
+| Current mutations are submit/respond/retry/cancel | `extend` also exists and is distinct from retry |
+| Terminal completion is only `completed` | Operator-facing `completed_dirty` exists |
+| There is no headless return path | `sgt watch` is shipped and adjudicated |
+| Estate administration remains outside the TUI discussion | Repo/group lifecycle and Doctor are now mature CLI surfaces |
+| Dashboard reactivation issues remain | #15 and #21 closed when the dashboard was deleted |
 
-> **Don't push work through the model. Put the model in the work.**
+Sources:
 
-The scrolling thread is therefore a portal into Work. It is not the authoritative object, and the TUI never implies that a conversation owns the procedure or continuity.
+- [`src/cli.rs@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/src/cli.rs)
+- [`src/api.rs@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/src/api.rs)
+- [`src/tui.rs@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/src/tui.rs)
+- [`README.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/README.md)
+- [PR #105](https://github.com/miztertea/sergeant-rs/pull/105)
+- [PR #69](https://github.com/miztertea/sergeant-rs/pull/69)
 
-## 3.2 Intent is the primary human act
+**Decision T2-05 (R1/R2):** Preserve sound decisions from the existing proposal; delete or rewrite every decision whose premise has been superseded by shipped behavior.
 
-**Decision T-04 (R2):** Home begins with the question “What should Sergeant do?” and maps the answer to the existing Work submission operation.
+## 3.2 Main revision
 
-The README already defines the product this way: submit intent, get a durable agent run, watch it or walk away. Starting new Work must not require leaving the TUI for an otherwise equivalent CLI invocation.
-
-## 3.3 Familiar harness grammar is an affordance
-
-**Decision T-05 (R2/R5):** The interface deliberately uses the familiar shape of contemporary agent harnesses—top navigation, a switchable left rail, a scrolling thread, and a bottom composer—implemented with the Ratatui stack already pinned in the repository.
-
-Familiarity reduces orientation cost. It does not license hidden chat semantics. The composer and thread remain constrained by Sergeant's state machine and journal evidence.
-
-## 3.4 The interface reveals constraints; it does not invent them
-
-**Decision T-06 (R2):** Work state, workflow stage, executor, execution lifecycle, input request, and evidence remain visibly separate.
-
-Ecological Interface Design begins from the work domain and makes invariant constraints perceptible rather than forcing the operator to reconstruct them mentally. Sergeant already contains those distinctions; the TUI must preserve them while improving hierarchy.
-
-The UI may derive labels, grouping, truncation, and navigation. It may not derive new Work state, authority, completion, file changes, success, or progress.
-
-## 3.5 Clients remain equal
-
-**Decision T-07 (R2):** `src/tui.rs` continues to receive runtime and repository procedure only through `ApiClient`.
-
-The TUI gets no journal handle, DuckDB connection, engine reference, backend registry, daemon state, or filesystem shortcut. The workflow catalog is exposed through an endpoint precisely because repository-owned workflow content participates in execution planning and must not become a TUI-only interpretation.
-
-## 3.6 Progressive disclosure replaces architectural display
-
-**Decision T-08 (R2/R5):** Intent, attention, current stage, current question, and meaningful activity are primary. ULIDs, full paths, native IDs, reservation IDs, route source, content hashes, raw payloads, graph provenance, and SQL are secondary.
-
-This follows both the Work Filesystem's “one responsibility per surface” rule and Anthropic's context-engineering guidance: place information where it becomes useful rather than loading every fact at once. The current property sheet is accurate but hierarchically flat. The redesign changes presentation, not truth.
-
-## 3.7 Mutations require deliberate confirmation
-
-**Decision T-09 (R2/R5):** Durable submission and human response do not fire on naked Return.
-
-`Enter` means newline inside a composer. `Ctrl+Enter` means submit when distinguishable. The focused Send action is the portable confirmation path. Cancel retains explicit confirmation. Retry is a named action, never an incidental effect of typing.
-
-## 3.8 Ponytail is binding
-
-**Decision T-10 (R2):** Every implementation choice follows the repository's Ponytail ladder in order:
+The binding source audit is pinned to:
 
 ```text
-R1  skip it when the need is not demonstrated
-R2  reuse what is already in the repository
+main = 242abe3c4a889c2b666c7ce34b32812dd1ee8d61
+```
+
+At this revision:
+
+- `sgt tui` is explicit and no-spawn.
+- the TUI still has only Fleet and Detail screens;
+- automatic SSE reconnect, auth-failure stop, and terminal safety are implemented;
+- transcript, output, envelope, extend, Watch, Estate, Doctor, and harness passthrough exist;
+- the dashboard is absent;
+- the workflow root catalog lists 23 admitted workflows;
+- Ratatui 0.30.2 is installed and Crossterm is consumed through Ratatui's re-export.
+
+## 3.3 Open integration branch
+
+The current open integration surface is:
+
+```text
+PR #111
+integration/path-to-mac-2026-08-15
+head = 251a6f1c09caee95fcac30f724dab0ece166cae0
+```
+
+The branch is not binding main truth. Its PR explicitly says it is not ready to merge because the shipping gate produced false passed verdicts and #120 remains open.
+
+The branch nonetheless contains directly relevant candidate surfaces:
+
+- ceiling interruption lands in `blocked` rather than wedged `active`;
+- human transcript rendering includes journal timestamps;
+- Doctor gains a filesystem reliability check;
+- `GET /v1/retained` and `sgt work retained` inspect retained state;
+- `POST /v1/work/{id}/reap` and `sgt work reap` explicitly dispose retained dirty state after confirmation.
+
+[PR #111](https://github.com/miztertea/sergeant-rs/pull/111) is reviewed as a concurrent dependency, never treated as merged.
+
+**Decision T2-06 (R1):** T0 pins the actual implementation base after PR #111 is either merged or explicitly excluded. No T-Series screen may claim an integration-only fact before that disposition.
+
+**Decision T2-07 (R2):** If the retained/reap surfaces land, consume them in Work output and Health drill-down. If they do not land, omit those controls completely; do not ship placeholders.
+
+## 3.4 Audit corpus
+
+This revision is grounded in:
+
+- [`NORTH-STAR.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/NORTH-STAR.md)
+- [`AGENTS.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/AGENTS.md)
+- [`docs/DEVELOPMENT.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/DEVELOPMENT.md)
+- [`GAUNTLET.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/GAUNTLET.md)
+- [`LESSONS.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/LESSONS.md)
+- [WATCH contract](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/gauntlet/contracts/WATCH.md)
+- [ADRs 0005-0011](https://github.com/miztertea/sergeant-rs/tree/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/adr)
+- [current workflow catalog](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/.sergeant/index.md)
+- the existing T-Series proposal in full;
+- PR #111's source patches and contract record;
+- the Notion work-centered research above;
+- the [Taste skill at `e988add`](https://github.com/Leonxlnx/taste-skill/blob/e988add20dab0fa97d7a76781c48961c8184288e/skills/taste-skill/SKILL.md);
+- official Ratatui, Crossterm, and text-area documentation cited in §8.
+
+---
+
+# 4. Design Method: Taste Applied Honestly
+
+## 4.1 Boundary of the Taste skill
+
+The Taste skill says directly that it is not intended for dashboards, dense product interfaces, or multi-step product UI. Sergeant is exactly that class of application.
+
+This proposal therefore does not import its React, Tailwind, marketing-page, image, web-animation, or component-system prescriptions. It uses the transferable discipline:
+
+```text
+infer the real brief
+audit before redesign
+set design variance / motion / density explicitly
+reject default AI aesthetics
+use one coherent color and shape system
+make hierarchy visible
+provide loading / empty / error / focus states
+run a mechanical pre-flight before shipping
+```
+
+**Decision T2-08 (R2):** Use Taste as an audit method and anti-slop filter, not as a web implementation authority.
+
+## 4.2 Design read
+
+> Reading this as: a greenfield-overhaul of a keyboard-first operator console for technical users, with a restrained dark developer-tool language, leaning toward Claude Code and Primer-style clarity rather than a sysadmin dashboard.
+
+No military visual language is needed. Sergeant's name and domain do not require green tactical chrome, ranks, insignia, or novelty metaphors.
+
+**Decision T2-09 (R1):** Reject military styling. Product identity comes from interaction quality and domain clarity.
+
+## 4.3 Design dials
+
+```text
+DESIGN_VARIANCE   4 / 10
+MOTION_INTENSITY  3 / 10
+VISUAL_DENSITY    7 / 10
+```
+
+- **Variance 4:** geometry is stable and predictable; hierarchy changes by context, not by decorative asymmetry.
+- **Motion 3:** state feedback and active execution only; no cinematic transitions or pulsing alerts.
+- **Density 7:** enough information for real operations, with progressive disclosure preventing a cockpit from becoming clutter.
+
+**Decision T2-10 (R5):** These dials are binding visual constraints, not marketing metadata.
+
+## 4.4 Audit of the prior renderings
+
+The previous renderings established a strong foundation:
+
+- dark neutral canvas;
+- terminal-native lines and glyphs;
+- readable mono hierarchy;
+- subtle cyan focus;
+- semantic state color;
+- consistent footer hints;
+- layouts plausible in a character grid.
+
+They also exposed recurring problems:
+
+- almost every region received a full box and uppercase heading;
+- stale System/resource, Files/diff, Artifacts, Web, and `/interrupt` surfaces re-entered the mockup;
+- the visual language drifted toward a terminalized administration dashboard;
+- Work was sometimes represented twice through a full view and separate quick-view modal;
+- gauges appeared where the underlying ratio was not truthful.
+
+The evolved rule is:
+
+```text
+full border      one major interactive region
+single divider   subordinate related section
+whitespace       grouping and breathing room
+accent border    current focus only
+color            semantic state only
+```
+
+**Decision T2-11 (R5):** Reduce border count and visual noise before adding decoration.
+
+---
+
+# 5. Governing Invariants
+
+## 5.1 Work remains the center
+
+The North Star says surfaces own presentation and steering, while the core owns durable execution. Work-Centered Intelligence says the actor moves and Work remains.
+
+**Decision T2-12 (R2):** Navigation, threads, drawers, and composers are views into Work. None becomes a new durable domain object.
+
+## 5.2 Daemon-owned truth enters through the API
+
+The current TUI's strongest architectural property is that it imports `ApiClient` and does not reach into the journal, projection, engine, daemon, or backend registry.
+
+**Decision T2-13 (R2):** All Work, execution, transcript, event, graph, analytics, output, envelope, and retained-state facts come through authenticated daemon routes.
+
+The workflow catalog remains the one proposed read-only addition because workflow resolution participates in execution planning and should not become a TUI-only filesystem interpretation.
+
+## 5.3 Estate-local behavior is shared, not tunneled through the daemon
+
+Repo/group commands are deliberately local manifest operations. Doctor must work when no daemon is running. Forcing them through new daemon routes solely for UI purity would violate their existing lifecycle semantics.
+
+**Decision T2-14 (R2/R6):** The TUI consumes repo/group and Doctor behavior through narrow typed local operations extracted from the current CLI implementation. The CLI and TUI format the same outcomes differently.
+
+This is an explicit refinement of the old "TUI imports only ApiClient" source-scan rule:
+
+```text
+daemon-owned facts     ApiClient only
+estate manifest edits  shared local Estate operations
+installation checks    shared local Doctor report
+```
+
+## 5.4 SSE remains invalidation
+
+**Decision T2-15 (R2):** A live event says the answer changed. The TUI rereads authoritative state and does not become a second reducer.
+
+## 5.5 Observation never materializes the daemon
+
+ADR 0009 moved `status`, Work reads, analytics, Watch, Doctor, and TUI into the no-auto-spawn set.
+
+**Decision T2-16 (R2):** `sgt tui` continues to refuse without a running daemon and names `sgt doctor` or a dispatching verb as the remedy. The Estate/Health screens do not create an offline exception inside the TUI.
+
+## 5.6 Execution is not dialogue
+
+R-NS-6 distinguishes execution mechanics from the harness-owned conversation. `respond` answers a parked request. It is not a generic message operation.
+
+**Decision T2-17 (R1/R2):** T-Series adds no arbitrary active-turn guidance, continuous chat, embedded harness session, or PTY supervision.
+
+## 5.7 Process liveness is not Work truth
+
+**Decision T2-18 (R2):** Spinners, labels, and actions derive from journal-backed projected state. Silence, elapsed time, or a process table never creates a Work transition.
+
+## 5.8 Ponytail is binding in both directions
+
+```text
+R1  do not build it when the need is unproven
+R2  reuse current repository capability
 R3  use the standard library
-R4  use a native platform capability
-R5  use an already installed dependency
-R6  add one local line or tiny composition
-R7  add the minimum new machinery, naming failed lower rungs
+R4  use a native platform/terminal capability
+R5  use an installed dependency
+R6  add a tiny local composition or extraction
+R7  add the minimum new machinery after naming failed lower rungs
 ```
 
-R7 decisions in this proposal are exceptional and name the failed lower rungs. A future builder does not get to reinterpret “rich TUI” as permission for a UI framework, state store, plugin system, animation package, or generalized command language.
+Overbuilt frameworks and underbuilt shortcuts are both violations.
+
+**Decision T2-19 (R2):** Every implementation deviation names its rung and the lower rungs it exhausted.
 
 ---
 
-# 4. Current Surface, as Implemented
+# 6. Scope Contract
 
-## 4.1 The P0 TUI
+## 6.1 In scope
 
-The current [`src/tui.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/tui.rs) contains:
+T-Series may:
 
-```text
-Screen::Fleet
-Screen::Detail
-```
+1. replace the current Fleet/Detail hierarchy with Home, Fleet, Workflows, Estate, and canonical Work;
+2. render a modern coherent visual system through Ratatui;
+3. submit Work through current intent, workflow, backend, profile, workspace, repository, envelope, and origin fields;
+4. expand an Estate group into the same repository selection current `sgt run --group` produces;
+5. add one authenticated read-only workflow catalog route over admitted procedure;
+6. display the authoritative Work transcript and Work-local event evidence;
+7. display output pointer, teardown, reservation, execution, stage executor, envelope, and reported state;
+8. invoke current respond, retry, extend, cancel, and conditional retained-state disposal semantics;
+9. expose the complete existing repo/group lifecycle through Estate;
+10. expose Doctor checks and named remedies through Estate/Health;
+11. derive a global Attention drawer from Work state;
+12. use Watch's adjudicated state vocabulary without launching Watch inside the TUI;
+13. add a fixed local slash palette and workflow chooser;
+14. add a multiline deliberate composer with portable confirmation fallback;
+15. preserve and test reconnect, authentication-failure, signal, PTY, shutdown, idle-CPU, and no-spawn behavior;
+16. update README screenshots only from the real implemented Ratatui application.
 
-It already proves several load-bearing properties:
+## 6.2 Explicit non-goals
 
-- all state enters through `ApiClient`;
-- SSE events invalidate and trigger authoritative rereads rather than becoming a second client reducer;
-- response and cancel use real mutation endpoints;
-- detached live state is durable on screen rather than a transient status message;
-- SIGTERM, SIGHUP, pty disappearance, panic, and requested exit share bounded terminal restoration behavior;
-- the keymap is separated from action execution and therefore testable.
+**Decision T2-20 (R1):** T-Series does not include:
 
-The problem is presentation hierarchy, not missing architectural discipline.
-
-## 4.2 Existing v1 routes
-
-**Decision T-11 (R2):** T-series reuses every existing route below and adds only the catalog route defined in §10.3.
-
-| Existing route | Existing meaning | TUI use |
-|---|---|---|
-| `GET /v1/system` | version, API revision, data dir, journal head | header and connection overlay |
-| `GET /v1/work` | all Work, current stage, resolved Work backend | Home, Fleet, Attention drawer |
-| `POST /v1/work` | submit Work | Home composer |
-| `GET /v1/work/{id}` | Work, stage, surface, execution, reservation, workflow, backend, route, teardown | canonical Work view |
-| `POST /v1/work/{id}/input` | answer Work in `needs_input` | Work composer |
-| `POST /v1/work/{id}/retry` | retry the current retryable stage | Work action |
-| `POST /v1/work/{id}/cancel` | cancel Work | Work action |
-| `GET /v1/events` | journal history after seq, optionally Work-filtered and limited | Work thread and Evidence |
-| `GET /v1/events/stream` | resumable SSE journal tail | live invalidation |
-| `GET /v1/graph/work/{id}` | one Work's provenance neighborhood | Work Graph view |
-| `GET /v1/analytics` | canned-query index and projection counts | palette-accessed Analytics utility |
-| `GET /v1/analytics/{name}` | one canned result | Analytics utility |
-
-`ApiClient` already provides generic authenticated `get` and `post` methods in addition to typed helpers. The implementation may add typed convenience methods without changing endpoint meaning.
-
-## 4.3 N3 facts now available to the TUI
-
-**Decision T-12 (R2):** The TUI visibly consumes N3's merged public facts rather than designing as though main were still P0.
-
-The Work view now exposes:
-
-```text
-reservation
-stage.executor
-workflow stages
-```
-
-The SSE vocabulary now includes:
-
-```text
-execution.reserved
-execution.abandoned
-conversation.ask
-```
-
-The semantic consequences are presentation-only:
-
-- an actor-authored `conversation.ask` becomes the primary gold question card;
-- `stage.executor` identifies the harness/profile actually responsible for the current checkpoint;
-- a reservation can be shown as a compact launch-state line rather than an unexplained gap before `execution.started`;
-- `execution.abandoned` is visible evidence, not silently folded into failure prose.
-
-The proposal does not add or modify the N3 signal pathway.
-
-## 4.4 Existing mutation semantics
-
-The operator can currently:
-
-```text
-submit
-respond
-retry
-cancel
-```
-
-The runtime decides whether a mutation is legal. The TUI can hide actions known to be invalid in the projected state, but it is not a second authorization or transition engine.
-
-**Decision T-13 (R1/R2):** The TUI invokes only those existing mutation operations and always rereads authoritative state after a successful write.
-
-It does not synthesize active-turn guidance, implicit interrupts, workflow rebinding, terminal Work resurrection, or local-only “acknowledged” state.
-
-## 4.5 Existing event vocabulary
-
-The event stream carries Work lifecycle, workflow binding, stage lifecycle, execution lifecycle, surface lifecycle, conversation messages and asks, tool calls, usage, commands, daemon events, and backend probes.
-
-**Decision T-14 (R2):** The semantic thread is a pure presentation fold over known event kinds. Unknown events remain visible in Evidence and never receive an invented card.
-
-Raw evidence always remains reachable because a semantic summary can be wrong even when the event is right.
-
-## 4.6 Existing graph and analytics limits
-
-The graph currently derives relationships among Work, workflow, stages, executions, backends, profiles, native sessions, repositories, messages, tool calls, models, workspaces, and clients. Every edge carries the journal sequence that justifies it. It deliberately does not claim Artifact, File, Commit, or Finding nodes because no current event family reports those facts.
-
-DuckDB currently exposes five canned questions:
-
-```text
-blocked_time_per_work
-backend_retries
-execution_touched
-tool_calls_before_failure
-token_totals_per_work
-```
-
-**Decision T-15 (R1/R2):** T-series renders those exact graph and analytics results. It adds no graph canvas, arbitrary SQL, global search language, file browser, artifact model, or commit view.
-
-## 4.7 The workflow catalog already exists as content
-
-The current ICM convention states:
-
-- `.sergeant/index.md` is the root discovery surface;
-- every admitted workflow under `.sergeant/workflows/` must appear there;
-- each workflow's `index.md` owns its human description and tags;
-- `workflow.toml` owns executable name, version, stage order, and N3 executor metadata;
-- `.sergeant/drafts/workflows/` is not admitted procedure.
-
-**Decision T-16 (R2):** Workflow discovery uses this existing publication contract. It does not scan for arbitrary TOML files, list drafts, or introduce a second catalog format.
-
-**Decision T-17 (R2/R6/R7):** Expose that existing catalog through one minimum authenticated read-only endpoint because the equal-client boundary forbids `src/tui.rs` from reading repository files privately. The exact route, response, lower-rung analysis, and failure behavior are specified in §10.3–§10.4.
-
-## 4.8 CLI-only diagnostics
-
-`sgt doctor` performs local tool, filesystem, journal, projection, and daemon checks and intentionally does not auto-spawn the daemon. That operation is not available through the HTTP API.
-
-**Decision T-18 (R1):** Doctor remains a CLI-only diagnostic. The TUI has a small connection overlay, not a System dashboard.
-
-## 4.9 The journal surface is a separate product gap
-
-The journal and DuckDB projection are substantially richer than the current operator query surface. A real Journal product must decide query grammar, pagination, historical windows, result provenance, performance, and the relationship between DuckDB answers and source journal events.
-
-**Decision T-19 (R1):** Global Journal/DuckDB exploration is removed from T-series and reserved for a separate proposal. T-series does not pre-allocate its API routes, query syntax, saved views, or top-level tab behavior.
-
-Work-local Evidence and current canned analytics stay reachable because they already exist; they are not represented as the eventual Journal product.
-
----
-
-# 5. Scope Contract
-
-## 5.1 In scope
-
-The program may:
-
-1. replace the TUI's screen hierarchy, view models, keymap, focus, scrolling, and rendering;
-2. submit new Work through the existing `POST /v1/work` fields, with intent primary;
-3. add one read-only workflow-catalog route over admitted `.sergeant/` content and the embedded fallback;
-4. add fixed local `/` and `@` grammars to the TUI;
-5. group, sort, filter, truncate, and search already-loaded Fleet rows client-side;
-6. present one canonical Work surface from every TUI entry point;
-7. render a semantic Work thread from existing journal events, including N3 asks and reservation events;
-8. render the pinned workflow stage list, current executor, current stage, and attempt from existing Work data;
-9. answer, retry, cancel, refresh, and navigate through existing API operations;
-10. render Work-local raw Evidence, the existing graph neighborhood, and current canned analytics;
-11. add responsive Ratatui layouts, standard terminal colors, focus styling, scrollbars, and restrained activity indicators;
-12. close issue #11 with width-aware layout and a falsifiable geometry test;
-13. close issue #16 with truthful auto-reconnect, refresh-before-resume, capped backoff, and explicit authentication failure;
-14. disable the web route and make `sgt web` report unavailability;
-15. update README, screenshots, tests, ledger, and proposal cross-references when implementation lands.
-
-## 5.2 Explicit non-goals
-
-**Decision T-20 (R1):** The following are not part of T-series:
-
-- a global journal query API, full-text search, arbitrary SQL, saved search, or alerting;
-- new Work states, stage kinds, event kinds, mutation routes, workflow grammar, or durable stores;
-- workflow authoring, publication, mutation, or generation from the TUI;
-- listing `.sergeant/drafts/workflows/` as runnable procedure;
-- arbitrary input to active Work;
-- active-turn interrupt semantics;
-- changing actor-initiated ask behavior;
-- changing per-stage routing or executor semantics;
-- file content, diff, artifact, commit, or finding views not supported by current events;
-- host, daemon, or child-process CPU/memory/disk metrics;
-- OpenTelemetry query integration;
+- global Journal/DuckDB query, full-text search, arbitrary SQL, saved searches, alerts, or a Journal tab;
+- CPU, memory, process, or host resource monitoring;
+- OpenTelemetry collector queries;
 - mouse interaction;
-- a web-dashboard redesign;
-- a graph canvas;
-- a generalized plugin, command, notification, or keybinding framework;
-- archival, retention, dismissal, or pinning semantics for old Work;
-- issue #26's pre-loop terminal-hangup repair;
-- issue #45's dropped-daemon-under-load investigation.
-
-The one new API route is read-only and exposes existing admitted procedure. No other API addition is licensed by this proposal.
+- embedded web, browser controls, or parity work;
+- Files, diffs, artifacts, commits, findings, or code viewers without current API facts;
+- a spatial graph canvas;
+- arbitrary active-Work guidance;
+- interrupt behavior added merely because the backend trait contains an interrupt capability;
+- continuous interactive harness sessions;
+- embedded PTY or harness process supervision;
+- `sgt init`, daemon foreground/stop administration, or harness passthrough screens;
+- JSON/JSONL automation;
+- workflow authoring, editing, generation, publication, or draft promotion;
+- a model catalog or capability catalog not exposed by the current API;
+- a universal application service, command bus, plugin system, or repository-wide CLI rewrite;
+- configurable keybindings;
+- mouse-enabled text editing;
+- a second durable notification/read-state store;
+- archive, snooze, pin, or dismissal semantics for Work;
+- silent consumption of unmerged PR #111 features.
 
 ---
-# 6. Information Architecture
 
-## 6.1 Top-level navigation
+# 7. Information Architecture
 
-**Decision T-21 (R2/R5):** The top navigation contains exactly:
+## 7.1 Top-level destinations
 
-```text
-Home    Fleet    Workflows
-```
-
-- **Home** is intent plus attention.
-- **Fleet** is the complete Work browser.
-- **Workflows** is admitted-procedure discovery and selection.
-
-There is no top-level **Work** tab because Work is the singular object entered from other surfaces. There is no top-level **Journal** tab until the separate journal proposal defines one. There is no **System** tab because the API exposes only basic connection identity, not a diagnostic or resource model.
-
-The header also contains:
+**Decision T2-21 (R2/R5):**
 
 ```text
-sergeant   Home  Fleet  Workflows      ? 2      live · seq 128492
+Home    Fleet    Workflows    Estate
 ```
 
-The selected mode is visibly styled. `Tab` and `Shift+Tab` move among focusable regions; left/right move within the top navigation when it has focus. The live indicator opens a read-only overlay containing version, API revision, data directory, journal head, and connection state.
+There is no top-level Work tab because Work is the object entered from the other destinations. There is no System tab because Health belongs to the Estate and resource monitoring is out of scope. There is no Explore placeholder because the Journal program has not yet defined that product.
 
-## 6.2 Attention drawer
-
-**Decision T-22 (R2/R5):** A collapsible left drawer, toggled by `~`, groups the existing Fleet into operator-relevant queues.
+A representative header:
 
 ```text
-NEEDS YOU
-  needs_input
-
-TROUBLE
-  blocked
-  failed
-
-IN FLIGHT
-  pending
-  active
-
-WAITING
-  waiting
-
-TERMINAL
-  completed
-  canceled
+sergeant   Home  Fleet  Workflows  Estate             ? 2  ! 1    live
 ```
 
-The order is attention order, not a new priority field. Within each group, Work remains ordered by its existing ULID/submission order unless a screen-local sort is selected.
+The right side shows:
 
-The drawer:
+- `? N` for current human input requests;
+- `! N` for blocked/failed/completed-dirty Work;
+- connection truth;
+- optional admission-paused status.
 
-- is open by default on wide terminals;
-- is closed by default on medium terminals;
-- becomes an overlay on narrow terminals;
-- restores the selected Work and scroll position when toggled;
-- shows intent first and state/stage second;
-- never stores read/unread, dismissal, snooze, or notification history.
+## 7.2 Canonical Work
 
-When closed, a static gold `? N` in the header reports the count of `needs_input` Work. It does not blink or pulse. Motion is reserved for active execution state.
-
-## 6.3 Canonical Work navigation
-
-**Decision T-23 (R2):** Every Work selection opens the same full-screen Work surface.
+**Decision T2-22 (R2):** Every Work selection opens one canonical full-body Work surface.
 
 Entry points include:
 
 ```text
-Home summary
-Attention drawer
+Home attention/current/recent rows
 Fleet
-Workflow run history where already present in loaded Fleet data
-Graph node or edge carrying a work_id
-Analytics row carrying a work_id
+Workflow recent-run row derived from loaded Fleet
+Attention drawer
+Graph or analytics result carrying work_id
+Retained-state result if PR #111 lands
 ```
 
-The TUI maintains a navigation stack. `Esc` returns to the exact prior mode, focus, filter, selection, and scroll position. Opening Work from a filtered Fleet must not drop the user back into an unfiltered list.
+`Esc` returns to the exact prior destination, filter, selection, focus, and scroll position.
 
-The Work surface is not a small popup. It occupies the application body while preserving the global header and optional drawer.
+## 7.3 Global Attention drawer
 
-## 6.4 Responsive composition
-
-**Decision T-24 (R5):** Ratatui's installed layout and widget primitives implement three explicit compositions.
-
-### Wide — approximately 150 columns and above
+**Decision T2-23 (R2/R5):** `~` toggles one global left drawer. It stores no notification state.
 
 ```text
-attention drawer | main thread or mode body | contextual rail
+NEEDS INPUT
+  needs_input
+
+STOPPED
+  blocked
+  failed
+  completed_dirty
+
+WAITING
+  waiting
+
+RUNNING
+  pending
+  active
+
+FINISHED
+  completed
+  canceled
 ```
 
-### Medium — approximately 100–149 columns
+Watch does not treat `pending` or `active` as notice-producing states, but the cockpit may show them under Running because the drawer is a fleet view, not the Watch protocol itself.
+
+The drawer:
+
+- opens by default at wide widths;
+- overlays at narrow widths;
+- restores selection and scroll position;
+- leads with intent, not ULID;
+- never blinks or pulses;
+- bounds Finished rows.
+
+## 7.4 Overlays
+
+The application has a small fixed set:
 
 ```text
-optional drawer | main body
-contextual detail becomes a selectable view
+slash command palette
+workflow chooser
+help
+cancel confirmation
+extend envelope
+repo add/remove
+group edit/remove
+retained-state preview/reap confirmation, if available
+connection detail
+terminal-too-small notice
 ```
 
-### Narrow — approximately 80–99 columns
-
-```text
-main body only
-drawer and secondary detail appear as overlays or full-body views
-```
-
-Below the contract minimum of `80×24`, the TUI must remain safe and legible enough to tell the operator the terminal is too small. It may reduce content, but it must not panic, overlap the composer, or leave the terminal corrupted.
-
-Widths are acceptance fixtures, not exact visual snapshots. Content priority determines degradation:
-
-```text
-intent / question / state
-    before
-stage / executor / workflow
-    before
-backend / workspace / short id
-    before
-full ids / paths / provenance
-```
+**Decision T2-24 (R1/R5):** Overlays are contextual views over existing operations, not a modal framework or second navigation system.
 
 ---
 
-# 7. Interaction Grammar
+# 8. Visual System and Ratatui Feasibility
 
-## 7.1 The persistent composer
+## 8.1 Theme
 
-**Decision T-25 (R2/R5):** A composer occupies the bottom region across all primary modes.
+**Decision T2-25 (R5):** One dark theme governs the whole TUI.
 
-Its label and behavior depend on context:
-
-| Context | Label | Ordinary text |
-|---|---|---|
-| Home | `NEW WORK` | creates a Work through `POST /v1/work` |
-| Work in `needs_input` | `ANSWER` | posts to `/v1/work/{id}/input` |
-| Other Work states | `COMMAND` | disabled as agent input; `/` remains available |
-| Fleet | `FILTER OR COMMAND` | filters when filter focus is chosen; `/` opens palette |
-| Workflows | `FILTER OR COMMAND` | filters catalog; `@` opens workflow chooser |
-
-The composer is one visual component with context-specific semantics, not a universal chat channel.
-
-An ordinary printable character in a read-only Work does not silently become guidance. The TUI explains that the Work is not awaiting input and offers valid commands instead.
-
-## 7.2 Multiline input and deliberate send
-
-**Decision T-26 (R2/R5):** Composer submission uses:
+Semantic tokens:
 
 ```text
-Enter          insert newline
-Ctrl+Enter     submit, when the terminal reports the modifier
-Tab            move focus to [ Send ]
-Enter on Send  submit on every supported terminal
-Esc            leave composer focus; preserve the local draft
+background       near-black neutral
+surface          slightly raised cool neutral
+surface-muted    secondary region
+border           low-contrast cool gray
+text             off-white
+muted            cool gray
+focus/accent     restrained cyan or cool blue
+success          green
+attention        gold/yellow
+warning          amber where reliable, else yellow
+danger           red
+info/reference   restrained violet only for workflow references
 ```
 
-The fallback is load-bearing. Traditional terminal protocols may report `Ctrl+Enter` as ordinary Enter. In that case the input gains a newline rather than submitting accidentally, and the visible Send action remains available.
+No pure black/white requirement is imposed on terminal users. Where truecolor is unavailable, the implementation falls back to standard/256-color equivalents while preserving labels and glyphs.
 
-Blank or whitespace-only submission is refused locally; Home submission is also rejected by the existing API when intent is empty. A send attempt does not clear the draft until the API accepts the mutation. A rejected submit or response leaves the draft intact and shows the structured error.
+The terminal controls the font. The TUI controls only weight, brightness, underline, dim, and spacing.
 
-## 7.3 Local slash palette
+## 8.2 Shape and hierarchy
 
-**Decision T-27 (R2/R5/R6):** `/` opens a fixed TUI command palette over existing views and operations.
-
-Initial vocabulary:
+**Decision T2-26 (R5):**
 
 ```text
-/home
-/fleet
-/workflows
-/back
-/refresh
-/answer
-/retry
-/cancel
-/events
-/graph
-/details
-/analytics
-/quit
+major focus region     full border
+secondary grouping     one divider or title line
+metadata               aligned text and whitespace
+selected row           background or accent marker
+focused control        accent border/title/cursor
 ```
 
-The palette is context-filtered:
+Nested boxes inside boxes are prohibited unless the inner region is independently focusable.
 
-- `/answer` appears only when the selected Work is in `needs_input`;
-- `/retry` appears only for a projected retryable state;
-- `/cancel` appears only where cancellation is not already terminally impossible;
-- `/events`, `/graph`, and `/details` require an open Work;
-- `/analytics` opens the existing canned-query utility;
-- `/workflows` navigates to the catalog but never changes a running Work.
+Uppercase micro-headings are rationed. A screen should not look like every paragraph is a subsystem.
 
-The parser rule is narrow:
+## 8.3 Built-in widgets
+
+Ratatui 0.30.2 already supplies and re-exports the primitives needed here:
+
+- `Tabs`
+- `Table` and `List`
+- `Paragraph` with wrapping
+- `Scrollbar`
+- `Block`
+- `Clear` for overlays
+- `Gauge` and `LineGauge`
+- styled `Span`, `Line`, and `Text`
+
+Official references:
+
+- [Ratatui 0.30.2](https://docs.rs/ratatui/0.30.2/ratatui/)
+- [built-in widgets](https://docs.rs/ratatui/0.30.2/ratatui/widgets/)
+- [LineGauge](https://docs.rs/ratatui/0.30.2/ratatui/widgets/struct.LineGauge.html)
+- [TestBackend](https://docs.rs/ratatui/0.30.2/ratatui/backend/struct.TestBackend.html)
+
+Canvas exists, but is not evidence that a spatial graph is the right terminal interaction.
+
+**Decision T2-27 (R5):** Build the visual system from Ratatui primitives already in the dependency graph. Add no UI framework, animation crate, or charting package.
+
+## 8.4 State glyphs
+
+**Decision T2-28 (R5):** Every important state uses text, glyph, and color.
+
+| State | Glyph | Treatment |
+|---|---:|---|
+| pending | `·` | muted |
+| active | spinner frame | cyan |
+| waiting | `○` | muted blue/gray |
+| needs_input | `?` | gold, bold |
+| blocked | `!` | amber/yellow |
+| failed | `×` | red |
+| completed | `✓` | green |
+| completed_dirty | `!` | gold with `output needs review` |
+| canceled | `-` | dim gray |
+| reconnecting | `↻` | yellow with explicit label |
+| auth failed | `!` | red with explicit label |
+
+Every glyph is tested for one-cell width. ASCII fallback is mandatory.
+
+## 8.5 Motion
+
+**Decision T2-29 (R2/R6):** Only attached Work whose projected state is `active` animates.
+
+The spinner is a local frame array advanced by the existing event-loop tick. It communicates lifecycle motion, not native process proof.
+
+Motion stops when:
+
+- the SSE tail is reconnecting;
+- authentication failed;
+- the TUI marks data stale;
+- reduced Unicode capability selects a static fallback.
+
+No pulsing attention, animated borders, loading shimmer, or transition framework.
+
+## 8.6 Progress
+
+**Decision T2-30 (R1/R2/R5):** Use a `LineGauge` only for the real turn-envelope ratio:
 
 ```text
-/ as first non-whitespace input  local TUI command
-/ elsewhere in text             literal character
+Turns  4 / 12   ━━━━━━━────────────
+Ceiling  40m per turn
 ```
 
-The palette is a Rust enum and a match, not a shell, command language, plugin interface, or new `sgt` CLI grammar. Palette actions never enter the journal unless they invoke an existing mutation endpoint, in which case the daemon records the real command exactly as it does today.
+The label always states numerator and denominator. A cap of zero/unknown does not render a fabricated ratio.
 
-## 7.4 Workflow mention and selection
-
-**Decision T-28 (R2/R5/R6):** `@` invokes the admitted workflow catalog with context-sensitive meaning.
-
-### On Home
-
-Selecting a workflow sets the existing submission field and renders a chip outside the intent:
+Workflow progress is ordinal:
 
 ```text
-Workflow  @repo-to-icm v2
-
-> Decompose this repository's procedural knowledge.
+stage 4 / 10
+✓ plan  ✓ context  ⠹ implement  · verify  · close
 ```
 
-The durable intent is the text in the composer, not UI control syntax. Choosing another workflow replaces the selected workflow. Clearing the chip restores default workflow resolution.
+It never becomes 40 percent complete.
 
-### In Workflows
+## 8.7 Multiline editor
 
-`@` focuses catalog search. Enter opens workflow detail. A `Start Work` action returns to Home with that workflow selected.
+The original proposal specified a custom local editor. Current ecosystem research changes the lower-rung analysis.
 
-### Inside an existing Work
+[`ratatui-textarea`](https://docs.rs/ratatui-textarea/latest/ratatui_textarea/) is a maintained Ratatui-native multiline editor with insertion, deletion, wrapping, cursor movement, scrolling, and custom key mappings. A mature Ratatui application such as GitUI currently pairs Ratatui 0.30 with `ratatui-textarea`.
 
-The Work's workflow is already pinned and cannot be rebound. Choosing `@name` while answering inserts a literal reference into the answer text. It is not interpreted by the engine and does not load context automatically.
+**Decision T2-31 (R7, dependency-tree gated):** Prefer one narrow wrapper over a pinned compatible `ratatui-textarea` release instead of hand-building cursor-aware multiline editing.
 
-If the user types an unselected literal `@name`, it remains ordinary text. The TUI does not invent a workflow identity that the catalog did not resolve.
+Failed lower rungs:
 
-## 7.5 Focus and keyboard help
+- R1 fails: multiline deliberate input is settled.
+- R2 fails: the current one-line `String` buffer cannot satisfy it.
+- R3/R4 fail: standard Rust and terminal events do not provide editor behavior.
+- R5 fails: the currently installed dependency set has no editor.
+- R6 fails: correct wrapping, visual-row cursor movement, paste, delete, and scrolling are not a tiny composition.
 
-The footer always describes the valid operations for the current focus. It is not a static list of every key in the application.
-
-Examples:
+The dependency is admitted only if a T0 spike proves:
 
 ```text
-Home composer     Enter newline · Ctrl+Enter send · @ workflow · / commands · Esc leave
-Fleet list        ↑↓ move · Enter open · / commands · ~ attention
-Needs input       Enter newline · Ctrl+Enter answer · @ reference · / commands · Esc back
-Read-only Work    / commands · Tab views · ~ attention · Esc back
+one resolved Ratatui version
+one resolved Crossterm version
+no direct conflicting crossterm edge
+no search/regex feature
+no mouse requirement
+no editor-owned submit behavior
+pure access to the local draft for testing
 ```
 
-A `?` key may open a help overlay listing the same fixed keymap. It does not create a configurable keybinding subsystem.
+If that proof fails, the dependency is refused and the bounded local-editor fallback from the original proposal is used. The user-visible contract does not change.
+
+## 8.8 Enhanced keyboard protocol
+
+Crossterm `KeyEvent` carries code, modifiers, kind, and state. `PushKeyboardEnhancementFlags` can enable the Kitty keyboard protocol in compatible terminals and should be paired with `PopKeyboardEnhancementFlags`.
+
+References:
+
+- [Crossterm `KeyEvent`](https://docs.rs/crossterm/0.29.0/crossterm/event/struct.KeyEvent.html)
+- [`PushKeyboardEnhancementFlags`](https://docs.rs/crossterm/0.29.0/crossterm/event/struct.PushKeyboardEnhancementFlags.html)
+- [`KeyboardEnhancementFlags`](https://docs.rs/crossterm/0.29.0/crossterm/event/struct.KeyboardEnhancementFlags.html)
+
+**Decision T2-32 (R4/R6):** Preserve full `KeyEvent` values and opportunistically request disambiguated modified keys. Failure or lack of terminal support is nonfatal.
+
+```text
+Enter                 newline
+Ctrl+Enter            submit when distinguishable
+Tab to Send + Enter   universal deliberate fallback
+```
+
+Push/pop is integrated into the existing terminal lifecycle guard and tested on every exit path. Ctrl+Enter is never the only route.
+
+## 8.9 Mouse
+
+**Decision T2-33 (R1):** Mouse capture remains disabled. Every action is reachable, visible, and testable from the keyboard.
 
 ---
 
-# 8. Home
+# 9. Home
 
-Home combines the two primary operator acts: state new intent and address existing Work that needs attention.
+Home is the command center for current Work and new intent.
 
-A wide rendering:
+A wide composition:
 
 ```text
-sergeant   Home  Fleet  Workflows                          ? 2   live · seq 128492
-┌─ ATTENTION ───────────┬──────────────────────────────────────────────────────────┐
-│ NEEDS YOU          2  │ NEW WORK                                                 │
-│ ? Retry handling      │ What should Sergeant do?                                 │
-│ ? Auth policy         │ > Add retry handling to the settlement worker.           │
-│                       │                                                          │
-│ IN FLIGHT          3  │ Workflow  @software-change v1                            │
-│ ⠹ ICM decomposition  │ Advanced  backend default · profile default · repo current│
-│ ⠹ Release validation │                                           [ Send intent ] │
-│                       ├──────────────────────────────────────────────────────────┤
-│ WAITING            1  │ NEEDS YOU                                                │
-│ ○ External approval  │ Retry handling · 10-implement                             │
-│                       │ Should the retry budget be 3 attempts?                    │
-│ TERMINAL              │                                                          │
-│ ✓ Idempotency keys    │ IN FLIGHT                                                │
-│ × Failed deployment   │ ⠹ Generate ICM workflows · 40-classify 5/10 · claude     │
-└───────────────────────┴──────────────────────────────────────────────────────────┘
-Enter newline · Ctrl+Enter send · @ workflow · / commands · ~ attention
+┌ Attention ─────────┬ Home / New Work ─────────────────────┬ Recent Outputs ┐
+│ needs input        │ target       payments (group)         │ payment worker │
+│ blocked            │ workflow     @implement               │ a412ce7  23m   │
+│ waiting            │ backend      default                  │                │
+│ running            │ profile      sonnet                   │ Running Now    │
+│ completed-review   │ turns        4 / 12                   │ ...            │
+│                    │ ceiling      40m                      │                │
+│                    │                                      │                │
+│                    │ intent composer                       │                │
+│                    │                                      │                │
+│                    │                         [ Run Work ]   │                │
+└────────────────────┴──────────────────────────────────────┴────────────────┘
 ```
 
-## 8.1 New Work composer
+## 9.1 New Work fields
 
-**Decision T-29 (R2):** Home maps directly to the current submission body.
-
-Default submission:
+**Decision T2-34 (R2):** Home maps to current submission semantics.
 
 ```text
 intent
-created_by = "tui"
-origin.client = "tui"
-origin.cwd = the TUI process's current directory
-```
-
-A collapsed Advanced region exposes only fields already accepted by `POST /v1/work`:
-
-```text
 workflow
 backend
 profile
 workspace
 repositories[]
+envelope.turn_cap
+envelope.ceiling_secs
+created_by = "tui"
+origin.client = "tui"
+origin.cwd = launch cwd
 ```
 
-Workflow selection normally comes from `@`; exact-name entry remains available in Advanced for recovery and automation parity. Backend, profile, workspace, and repositories remain exact-name fields. No additional catalog or preflight system is added for them.
+Target selection uses the estate's declared repositories and groups. A selected group is expanded client-side into `repositories[]` through the same shared logic as `sgt run --group`; no new group field is invented in the daemon request.
 
-The launch summary always shows the resolved request before submission:
+Workflow selection uses the catalog endpoint. Profiles may be listed from the current estate manifest through shared read logic.
+
+There is no model selector because current submission has no direct model field and no public model catalog. Backend remains default or exact-name unless a current authoritative catalog is added outside this proposal.
+
+**Decision T2-35 (R1/R2):** Do not expose capability-driven backend/model controls until an API or local authoritative source actually provides the required catalog. The layout leaves room for future valid controls but ships none disabled or guessed.
+
+## 9.2 Deliberate submission
+
+The intent editor is the primary focus. The request summary remains visible before submission.
 
 ```text
-intent      Add retry handling to the settlement worker.
-workflow    @software-change v1
-backend     default
-profile     default
-workspace   discovered from current cwd
-repositories current/default
+Ctrl+Enter submit
+Tab to [ Run Work ] then Enter
+Enter newline
+Esc leave focus and preserve draft
 ```
 
-This is request review, not a second planning engine. The daemon still performs authoritative discovery, routing, workflow load, and N3 preflight.
+The draft clears only after the daemon accepts the Work. Structured errors preserve it.
 
-## 8.2 Attention-oriented current Work
+When admission is paused, Home shows the current daemon fact and disables Run Work with the named reason.
 
-Home groups non-terminal Work using the same state grammar as the drawer. Each item shows:
+## 9.3 Attention and running Work
+
+Rows show:
 
 ```text
 state glyph
 intent
-current stage coordinate
-current question/reason when present
-resolved current-stage executor when present
-time since submission, labeled honestly as submission age
-short id only when needed for disambiguation
+stage coordinate
+question/reason when present
+turns spawned/cap for active Work
+age labeled as submission age
 ```
 
-Intent is the primary identity. A 26-character ULID never leads a Home row.
+ULIDs are secondary.
 
-## 8.3 Bounded terminal Work
+## 9.4 Recent outputs
 
-**Decision T-30 (R1/R2):** Home shows all non-terminal Work and only a bounded slice of terminal Work.
+**Decision T2-36 (R2):** Recent Outputs displays only terminal Work with a non-null output pointer.
 
-The current Fleet body has `created_at`, not a terminal timestamp. The UI may therefore label the terminal section **Terminal**, not “Recently completed.” The full history remains in Fleet. No archive or dismissal state is introduced.
+It may show:
+
+```text
+intent
+repository
+retained branch
+finalize commit
+disposition
+submission/terminal timestamp only where the API supplies it honestly
+```
+
+It does not imply a diff, file list, artifact inventory, or successful promotion beyond the output pointer's facts.
+
+`completed_dirty` appears as `output needs review`, never a green success.
+
+Home bounds this list. Fleet remains complete.
 
 ---
 
-# 9. Fleet
+# 10. Fleet
 
-Fleet is the complete Work browser, not the Home screen and not a process table.
+Fleet is the complete Work browser.
+
+## 10.1 Layout
+
+Wide:
 
 ```text
-sergeant   Home  Fleet  Workflows                          ? 2   live
-
-FLEET   27 Work          filter: state:any  workflow:any  text:"retry"
-
-  ?  Add retry handling to the settlement worker
-     needs input  ·  10-implement 1/2  ·  claude  ·  8m since submit
-
-  ⠹  Generate ICM workflows from this repository
-     active       ·  40-classify 5/10   ·  claude  ·  19m since submit
-
-  !  Resolve deployment policy
-     blocked      ·  20-review 2/4      ·  claude
-
-  ✓  Add idempotency keys
-     completed    ·  20-review 2/2      ·  claude
-
-↑↓ move · Enter open Work · f filter · / commands · ~ attention
+filters | Work table/list
+        | selected Work preview
 ```
 
-## 9.1 Width-aware rows
-
-**Decision T-31 (R5):** Fleet rows use Ratatui constraints, wrapping, and explicit ellipsis rather than fixed string padding.
-
-At wide widths, a row may show intent, state, stage, current executor, workspace, submission age, and short ID. At narrow widths it degrades in that order:
+Medium:
 
 ```text
-intent + state
-intent + state + stage
-intent + state + stage + executor
-additional metadata only when space remains
+Work list
+selected preview below or toggle
 ```
 
-Independent fields never run together. Issue #11's exact failure shape must be impossible by construction.
-
-## 9.2 Client-side filters and grouping
-
-**Decision T-32 (R2):** Fleet filtering uses only fields already returned by `GET /v1/work`.
-
-Supported filters:
+Narrow:
 
 ```text
-text over intent/id/workspace/workflow/backend/stage
+intent-first stacked rows
+filter overlay
+```
+
+**Decision T2-37 (R5):** Use Ratatui `Table` or two-line `List` rows with constraints, wrapping, and explicit truncation. Never return to fixed padded strings.
+
+## 10.2 Row priority
+
+```text
+intent
 state
-workflow exact name
-backend/executor name where present
-terminal vs non-terminal
+stage
+target
+workflow
+turn envelope
+backend/executor
+age
+short id
 ```
 
-Filtering is local to the loaded Fleet. It is not the future Journal query language. Filter drafts are ephemeral and restored when returning from an opened Work.
+At 80 columns, intent/state/stage survive before the rest.
 
-## 9.3 Actions
+## 10.3 Filters
 
-Enter opens the canonical Work. The slash palette exposes valid actions. There is no mouse-only affordance and no single-key destructive mutation.
+**Decision T2-38 (R2):** Local Fleet filters use fields already returned in the Fleet projection:
+
+```text
+text
+state
+terminal/nonterminal
+workflow
+workspace
+repository/target where present
+backend
+envelope pressure
+```
+
+This is not Journal search.
+
+## 10.4 Reported states
+
+Fleet visibly distinguishes:
+
+```text
+completed
+completed_dirty
+needs_input
+waiting
+blocked
+failed
+active
+pending
+canceled
+```
+
+`completed_dirty` is grouped with review-required Work, not normal success.
+
+## 10.5 Actions
+
+Enter opens canonical Work. Mutations are available through the contextual palette and confirmations, not single-key destructive shortcuts.
+
+If PR #111 lands, retained-state markers may appear on relevant terminal rows only when the current API reports them.
 
 ---
 
-# 10. Workflows
+# 11. Workflows
 
-Workflows is a read-only view of admitted repository procedure and a launch affordance for new Work.
+## 11.1 Catalog authority
 
-## 10.1 Authoritative sources
+The current root catalog lists 23 admitted workflows and excludes drafts. It delegates description/tags to each workflow's `index.md`; `workflow.toml` owns executable identity and stage order.
 
-The catalog has three existing sources with distinct responsibilities:
+Sources:
 
-```text
-.sergeant/index.md
-    authoritative admitted-workflow list and discovery boundary
+- [`.sergeant/index.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/.sergeant/index.md)
+- [`docs/icm/convention.md@242abe3`](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/icm/convention.md)
 
-.sergeant/workflows/<name>/index.md
-    human description, status, tags, use-when language
+**Decision T2-39 (R2):** Show only root-indexed published workflows plus the honest embedded fallback when not overridden. Never scan arbitrary directories or list drafts.
 
-.sergeant/workflows/<name>/workflow.toml
-    executable name, version, stage order, kind, harness, profile
-```
+## 11.2 Read-only catalog route
 
-The engine's `WorkflowDefinition` remains authoritative for executable validity. The catalog does not reinterpret stage context or invent procedure from prose.
-
-## 10.2 Catalog contents
-
-**Decision T-33 (R2):** The Workflows screen contains:
-
-- every workflow listed as admitted/published by `.sergeant/index.md` and successfully loaded through the existing workflow loader;
-- the embedded `software-change` fallback, marked `embedded`, when it is not replaced by an admitted repository-local definition;
-- no workflow under `.sergeant/drafts/workflows/`;
-- no unindexed directory found by broad scanning;
-- no generated or inferred workflow.
-
-A catalog row shows:
+The proposal retains the original minimum addition:
 
 ```text
-@name
-version
-published or embedded source
-short description
-stage count
-stage executor summary when declared
+GET /v1/workflows?cwd=<percent-encoded path>
 ```
 
-A workflow detail shows its description, tags, source, stage rail, stage kind, explicit harness/profile declarations, and content identity where available. Stage `CONTEXT.md` bodies are not rendered as an authoring editor; the catalog is orientation and selection, not a procedure IDE.
+The route reuses:
 
-## 10.3 Read-only workflow-catalog API
+- current estate/workspace discovery;
+- current workflow loader and validation;
+- root publication boundary;
+- current embedded fallback;
+- existing Axum and `ApiClient` patterns.
 
-Under Decision T-17, add one authenticated read-only route:
+It performs no mutation and appends no event.
 
-```text
-GET /v1/workflows?cwd=<percent-encoded-path>
-```
+**Decision T2-40 (R2/R6/R7):** Add one workflow catalog projection because the TUI must not privately reinterpret executable procedure.
 
-The route exists because:
-
-- R1 fails: workflow discovery is a settled operator requirement;
-- R2 succeeds for the underlying capabilities: workspace discovery, workflow loading, embedded fallback, validation, and publication convention already exist;
-- R3/R4 do not supply a repository workflow catalog over HTTP;
-- R5 supplies Axum, the existing API/client pattern, TOML parsing, and blocking-I/O boundary;
-- R6 covers most wiring, but parsing the existing Markdown catalog/front matter requires a small bounded addition;
-- R7 is limited to the minimum catalog projection and exact record parser needed to expose the existing contract.
-
-The endpoint performs no mutation and appends no event. It executes filesystem discovery outside the core lock, following `submit_work`'s current planning precedent.
-
-A representative response shape:
+Representative entry:
 
 ```json
 {
-  "context": {
-    "cwd": "/work/service",
-    "workspace": "service",
-    "root": "/work/service"
-  },
-  "workflows": [
+  "name": "implement",
+  "version": "2",
+  "status": "published",
+  "source": "repository",
+  "description": "...",
+  "tags": ["implementation"],
+  "content_hash": "...",
+  "stages": [
     {
-      "name": "repo-to-icm",
-      "version": "2",
-      "status": "published",
-      "source": "repository",
-      "description": "Convert repository procedure into reviewable ICM drafts.",
-      "tags": ["icm", "generator", "measurement"],
-      "content_hash": "...",
-      "stages": [
-        {
-          "id": "00-contract",
-          "kind": "actor",
-          "harness": null,
-          "profile": null
-        }
-      ]
-    },
-    {
-      "name": "software-change",
-      "version": "1",
-      "status": "embedded",
-      "source": "embedded",
-      "description": null,
-      "tags": [],
-      "content_hash": "...",
-      "stages": []
+      "id": "10-plan",
+      "kind": "actor",
+      "harness": null,
+      "profile": "planner"
     }
   ]
 }
 ```
 
-The exact response is contracted before implementation; the principles above are binding.
+The exact response is contracted before implementation.
 
-`ApiClient` gains a typed workflow-catalog method. `src/tui.rs` imports no workflow or filesystem module. The M6 equal-client structural test is amended deliberately to pin the endpoint-backed addition rather than weakened.
-
-## 10.4 Catalog parsing and failure behavior
-
-**Decision T-34 (R2/R3/R6):** Catalog parsing implements only the repository's current documented record shapes.
-
-It is not a general Markdown or YAML engine. It needs only to:
-
-- read the root catalog's admitted workflow entries;
-- follow the declared relative `index.md` path;
-- read the exact front-matter fields used by current workflow indexes (`name`, `status`, `version`, `description`, `tags`);
-- validate executable content through `WorkflowDefinition::resolve` or the corresponding existing loader;
-- distinguish repository and embedded source.
-
-No new parsing dependency is added unless a challenge round demonstrates that a bounded parser cannot correctly handle the committed convention.
-
-Failure rules:
-
-- no `.sergeant/index.md` means no repository catalog; the embedded fallback remains available;
-- an index entry that escapes `.sergeant/`, points to a missing file, claims a non-published status, disagrees with `workflow.toml`, or fails workflow loading makes the catalog request fail with a structured `workflow_catalog_invalid` error naming the entry and path;
-- a workflow directory present but absent from the root index remains undiscoverable by design;
-- catalog failure does not modify Work or prevent exact-name submission through the existing endpoint; it prevents the TUI from pretending discovery succeeded.
-
-## 10.5 Live catalog versus pinned Work
-
-**Decision T-35 (R2):** Workflows shows the live repository catalog for starting future Work. An existing Work always shows the workflow definition pinned in its `workflow.bound` journal event.
-
-Editing `.sergeant/` while Work is running may change the catalog but cannot rewrite the Work's displayed procedure. The UI labels these surfaces distinctly:
+## 11.3 Screen
 
 ```text
-Catalog workflow     available for new Work now
-Pinned workflow      procedure this Work actually bound
+catalog list | workflow detail | usage/recent Work derived from loaded Fleet
 ```
 
-## 10.6 Workflow actions
-
-The screen supports:
+Detail may show:
 
 ```text
-Enter       inspect workflow
-n or action Start Work   return to Home with workflow selected
-@           filter/select
-/           local commands
-Esc         return
+name/version/source/status
+description/tags
+stage order
+stage kind
+declared harness/profile
+content identity
+recent Work using this workflow
 ```
 
-It does not edit, copy, promote, publish, validate, or generate workflows.
+It does not show a generalized backend capability matrix. Backend capabilities exist internally, but current public surfaces do not provide a complete capability/catalog read model to the TUI.
+
+## 11.4 Actions
+
+```text
+Enter inspect
+Use in New Work
+@ filter/select
+/ commands
+Esc back
+```
+
+No workflow editing, validation, generation, or publication.
+
+## 11.5 Live catalog versus pinned Work
+
+**Decision T2-41 (R2):** Workflows shows what new Work can bind now. Canonical Work shows the workflow definition pinned when that Work bound. The two are labeled distinctly and never silently reconciled.
 
 ---
 
-# 11. Canonical Work Surface
+# 12. Estate
 
-A Work surface should answer “what is happening here?” before “what are all its fields?”
-
-```text
-sergeant / Add retry handling to the settlement worker       ? NEEDS INPUT
-@software-change v1 · 10-implement 1/2 · attempt 1 · claude   live
-
-Thread   Workflow   Evidence   Graph   Details
-
-INTENT
-Add retry handling to the payment settlement worker.
-
-✓ Surface materialized for service
-✓ Entered 10-implement
-⠹ Claude execution started
-
-AGENT
-I found the existing exponential-backoff policy.
-
-? INPUT REQUEST
-Should the retry budget be 3 attempts?
-
-────────────────────────────────────────────────────────────────────────────
-ANSWER
-> Yes. Use three attempts with exponential backoff and jitter.
->
->                                                                     [ Send ]
-────────────────────────────────────────────────────────────────────────────
-Enter newline · Ctrl+Enter answer · @ workflow reference · / commands · Esc back
-```
-
-## 11.1 Work header
-
-**Decision T-36 (R2):** The header shows, in order:
-
-1. state glyph and explicit state label;
-2. intent;
-3. pinned workflow name/version;
-4. current stage coordinate and attempt;
-5. current-stage executor/harness and profile when present;
-6. connection truth.
-
-Workspace, repository names, short Work ID, and reservation state may appear on a secondary line when space permits. Full IDs and paths belong in Details.
-
-When Work is in `needs_input`, the current question is visible without scrolling to the event that caused it.
-
-## 11.2 Workflow rail
-
-**Decision T-37 (R2):** The pinned `workflow.stages` array supplies the complete ordinal rail.
-
-The current stage index and the engine's ordered-stage invariant justify these labels:
+Estate is a full top-level destination.
 
 ```text
-indices before current    completed
-current index             current status and attempt
-indices after current     not entered
+Estate
+  Repositories
+  Groups
+  Health
 ```
 
-Event history may add attempt counts, question/failure details, and known transitions. The UI does not invent durations where the loaded evidence lacks timestamps.
+**Decision T2-42 (R2):** Estate is first-class because estate topology and health are prerequisites to setting useful intent, not miscellaneous settings.
 
-N3 executor information is shown per stage where pinned data is available; at minimum the current stage's executor comes from `stage.executor`. The rail never reduces a mixed-harness workflow to the Work-level default.
+## 12.1 Repositories
 
-Compact form:
+The screen consumes current repo lifecycle semantics:
 
 ```text
-✓ contract  ✓ inventory  ✓ harvest  ⠹ classify  · synthesize  · draft
+sgt repo list
+sgt repo add
+sgt repo remove
 ```
 
-Expanded form:
+List/detail may show only current manifest facts:
 
 ```text
-✓ 00-contract      completed
-✓ 10-inventory     completed
-✓ 20-harvest       completed
-⠹ 40-classify      active · attempt 2 · claude / review-profile
-· 50-synthesize
-· 60-draft
+name
+path
+origin when declared
+instruction policy
+group membership derived from current groups
+present/valid result when current validation provides it
 ```
 
-## 11.3 Semantic thread
+### Add
 
-**Decision T-38 (R2):** Existing event kinds map to bounded, testable thread items.
+Fields:
 
-| Event family | Default rendering |
+```text
+name
+origin, optional only when repo already exists
+instruction policy: local | suppress
+```
+
+The existing clone/register operation runs off the render loop. The TUI shows a spinner, current phase text where the operation itself supplies one, elapsed time, and final structured result. It does not fabricate clone percentage.
+
+### Remove
+
+Confirmation states:
+
+```text
+This removes the estate declaration.
+It does not delete repos/<name> from disk.
+```
+
+Existing group-reference refusal remains authoritative.
+
+**Decision T2-43 (R2/R6):** Reuse repo behavior exactly. The TUI never shells out to `sgt repo`, parses text, or reimplements manifest validation.
+
+## 12.2 Groups
+
+The screen consumes:
+
+```text
+sgt group list
+sgt group add
+sgt group remove
+```
+
+It supports:
+
+- create group;
+- extend existing membership;
+- remove selected members;
+- remove group;
+- display/edit the brief only if current add semantics can safely replace it.
+
+Every member must already be declared. Existing refusal text and remedies are preserved structurally.
+
+**Decision T2-44 (R2/R6):** Group editing is full lifecycle parity with current CLI semantics, not a read-only viewer.
+
+## 12.3 Health
+
+Health renders the current Doctor check report:
+
+```text
+status
+check name
+summary/detail
+remedy
+```
+
+It does not reinvent health policy.
+
+Current checks include installation, environment, data directory, Docker, journal, projection, daemon, estate, profiles, and disk pressure. If PR #111 lands, filesystem reliability joins the report.
+
+**Decision T2-45 (R2/R6):** Extract Doctor's structured `Check`/`Report` result from CLI formatting and let both CLI and TUI consume it.
+
+Health is not a resource dashboard. Disk facts appear only when Doctor already measures them.
+
+A selected failing/warning check receives one clear detail/remedy panel.
+
+## 12.4 Retained state, conditional on PR #111
+
+If the integration branch's retained/reap surfaces merge:
+
+- Health's disk-pressure detail may open a Retained Work overlay;
+- Work Details may show the retained binding, path, reason, and byte count;
+- the operator may preview exactly what Reap would delete;
+- Reap requires explicit confirmation;
+- retained branches remain outside the deletion path.
+
+**Decision T2-46 (R2):** Retained-state UI is conditional consumption of a real merged API, not a T-Series invention.
+
+## 12.5 What Estate excludes
+
+Estate does not expose:
+
+```text
+sgt init
+daemon foreground or stop
+harness passthrough
+data-dir relocation
+raw manifest editor
+CPU/memory/process monitoring
+```
+
+---
+
+# 13. Canonical Work Surface
+
+## 13.1 Header
+
+**Decision T2-47 (R2):** The Work header leads with:
+
+```text
+state + state label
+intent
+pinned workflow
+current stage / total
+attempt
+current stage executor/profile where present
+target repos/group-derived summary
+turn envelope
+connection truth
+```
+
+Full IDs, native session, route source, and paths stay in Details.
+
+`needs_input` pins the current question above the fold.
+
+## 13.2 Views
+
+```text
+Thread    Workflow    Evidence    Graph    Details
+```
+
+**Decision T2-48 (R2/R5):** There is one canonical representation. A peek overlay may summarize it, but it cannot expose a separate action vocabulary or become a second Work screen.
+
+## 13.3 Thread
+
+Thread combines two authoritative reads:
+
+```text
+GET /v1/work/{id}/transcript
+GET /v1/events?work_id=<id>&limit=<bounded>
+```
+
+Transcript turns carry causal sequence and, once PR #111 or equivalent lands, visible journal timestamps. Event history supplies stage, execution, surface, envelope, and lifecycle system lines.
+
+The two streams are merged by journal sequence where possible.
+
+Default rendering:
+
+| Fact | Rendering |
 |---|---|
-| `work.submitted` | intent card |
-| `workflow.bound` | workflow/workspace/routing system line |
-| `surface.materializing/materialized/torn_down` | compact surface line |
-| `stage.entered` | stage divider |
-| `stage.completed` | completed-stage line with summary/detail |
-| `stage.waiting` / `work.waiting` | muted waiting card |
-| `conversation.ask` | primary gold actor-authored input-request card |
-| `stage.needs_input` / `work.needs_input` | state transition supporting the current request; deduplicated from the ask card |
-| `stage.input_received` | human-response line |
-| `stage.blocked` / `work.blocked` | amber blocked card |
-| `stage.failed` | red failed-stage card |
-| `execution.reserved` | compact reservation/launch-preparation line |
-| `execution.started` | executor-started line |
-| `execution.stopped` | executor-ended line |
-| `execution.abandoned` | explicit abandoned-reservation warning |
-| `execution.reconciled` | restart/reconciliation line |
-| `conversation.user` | user/engine prompt line where useful |
-| `conversation.assistant.completed` | agent message |
-| `tool.requested` / `tool.completed` | paired, collapsible tool item |
-| `usage.updated` | compact usage line, collapsed by default |
-| `work.completed` | green terminal outcome line |
-| `work.failed` / `work.canceled` | terminal outcome line |
-| unknown kind | generic evidence line with kind and sequence |
+| Work intent | initial intent block |
+| user/assistant transcript turn | conversation turn |
+| actor-authored ask | primary gold request card |
+| human response | human turn |
+| workflow/stage transition | compact divider/system line |
+| execution reservation/start/stop | compact lifecycle line |
+| tool request/completion | paired collapsible row |
+| waiting | muted card |
+| blocked | warning card |
+| failed | danger card |
+| envelope extended | explicit budget system line |
+| ceiling interrupted | explicit interruption line |
+| output pointer | output card |
+| completed | success outcome |
+| completed_dirty | output-needs-review outcome |
+| canceled | muted terminal outcome |
+| unknown event | Evidence-only generic line |
 
-The semantic thread never says “thinking,” “making progress,” or “working on files” unless a recorded event supports that claim. An active spinner means lifecycle state `active`, not verified native process activity.
+**Decision T2-49 (R2):** Thread renders only journal-backed facts. It never displays chain-of-thought, guessed progress, inferred file changes, or process activity.
 
-The default Work window loads the newest 200 matching events. When exactly 200 are returned, the thread offers `Load older`, which increases the existing endpoint's `limit` in bounded steps. The UI labels a partial window honestly until fewer rows than the limit are returned. This is not global Journal search.
+Transcript source markers such as recovered/interrupted raw archive remain visible. Timestamp display never computes a fake "now" relationship when only the original timestamp is authoritative.
 
-## 11.4 Work views
+## 13.4 Workflow
 
-**Decision T-39 (R2/R5):** The canonical Work surface has five views:
+The pinned ordered stage list forms the rail.
 
 ```text
-Thread     human-readable recent trajectory and current request
-Workflow   complete pinned stage rail and known attempt history
-Evidence   raw event rows, sequence, timestamp, kind, source, payload
-Graph      existing one-Work graph neighborhood as a navigable tree/list
-Details    IDs, route, reservation, execution, surface, repositories, teardown
+✓ plan
+✓ context
+⠹ implement  attempt 2
+· verify
+· close
 ```
 
-Graph remains terminal-native:
+Event history may prove earlier attempts and statuses. Future stages remain not entered.
+
+Per-stage harness/profile appears only where the pinned definition supplies it.
+
+**Decision T2-50 (R2):** Stage order is not duration. The rail never becomes a percent bar.
+
+## 13.5 Evidence
+
+Evidence is the raw Work-local journal window:
 
 ```text
-Work: Add retry handling
-├─ follows → Workflow: software-change v1
-├─ targets → Repository: service
-├─ stage → 10-implement #1
-├─ executed-by → Execution: 01KZ...
-│  ├─ uses → Backend: claude
-│  └─ bound-to → Native session: ...
-└─ message → agent: Should the retry budget be 3 attempts?
+seq
+timestamp
+kind
+source
+execution/correlation/causation where present
+payload
 ```
 
-It does not draw a browser-like node canvas.
+It supports local filtering over loaded rows and bounded "load older". It does not become P2-JOURNAL.
 
-## 11.5 Composer and action matrix
+## 13.6 Graph
 
-**Decision T-40 (R2):** The TUI advertises only actions supported by existing semantics.
+The existing one-Work graph is rendered as a navigable relationship tree/list.
 
-| Work state | Ordinary text | Actions |
+```text
+Work
+├─ targets -> Repository
+├─ follows -> Workflow
+├─ current -> Stage
+├─ executed-by -> Execution
+│  ├─ uses -> Backend
+│  └─ bound-to -> Native session
+└─ contains -> Message / ToolCall
+```
+
+Every relationship may expose source event sequence.
+
+**Decision T2-51 (R1/R2):** No Canvas node graph. No File, Artifact, Commit, or Finding nodes unless current events and graph projection actually supply them.
+
+## 13.7 Details
+
+Details contains progressive-disclosure facts:
+
+```text
+Work id and origin
+workspace/repos
+reported and persisted state where relevant
+workflow source/content identity
+route source
+reservation
+execution/native session
+surface bindings
+teardown
+output pointer
+envelope
+conditional retained state
+```
+
+## 13.8 Output
+
+Output card shows only current pointer facts:
+
+```text
+repository
+source repo
+retained branch
+finalize commit
+worktree path
+teardown disposition
+```
+
+No file list or diff.
+
+## 13.9 Envelope
+
+```text
+turns spawned / effective cap
+bonus turns
+per-turn ceiling
+latest envelope extension evidence
+```
+
+`extend` and `retry` remain separate.
+
+## 13.10 Action matrix
+
+**Decision T2-52 (R2):** Advertise current semantic operations only.
+
+| Reported state | Ordinary text | Actions |
 |---|---|---|
-| `pending` | disabled | refresh, cancel, inspect |
-| `active` | disabled | refresh, cancel, inspect |
-| `waiting` | disabled | retry, cancel, inspect |
-| `needs_input` | answer | respond, cancel, inspect |
-| `blocked` | disabled | retry, cancel, inspect |
-| `failed` | disabled | retry, cancel, inspect |
-| `completed` | disabled | inspect; navigate Home for new Work |
-| `canceled` | disabled | inspect; navigate Home for new Work |
+| pending | disabled | cancel, inspect |
+| active | disabled | cancel, inspect |
+| waiting | disabled | retry, cancel, inspect |
+| needs_input | answer | respond, cancel, inspect |
+| blocked | disabled | retry, extend where relevant, cancel, inspect |
+| failed | disabled | retry, cancel, inspect |
+| completed | disabled | inspect output/evidence |
+| completed_dirty | disabled | inspect output/retained state; conditional reap |
+| canceled | disabled | inspect |
 
-The API remains authoritative. A race may make an advertised action invalid by the time it arrives; the structured conflict is shown and state is refreshed.
+The daemon is authoritative. Races return structured errors, preserve the screen, and trigger refresh.
 
-Cancel requires explicit confirmation. Retry requires selecting the action and confirming the target Work. A response requires the deliberate send behavior in §7.2.
-
-## 11.6 Workflow references inside an answer
-
-Selecting `@workflow` inside a needs-input composer inserts a literal reference. The TUI may show a small preview from the catalog before insertion, but the answer sent to the backend is ordinary text. The current Work's pinned workflow and stage remain unchanged.
+`extend` never implicitly retries. `retry` never implicitly extends.
 
 ---
 
-# 12. Live Connection and Reconnect
+# 14. Attention and WATCH
 
-The current TUI tells the truth when its SSE tail closes, but issue #16 records that recovery is manual. A long-lived operator surface that remains stale until the user knows to press `r` is not complete enough for this usability program.
-
-**Decision T-41 (R2/R6):** T-series closes issue #16 with a small explicit connection state machine.
+WATCH defines a headless blocking contract over six meaningful states:
 
 ```text
-Attached
-   │ stream ends / chunk error / refill failure
-   ▼
-Reconnecting(attempt, next_delay)
-   │ successful stream open
-   ├──────────────► Refresh authoritative state ► Attached
-   │ 401/403
-   └──────────────► AuthenticationFailed
+needs_input
+waiting
+blocked
+failed
+completed
+canceled
 ```
 
-Rules:
+`pending` and `active` do not emit Watch notices.
 
-1. Reconnect uses bounded exponential backoff with a capped interval; it does not create a high-frequency retry loop.
-2. `r` requests an immediate refresh/reconnect attempt without resetting historical truth.
-3. A stream open is not enough. The TUI rereads current system/Fleet/selected Work state before labeling the connection attached, because the SSE gap may contain changes.
-4. An authentication failure stops automatic retry and states that the daemon identity/token changed. The TUI does not retry forever with a known-invalid token.
-5. Transport failures continue retrying at the capped interval while the screen remains usable and visibly stale.
-6. A command result never overwrites the connection state.
-7. Active spinners stop when the tail is not attached; stale data must not be animated as live.
+**Decision T2-53 (R2):** Reuse this vocabulary to decide which transitions deserve in-cockpit attention, but do not run or emulate `sgt watch` inside the TUI.
 
-This changes only client liveness behavior. It adds no journal event, daemon state, token rotation, or reconnect protocol.
+Attention rules:
+
+- `needs_input`: gold and counted in `? N`;
+- `blocked`, `failed`, `completed_dirty`: warning/danger and counted in `! N`;
+- `waiting`: visible but not urgent gold;
+- `completed`, `canceled`: transient/bounded finished section;
+- `pending`, `active`: ordinary running state.
+
+An event may trigger a brief ephemeral banner after the authoritative reread. The banner is not persisted or acknowledged.
+
+No pulsing bell. The static count and drawer contents are sufficient.
 
 ---
 
-# 13. Visual Language
+# 15. Interaction Grammar
 
-## 13.1 State grammar
+## 15.1 Persistent composer
 
-**Decision T-42 (R5):** Every state is communicated through label, glyph, and standard terminal color. Color is never the sole carrier.
+**Decision T2-54 (R2/R5):** The bottom region is visually stable and semantically contextual.
 
-| State | Glyph | Treatment |
-|---|---:|---|
-| `pending` | `·` | muted cyan |
-| `active` | spinner frame | cyan/blue |
-| `waiting` | `○` | muted gray/blue |
-| `needs_input` | `?` | gold/yellow, bold |
-| `blocked` | `!` | amber/orange where available, else yellow |
-| `failed` | `×` | red, bold |
-| `completed` | `✓` | green |
-| `canceled` | `—` | dim gray |
-| reconnecting | `↻` | yellow/cyan with explicit label |
-| detached/auth failed | `!` | red with explicit label |
+| Context | Label | Ordinary text |
+|---|---|---|
+| Home | `INTENT` | submit new Work |
+| Work needs_input | `ANSWER` | respond to the current request |
+| Other Work | `COMMAND` | disabled as actor input |
+| Fleet | `FILTER` when focused | local Fleet filter |
+| Workflows | `FILTER` when focused | local catalog filter |
+| Estate lists | `FILTER` when focused | local list filter |
 
-Terminal palettes vary. The textual state is always present in important contexts.
+The composer never implies chat where no message operation exists.
 
-## 13.2 Motion
-
-**Decision T-43 (R2/R6):** Only currently active Work receives animation, and only while the SSE tail is attached.
-
-The spinner uses a small in-code frame array on the existing event-loop tick:
+## 15.2 Submission keys
 
 ```text
-⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+Enter          newline
+Ctrl+Enter     submit when distinguishable
+Tab            focus Send / Run / Confirm
+Enter          activate focused action
+Esc            leave focus, preserve draft
 ```
 
-No animation framework, effects crate, busy render loop, pulsing attention bell, or transition choreography is added. Needs input, blocked, failed, and completed are static because their importance comes from state, not motion.
+Blank input is refused. Draft clears only after accepted mutation.
 
-A Unicode fallback such as `*` or `>` is used if the selected symbol width is not one cell in the test environment.
+## 15.3 Slash palette
 
-## 13.3 Progress
+**Decision T2-55 (R2/R5/R6):** `/` at the first non-whitespace position opens a fixed local palette.
 
-**Decision T-44 (R1/R2):** Workflow progress is ordinal, never a percentage gauge.
-
-`5/10` means the fifth ordered checkpoint, not 50% of elapsed time, token cost, or effort. The UI uses a stage rail and coordinate. Ratatui gauges are not used where the domain has no honest ratio.
-
-## 13.4 Focus and affordance
-
-**Decision T-45 (R5):** Focus is visible through border/title style, cursor placement, and footer language.
-
-The TUI never relies on invisible modal state. When printable keys will edit a field, a cursor is visible. When `/` will navigate, the footer says so. When text cannot be sent to the current Work, the composer states that fact rather than silently swallowing input.
-
-## 13.5 Rich but terminal-native
-
-The implementation may use Ratatui's current widgets for:
+Core vocabulary:
 
 ```text
-Tabs
-Table/List
-Paragraph/Wrap
-Scrollbar
-Gauge only for honest binary/ratio states
-Blocks and titles
-styled spans
-popups and overlays
+/home
+/fleet
+/workflows
+/estate
+/back
+/refresh
+/answer
+/retry
+/extend
+/cancel
+/evidence
+/graph
+/details
+/analytics
+/help
+/quit
 ```
 
-It does not imitate browser pixels, graphical file icons, rounded CSS pills, or a spatial graph canvas. Box drawing, text hierarchy, whitespace, color, and restrained symbols are the visual system.
+Conditional if merged:
+
+```text
+/retained
+/reap
+```
+
+Explicitly absent:
+
+```text
+/interrupt
+/files
+/web
+/watch
+/daemon
+/init
+/claude
+/codex
+/opencode
+/goose
+```
+
+Slash elsewhere in prose is literal.
+
+The palette is a Rust enum and match, not a shell or plugin language.
+
+## 15.4 Workflow chooser
+
+**Decision T2-56 (R2/R5/R6):**
+
+- On Home, `@` selects the existing workflow request field and renders a chip outside durable intent.
+- In Workflows, `@` focuses catalog selection.
+- In a needs-input answer, `@name` inserts literal reference text only.
+- In existing Work, it never rebinds procedure.
+
+## 15.5 Confirmation
+
+Durable and destructive actions require deliberate review:
+
+- Run Work: deliberate send.
+- Respond: deliberate send.
+- Cancel: confirmation naming Work.
+- Retry: confirmation naming stage/attempt.
+- Extend: explicit added turns and resulting cap.
+- Repo remove: state that directory is not deleted.
+- Group remove: list affected members.
+- Reap: preview exact paths/bytes and state that retained branch remains.
+
+## 15.6 Help
+
+`?` opens contextual help derived from the same fixed key/action table used by the footer. No configurable binding subsystem.
 
 ---
 
-# 14. TUI State and Data Flow
+# 16. Data and Extraction Boundaries
 
-## 14.1 Local state is interaction state
+## 16.1 Work client
 
-**Decision T-46 (R2):** `App` owns only ephemeral client interaction state.
+Work remains on `ApiClient`.
 
-Representative fields:
-
-```text
-mode and navigation stack
-focus
-attention drawer open/closed
-Fleet rows and filters
-workflow catalog and selection
-selected Work and loaded event limit
-current Work view
-scroll offsets
-composer drafts and cursors
-slash/@ popup state
-connection/reconnect state
-last seen journal seq
-status/error message
-cancel/retry confirmation
-spinner frame
-```
-
-None is authoritative Work state. Restarting the TUI loses drafts, filters, and cursor positions but loses no Work fact.
-
-## 14.2 Authoritative reads
-
-The initial Home paint fetches:
+Representative typed additions are convenience methods only:
 
 ```text
-/v1/system
-/v1/work
-/v1/workflows?cwd=<launch cwd>
+submit
+fleet
+work
+transcript
+events
+respond
+retry
+extend
+cancel
+graph
+analytics
+workflow_catalog
+conditional retained/reap
 ```
 
-Opening Work fetches:
+## 16.2 Estate operations
+
+Current CLI repo/group behavior should move behind small typed functions only when Estate consumes it.
+
+Illustrative, nonbinding shape:
+
+```rust
+list_repositories(...)
+add_repository(...)
+remove_repository(...)
+
+list_groups(...)
+upsert_group(...)
+remove_group_members(...)
+remove_group(...)
+```
+
+The functions own:
 
 ```text
-/v1/work/{id}
-/v1/events?work_id={id}&limit={current_limit}
+manifest locking
+atomic writes
+validation
+clone/register behavior
+group reference refusal
+no-delete guarantee
+structured result/error/remedy
 ```
 
-Graph and analytics are lazy: they load only when selected.
+CLI owns Clap/stdout/JSON/exit code. TUI owns forms/focus/rendering.
 
-## 14.3 Refresh discipline
+**Decision T2-57 (R2/R6):** Extract on contact. Do not build `ApplicationService`, `CommandBus`, a generic command trait, or a second internal API.
 
-**Decision T-47 (R2):** SSE remains invalidation, not a client-side authoritative reducer.
+## 16.3 Doctor report
 
-An observed event may:
+Illustrative, nonbinding shape:
 
-- advance `last_seq`;
-- mark Fleet or selected Work dirty;
-- trigger a debounced authoritative reread;
-- update connection activity.
+```rust
+DoctorReport {
+    checks: Vec<DoctorCheck>
+}
 
-It may not directly decide Work state, stage, workflow, executor, surface, or legal actions. The raw event itself may appear in the selected Work's Evidence window only after the authoritative history request includes it.
-
-Refreshes are coalesced during event bursts so the TUI does not issue one full set of reads per event. The current P1 graph and read-path measurements become budgets: the UI must not replace an idle SSE client with a polling storm.
-
-## 14.4 Minimal multiline composer machinery
-
-**Decision T-48 (R7):** Implement one small TUI-local multiline composer rather than adding a generalized editor dependency.
-
-Lower rungs:
-
-- R1 fails: multiline deliberate input is a settled usability requirement.
-- R2 fails: the existing `String` buffer supports only append/backspace and Enter-to-submit.
-- R3 fails: Rust's standard library provides no terminal editor.
-- R4 fails: terminal protocols provide events, not editing behavior.
-- R5 fails: Ratatui/Crossterm are installed but do not supply the required text-area state; adding another dependency is not lower than a bounded local implementation.
-- R6 fails: cursor-aware multiline input is not one line.
-
-The R7 addition is explicitly bounded to:
-
-```text
-insert character
-insert newline
-backspace and delete
-left/right/up/down
-home/end within line
-cursor rendering
-wrapped display
-Ctrl+Enter submission detection
-```
-
-The current key-reader channel carries only `KeyCode` and therefore discards modifier information. T-series changes that local transport to preserve the `KeyEvent` (or an equivalently small key-plus-modifiers value). It does not require an enhanced-keyboard protocol: where the terminal cannot distinguish `Ctrl+Enter`, the event is treated as ordinary Enter and the visible Send action remains the portable confirmation path.
-
-It excludes selection, mouse editing, undo trees, history, syntax highlighting, completion protocols beyond the fixed `/` and `@` popups, and configurable bindings. Tests drive every editing operation as pure state transitions.
-
-A challenge round may overturn this choice in favor of a narrowly vetted text-area dependency only by showing that the local editor would be larger or less correct after the same required behaviors are counted.
-
-## 14.5 Pure presentation shapes
-
-The implementation may introduce TUI-local types such as:
-
-```text
-Mode
-Focus
-AttentionGroup
-WorkBrief
-WorkflowCatalogEntry
-ThreadItem
-WorkView
-Composer
-PaletteItem
-ConnectionState
-```
-
-They are projections over JSON/API values and local interaction state. They are not domain types and are never serialized as durable state.
-
-## 14.6 Physical code layout
-
-**Decision T-49 (R1):** This proposal defines logical seams, not a mandatory module tree.
-
-The current `src/tui.rs` is already large. Splitting rendering, interaction, composer, and view projection into focused modules is allowed when implementation evidence shows one file no longer remains reviewable. Predeclaring a miniature UI framework before that evidence is not allowed.
-
----
-# 15. Web Dashboard Disposition
-
-The browser surface proved the equal-client architecture, but developing two interaction models before either is settled creates duplicate presentation logic and expands the unexecuted-JavaScript gap in issue #21.
-
-**Decision T-50 (R1/R2):** Disable the dashboard without deleting its source.
-
-Implementation disposition:
-
-1. `crate::web::routes(...)` is not merged into the daemon router.
-2. `/ui` and its asset routes therefore receive the listener's normal structured 404.
-3. `src/web.rs` and embedded CSS/JavaScript remain in the repository as a dormant future stub.
-4. `sgt web` does not auto-spawn the daemon. It reports that the dashboard is disabled and directs the operator to bare `sgt`.
-5. `sgt web --json` returns a stable disabled result such as:
-
-```json
-{
-  "available": false,
-  "surface": "web",
-  "reason": "disabled while the terminal interaction model is being proven"
+DoctorCheck {
+    name
+    status
+    summary
+    detail
+    remedy
 }
 ```
 
-6. Human form exits nonzero because the requested surface is unavailable; it does not print a tokenized URL.
-7. Existing web render tests may remain as unit tests for the retained stub where cheap, but no new dashboard UX or browser test tier is built in T-series.
+The current CLI text and JSON are rendered from that report. TUI Health renders the same report.
 
-Disabling the route is not a claim that HTML is a bad interface. It is a sequencing decision: prove one semantic interaction model, then build a browser client from settled concepts rather than maintain visual parity with a moving target.
+**Decision T2-58 (R2/R6):** Shared result, one diagnostic implementation.
 
-## 15.1 Reactivation prerequisites
+## 16.4 Workflow catalog
 
-**Decision T-51 (R1):** Issues #15 and #21 remain open and dormant.
+Workflow discovery stays daemon-projected. `src/tui` never reads `.sergeant` directly.
 
-Before the browser surface returns:
+## 16.5 Long local operations
 
-- token-in-URL handling is reconsidered under #15's trigger and security boundary;
-- dashboard JavaScript receives an executed browser test tier per #21;
-- semantic parity is defined against the settled terminal concepts—Home, Fleet, admitted Workflows, Attention, canonical Work, input requests, and evidence—not against Ratatui geometry;
-- the separate Journal proposal decides whether and how browser exploration differs from terminal exploration.
+Clone, Doctor, and any retained-state inspection/reap that performs blocking work run outside the render/event loop. The screen remains responsive and shows honest indeterminate activity.
 
-No web reactivation date is promised here.
+**Decision T2-59 (R3/R5/R6):** Use existing Tokio blocking boundaries. Add no job system or progress protocol.
 
----
+## 16.6 Forward rule
 
-# 16. Open-Issue Boundaries
-
-## 16.1 Issue #11 — owned and closed
-
-**Decision T-52 (R2/R5):** T-series owns issue #11 and closes it through responsive layout plus a falsifiable test.
-
-The fix is not “increase padding.” It is to stop encoding independent fields as unbounded padded strings. Restoring the old renderer must fail a test that verifies state, stage, and executor/backend remain visually separable at realistic widths and with long values.
-
-## 16.2 Issue #16 — owned and closed
-
-Issue #16 is implemented through §12. It is a named foundation item, not hidden polish. Its commit carries `Fixes #16` only when the reconnect state machine, refresh-before-resume behavior, auth-failure stop, and regression tests all land.
-
-## 16.3 Issue #26 — separate correctness work
-
-**Decision T-53 (R1):** The pre-loop PTY hangup, loaded shutdown flake, and adapter/profile defects remain separate work rather than being papered over in presentation.
-
-The TUI redesign must preserve all existing post-initialization terminal safety and must not widen the startup window. It does not claim to close #26 without its specific early-install or first-interaction fix and reproduction test.
-
-## 16.4 Issue #45 — separate flake investigation
-
-Issue #45 records a loaded m6 failure shape—dead daemon with `runtime.json` left behind—that may overlap the startup/signal window class. T-series changes m6 coverage and therefore must run its scenario and PTY tests under repeated load, but it does not close #45 unless the underlying cause is independently established and fixed.
-
-## 16.5 Issues #46 and #47 — separate adapter/runtime defects
-
-Under Decision T-53, T-series does not reinterpret adapter failure as presentation state.
-
-Issue #46 records a measured fail-closed violation in which an envelope-less Claude turn can leave Work visibly `active` after the native process is gone. The TUI must render the authoritative state and available evidence honestly; it must not infer failure from silence, elapsed time, or absent process data the client does not own. T-series does not close #46 unless the adapter's signal path is independently fixed and pinned.
-
-Issue #47 moves Claude permission mode into profile-owned launch configuration. Home may continue to accept the existing profile name and Work may display the pinned/effective profile fields the API supplies. The TUI does not invent permission-mode controls or claim an effective mode the current public view does not report. #47 remains adapter/profile work.
-
-## 16.6 Dashboard issues
-
-Issues #15 and #21 remain visible as §15.1 reactivation gates. Disabling the dashboard does not close them as “not planned.”
-
-## 16.7 Journal gap
-
-The absence of a rich journal/DuckDB operator surface is recorded in this proposal's boundary, not silently treated as solved by Work-local Evidence. Its separate proposal should cite this decision and the current DuckDB/event contracts rather than restate T-series.
+**Decision T2-60 (R2):** New domain behavior added after T-Series lives below presentation from the start. Existing behavior is extracted only when a second surface consumes it.
 
 ---
 
-# 17. Testing and Validation
+# 17. Connection, Loading, Empty, and Error States
 
-## 17.1 Test philosophy
+## 17.1 Startup
 
-**Decision T-54 (R2):** Retain M6's proven Ratatui `TestBackend` strategy: assert semantics and important geometry, not entire pixel snapshots.
+`sgt tui` performs its current first authoritative read before terminal initialization. With no daemon, it refuses normally and names the remedy.
 
-Full-frame golden snapshots were already rejected because they break on every harmless layout adjustment and mostly test box drawing. T-series adds stronger geometry assertions where geometry is the contract—especially #11, composer separation, drawer collapse, and narrow-terminal safety.
+**Decision T2-61 (R2):** No offline shell, daemon auto-start, or TUI-only Doctor mode.
 
-Every fix and every new behavior carries a pinning test that fails if the behavior is reverted, per LESSONS L7 and the S-series independent-prober discipline.
+## 17.2 Live connection
 
-## 17.2 Pure view-model tests
-
-Tests cover:
-
-- Fleet row projection and attention grouping;
-- intent-first ordering and short-ID rules;
-- terminal slice bounding;
-- state glyph/label/color mapping;
-- stage rail derivation from ordered workflow and current index;
-- N3 current-stage executor projection;
-- reservation and abandoned-execution rendering;
-- event-to-thread mapping, including `conversation.ask` deduplication with `stage.needs_input` and `work.needs_input`;
-- unknown-event fallback to Evidence;
-- Work action availability by state;
-- catalog row projection;
-- local filter behavior;
-- navigation-stack restoration.
-
-## 17.3 Composer and grammar tests
-
-The composer is driven as pure state:
-
-- character insertion at cursor;
-- newline on Enter;
-- no submission on ordinary Enter;
-- submission on `Ctrl+Enter` when the modifier is reported;
-- focused Send fallback;
-- draft preservation on `Esc` and API rejection;
-- clearing only after accepted submission;
-- backspace/delete and cursor movement across lines;
-- wrapped rendering and cursor placement;
-- blank-input refusal;
-- slash command recognized only as first non-whitespace input;
-- slash inside prose remains literal;
-- palette context filtering;
-- every palette mutation maps to an existing endpoint action;
-- Home `@` selection sets the workflow field and does not contaminate intent;
-- Work `@` selection inserts literal text and does not rebind procedure.
-
-A mutation probe that makes ordinary Enter submit must kill a test.
-
-## 17.4 Workflow-catalog API tests
-
-The read-only endpoint receives dedicated contract tests:
-
-1. repository with no `.sergeant/index.md` returns the embedded fallback only;
-2. root index with one published workflow returns its exact name, version, description, tags, source, content hash, stage order, kind, harness, and profile;
-3. `.sergeant/drafts/workflows/` is never returned;
-4. an unindexed admitted directory is not discovered by scan;
-5. path traversal in catalog links is rejected;
-6. missing index target is a structured catalog error;
-7. `index.md`/`workflow.toml` name, version, or status disagreement fails closed;
-8. malformed `workflow.toml` reuses the existing loader's exact failure rather than inventing a second validator;
-9. local `software-change` correctly overrides the embedded fallback;
-10. cwd/workspace discovery matches submission planning;
-11. the route performs no journal append and no Work mutation;
-12. `src/tui.rs` remains API-only under the structural source scan;
-13. `ApiViews` is either narrowed with the disabled web surface or updated only through an endpoint-backed method whose route is pinned by the structural test.
-
-The catalog parser receives fixture and mutation tests for every supported record field and failure branch.
-
-## 17.5 Action tests through a live daemon
-
-Against a deterministic fake backend:
-
-- Home submission creates exactly one Work and shows the daemon-projected result;
-- workflow selected through `@` arrives in the existing request field;
-- actor-authored `conversation.ask` produces `needs_input` and the gold card;
-- a multiline answer resumes the same execution through the existing input endpoint;
-- retry works only from retryable states;
-- cancel confirmation prevents accidental mutation;
-- a state race returns a structured conflict, preserves screen integrity, and triggers refresh;
-- completed/canceled Work cannot be resurrected through the composer.
-
-## 17.6 Reconnect tests
-
-Issue #16 is pinned with both pure-state and live tests:
-
-- stream end transitions `Attached → Reconnecting`;
-- backoff grows and caps;
-- no busy reconnect loop;
-- successful reconnect triggers state refresh before `Attached` is rendered;
-- events committed during the gap appear after refresh;
-- 401/403 transitions to `AuthenticationFailed` and stops automatic attempts;
-- manual `r` requests an immediate attempt;
-- command status cannot overwrite connection truth;
-- active spinner does not run while detached;
-- event decoder chunk/comment/error cases from the S-series coverage work remain green.
-
-## 17.7 Responsive layout tests
-
-**Decision T-55 (R5; governed by L7):** Render every major surface through `TestBackend` at:
+Existing states remain:
 
 ```text
-80×24
-120×36
-180×48
+Attached
+Reconnecting
+AuthFailed
 ```
 
-Fixtures include:
+Rules already shipped under #16 remain binding:
+
+- capped backoff;
+- authoritative refresh before Attached;
+- manual `r` attempt;
+- authentication failure stops automatic retries;
+- command status never overwrites connection truth.
+
+During Reconnecting/AuthFailed:
+
+- stale label is persistent;
+- active spinners stop;
+- writes are disabled or fail clearly;
+- navigation and already-loaded evidence remain usable.
+
+## 17.3 Loading
+
+Each lazy region has a shaped textual loading state:
 
 ```text
-Home empty
-Home with attention and long intent
-Fleet with every state and long stage/executor names
-Work active
-Work actor-authored needs_input
-Work blocked
-Work failed
-Work completed
-Workflows catalog and workflow detail
-slash palette
-@ workflow chooser
-connection reconnecting/auth failed
-web-disabled CLI output (outside Ratatui)
+Loading transcript...
+Loading graph...
+Running health checks...
+Adding repository...
 ```
 
-Assertions include:
+One spinner per active operation, not per empty panel.
 
-- no panic at zero/tiny child areas;
-- issue #11 collision cannot occur;
-- state and current question remain visible at all supported sizes;
-- composer never overlaps thread or footer;
-- focused cursor lies within the composer area;
-- drawer and contextual views collapse at declared widths;
-- long values wrap or truncate inside their assigned regions;
-- `? N` remains visible when the drawer is closed;
-- workflow chips and Send action do not disappear under ordinary 80-column composition;
-- Unicode glyphs occupy one cell or fall back.
+## 17.4 Empty states
 
-The #11 test must fail when the old fixed-padding renderer is restored.
-
-## 17.8 PTY, shutdown, and hygiene tests
-
-Existing terminal restoration, signal, dead-pty, reader-shutdown, and idle-CPU tests remain binding. T-series adds:
-
-- repeated open/close of drawer and overlays without raw-mode corruption;
-- quitting while composer, palette, workflow chooser, reconnect timer, and cancel confirmation are active;
-- a loaded repeated-run sweep informed by #45;
-- daemon/TUI process leak sweep using the repository's non-self-matching `pgrep` rule;
-- no high-frequency animation or reconnect CPU regression.
-
-Issue #26 remains separately red if its specific pre-loop reproduction is run; T-series does not weaken the test to claim otherwise.
-
-## 17.9 Web-disabled tests
-
-Tests pin:
-
-- `/ui` returns structured 404;
-- `sgt web` does not auto-spawn the daemon;
-- human output names the disabled surface and bare `sgt` alternative;
-- `--json` output is stable and reports `available: false`;
-- no tokenized URL is printed;
-- retained web source and assets still compile as a dormant stub;
-- #15/#21 references remain in docs/backlog rather than disappearing.
-
-## 17.10 End-to-end story
-
-A deterministic walkthrough exercises the product story:
+Examples:
 
 ```text
-launch bare sgt in a repository
-open Workflows and inspect admitted procedure
-select @software-change and return Home
-compose multiline intent
-Tab to Send and submit
-watch Work appear in Attention/Fleet
-open canonical Work
-observe reservation, execution, and stage transition
-fake actor emits conversation.ask
-answer with multiline Ctrl+Enter/send fallback
-Work resumes and completes
-inspect Workflow, Evidence, Graph, Details
-return to exact Fleet position
-kill the SSE stream and verify reconnect truth/recovery
-run sgt web and receive the disabled response
-quit with terminal restored
+No Work yet
+Describe an intent on Home.
+
+No published workflows found
+Exact-name submission still uses daemon resolution; inspect the catalog error.
+
+No repositories declared
+Use Estate / Repositories / Add.
+
+No groups declared
+Create one from declared repositories.
+
+All checks healthy
+No remedy required.
+
+No conversation recorded
+Use Evidence for lifecycle events.
 ```
 
-Every claim is re-read from the API or journal-backed endpoint. The walkthrough is not graded on its narration.
+## 17.5 Errors
 
-## 17.11 Gates
+Structured errors remain visible beside the action that caused them. Forms preserve input. Errors never disappear merely because focus changed.
 
-Each implementation milestone closes with:
+Catalog failure, manifest failure, Doctor failure, transport failure, and mutation conflict remain distinct.
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-scripts/demo.sh
-scripts/gate.sh "<milestone outcome>"
-pgrep -f "debug/sgt [-]-data-dir"
+## 17.6 Terminal lifecycle
+
+Existing guarantees remain:
+
+- panic restoration;
+- SIGTERM/SIGHUP restoration;
+- dead PTY exit;
+- bounded key-reader shutdown;
+- initial-draw hangup handling;
+- no idle busy loop.
+
+Keyboard enhancement push/pop is added to the same lifecycle and mutation-probed.
+
+## 17.7 Terminal too small
+
+Below `80x24`, render a safe minimal notice with current dimensions and exit/back help. Never panic, overlap composer/footer, or corrupt raw mode.
+
+---
+
+# 18. Responsive Composition
+
+**Decision T2-62 (R5):** Test and implement three compositions.
+
+## 18.1 Wide: 150 columns and above
+
+```text
+drawer | primary body | contextual rail
 ```
 
-Coverage remains above the repository's established CI floor. New code follows the full multi-axis loop because code is code (R-S0-12).
+Home may use Attention, New Work, and Recent Outputs simultaneously.
+
+## 18.2 Medium: 100-149 columns
+
+```text
+optional drawer | primary body
+```
+
+Contextual rail moves below or into a selectable subview.
+
+## 18.3 Narrow: 80-99 columns
+
+```text
+primary body only
+drawer and context as overlays/full-body views
+```
+
+Home fields stack. Fleet uses two-line rows. Estate detail replaces list temporarily. Work tabs remain horizontally scrollable or collapse to a view chooser.
+
+## 18.4 Height
+
+At 24 rows:
+
+- header and footer remain one row each;
+- composer gets a bounded minimum;
+- body scrolls;
+- nonessential summaries disappear before primary state/question/actions.
+
+No fixed 60/40 split survives regardless of content.
 
 ---
 
-# 18. Program Shape
+# 19. Testing and Validation
 
-The proposal is one program with four bounded outcomes. This is not issue/PR decomposition; contracts are written only after the proposal is adjudicated.
+## 19.1 Philosophy
 
-## 18.1 T0 — proposal adjudication and audit freeze
+**Decision T2-63 (R2):** Continue Ratatui `TestBackend` semantic and geometry testing. Do not use brittle whole-frame golden snapshots as the primary contract.
 
-Outcome:
+Ratatui's own widget tests use `TestBackend` and buffer assertions, including narrow-area behavior. T-Series follows that pattern.
 
-- challenge this proposal on spec-fidelity, invariants, simplicity, and test-honesty;
-- confirm `a5fb875` as audit basis or update it explicitly if main advances before T0 begins;
-- adjudicate the sole read-only API addition;
-- confirm the Journal boundary and web disablement;
-- record accepted amendments and issue ownership;
-- write the T1 contract only after rulings exist.
+## 19.2 Pure state tests
 
-No product code changes.
+Cover:
 
-## 18.2 T1 — surface foundation
+- attention grouping and counts;
+- reported-state treatment;
+- intent-first row projection;
+- envelope ratio;
+- stage rail;
+- transcript/event merge by sequence;
+- current question pinning;
+- output card;
+- action availability;
+- navigation-stack restoration;
+- workflow live-versus-pinned labeling;
+- Estate list projections;
+- visual token/glyph fallback.
 
-Outcome:
+## 19.3 Composer tests
 
-- disable the web route and `sgt web` handoff;
-- add the workflow-catalog endpoint and contract tests;
-- establish responsive application shell, top navigation, focus, overlays, Attention drawer, composer state, and local palette infrastructure;
-- close issue #11;
-- close issue #16;
-- preserve all terminal safety and client-equality tests.
+Cover:
 
-This milestone carries the highest cross-cutting risk and receives the full gauntlet before feature screens build on it.
+- insertion/newline/delete/cursor/wrap/paste;
+- ordinary Enter never submits;
+- Ctrl+Enter submits only with reported modifier;
+- Send fallback;
+- draft preservation;
+- blank refusal;
+- slash parser boundary;
+- `@` semantics;
+- dependency wrapper behavior if `ratatui-textarea` is adopted;
+- no mouse path.
 
-## 18.3 T2 — intent, Fleet, and admitted Workflows
+## 19.4 Workflow catalog tests
 
-Outcome:
+Retain and update the original proposal's contract:
 
-- Home intent composer with deliberate multiline submission;
-- Advanced request fields;
-- `@workflow` selection and chips;
-- Home attention summary;
-- complete responsive Fleet and filters;
-- Workflows catalog and detail;
-- `/home`, `/fleet`, `/workflows`, `/refresh`, `/back`, `/quit` palette paths;
-- deterministic launch story from workflow discovery through Work creation.
+- embedded fallback;
+- indexed published workflow;
+- drafts excluded;
+- unindexed directory excluded;
+- path traversal rejected;
+- missing/malformed/disagreeing records fail closed;
+- repository fallback override;
+- cwd discovery matches submission;
+- no event append;
+- TUI remains endpoint-backed.
 
-No canonical Work thread beyond the existing detail remains required at this checkpoint.
+## 19.5 Estate parity tests
 
-## 18.4 T3 — canonical Work and close-out
+**Decision T2-64 (R2; L7):** For every shared repo/group operation, run the CLI and the shared function against equivalent fixtures and assert the same structured result and filesystem/manifest outcome.
 
-Outcome:
+Pin:
 
-- canonical Work header and navigation stack;
-- Workflow rail with N3 executor details;
-- semantic thread including actor asks and reservations;
-- multiline response composer;
-- state-aware retry/cancel/inspect actions;
-- Evidence, Graph, and Details views;
-- palette actions for Work and analytics;
-- final responsive/hygiene/load validation;
-- README and real Ratatui screenshots replace the P0 images;
-- ledger entry and lessons update;
-- explicit handoff to the separate Journal proposal.
+- add existing repo;
+- clone new repo;
+- instruction policy;
+- remove declaration without deleting directory;
+- group reference refusal;
+- add/extend group;
+- remove member/group;
+- atomic write and lock failure;
+- TUI cancellation before confirm causes no mutation.
 
-## 18.5 Journal proposal relationship
+## 19.6 Doctor parity
 
-The Journal proposal may begin after T0 or in parallel if it does not modify T-series-owned files. T-series does not depend on it. When Journal later ships, it may add a top-level destination through the established navigation/palette patterns, but it must not force T-series to invent query contracts in advance.
+The CLI text/JSON and TUI Health consume one `DoctorReport`. Tests assert no check disappears or changes status/remedy between surfaces.
 
-## 18.6 Proposal as a timestamped model
+If PR #111 lands, filesystem reliability is included.
 
-Like the repository's other proposals, this document records the best current model. Milestone contracts may narrow or amend it when measurements prove a claim wrong. Amendments are registered and reviewed; implementation does not silently drift.
+## 19.7 Live daemon tests
+
+Using fake backend:
+
+- Home submission;
+- group expansion;
+- workflow selection;
+- transcript rendering;
+- actor ask and multiline response;
+- retry;
+- extend without automatic retry;
+- cancel confirmation;
+- output pointer;
+- completed_dirty;
+- state race refresh;
+- Watch-state attention transition.
+
+## 19.8 Integration branch conditional tests
+
+If retained/reap lands:
+
+- retained list is API-backed;
+- preview does not mutate or auto-spawn;
+- reap requires confirmation;
+- branch survives;
+- exact per-binding result renders;
+- Health disk detail reaches retained overlay;
+- no placeholder remains when endpoint is absent.
+
+## 19.9 Reconnect and lifecycle
+
+Preserve all current #11/#16/#26 tests and add coverage for the new shell, drawer, editor, overlays, and keyboard enhancement cleanup.
+
+## 19.10 Geometry matrix
+
+Render every major surface at:
+
+```text
+80x24
+120x36
+180x48
+```
+
+Fixtures:
+
+```text
+Home empty/full/admission-paused
+Fleet every state and long values
+Work active/needs-input/blocked/failed/completed/completed-dirty
+Workflow catalog/detail/error
+Estate repos/groups/health
+Attention open/closed/overlay
+palette/chooser/confirmations
+reconnecting/auth-failed
+terminal-too-small
+conditional retained/reap
+```
+
+Assertions:
+
+- no collision;
+- question/state/action remain visible;
+- composer/footer never overlap;
+- focus is visible;
+- long values remain contained;
+- drawer collapses as contracted;
+- no one-cell glyph violation;
+- no workflow percent gauge;
+- no active animation while stale.
+
+## 19.11 Taste pre-flight
+
+Before screenshots or close-out, mechanically audit:
+
+```text
+one theme
+one focus accent
+semantic color only
+few full borders
+no nested-box wallpaper
+no fake data precision
+no unsupported controls
+no color-only states
+no false workflow percentage
+no duplicated Work representation
+no stale web/resource/file surfaces
+every empty/loading/error/confirmation state present
+```
+
+## 19.12 Gates
+
+Each milestone runs the repository's current shipping procedure, not a hand-rolled stale copy. The gate defect in PR #111 must be resolved before its result is trusted.
 
 ---
 
-# 19. Acceptance Contract
+# 20. Program Shape
 
-T-series is complete when all of the following are true:
+This is one program with bounded slices. No slice waits for a universal refactor.
 
-1. Bare `sgt` opens Home, not the literal P0 Fleet table.
-2. Top navigation is exactly `Home / Fleet / Workflows`; no placeholder Journal or System tab appears.
-3. Home accepts multiline intent and submits only through deliberate `Ctrl+Enter` or the focused Send action.
-4. Home exposes the existing workflow/backend/profile/workspace/repository request fields without becoming a second planner.
-5. `/` opens a fixed local palette and is never advertised as a new CLI language.
-6. `@` selects an admitted workflow on Home and inserts only a textual reference inside an existing Work.
-7. Workflow discovery comes from the endpoint-backed `.sergeant/index.md` publication boundary; drafts and unindexed directories are absent.
-8. The embedded `software-change` fallback appears honestly as embedded.
-9. Catalog failure is named and fail-closed; exact-name Work submission remains the daemon's existing behavior.
-10. Home and the Attention drawer distinguish needs-input, trouble, in-flight, waiting, and terminal Work without new durable state.
-11. The full Fleet remains reachable and issue #11 is closed by responsive layout, not padding.
-12. Every Work entry opens one canonical Work surface and `Esc` restores exact prior navigation state.
-13. The Work header shows intent, lifecycle state, pinned workflow, current stage, attempt, and current executor before secondary IDs and paths.
-14. Actor-authored `conversation.ask` appears as the primary gold input request.
-15. The semantic thread is derived only from journaled events and always offers raw Evidence.
-16. Workflow progress is ordinal, never a false percentage.
-17. Ordinary text is accepted only on Home and Work in `needs_input`.
-18. Submit, respond, retry, and cancel retain their existing API and engine semantics.
-19. Active Work is not interrupted by typing and receives no invented guidance channel.
-20. Completed and canceled Work remain terminal.
-21. Issue #16 is closed: reconnect uses capped backoff, refreshes before declaring live, and stops on authentication failure.
-22. Connection state cannot be overwritten by command status, and stale Work is never animated as live.
-23. Graph renders only current proven relationships; files, artifacts, commits, and findings are not invented.
-24. Existing canned analytics remain reachable but are not represented as the future Journal product.
-25. No global journal query route, arbitrary SQL, full-text search, saved view, or Journal tab is added.
-26. No CPU, memory, disk, OpenTelemetry query, mouse, graph canvas, or web redesign is added.
-27. `/ui` is unmounted and `sgt web` reports the browser surface disabled without printing a token URL.
-28. Issues #15 and #21 remain visible reactivation prerequisites.
-29. Issues #26, #45, #46, and #47 remain separate unless their actual causes are independently fixed and pinned.
-30. The TUI never converts silence, elapsed time, or guessed process liveness into a Work transition; #46 remains visible rather than being papered over in presentation.
-31. `src/tui.rs` still reaches state and workflow catalog only through `ApiClient`.
-32. All major screens pass semantic and geometry tests at `80×24`, `120×36`, and `180×48`.
-33. Composer, palette, `@`, reconnect, catalog, and mutation behaviors are mutation-probed or otherwise demonstrably falsifiable.
-34. Existing signal, pty, shutdown, idle-CPU, and process-hygiene guarantees remain green.
-35. `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `scripts/demo.sh`, and the shipping gate pass.
-36. The final ledger entry records mission outcome, environmental behavior, every rung decision, every adjudication amendment, and every deferred finding.
+## 20.1 T0: Adjudication and revision freeze
+
+- review this proposal through the repository's proposal gauntlet;
+- pin current main and integration disposition;
+- re-audit CLI/API/TUI/workflow catalog;
+- validate workflow catalog route;
+- spike `ratatui-textarea` dependency resolution;
+- contract the visual token set and responsive geometries;
+- write T1 only after rulings.
+
+No product code.
+
+## 20.2 T1: Cockpit foundation and immediate Work value
+
+- application shell and `Home / Fleet / Workflows / Estate` navigation;
+- focus model, overlays, footer/help, Attention drawer;
+- responsive Fleet;
+- canonical Work shell;
+- transcript-backed Thread;
+- output/envelope/completed-dirty;
+- respond/retry/extend/cancel;
+- multiline composer;
+- preserve reconnect and terminal safety.
+
+This produces visible value without Estate extraction or workflow-catalog API completion.
+
+## 20.3 T2: Workflow discovery
+
+- workflow catalog endpoint;
+- Workflows list/detail;
+- Home `@` chooser;
+- live versus pinned workflow labeling;
+- recent usage derived from loaded Fleet;
+- catalog error/empty states.
+
+## 20.4 T3: Estate
+
+- extract repo/group operations on contact;
+- Repositories full lifecycle;
+- Groups full lifecycle;
+- extract Doctor report;
+- Health;
+- conditional retained/reap consumption;
+- no generic service layer.
+
+## 20.5 T4: Close-out and polish
+
+- all responsive fixtures;
+- visual pre-flight;
+- repeated lifecycle/load/hygiene runs;
+- real Ratatui screenshots;
+- README and help updates;
+- ledger/lessons/ADR/proposal supersession updates;
+- explicit handoff to P2-JOURNAL.
+
+## 20.6 Parallel boundaries
+
+P2-JOURNAL may proceed independently if it does not silently define T-Series navigation or modify the same files without coordination.
+
+Interactive durable sessions require their own proposal and evidence. They are not a T-Series tail item.
 
 ---
 
-# 20. Ponytail Decision Register
+# 21. Acceptance Contract
 
-The rung is the lowest viable resolution, not the most impressive implementation.
+T-Series is complete when:
+
+1. `sgt tui` opens the cockpit; bare `sgt` remains the static homepage.
+2. Observation still never auto-spawns a daemon.
+3. Top navigation is exactly Home, Fleet, Workflows, Estate.
+4. No Journal, System, Explore, or Web placeholder appears.
+5. Home can submit current Work request fields without becoming a second planner.
+6. Repo/group target selection expands into current repository semantics.
+7. Home does not invent model or capability catalogs.
+8. Home uses deliberate multiline submission.
+9. Home shows current attention, active Work, and pointer-backed recent outputs.
+10. Fleet is complete, responsive, and intent-first.
+11. `completed_dirty` is visibly review-required, not normal success.
+12. Every Work entry opens the same canonical Work surface.
+13. Work has Thread, Workflow, Evidence, Graph, Details.
+14. Thread uses the authoritative transcript and journal-backed system events.
+15. Thread exposes recovered/interrupted transcript provenance honestly.
+16. No chain-of-thought, guessed progress, file change, or process inference appears.
+17. Actor-authored questions are pinned and gold.
+18. Ordinary Work text is accepted only for `needs_input`.
+19. Respond retains current semantics.
+20. Retry and extend remain separate.
+21. Cancel remains deliberate.
+22. Output displays pointer facts only.
+23. Envelope consumption is the only progress gauge.
+24. Workflow progression is ordinal only.
+25. Graph contains only current proven nodes and edges.
+26. Evidence is Work-local and never advertised as P2-JOURNAL.
+27. Attention derives entirely from current Work state.
+28. No Watch process or Watch screen exists inside TUI.
+29. Workflows uses the root admitted catalog and embedded fallback.
+30. Drafts and unindexed workflows are absent.
+31. Live catalog and pinned Work procedure are distinct.
+32. Estate is a full destination.
+33. Repositories supports current list/add/remove semantics including clone.
+34. Repository removal never deletes the directory.
+35. Groups supports current add/extend/member removal/group removal semantics.
+36. Health renders the same checks and remedies as `sgt doctor`.
+37. Health does not invent CPU/memory/process monitoring.
+38. `sgt init`, daemon administration, and harness passthrough remain outside.
+39. Work daemon facts still enter only through ApiClient.
+40. Estate/Doctor behavior is shared through small typed extractions, not duplicated.
+41. No generic service layer, command bus, or full CLI rewrite lands.
+42. The dashboard remains deleted and no browser control returns.
+43. No mouse path is required or documented.
+44. No Files/diff/artifact view appears without current API support.
+45. `/` is a local fixed palette, not a new CLI grammar.
+46. `@` selects/reference workflows without rebinding current Work.
+47. Ctrl+Enter is an enhancement, not the only send route.
+48. Keyboard enhancement flags are restored on every exit.
+49. Reconnect and auth-failure truth remain visible and correct.
+50. Active animation stops while state is stale.
+51. Every major empty/loading/error/confirmation state exists.
+52. Every major surface passes semantic/geometry tests at 80x24, 120x36, 180x48.
+53. Existing PTY, signal, shutdown, idle-CPU, no-spawn, and reconnect tests remain green.
+54. If PR #111 lands, retained/reap is consumed only through its real API and confirmation contract.
+55. If PR #111 does not land, no retained/reap placeholder or claim remains.
+56. The final screenshots come from the real TUI, not image-generation mockups.
+57. The shipping gate actually executes and passes; a skipped false-green is failure.
+58. The ledger records every amendment, R7, deferred finding, and integration disposition.
+
+---
+
+# 22. Ponytail Decision Register
+
+The rung is the lowest viable resolution.
 
 | Decision | Rung | Resolution |
 |---|---:|---|
-| T-01 | R1 | Pin audit revision `a5fb875`; do not design against moving main |
-| T-02 | R1/R2 | Admit only local `/`, local `@`, and one endpoint-backed catalog beyond the strict draft |
-| T-03 | R2 | Organize around existing durable Work |
-| T-04 | R2 | Reuse current Work submission for Home intent |
-| T-05 | R2/R5 | Reuse familiar harness layout with installed Ratatui |
-| T-06 | R2 | Preserve existing Work/stage/executor/execution coordinates |
-| T-07 | R2 | Preserve equal clients; no TUI filesystem or runtime shortcut |
-| T-08 | R2/R5 | Reorder existing facts through progressive disclosure |
-| T-09 | R2/R5 | Require deliberate confirmation for durable writes |
-| T-10 | R2 | Apply the repository's existing Ponytail contract |
-| T-11 | R2 | Reuse current v1 routes; one catalog exception only |
-| T-12 | R2 | Render merged N3 ask/reservation/executor facts |
-| T-13 | R1/R2 | Use only submit/respond/retry/cancel mutations already present |
-| T-14 | R2 | Semantic thread is a presentation fold over existing events |
-| T-15 | R1/R2 | Render current graph and canned analytics exactly; do not generalize |
-| T-16 | R2 | Reuse `.sergeant/index.md`, workflow indexes, and `workflow.toml` as catalog authority |
-| T-17 | R2/R6/R7 | Add one minimum read-only workflow-catalog endpoint; lower-rung reasoning in §10.3 |
-| T-18 | R1 | Keep Doctor CLI-only; no System dashboard |
-| T-19 | R1 | Give global Journal/DuckDB exploration its own proposal |
-| T-20 | R1 | Explicitly exclude adjacent feature work |
-| T-21 | R2/R5 | Use `Home / Fleet / Workflows` top navigation |
-| T-22 | R2/R5 | Derive Attention drawer from existing Fleet state |
-| T-23 | R2 | One canonical Work surface from every entry point |
-| T-24 | R5 | Use Ratatui's existing layout primitives for responsive compositions |
-| T-25 | R2/R5 | One persistent state-aware composer |
-| T-26 | R2/R5 | Enter newline; Ctrl+Enter/Send deliberate submit |
-| T-27 | R2/R5/R6 | Fixed local slash palette over existing actions |
-| T-28 | R2/R5/R6 | Local `@` selection/reference over admitted catalog |
-| T-29 | R2 | Map Home exactly to current submit body |
-| T-30 | R1/R2 | Bound terminal Work on Home; Fleet remains complete |
-| T-31 | R5 | Replace padded strings with responsive row layout |
-| T-32 | R2 | Filter only fields already present in Fleet |
-| T-33 | R2 | Show admitted and embedded workflows only |
-| T-34 | R2/R3/R6 | Parse only committed catalog/front-matter shapes; no generalized parser |
-| T-35 | R2 | Separate live catalog from journal-pinned Work workflow |
-| T-36 | R2 | Intent/state/workflow/stage/executor lead Work header |
-| T-37 | R2 | Derive workflow rail from pinned ordered stages/current index |
-| T-38 | R2 | Map known events to semantic thread items with raw fallback |
-| T-39 | R2/R5 | Thread/Workflow/Evidence/Graph/Details over current data |
-| T-40 | R2 | Advertise only current legal action families |
-| T-41 | R2/R6 | Close #16 with a small explicit reconnect state machine |
-| T-42 | R5 | Text + glyph + standard color state grammar |
-| T-43 | R2/R6 | Animate only attached active Work using a local frame array |
-| T-44 | R1/R2 | Ordinal workflow progress, no percentage gauge |
-| T-45 | R5 | Focus visible through installed Ratatui styling/cursor primitives |
-| T-46 | R2 | App owns ephemeral interaction state only |
-| T-47 | R2 | SSE invalidates; API reread remains authoritative |
-| T-48 | R7 | Minimum local multiline composer; failed lower rungs named in §14.4 |
-| T-49 | R1 | Split code only when implementation size proves the need |
-| T-50 | R1/R2 | Unmount web, retain source stub, report disabled |
-| T-51 | R1 | Keep #15/#21 dormant until explicit reactivation gates fire |
-| T-52 | R2/R5 | Close #11 through layout plus falsifiable geometry test |
-| T-53 | R1 | Keep #26/#45/#46/#47 separate; never invent a presentation-layer transition |
-| T-54 | R2 | Reuse M6 TestBackend semantic testing and S-series falsifiability discipline |
-| T-55 | R5 | Test three representative terminal geometries with installed TestBackend |
+| T2-01 | R2 | Revise the existing proposal rather than create a competing program |
+| T2-02 | R2 | Make the TUI a Work operator cockpit, not a process/system/harness replacement |
+| T2-03 | R2 | Organize around operator questions of current Work |
+| T2-04 | R2 | Grade the complete delegation loop |
+| T2-05 | R1/R2 | Preserve sound old decisions and remove superseded premises |
+| T2-06 | R1 | Do not treat open PR #111 as merged truth |
+| T2-07 | R2 | Consume retained/reap only if its real surface lands |
+| T2-08 | R2 | Use Taste as design audit, not web implementation authority |
+| T2-09 | R1 | Reject military styling |
+| T2-10 | R5 | Bind visual variance/motion/density |
+| T2-11 | R5 | Reduce boxes before adding ornament |
+| T2-12 | R2 | Work remains the durable center |
+| T2-13 | R2 | Daemon-owned facts remain ApiClient-only |
+| T2-14 | R2/R6 | Share local Estate/Doctor behavior without daemon tunneling |
+| T2-15 | R2 | SSE invalidates; authoritative reads decide |
+| T2-16 | R2 | TUI remains no-auto-spawn |
+| T2-17 | R1/R2 | Respond is not generalized into continuous chat |
+| T2-18 | R2 | Never infer Work state from process liveness |
+| T2-19 | R2 | Apply Ponytail in both overbuild and shortcut directions |
+| T2-20 | R1 | Exclude adjacent feature work explicitly |
+| T2-21 | R2/R5 | Use Home/Fleet/Workflows/Estate navigation |
+| T2-22 | R2 | One canonical Work from every entry point |
+| T2-23 | R2/R5 | Derive Attention from Fleet/Work state |
+| T2-24 | R1/R5 | Use a fixed overlay set, not a modal framework |
+| T2-25 | R5 | One dark semantic theme |
+| T2-26 | R5 | Full border only for major focus regions |
+| T2-27 | R5 | Use installed Ratatui primitives |
+| T2-28 | R5 | Communicate state through text, glyph, color |
+| T2-29 | R2/R6 | Animate attached active Work only |
+| T2-30 | R1/R2/R5 | Gauge only actual envelope consumption |
+| T2-31 | R7 | Prefer narrowly wrapped `ratatui-textarea`, dependency-tree gated |
+| T2-32 | R4/R6 | Opportunistic enhanced keys plus universal Send fallback |
+| T2-33 | R1 | No mouse |
+| T2-34 | R2 | Home maps to current submission body |
+| T2-35 | R1/R2 | No guessed model/capability selectors |
+| T2-36 | R2 | Recent outputs require a real output pointer |
+| T2-37 | R5 | Responsive Fleet Table/List, no fixed padding |
+| T2-38 | R2 | Fleet filters only current fields |
+| T2-39 | R2 | Catalog only admitted/indexed procedure and fallback |
+| T2-40 | R2/R6/R7 | One minimum workflow-catalog endpoint |
+| T2-41 | R2 | Separate live catalog and pinned Work workflow |
+| T2-42 | R2 | Estate is first-class |
+| T2-43 | R2/R6 | Reuse repo lifecycle through shared operations |
+| T2-44 | R2/R6 | Full group lifecycle parity |
+| T2-45 | R2/R6 | Doctor and Health consume one report |
+| T2-46 | R2 | Retained UI is conditional on merged surfaces |
+| T2-47 | R2 | Intent/state/procedure/stage/envelope lead Work |
+| T2-48 | R2/R5 | Thread/Workflow/Evidence/Graph/Details |
+| T2-49 | R2 | Thread is journal-backed only |
+| T2-50 | R2 | Workflow rail is ordinal |
+| T2-51 | R1/R2 | Terminal graph is a proven relationship tree |
+| T2-52 | R2 | Advertise current actions only |
+| T2-53 | R2 | Reuse WATCH vocabulary without embedding Watch |
+| T2-54 | R2/R5 | Persistent context-aware composer |
+| T2-55 | R2/R5/R6 | Fixed local slash palette |
+| T2-56 | R2/R5/R6 | Context-aware workflow chooser/reference |
+| T2-57 | R2/R6 | Extract Estate behavior on contact only |
+| T2-58 | R2/R6 | Extract one structured Doctor result |
+| T2-59 | R3/R5/R6 | Keep blocking local effects off render loop |
+| T2-60 | R2 | New behavior lives below presentation going forward |
+| T2-61 | R2 | No offline TUI exception |
+| T2-62 | R5 | Three responsive compositions |
+| T2-63 | R2 | TestBackend semantics and geometry over whole-frame goldens |
+| T2-64 | R2 | Pin CLI/TUI Estate parity and mutation behavior |
 
-Any implementation decision not represented here is logged in the milestone report. Any new R7 names failed R1–R6 paths before it is admitted.
+Any implementation decision not represented here is logged in the milestone report. Every new R7 names failed lower rungs.
 
 ---
 
-# 21. Source-to-Decision Map
+# 23. Dispositions
 
-| Source | What it constrains here |
+## 23.1 Adopted from the previous proposal
+
+- Work-centered Home/Fleet/Workflows concept.
+- canonical Work surface.
+- Attention drawer.
+- deliberate multiline composer.
+- local slash palette.
+- workflow chooser/reference.
+- endpoint-backed workflow catalog.
+- ordinal workflow rail.
+- Work-local Evidence and graph.
+- separate Journal proposal.
+- API invalidation discipline.
+- TestBackend semantic testing.
+
+## 23.2 Revised
+
+| Previous decision | Revision |
 |---|---|
-| [`CLAUDE.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/CLAUDE.md) | journal truth, one owner, equal clients, tests, Ponytail, code-is-code |
-| [`src/tui.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/tui.rs) | current P0 screens, key reader, SSE invalidation, terminal safety, manual reconnect |
-| [`src/api.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/api.rs) | existing routes, N3 Work view, event vocabulary, structured errors, client boundary |
-| [`src/domain/workflow.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/domain/workflow.rs) | ordered pinned workflows, tagged stages, per-stage executor metadata, embedded fallback |
-| [`.sergeant/index.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/.sergeant/index.md) | admitted workflow discovery surface |
-| [`docs/icm/convention.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/docs/icm/convention.md) | catalog authority, publication boundary, drafts excluded |
-| [`docs/gauntlet/contracts/N3.md`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/docs/gauntlet/contracts/N3.md) | actor-authored ask resumes through existing respond; N3 is current behavior |
-| [`src/runtime/analytics.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/runtime/analytics.rs) | current canned analytics and the evidence that global Journal deserves its own contract |
-| [`src/runtime/graph.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/src/runtime/graph.rs) | proven graph node/edge vocabulary and absent file/artifact/commit facts |
-| [`tests/m6_surfaces.rs`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/tests/m6_surfaces.rs) | semantic TestBackend approach and equal-client structural enforcement |
-| [Issue #11](https://github.com/miztertea/sergeant-rs/issues/11) | responsive Fleet layout and collision regression |
-| [Issue #16](https://github.com/miztertea/sergeant-rs/issues/16) | reconnect/backoff/refresh/auth-failure contract |
-| [Issue #26](https://github.com/miztertea/sergeant-rs/issues/26) | explicit startup-hangup exclusion |
-| [Issue #45](https://github.com/miztertea/sergeant-rs/issues/45) | loaded m6 flake budget and separate investigation |
-| [Issue #46](https://github.com/miztertea/sergeant-rs/issues/46) | adapter fail-closed defect; forbids the TUI from deriving state from silence |
-| [Issue #47](https://github.com/miztertea/sergeant-rs/issues/47) | profile-owned permission-mode work; no speculative TUI control |
-| [Issues #15](https://github.com/miztertea/sergeant-rs/issues/15) and [#21](https://github.com/miztertea/sergeant-rs/issues/21) | dormant web reactivation gates |
-| [Work-Centered Intelligence](https://app.notion.com/p/3ac27ada618f81728a73fbd7ac90c61c) | Work remains durable center; prompt/thread is portal |
-| [WorkPacket](https://app.notion.com/p/39a27ada618f818cba42f5efe8ffe1f0) | interface surfaces state and human decisions but does not own Work state |
-| [Work Filesystem](https://app.notion.com/p/3ac27ada618f819d8196fa78ab420224) | progressive disclosure, one responsibility per surface, visible stage/resources/evidence |
-| [Shared-Engine Human-Agent Workbench](https://app.notion.com/p/39a27ada618f81999694e0fbb019ca50) | human and agent faces operate over one engine/model |
-| [Ecological Interface Design](https://app.notion.com/p/3ac27ada618f81909dd5d48e1f9b9912) | reveal work-domain constraints without unnecessary cognitive escalation |
-| [Ponytail Minimality Ladder](https://app.notion.com/p/39a27ada618f8100babadb321a70de9b) | strict solution ordering and explicit R7 burden |
-| [Anthropic context-engineering source record](https://app.notion.com/p/3af27ada618f8188806de090bd721054) | progressive disclosure and distinct context surfaces |
-| [Garrison Business User Workspace](https://app.notion.com/p/3ab27ada618f812db874fbebc0eaf9d8) | warning against building a visual product before the operating model is proven |
+| Bare `sgt` is the TUI | `sgt tui` is explicit; bare `sgt` remains homepage |
+| Home/Fleet/Workflows | Estate added as full destination |
+| Doctor CLI-only | Shared Doctor report powers Estate/Health |
+| Repo/group outside TUI | Full current lifecycle included through extract-on-contact |
+| Local custom editor | Maintained text-area dependency preferred under a hard compatibility gate |
+| Submit/respond/retry/cancel | Extend added and kept distinct |
+| Event-derived conversation | Authoritative transcript becomes Thread backbone |
+| Web disabled but retained | Web already deleted; all web proposal text removed |
+| #11/#16 owned fixes | Those fixes are shipped guarantees to preserve |
+| no output/envelope UI | Both are current Work facts and primary |
+| completed only | completed_dirty is a separate operator-facing condition |
+
+## 23.3 Rejected alternatives
+
+### Full CLI service refactor
+
+Rejected. It would force unrelated daemon, observation, static homepage, local manifest, Doctor, and exec-replacement command families into one abstraction and likely stall the TUI on regression work.
+
+### New daemon APIs for repo/group/Doctor
+
+Rejected. They would distort local/no-daemon semantics. Share the existing local implementation instead.
+
+### TUI shelling out to `sgt`
+
+Rejected. Text parsing creates drift and loses structured errors.
+
+### Read-only Estate
+
+Rejected. It would immediately send operators back to the CLI for ordinary management despite mature semantics already existing.
+
+### System/resource dashboard
+
+Rejected. CPU/memory/process accounting is unowned feature work. Doctor's existing disk facts remain valid.
+
+### Embedded harness/PTTY
+
+Rejected. ADR 0006 deliberately chooses `exec`, never supervise. Interactive durable sessions need separate domain and authority decisions.
+
+### Active-turn chat/guidance
+
+Rejected. Current `respond` is an answer to `needs_input`, not a general message contract.
+
+### Separate Watch screen
+
+Rejected. The TUI already consumes SSE. Watch supplies the attention vocabulary for headless clients.
+
+### Files/diff/artifacts
+
+Rejected. The current output pointer does not supply their content.
+
+### Spatial graph canvas
+
+Rejected. Canvas availability does not make it the correct terminal interaction.
+
+### Mouse
+
+Rejected. Keyboard-first is complete and easier to test.
+
+### Web parity
+
+Rejected. The dashboard was deleted by owner ruling.
+
+### Capability-driven model selector now
+
+Rejected. Capability types exist internally, but no complete current public catalog supports such a control. Future seam only.
+
+### Local workflow filesystem scan from TUI
+
+Rejected. Executable procedure remains endpoint-projected through the same loader the daemon trusts.
+
+### Quick View as a second Work representation
+
+Rejected. Any peek is a summary of canonical Work and cannot have independent actions.
+
+## 23.4 Deferred, not rejected
+
+- P2-JOURNAL and future Journal destination.
+- durable human-initiated turns against existing Work.
+- human attach where adapters expose and publicize it.
+- capability-aware backend/model/profile chooser after a trustworthy read model exists.
+- richer output browsing after real artifact/file/change events and APIs exist.
+- browser client after a future owner ruling.
 
 ---
 
-# 22. Final Position
+# 24. Falsifiers and Source Map
 
-Sergeant is not a chat client with a workflow engine attached. It is a durable work engine whose current human interface happens to be too literal.
+## 24.1 Sharp falsifiers
 
-The correct terminal product begins where the architecture begins:
+The proposal is violated if any implementation:
 
-```text
-human intent
-    ↓
-admitted procedure
-    ↓
-durable Work
-    ↓
-actor execution and evidence
-    ↓
-human decision when requested
-    ↓
-resumption, retry, cancellation, or terminal outcome
-```
+1. launches the TUI from bare `sgt`;
+2. auto-spawns a daemon merely to open the TUI;
+3. reads daemon Work facts directly from journal/filesystem;
+4. duplicates repo/group validation in `src/tui`;
+5. changes CLI repo/group outcomes while claiming presentation-only extraction;
+6. builds a generic service/command framework before a second concrete consumer requires it;
+7. accepts ordinary text on active Work;
+8. makes extend retry automatically;
+9. shows workflow percentage completion;
+10. animates stale Work while reconnecting;
+11. shows a model selector without a current source of valid models;
+12. displays Files/diffs/artifacts from output-pointer metadata alone;
+13. represents `completed_dirty` as green completion;
+14. stores read/unread/dismissed attention state;
+15. starts `sgt watch` from the TUI;
+16. brings back Web/System/Explore placeholders;
+17. requires Ctrl+Enter with no portable Send fallback;
+18. fails to pop keyboard enhancement flags on an exit path;
+19. lets Health disagree with `sgt doctor`;
+20. deletes a repository directory on declaration removal;
+21. uses PR #111 facts as shipped before merge;
+22. trusts a shipping gate that skipped its stages;
+23. ships screenshots generated from design-image tooling rather than the application;
+24. passes only because a whole-frame snapshot was updated to match a regression.
 
-The TUI should make that loop feel as immediate as a modern agent harness while remaining more honest than one:
+## 24.2 Primary repository sources
 
-- intent is primary;
-- Work survives the screen;
-- workflow is explicit and pinned;
-- actor asks are first-class;
-- human answers are deliberate;
-- state, stage, executor, and process remain separate;
-- every friendly summary has raw evidence behind it;
-- current capability is never embellished to complete a mockup;
-- repository procedure is discoverable through its existing catalog;
-- historical Journal exploration is important enough to receive a real proposal rather than a fake search box;
-- the browser waits until the terminal interaction model is proven.
+- [North Star](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/NORTH-STAR.md)
+- [Agent operating contract](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/AGENTS.md)
+- [Development rules](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/DEVELOPMENT.md)
+- [Current CLI](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/src/cli.rs)
+- [Current API](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/src/api.rs)
+- [Current TUI](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/src/tui.rs)
+- [Backend capabilities](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/src/backend/mod.rs)
+- [Workflow catalog](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/.sergeant/index.md)
+- [WATCH contract](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/gauntlet/contracts/WATCH.md)
+- [ADR 0006 harness passthrough](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/adr/0006-harness-passthrough.md)
+- [Existing T-Series proposal](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/reference/proposal-tui-t-series.md)
+- [Open integration PR #111](https://github.com/miztertea/sergeant-rs/pull/111)
 
-The target is not “a prettier Fleet.”
+## 24.3 Design and implementation references
 
-> **The target is the human command surface for setting intent and operating durable procedural Work—rich enough to understand at a glance, restrained enough to remain true.**
+- [Taste skill, pinned](https://github.com/Leonxlnx/taste-skill/blob/e988add20dab0fa97d7a76781c48961c8184288e/skills/taste-skill/SKILL.md)
+- [Ratatui 0.30.2](https://docs.rs/ratatui/0.30.2/ratatui/)
+- [Ratatui widgets](https://docs.rs/ratatui/0.30.2/ratatui/widgets/)
+- [Ratatui LineGauge](https://docs.rs/ratatui/0.30.2/ratatui/widgets/struct.LineGauge.html)
+- [Ratatui TestBackend](https://docs.rs/ratatui/0.30.2/ratatui/backend/struct.TestBackend.html)
+- [ratatui-textarea](https://docs.rs/ratatui-textarea/latest/ratatui_textarea/)
+- [Crossterm KeyEvent](https://docs.rs/crossterm/0.29.0/crossterm/event/struct.KeyEvent.html)
+- [Crossterm keyboard enhancement](https://docs.rs/crossterm/0.29.0/crossterm/event/struct.PushKeyboardEnhancementFlags.html)
+- [Work-Centered Intelligence](https://app.notion.com/p/3ac27ada618f81728a73fbd7ac90c61c)
+- [WorkPacket](https://app.notion.com/p/39a27ada618f818cba42f5efe8ffe1f0)
+- [Intelligent Work Environments Research Map](https://app.notion.com/p/3ac27ada618f817b8418e50151dd7015)
+
+---
+
+# 25. Closing Ruling
+
+The original T-Series correctly recognized that Sergeant's interface should resemble a modern agent harness while remaining Work-centered. The shipped MVP makes that design substantially more powerful and substantially more concrete.
+
+The revised center is:
+
+> **`sgt tui` is the gorgeous, modern operator cockpit for durable Work and the estate that makes the Work possible.**
+
+It sets intent. It shows attention. It opens one canonical Work. It lets the operator answer, retry, extend, cancel, collect output, and understand evidence. It manages repositories and groups through existing validated semantics. It renders Doctor as Health. It remains honest about the boundaries it does not own.
+
+It reaches that destination by reusing the product that already exists, not by pausing to build a new internal platform first.

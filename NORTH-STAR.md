@@ -114,6 +114,28 @@ text below stands as the argument record.
   reconstructed tmux-era supervision; the settled D7/B1/#131-class
   machinery.
 
+**Amended 2026-08-15 (owner ruling, in dialogue with Captain): the T-series
+unblock condition is satisfied.** Wave 3's "dogfood round 2" gate was
+written against the record as it stood on 2026-08-11, when the one measured
+dogfood run (`docs/gauntlet/runs/dogfood-2026-08-11/`) was the entire
+evidence base. Since then the MVP shipped self-hosted (MVP CLOSE-OUT
+ledger entry, 2026-08-13), WATCH shipped and was piloted (WATCH ledger
+entry, 2026-08-13), the FOUNDATION-1 proposal-grading gauntlet and the
+cross-platform bug sprint both ran as dispatched `sgt` Works against this
+repo (`GAUNTLET.md`, 2026-08-14), and a MacBook-arrival measurement pass
+closed #18/#81/#82/#95 (PR #126, 2026-08-15) — each an instance of the same
+loop the gate was waiting to see proven again, not one discrete "round 2"
+event by name. Per this document's own rule ("binding until evidence beats
+it, then amended in place with a dated entry"), the letter of an unfired
+named event yields to that accumulated evidence: **the T-series full-spec
+gate is lifted.** The revised proposal
+(`reference/proposal-tui-t-series.md`, superseding its 2026-08-11
+predecessor) is queued for FOUNDATION-1-style proposal grading under
+`docs/gauntlet/contracts/T-SERIES-1.md` before any build begins. The
+sibling item sharing this gate's text — "stranger onboarding + prebuilt
+binary" — is untouched by this ruling and remains a separate, unscoped
+decision.
+
 ## Gaps the record must close (owned by the MVP plan's buckets)
 
 Install path, Work-vs-inline routing judgment (OS-owned), per-repo
