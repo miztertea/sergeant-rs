@@ -15,17 +15,26 @@
 //! three (ADR 0003 D6).
 //!
 //! Shaped like every other fact in this boundary (ADR 0002 D3): [`classify`]
-//! and [`parse_proc_mounts`] are plain, unconditionally-compiled functions
-//! exercised by the tests below on any host, including a bare Linux box that
-//! has never seen a `drvfs`/NFS/SMB mount — only the actual `/proc/mounts`
-//! read is `#[cfg]`-gated. macOS has no `/proc` (D5's own liveness gap notes
-//! this), and what it should use instead — `statfs`, `getmntinfo`,
-//! `diskutil` — is explicitly unmeasured (ADR 0003's open question): rather
-//! than guess at an implementation nobody has run, the macOS arm always
-//! reports [`Reliability::Unknown`], which is the fail-closed-*safe*
-//! direction the asymmetry below calls for (an inconclusive probe must never
-//! refuse). It closes only once someone measures a real detection path on a
-//! macOS host.
+//! and [`parse_proc_mounts`] are decision-logic functions exercised by the
+//! tests below on any host, including a bare Linux box that has never seen a
+//! `drvfs`/NFS/SMB mount — only the actual `/proc/mounts` read is
+//! `#[cfg]`-gated. They are gated `cfg(any(test, target_os = "linux"))`
+//! rather than left fully unconditional, the same fix `process.rs`'s
+//! `parse_ps_output` applies and for the same reason: on Linux they have a
+//! live production caller (`raw_detect` below) so they're never dead there,
+//! but on macOS and every other non-Linux target they have no production
+//! caller at all — only `cargo test` exercises them — and an unconditional
+//! declaration trips `cargo clippy --all-targets -- -D warnings`'s
+//! `dead_code` lint on that lib-only compilation (measured on this repo's
+//! first macOS host, 2026-08-15; #85's arm was the one file in this module
+//! family that hadn't yet applied `process.rs`'s precedent). macOS has no
+//! `/proc` (D5's own liveness gap notes this), and what it should use
+//! instead — `statfs`, `getmntinfo`, `diskutil` — is explicitly unmeasured
+//! (ADR 0003's open question): rather than guess at an implementation
+//! nobody has run, the macOS arm always reports [`Reliability::Unknown`],
+//! which is the fail-closed-*safe* direction the asymmetry below calls for
+//! (an inconclusive probe must never refuse). It closes only once someone
+//! measures a real detection path on a macOS host.
 //!
 //! Ponytail rung **R2**: this is a new file, but it reuses the platform
 //! boundary's already-established shape verbatim — the same `#[cfg]`-selected
@@ -63,11 +72,13 @@ pub enum Reliability {
 /// network or 9p-family filesystem in existence — it is the originating
 /// `drvfs` case plus ADR 0003's explicit NFS/SMB generalization, extended by
 /// name as new cases are measured (ADR 0003's second open question).
+#[cfg(any(test, target_os = "linux"))]
 const UNRELIABLE_FS_TYPES: &[&str] = &[
     "drvfs", "9p", "nfs", "nfs2", "nfs3", "nfs4", "cifs", "smb3", "smbfs",
 ];
 
 /// One `/proc/mounts` row this module cares about.
+#[cfg(any(test, target_os = "linux"))]
 struct MountEntry {
     mount_point: PathBuf,
     fs_type: String,
@@ -77,6 +88,7 @@ struct MountEntry {
 /// point field as three-digit octal (`\040` for a space); everything else
 /// passes through unchanged. Necessary because a WSL2 drive letter mount or
 /// an operator-chosen mount point can legitimately contain a space.
+#[cfg(any(test, target_os = "linux"))]
 fn unescape_octal(field: &str) -> String {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -103,6 +115,7 @@ fn unescape_octal(field: &str) -> String {
 /// fewer than three columns is dropped rather than turned into a bogus
 /// entry — the same "never guess" posture [`crate::platform::process`]'s
 /// per-line parsing takes.
+#[cfg(any(test, target_os = "linux"))]
 fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
     content
         .lines()
@@ -126,6 +139,19 @@ fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
 /// by its filesystem type. No covering mount at all is [`Reliability::Unknown`],
 /// never [`Reliability::Unreliable`]: absence of evidence must not read as
 /// evidence of a bad filesystem.
+///
+/// Gating on `cfg(any(test, target_os = "linux"))` (rather than leaving this
+/// and the parsing helpers above fully unconditional, as the module doc
+/// comment's "plain, unconditionally-compiled" phrasing might suggest) is
+/// the same fix `process.rs`'s `parse_ps_output` applies for the same
+/// reason: on Linux this has a live production caller (`raw_detect` below),
+/// so it's never dead there; on macOS and other non-Linux targets it has no
+/// production caller at all, only the tests below — and `cargo clippy
+/// --all-targets -D warnings` (`docs/DEVELOPMENT.md`'s gate) trips
+/// `dead_code` on that lib-only compilation without this gate. Measured on
+/// this host 2026-08-15 (macOS, Apple M3 Pro): un-gated, `cargo clippy
+/// --all-targets -- -D warnings` fails; gated, it's clean.
+#[cfg(any(test, target_os = "linux"))]
 fn classify(path: &Path, mounts: &[MountEntry]) -> Reliability {
     let governing = mounts
         .iter()
@@ -153,6 +179,7 @@ fn classify(path: &Path, mounts: &[MountEntry]) -> Reliability {
 /// path down to a verdict be exercised in tests without a real
 /// `drvfs`/NFS/SMB mount anywhere in the test sandbox. `raw_detect` below is
 /// the only caller that supplies the real thing.
+#[cfg(any(test, target_os = "linux"))]
 fn raw_detect_from(path: &Path, mounts_source: impl FnOnce() -> Option<String>) -> Reliability {
     match mounts_source() {
         Some(content) => classify(path, &parse_proc_mounts(&content)),

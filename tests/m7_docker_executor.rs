@@ -25,7 +25,14 @@ use std::sync::Arc;
 use serde_json::json;
 use tempfile::TempDir;
 
-use sergeant_rs::backend::docker::{self, DockerBackend, DockerConfig};
+// `docker` (the bare module path) is only used by the RSS/disk-pressure
+// measurement in `large_captured_output_does_not_grow_this_process_proportionally`,
+// which is itself Linux-only (`/proc/self/status`) — gated separately so a
+// non-Linux build (first measured on macOS, 2026-08-15) doesn't trip
+// `cargo clippy --all-targets -- -D warnings`'s `unused_imports` lint.
+#[cfg(target_os = "linux")]
+use sergeant_rs::backend::docker;
+use sergeant_rs::backend::docker::{DockerBackend, DockerConfig};
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
     Backend, BackendError, BackendRegistry, PreparedExecution, StartRequest,
@@ -898,7 +905,6 @@ fn large_captured_output_does_not_grow_this_process_proportionally() {
     #[cfg(not(target_os = "linux"))]
     {
         eprintln!("SKIPPED-ENV: RSS measurement via /proc/self/status is Linux-only");
-        return;
     }
     #[cfg(target_os = "linux")]
     {
