@@ -59,8 +59,8 @@ use tempfile::TempDir;
 
 use sergeant_rs::api::Core;
 use sergeant_rs::backend::claude::{
-    CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig, EXECUTION_MODEL_CONTRACT, PinVerdict,
-    preflight_model_pin, verify_model_pin,
+    CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig, ENVIRONMENT_CONTRACT,
+    EXECUTION_MODEL_CONTRACT, PinVerdict, preflight_model_pin, verify_model_pin,
 };
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
@@ -2258,9 +2258,11 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
     );
     assert_eq!(
         first.stdin,
-        format!("{EXECUTION_MODEL_CONTRACT}||the intent||the stage context"),
-        "ADR 0007(a) precedes it, then §12: intent plus the stage's \
-         CONTEXT.md, verbatim, on stdin"
+        format!(
+            "{EXECUTION_MODEL_CONTRACT}||{ENVIRONMENT_CONTRACT}||the intent||the stage context"
+        ),
+        "ADR 0007(a) precedes it, both statements together, then §12: intent \
+         plus the stage's CONTEXT.md, verbatim, on stdin"
     );
 
     let second = &launches[1];
@@ -2315,6 +2317,42 @@ fn adr_0007a_the_first_turn_states_the_execution_model() {
         first.stdin.ends_with("the intent||the stage context"),
         "the intent and CONTEXT.md must still reach the actor, verbatim, \
          after the execution model: {:?}",
+        first.stdin
+    );
+}
+
+/// ADR 0006/0007(a): the environment-guarantee statement is composed at the
+/// exact same seam as the execution-model statement (`ClaudeAdapter::launch`)
+/// — this pins that the two cooperate rather than one overwriting the other.
+/// A turn that lost either statement would silently regress: dropping the
+/// execution model reopens #94 (an actor backgrounds a command and loses its
+/// work waiting for a notification that never comes); dropping the
+/// environment guarantee reopens #60 (an actor misreads a PATH gap as a
+/// permissions fault). Reverting either half of the `format!` in `launch`
+/// alone — without touching the other — must fail this test.
+#[test]
+fn adr_0006_and_0007a_both_contracts_reach_the_first_turn_together() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-envmodel", cwd.path(), "the intent", None);
+    request.context = "the stage context".to_string();
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(1);
+    let first = &launches[0];
+    assert_eq!(
+        first.stdin,
+        format!(
+            "{EXECUTION_MODEL_CONTRACT}||{ENVIRONMENT_CONTRACT}||the intent||the stage context"
+        ),
+        "both ADR 0007(a) statements must reach the actor, in this order, \
+         with the intent and CONTEXT.md still intact after them: {:?}",
         first.stdin
     );
 }

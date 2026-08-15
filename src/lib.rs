@@ -8,6 +8,7 @@ pub mod backend;
 pub mod cli;
 pub mod daemon;
 pub mod domain;
+pub mod harness;
 pub mod platform;
 pub mod runtime;
 pub mod telemetry;
