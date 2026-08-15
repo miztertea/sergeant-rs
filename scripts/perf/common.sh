@@ -47,8 +47,28 @@ perf_now_ns() {
     while [ ${#frac} -lt 9 ]; do frac="${frac}0"; done
     printf '%s%s\n' "$sec" "${frac:0:9}"
   else
-    date +%s%N
+    local ns
+    ns="$(date +%s%N)"
+    perf_require_numeric_ns "$ns"
+    printf '%s\n' "$ns"
   fi
+}
+
+# #95: `date +%s%N` is a GNU coreutils extension — BSD/macOS `date` (the only
+# path bash 3.2's macOS ever reaches, since EPOCHREALTIME needs bash 5.0)
+# silently emits the epoch seconds followed by a literal `N`, e.g.
+# "1786728341N". Fed straight into arithmetic that would be a silently wrong
+# measurement, not a crash — worse for a perf harness than refusing to run.
+# This is the one guard in scope here; which working clock macOS gets
+# instead (perl -MTime::HiRes, python3 time.time_ns() with its fork cost
+# measured, or documented millisecond resolution) is an open parameter left
+# for the platform that can actually time the candidates.
+perf_require_numeric_ns() {
+  case "$1" in
+    ''|*[!0-9]*)
+      perf_die "no working nanosecond clock: \$EPOCHREALTIME is unset (needs bash 5.0+; macOS ships 3.2.57) and 'date +%s%N' returned non-numeric '$1' (%N is a GNU coreutils extension BSD/macOS date does not implement). See issue #95 for the clock this platform still needs."
+      ;;
+  esac
 }
 
 # perf_mark VAR — assign "now" in ns to VAR without forking a subshell.
@@ -67,6 +87,7 @@ perf_mark() {
     __perf_mark_val="${__perf_mark_sec}${__perf_mark_frac:0:9}"
   else
     __perf_mark_val="$(date +%s%N)"
+    perf_require_numeric_ns "$__perf_mark_val"
   fi
   printf -v "$1" '%s' "$__perf_mark_val"
 }

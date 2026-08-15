@@ -476,6 +476,24 @@ async fn test_hold_wait(path: String, deadman: Duration, poll: Duration) -> Resu
     // falls through to the same bounded wait/timeout rather than a distinct
     // error variant.
     let _ = std::fs::write(&ready, b"");
+    // #108: this marker must not outlive the wait on *either* exit — the
+    // happy path (release path appears) or the dead-man path (it never
+    // does). Both are ordinary returns from this `async fn` (no signal is
+    // involved), so `Drop` runs every time and an RAII guard is sufficient;
+    // relying on the caller to remember cleanup only covers whichever path
+    // that particular caller happens to exercise.
+    //
+    // Ponytail rung R2: reuses the RAII-guard-on-Drop idiom this crate
+    // already relies on elsewhere for exactly this shape of problem
+    // (tests/support/mod.rs's DataDir reaps its daemons the same way) rather
+    // than inventing a new cleanup mechanism for one call site.
+    struct ReadyMarker(String);
+    impl Drop for ReadyMarker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _ready_marker = ReadyMarker(ready);
     let deadline = Instant::now() + deadman;
     loop {
         if std::path::Path::new(&path).exists() {
@@ -802,12 +820,52 @@ mod tests {
         .await;
 
         releaser.await.expect("releaser task must not panic");
+        // The `.ready` marker is `test_hold_wait`'s own artifact — its RAII
+        // guard removes it on this return, so only the release path this
+        // test itself created needs cleaning up here (#108).
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{path}.ready"));
 
         assert!(
             result.is_ok(),
             "the hold must resolve Ok(()) once the release path appears: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hold_wait_removes_its_ready_marker_even_when_the_deadman_fires() {
+        // #108: the dead-man branch's premise is that the release path never
+        // appears, so this is exactly the path a plain `let _ =
+        // std::fs::remove_file` in the *test* body cannot cover — cleanup
+        // has to live in `test_hold_wait` itself. Revert the RAII guard and
+        // this fails: the `.ready` marker survives the timeout.
+        let path = std::env::temp_dir()
+            .join(format!(
+                "sgt-watch-test-hold-deadman-cleanup-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let ready = format!("{path}.ready");
+        // Guard against a stale file from a previous failed run confusing
+        // this assertion.
+        let _ = std::fs::remove_file(&ready);
+
+        let result = test_hold_wait(
+            path.clone(),
+            Duration::from_millis(60),
+            Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(WatchError::TestHoldTimedOut { .. })),
+            "expected the dead-man timeout, got {result:?}"
+        );
+        assert!(
+            !std::path::Path::new(&ready).exists(),
+            "the .ready marker at {ready:?} must not survive the dead-man branch \
+             (#108: it leaked one such file per suite run into tmpfs /tmp)"
         );
     }
 
