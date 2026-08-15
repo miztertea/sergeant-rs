@@ -1,39 +1,94 @@
-# Review output — 30-review
+# 30-review output — WB: restart-reconciliation bug (issue #129)
 
-Work: WA · gate-script portability (#130)
-Branch: sergeant/01M03JS0FTRMWVMTVR99FJ6ZDM
-Date: 2026-08-15
+**Reviewed commit:** `581b85a tests/m3_execution: fix t8 extra-OBSERVE assertion to be timing-robust`  
+**Diff scope:** `tests/m3_execution.rs` only (one file, 33 lines changed)  
+**Review effort:** high (three-angle code-review: line-by-line correctness, removed-behavior audit, cross-file tracer)
 
-## Change reviewed
+---
 
-`scripts/gate.sh` — `daemon_env_ok()` narrowed to skip the `/proc/<pid>/environ` check on the direct-fork (non-systemd) path on hosts where `/proc` is not available (macOS), while keeping it as a hard requirement on Linux (where `/proc` is authoritative) and failing with a clear diagnostic on any host where systemd manages the daemon without `/proc` being available.
+## Summary
 
-Diff base: `4e7e21b` (the implementing commit, "scripts/gate.sh: narrow daemon_env_ok() to skip /proc check on direct-fork path")
+The implementation is correct. The fix is accepted with one observation noted for the record.
 
-## Review method
+---
 
-`/code-review --effort high` — synthesized from multiple review angles (correctness A–C, cleanup/efficiency/altitude D–H).
+## Root cause (established by stage 10)
 
-## Findings
+`t8`'s assertion counted *total* OBSERVEs on the survivor's `first_execution`
+(expected 2 = 1 pre-restart + 1 from reconciliation). On macOS, the daemon's
+200 ms completion driver (`drive_completions`) fires during the first daemon's
+lifetime before shutdown — the HTTP submits and git worktree creation takes
+> 200 ms on this host — so the total can be 3 instead of 2. This is a
+scheduler-pacing difference between hosts; the reconciliation logic in
+`src/runtime/recovery.rs` and `src/runtime/engine.rs` (`reconcile_work`,
+`Resumed` branch + `run_inline`) correctly observes exactly once.
 
-### Finding 1 — CONFIRMED, FIXED (correctness, HIGH)
-**File:** `scripts/gate.sh`, line 95 (original implementation commit)
-**Summary:** `daemon_env_ok()` was fail-open on Linux when the daemon died in the narrow window between `daemon_pid()` reading the PID file and the `[ -f "/proc/$pid/environ" ]` test.
+---
 
-**Failure scenario:** On Linux, `/proc/<pid>/environ` disappears atomically when the process exits. With the original fix, a dead daemon's absent `/proc` entry fell through to the macOS path: `systemd_unit()` returned empty on a direct-fork host → `return 0`. The old code's unconditional `grep` on the missing file returned 1, which was fail-closed (correct). The new code's structural change inadvertently changed this to fail-open on Linux.
+## What the fix does
 
-**Fix applied (this review stage):** Added `if [ -d /proc ]; then return 1; fi` immediately after the `[ -f "/proc/$pid/environ" ]` check fails. On Linux, `/proc` is always a mounted filesystem; its presence means the OS supports `/proc/<pid>/environ` and the PID's absence from it means the daemon is dead → caller's restart block fires. On macOS, `/proc` does not exist at all → `[ -d /proc ]` is false → the code falls through to the systemd/direct-fork logic as intended.
+Captures `obs_before_reconcile` immediately after `handle.shutdown()` (the
+first daemon's completion driver is stopped at that point) and asserts that
+the *delta* `obs_after_reconcile - obs_before_reconcile == 1`. This isolates
+what reconciliation itself contributed, independent of how many times the
+first daemon's completion driver polled `first_execution` during its lifetime.
 
-**Verified:** under `/bin/bash` (3.2.57, arm64-macOS) — macOS direct-fork path returns 0; `/proc` not present confirms the guard does not fire on this host.
+The assertion still catches both failure directions:
+- 0 → reconciliation skipped its OBSERVE entirely
+- ≥ 2 → genuine double-observe in the reconciliation path
 
-### Findings 2 & 3 — OUT OF SCOPE
-`scripts/perf/common.sh:56,130` — `|| true` missing on perl-clock fallback assignments. Not in WA's file scope (`scripts/gate.sh` only). Filed for separate attention.
+---
 
-### Finding 4 — OUT OF SCOPE
-`src/domain/workspace.rs:1776` — vacuous `assert_eq!(None, None)` in workspace test. Not in WA's file scope.
+## Code-review findings (scoped to the diff)
+
+Three angle agents ran. Their findings about files outside the diff (the
+broader macOS portability pass committed in parallel waves WA and WC) are out
+of scope here. One finding applies to my diff:
+
+**Candidate: unsigned `usize` subtraction could underflow (Angle A)**  
+`obs_after_reconcile - obs_before_reconcile` where both are `usize`.  
+Verdict: **CONFIRMED SAFE** in this context.  
+`FakeBackend.observations` is a `Vec<String>` with push-only access
+(`src/backend/fake.rs:906` — only `push`, never cleared or truncated). Between
+the two snapshots, no code path removes entries. `obs_after_reconcile >=
+obs_before_reconcile` is guaranteed by the append-only semantics of the fake
+backend. The concern is PLAUSIBLE in general but does not apply here. A
+`checked_sub` guard would add defensive noise to a test that deliberately
+relies on the fake backend's invariants.
+
+---
+
+## Test verification
+
+Ran 3 times, isolated (`--test-threads=1`), all passed:
+
+```
+--- Run 1 ---
+test t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work ... ok
+--- Run 2 ---
+test t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work ... ok
+--- Run 3 ---
+test t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work ... ok
+```
+
+Pre-fix (on `integration/macbook-arrival-2026-08-15` before this commit):
+deterministic failure with `left: 3, right: 2`.
+
+---
+
+## L6 adjacent-append audit
+
+No journal-appending code was changed. `src/runtime/recovery.rs` and
+`src/runtime/engine.rs`'s reconciliation path are untouched. This is a
+test-precision fix only. No adjacent-append crash window is introduced or
+resolved by this change.
+
+---
 
 ## Disposition
 
-One in-scope finding confirmed and fixed in this review stage. No remaining open findings in `scripts/gate.sh`. The change is correct, bash-3.2-clean (`/bin/bash -n` passes), and resolves #130's hard-block on macOS without weakening the guard's protection on Linux or systemd hosts.
-
-Commit trailer: `Fixes #130` — justified: the check now correctly handles all three cases (Linux live daemon, Linux dead daemon, macOS direct-fork). The "no platform-independent verification on macOS+systemd" path remains, but that is a host that does not currently exist in this repo's measured environment set, and the failure there is an explicit diagnostic, not a silent pass.
+**Accept.** The commit carries `Fixes #129` and is justified: the root cause
+is diagnosed (scheduler-pacing difference surfaces a pre-existing counting
+error in the test assertion), the fix is minimal and correct (delta assertion
+rather than absolute total), and the invariant it pins is stronger — it
+catches both the zero case and the double-observe case explicitly.

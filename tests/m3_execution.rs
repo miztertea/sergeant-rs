@@ -2003,6 +2003,19 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
 
     handle.shutdown().await;
 
+    // Capture the first execution ID and its OBSERVE count now — after the
+    // first daemon's completion driver has stopped, before the second daemon's
+    // reconciliation runs.  The 200 ms completion-driver interval can fire any
+    // number of times during the first daemon's lifetime (a timing fact that
+    // varies by host and scheduler); pinning the *delta* rather than the total
+    // makes the assertion below robust against those extra pre-restart polls.
+    let first_execution = durable.starts()[0].execution_id.clone();
+    let obs_before_reconcile = durable
+        .observations()
+        .iter()
+        .filter(|id| **id == first_execution)
+        .count();
+
     // While the daemon was down, the surviving session finished its stage.
     durable.complete_live_executions();
 
@@ -2082,21 +2095,21 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
 
     // Reconciliation asked the surviving session what it was doing exactly
     // once, and the resumed run acted on *that* answer rather than asking a
-    // second time — two OBSERVEs are not guaranteed to agree, and the run
-    // would then be driven from an answer no decision was made on. The
-    // survivor's first execution was observed once while it was running,
-    // before the restart, and once by reconciliation: a third would be the
-    // duplicate this pins against.
-    let first_execution = durable.starts()[0].execution_id.clone();
-    let observes = durable
+    // second time — two OBSERVEs are not guaranteed to agree, and driving
+    // from a second would mean acting on an answer no recorded decision was
+    // made on.  The diff `obs_after_reconcile - obs_before_reconcile` isolates
+    // exactly what reconciliation contributed, independent of how many times
+    // the first daemon's completion driver polled `first_execution`.
+    let obs_after_reconcile = durable
         .observations()
         .iter()
         .filter(|id| **id == first_execution)
         .count();
     assert_eq!(
-        observes,
-        2,
-        "one OBSERVE before the restart, one to reconcile: got {:?}",
+        obs_after_reconcile - obs_before_reconcile,
+        1,
+        "reconciliation must observe the survivor's first execution exactly once \
+         (not zero, not twice): got {:?}",
         durable.observations()
     );
 
