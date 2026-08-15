@@ -48,7 +48,7 @@ use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::KIND_SURFACE_MATERIALIZED;
 
 mod support;
-use support::{DataDir, ReapSignal};
+use support::{DataDir, ReapSignal, daemon_pids};
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
@@ -1774,33 +1774,24 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
     assert!(intents.contains(&"racer A") && intents.contains(&"racer B"));
 
     // Exactly one surviving daemon: the descriptor names a live PID, and
-    // scanning /proc finds exactly one `sgt ... daemon` on this data dir.
+    // `support::daemon_pids` (platform-correct: `/proc` on Linux, `ps` on
+    // macOS — src/platform/process.rs) finds exactly one `sgt ... daemon` on
+    // this data dir. This used to hand-roll its own `/proc`-only scan rather
+    // than reuse that helper — an L18 reinvention that was also, separately,
+    // unconditional `/proc` with no macOS arm at all (first measured on the
+    // MacBook Pro M3 Pro arrival trip, 2026-08-15: it panicked outright with
+    // `read /proc: No such file or directory` rather than just undercounting).
     let descriptor = descriptor_of(dir.path()).expect("descriptor exists");
     assert!(
         daemon::pid_alive(descriptor.pid),
         "descriptor PID must be alive"
     );
-    let needle = dir.path().to_string_lossy().to_string();
-    let mut daemons = 0;
-    for entry in std::fs::read_dir("/proc").expect("read /proc") {
-        let entry = entry.expect("proc entry");
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .chars()
-            .all(|c| c.is_ascii_digit())
-        {
-            continue;
-        }
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-        if cmdline.contains(&needle) && cmdline.contains(" daemon") && cmdline.contains("sgt") {
-            daemons += 1;
-        }
-    }
-    assert_eq!(daemons, 1, "exactly one daemon may survive the race");
+    let daemons = daemon_pids(dir.path());
+    assert_eq!(
+        daemons.len(),
+        1,
+        "exactly one daemon may survive the race: {daemons:?}"
+    );
 
     stop_daemon(dir.path());
 }
@@ -2471,14 +2462,29 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     assert!(!home.path().join(".local").exists());
     drop(_reap);
 
-    // Absent SGT_DATA_DIR, `$XDG_DATA_HOME/sergeant` is next. Run from a cwd
-    // outside any estate: an in-tree cwd would let step 3 (estate discovery,
-    // `resolve_data_dir`) resolve first and this fallback rung would never
-    // actually be exercised.
+    // Absent SGT_DATA_DIR, the OS's own fallback-tail convention is next
+    // (`src/platform/data_dir.rs`, #82). Run from a cwd outside any estate:
+    // an in-tree cwd would let step 3 (estate discovery, `resolve_data_dir`)
+    // resolve first and this fallback rung would never actually be
+    // exercised.
+    //
+    // **#82, closed by measurement (MacBook Pro M3 Pro, 2026-08-15).** This
+    // block used to assert `XDG_DATA_HOME/sergeant` unconditionally — true
+    // on Linux, but macOS's own convention (`MACOS.env_override: None` in
+    // `data_dir.rs`, already unit-tested there without a macOS host) ignores
+    // `XDG_DATA_HOME` entirely and always uses
+    // `~/Library/Application Support/sergeant`. That unit test exercised the
+    // decision logic in isolation; this integration test is what actually
+    // runs the real `sgt` binary end to end, and it had never been updated
+    // for the platform split it was itself designed to prove out.
     let xdg2 = TempDir::new().expect("tempdir");
     let home2 = TempDir::new().expect("tempdir");
     let cwd2 = TempDir::new().expect("tempdir");
-    let resolved = xdg2.path().join("sergeant");
+    let resolved = if cfg!(target_os = "macos") {
+        home2.path().join("Library/Application Support/sergeant")
+    } else {
+        xdg2.path().join("sergeant")
+    };
     let _reap = ReapOnDrop(resolved.clone());
     let output = Command::new(SGT)
         .args(["run", "resolve data dir fallback probe"])
@@ -2495,16 +2501,27 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     );
     assert!(
         resolved.join("journal").is_dir(),
-        "XDG_DATA_HOME/sergeant must be used"
+        "this platform's own fallback-tail convention must be used: {resolved:?}"
     );
-    assert!(!home2.path().join(".local").exists());
+    if cfg!(target_os = "macos") {
+        assert!(
+            !xdg2.path().join("sergeant").exists(),
+            "macOS's convention must ignore XDG_DATA_HOME, not merely prefer its own path"
+        );
+    } else {
+        assert!(!home2.path().join(".local").exists());
+    }
     drop(_reap);
 
-    // Absent both, `$HOME/.local/share/sergeant` is the last resort. Same
-    // cwd-isolation reasoning as the XDG case above.
+    // Absent both, `$HOME`'s own convention-suffix is the last resort. Same
+    // cwd-isolation reasoning as above, and the same platform split.
     let home3 = TempDir::new().expect("tempdir");
     let cwd3 = TempDir::new().expect("tempdir");
-    let resolved = home3.path().join(".local/share/sergeant");
+    let resolved = if cfg!(target_os = "macos") {
+        home3.path().join("Library/Application Support/sergeant")
+    } else {
+        home3.path().join(".local/share/sergeant")
+    };
     let _reap = ReapOnDrop(resolved.clone());
     let output = Command::new(SGT)
         .args(["run", "resolve data dir fallback probe"])
@@ -2521,7 +2538,7 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     );
     assert!(
         resolved.join("journal").is_dir(),
-        "HOME/.local/share/sergeant must be used"
+        "HOME's own convention suffix must be used: {resolved:?}"
     );
 }
 

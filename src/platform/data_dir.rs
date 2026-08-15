@@ -72,8 +72,13 @@ fn resolve(
 
 /// The fallback tail for whatever platform this binary is built for.
 ///
-/// **The macOS arm is UNVERIFIED** — never executed on a real macOS host.
-/// Closes when measured there (#82), not when this lands.
+/// **The macOS arm is verified 2026-08-15** on a real macOS host (Apple M3
+/// Pro, macOS 26.6.1, `docs/environments/macbook.md`) — closes #82.
+/// `tests/m2_daemon_api.rs`'s and `tests/m8_estate_cli.rs`'s data-dir
+/// fallback integration tests both exercised the real `sgt` binary's
+/// `~/Library/Application Support/sergeant` path end to end; both tests had
+/// only ever asserted the freedesktop path and needed a platform-conditional
+/// fix to actually exercise this arm rather than fail on it.
 pub fn fallback_dir(probe: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     resolve(CURRENT, probe)
 }

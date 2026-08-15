@@ -762,21 +762,41 @@ fn explicit_data_dir_and_env_still_win_over_a_discovered_estate() {
 /// milestone. Mutation this kills: the new estate-walk fallback firing (or
 /// erroring) even when no estate exists, changing the pre-existing default
 /// path.
+/// **#82, closed by measurement (MacBook Pro M3 Pro, 2026-08-15).** This
+/// used to set only `XDG_DATA_HOME` and assert it unconditionally won — true
+/// on Linux, but macOS's own convention (`src/platform/data_dir.rs`'s
+/// `MACOS.env_override: None`) ignores `XDG_DATA_HOME` entirely and falls
+/// back to `$HOME/Library/Application Support/sergeant` — and since this
+/// test never overrode `HOME` either (it didn't need to, on the platform it
+/// was written against), that fallback landed on this *host's real* `$HOME`
+/// rather than the test's own scratch dir. Both env vars are now set and the
+/// expected path is platform-conditional, mirroring
+/// `tests/m2_daemon_api.rs::resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home`,
+/// which needed the identical fix.
 #[test]
 fn no_estate_anywhere_falls_back_to_the_pre_estate_default_unchanged() {
     let scratch = tempfile::TempDir::new().expect("tempdir");
     let cwd = scratch.path().join("plain").join("nested");
     std::fs::create_dir_all(&cwd).expect("nested dir");
     let xdg = scratch.path().join("xdg-home");
+    let home = scratch.path().join("home");
 
     let result = run(
         &cwd,
         None,
-        &[("XDG_DATA_HOME", xdg.to_str().expect("utf8"))],
+        &[
+            ("XDG_DATA_HOME", xdg.to_str().expect("utf8")),
+            ("HOME", home.to_str().expect("utf8")),
+        ],
         &["--json", "doctor"],
     );
     let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
-    assert_eq!(reported, xdg.join("sergeant"));
+    let expected = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/sergeant")
+    } else {
+        xdg.join("sergeant")
+    };
+    assert_eq!(reported, expected);
 }
 
 /// Append `data_dir = "<value>"` to the `[estate]` table `sgt init` already
