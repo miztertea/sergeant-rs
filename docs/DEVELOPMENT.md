@@ -67,10 +67,22 @@ in `AGENTS.md` instead.
   never waives them. <!-- BU-0018, BU-0113 -->
 - Never push directly to a default branch; a session working here still goes
   through a branch and review like any other change. <!-- BU-0114 -->
-- A workflow stage or actor executing inside a worktree never invokes
+- **Superseded by ADR 0005 (2026-08-14), "Gating becomes a dispatched
+  Work" — read that ADR before relying on this bullet.** The rule below is
+  kept, not deleted, per L20's ruling that a document says what we knew when
+  it was written and a superseded rule stays legible rather than being
+  quietly edited away; it was never wrong when written; it predates the
+  engine being able to run work at all, so nothing contradicted it until
+  gating itself became dispatchable. What now governs: gating is a
+  dispatched Work like any other — it mints and owns its own isolated
+  surface, which is the same single-owner posture the original rule below
+  was protecting, so there is nothing left for an "actor never invokes the
+  gate" exception to guard against. Captain adjudicates a gate Work's
+  findings; Sgt executes the gate itself. Original text, historical:
+  *"A workflow stage or actor executing inside a worktree never invokes
   `scripts/gate.sh`/no-mistakes itself — only the top-level orchestrating
   session owns a shipping-gate run, matching the single-owner posture the
-  engine itself enforces on the data dir. <!-- BU-0041, BU-0122, BU-1196 -->
+  engine itself enforces on the data dir."* <!-- BU-0041, BU-0122, BU-1196 -->
 - A command's own `--help`, its emitted usage/error contract, and its tests
   are the authority over prose when they disagree; file an issue on the
   mismatch rather than trusting either doc silently. <!-- BU-0107 -->
