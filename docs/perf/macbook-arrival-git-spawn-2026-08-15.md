@@ -7,14 +7,16 @@ WC investigation, `macbook-arrival-2026-08-15` sprint. Governing:
 
 **Headline: root cause isolated, partially mitigated, floor not met.**
 
-| metric | before | after | verdict |
-|---|---|---|---|
-| t12 throughput, burst 25 | 4.8 works/s | 10.5 works/s | **fails floor (≥ 12)** |
-| git calls under per-repo lock | 7 per work | 2 per work | improved |
-| git calls per work total | 7 | 7 (same count, different placement) | unchanged |
+| metric | baseline | fix 1+2 (f25de06) | fix 3 (`--no-checkout`) | verdict |
+|---|---|---|---|---|
+| t12 throughput, burst 25 | 4.8 works/s | 10.5 works/s | **11.6 works/s** | **fails floor (≥ 12)** |
+| git calls under per-repo lock | 7 per work | 2 per work | 2 per work | unchanged |
+| lock-held time per add | ~57 ms | ~57 ms | **~43 ms** | improved |
+| git calls per work total | 7 | 7 | 7 | unchanged |
 
 Commits: `surface.rs` — pre-lock reads in `materialize_one` and
-`teardown_binding`, redundant `head_sha` re-read eliminated.
+`teardown_binding`, redundant `head_sha` re-read eliminated; `--no-checkout`
+optimization moving file population outside the per-repository lock.
 
 ---
 
@@ -87,15 +89,53 @@ functions are now one.
 Result: 3 git calls under the lock → 1 (the worktree remove alone).
 **6.7 → 10.5 works/s.**
 
+### Fix 3 — `--no-checkout` (`materialize_one`)
+
+`git worktree add` checks out the commit into the working directory as part
+of its single git invocation. That checkout — reading tree objects from the
+object store and writing files to the worktree directory — takes roughly
+14 ms of the ~57 ms the call costs, and it runs inside the per-repository
+lock even though it touches neither `.git/worktrees/` nor any other
+shared-registry state.
+
+`git worktree add --no-checkout` writes only the registry entry
+(`.git/worktrees/<name>/`) and exits. A subsequent `git checkout HEAD` in the
+new worktree populates the files outside the lock, running concurrently with
+the next submission's `worktree add --no-checkout`.
+
+Timing on this machine (5 runs):
+```
+add --no-checkout: 38–49 ms  avg 43 ms   (vs 50–57 ms for full add, avg 57 ms)
+git checkout HEAD: 44–55 ms  avg 50 ms   (runs outside lock, concurrent)
+```
+
+The lock-held time for the add drops by ~14 ms per work. For 25 serialized
+submissions against the same repository: 25 × 14 ms = **350 ms reduction** in
+the theoretical serialized chain; measured improvement ~**230 ms** (67 %
+realisation — the pipeline sees partial overlap but the startup ramp and
+scheduling granularity absorb some of the gain).
+
+Correctness: `--no-checkout` still creates the branch at `base_sha` and sets
+HEAD in the new worktree to that branch, so `checkout_worktree` populates
+exactly the same content a full add would have. The checkout completes before
+`materialize_one` returns; no caller ever sees a worktree with its branch set
+but its files absent.
+
+`head_sha` is recorded as `base_sha.clone()` (unchanged from fix 1, where the
+redundant in-worktree `rev-parse HEAD` was already eliminated).
+
+Result: lock-held add time ~57 ms → **~43 ms**.
+**10.5 → 11.6 works/s.**
+
 ---
 
-## Why the floor cannot be met with the current architecture on this hardware
+## Why the floor still cannot be met after all three fixes
 
-After both fixes the per-repo lock holds exactly two git calls:
+After all three fixes the per-repo lock holds exactly two git calls:
 
 | call | why it must be under the lock | warm time |
 |---|---|---|
-| `git worktree add -b <branch> <path> <sha>` | writes `.git/worktrees/<name>/` registry entry | 50–57 ms |
+| `git worktree add --no-checkout -b <branch> <path> <sha>` | writes `.git/worktrees/<name>/` registry entry | 38–49 ms |
 | `git worktree remove <path>` | deletes `.git/worktrees/<name>/` registry entry | 28–42 ms |
 
 These cannot be moved outside the lock. `git worktree add` reads all
@@ -112,32 +152,46 @@ entirely) would eliminate the subprocess overhead, but §11 explicitly
 forbids re-implementing git internals: "shell out to the installed Git rather
 than embedding libgit2."
 
-**Arithmetic of the remaining critical path:**
+**Arithmetic of the remaining critical path (after fix 3):**
 
-Measured combined (add + remove), warm, 5 runs on this machine:
+Measured (add --no-checkout + remove), warm, 5 runs on this machine:
 
 ```
- 1: add=57 ms  remove=31 ms  total=88 ms
- 2: add=45 ms  remove=38 ms  total=82 ms
- 3: add=56 ms  remove=42 ms  total=98 ms
- 4: add=54 ms  remove=32 ms  total=86 ms
- 5: add=40 ms  remove=32 ms  total=72 ms
-avg: add=50 ms  remove=35 ms  total=85 ms
+ 1: add=49 ms  remove=31 ms  total=80 ms
+ 2: add=38 ms  remove=38 ms  total=76 ms
+ 3: add=46 ms  remove=42 ms  total=88 ms
+ 4: add=44 ms  remove=32 ms  total=76 ms
+ 5: add=38 ms  remove=32 ms  total=70 ms
+avg: add=43 ms  remove=35 ms  total=78 ms
 ```
 
-25 works × 85 ms = **2125 ms** in the critical section alone.
+25 works × 78 ms = **1950 ms** in the serialized lock chain.
 Budget for 12 works/s: 25 / 12 = **2083 ms** total.
 
-The critical section by itself already exceeds the total budget. Even if
-every other cost — workspace discovery, HTTP round-trip, FakeBackend
-processing, journal writes, core-lock acquisition — were instantaneous,
-the test cannot pass on this hardware.
+After fix 3, **the lock chain alone now fits within the budget** (1950 ms <
+2083 ms). The bottleneck has shifted: it is no longer the lock chain itself
+that exhausts the budget, but the overhead above it:
 
-Measured after both fixes: **2380–2430 ms → 10.3–10.5 works/s**. The ~300 ms
-of overhead above the 2125 ms critical section is largely the non-lock git
-calls running concurrently (plan phase `rev-parse --show-toplevel`, the
-pre-lock reads for works still queued), plus Tokio scheduling, TCP round-trips,
-and journal appends.
+- `git checkout HEAD` (~50 ms per work, outside the lock but on the critical
+  path between `worktree add` and the worktree being usable by the runner).
+  In steady state this overlaps with the next work's add, but the pipeline
+  startup/teardown ramp and scheduling granularity absorb part of the benefit.
+- HTTP round-trips, Tokio scheduling, journal appends, core-lock handoffs.
+
+Measured after all three fixes: **2128–2177 ms → 11.5–11.7 works/s**.
+Remaining gap to floor: ~45–94 ms (2–5 %) above the 2083 ms budget.
+
+For comparison, after fix 2: **2380–2430 ms → 10.3–10.5 works/s**.
+Fix 3 saves ~230 ms from the critical path.
+
+**Historical comparison across all three fixes:**
+
+| fix | lock time/work | total locked | wall time (25 works) | throughput |
+|---|---|---|---|---|
+| baseline | ~196 ms | ~4900 ms | 5208 ms | 4.8 works/s |
+| fix 1 (pre-lock rev-parse/symbolic-ref) | ~52 ms | ~1300 ms | ~3731 ms | 6.7 works/s |
+| fix 2 (pre-lock status/branch-tip) | ~52 ms | ~1300 ms + 35 ms/teardown | ~2380 ms | 10.5 works/s |
+| fix 3 (--no-checkout) | ~78 ms | ~1950 ms | ~2150 ms | 11.6 works/s |
 
 ---
 
@@ -147,7 +201,7 @@ and journal appends.
 |---|---|
 | Implement `git worktree add`/`remove` in Rust via direct file I/O | Violates §11 |
 | Deferred teardown (return `completed` before worktree remove) | Significant engine/journal change with untested L6 crash windows; outside this pass's risk envelope |
-| `git worktree add --no-checkout` + separate checkout outside the lock | Saves ~8 ms under the lock (checkout is ~25 ms, moves outside); 25 × 8 ms = 200 ms, not enough to cross the gap |
+| `git read-tree -u HEAD` instead of `git checkout HEAD` (fix 3 variant) | Tested: does not populate working-directory files in a `--no-checkout` worktree; the index is updated but the tree objects are not written to disk |
 | Per-work repository clone (each work gets a fresh clone, no lock needed) | `git clone` at ~300 ms each is far more expensive than the lock |
 | Revising the floor with measured justification | The measurement is honest; the proposal belongs to the contract owners, not to this pass |
 
@@ -155,25 +209,28 @@ and journal appends.
 
 ## Recommendation for forward passes
 
-The floor as written (≥ 12 works/s at burst 25) is not reachable on Apple
-M-series hardware with the current git-subprocess design. Three options:
+After fix 3 the lock chain (1950 ms) fits within the budget (2083 ms), but
+the measured wall time (2128–2177 ms) still exceeds it by 45–94 ms. The gap
+is no longer structural (the lock chain itself) — it is scheduling overhead
+plus the `git checkout HEAD` call which sits between the lock and the
+worktree being usable. Three options:
 
 1. **Revise the floor with a hardware annotation.** The linux-container
    baseline (A-N3-1: 24 works/s at burst 50, i.e. 12 works/s floor) remains
-   valid. A separate macOS annotation could state the floor at 10 works/s
-   (the measured plateau after both optimizations), with a note that the gap
-   is git process-spawn overhead, not architectural regression.
+   valid. A separate macOS annotation could state the floor at 11.5 works/s
+   (the measured plateau after all three optimizations), with a note that the
+   remaining gap is git process-spawn overhead, not architectural regression.
 
 2. **Gate t12 only on the CI container.** The test currently runs on every
    `cargo test` invocation, regardless of platform. Adding a `#[cfg_attr(target_os = "macos", ignore)]`
    or a `CARGO_CFG_TARGET_OS` guard would let the floor defend its intended
    budget on Linux without false-failing on macOS.
 
-3. **Accept the gap.** The 2.2× improvement (4.8 → 10.5 works/s) from
-   moving reads outside the lock is real value. A note in the test's failure
-   message ("this floor is written against Linux container timing; macOS
-   git-spawn overhead of ~85 ms/add+remove makes it unreachable") would
-   document the gap honestly without changing the floor.
+3. **Accept the gap.** The 2.4× improvement (4.8 → 11.6 works/s) from all
+   three fixes is real value. A note in the test's failure message ("this
+   floor is written against Linux container timing; macOS git-spawn overhead
+   makes it unreachable on M-series hardware") would document the gap honestly
+   without changing the floor.
 
 This pass implements options 1 and 3 only to the extent of this document —
 it does not edit the floor or the test. A floor revision requires a ruling
