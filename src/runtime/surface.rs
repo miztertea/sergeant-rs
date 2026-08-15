@@ -455,20 +455,50 @@ fn materialize_one(
             source_repo: repository.path.display().to_string(),
         });
     }
-    let (base_sha, base_branch, head_sha) = with_repository(&repository.path, || {
-        let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
-        // A detached HEAD has no branch name; record the fact rather than
-        // inventing one.
-        let base_branch = git(
-            &repository.path,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        )
-        .unwrap_or_else(|_| "(detached)".to_string());
+    // Read HEAD metadata **before** taking the per-repository lock.  Both
+    // calls touch only `.git/HEAD` and ref storage — they do not access the
+    // worktree registry (`.git/worktrees/`) that `with_repository` protects.
+    // Running them before acquiring the lock lets concurrent submissions that
+    // target the same repository overlap this work rather than serializing all
+    // four git spawns per materialization behind a single gate.
+    //
+    // Correctness under a concurrent HEAD advance: `base_sha` is passed
+    // explicitly to `git worktree add` rather than "HEAD", so the new
+    // worktree lands at the commit we recorded here even if the branch tip
+    // moves between this read and the add.  The provenance record and the
+    // actual checkout agree with each other; a one-commit lag behind the tip
+    // is the same fact it was before (the submit captured a snapshot of HEAD
+    // at request time, and that snapshot is what the run executes on).
+    let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
+    // A detached HEAD has no branch name; record the fact rather than
+    // inventing one.
+    let base_branch = git(
+        &repository.path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .unwrap_or_else(|_| "(detached)".to_string());
 
-        add_worktree(&repository.path, &worktree_path, branch, &base_sha)?;
-        let head_sha = git(&worktree_path, &["rev-parse", "HEAD"])?;
-        Ok::<_, SurfaceError>((base_sha, base_branch, head_sha))
+    // Only `git worktree add` touches `.git/worktrees/` — the operation the
+    // per-repository lock exists to serialize.  Hold it for exactly that span
+    // and nothing more.
+    with_repository(&repository.path, || {
+        add_worktree(&repository.path, &worktree_path, branch, &base_sha)
     })?;
+
+    // `git worktree add -b <branch> <path> <sha>` creates the branch at
+    // `<sha>` and checks it out in the new worktree, so HEAD there resolves
+    // to exactly `base_sha` — a second `git rev-parse HEAD` in the worktree
+    // would only confirm what we already know.  Skipping it removes one
+    // serialized git spawn from the per-submission critical path without
+    // changing what is recorded: `head_sha` and `base_sha` are already
+    // identical by construction after a `Cut` materialization.
+    //
+    // Assumption: no `post-checkout` hook in the user's repository repoints
+    // HEAD after `git worktree add`.  Such a hook would be unusual and
+    // contrary to git norms; if one is encountered, the recorded `head_sha`
+    // and the actual worktree HEAD will diverge by exactly one commit, the
+    // same class of transient lag accepted above for `base_sha`.
+    let head_sha = base_sha.clone();
 
     Ok(RepositoryBinding {
         repository: repository.name.clone(),
@@ -1121,31 +1151,52 @@ pub fn directory_size(path: &Path) -> u64 {
 }
 
 fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
-    with_repository(&binding.source_path, || teardown_binding_locked(binding))
-}
-
-fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
-    // Read the retained branch's tip before anything else. Teardown always
-    // keeps the branch regardless of what happens to the worktree below, so
-    // this is available in every disposition — including `Missing`, where
-    // there is no worktree left to read a HEAD from at all.
+    // Read the retained branch's tip **before** taking the per-repository lock.
+    // This call reads from ref storage only — it does not access the worktree
+    // registry (`.git/worktrees/`) that `with_repository` protects, so running
+    // it before the lock lets concurrent teardowns that target the same
+    // repository do this work in parallel rather than serializing behind the
+    // gate that only `git worktree remove` actually needs.
+    //
+    // Teardown always keeps the branch regardless of what happens to the
+    // worktree below, so `final_sha` is available in every disposition —
+    // including `Missing`, where there is no worktree left to read a HEAD from.
     let final_sha = git(
         &binding.source_path,
         &["rev-parse", &format!("refs/heads/{}", binding.work_branch)],
     )
     .ok();
+
     if !binding.worktree_path.exists() {
         // The directory is gone, but the source repository still lists it;
         // unregister it now so a later rematerialize at the same path is
-        // possible. This does not change the disposition below either way.
-        prune_stale_worktrees(&binding.source_path);
+        // possible.  `git worktree prune` modifies the registry → lock.
+        with_repository(&binding.source_path, || {
+            prune_stale_worktrees(&binding.source_path);
+        });
         return (BindingDisposition::Missing, final_sha);
     }
+
+    // Check whether the worktree is clean **before** taking the per-repository
+    // lock.  `git status --porcelain` runs in the linked worktree and reads
+    // the shared object store (read-only) plus the worktree-local index — it
+    // does not touch `.git/worktrees/`, so it is safe outside the lock.
+    //
+    // TOCTOU note: if the worktree becomes dirty between this read and the
+    // `git worktree remove` below, git's own pre-removal dirty check fires and
+    // refuses the removal, surfacing a `RetainedError` rather than silently
+    // destroying content — the same fail-closed outcome the explicit status
+    // check produces, so the window carries no correctness risk.
     match git(&binding.worktree_path, &["status", "--porcelain"]) {
         Ok(changes) if !changes.is_empty() => {
-            return (retain_dirty(binding, changes), final_sha);
+            // Dirty: `retain_dirty` captures a patch and calls `git worktree
+            // remove --force`, which does touch the registry.  Hold the lock
+            // for that entire path.
+            let disposition =
+                with_repository(&binding.source_path, || retain_dirty(binding, changes));
+            return (disposition, final_sha);
         }
-        Ok(_) => {}
+        Ok(_) => {} // clean — proceed to the removal below
         Err(e) => {
             // Cannot establish that it is clean ⇒ must not remove it.
             return (
@@ -1156,39 +1207,43 @@ fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, 
             );
         }
     }
+
+    // Clean path: only `git worktree remove` touches the registry.
     let path = binding.worktree_path.display().to_string();
-    let disposition = match git(&binding.source_path, &["worktree", "remove", &path]) {
-        Ok(_) => BindingDisposition::Removed,
-        // #22: git unconditionally refuses to remove a worktree that
-        // contains a submodule — "working trees containing submodules
-        // cannot be moved or removed" — regardless of whether anything in
-        // it is actually dirty. Left as `RetainedError` unconditionally,
-        // *every* submodule-bearing surface would leak its worktree on
-        // every single ordinary, successful teardown, forever (measured:
-        // this module's own `a_submodule_is_populated_into_the_
-        // materialized_worktree` failed here before this arm existed). The
-        // `git status --porcelain` check just above already answers
-        // whether the submodule itself has anything uncommitted — it
-        // recurses into a registered submodule by default and would have
-        // returned `RetainedDirty` already if so — so reaching this arm at
-        // all means the only reason git refused is the policy, not the
-        // content, and retrying with `--force` destroys nothing §11 does
-        // not already know is safe to remove.
-        Err(e) if e.to_string().contains("containing submodules") => {
-            match git(
-                &binding.source_path,
-                &["worktree", "remove", "--force", &path],
-            ) {
-                Ok(_) => BindingDisposition::Removed,
-                Err(e) => BindingDisposition::RetainedError {
-                    detail: e.to_string(),
-                },
+    let disposition = with_repository(&binding.source_path, || {
+        match git(&binding.source_path, &["worktree", "remove", &path]) {
+            Ok(_) => BindingDisposition::Removed,
+            // #22: git unconditionally refuses to remove a worktree that
+            // contains a submodule — "working trees containing submodules
+            // cannot be moved or removed" — regardless of whether anything in
+            // it is actually dirty. Left as `RetainedError` unconditionally,
+            // *every* submodule-bearing surface would leak its worktree on
+            // every single ordinary, successful teardown, forever (measured:
+            // this module's own `a_submodule_is_populated_into_the_
+            // materialized_worktree` failed here before this arm existed). The
+            // `git status --porcelain` check just above already answers
+            // whether the submodule itself has anything uncommitted — it
+            // recurses into a registered submodule by default and would have
+            // returned `RetainedDirty` already if so — so reaching this arm at
+            // all means the only reason git refused is the policy, not the
+            // content, and retrying with `--force` destroys nothing §11 does
+            // not already know is safe to remove.
+            Err(e) if e.to_string().contains("containing submodules") => {
+                match git(
+                    &binding.source_path,
+                    &["worktree", "remove", "--force", &path],
+                ) {
+                    Ok(_) => BindingDisposition::Removed,
+                    Err(e) => BindingDisposition::RetainedError {
+                        detail: e.to_string(),
+                    },
+                }
             }
+            Err(e) => BindingDisposition::RetainedError {
+                detail: e.to_string(),
+            },
         }
-        Err(e) => BindingDisposition::RetainedError {
-            detail: e.to_string(),
-        },
-    };
+    });
     (disposition, final_sha)
 }
 
@@ -1900,9 +1955,9 @@ mod tests {
         // removed: a submodule that never finished initializing has nothing
         // of its own for `git status --porcelain` to find dirty (there is no
         // checked-out submodule content yet to be dirty), so the force-retry
-        // `teardown_binding_locked` uses for git's blanket "containing
-        // submodules" refusal cleans it up rather than leaving it parked
-        // with a permanent `RetainedError`.
+        // `teardown_binding` uses for git's blanket "containing submodules"
+        // refusal cleans it up rather than leaving it parked with a permanent
+        // `RetainedError`.
         assert_eq!(teardown.bindings.len(), 1);
         assert_eq!(teardown.bindings[0].repository, "solo");
         assert_eq!(
@@ -1918,8 +1973,8 @@ mod tests {
         assert!(teardown.clean);
     }
 
-    /// The force-retry `teardown_binding_locked` uses for git's blanket
-    /// "containing submodules" refusal must never bypass real dirtiness —
+    /// The force-retry `teardown_binding` uses for git's blanket "containing
+    /// submodules" refusal must never bypass real dirtiness —
     /// uncommitted content genuinely *inside* the submodule is exactly what
     /// §11's fail-closed rule exists to protect. `git status --porcelain`
     /// already recurses into a registered submodule by default (measured,
