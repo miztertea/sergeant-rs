@@ -59,10 +59,32 @@ ledger commits against a stale base. But it sits in the pipeline's state as
 an open run, and nothing in sergeant knows it exists.
 
 This is **L22's shape one layer out**: a Work's own teardown is clean and
-journaled, while the *external tool* it drove keeps state that outlives it,
-with no verb on either side to reap it. Sergeant's disk-footprint contract
-(#109's larger item) covers what a Work writes to disk; it says nothing
-about state a Work creates in a third-party daemon.
+journaled, while the *external tool* it drove keeps state that outlives it.
+Sergeant's disk-footprint contract (#109's larger item) covers what a Work
+writes to disk; it says nothing about state a Work creates in a third-party
+daemon.
+
+**Corrected after filing (#124's own comment thread).** This section
+originally claimed no verb existed on either side to reap it. False:
+`no-mistakes axi abort --run <id>` exists precisely for this, and its help
+text names the worktree-teardown case — *"so an orphaned CI monitor (e.g.
+after a worktree was torn down) can be reaped deterministically."* The
+earlier attempt failed only because bare `axi abort` is branch-scoped and
+was run from another branch; the verb was reached for without reading its
+help, which is **L12** for the second time this session.
+
+The real gap is narrower and still worth fixing: **the mechanism exists and
+nothing calls it.** `validate-and-ship`'s `60-close-out` is the natural home
+— a gate Work that ends while its run is parked (five times this sprint,
+each correctly) leaves that run open by construction.
+
+**Disposing of it surfaced a second defect.** The parked run was *masking*
+the real one: `axi status` reports the most recent run without regard to
+whether it belongs to the current branch. With the stale run cancelled,
+status reports run `01M02VDEQ2F1HQJYXJGJQR4YT1` — **`outcome: passed`**, all
+nine steps, `review`/`test`/`document`/`lint` all `completed` with real
+durations. Anyone checking gate state between those two events would have
+read "parked, awaiting approval" for a sprint that had already passed.
 
 ### 1.3 Branch residue is three classes, and the merge check earned its keep
 
