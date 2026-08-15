@@ -68,6 +68,18 @@ pub fn dirs_missing_from_path(
     let existing: Vec<PathBuf> = path
         .map(|p| std::env::split_paths(p).collect())
         .unwrap_or_default();
+    missing_from_existing(dirs, &existing, exists)
+}
+
+/// The part of [`dirs_missing_from_path`] that does not need to know how
+/// `existing` was derived — shared with [`compose_path`], which already has
+/// `existing` in hand and would otherwise make [`dirs_missing_from_path`]
+/// re-split the same `path` a second time.
+fn missing_from_existing(
+    dirs: &[PathBuf],
+    existing: &[PathBuf],
+    exists: impl Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     let mut missing: Vec<PathBuf> = Vec::new();
     for dir in dirs {
         if exists(dir) && !existing.contains(dir) && !missing.contains(dir) {
@@ -87,7 +99,7 @@ pub fn compose_path(
     let existing: Vec<PathBuf> = path
         .map(|p| std::env::split_paths(p).collect())
         .unwrap_or_default();
-    let mut prefix = dirs_missing_from_path(path, dirs, exists);
+    let mut prefix = missing_from_existing(dirs, &existing, exists);
     prefix.extend(existing);
     std::env::join_paths(prefix).unwrap_or_else(|_| path.cloned().unwrap_or_default())
 }
