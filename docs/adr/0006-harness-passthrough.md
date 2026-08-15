@@ -1,6 +1,8 @@
 # ADR 0006: The harness passthrough
 
-**Status:** Accepted, 2026-08-14.
+**Status:** Accepted, 2026-08-14. Implemented, 2026-08-15 (`src/harness.rs`,
+`sgt claude`/`codex`/`opencode`/`goose` in `src/cli.rs`, the `environment`
+row in `sgt doctor`).
 
 ## Context
 
@@ -95,14 +97,62 @@ something a workflow drives, they add a new category of command alongside
 `sgt init` and `sgt doctor` — commands whose audience is a person sitting
 at a terminal, not an actor executing a Work.
 
+## Implementation, 2026-08-15
+
+§8.1 left "the environment" undecided rather than unresolved-by-omission —
+the Work that closed #100/#60 had to choose a list, not invent a mechanism
+to defer the choice again. Recorded here as the choice actually shipped,
+not as a retroactive ruling: it is reviewable and reversible the way any
+other implementation decision is, unlike the D2/D3 owner rulings above it.
+
+**What `sgt <harness>` composes (`src/harness.rs`):**
+
+- **PATH enrichment**, prepending `~/.cargo/bin` and `~/.local/bin` when
+  each exists on disk. Both are measured, not guessed
+  (`docs/environments/cerberus.md`): `~/.cargo/bin` houses cargo/rustc and
+  is the literal #60 failure; `~/.local/bin` is where the `claude` CLI
+  itself and `no-mistakes` are installed on that host, so a harness a user
+  cannot even find on PATH is a sharper version of the same problem than a
+  missing build tool.
+- **`SGT_DATA_DIR` bound explicitly**, set to whatever `cli::resolve_data_dir`
+  already resolved for the invocation (flag, env, estate walk, or the
+  pre-estate platform fallback, in that order) — reusing the existing ladder
+  rather than re-deriving estate discovery, so the harness, the daemon it
+  spawns, and every actor beneath it agree on one data dir.
+
+**The argument for this list:** it is the smallest change that closes the
+measured failure without sergeant taking on a host it does not own. It
+states two concrete, named directories and stops, rather than sourcing
+`.bashrc`/`.profile` (which would make sergeant responsible for parsing and
+running arbitrary shell config) or attempting to enumerate every possible
+toolchain manager (`nvm`, `sdkman`, Homebrew's `/opt/homebrew/bin`, ...).
+
+**The strongest argument against it:** it is measured on exactly one host
+(Cerberus). A colleague whose toolchain lives somewhere this list does not
+name (a non-standard `CARGO_HOME`, an `asdf`-managed toolchain, Homebrew on
+macOS) gets no PATH enrichment at all and is back to #60's failure shape —
+under-specified for their host even though it is not under-specified for
+the one host this was measured against. Widening the list is cheap later
+(`toolchain_path_dirs` in `src/harness.rs` is the one place both `sgt
+<harness>` and `sgt doctor`'s environment check read it from, so a future
+Work extends one function, not two call sites that could drift); narrowing
+a list that guessed wrong would be more disruptive. This asymmetry is why
+the narrower list was chosen over a broader guess.
+
+`sgt doctor`'s environment check (issue #100) reads the exact same list via
+`harness::dirs_missing_from_path`, so the check and the thing it is
+checking cannot silently disagree about what "the environment" means.
+
 ## Open questions
 
-The design of `sgt doctor`'s environment check — what exactly it verifies
-against, and what remedy text it prints when the check fails — is not
-specified here; issue #100 tracks that it is owed, not what it looks like.
+The design of `sgt doctor`'s environment check — resolved above: it checks
+the same `toolchain_path_dirs` list the passthrough composes, `Warn`s (not
+`Fail`s) when one exists on disk but is missing from `PATH`, and names `sgt
+claude` (or the sibling verbs) as the remedy.
 
 The exact set of environment variables and estate-binding facts the
-passthrough must compose was not enumerated in the interview beyond the
-general contract ("a deliberately-composed environment"); this ADR records
-that the contract must exist and be stated by the product, not its
-contents.
+passthrough must compose — resolved above, as an implementation judgment
+call rather than an owner ruling. Whether the chosen list is the *right*
+one for hosts beyond Cerberus remains open in the sense any measured-not-
+assumed fact is open: it closes further only as it is measured elsewhere
+(ADR 0001's posture).
