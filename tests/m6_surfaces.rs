@@ -853,17 +853,31 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // have a reachable Docker Engine (N4.md's own probe-gating rule for
     // Docker facts on the GH runner / cloud container).
     let docker = stub_docker(bin.path());
+    // Same treatment for the `environment` check's own `$HOME`: a fixture
+    // dir with neither `.cargo/bin` nor `.local/bin` on disk, so it reads a
+    // deterministic "ok" regardless of what toolchain directories the
+    // test-running host's real $HOME happens to have missing from PATH.
+    let home = TempDir::new().expect("tempdir");
+    let home = home.path().display().to_string();
 
     // --- healthy -------------------------------------------------------------
     let (code, stdout, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
     let (code, healthy_json, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     assert_eq!(code, Some(0));
@@ -880,6 +894,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         vec![
             "git",
             "claude",
+            // ADR 0006's residual hole (#100): whether *this* process's own
+            // environment carries the toolchain PATH enrichment `sgt
+            // claude`/etc. compose, independent of the data dir below.
+            "environment",
             // #67: data_dir is checked before docker — the docker adapter's
             // blob store and disk_pressure's `df` call both live inside the
             // data dir, so this check runs first and both defer to it by
@@ -924,7 +942,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     seed_journal(used.path(), 5);
     let (code, stdout, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(
@@ -934,7 +956,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, used_json, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&used_json).expect("json");
@@ -959,13 +985,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     corrupt_journal(used.path());
     let (code, stdout, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(code, Some(0), "an unreplayable journal must exit nonzero");
     let (_, torn_json, _) = doctor(
         used.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&torn_json).expect("json");
@@ -994,7 +1028,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // order, statuses) — only details may move.
     let (_, first_again, _) = doctor(
         data.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let first_again: Value = serde_json::from_str(&first_again).expect("json");
@@ -1096,7 +1134,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
         let (code, stdout, _) = doctor(
             live_data.path(),
-            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            &[
+                ("SGT_CLAUDE_BIN", &claude),
+                ("SGT_DOCKER_BIN", &docker),
+                ("HOME", &home),
+            ],
             false,
         );
         assert_eq!(
@@ -1106,7 +1148,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         );
         let (_, live_json, _) = doctor(
             live_data.path(),
-            &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+            &[
+                ("SGT_CLAUDE_BIN", &claude),
+                ("SGT_DOCKER_BIN", &docker),
+                ("HOME", &home),
+            ],
             true,
         );
         let report: Value = serde_json::from_str(&live_json).expect("json");
@@ -1134,7 +1180,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     write_descriptor(stale.path(), dead_pid(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor(
         stale.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_eq!(
@@ -1144,7 +1194,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, stale_json, _) = doctor(
         stale.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&stale_json).expect("json");
@@ -1171,7 +1225,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     write_descriptor(occupied.path(), squatter.id(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor(
         occupied.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(
@@ -1181,7 +1239,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     let (_, wedged_json, _) = doctor(
         occupied.path(),
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&wedged_json).expect("json");
@@ -1211,13 +1273,21 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     std::fs::write(&blocked, b"this is a file").expect("write file");
     let (code, stdout, _) = doctor(
         &blocked,
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         false,
     );
     assert_ne!(code, Some(0), "an unusable data dir must exit nonzero");
     let (_, broken_json, _) = doctor(
         &blocked,
-        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home),
+        ],
         true,
     );
     let report: Value = serde_json::from_str(&broken_json).expect("json");
@@ -1552,6 +1622,83 @@ fn t3f_doctor_names_an_unwritable_parent_as_one_remedy_row() {
             .contains("could not be measured on this platform"),
         "disk_pressure must not claim the platform can't measure free space when the real \
          cause is the parent directory data_dir already named: {disk_pressure_check}"
+    );
+}
+
+/// ADR 0006's residual hole (#100): a toolchain directory that exists on
+/// disk but is missing from `PATH` is #60's exact failure shape — an actor
+/// that cannot find `cargo` and misreads it as a permissions fault. This
+/// arms it deterministically by pointing `HOME` at a fixture directory that
+/// has `.cargo/bin` on disk but never touching `PATH`, so the real test
+/// process's PATH (which does not contain this fresh tempdir) still cannot
+/// see it.
+///
+/// guard-map: a mutation that always reports `ok` regardless of PATH, or one
+/// that checks a different directory than
+/// `harness::toolchain_path_dirs` actually composes, survives every other
+/// doctor test but fails this one.
+#[test]
+fn t3g_doctor_environment_check_flags_a_toolchain_dir_missing_from_path() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let home = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(home.path().join(".cargo").join("bin")).expect("mkdir cargo bin");
+
+    let (_, json, _) = doctor(
+        data.path(),
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home.path().display().to_string()),
+        ],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "environment");
+    assert_eq!(check["status"], "warn", "{check}");
+    let cargo_bin = home.path().join(".cargo").join("bin").display().to_string();
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains(&cargo_bin),
+        "the missing directory must be named: {detail}"
+    );
+    let remedy = check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("sgt claude"),
+        "the remedy must name the passthrough that would have composed it: {remedy}"
+    );
+}
+
+/// The control for [`t3g_doctor_environment_check_flags_a_toolchain_dir_missing_from_path`]:
+/// when neither toolchain directory exists on disk at all, there is nothing
+/// to enrich and the check must read `ok`, not warn about a directory the
+/// host never had in the first place.
+#[test]
+fn t3h_doctor_environment_check_is_ok_when_no_toolchain_dirs_exist() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    // A fresh tempdir with nothing under it — no `.cargo/bin`, no `.local/bin`.
+    let home = TempDir::new().expect("tempdir");
+
+    let (_, json, _) = doctor(
+        data.path(),
+        &[
+            ("SGT_CLAUDE_BIN", &claude),
+            ("SGT_DOCKER_BIN", &docker),
+            ("HOME", &home.path().display().to_string()),
+        ],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "environment");
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["remedy"].is_null(),
+        "a green check has nothing to remedy: {check}"
     );
 }
 

@@ -12,7 +12,11 @@
 //! materialize the thing observed, so a cold estate gets a refusal naming
 //! `sgt doctor` as the remedy, not a daemon started just to have something
 //! to report. Bare `sgt` (no subcommand) is a third thing again: a static
-//! homepage that never touches the daemon at all (ADR 0010).
+//! homepage that never touches the daemon at all (ADR 0010). `sgt
+//! claude`/`codex`/`opencode`/`goose` are a fourth thing: they never reach
+//! the daemon either, because they never return to this process at all —
+//! they compose an environment and `exec` into the harness (ADR 0006, D2;
+//! see `crate::harness`).
 //!
 //! Stale-descriptor policy (contract): endpoint refuses *and* PID is dead →
 //! stale, replace it; PID alive but endpoint unresponsive → ambiguous, fail
@@ -218,6 +222,40 @@ enum Command {
     Group {
         #[command(subcommand)]
         command: GroupCommand,
+    },
+    /// Launch `claude` bound to this estate (ADR 0006, D2): compose an
+    /// environment, bind the estate, then **exec** — replacing this `sgt`
+    /// process with `claude`'s, never forking and supervising it. Everything
+    /// after `--` passes straight through: `sgt claude -- --model opus`
+    /// reaches `claude` as `--model opus`, unexamined. A human-facing
+    /// surface like `sgt init`/`sgt doctor`, not something a workflow drives.
+    Claude {
+        /// Arguments to pass through to `claude`, verbatim, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch `codex` bound to this estate — the same passthrough as `sgt
+    /// claude` (ADR 0006, D2), for a different harness. Not an adapter: sgt
+    /// gives this harness a home without measuring or driving it (ADR 0001,
+    /// #25's precedent still gates that).
+    Codex {
+        /// Arguments to pass through to `codex`, verbatim, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch `opencode` bound to this estate — the same passthrough as `sgt
+    /// claude` (ADR 0006, D2).
+    Opencode {
+        /// Arguments to pass through to `opencode`, verbatim, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch `goose` bound to this estate — the same passthrough as `sgt
+    /// claude` (ADR 0006, D2).
+    Goose {
+        /// Arguments to pass through to `goose`, verbatim, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -850,7 +888,23 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         }
         Command::Repo { command } => repo_command(sgt.json, &data_dir, command).await,
         Command::Group { command } => group_command(sgt.json, &data_dir, command).await,
+        Command::Claude { args } => exec_harness("claude", &args, &data_dir),
+        Command::Codex { args } => exec_harness("codex", &args, &data_dir),
+        Command::Opencode { args } => exec_harness("opencode", &args, &data_dir),
+        Command::Goose { args } => exec_harness("goose", &args, &data_dir),
     }
+}
+
+/// `sgt <harness>`'s dispatch (ADR 0006, D2): compose the environment, bind
+/// `data_dir` — already resolved by [`resolve_data_dir`]'s own ladder, so
+/// this binds to exactly what this invocation decided rather than
+/// re-deriving it — then exec. [`crate::harness::exec`] only ever returns on
+/// failure; a successful exec replaces this process and never returns here
+/// at all, which is the whole point of the boundary (module docs).
+fn exec_harness(binary: &str, args: &[String], data_dir: &Path) -> Result<(), CliError> {
+    let command = crate::harness::prepare(binary, args, data_dir);
+    let err = crate::harness::exec(command);
+    Err(CliError::new(format!("cannot exec `{binary}`: {err}")))
 }
 
 /// The estate root every `sgt repo`/`sgt group` verb edits: discovered from
@@ -1694,7 +1748,7 @@ mod doctor {
 
     /// Run every check against `data_dir`.
     pub async fn run(data_dir: &Path) -> Report {
-        let mut checks = vec![git_check(), claude_check(data_dir)];
+        let mut checks = vec![git_check(), claude_check(data_dir), environment_check()];
         // #67: the data dir's own existence and writability is checked
         // before anything that lives *inside* it — the docker adapter's
         // blob store and disk-pressure's `df` call both fail the instant
@@ -1960,6 +2014,61 @@ mod doctor {
                     "install the Claude CLI at >= {}.{}.{} (or point {CLAUDE_BIN_ENV} at one); \
                      until then only the `fake` backend can run work",
                     MIN_TRUSTED_VERSION.0, MIN_TRUSTED_VERSION.1, MIN_TRUSTED_VERSION.2
+                ),
+            )
+        }
+    }
+
+    /// ADR 0006's residual hole, named in the ADR and in proposal §5.2:
+    /// `sgt claude`/`codex`/`opencode`/`goose` only fix the environment for
+    /// sessions that go through the front door. `sgt run` from a terminal
+    /// that never did returns to #60. This is the complement the ADR names —
+    /// issue #100 — checking the *current* process's own environment against
+    /// the exact list [`crate::harness::toolchain_path_dirs`] composes, so
+    /// this check and the passthrough it is checking can never silently
+    /// disagree about what "the environment" means.
+    ///
+    /// Deliberately `Warn`, not `Fail`: a missing toolchain dir narrows what
+    /// an actor launched from here can build, the same posture `docker`'s
+    /// row above takes for a capability gap rather than a broken
+    /// installation (§17.5's degraded-daemon doctrine).
+    fn environment_check() -> Check {
+        let Some(home) = std::env::var_os("HOME") else {
+            return Check::warn(
+                "environment",
+                "$HOME is not set — cannot check toolchain PATH enrichment",
+                "set HOME, or run through `sgt claude` (or codex/opencode/goose), which composes \
+                 PATH before it needs HOME to be set at all",
+            );
+        };
+        let dirs = crate::harness::toolchain_path_dirs(Path::new(&home));
+        let missing = crate::harness::dirs_missing_from_path(
+            std::env::var_os("PATH").as_ref(),
+            &dirs,
+            |dir| dir.exists(),
+        );
+        if missing.is_empty() {
+            Check::ok(
+                "environment",
+                "PATH already includes the toolchain directories `sgt claude` (and codex/\
+                 opencode/goose) compose — or none of them exist on this host",
+            )
+        } else {
+            let names: Vec<String> = missing.iter().map(|d| d.display().to_string()).collect();
+            Check::warn(
+                "environment",
+                format!(
+                    "{} exist{} on disk but {} not on PATH — this is #60's failure shape: a \
+                     tool an actor needs (cargo, a CLI harness itself) can go missing and read \
+                     as a permissions fault instead",
+                    names.join(", "),
+                    if names.len() == 1 { "s" } else { "" },
+                    if names.len() == 1 { "is" } else { "are" },
+                ),
+                format!(
+                    "run this session through `sgt claude` (or codex/opencode/goose), which \
+                     composes PATH before exec'ing, or add {} to PATH yourself",
+                    names.join(", ")
                 ),
             )
         }

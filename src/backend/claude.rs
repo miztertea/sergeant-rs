@@ -186,6 +186,29 @@ an adequate timeout and wait for it to finish before ending your turn. Do \
 not background a long-running command and end your turn expecting a \
 notification to resume you; none will come.";
 
+/// ADR 0007(a)'s other half: the environment-guarantee statement, composed
+/// at the same seam as [`EXECUTION_MODEL_CONTRACT`] (`ClaudeAdapter::launch`)
+/// so both statements always reach a launched turn together — this text was
+/// deliberately deferred until ADR 0006's `sgt <harness>` passthrough
+/// existed to make it true; asserting it earlier would have been a promise
+/// nothing in the product kept.
+///
+/// This is the second reading #60's own history shows an actor never got: an
+/// actor that inherited a daemon's bare environment found no `cargo` and
+/// diagnosed a permissions fault, not a PATH gap. Stating the guarantee (and
+/// the escape hatch when it does not hold) gives the actor that second
+/// reading before it needs it, the same way the execution model gave one to
+/// the actor that lost work backgrounding a command.
+pub const ENVIRONMENT_CONTRACT: &str = "\
+Environment: if this session was reached through `sgt claude` (or `sgt codex`/`opencode`/\
+`goose`), your PATH was deliberately composed before this turn was launched to include your \
+toolchain (e.g. `~/.cargo/bin`, `~/.local/bin`), and you are bound to the estate that launch \
+discovered — sergeant's daemon and every actor beneath it inherit that same environment. This \
+does not hold for a daemon reached any other way: a terminal that never went through `sgt \
+<harness>` inherits whatever environment it happened to have. If a tool you expect is missing, \
+that is more likely an unenriched PATH than a permissions fault — run `sgt doctor` to check what \
+this installation's environment actually guarantees before assuming otherwise.";
+
 /// The actor's question from one `post_turn_summary` line, when it asked one.
 ///
 /// **Measured, 2.1.226** (`docs/gauntlet/notes/n3-claude-ask-measurement.md`),
@@ -1609,13 +1632,15 @@ impl Backend for ClaudeBackend {
                 },
             );
         }
-        // ADR 0007(a) precedes both: sergeant's own execution-model
-        // statement, not stage content, so it is never subject to §12's
-        // "verbatim, uninterpreted" rule the way intent and CONTEXT.md are.
-        // §12 itself: procedure is data — intent plus the stage's
-        // CONTEXT.md, verbatim, uninterpreted.
+        // ADR 0007(a) precedes both: sergeant's own execution-model and
+        // environment-guarantee statements, not stage content, so neither is
+        // ever subject to §12's "verbatim, uninterpreted" rule the way
+        // intent and CONTEXT.md are. §12 itself: procedure is data — intent
+        // plus the stage's CONTEXT.md, verbatim, uninterpreted. The two
+        // contracts are composed together, in this fixed order, so a test
+        // can pin that adding one never overwrites the other.
         let prompt = format!(
-            "{EXECUTION_MODEL_CONTRACT}\n\n{}\n\n{}",
+            "{EXECUTION_MODEL_CONTRACT}\n\n{ENVIRONMENT_CONTRACT}\n\n{}\n\n{}",
             request.intent, request.context
         );
         if let Err(e) = self.spawn_turn(&request.execution_id, prompt) {

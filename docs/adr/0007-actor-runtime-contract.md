@@ -1,6 +1,10 @@
 # ADR 0007: The product states the actor's execution model
 
-**Status:** Accepted, 2026-08-14.
+**Status:** Accepted, 2026-08-14. (a) fully implemented 2026-08-15 — the
+execution-model half shipped with this ADR; the environment-guarantee half
+was deferred until ADR 0006's passthrough existed to make it true, and
+lands together with ADR 0006's own implementation (`ENVIRONMENT_CONTRACT`
+in `src/backend/claude.rs`).
 
 ## Context
 
@@ -76,6 +80,20 @@ and `reported_state` in `src/api.rs`, which report `completed_dirty`
 instead of plain `completed` when a closing stage's branch never actually
 advanced, surfaced through `sgt work show`/`work list`/`watch` and the TUI.
 
+**2026-08-15:** (a)'s other statement — the environment guarantee named
+alongside the execution model in the Decision above — is now also
+implemented: `ENVIRONMENT_CONTRACT` in `src/backend/claude.rs`, composed at
+the same seam as `EXECUTION_MODEL_CONTRACT` (`ClaudeAdapter::launch`), in
+the same fixed order, on every headless turn's launch. This was
+deliberately not implemented alongside the execution-model half on
+2026-08-14: asserting an environment guarantee before ADR 0006's `sgt
+<harness>` passthrough existed to make it true would have been a false
+statement composed into every actor's context. It shipped together with
+ADR 0006's own implementation, once the guarantee it states became true on
+the common path. `tests/m4_backends.rs`'s
+`adr_0006_and_0007a_both_contracts_reach_the_first_turn_together` pins that
+both statements reach a launched turn together, not just either alone.
+
 Recording the orchestrator's own fault in the second #94 occurrence is
 itself a consequence worth stating plainly: this decision is not only
 "actors need better information," it is also "briefs that demand
@@ -89,7 +107,13 @@ The exact mechanism for (a) — what the context-composition step says,
 where an actor reads it, and whether it differs by backend or harness — is
 not specified in the interview beyond "whatever composes an actor's
 context states what wakes it." This ADR records the requirement, not its
-implementation.
+implementation. **Resolved for the `claude` backend, 2026-08-15:** both
+statements are plain text, composed at `ClaudeAdapter::launch` ahead of the
+intent and CONTEXT.md, identically regardless of which `sgt <harness>` verb
+(or none) launched the session — the guarantee's *truth* varies by launch
+path, but its *statement* does not. Whether a future non-`claude` backend
+needs its own composition seam, or can share this one, is unmeasured (no
+second backend exists yet to test it against).
 
 The exact detection logic for (b) — what distinguishes "worktree dirty
 because the actor is still working" from "worktree dirty because the
