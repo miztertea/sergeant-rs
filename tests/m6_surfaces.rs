@@ -903,6 +903,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // data dir, so this check runs first and both defer to it by
             // name when it fails rather than re-diagnosing the same fault.
             "data_dir",
+            // #85, ADR 0003 D6: whether this data dir's filesystem supports
+            // reliable advisory locking — independent of data_dir's own
+            // writability, so it sits beside rather than behind it.
+            "filesystem",
             "docker",
             "journal",
             "projection",

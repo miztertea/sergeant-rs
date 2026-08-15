@@ -1763,6 +1763,12 @@ mod doctor {
         // (and re-explaining) the same root cause.
         let (data_dir_check, data_dir_ok) = data_dir_check(data_dir);
         checks.push(data_dir_check);
+        // #85, ADR 0003 D6: whether this data dir's filesystem supports
+        // reliable advisory locking, independent of `data_dir_ok` — this
+        // answers a question about the mount underneath, not about
+        // writability, and (via `fs_locking::detect_for_path`'s own ancestor
+        // walk) works whether or not the data dir has been created yet.
+        checks.push(filesystem_check(data_dir));
         checks.push(docker_check(data_dir, data_dir_ok));
         // The journal is the only durable fact in the installation, so it is
         // checked before anything derived from it; a projection rebuild over
@@ -2313,6 +2319,58 @@ mod doctor {
         }
     }
 
+    /// #85, ADR 0003 D6: does this data dir's filesystem support reliable
+    /// advisory locking. The fail-closed asymmetry the ADR calls for: a
+    /// *confirmed* bad filesystem is `Fail` (this is not in
+    /// `healthy_for_init`'s `claude`/`docker` advisory exemption, so it
+    /// blocks `sgt init`'s exit code the same way `data_dir` above does); an
+    /// *inconclusive* probe — today, always true on macOS, #85's own open
+    /// question — is `Warn`, never `Fail`, because refusing on a probe this
+    /// crate cannot yet run would brick `sgt init` on exactly the platform
+    /// whose detection is unmeasured.
+    fn filesystem_check(data_dir: &Path) -> Check {
+        check_from_reliability(
+            data_dir,
+            crate::platform::fs_locking::detect_for_path(data_dir),
+        )
+    }
+
+    /// Split from [`filesystem_check`] so the three-way mapping from a
+    /// [`crate::platform::fs_locking::Reliability`] verdict to a `Check` is
+    /// testable without a real `drvfs`/NFS/SMB mount (`platform::fs_locking`'s
+    /// own tests cover the detection half).
+    fn check_from_reliability(
+        data_dir: &Path,
+        reliability: crate::platform::fs_locking::Reliability,
+    ) -> Check {
+        use crate::platform::fs_locking::Reliability;
+        match reliability {
+            Reliability::Reliable => Check::ok(
+                "filesystem",
+                format!("{} supports reliable advisory locking", data_dir.display()),
+            ),
+            Reliability::Unreliable { filesystem } => Check::fail(
+                "filesystem",
+                format!(
+                    "{} is on a {filesystem} filesystem, where advisory locking (flock) is \
+                     unreliable",
+                    data_dir.display()
+                ),
+                crate::platform::fs_locking::remedy(&filesystem),
+            ),
+            Reliability::Unknown { reason } => Check::warn(
+                "filesystem",
+                format!(
+                    "cannot determine whether {} supports reliable advisory locking: {reason}",
+                    data_dir.display()
+                ),
+                "this could not be measured on this platform; if the estate lives on a WSL2 \
+                 /mnt/c mount, an NFS share, or an SMB share, move it to a native filesystem as \
+                 a precaution",
+            ),
+        }
+    }
+
     /// Walk up from `path` to the nearest ancestor that already exists on
     /// disk — the directory `create_dir_all` actually stalled at, and the
     /// one worth naming as the fault (`data_dir_check`, #67).
@@ -2525,6 +2583,54 @@ mod doctor {
                  `sgt daemon` spawns a fresh daemon, which republishes it — observation verbs \
                  refuse instead rather than spawning one just to observe it (ADR 0009)",
             )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::platform::fs_locking::Reliability;
+
+        /// #85, ADR 0003 D6: a confirmed-bad filesystem is `Fail`, and the
+        /// remedy names the filesystem. Reverting the `Unreliable` match arm
+        /// to `Check::warn` (or `ok`) fails this immediately, and — because
+        /// `healthy_for_init` only exempts `claude`/`docker` — would also
+        /// silently stop this check from blocking `sgt init`'s exit code.
+        #[test]
+        fn a_confirmed_bad_filesystem_is_a_failing_check_naming_the_remedy() {
+            let check = check_from_reliability(
+                Path::new("/some/data/dir"),
+                Reliability::Unreliable {
+                    filesystem: "drvfs".to_string(),
+                },
+            );
+            assert_eq!(check.status, Status::Fail);
+            assert!(check.detail.contains("drvfs"));
+            let remedy = check.remedy.expect("a failing check must name its remedy");
+            assert!(remedy.contains("drvfs"));
+        }
+
+        /// The fail-closed asymmetry's other half: an inconclusive probe is
+        /// `Warn`, never `Fail` — a `Fail` here would gate `healthy_for_init`
+        /// and brick `sgt init` on exactly the platform (macOS, today) whose
+        /// detection is unmeasured.
+        #[test]
+        fn an_inconclusive_probe_is_a_warning_never_a_failure() {
+            let check = check_from_reliability(
+                Path::new("/some/data/dir"),
+                Reliability::Unknown {
+                    reason: "macOS detection is unmeasured".to_string(),
+                },
+            );
+            assert_eq!(check.status, Status::Warn);
+            assert!(check.detail.contains("macOS detection is unmeasured"));
+        }
+
+        #[test]
+        fn an_ordinary_filesystem_is_ok() {
+            let check = check_from_reliability(Path::new("/some/data/dir"), Reliability::Reliable);
+            assert_eq!(check.status, Status::Ok);
+            assert!(check.remedy.is_none());
         }
     }
 }
