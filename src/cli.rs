@@ -141,7 +141,11 @@ enum Command {
     /// R-MVP1-10's exit door for R-MVP1-7's envelope-exhausted `blocked`
     /// landing: raise a work's turn envelope, then `sgt retry` to actually
     /// re-enter the stage (extending alone has no effect on its own — it
-    /// only changes what the next retry is checked against).
+    /// only changes what the next retry is checked against). The same door
+    /// also reopens a `blocked` landing from a per-turn wall-clock ceiling
+    /// interrupt (#90) — `sgt retry` alone is usually enough there, since a
+    /// ceiling crossing rarely also exhausts the turn envelope; `extend` only
+    /// matters if it happens to have.
     Extend {
         /// Work id whose envelope is being raised.
         id: String,
