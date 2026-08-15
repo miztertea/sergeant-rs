@@ -43,8 +43,10 @@ for themselves.
 
 ## Axes
 
-Four blind seats, one axis each, fresh context, dispatched as separate
-subagents so blindness is structural rather than promised — same four axes
+Four blind seats, one axis each, fresh context, dispatched as separate `sgt`
+Work items (`--workflow research`, per `PATH-TO-MAC-1`'s own precedent — not
+Claude Code subagents) so blindness is structural rather than promised — same
+four axes
 `PATH-TO-MAC-1` adapted from the code-gauntlet's original set, for the same
 reason (`test-honesty` has no meaning for a plan; `simplicity` folds into
 `invariants` via the Ponytail ladder):
@@ -53,7 +55,7 @@ reason (`test-honesty` has no meaning for a plan; `simplicity` folds into
 |---|---|
 | **fidelity** | The plan against the sources it cites — do `docs/DEVELOPMENT.md`, ADR 0005, the estate-navigation skill, and issues #128/#129/#130 actually say what the plan says they say? |
 | **invariants** | The plan against `NORTH-STAR.md`'s ownership boundaries, `docs/DEVELOPMENT.md`'s architecture invariants, and `AGENTS.md`'s "When NOT to use `sgt`" boundary; Ponytail rung for anything the plan proposes building |
-| **enactability** | Can a Work execute each Wave-1/Wave-2 section as written, or does confident prose hide an undecided question — e.g. §6's "[to verify at Wave 0]" `default_backend` flag, or WC's open-ended acceptance criterion |
+| **enactability** | Can a Work execute each Wave-1/Wave-2 section as written, or does confident prose hide an undecided question — e.g. WC's open-ended acceptance criterion, or whether WD's brief can actually enforce R6 (no skipped `validate-and-ship` stages) given the workflow's own stage files are only partially read (plan §8 risk 5) |
 | **assumptions** | Every factual and measured claim, especially §4's "0 repositories declared" / "nothing has ever run in this data dir" claim and §5's file-disjointness claim across WA/WB/WC |
 
 ## Acceptance
