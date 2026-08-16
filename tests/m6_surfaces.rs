@@ -4097,6 +4097,39 @@ fn the_perf_clock_guard_fails_loudly_instead_of_a_malformed_timestamp() {
     );
 }
 
+// -------------------------------------------------- shipping-gate #120 pin
+
+/// #120: no-mistakes resolves its diff base by running `git ls-remote
+/// --symref origin HEAD` against this repo's `origin` remote (a live,
+/// non-bare working copy, not a fixed-default-branch host) and rebasing
+/// onto it; when a checkout was cut from that same tip, the resulting diff
+/// is genuinely empty and no-mistakes silently fast-paths to `outcome:
+/// passed` without running review/test/document/lint. The fix (this repo's
+/// own `docs/gauntlet/runs/t-series-build-2026-08-16/plan.md` names it
+/// explicitly) is a pre-flight guard in `scripts/gate.sh` that replicates
+/// that same base detection and refuses loudly instead. Same pattern as the
+/// coverage harness and perf clock guard self-tests above: a shell script
+/// outside the gate is a script whose checks are claims, and this suite
+/// already owns `scripts/`.
+#[test]
+fn the_shipping_gate_refuses_rather_than_silently_fast_pathing_on_120s_empty_diff() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/gate-guard-selftest.sh");
+    assert!(script.exists(), "scripts/gate-guard-selftest.sh must exist");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/gate-guard-selftest.sh");
+    assert!(
+        output.status.success(),
+        "the shipping gate's #120 empty-diff guard selftest must pass\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ------------------------------------------------------- spawned-daemon rig
 
 /// How the rig's own daemon ended, and what the kernel said about it.
