@@ -3,13 +3,18 @@
 //!
 //! The *mechanism* — how one opens, closes, and restores focus — is T1a's
 //! job; T1c fills in the four real confirmations respond/retry/extend/
-//! cancel need (§13.10/§15.5). What is left for later Works: the workflow
-//! chooser (T2's catalog), repo/group add-remove and the retained-state
-//! preview (T3's Estate routes), and the slash palette (§15.3, explicitly
-//! out of T1c's scope). Opening an overlay never mutates the destination
-//! state underneath it — [`super::app::App::on_key`] simply routes every
-//! keystroke to the overlay instead of the destination while one is open —
-//! so closing it "restores focus" for free: nothing under it ever moved.
+//! cancel need (§13.10/§15.5). T2 and T3 fill in the workflow chooser and
+//! the repo/group/retained-state panels respectively. The T-series
+//! follow-up closes the three gaps T1c's own scope note had named and
+//! left open: the Workflows-screen half of the `@` chooser (§15.4, issue
+//! #153), the connection detail panel (§7.4/§8.1, issue #154), and the
+//! slash palette (§15.3's Decision T2-55, `Overlay::SlashPalette` —
+//! [`SlashCommand`]'s fixed vocabulary as a Rust enum and match, not a
+//! shell or plugin language, issue #152). Opening an overlay never mutates
+//! the destination state underneath it — [`super::app::App::on_key`]
+//! simply routes every keystroke to the overlay instead of the destination
+//! while one is open — so closing it "restores focus" for free: nothing
+//! under it ever moved.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -57,32 +62,103 @@ impl Overlay {
             Overlay::ConnectionDetail => "Connection",
         }
     }
+}
 
-    /// The later Work that actually implements this overlay's content —
-    /// `None` for the ones already built: [`Overlay::Help`] (T1a), T1c's
-    /// four real confirmations (§13.10/§15.5), T2's live-catalog
-    /// [`Overlay::WorkflowChooser`] (§11.4, §15.4), T3's three Estate
-    /// panels (§12.1/§12.2/§12.4), and [`Overlay::ConnectionDetail`]
-    /// (§7.4/§8.1, issue #154 — a follow-up Work, since T1c's own scope note
-    /// only named the slash palette and the Workflows `@` chooser half as
-    /// deferred).
-    fn owner(self) -> Option<&'static str> {
+/// §15.3's fixed vocabulary (Decision T2-55): a Rust enum and match, not a
+/// shell or plugin language. [`SlashCommand::ALL`] is the palette's whole
+/// content, in the order the proposal lists it — explicitly *not*
+/// `/interrupt`, `/files`, `/web`, `/watch`, `/daemon`, `/init`, `/claude`,
+/// `/codex`, `/opencode`, or `/goose`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommand {
+    Home,
+    Fleet,
+    Workflows,
+    Estate,
+    Back,
+    Refresh,
+    Answer,
+    Retry,
+    Extend,
+    Cancel,
+    Evidence,
+    Graph,
+    Details,
+    AnalyticsPanel,
+    Retained,
+    Reap,
+    Help,
+    Quit,
+}
+
+impl SlashCommand {
+    pub const ALL: [SlashCommand; 18] = [
+        SlashCommand::Home,
+        SlashCommand::Fleet,
+        SlashCommand::Workflows,
+        SlashCommand::Estate,
+        SlashCommand::Back,
+        SlashCommand::Refresh,
+        SlashCommand::Answer,
+        SlashCommand::Retry,
+        SlashCommand::Extend,
+        SlashCommand::Cancel,
+        SlashCommand::Evidence,
+        SlashCommand::Graph,
+        SlashCommand::Details,
+        SlashCommand::AnalyticsPanel,
+        SlashCommand::Retained,
+        SlashCommand::Reap,
+        SlashCommand::Help,
+        SlashCommand::Quit,
+    ];
+
+    /// The literal `/word` §15.3 lists for this command.
+    pub fn word(self) -> &'static str {
         match self {
-            Overlay::Help
-            | Overlay::CancelConfirmation
-            | Overlay::RetryConfirmation
-            | Overlay::ExtendEnvelope
-            | Overlay::ReapConfirmation
-            | Overlay::WorkflowChooser
-            | Overlay::RepoAddRemove
-            | Overlay::GroupEditRemove
-            | Overlay::RetainedPreview
-            | Overlay::ConnectionDetail => None,
-            // §15.3 is explicitly out of T1c's scope (deferred alongside
-            // §15.4's Workflows half, since closed by issue #153, and
-            // §15.6) — not this Work, and not yet reassigned to a later one
-            // by name.
-            Overlay::SlashPalette => Some("a later Work (§15.3)"),
+            SlashCommand::Home => "/home",
+            SlashCommand::Fleet => "/fleet",
+            SlashCommand::Workflows => "/workflows",
+            SlashCommand::Estate => "/estate",
+            SlashCommand::Back => "/back",
+            SlashCommand::Refresh => "/refresh",
+            SlashCommand::Answer => "/answer",
+            SlashCommand::Retry => "/retry",
+            SlashCommand::Extend => "/extend",
+            SlashCommand::Cancel => "/cancel",
+            SlashCommand::Evidence => "/evidence",
+            SlashCommand::Graph => "/graph",
+            SlashCommand::Details => "/details",
+            SlashCommand::AnalyticsPanel => "/analytics",
+            SlashCommand::Retained => "/retained",
+            SlashCommand::Reap => "/reap",
+            SlashCommand::Help => "/help",
+            SlashCommand::Quit => "/quit",
+        }
+    }
+
+    /// One line of what selecting this command does — the palette is
+    /// self-documenting rather than requiring a second lookup in `?` help.
+    fn description(self) -> &'static str {
+        match self {
+            SlashCommand::Home => "go to Home",
+            SlashCommand::Fleet => "go to Fleet",
+            SlashCommand::Workflows => "go to Workflows",
+            SlashCommand::Estate => "go to Estate",
+            SlashCommand::Back => "leave the open Work",
+            SlashCommand::Refresh => "re-read the API now",
+            SlashCommand::Answer => "focus ANSWER (where respond is offered)",
+            SlashCommand::Retry => "open the retry confirmation (where offered)",
+            SlashCommand::Extend => "open the extend confirmation (where offered)",
+            SlashCommand::Cancel => "open the cancel confirmation (where offered)",
+            SlashCommand::Evidence => "open Work: Evidence tab",
+            SlashCommand::Graph => "open Work: Graph tab",
+            SlashCommand::Details => "open Work: Details tab",
+            SlashCommand::AnalyticsPanel => "not built in this Work yet",
+            SlashCommand::Retained => "estate-wide retained-state preview",
+            SlashCommand::Reap => "open the reap confirmation (where offered)",
+            SlashCommand::Help => "this help",
+            SlashCommand::Quit => "leave the TUI",
         }
     }
 }
@@ -94,6 +170,7 @@ Navigation
   1-4         Home / Fleet / Workflows / Estate
   Tab / S-Tab cycle destinations
   ~           toggle the Attention drawer
+  /           slash command palette (INTENT/ANSWER, first non-whitespace)
   ?           this help
   c           connection detail (live/reconnecting/auth failed)
   q / Esc     back, or quit from a top-level destination
@@ -154,11 +231,7 @@ pub fn render(frame: &mut Frame, area: Rect, overlay: Overlay, app: &App) {
         Overlay::RetainedPreview => retained_body(&app.estate),
         Overlay::WorkflowChooser => workflow_chooser_body(app),
         Overlay::ConnectionDetail => connection_detail_body(app),
-        _ => format!(
-            "{} is not built in this Work.\n\n{} implements it.\n\nEsc closes this panel.",
-            overlay.title(),
-            overlay.owner().unwrap_or("a later Work"),
-        ),
+        Overlay::SlashPalette => slash_palette_body(app),
     };
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
 }
@@ -265,7 +338,12 @@ fn extend_body(app: &App) -> String {
 /// reaped, even though [`super::app::App::execute`]'s own `Action::Reap`
 /// correctly acts on `retained_reap_id` either way.
 fn reap_identity(app: &App) -> (String, String) {
-    if app.open_work.is_some() {
+    // `retained_reap_id` is the explicit selection made inside §12.4's
+    // Retained preview, so it takes precedence over an open Work — the
+    // two can now both be set at once since §15.3's `/retained` reaches
+    // that preview without first leaving an open Work (see the matching
+    // precedence in `App::on_key_overlay`'s `ReapConfirmation` arm).
+    if app.retained_reap_id.is_none() && app.open_work.is_some() {
         return work_identity(app);
     }
     let id = app
@@ -373,6 +451,26 @@ fn connection_detail_body(app: &App) -> String {
     body
 }
 
+/// §15.3's fixed vocabulary, one line per [`SlashCommand`] in
+/// [`SlashCommand::ALL`]'s order, with the highlighted entry marked exactly
+/// like [`workflow_chooser_body`] above.
+fn slash_palette_body(app: &App) -> String {
+    let mut lines = vec!["j/k move · Enter selects · Esc/q aborts\n".to_string()];
+    for (i, command) in SlashCommand::ALL.into_iter().enumerate() {
+        let marker = if i == app.slash_palette_index {
+            "▶ "
+        } else {
+            "  "
+        };
+        lines.push(format!(
+            "{marker}{:<12}{}",
+            command.word(),
+            command.description()
+        ));
+    }
+    lines.join("\n")
+}
+
 /// A `percent_x` × `percent_y` box, centered in `area`.
 fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let [area] = Layout::vertical([Constraint::Percentage(percent_y)])
@@ -389,27 +487,64 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// §15.3's exact vocabulary (Decision T2-55) — no more, no fewer, and
+    /// never one of the names §15.3 explicitly excludes.
     #[test]
-    fn help_t1c_t2_t3_and_connection_detail_panels_are_built_here() {
-        for built in [
-            Overlay::Help,
-            Overlay::CancelConfirmation,
-            Overlay::RetryConfirmation,
-            Overlay::ExtendEnvelope,
-            Overlay::ReapConfirmation,
-            Overlay::WorkflowChooser,
-            Overlay::RepoAddRemove,
-            Overlay::GroupEditRemove,
-            Overlay::RetainedPreview,
-            Overlay::ConnectionDetail,
+    fn the_slash_vocabulary_is_exactly_15_3s_fixed_list() {
+        let words: Vec<&str> = SlashCommand::ALL.iter().map(|c| c.word()).collect();
+        assert_eq!(
+            words,
+            vec![
+                "/home",
+                "/fleet",
+                "/workflows",
+                "/estate",
+                "/back",
+                "/refresh",
+                "/answer",
+                "/retry",
+                "/extend",
+                "/cancel",
+                "/evidence",
+                "/graph",
+                "/details",
+                "/analytics",
+                "/retained",
+                "/reap",
+                "/help",
+                "/quit",
+            ]
+        );
+        for excluded in [
+            "/interrupt",
+            "/files",
+            "/web",
+            "/watch",
+            "/daemon",
+            "/init",
+            "/claude",
+            "/codex",
+            "/opencode",
+            "/goose",
         ] {
             assert!(
-                built.owner().is_none(),
-                "{built:?} must be built in this Work"
+                !words.contains(&excluded),
+                "{excluded} is explicitly excluded by §15.3"
             );
         }
-        let later = Overlay::SlashPalette;
-        assert!(later.owner().is_some(), "{later:?} must name who builds it");
+    }
+
+    /// The palette lists every command with the highlighted entry marked,
+    /// same shape as [`workflow_chooser_lists_the_live_catalog_with_the_highlighted_entry_marked`].
+    #[test]
+    fn slash_palette_lists_every_command_with_the_highlighted_entry_marked() {
+        let mut app = App::new();
+        app.slash_palette_index = 3;
+        let body = slash_palette_body(&app);
+        for command in SlashCommand::ALL {
+            assert!(body.contains(command.word()), "{body}");
+        }
+        assert!(body.contains("▶ /estate"), "{body}");
     }
 
     /// §15.4/§11.4: the chooser lists the live catalog by name, with the

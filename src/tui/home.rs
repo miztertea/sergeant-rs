@@ -75,6 +75,10 @@ pub enum HomeOutcome {
     /// field, this opens the live-catalog chooser (`Overlay::WorkflowChooser`,
     /// App-level state) instead of typing a literal `@`.
     OpenWorkflowChooser,
+    /// §15.3: `/` at the first non-whitespace position of the `INTENT`
+    /// composer opens `Overlay::SlashPalette` (App-level state) instead of
+    /// being typed literally.
+    OpenSlashPalette,
 }
 
 /// §9.1's New Work fields. §15.1's `INTENT` context: the intent field is
@@ -157,6 +161,7 @@ impl NewWorkForm {
             // exactly as reaching `[ Run Work ]` by Tab and Enter would.
             return match self.intent.on_key(key) {
                 ComposerOutcome::Submit(_) | ComposerOutcome::Refused => self.try_submit(),
+                ComposerOutcome::OpenSlashPalette => HomeOutcome::OpenSlashPalette,
                 ComposerOutcome::None => HomeOutcome::None,
             };
         }
@@ -606,6 +611,29 @@ mod tests {
             HomeOutcome::OpenWorkflowChooser
         );
         assert_eq!(form.workflow, "", "no literal '@' was typed into the field");
+    }
+
+    /// §15.3: `/` at the start of the still-empty `INTENT` composer asks
+    /// `App` to open the slash palette rather than being typed literally.
+    #[test]
+    fn slash_on_the_intent_field_asks_to_open_the_slash_palette() {
+        let mut form = NewWorkForm::default();
+        assert_eq!(
+            form.on_key(KeyCode::Char('/')),
+            HomeOutcome::OpenSlashPalette
+        );
+        assert_eq!(form.intent.text(), "", "no literal '/' was typed");
+    }
+
+    /// `/` typed into the intent field after other content is still
+    /// ordinary text — only the first non-whitespace position triggers it.
+    #[test]
+    fn slash_after_other_intent_text_is_ordinary_text() {
+        let mut form = NewWorkForm::default();
+        for c in "fix /path".chars() {
+            form.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(form.intent.text(), "fix /path");
     }
 
     /// `@` typed into any other field is still ordinary text — only the
