@@ -3586,12 +3586,14 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     assert!(
         rate >= THROUGHPUT_FLOOR,
         "submission throughput fell to {rate:.1} works/s at burst {BURST}, below the \
-         {THROUGHPUT_FLOOR} works/s floor — A-N3-1's amended budget of {BUDGET} works/s \
-         at burst 50 (docs/perf/n3-two-phase-boundary-2026-08-10.md) divided by a \
-         {CONTENTION_ALLOWANCE}× allowance for a shared test host. This is the whole \
-         submit path — workspace discovery, workflow bind, `git worktree add`, \
-         reservation, launch — so any external effect of ~80 ms or more put back under \
-         the core lock lands below it, whatever the host speed."
+         {THROUGHPUT_FLOOR} works/s floor. Derivation: A-N3-1's amended budget of \
+         {BUDGET} works/s at burst 50 (docs/perf/n3-two-phase-boundary-2026-08-10.md) \
+         divided by a {CONTENTION_ALLOWANCE}× allowance for a shared test host gives \
+         12.0 on Linux; revised to {THROUGHPUT_FLOOR} on M3 Pro / macOS due to \
+         git-spawn overhead (#128). This is the whole submit path — workspace discovery, \
+         workflow bind, `git worktree add`, reservation, launch — so any external effect \
+         of ~80 ms or more put back under the core lock lands below it, whatever the host \
+         speed."
     );
 }
 
