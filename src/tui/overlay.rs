@@ -245,22 +245,59 @@ fn extend_body(app: &App) -> String {
     body
 }
 
+/// The Work identity a reap confirmation names: an open Work surface's own
+/// (§13.10), or — when reached from Estate's Retained preview instead
+/// (§12.4, [`super::app::App::retained_reap_id`]) — the retained entry's own
+/// id and repository, since there is no open Work surface to read from in
+/// that path.
+///
+/// **Regression this Work's geometry matrix caught**: this used to call
+/// [`work_identity`] unconditionally, which reads only `app.open_work`/
+/// `app.work_screen` — both `None` on the Retained-preview path — so the
+/// confirmation silently named "-  -" instead of the Work actually being
+/// reaped, even though [`super::app::App::execute`]'s own `Action::Reap`
+/// correctly acts on `retained_reap_id` either way.
+fn reap_identity(app: &App) -> (String, String) {
+    if app.open_work.is_some() {
+        return work_identity(app);
+    }
+    let id = app
+        .retained_reap_id
+        .clone()
+        .unwrap_or_else(|| "-".to_string());
+    let repository = app
+        .estate
+        .retained
+        .iter()
+        .find(|entry| entry["work_id"].as_str() == app.retained_reap_id.as_deref())
+        .and_then(|entry| entry["repository"].as_str())
+        .unwrap_or("-")
+        .to_string();
+    (id, repository)
+}
+
 /// §15.5: "Reap: preview exact paths/bytes and state that retained branch
 /// remains." The current Work read does not surface paths/bytes (only
 /// `/v1/retained`, an estate-wide read T3's Estate surface owns, §20.4) —
 /// per this Work's own scope note, a minimal confirmation stating the
 /// branch is retained is what ships here rather than blocking on that data.
+///
+/// The accept/abort line comes right after the identity, ahead of the
+/// longer explanatory paragraph: this Work's geometry matrix found the
+/// original order pushed "Enter confirms · Esc/q aborts" off the bottom of
+/// an 80x24 frame — §18.4's own rule ("nonessential summaries disappear
+/// before primary state/question/actions") applies to this panel too.
 fn reap_body(app: &App) -> String {
-    let (id, intent) = work_identity(app);
+    let (id, description) = reap_identity(app);
     let mut body = format!(
-        "Reap this Work's retained state?\n\n  {intent}\n  {id}\n\n\
+        "Reap this Work's retained state?\n\n  {description}\n  {id}\n\n\
          Reap disposes local retained artifacts (worktrees/branches this daemon \
          still holds for review). The retained branch itself is not deleted — \
          only local disposal happens here.\n\n\
+         Enter confirms · Esc/q aborts, nothing is sent.\n\n\
          Exact paths and bytes are not previewed here: that detail comes from \
          the estate-wide `/v1/retained` read, outside this Work's four Work-\
-         scoped reads (T3's Estate surface, §20.4).\n\n\
-         Enter confirms · Esc/q aborts, nothing is sent."
+         scoped reads (T3's Estate surface, §20.4)."
     );
     if let Some(error) = &app.pending_action.last_error {
         body.push_str(&format!("\n\nlast attempt failed: {error}"));

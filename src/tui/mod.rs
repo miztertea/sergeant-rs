@@ -55,6 +55,15 @@ mod theme;
 mod work_view;
 mod workflows;
 
+/// T4's geometry matrix, Taste pre-flight, and real-screenshot generator
+/// (§19.10/§19.11/§20.5) — internal rather than `tests/*.rs` because most of
+/// its fixtures need an open [`work_view::WorkScreen`], reachable only
+/// through `work_view::WorkScreen::from_parts` (`pub(crate)`), not from an
+/// external test crate.
+#[cfg(test)]
+#[path = "geometry_matrix_tests.rs"]
+mod geometry_matrix_tests;
+
 pub use app::{Action, App, Destination, OpenWork};
 pub use fleet::WorkRow;
 
