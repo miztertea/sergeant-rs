@@ -34,9 +34,24 @@ Either an existing tracked task supplies brief/branch/context, or a free-form br
   (trigger: an operator or an automated caller (dagr hook) needs a piece of work executed by an agent in one or more repos; outcome: a durable, observable Work exists per targeted repo, each with its own isolated code snapshot and a running worker)
   — `BU-P6-123`, `reference/sergeant-upstream/bin/sgt-dispatch` (L1-5)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Deriving the plan (repos, dependency order, branch, backend) from a td task or a free-form brief (`BU-P5-057`, `BU-P5-059`, `BU-P5-060`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- The stated plan is not confirmed as accurate before proceeding — `BU-P5-058` requires explicit confirmation, not an inferred go-ahead.
+
+### Completion boundary
+This stage may complete only when either an existing tracked task supplies brief/branch/context, or a free-form brief plus explicit repo list is confirmed accurate.
+
+### Decision evidence
+The confirmed plan is this stage's own durable output.
 
 ## Output
 

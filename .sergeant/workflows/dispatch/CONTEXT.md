@@ -26,10 +26,32 @@ Work spans repositories, contains two or more independent repository-owned tasks
 | `80-monitor` | actor-stage (§6.4, judgment) | Fleet reconciliation, tracked-work creation, surface acquisition, brief rendering, and launch-and-record all run first (folded helpers, in that order); escalations are then read in full, human decisions obtained without inference, delivered to the exact task/repo pair. |
 | `90-reconcile-fleet` | actor-stage (§6.4, judgment) | Per-repo verification of pinned scope, validation, review artifacts, zero blocking findings, CI, threads, and dependency merge order — never complete merely because PRs exist. |
 
+## Authority envelope
+
+This workflow receives an already-admitted Work intent (a project, a brief or tracked task, and a repository set).
+
+### Workflow may decide
+- Whether an existing td task or a free-form brief supplies the plan (`00-check-queue-and-plan`).
+- Which itemized gates a repo has met at reconciliation time (`90-reconcile-fleet`).
+
+### Workflow may not decide
+- Routing a safety-sensitive objective onto the standard-isolated path — the keyword set is fixed (`05-classify-risk`).
+- Widening the admission lock's hold window beyond the first durable side effect (`15-check-admission`).
+- Resolving a worker's escalation without an explicit, uninferred human decision (`80-monitor`).
+
+### Human or Captain gates
+- Confirming the stated dispatch plan before anything is created.
+- Every worker escalation.
+
+### Decision record
+Material decisions are recorded per-stage in each stage's own output artifact.
+
 ## Relationships to other workflows
 
-- `15-check-admission` delegates to **drain-fleet**.
-- `80-monitor` delegates to **respond-to-worker**.
+**Corrected 2026-08-16, ICM-R3 (BU-DISP-15):** neither of the two packages named below exists in this repository — both are open, unbuilt engine gaps, not live delegations.
+
+- `15-check-admission` holds and releases the fleet-wide admission lock itself, across exactly one durable side effect — it does not delegate to a `drain-fleet` workflow (unbuilt, engine-gap G4).
+- `80-monitor` delivers escalation responses via the shipped `sgt respond` command / `POST /v1/work/{id}/input` — it does not delegate to a `respond-to-worker` workflow (unbuilt).
 
 ## Adjudication notes (A3, A4)
 
@@ -67,4 +89,4 @@ Reviewers originally flagged this as the corpus's largest single cluster (63 uni
 
 ## Provenance
 
-See `provenance.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.
+See `docs/gauntlet/promoted-provenance/dispatch.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 correction: the prior text pointed at a workflow-local `provenance.md` that does not exist under `.sergeant/workflows/dispatch/`.)

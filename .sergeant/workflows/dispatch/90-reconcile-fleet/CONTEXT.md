@@ -28,9 +28,27 @@ Per-repo verification of pinned scope, validation, review artifacts, zero blocki
   (trigger: workers dispatched; outcome: cross-repository delivery is reconciled)
   — `BU-P1-006`, `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L20, dispatch-mode step 3)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Verifying the itemized gate list per repository and reconciling dependency merge order (`BU-P5-070`, `BU-P1-006`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J5 — governing constraint
+- **A fleet is never reconciled merely because every worker opened a PR; all completion gates must be met** (`BU-P5-071`).
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when every itemized gate (pinned scope, validation, review artifacts, zero blocking findings, CI, resolved threads, dependency merge order) is verified per repository.
+
+### Decision evidence
+The per-repo gate verification is this stage's own durable output.
 
 ## Output
 
