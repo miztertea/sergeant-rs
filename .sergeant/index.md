@@ -30,13 +30,11 @@ history.
 | `diagnose-bug` | published | [`workflows/diagnose-bug/index.md`](workflows/diagnose-bug/index.md) |
 | `dispatch` | published | [`workflows/dispatch/index.md`](workflows/dispatch/index.md) |
 | `implement` | published | [`workflows/implement/index.md`](workflows/implement/index.md) |
-| `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
 | `prototype` | published | [`workflows/prototype/index.md`](workflows/prototype/index.md) |
 | `recover-stalled-worker` | published | [`workflows/recover-stalled-worker/index.md`](workflows/recover-stalled-worker/index.md) |
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
 | `resolving-merge-conflicts` | published | [`workflows/resolving-merge-conflicts/index.md`](workflows/resolving-merge-conflicts/index.md) |
-| `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
 | `to-tickets` | published | [`workflows/to-tickets/index.md`](workflows/to-tickets/index.md) |
 | `triage` | published | [`workflows/triage/index.md`](workflows/triage/index.md) |
 | `validate-and-ship` | published | [`workflows/validate-and-ship/index.md`](workflows/validate-and-ship/index.md) |
@@ -49,4 +47,6 @@ never admitted procedure, never listed here (`docs/icm/convention.md` §2).
 
 Operator skills (never dispatched as Work; loaded directly by the harness)
 live at `skills/<name>/SKILL.md`: `sergeant-help`, `grilling`,
-`grill-with-docs`, `estate-navigation`.
+`grill-with-docs`, `estate-navigation`, `to-spec` (added at ICM-R3, REHOME
+from the retired `to-spec` workflow — its defining behavior synthesizes
+from the current conversation, which a dispatched Work cannot receive).

@@ -1,10 +1,10 @@
-# 30-recommend: recommend
+# 20-recommend: recommend
 
 ## Inputs
 
 | File | Layer | Why |
 |---|---|---|
-| ../20-verify/output/README.md | L4 | upstream artifact produced by `20-verify` |
+| ../10-gather-context/output/README.md | L4 | upstream artifact produced by `10-gather-context` |
 
 ## Purpose
 
@@ -22,9 +22,24 @@ A category/state proposal is made, then the run waits for direction.
   (trigger: context has been gathered; outcome: the maintainer has a recommendation to react to before any state-changing action occurs)
   — `BU-P3-066`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 72)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Proposing a category/state recommendation with reasoning and a relevant codebase summary (`BU-P3-066`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- **No state-changing action proceeds before explicit maintainer direction.** This stage always ends by waiting for direction — the recommendation is a proposal, never a decision the stage makes for itself.
+
+### Completion boundary
+This stage may complete only when a recommendation with reasoning has been proposed and the run is waiting for maintainer direction.
+
+### Decision evidence
+The proposed recommendation is this stage's own durable output.
 
 ## Output
 

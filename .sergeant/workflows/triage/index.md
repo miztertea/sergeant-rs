@@ -2,7 +2,7 @@
 kind: workflow
 name: triage
 status: published
-version: 2
+version: 3
 description: >-
   Work through the attention queue: gather context, verify claims, recommend a disposition, and apply the terminal outcome with its required artifact.
 tags:

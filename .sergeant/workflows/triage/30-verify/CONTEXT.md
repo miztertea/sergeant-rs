@@ -1,10 +1,10 @@
-# 20-verify: verify
+# 30-verify: verify
 
 ## Inputs
 
 | File | Layer | Why |
 |---|---|---|
-| ../10-gather-context/output/README.md | L4 | upstream artifact produced by `10-gather-context` |
+| ../20-recommend/output/README.md | L4 | upstream artifact produced by `20-recommend` |
 
 ## Purpose
 
@@ -22,9 +22,24 @@ The claim is reproduced or the PR diff is tested, reported as confirmed/failed/i
   (trigger: a recommendation has been given and direction received; outcome: the claim's validity is empirically established before further action)
   — `BU-P3-067`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 74)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Reproducing a bug or checking out and testing a PR's diff, and reporting confirmed/failed/insufficient-detail (`BU-P3-067`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when the claim has been empirically checked and reported as confirmed, failed, or insufficient-detail.
+
+### Decision evidence
+The confirmed/failed/insufficient-detail verdict is this stage's own durable output.
 
 ## Output
 

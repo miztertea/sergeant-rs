@@ -4,7 +4,7 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../30-recommend/output/README.md | L4 | upstream artifact produced by `30-recommend` |
+| ../30-verify/output/README.md | L4 | upstream artifact produced by `30-verify` |
 
 ## Purpose
 
@@ -27,9 +27,24 @@ Underspecified items are escalated to an interview.
   domain terminology folds into the same `grilling` session below rather
   than a second invocation.
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Judging whether the item is underspecified after verification, and running the `grilling` skill to sharpen it (`BU-P3-068`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None beyond what the `grilling` skill's own live interview already surfaces to the user.
+
+### Completion boundary
+This stage may complete only when the item is either already sufficiently specified (skip) or has been sharpened via a completed `grilling` session, with decisions captured inline.
+
+### Decision evidence
+The sharpened specification (or the skip decision, if already sufficient) is this stage's own durable output.
 
 ## Delegation
 

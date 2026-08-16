@@ -49,9 +49,32 @@ The terminal disposition is applied with its required artifact.
   (trigger: a maintainer reconsiders a previously rejected concept; outcome: old closed issues stay closed even though the KB record that justified closing them is gone)
   — `BU-P3-096`, `reference/sergeant-upstream/.agents/skills/triage/OUT-OF-SCOPE.md` (line 104)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J5 — fixed rules, no interpretation
+- Wontfix because already-implemented: closing comment cites the existing implementation, and the out-of-scope KB is never written to (`BU-P3-071`, `BU-P3-093`).
+- Wontfix because a rejected enhancement: an out-of-scope KB record is written and linked from the closing comment before the item is closed (`BU-P3-072`, `BU-P3-092`).
+- The KB is written to only for rejected enhancements, never bugs, regardless of whether the item is an issue or a PR (`BU-P3-092`).
+- Maintainer confirms a surfaced KB match applies: the new issue is appended to that file's prior-requests list and closed (`BU-P3-090`).
+- Maintainer reconsiders a previously rejected concept: the KB file is deleted or updated, the new issue proceeds through normal triage instead of auto-closing, and previously closed issues that cited the old rejection are left closed, not reopened (`BU-P3-091`, `BU-P3-096`).
+
+### J2 — delegated to this stage
+- Drafting the structured agent brief (ready-for-agent), the templated triage notes (needs-info), and the closing comment's specific wording (`BU-P3-069`, `BU-P3-070`).
+- Folding anything resolved during grilling into the needs-info template's "established so far" section, and keeping outstanding questions specific and actionable (`BU-P3-074`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers — the KB write/no-write and reconsideration rules above are J5, not judgment calls.
+
+### Completion boundary
+This stage may complete only when the terminal disposition's required artifact (agent brief, triage notes, or closing comment with correct KB handling) has been produced and applied.
+
+### Decision evidence
+The applied artifact and any KB record change are this stage's own durable output.
 
 ## Output
 
