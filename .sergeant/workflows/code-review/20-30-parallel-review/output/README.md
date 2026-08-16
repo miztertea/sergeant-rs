@@ -1,8 +1,8 @@
-# Output — `30-parallel-review-spec`
+# Output — `20-30-parallel-review`
 
 Layer 4 (per-run artifact), per `docs/icm/convention.md` §1a. This directory is empty in the authored tree; a run of this stage writes its artifact(s) here in the materialized work surface, Git-tracked on the Work branch and reviewable in the diff like any other change.
 
-**Expected artifact:** a record of — An isolated review against the identified spec source.
+**Expected artifact:** a record of — Both axes run as isolated sub-agents, spawned in a single message, and each produces its own report.
 
 **Disposition:** `evidence`
 

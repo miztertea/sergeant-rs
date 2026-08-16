@@ -4,7 +4,7 @@
 
 | File | Layer | Why |
 |---|---|---|
-| ../30-parallel-review-spec/output/README.md | L4 | upstream artifact produced by `30-parallel-review-spec` |
+| ../20-30-parallel-review/output/README.md | L4 | upstream artifact produced by `20-30-parallel-review` |
 
 ## Purpose
 
@@ -28,9 +28,25 @@ The two axes are reported separately, never merged or reranked.
   (trigger: n/a (design rationale); outcome: the two-axis structure is preserved rather than collapsed)
   — `BU-P2-018`, `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (Why two axes, lines 84-87)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Lightly cleaning the two sub-agent reports for the final aggregate without altering their substance (`BU-P2-016`).
+- Writing the one-line closing summary — total findings per axis, worst issue within each axis (`BU-P2-017`).
+
+### J1 — local choices allowed
+- Exact Markdown formatting of the `## Standards` / `## Spec` headings and summary line.
+
+### J0 — must become `needs_input`
+- None identified for this stage — aggregation is bounded, mechanical composition of already-produced upstream reports. A downstream ambiguity (e.g. both reports empty and equally silent) is not a J0: report it truthfully rather than escalating.
+
+### Completion boundary
+This stage may complete only when both axes are presented under separate headings, unmerged and unreranked (`BU-P2-016`, J5 per the package's Authority envelope), and the closing summary line does not pick a single winner across axes (`BU-P2-018`).
+
+### Decision evidence
+The aggregated report itself, written to `output/README.md` with `promote` disposition, is the decision record.
 
 ## Output
 
