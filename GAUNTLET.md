@@ -59,6 +59,54 @@ letter by coincidence, as D6 and D7 do here.
 
 ## Ledger entries
 
+### ICM-R1/R2 — 2026-08-16, doctrine landed and nine-package pilot reconciled
+
+**Mission outcome: built.** Following the owner's live §19 ruling
+(`docs/adr/0013-icm-r0-owner-rulings.md`), ICM-R1 (doctrine, templates)
+and ICM-R2 (the nine-package pilot) both executed the same day as ICM-R0's
+grading. Full record: `docs/gauntlet/runs/icm-r2/adjudication.md`
+(per-package detail in sibling files); doctrine changes are the
+`.sergeant/common/contexts/bounded-judgment.md`,
+`docs/icm/convention.md` §6, `docs/icm/record-shapes.md` §6, and
+`_config/icm-ladder.md` §6.1a commits on `chore/backlog-grooming-
+2026-08-16`.
+
+**Nine packages reconciled, 18 dispatched `sgt` Works (producer +
+independent reviewer per package) plus one redispatch.** Six STAND
+(`grilling`, `sergeant-help`, `research`, `validate-and-ship`,
+`code-review`, `repo-to-icm`), three retired (`task-intake-and-route`
+ABSORBED, `sergeant-setup` SPLIT into `estate-navigation`/`AGENTS.md`,
+`direct-implementation` HARVEST into `AGENTS.md`). Catalog: 23 → 20
+published workflows. Three of nine producers reached a verdict different
+from, and better evidenced than, their own dispatch hint — the pilot's
+own disagreement-surfacing purpose (proposal §10.3) working as intended,
+not a sign the hints were badly chosen.
+
+**The push/pr/ci gap (the session's own opening question, several turns
+before this pass) now has an honest, citable answer inside the live
+package.** `validate-and-ship/40-drive-gates/CONTEXT.md` names it J0 —
+not delegated, not resolved, measured live twice as a real gap (#123,
+"materialized, not just predicted") — rather than leaving it silently
+unclassified the way `scripts/gate.sh`'s hardcoded flag did. This is a
+placeholder for the owner's separate ruling, not a policy invented by
+this pass.
+
+**Two process misses caught live, matching this repo's own discipline of
+not smoothing them over:** the orchestrating session repeated its own
+ICM-R0 mistake once more (editing `adjudication.md` into the outer
+checkout instead of the estate clone, caught and fixed before commit),
+and one `repo-to-icm` producer blocked on turn-ceiling exhaustion after
+attempting to delegate its own task to a nested sub-agent — redispatched
+with an explicit no-sub-delegation instruction and a longer ceiling;
+succeeded clean on retry.
+
+**Not yet done.** ICM-R3 (the remaining 16 published workflows plus
+`software-change`, gated on this pilot per decision 9) and ICM-R4
+(dogfood/measurement) are explicitly out of this pass's scope, per the
+proposal's own pilot-before-full-corpus sequencing. Shipping gate and PR
+against `main` are this session's immediate next steps, not yet run as
+of this entry.
+
 ### ICM-R0 — 2026-08-16, ICM-R procedure-authority proposal graded: validated with findings
 
 **Mission outcome: validated with findings.** The owner supplied
