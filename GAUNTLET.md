@@ -58,6 +58,79 @@ letter by coincidence, as D6 and D7 do here.
 
 ## Ledger entries
 
+### T-SERIES-1 — 2026-08-16, revised operator-cockpit proposal graded: validated with findings
+
+**Mission outcome: validated with findings.** The revised T-series proposal
+(`reference/proposal-tui-t-series.md`, 2026-08-15, superseding the
+2026-08-11 predecessor) was graded by the same four-axis blind-panel method
+FOUNDATION-1 established: fidelity, invariants, assumptions, enactability,
+each critic run as a dispatched `sgt` Work, each finding independently
+re-derived (not trusted) by a per-axis adversarial refuter, adjudicated by
+the orchestrating session. First reuse of the proposal-grading method on a
+proposal roughly 4.5× the size of FOUNDATION-1's (~2,300 lines). 19
+findings, 1 refuted, 18 confirmed, 3 severity downgrades, **3 surviving
+errors**. Every verdict held its section survives a local correction; no
+decision was invalidated and nothing was sent back. Full record:
+`docs/gauntlet/runs/t-series-1/` (critics, refuters, adjudication).
+
+**North Star gate lifted first, same session.** `NORTH-STAR.md`'s Wave 3
+"dogfood round 2" condition on T-series was amended in place (dated
+2026-08-15, owner ruling in dialogue with Captain): satisfied by evidence
+accrued since 2026-08-11 (MVP ship, WATCH ship, FOUNDATION-1 + cross-
+platform sprint, the MacBook-arrival measurement pass) rather than by one
+discrete named event. This gauntlet unit is the first work dispatched under
+that lifted gate.
+
+**The three surviving errors.** `inv-estate-doctor-bypasses-client-
+boundary`: Decision T2-14 has `tui.rs` call shared local Estate/Doctor
+operations directly, a second crate-internal reach path beyond
+`crate::api` that `tests/m6_surfaces.rs` t5/t5b rejects today by
+construction — the proposal names the rule it changes but never names the
+test, and its stated justification (no-daemon CLI semantics) doesn't apply
+to the TUI, which ADR 0009/T2-16 already commit to never running without a
+live daemon. Per the FOUNDATION-1 precedent for a genuine open design
+question, this is not resolved by adjudication fiat — it is named as T0's
+first required ruling. `assumptions F1`: PR #111 merged into `main` at
+`3a46b87` (2026-08-15T15:28:02Z) before this proposal was even drafted, but
+~20 locations — frontmatter, header, a full section, a full subsection, two
+acceptance items, a falsifier — instruct a reader or dispatched Work to
+treat it as unmerged; the assumptions refuter distinguished this from the
+FOUNDATION-1 precedent's similar-shaped finding because these are
+prescriptive instructions a Work would read as binding, not narrative
+background. `enactability Finding 3`: the T0–T4 program never assigns the
+Workflow, Evidence, Graph, or Details tabs (of `Thread Workflow Evidence
+Graph Details`, all four bound into §21 acceptance) to any phase — a Work
+could complete every phase's own checklist and still fail acceptance, with
+no earlier catch point.
+
+**The refuted finding.** `enactability Finding 1` claimed §20.1's "No
+product code" and its required dependency-resolution spike were mutually
+exclusive. Refuted on the critic's own evidence: the critic's own
+investigative method (`cargo tree`, `cargo add --dry-run`, a scratch crate)
+already produces the required proof without touching a product file — the
+critic used exactly those tools one paragraph before concluding no such
+path exists.
+
+**Three downgrades**, each a refuter correcting severity inherited by
+association rather than earned by independent downstream impact:
+`assumptions F2` (error→warning, a real-but-misattributed commit hash with
+no normative content depending on it, structurally identical to a sibling
+finding the same critic scored warning), `enactability Finding 2`
+(error→warning, a Work has an obvious non-stalling resolution available
+from context), `enactability Finding 6` (warning→info, the refuter's own
+live `gh pr view 111` call foreclosed the concrete risk scenario the
+finding's severity depended on).
+
+**Disposition.** No build authorized by this unit — acceptance is the
+owner's, not the panel's, per the contract. A mechanical corrections pass
+over the proposal (all ~20 PR #111 locations, the two other citation
+defects, the Doctor check-name list, the disposition-table mislabel, the
+R7 justification gap, the R-NS-6 restatement, the four unassigned tabs
+under T1, and the client-boundary open question as T0's first ruling) is
+dispatched as its own `sgt` Work rather than hand-edited by this
+adjudication, so it receives the same review stage every other piece of
+this unit did.
+
 ### ADR 0008 — 2026-08-14, manifest authority over its own state location: (b) implemented, (a) pinned unchanged, (c) re-ruled and #64 closed without code
 
 **Mission outcome: shipped.** Implements proposal §5.4 / ADR 0008, a Work
