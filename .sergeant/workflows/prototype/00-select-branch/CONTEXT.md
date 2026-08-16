@@ -28,9 +28,25 @@ Which question type (logic vs. UI) is decided; a heuristic fallback is recorded 
   (trigger: the branch question is ambiguous and the user is unreachable; outcome: a branch is chosen by heuristic and the assumption is recorded, rather than the workflow stalling)
   — `BU-P3-014`, `reference/sergeant-upstream/.agents/skills/prototype/SKILL.md` (line 17)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Determining which branch (logic vs. UI) applies, from the prompt, surrounding code, or the user directly (`BU-P3-012`, `BU-P3-013`).
+- Choosing a heuristic fallback and recording the assumption when the branch is ambiguous and the user is unreachable (`BU-P3-014`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- The branch choice is ambiguous and the user *is* reachable — the heuristic fallback (`BU-P3-014`) applies only when the user cannot be reached; it is not a general-purpose shortcut.
+
+### Completion boundary
+This stage may complete only when exactly one branch (logic or UI) is selected and recorded.
+
+### Decision evidence
+The selected branch and, if a heuristic was used, the recorded assumption are this stage's own durable output.
 
 ## Output
 

@@ -5,6 +5,7 @@
 | File | Layer | Why |
 |---|---|---|
 | ../10-record-question/output/README.md | L4 | upstream artifact produced by `10-record-question` |
+| ../references/shared-rules.md | L3 | rules that apply to both branches (throwaway marking/location, one command to run, no persistence by default, surface the state) — added ICM-R3, closing a gap where these were extracted at N1 but never materialized (`BU-PROTO-28`) |
 
 ## Purpose
 
@@ -37,9 +38,24 @@ A logic prototype is built to answer the recorded question.
   (trigger: the logic prototype is ready to hand to the user; outcome: the prototype is runnable via the project's normal task-runner invocation)
   — `BU-P3-026`, `reference/sergeant-upstream/.agents/skills/prototype/LOGIC.md` (step 5, line 61)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`. See `../references/shared-rules.md` for the rules this stage shares with `20U-build-variants`.
+
+### J2 — delegated to this stage
+- Designing the pure logic module's interface and the TUI shell around it (`BU-P3-022`, `BU-P3-023`).
+
+### J1 — local choices allowed
+- Terminal rendering details, provided the frame is fully replaced on every update, never appended (`BU-P3-024`, `BU-P3-025`).
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when an interactive terminal app exists, the logic module is pure and one-way-dependent (TUI imports logic, never the reverse), and the prototype is wired into the project's task runner (`BU-P3-026`) — plus the shared rules in `../references/shared-rules.md`.
+
+### Decision evidence
+The built prototype and its interface design are this stage's own durable output.
 
 ## Additional note
 

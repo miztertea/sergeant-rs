@@ -22,9 +22,24 @@ The design question the prototype must answer is recorded.
   (trigger: the logic-prototype branch has been selected; outcome: a written statement of the question and state model exists before code is written)
   — `BU-P3-021`, `reference/sergeant-upstream/.agents/skills/prototype/LOGIC.md` (step 1, line 18)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Phrasing the state model and question in the form later checkable against the eventual result (`BU-P3-021`).
+
+### J1 — local choices allowed
+- Where the written statement lives (README, top-of-file comment).
+
+### J0 — must become `needs_input`
+- The question cannot be stated precisely enough to be later checked against a result — an unstated question is "pure waste" per the source's own framing; ask rather than proceed on a vague one.
+
+### Completion boundary
+This stage may complete only when a written statement of the question and state model exists, before any code is written.
+
+### Decision evidence
+The recorded question/state-model statement is this stage's own durable output.
 
 ## Output
 

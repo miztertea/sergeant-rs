@@ -23,9 +23,24 @@ The prototype and its answer are handed off.
   (trigger: the variant switcher is built and ready; outcome: the user has a shareable URL to explore variants and can express cross-variant preferences)
   — `BU-P3-035`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (process step5, line 96)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- How to present the handoff (URL, variant keys, or the logic prototype's own invocation instructions).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when the user has a shareable, runnable handoff and can express a preference (including cross-variant recombination, for the UI branch — `BU-P3-035`).
+
+### Decision evidence
+The handoff artifact is this stage's own durable output.
 
 ## Additional note
 

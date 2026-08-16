@@ -5,6 +5,7 @@
 | File | Layer | Why |
 |---|---|---|
 | ../10-record-question/output/README.md | L4 | upstream artifact produced by `10-record-question` |
+| ../references/shared-rules.md | L3 | rules that apply to both branches (throwaway marking/location, one command to run, no persistence by default, surface the state) — added ICM-R3, closing a gap where these were extracted at N1 but never materialized (`BU-PROTO-28`) |
 
 ## Purpose
 
@@ -40,9 +41,25 @@ UI variants are built to answer the recorded question.
   (trigger: building or wiring a UI variant; outcome: no UI variant performs a real write against production systems)
   — `BU-P3-038`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (Anti-patterns, line 111)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`. See `../references/shared-rules.md` for the rules this stage shares with `20L-build-logic`.
+
+### J2 — delegated to this stage
+- Choosing sub-shape A (mounted in an existing page) vs. sub-shape B (standalone route) — A is preferred unless no existing page can host the variants (`BU-P3-030`).
+- How many variants to produce, between the default of three and the cap of five (`BU-P3-032`), and how to force structural divergence between them (`BU-P3-033`).
+
+### J1 — local choices allowed
+- Naming of a sub-shape B throwaway route, within the project's existing routing convention (`BU-P3-031`).
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when the variant switcher is gated off in production builds (`BU-P3-034`), no variant performs a real mutation (`BU-P3-038`), and every variant is structurally (not merely cosmetically) distinct — plus the shared rules in `../references/shared-rules.md`.
+
+### Decision evidence
+The built variants and the sub-shape choice are this stage's own durable output.
 
 ## Additional note
 
