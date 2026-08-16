@@ -25,9 +25,29 @@ Four signals are collected together before any kill/relaunch decision.
   (trigger: the same or a very similar notification arrives more than once; outcome: the operator investigates the specific cause rather than reflexively creating a new task or response for what may be a duplicate)
   — `BU-P8-099`, `reference/sergeant-upstream/docs/troubleshooting.md` (L96-100 (Repeated notifications))
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- No kill/relaunch decision on partial evidence — all four signals must be collected together first (`BU-P8-095`).
+- Never produce a duplicate task or a duplicate response for a repeated notification (`BU-P8-099`).
+
+### J2 — delegated to this stage
+- Reconciling a nonterminal stall diagnostic through the documented progress rules (`BU-P8-095`).
+- Investigating a repeated notification's specific cause — stale fleet record, unconsumed response, or misreclassified expected-blocked worker (`BU-P8-099`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only once all four signals are collected and any repeated notification is investigated to a specific cause.
+
+### Decision evidence
+The collected signals are this stage's own durable output, recorded per `output/README.md`.
 
 ## Output
 

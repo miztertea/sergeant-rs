@@ -22,9 +22,31 @@ Stall proof, lease convergence, drain check, relaunch-metadata completeness, and
   (trigger: a worker's status is in_progress with a recorded stall diagnostic; outcome: a stalled worker gets exactly one automatic relaunch attempt, ever, before requiring human input)
   — `BU-P6-071`, `reference/sergeant-upstream/bin/sgt-recover` (L6-10)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim. The helper invocations below run first, mechanically, to reach the point where this judgment (make the one bounded attempt, or recognize it is already spent) applies.
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- A stall recovery attempt is gated on concrete stall proof; every invocation is stamped so a second attempt always escalates rather than retries (`BU-P6-071`).
+- Refuse while an unfinished action-lease exists unless the owner is provably dead; anything else fails closed (`BU-P6-073`).
+- Every pre-flight validation runs to completion before the attempt is stamped as made (`BU-P6-075`).
+- Recovery is refused while a drain is active (`BU-P7-092`).
+- Lease-owner liveness/staleness is adjudicated fail-closed on unprovable ownership (`BU-P7-093`).
+- The replacement is only launched, and its identity validated, before the original is ever terminated (`BU-P6-072`, `BU-P7-094`).
+- Exactly one bounded recovery attempt per invocation: terminate, relaunch, atomically update fleet metadata, deliver notification (`BU-P7-095`).
+
+### J1 — local choices allowed
+- Error-message text quality when reporting a lease-owner adjudication failure — no raw shell error is leaked to stderr (`BU-P7-093`).
+
+### J0 — must become `needs_input`
+- A second stall on an already-stamped worker (`BU-P6-071`).
+- A first, correctly-blocked preflight failure for an operational reason — an active drain (`BU-P7-092`) or an unprovable lease owner (`BU-P7-093`/`BU-P6-073`) — does **not** consume the one-shot stamp (`BU-P6-075`), so it is neither a completed recovery nor a "second attempt" escalation. State this explicitly rather than leaving it silent: the stage completes with `evidence`-only output recording the block, and continued visibility relies on `sgt-watch`'s own independent periodic reclassification to re-surface the worker later — the same division of labor the upstream architecture uses between watcher and recoverer.
+
+### Completion boundary
+This stage may complete only once the one bounded recovery attempt is made (preflight validated, replacement launched and proven live, original retired only after) — or the stage has stopped/recorded one of the J0 cases above.
+
+### Decision evidence
+The stamp state, preflight results, and replacement viability are this stage's own durable output, recorded per `output/README.md`.
 
 ## Helper invocations (folded stages, N1 adjudication A4)
 
