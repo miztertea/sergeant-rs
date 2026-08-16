@@ -60,6 +60,8 @@ relationship: >-
 
 Sections are numbered for contract citation. Every normative decision names its lowest viable Ponytail rung. The complete register is §22.
 
+**Implementation status (2026-08-16):** T0 through T4 are built, tested, and merged to `integration/t-series-2026-08-15` (head PR #131) — see `GAUNTLET.md`'s T-SERIES-BUILD entry for the full record. `status: proposed` above is left as-is rather than changed to `published`, since that branch has not merged to `main`; this is the owner's call, not this document's. Two named gaps are explicitly not built by this program: the slash palette (§15.3) and the Workflows-screen half of the `@` chooser (§15.4) — tracked, not silently dropped.
+
 ---
 
 # 1. Executive Summary

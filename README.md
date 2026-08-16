@@ -72,7 +72,16 @@ try the loop without spending tokens.
 
 ## See it
 
-| TUI — work detail with live journal tail | TUI — fleet |
+The images below are from the M6-era minimal Fleet/Detail TUI, superseded
+by the T-series `Home / Fleet / Workflows / Estate` cockpit
+(`reference/proposal-tui-t-series.md`) — real terminal PNG captures of the
+current TUI are a pending follow-up (no real-terminal session was
+available to capture them from). `docs/tui-screenshots/*.txt` has honest,
+current renders in the meantime — actual `ratatui::TestBackend` output
+flattened to plain text, not mockups; regenerate with `cargo test --lib --
+--ignored generate_t4_wide_screenshots`.
+
+| TUI — work detail with live journal tail (M6, superseded) | TUI — fleet (M6, superseded) |
 |---|---|
 | ![TUI work detail](docs/img/tui-detail.png) | ![TUI fleet](docs/img/tui-fleet.png) |
 
@@ -97,7 +106,7 @@ sgt work list            # the fleet: id, state, intent
 sgt work show <id>       # one item: stage, execution, surface, output pointer, recent events
 sgt work show <id> --graph   # the work's provenance graph instead of its record
 sgt work transcript <id> # decode the work's conversation from the journal, in causal order
-sgt tui                   # fleet + detail, live over SSE
+sgt tui                   # Home/Fleet/Workflows/Estate cockpit, live over SSE
 sgt                       # no subcommand: a homepage — logo, quickstart, no daemon contact
 ```
 
