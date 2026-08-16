@@ -28,9 +28,25 @@ Trigger (workflow-level): "Diagnose"/"debug this", or something reported broken,
   (trigger: hypotheses are ranked and falsifiable; outcome: the user gets a chance to re-rank or rule out hypotheses without blocking the actor if unavailable)
   — `BU-P2-039`, `reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` (Phase 3: user checkpoint, lines 92-92)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Generating and ranking 3-5 falsifiable hypotheses (`BU-P2-037`, `BU-P2-038`).
+- Proceeding without the user's re-ranking if the user is unavailable — an explicitly named non-blocking exception, not a J0 escalation (`BU-P2-039`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- A hypothesis that cannot be stated as a falsifiable prediction — discard or sharpen it before showing the list (`BU-P2-038`), rather than presenting a vibe as a hypothesis.
+
+### Completion boundary
+This stage may complete only when 3-5 ranked, falsifiable hypotheses have been shown to the user (or, if unavailable, recorded for later re-ranking per `BU-P2-039`).
+
+### Decision evidence
+The ranked hypothesis list is this stage's own durable output.
 
 ## Output
 

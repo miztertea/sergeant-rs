@@ -46,9 +46,24 @@ A named, already-run, red-capable, deterministic, fast, agent-runnable command e
   (trigger: the actor is tempted to hypothesize before Phase 1 completes; outcome: the actor stops and returns to loop-building instead of hypothesizing early)
   — `BU-P2-030`, `reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` (Phase 1 closing rule, lines 60-60)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Which construction strategy to attempt first from the ranked ladder, and how to tighten it along the three named axes (`BU-P2-023`, `BU-P2-025`).
+
+### J1 — local choices allowed
+- Local tooling/script naming within the chosen construction strategy.
+
+### J0 — must become `needs_input`
+- **No loop can genuinely be built.** Stop, list what was tried, and ask the user for environment access, a captured artifact, or permission to add temporary production instrumentation — never proceed to hypothesize without a loop (`BU-P2-028`, `BU-P2-030`).
+
+### Completion boundary
+This stage may complete only when the actor can name one already-run command that is red-capable, deterministic (or pinned high-rate for flaky bugs), fast, and agent-runnable (`BU-P2-029`).
+
+### Decision evidence
+The named command and its construction path are this stage's own durable output.
 
 ## Output
 
