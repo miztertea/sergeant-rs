@@ -28,6 +28,10 @@ pub enum ComposerOutcome {
     /// A submit was asked for with nothing but whitespace in the draft
     /// (§15.2: "blank input is refused").
     Refused,
+    /// §15.3's Decision T2-55: `/` was typed at the first non-whitespace
+    /// position of the draft — the caller opens `Overlay::SlashPalette`
+    /// instead of this composer taking the character as text.
+    OpenSlashPalette,
 }
 
 /// The deliberate multiline composer: Home's `INTENT` field and an open
@@ -57,15 +61,33 @@ impl Composer {
     }
 
     /// One keystroke (§15.2). `Ctrl+Enter` asks to submit rather than
-    /// inserting a newline; every other key — including plain `Enter`, which
-    /// the crate itself maps to a newline — is forwarded to the editor
-    /// untouched.
+    /// inserting a newline; `/` at the first non-whitespace position asks to
+    /// open the slash palette rather than being inserted (§15.3); every
+    /// other key — including plain `Enter`, which the crate itself maps to a
+    /// newline — is forwarded to the editor untouched.
     pub fn on_key(&mut self, key: KeyEvent) -> ComposerOutcome {
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.submit();
         }
+        if key.code == KeyCode::Char('/') && self.at_first_nonwhitespace() {
+            return ComposerOutcome::OpenSlashPalette;
+        }
         self.area.input(key);
         ComposerOutcome::None
+    }
+
+    /// §15.3's trigger condition (Decision T2-55): every line above the
+    /// cursor, and every character on the cursor's own line up to the
+    /// cursor, is blank — so a `/` typed here can only be the start of a
+    /// command, never a character inside typed text.
+    fn at_first_nonwhitespace(&self) -> bool {
+        let cursor = self.area.cursor();
+        let lines = self.area.lines();
+        lines[..cursor.0].iter().all(|line| line.trim().is_empty())
+            && lines[cursor.0]
+                .chars()
+                .take(cursor.1)
+                .all(char::is_whitespace)
     }
 
     /// Ask to submit the current draft outright — the Tab-to-Send-then-Enter
@@ -188,6 +210,66 @@ mod tests {
             composer.on_key(ctrl_enter()),
             ComposerOutcome::Refused,
             "whitespace-only is still blank"
+        );
+    }
+
+    #[test]
+    fn slash_on_an_empty_draft_opens_the_palette_instead_of_being_typed() {
+        let mut composer = Composer::new();
+        assert_eq!(
+            composer.on_key(key(KeyCode::Char('/'))),
+            ComposerOutcome::OpenSlashPalette
+        );
+        assert_eq!(composer.text(), "", "the '/' must not have been inserted");
+    }
+
+    #[test]
+    fn slash_after_leading_whitespace_still_opens_the_palette() {
+        let mut composer = Composer::new();
+        for c in "   ".chars() {
+            composer.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            composer.on_key(key(KeyCode::Char('/'))),
+            ComposerOutcome::OpenSlashPalette
+        );
+        assert_eq!(composer.text(), "   ", "leading whitespace is untouched");
+    }
+
+    #[test]
+    fn slash_elsewhere_in_the_draft_stays_literal_text() {
+        let mut composer = Composer::new();
+        for c in "fix the /path".chars() {
+            assert_eq!(composer.on_key(key(KeyCode::Char(c))), ComposerOutcome::None);
+        }
+        assert_eq!(composer.text(), "fix the /path");
+    }
+
+    #[test]
+    fn slash_on_a_later_line_is_literal_when_the_first_line_has_content() {
+        let mut composer = Composer::new();
+        for c in "first".chars() {
+            composer.on_key(key(KeyCode::Char(c)));
+        }
+        composer.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            composer.on_key(key(KeyCode::Char('/'))),
+            ComposerOutcome::None,
+            "an earlier nonblank line means this is not the first non-whitespace \
+             position of the draft"
+        );
+        assert_eq!(composer.text(), "first\n/");
+    }
+
+    #[test]
+    fn slash_at_the_start_of_a_blank_second_line_still_opens_the_palette() {
+        let mut composer = Composer::new();
+        composer.on_key(key(KeyCode::Enter));
+        assert_eq!(
+            composer.on_key(key(KeyCode::Char('/'))),
+            ComposerOutcome::OpenSlashPalette,
+            "every line above the cursor is blank, so this is still the draft's \
+             first non-whitespace position"
         );
     }
 

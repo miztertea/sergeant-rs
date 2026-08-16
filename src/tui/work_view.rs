@@ -117,6 +117,10 @@ pub enum WorkScreenOutcome {
     OpenExtendEnvelope,
     /// §13.10/§15.5: open the Reap confirmation.
     OpenReapConfirm,
+    /// §15.3: `/` at the first non-whitespace position of the `ANSWER`
+    /// composer opens `Overlay::SlashPalette` (App-level state) instead of
+    /// being typed literally.
+    OpenSlashPalette,
 }
 
 /// The canonical Work surface's own state: the four fetched reads, which tab
@@ -265,9 +269,23 @@ impl WorkScreen {
     /// Whether `action` (§13.10's vocabulary: `"respond"`, `"cancel"`,
     /// `"retry"`, `"extend"`, `"reap"`) is legal for the current reported
     /// state — the same table the header already renders (§13.10's
-    /// Decision T2-52).
-    fn action_available(&self, action: &str) -> bool {
+    /// Decision T2-52). `pub` so [`super::app::App`]'s §15.3 slash commands
+    /// gate on exactly this matrix rather than a second copy of it.
+    pub fn action_available(&self, action: &str) -> bool {
         actions_for_state(&self.state()).1.contains(&action)
+    }
+
+    /// §15.3's `/answer` command: the same effect as the mnemonic `r` key
+    /// (§13.10) — the caller has already checked [`WorkScreen::action_available`].
+    pub fn focus_answer(&mut self) {
+        self.answer_focused = true;
+        self.answer_send_focused = false;
+    }
+
+    /// §15.3's `/evidence`, `/graph`, `/details` commands: the same tab
+    /// switch the `1`-`5` digit keys already perform.
+    pub fn show_tab(&mut self, tab: Tab) {
+        self.tab = tab;
     }
 
     pub fn on_key(&mut self, key: impl Into<KeyEvent>) -> WorkScreenOutcome {
@@ -341,7 +359,10 @@ impl WorkScreen {
                 KeyCode::Enter => match self.answer.submit() {
                     ComposerOutcome::Submit(text) => return WorkScreenOutcome::Respond(text),
                     ComposerOutcome::Refused => return WorkScreenOutcome::AnswerRefused,
-                    ComposerOutcome::None => {}
+                    // `Composer::submit` never returns this — only
+                    // `Composer::on_key` interprets a typed `/` — but the
+                    // match must still be exhaustive.
+                    ComposerOutcome::None | ComposerOutcome::OpenSlashPalette => {}
                 },
                 _ => {}
             }
@@ -353,6 +374,7 @@ impl WorkScreen {
             _ => match self.answer.on_key(key) {
                 ComposerOutcome::Submit(text) => return WorkScreenOutcome::Respond(text),
                 ComposerOutcome::Refused => return WorkScreenOutcome::AnswerRefused,
+                ComposerOutcome::OpenSlashPalette => return WorkScreenOutcome::OpenSlashPalette,
                 ComposerOutcome::None => {}
             },
         }
@@ -1860,6 +1882,20 @@ mod tests {
             screen.on_key(ctrl_enter()),
             WorkScreenOutcome::Respond("yes, proceed".to_string())
         );
+    }
+
+    /// §15.3: `/` at the first non-whitespace position of the still-empty
+    /// `ANSWER` composer asks to open the slash palette rather than being
+    /// typed literally.
+    #[test]
+    fn slash_on_the_answer_composer_asks_to_open_the_slash_palette() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        assert_eq!(
+            screen.on_key(KeyCode::Char('/')),
+            WorkScreenOutcome::OpenSlashPalette
+        );
+        assert_eq!(screen.answer.text(), "", "no literal '/' was typed");
     }
 
     #[test]
