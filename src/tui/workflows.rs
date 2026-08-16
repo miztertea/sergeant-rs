@@ -33,11 +33,18 @@ pub enum WorkflowsOutcome {
     /// field and switching destinations) — this screen only names the
     /// workflow.
     UseInNewWork(String),
+    /// §15.4/T2-56's Workflows half (issue #153): open the same live-catalog
+    /// chooser Home's workflow field already opens (`Overlay::
+    /// WorkflowChooser`, `App`-level state) — this screen only asks for it,
+    /// the same way `HomeOutcome::OpenWorkflowChooser` does.
+    OpenWorkflowChooser,
 }
 
 /// Workflows' own screen state: the catalog `App::refresh` last read, local
-/// selection, and the `@` filter (§15.4: "In Workflows, `@` focuses catalog
-/// selection").
+/// selection, and the `/` filter (mirrors Fleet's own local filter, §10.3).
+/// `@` is reserved for §15.4's live-catalog chooser
+/// (`WorkflowsOutcome::OpenWorkflowChooser`) rather than this local filter,
+/// matching Home's own `@` binding on its workflow field.
 #[derive(Debug, Default)]
 pub struct WorkflowsScreen {
     /// `GET /v1/workflows`'s `workflows[]`, verbatim (§11.2's CatalogEntry
@@ -53,7 +60,7 @@ pub struct WorkflowsScreen {
 }
 
 impl WorkflowsScreen {
-    /// Entries the current `@` filter admits: a case-insensitive substring
+    /// Entries the current `/` filter admits: a case-insensitive substring
     /// match on name, description, or any tag (mirrors Fleet's own local
     /// filter, §10.3).
     pub fn visible(&self) -> Vec<&Value> {
@@ -71,7 +78,40 @@ impl WorkflowsScreen {
         self.visible().into_iter().nth(self.selected)
     }
 
-    /// Whether the `@` filter field currently owns the keyboard — `App`
+    /// Move the local selection onto the catalog entry named `name` — how
+    /// `Overlay::WorkflowChooser`'s Enter (opened via
+    /// `WorkflowsOutcome::OpenWorkflowChooser`) hands its pick back to this
+    /// screen, mirroring how the same overlay hands its pick to Home's
+    /// workflow field. The chooser lists the full, unfiltered catalog
+    /// (§15.4), so `name` may not pass this screen's own local `/` filter;
+    /// in that case the filter is cleared so `name` becomes selectable.
+    pub fn select_by_name(&mut self, name: &str) {
+        if let Some(index) = self
+            .visible()
+            .iter()
+            .position(|e| e["name"].as_str() == Some(name))
+        {
+            self.selected = index;
+            return;
+        }
+        if !self
+            .entries
+            .iter()
+            .any(|e| e["name"].as_str() == Some(name))
+        {
+            return;
+        }
+        self.filter.clear();
+        if let Some(index) = self
+            .visible()
+            .iter()
+            .position(|e| e["name"].as_str() == Some(name))
+        {
+            self.selected = index;
+        }
+    }
+
+    /// Whether the `/` filter field currently owns the keyboard — `App`
     /// consults this before routing a keystroke to a global destination-nav
     /// key, exactly as Home and Fleet's own text fields already do.
     pub fn wants_text_focus(&self) -> bool {
@@ -130,7 +170,8 @@ impl WorkflowsScreen {
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Char('@') => self.filter_focus = true,
+            KeyCode::Char('/') => self.filter_focus = true,
+            KeyCode::Char('@') => return WorkflowsOutcome::OpenWorkflowChooser,
             KeyCode::Char('x') if !self.filter.is_empty() => {
                 self.filter.clear();
                 self.clamp();
@@ -195,10 +236,10 @@ fn render_list(frame: &mut Frame, area: Rect, screen: &WorkflowsScreen) {
     let [filter_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
     let filter_text = if screen.filter_focus {
-        format!("@{}_", screen.filter)
+        format!("/{}_", screen.filter)
     } else {
         format!(
-            "filter: {}  ('@' filter · 'u' use in new work)",
+            "filter: {}  ('/' filter · '@' chooser · 'u' use in new work)",
             if screen.filter.is_empty() {
                 "-"
             } else {
@@ -459,11 +500,11 @@ mod tests {
     }
 
     #[test]
-    fn at_sign_focuses_the_filter_and_typing_narrows_the_visible_list() {
+    fn slash_focuses_the_filter_and_typing_narrows_the_visible_list() {
         let mut screen = WorkflowsScreen::default();
         screen.set_entries(vec![entry("implement"), entry("diagnose-bug")]);
         assert!(!screen.wants_text_focus());
-        screen.on_key(KeyCode::Char('@'));
+        screen.on_key(KeyCode::Char('/'));
         assert!(screen.wants_text_focus());
         for c in "diag".chars() {
             screen.on_key(KeyCode::Char(c));
@@ -485,11 +526,69 @@ mod tests {
     fn a_filter_matching_nothing_leaves_no_selection() {
         let mut screen = WorkflowsScreen::default();
         screen.set_entries(vec![entry("implement")]);
-        screen.on_key(KeyCode::Char('@'));
+        screen.on_key(KeyCode::Char('/'));
         for c in "nope".chars() {
             screen.on_key(KeyCode::Char(c));
         }
         assert!(screen.selected_entry().is_none());
+    }
+
+    /// §15.4/T2-56's Workflows half (issue #153): `@` asks `App` to open the
+    /// live-catalog chooser rather than doing anything locally — it does not
+    /// touch the `/` filter or the current selection.
+    #[test]
+    fn at_sign_asks_to_open_the_workflow_chooser() {
+        let mut screen = WorkflowsScreen::default();
+        screen.set_entries(vec![entry("implement"), entry("diagnose-bug")]);
+        assert_eq!(
+            screen.on_key(KeyCode::Char('@')),
+            WorkflowsOutcome::OpenWorkflowChooser
+        );
+        assert!(
+            !screen.wants_text_focus(),
+            "no literal '@' opened the filter"
+        );
+        assert_eq!(screen.selected_entry().unwrap()["name"], "implement");
+    }
+
+    #[test]
+    fn select_by_name_moves_the_selection_to_the_named_entry() {
+        let mut screen = WorkflowsScreen::default();
+        screen.set_entries(vec![entry("implement"), entry("diagnose-bug")]);
+        screen.select_by_name("diagnose-bug");
+        assert_eq!(screen.selected_entry().unwrap()["name"], "diagnose-bug");
+    }
+
+    #[test]
+    fn select_by_name_with_an_unknown_name_leaves_the_selection_unchanged() {
+        let mut screen = WorkflowsScreen::default();
+        screen.set_entries(vec![entry("implement"), entry("diagnose-bug")]);
+        screen.select_by_name("does-not-exist");
+        assert_eq!(screen.selected_entry().unwrap()["name"], "implement");
+    }
+
+    #[test]
+    fn select_by_name_clears_a_stale_local_filter_that_hides_the_pick() {
+        let mut screen = WorkflowsScreen::default();
+        screen.set_entries(vec![entry("implement"), entry("diagnose-bug")]);
+        screen.on_key(KeyCode::Char('/'));
+        for c in "diag".chars() {
+            screen.on_key(KeyCode::Char(c));
+        }
+        screen.on_key(KeyCode::Enter);
+        assert_eq!(
+            screen.visible().len(),
+            1,
+            "the local filter is still narrowing the list"
+        );
+
+        screen.select_by_name("implement");
+
+        assert_eq!(
+            screen.selected_entry().unwrap()["name"],
+            "implement",
+            "a live-chooser pick must land even when it doesn't match a stale local filter"
+        );
     }
 
     #[test]

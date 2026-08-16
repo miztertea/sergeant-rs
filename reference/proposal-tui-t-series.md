@@ -60,7 +60,7 @@ relationship: >-
 
 Sections are numbered for contract citation. Every normative decision names its lowest viable Ponytail rung. The complete register is §22.
 
-**Implementation status (2026-08-16):** T0 through T4 are built, tested, and merged to `integration/t-series-2026-08-15` (head PR #131) — see `GAUNTLET.md`'s T-SERIES-BUILD entry for the full record. `status: proposed` above is left as-is rather than changed to `published`, since that branch has not merged to `main`; this is the owner's call, not this document's. Two named gaps are explicitly not built by this program: the slash palette (§15.3) and the Workflows-screen half of the `@` chooser (§15.4) — tracked, not silently dropped.
+**Implementation status (2026-08-16):** T0 through T4 are built, tested, and merged to `integration/t-series-2026-08-15` (head PR #131) — see `GAUNTLET.md`'s T-SERIES-BUILD entry for the full record. `status: proposed` above is left as-is rather than changed to `published`, since that branch has not merged to `main`; this is the owner's call, not this document's. This program left three gaps: two named — the slash palette (§15.3) and the Workflows-screen half of the `@` chooser (§15.4), tracked rather than silently dropped — and one unnamed, `Overlay::ConnectionDetail` (§7.4/§8.1: no render body and no key binding anywhere, issue #154). All three are now closed by follow-up Works on `integration/t-series-followup-2026-08-16` (closing issues #152, #153, #154) — see `GAUNTLET.md`'s T-SERIES-BUILD entry for the full record.
 
 ---
 

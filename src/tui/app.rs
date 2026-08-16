@@ -16,8 +16,8 @@ use super::estate::{
 };
 use super::fleet::{FleetOutcome, FleetScreen, WorkRow, fleet_rows};
 use super::home::{HomeOutcome, NewWorkForm};
-use super::overlay::Overlay;
-use super::work_view::{WorkScreen, WorkScreenOutcome};
+use super::overlay::{Overlay, SlashCommand};
+use super::work_view::{Tab, WorkScreen, WorkScreenOutcome};
 use super::workflows::{WorkflowsOutcome, WorkflowsScreen};
 
 /// §7.1's top-level destinations, in their displayed order.
@@ -181,6 +181,10 @@ pub struct App {
     /// request field"). Reset whenever the overlay opens or closes, the same
     /// as `pending_action` above.
     pub workflow_chooser_index: usize,
+    /// [`Overlay::SlashPalette`]'s own live state: which [`SlashCommand`] is
+    /// highlighted (§15.3) — reset to `0` every time the palette opens, the
+    /// same as `workflow_chooser_index` above.
+    pub slash_palette_index: usize,
     /// Whether the global Attention drawer is showing (§7.3: opens by
     /// default at Wide; `~` toggles it at any tier).
     pub drawer_open: bool,
@@ -212,6 +216,7 @@ impl App {
             estate: EstateScreen::default(),
             retained_reap_id: None,
             workflow_chooser_index: 0,
+            slash_palette_index: 0,
             drawer_open: true,
             system: Value::default(),
             last_seq: 0,
@@ -390,6 +395,13 @@ impl App {
                     self.overlay = Some(Overlay::WorkflowChooser);
                     Action::None
                 }
+                // §15.3: `/` at the first non-whitespace position of the
+                // INTENT composer, same wiring shape as `@`'s chooser above.
+                HomeOutcome::OpenSlashPalette => {
+                    self.slash_palette_index = 0;
+                    self.overlay = Some(Overlay::SlashPalette);
+                    Action::None
+                }
             },
             Destination::Fleet => match self.fleet.on_key(key.code, &self.rows) {
                 FleetOutcome::None => Action::None,
@@ -404,6 +416,16 @@ impl App {
                 WorkflowsOutcome::UseInNewWork(name) => {
                     self.home.workflow = name;
                     self.goto(Destination::Home);
+                    Action::None
+                }
+                // §15.4's Workflows half (issue #153): `@` on the Workflows
+                // screen opens the same live-catalog chooser Home's
+                // workflow field opens — the overlay is `App`-level state,
+                // so `Workflows` only asks for it, exactly as `Home` does
+                // above.
+                WorkflowsOutcome::OpenWorkflowChooser => {
+                    self.workflow_chooser_index = 0;
+                    self.overlay = Some(Overlay::WorkflowChooser);
                     Action::None
                 }
             },
@@ -444,6 +466,10 @@ impl App {
         match key {
             KeyCode::Char('~') => self.drawer_open = !self.drawer_open,
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
+            // §7.4/§8.9: mouse capture stays disabled, so the connection
+            // detail overlay (issue #154) needs its own dedicated keyboard
+            // trigger rather than a click on the header's indicator.
+            KeyCode::Char('c') => self.overlay = Some(Overlay::ConnectionDetail),
             KeyCode::Char('1') => self.goto(Destination::Home),
             KeyCode::Char('2') => self.goto(Destination::Fleet),
             KeyCode::Char('3') => self.goto(Destination::Workflows),
@@ -482,6 +508,115 @@ impl App {
         self.retained_reap_id = None;
     }
 
+    /// §15.3's fixed vocabulary, run: the palette closes unconditionally —
+    /// Enter is the deliberate choice — and each command either changes
+    /// state directly or opens the exact overlay/composer its keyboard
+    /// mnemonic already does (§13.10's `r`/`c`/`t`/`e`/`p`, `?`, `q`), so
+    /// durable/destructive actions still land on their own confirmation
+    /// rather than skipping it (§15.5).
+    fn run_slash_command(&mut self, command: SlashCommand) -> Action {
+        self.overlay = None;
+        match command {
+            SlashCommand::Home => self.leave_open_work_and_goto(Destination::Home),
+            SlashCommand::Fleet => self.leave_open_work_and_goto(Destination::Fleet),
+            SlashCommand::Workflows => self.leave_open_work_and_goto(Destination::Workflows),
+            SlashCommand::Estate => self.leave_open_work_and_goto(Destination::Estate),
+            // §15.6's "q / Esc: back": leaves the open Work, the same
+            // effect Esc has there. Unlike Esc/q, this does not also quit
+            // from a top-level destination — `/quit` already names that
+            // outright, so with no Work open this is a deliberate no-op
+            // rather than an exit hidden behind a menu pick.
+            SlashCommand::Back => {
+                if self.open_work.is_some() {
+                    self.open_work = None;
+                    self.work_screen = None;
+                }
+            }
+            SlashCommand::Refresh => return Action::Refresh,
+            // §12.4's Retained preview: the `r` mnemonic only surfaces this
+            // from Estate/Health with the `disk_pressure` check selected,
+            // but the read itself (`GET /v1/retained`) is estate-wide, so
+            // the palette reaches it from anywhere, same as /evidence,
+            // /graph, and /details reach their tabs outside the mnemonic's
+            // own digit-key context.
+            SlashCommand::Retained => return Action::LoadRetained,
+            SlashCommand::Help => self.overlay = Some(Overlay::Help),
+            SlashCommand::Quit => {
+                self.quit = true;
+                return Action::Quit;
+            }
+            // §13.10's respond mnemonic (`r`), gated the same way: the
+            // composer only gains focus where the action matrix offers it.
+            SlashCommand::Answer => {
+                if self.work_action_available("respond")
+                    && let Some(screen) = self.work_screen.as_mut()
+                {
+                    screen.focus_answer();
+                }
+            }
+            // Durable/destructive per §15.5: this only ever opens the same
+            // confirmation the mnemonic key does — the mutation itself
+            // still waits on that overlay's own deliberate Confirm.
+            SlashCommand::Cancel => {
+                self.open_action_confirmation("cancel", Overlay::CancelConfirmation)
+            }
+            SlashCommand::Retry => {
+                self.open_action_confirmation("retry", Overlay::RetryConfirmation)
+            }
+            SlashCommand::Extend => {
+                self.open_action_confirmation("extend", Overlay::ExtendEnvelope)
+            }
+            SlashCommand::Reap => self.open_action_confirmation("reap", Overlay::ReapConfirmation),
+            SlashCommand::Evidence => self.show_work_tab(Tab::Evidence),
+            SlashCommand::Graph => self.show_work_tab(Tab::Graph),
+            SlashCommand::Details => self.show_work_tab(Tab::Details),
+            // No TUI destination reads the daemon's `/v1/analytics` routes
+            // yet (§16.1 lists the client method as a later addition) — said
+            // plainly rather than pretending a screen exists.
+            SlashCommand::AnalyticsPanel => {
+                self.status = "/analytics is not built in this Work yet".to_string();
+            }
+        }
+        Action::None
+    }
+
+    /// §15.3's Home/Fleet/Workflows/Estate commands: an open Work has no
+    /// meaning once the destination underneath it changes, so it closes
+    /// first — the same effect `/back` has on its own.
+    fn leave_open_work_and_goto(&mut self, destination: Destination) {
+        self.open_work = None;
+        self.work_screen = None;
+        self.goto(destination);
+    }
+
+    /// Whether `action` is legal for the currently open Work's reported
+    /// state (§13.10) — `false` with no Work open, so every gated slash
+    /// command is a quiet no-op outside a canonical Work surface.
+    fn work_action_available(&self, action: &str) -> bool {
+        self.work_screen
+            .as_ref()
+            .is_some_and(|screen| screen.action_available(action))
+    }
+
+    /// §15.3's cancel/retry/extend/reap commands: open the same confirmation
+    /// overlay the mnemonic key does, only where the action matrix offers
+    /// it — otherwise a no-op, exactly like the mnemonic key itself.
+    fn open_action_confirmation(&mut self, action: &str, overlay: Overlay) {
+        if self.work_action_available(action) {
+            self.pending_action = PendingAction::default();
+            self.overlay = Some(overlay);
+        }
+    }
+
+    /// §15.3's evidence/graph/details commands: switch the open Work's tab,
+    /// the same effect the `3`/`4`/`5` digit keys have — a no-op with no
+    /// Work open.
+    fn show_work_tab(&mut self, tab: Tab) {
+        if let Some(screen) = self.work_screen.as_mut() {
+            screen.show_tab(tab);
+        }
+    }
+
     fn on_key_overlay(&mut self, key: KeyEvent) -> Action {
         let Some(overlay) = self.overlay else {
             return Action::None;
@@ -510,12 +645,13 @@ impl App {
             }
             // Same fixed controls as above, but the Work id can come from
             // either an open Work surface (§13.10) or §12.4's Retained
-            // preview — [`App::retained_reap_id`] is Estate's own source, so
-            // this stays the one Reap implementation either way.
+            // preview — [`App::retained_reap_id`] is Estate's own source,
+            // and takes precedence over an open Work when both are present,
+            // so this stays the one Reap implementation either way.
             Overlay::ReapConfirmation => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        if self.open_work_id().is_none() && self.retained_reap_id.is_some() {
+                        if self.retained_reap_id.is_some() {
                             self.overlay = Some(Overlay::RetainedPreview);
                             self.pending_action = PendingAction::default();
                             self.retained_reap_id = None;
@@ -524,9 +660,17 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
+                        // `retained_reap_id` is the explicit selection made
+                        // inside §12.4's Retained preview, so it takes
+                        // precedence over an open Work — `/retained`
+                        // (§15.3) can now reach this preview with a Work
+                        // open, and reaping must target what the user
+                        // actually picked there, not whatever Work happens
+                        // to be open underneath.
                         let Some(id) = self
-                            .open_work_id()
-                            .or_else(|| self.retained_reap_id.clone())
+                            .retained_reap_id
+                            .clone()
+                            .or_else(|| self.open_work_id())
                         else {
                             self.close_overlay();
                             return Action::None;
@@ -656,9 +800,14 @@ impl App {
                 }
                 Action::None
             }
-            // §15.4/§11.4's live-catalog chooser: j/k move the highlighted
-            // entry, Enter selects it onto Home's workflow field and closes,
-            // Esc/q aborts with the field untouched.
+            // §15.4/§11.4's live-catalog chooser, opened either from Home's
+            // workflow field or from the Workflows screen itself (issue
+            // #153): j/k move the highlighted entry, Esc/q aborts with
+            // nothing touched. Enter's destination depends on which screen
+            // asked for it — `self.destination` still names that screen,
+            // since opening the overlay never changes it: Home gets the
+            // pick onto its workflow field, Workflows moves its own
+            // selection onto the picked entry instead.
             Overlay::WorkflowChooser => {
                 let entries = self.workflows.entries.len();
                 match key.code {
@@ -672,13 +821,17 @@ impl App {
                         self.workflow_chooser_index = self.workflow_chooser_index.saturating_sub(1);
                     }
                     KeyCode::Enter => {
-                        if let Some(name) = self
+                        let picked = self
                             .workflows
                             .entries
                             .get(self.workflow_chooser_index)
                             .and_then(|e| e["name"].as_str())
-                        {
-                            self.home.workflow = name.to_string();
+                            .map(str::to_string);
+                        if let Some(name) = picked {
+                            match self.destination {
+                                Destination::Workflows => self.workflows.select_by_name(&name),
+                                _ => self.home.workflow = name,
+                            }
                         }
                         self.close_overlay();
                     }
@@ -686,13 +839,36 @@ impl App {
                 }
                 Action::None
             }
-            // Every overlay still owned by a later Work (§7.4's note) plus
-            // Help (content-built at T1a, but generic close-only controls
-            // are all it ever needs): the mechanism this Work built at
-            // T1a — open, close, restore focus for free. RepoAddRemove,
-            // GroupEditRemove, and RetainedPreview have their own real arms
-            // above (T3); WorkflowChooser has its own real arm above (T2).
-            Overlay::Help | Overlay::SlashPalette | Overlay::ConnectionDetail => {
+            // §15.3's fixed vocabulary picker: j/k move the highlighted
+            // command, Enter runs it (`run_slash_command`, which closes the
+            // palette itself), Esc/q aborts with nothing run — the same
+            // shape as `Overlay::WorkflowChooser` above.
+            Overlay::SlashPalette => {
+                let len = SlashCommand::ALL.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.close_overlay(),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.slash_palette_index + 1 < len {
+                            self.slash_palette_index += 1;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.slash_palette_index = self.slash_palette_index.saturating_sub(1);
+                    }
+                    KeyCode::Enter => {
+                        return self.run_slash_command(SlashCommand::ALL[self.slash_palette_index]);
+                    }
+                    _ => {}
+                }
+                Action::None
+            }
+            // Help and ConnectionDetail have real content (T1a and issue
+            // #154 respectively) but need nothing beyond the generic
+            // close-only controls this Work built at T1a — open, close,
+            // restore focus for free. RepoAddRemove, GroupEditRemove, and
+            // RetainedPreview have their own real arms above (T3);
+            // WorkflowChooser has its own real arm above (T2).
+            Overlay::Help | Overlay::ConnectionDetail => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.overlay = None,
                     _ => {}
@@ -706,9 +882,13 @@ impl App {
     /// interpret (§13.2's tab switching and each tab's local navigation) —
     /// `App` only acts on the outcomes that reach outside the surface
     /// itself: closing it, an API round trip Evidence's bounded "load
-    /// older" needs, a deliberately submitted Answer (§15.1/§15.2), and
-    /// opening one of §13.10's confirmation overlays (the mutation itself
-    /// waits on that overlay's own deliberate Confirm, per §15.5).
+    /// older" needs, a deliberately submitted Answer (§15.1/§15.2), opening
+    /// one of §13.10's confirmation overlays (the mutation itself waits on
+    /// that overlay's own deliberate Confirm, per §15.5), and — when the
+    /// surface claims no local binding for the key at all (issue #154's
+    /// follow-up) — falling through to the same global keymap browsing
+    /// uses everywhere else, so e.g. `c` still reaches
+    /// `Overlay::ConnectionDetail` whenever cancel isn't currently offered.
     fn on_key_open_work(&mut self, key: KeyEvent) -> Action {
         let Some(screen) = self.work_screen.as_mut() else {
             // The opening fetch is still in flight: only Esc/q is
@@ -756,6 +936,19 @@ impl App {
                 self.overlay = Some(Overlay::ReapConfirmation);
                 Action::None
             }
+            // §15.3: `/` at the first non-whitespace position of the
+            // ANSWER composer, same wiring shape as the four confirmations
+            // above.
+            WorkScreenOutcome::OpenSlashPalette => {
+                self.slash_palette_index = 0;
+                self.overlay = Some(Overlay::SlashPalette);
+                Action::None
+            }
+            // No local WorkScreen binding claimed this key: let the same
+            // global keymap browsing uses everywhere else see it, so e.g.
+            // `c` reaches `Overlay::ConnectionDetail` whenever cancel isn't
+            // currently offered on the open Work.
+            WorkScreenOutcome::Unhandled => self.on_key_global(key.code).unwrap_or(Action::None),
         }
     }
 
@@ -1075,6 +1268,32 @@ mod tests {
         assert!(app.overlay.is_none());
     }
 
+    /// Issue #154: unlike every other overlay in §7.4's fixed set,
+    /// `Overlay::ConnectionDetail` had no key binding anywhere — `c` opens
+    /// it globally (mouse capture stays disabled, §8.9), and it closes the
+    /// same way `Help`/`SlashPalette` already do.
+    #[test]
+    fn connection_detail_opens_on_c_and_closes_on_esc_q_or_question_mark() {
+        let mut app = App::new();
+        app.on_key(KeyCode::Esc); // reach global focus from Home
+
+        assert!(app.overlay.is_none());
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        app.on_key(KeyCode::Esc);
+        assert!(app.overlay.is_none());
+
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        app.on_key(KeyCode::Char('q'));
+        assert!(app.overlay.is_none());
+
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        app.on_key(KeyCode::Char('?'));
+        assert!(app.overlay.is_none());
+    }
+
     #[test]
     fn fleet_enter_asks_to_open_the_canonical_work_surface() {
         let mut app = App::new();
@@ -1241,14 +1460,47 @@ mod tests {
 
     #[test]
     fn an_action_key_is_a_no_op_when_the_matrix_does_not_offer_it() {
-        // completed offers only "inspect" (§13.10) — cancel/retry/extend/
-        // reap/respond must all be no-ops, not silently open a confirmation
-        // for a mutation the daemon would refuse anyway.
+        // completed offers only "inspect" (§13.10) — retry/extend/reap/
+        // respond must all be no-ops, not silently open a confirmation for a
+        // mutation the daemon would refuse anyway. `c` is exempt: when
+        // cancel isn't offered it falls through to the global keymap and
+        // opens `Overlay::ConnectionDetail` instead (issue #154's follow-up,
+        // covered separately below), so it isn't a plain no-op here.
         let mut app = app_with_open_work("a", "completed");
-        for key in ['c', 't', 'e', 'p', 'r'] {
+        for key in ['t', 'e', 'p', 'r'] {
             assert_eq!(app.on_key(KeyCode::Char(key)), Action::None);
             assert!(app.overlay.is_none(), "{key} must not open anything");
         }
+    }
+
+    /// Issue #154's follow-up: while a Work is open, `c` is the cancel
+    /// mnemonic exactly when cancel is offered (§13.10) — and falls through
+    /// to the same global `c` binding that opens `Overlay::ConnectionDetail`
+    /// everywhere else the moment cancel is not offered, rather than being
+    /// silently swallowed by the WorkScreen catch-all.
+    #[test]
+    fn c_opens_connection_detail_in_open_work_when_cancel_is_not_offered_and_still_cancels_when_it_is()
+     {
+        let mut app = app_with_open_work("a", "completed");
+        assert!(!app.work_screen.as_ref().unwrap().action_available("cancel"));
+        assert_eq!(app.on_key(KeyCode::Char('c')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        // still inside the open Work — didn't close it or the confirmation
+        // matrix by accident.
+        assert!(app.open_work.is_some());
+
+        app.on_key(KeyCode::Esc); // close the overlay, back to the open Work
+        assert!(app.overlay.is_none());
+        assert!(app.open_work.is_some());
+
+        let mut app = app_with_open_work("a", "blocked");
+        assert!(app.work_screen.as_ref().unwrap().action_available("cancel"));
+        assert_eq!(app.on_key(KeyCode::Char('c')), Action::None);
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::CancelConfirmation),
+            "cancel still wins whenever it's offered"
+        );
     }
 
     #[test]
@@ -1347,6 +1599,25 @@ mod tests {
 
         assert_eq!(app.on_key(KeyCode::Esc), Action::None);
         assert!(app.overlay.is_none(), "no Retained preview to fall back to");
+    }
+
+    #[test]
+    fn enter_on_reap_confirmation_with_both_an_open_work_and_a_retained_selection_reaps_the_retained_id()
+     {
+        // §15.3's `/retained` can now open the Retained preview without
+        // first closing an open Work, so both `open_work` and
+        // `retained_reap_id` can be set at once when Enter confirms the
+        // reap — the explicit Retained selection must still win, exactly
+        // as `reap_identity` displays it.
+        let mut app = app_with_open_work("a", "completed_dirty");
+        app.retained_reap_id = Some("01RET".to_string());
+        app.overlay = Some(Overlay::ReapConfirmation);
+
+        assert_eq!(
+            app.on_key(KeyCode::Enter),
+            Action::Reap("01RET".to_string()),
+            "the Retained selection takes precedence over the open Work's id"
+        );
     }
 
     #[test]
@@ -1464,13 +1735,13 @@ mod tests {
         assert_eq!(app.home.workflow, "implement", "the field is untouched");
     }
 
-    /// The `@` filter field on the Workflows destination owns the keyboard
+    /// The `/` filter field on the Workflows destination owns the keyboard
     /// exactly like Home's and Fleet's own text fields — `2`/`4` etc. must
     /// not be hijacked as destination-nav while typing a filter.
     #[test]
-    fn workflows_at_sign_filter_owns_the_keyboard_like_any_other_text_field() {
+    fn workflows_slash_filter_owns_the_keyboard_like_any_other_text_field() {
         let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
-        app.on_key(KeyCode::Char('@'));
+        app.on_key(KeyCode::Char('/'));
         app.on_key(KeyCode::Char('4')); // would otherwise jump to Estate
         assert_eq!(app.destination, Destination::Workflows);
         app.on_key(KeyCode::Esc);
@@ -1479,6 +1750,51 @@ mod tests {
             app.destination,
             Destination::Estate,
             "global nav works again once the filter is left"
+        );
+    }
+
+    /// §15.4's Workflows half (issue #153): `@` while focused on the
+    /// Workflows screen itself opens the same live-catalog chooser Home's
+    /// workflow field opens; Enter here moves this screen's own selection
+    /// onto the picked entry instead of touching Home's field (`Overlay::
+    /// WorkflowChooser`'s Enter arm tells the two contexts apart by
+    /// `self.destination`, which opening the overlay never changes).
+    #[test]
+    fn at_sign_on_workflows_opens_the_chooser_and_enter_selects_it() {
+        let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
+        assert_eq!(app.on_key(KeyCode::Char('@')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::WorkflowChooser));
+
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.on_key(KeyCode::Enter), Action::None);
+        assert!(app.overlay.is_none(), "selecting closes the chooser");
+        assert_eq!(
+            app.destination,
+            Destination::Workflows,
+            "picking from Workflows stays on Workflows, unlike Home's field pick"
+        );
+        assert_eq!(
+            app.workflows.selected_entry().unwrap()["name"],
+            "diagnose-bug"
+        );
+        assert_eq!(
+            app.home.workflow, "",
+            "Home's own field is untouched by a pick made from Workflows"
+        );
+    }
+
+    /// Esc/q aborts the chooser without changing Workflows' own selection.
+    #[test]
+    fn esc_aborts_the_workflow_chooser_opened_from_workflows_without_changing_selection() {
+        let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
+        app.on_key(KeyCode::Char('@'));
+        app.on_key(KeyCode::Char('j')); // highlight diagnose-bug in the chooser
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.workflows.selected_entry().unwrap()["name"],
+            "implement",
+            "the underlying selection is untouched"
         );
     }
 

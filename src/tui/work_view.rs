@@ -117,6 +117,15 @@ pub enum WorkScreenOutcome {
     OpenExtendEnvelope,
     /// §13.10/§15.5: open the Reap confirmation.
     OpenReapConfirm,
+    /// §15.3: `/` at the first non-whitespace position of the `ANSWER`
+    /// composer opens `Overlay::SlashPalette` (App-level state) instead of
+    /// being typed literally.
+    OpenSlashPalette,
+    /// No local WorkScreen binding claimed this key (issue #154's follow-up):
+    /// the caller falls it through to `App::on_key_global` instead of
+    /// discarding it, so e.g. `c` reaches `Overlay::ConnectionDetail`
+    /// whenever cancel isn't currently offered.
+    Unhandled,
 }
 
 /// The canonical Work surface's own state: the four fetched reads, which tab
@@ -265,9 +274,30 @@ impl WorkScreen {
     /// Whether `action` (§13.10's vocabulary: `"respond"`, `"cancel"`,
     /// `"retry"`, `"extend"`, `"reap"`) is legal for the current reported
     /// state — the same table the header already renders (§13.10's
-    /// Decision T2-52).
-    fn action_available(&self, action: &str) -> bool {
+    /// Decision T2-52). `pub` so [`super::app::App`]'s §15.3 slash commands
+    /// gate on exactly this matrix rather than a second copy of it.
+    pub fn action_available(&self, action: &str) -> bool {
         actions_for_state(&self.state()).1.contains(&action)
+    }
+
+    /// §15.3's `/answer` command: the same effect as the mnemonic `r` key
+    /// (§13.10) — the caller has already checked [`WorkScreen::action_available`].
+    pub fn focus_answer(&mut self) {
+        self.answer_focused = true;
+        self.answer_send_focused = false;
+    }
+
+    /// §15.3's `/evidence`, `/graph`, `/details` commands: the same tab
+    /// switch the `1`-`5` digit keys already perform. Those digit keys are
+    /// only reachable with the `ANSWER` composer unfocused (`on_key`
+    /// routes to `on_key_answer` first when it's focused) — the palette
+    /// has no such precondition, so this must drop focus itself or a
+    /// palette pick made mid-answer would switch the visible tab while
+    /// keys kept routing into the hidden draft.
+    pub fn show_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+        self.answer_focused = false;
+        self.answer_send_focused = false;
     }
 
     pub fn on_key(&mut self, key: impl Into<KeyEvent>) -> WorkScreenOutcome {
@@ -320,7 +350,7 @@ impl WorkScreen {
             KeyCode::Char('p') if self.action_available("reap") => {
                 return WorkScreenOutcome::OpenReapConfirm;
             }
-            _ => {}
+            _ => return WorkScreenOutcome::Unhandled,
         }
         WorkScreenOutcome::None
     }
@@ -341,7 +371,10 @@ impl WorkScreen {
                 KeyCode::Enter => match self.answer.submit() {
                     ComposerOutcome::Submit(text) => return WorkScreenOutcome::Respond(text),
                     ComposerOutcome::Refused => return WorkScreenOutcome::AnswerRefused,
-                    ComposerOutcome::None => {}
+                    // `Composer::submit` never returns this — only
+                    // `Composer::on_key` interprets a typed `/` — but the
+                    // match must still be exhaustive.
+                    ComposerOutcome::None | ComposerOutcome::OpenSlashPalette => {}
                 },
                 _ => {}
             }
@@ -353,6 +386,7 @@ impl WorkScreen {
             _ => match self.answer.on_key(key) {
                 ComposerOutcome::Submit(text) => return WorkScreenOutcome::Respond(text),
                 ComposerOutcome::Refused => return WorkScreenOutcome::AnswerRefused,
+                ComposerOutcome::OpenSlashPalette => return WorkScreenOutcome::OpenSlashPalette,
                 ComposerOutcome::None => {}
             },
         }
@@ -1825,7 +1859,10 @@ mod tests {
     #[test]
     fn r_opens_the_answer_composer_only_when_respond_is_offered() {
         let mut screen = screen_with("active", Vec::new());
-        assert_eq!(screen.on_key(KeyCode::Char('r')), WorkScreenOutcome::None);
+        assert_eq!(
+            screen.on_key(KeyCode::Char('r')),
+            WorkScreenOutcome::Unhandled
+        );
         assert!(!screen.answer_focused, "respond is not offered for active");
 
         let mut screen = screen_with("needs_input", Vec::new());
@@ -1860,6 +1897,20 @@ mod tests {
             screen.on_key(ctrl_enter()),
             WorkScreenOutcome::Respond("yes, proceed".to_string())
         );
+    }
+
+    /// §15.3: `/` at the first non-whitespace position of the still-empty
+    /// `ANSWER` composer asks to open the slash palette rather than being
+    /// typed literally.
+    #[test]
+    fn slash_on_the_answer_composer_asks_to_open_the_slash_palette() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        assert_eq!(
+            screen.on_key(KeyCode::Char('/')),
+            WorkScreenOutcome::OpenSlashPalette
+        );
+        assert_eq!(screen.answer.text(), "", "no literal '/' was typed");
     }
 
     #[test]
@@ -1916,6 +1967,28 @@ mod tests {
             screen.answer_send_focused = false;
         }
         assert!(!screen.answer_focused);
+    }
+
+    /// §15.3: `/evidence`, `/graph`, `/details` reach `show_tab` while the
+    /// `ANSWER` composer may still be focused (the palette opens from
+    /// there via `/`). `on_key` routes to `on_key_answer` first whenever
+    /// `answer_focused` is set, so without this the visible tab would
+    /// change while keys kept landing in the hidden draft.
+    #[test]
+    fn show_tab_drops_answer_focus_so_the_new_tab_receives_keys() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        assert!(screen.answer_focused);
+        screen.show_tab(Tab::Evidence);
+        assert!(!screen.answer_focused);
+        assert!(!screen.answer_send_focused);
+        assert_eq!(screen.tab, Tab::Evidence);
+        screen.on_key(KeyCode::Char('j'));
+        assert_eq!(
+            screen.answer.text(),
+            "",
+            "'j' navigated the tab, not the hidden draft"
+        );
     }
 
     #[test]
