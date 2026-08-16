@@ -6,6 +6,34 @@ than duplicate; delete what proves wrong. Entries marked **[world-delta]** are
 candidates for promotion into the owner's knowledge corpus — promotion happens
 only on the owner's explicit ask.
 
+## L25 — A dispatched Work's journaled `final_sha` outlives its local git ref
+
+Cerberus, 2026-08-16, T-series build sprint. A wildcard `git fetch
+github 'refs/heads/sergeant/*:refs/heads/sergeant/*'`, run to sync a
+critic's branch, silently deleted four *other* local branches for Works
+that had completed but were never pushed — the wildcard mapping overlays
+remote state directly onto matching local refs, and "the remote doesn't
+have this branch" reads as "delete the local one," even for a branch the
+remote never had a chance to hold yet. This is the exact class of harm
+`docs/DEVELOPMENT.md`'s guardrails warn about for destructive git
+operations, arrived at by an ordinary-looking sync command, not an
+obviously risky one.
+
+Nothing was actually lost. `sgt work show <id>`'s `teardown.bindings[].
+final_sha` — journaled at teardown, independent of whatever ref happens to
+point at it — named the exact commit each deleted branch had pointed to.
+`git cat-file -t <sha>` confirmed every commit object was still present
+(git's object store doesn't prune on ref deletion without an explicit
+gc), so `git branch <name> <sha>` recreated every branch, byte-identical,
+from data the daemon had already durably recorded. Rule: **a Work's own
+journaled `final_sha` is the recovery anchor, not the branch ref that
+happens to carry it right now.** This is the same "journal is the only
+truth, everything else is a disposable projection" invariant
+(`docs/DEVELOPMENT.md`) applied one layer up — a local git ref is exactly
+as disposable as an in-memory projection, and the journal already has
+the fact that would rebuild it. Before treating a lost branch as lost
+work, check `sgt work show` first.
+
 ## L24 — A quiet observer and a stalled subject look identical; and a false absence's *correction* is where the damage lands **[world-delta]**
 
 Cerberus, 2026-08-15, PATH-TO-MAC-1. Two halves of one shape, both found in a

@@ -1754,7 +1754,7 @@ fn report_daemon_stop(json: bool, status: &str, message: &str) {
 /// `retry`, `extend`, `cancel`) start one on demand; this one is asking
 /// whether the installation is sound, and starting the thing under
 /// examination would answer a different question.
-mod doctor {
+pub(crate) mod doctor {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 

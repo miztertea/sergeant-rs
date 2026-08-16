@@ -58,6 +58,146 @@ letter by coincidence, as D6 and D7 do here.
 
 ## Ledger entries
 
+### T-SERIES-BUILD — 2026-08-16, the operator cockpit shipped: T0-T4 built, tested, and merged to the integration branch
+
+**Mission outcome: built.** The T-SERIES-1-validated proposal
+(`reference/proposal-tui-t-series.md`) is implemented in full except two
+named, tracked gaps (below). Ten `sgt` Works dispatched against
+`integration/t-series-2026-08-15`, each independently verified by the
+orchestrating session (Captain) — `cargo fmt --check`, `cargo clippy
+--all-targets -D warnings`, and the full `cargo test` suite re-run
+post-merge, never trusted from a Work's own claim — per
+`docs/gauntlet/runs/t-series-build-2026-08-16/plan.md`'s stated duty. No
+merge to `main`; every Work landed as its own sub-PR against head PR
+#131, per the owner's explicit instruction.
+
+**The one owner ruling this program needed.** T-SERIES-1's sole surviving
+error on the invariants axis — Decision T2-14's proposed Estate/Doctor
+client-boundary bypass — was not resolved by adjudication fiat. The owner
+ruled directly, in dialogue with Captain: extend the daemon API (`GET`/
+`POST`/`DELETE /v1/estate/{repos,groups}`, `GET /v1/doctor`, all thin
+wrappers over already-existing `crate::domain::manifest`/`mod doctor`
+functions), never revise the hardened `t5`/`t5b` client-boundary tests.
+Recorded in full at **ADR 0012**.
+
+**Waves, as run** (plan's own table, `docs/gauntlet/runs/
+t-series-build-2026-08-16/plan.md` §4):
+
+| Work | Scope | Turns | Notes |
+|---|---|---|---|
+| ruling | T2-14 resolved into the proposal text | 2 | Owner ruling applied verbatim, not invented |
+| T0 | Adjudication/revision freeze: pinned base, re-audited CLI/API/TUI (no drift), finalized the workflow-catalog schema, ran the `ratatui-textarea` spike read-only (all 8 conditions proved), locked visual tokens/breakpoints | 4 | |
+| T1a | `src/tui.rs` (2,614 lines, flat) restructured into a module tree; `Home/Fleet/Workflows/Estate` nav; Attention drawer; Fleet; Home's submission form | 2 | Preserved the existing terminal-lifecycle/reconnect machinery rather than reinventing it |
+| T1b | Canonical Work surface: Thread/Workflow/Evidence/Graph/Details, action matrix display-only | 2 | |
+| T1c | `ratatui-textarea` composer (one narrow wrapper, T2-31); wired respond/retry/extend/cancel/reap live; confirmation flows; responsive Fleet | 2 | Added the two missing `ApiClient` methods (`retry`, `extend`) the T0 audit didn't know were absent |
+| T2 ‖ | Workflow discovery: `GET /v1/workflows` (T0's locked schema) + loader front-matter parsing (new); Workflows screen; live-catalog `@` chooser | 2 | Parallel wave with T3 |
+| T3 ‖ | Estate: the 7 ADR-0012 routes; Repositories/Groups/Health screens, full lifecycle parity | 2 | Parallel wave with T2; merged first |
+| — | **T2 merge conflict** (both waves add sibling entries to `src/api.rs`'s imports, `src/tui/{app,mod,overlay}.rs`'s enums/match arms) resolved by hand by Captain — mechanical, never a semantic disagreement between the two Works. Verified: fmt/clippy/full suite green twice | — | Anticipated in the plan's own §7 risk list |
+| gate-guard | scripts/gate.sh pre-flight refuses rather than silently false-passing on issue #120's empty-diff condition | 4 | This estate's own `origin` remote was, at dispatch time, exactly the condition #120 describes — this Work protected its own sprint's later gate run |
+| T4 | Geometry matrix (80x24/120x36/180x48) across every screen; Taste pre-flight (fixed a stale doc claim); real `TestBackend` screenshots (`docs/tui-screenshots/`, `#[ignore]`d generator, not run every `cargo test`) | 2 | Caught a real regression: Reap's confirmation silently named "-  -" when opened from Estate's Retained preview rather than an open Work, since it read only `open_work`/`work_screen`, both `None` on that path |
+
+**Named gaps, not silently dropped.** The slash palette (§15.3) and the
+Workflows-screen half of the `@` chooser (§15.4) were deferred by T1c and
+never assigned to T2, T3, or T4 — `Overlay::SlashPalette::owner()` says so
+in the running code, and the proposal's own implementation-status note
+(added this entry) says so in prose. Tracked for a future round, not lost.
+
+**Evidence discipline, not narrated.** Every merge in this table was
+gated on an independent post-merge `cargo test` run by Captain (never the
+dispatched Work's own self-report) — two of the ten Works (T1b, and the
+first T2/T3 merge) hit a real flaky test under full-suite host load
+(`t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it`), reproduced
+clean in isolation and on a second full run both times, matching this
+ledger's own ADR-0008-entry precedent for the same class of flake — not
+waved through on the first red without re-running.
+
+**Shipping gate.** Not yet run — the deliverable of this entry is the
+built, tested, merged integration branch; the final `validate-and-ship`
+whole-branch gate (protected by this same sprint's own gate-guard Work)
+and the owner's review of head PR #131 are the remaining steps, both
+outside this entry's scope by design (the owner's own instruction: no
+merge to `main` by this session).
+
+**P2-JOURNAL handoff.** Unaffected by this program, and unaffected by it
+deliberately: §16's data-and-extraction boundary holds throughout — this
+implementation added exactly one new read-only route (`GET /v1/workflows`)
+and seven new estate/doctor routes, all Work- or estate-scoped, and zero
+global journal/DuckDB query surface. P2-JOURNAL remains free to design
+that surface without inheriting any T-series decision about it.
+
+### T-SERIES-1 — 2026-08-16, revised operator-cockpit proposal graded: validated with findings
+
+**Mission outcome: validated with findings.** The revised T-series proposal
+(`reference/proposal-tui-t-series.md`, 2026-08-15, superseding the
+2026-08-11 predecessor) was graded by the same four-axis blind-panel method
+FOUNDATION-1 established: fidelity, invariants, assumptions, enactability,
+each critic run as a dispatched `sgt` Work, each finding independently
+re-derived (not trusted) by a per-axis adversarial refuter, adjudicated by
+the orchestrating session. First reuse of the proposal-grading method on a
+proposal roughly 4.5× the size of FOUNDATION-1's (~2,300 lines). 19
+findings, 1 refuted, 18 confirmed, 3 severity downgrades, **3 surviving
+errors**. Every verdict held its section survives a local correction; no
+decision was invalidated and nothing was sent back. Full record:
+`docs/gauntlet/runs/t-series-1/` (critics, refuters, adjudication).
+
+**North Star gate lifted first, same session.** `NORTH-STAR.md`'s Wave 3
+"dogfood round 2" condition on T-series was amended in place (dated
+2026-08-15, owner ruling in dialogue with Captain): satisfied by evidence
+accrued since 2026-08-11 (MVP ship, WATCH ship, FOUNDATION-1 + cross-
+platform sprint, the MacBook-arrival measurement pass) rather than by one
+discrete named event. This gauntlet unit is the first work dispatched under
+that lifted gate.
+
+**The three surviving errors.** `inv-estate-doctor-bypasses-client-
+boundary`: Decision T2-14 has `tui.rs` call shared local Estate/Doctor
+operations directly, a second crate-internal reach path beyond
+`crate::api` that `tests/m6_surfaces.rs` t5/t5b rejects today by
+construction — the proposal names the rule it changes but never names the
+test, and its stated justification (no-daemon CLI semantics) doesn't apply
+to the TUI, which ADR 0009/T2-16 already commit to never running without a
+live daemon. Per the FOUNDATION-1 precedent for a genuine open design
+question, this is not resolved by adjudication fiat — it is named as T0's
+first required ruling. `assumptions F1`: PR #111 merged into `main` at
+`3a46b87` (2026-08-15T15:28:02Z) before this proposal was even drafted, but
+~20 locations — frontmatter, header, a full section, a full subsection, two
+acceptance items, a falsifier — instruct a reader or dispatched Work to
+treat it as unmerged; the assumptions refuter distinguished this from the
+FOUNDATION-1 precedent's similar-shaped finding because these are
+prescriptive instructions a Work would read as binding, not narrative
+background. `enactability Finding 3`: the T0–T4 program never assigns the
+Workflow, Evidence, Graph, or Details tabs (of `Thread Workflow Evidence
+Graph Details`, all four bound into §21 acceptance) to any phase — a Work
+could complete every phase's own checklist and still fail acceptance, with
+no earlier catch point.
+
+**The refuted finding.** `enactability Finding 1` claimed §20.1's "No
+product code" and its required dependency-resolution spike were mutually
+exclusive. Refuted on the critic's own evidence: the critic's own
+investigative method (`cargo tree`, `cargo add --dry-run`, a scratch crate)
+already produces the required proof without touching a product file — the
+critic used exactly those tools one paragraph before concluding no such
+path exists.
+
+**Three downgrades**, each a refuter correcting severity inherited by
+association rather than earned by independent downstream impact:
+`assumptions F2` (error→warning, a real-but-misattributed commit hash with
+no normative content depending on it, structurally identical to a sibling
+finding the same critic scored warning), `enactability Finding 2`
+(error→warning, a Work has an obvious non-stalling resolution available
+from context), `enactability Finding 6` (warning→info, the refuter's own
+live `gh pr view 111` call foreclosed the concrete risk scenario the
+finding's severity depended on).
+
+**Disposition.** No build authorized by this unit — acceptance is the
+owner's, not the panel's, per the contract. A mechanical corrections pass
+over the proposal (all ~20 PR #111 locations, the two other citation
+defects, the Doctor check-name list, the disposition-table mislabel, the
+R7 justification gap, the R-NS-6 restatement, the four unassigned tabs
+under T1, and the client-boundary open question as T0's first ruling) is
+dispatched as its own `sgt` Work rather than hand-edited by this
+adjudication, so it receives the same review stage every other piece of
+this unit did.
+
 ### MACBOOK-ARRIVAL-1 — 2026-08-15, a plan graded before it governed: validated with findings, no section sent back
 
 **Mission outcome: validated with findings.** Artifact:

@@ -64,7 +64,7 @@ use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::runtime::journal::Journal;
-use sergeant_rs::tui::{self, App, Screen};
+use sergeant_rs::tui::{self, Action, App, Destination};
 
 mod support;
 use support::DataDir;
@@ -124,6 +124,23 @@ fn write_workflow(root: &Path) {
         std::fs::create_dir_all(dir.join(stage)).expect("stage dir");
         std::fs::write(dir.join(stage).join("CONTEXT.md"), "context").expect("CONTEXT.md");
     }
+}
+
+/// A one-stage workflow — T1c's mutation tests each drive exactly one Work
+/// through exactly one stage, so a single-stage fixture keeps each test's
+/// `FakeStep` script trivially "one step per turn", with no risk of a
+/// second Work's launch or a retry's re-entry consuming the wrong entry off
+/// a queue shared with anything else.
+fn write_solo_workflow(root: &Path) {
+    let dir = root.join(".sergeant/workflows/solo");
+    std::fs::create_dir_all(&dir).expect("workflow dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"solo\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+    )
+    .expect("workflow.toml");
+    std::fs::create_dir_all(dir.join("00-only")).expect("stage dir");
+    std::fs::write(dir.join("00-only").join("CONTEXT.md"), "context").expect("CONTEXT.md");
 }
 
 async fn start_fake(
@@ -213,9 +230,13 @@ fn assert_shows(terminal: &Terminal<TestBackend>, needle: &str, what: &str) {
 
 // ------------------------------------------------------------------- 1. TUI
 
-/// Acceptance 1. The TUI's two screens render the contracted fields from a
-/// live daemon, a live SSE event drives a re-render, and its write keys are
-/// real verbs against the API — not decoration.
+/// Acceptance 1. The TUI's Fleet browser and canonical-Work stub render the
+/// contracted fields from a live daemon, a live SSE event drives a
+/// re-render, and Home's New Work submission is a real verb against the API
+/// — not decoration. (T1a replaces the M6-era two-screen Fleet/Detail TUI
+/// with `Home / Fleet / Workflows / Estate` navigation over a canonical Work
+/// stub; respond/retry/extend/cancel mutations are T1c's job, §20.2, so this
+/// acceptance test no longer drives them.)
 #[tokio::test]
 async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     let data = TempDir::new().expect("tempdir");
@@ -223,18 +244,15 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     init_repo(repo.path());
     write_workflow(repo.path());
 
-    // Two works: one that finishes, one that stops for an answer. Between
-    // them the fleet screen has to show two different states and the detail
-    // screen has something to say about stage, surface and execution.
+    // Two works: one that finishes, one that stops for an answer, so Fleet
+    // has to show two different states and the canonical Work stub has
+    // something to say about stage and workflow.
     let (handle, _fake) = start_fake(
         data.path(),
         [
             FakeStep::complete_with("first stage done"),
             FakeStep::complete(),
             FakeStep::needs_input("which retry budget?"),
-            // The fourth work below must be in a cancelable state when the
-            // cancel key reaches it — a completed work is not one.
-            FakeStep::needs_input("and how many retries here?"),
         ],
     )
     .await;
@@ -246,46 +264,95 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
 
-    // --- fleet screen ------------------------------------------------------
+    // --- Fleet ---------------------------------------------------------
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('2')); // Fleet
+    assert_eq!(app.destination, Destination::Fleet);
+
     let terminal = render(&app);
-    assert_shows(&terminal, &done, "completed work's id");
-    assert_shows(&terminal, &asking, "waiting work's id");
+    // Fleet's id column is §10.2's lowest-priority, "short id" field — it
+    // may truncate a full ULID under real terminal widths, so this checks a
+    // distinguishing prefix rather than the whole thing. The canonical Work
+    // stub below asserts the untruncated id.
+    assert_shows(&terminal, &done[..12], "completed work's id (prefix)");
+    assert_shows(&terminal, &asking[..12], "waiting work's id (prefix)");
     assert_shows(&terminal, "completed", "completed state");
     assert_shows(&terminal, "needs_input", "needs_input state");
     assert_shows(&terminal, "finish this one", "intent");
     assert_shows(&terminal, "00-first 1/2", "stage coordinate");
     assert_shows(&terminal, FAKE_BACKEND_NAME, "resolved backend");
-    assert_shows(&terminal, "fleet — 2 work", "fleet header");
+    assert_shows(&terminal, "Fleet — 2 works", "fleet header");
 
-    // --- detail screen -----------------------------------------------------
+    // --- the canonical Work surface (§13, T1b) --------------------------
     let asking_row = app
         .rows
         .iter()
         .position(|row| row.id == asking)
         .expect("the waiting work is in the fleet");
-    app.selected = asking_row;
+    app.fleet.selected = asking_row;
     let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
     assert_eq!(
         action,
-        tui::Action::Refresh,
-        "enter opens the detail screen"
+        Action::OpenWork(asking.clone()),
+        "opening the real surface asks for the fetch WorkScreen::load makes"
     );
-    assert_eq!(app.screen, Screen::Detail);
-    app.refresh(&client).await.expect("detail read");
+    assert!(
+        app.open_work.is_none(),
+        "not open until the fetch actually runs"
+    );
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::None);
+    assert_eq!(
+        app.open_work,
+        Some(tui::OpenWork {
+            id: asking.clone(),
+            from: Destination::Fleet,
+        })
+    );
 
+    // Thread (default tab): the initial intent, the pinned workflow's own
+    // question surfaced as a gold ask card or, absent one from this fake
+    // backend, at minimum the header's above-the-fold pin.
     let terminal = render(&app);
-    let detail = screen_text(&terminal);
     assert_shows(&terminal, &asking, "work id");
     assert_shows(&terminal, "ask me something", "intent");
     assert_shows(&terminal, "needs_input", "state");
     assert_shows(&terminal, "tiny", "workflow name");
-    assert_shows(&terminal, "00-first 1/2", "stage");
-    assert_shows(&terminal, "which retry budget?", "the stage's question");
-    assert_shows(&terminal, "fake-session-", "native session identity");
-    assert_shows(&terminal, "sergeant/", "the surface's work branch");
+    assert_shows(&terminal, "00-first", "stage");
+    assert_shows(
+        &terminal,
+        "which retry budget?",
+        "the stage's question, pinned above the fold",
+    );
+    assert_shows(&terminal, "Thread", "the tab bar names Thread");
+    assert_shows(&terminal, "Workflow", "the tab bar names Workflow");
+    assert_shows(&terminal, "Evidence", "the tab bar names Evidence");
+    assert_shows(&terminal, "Graph", "the tab bar names Graph");
+    assert_shows(&terminal, "Details", "the tab bar names Details");
+
+    // Workflow: the pinned stage rail, not a percent bar.
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    let terminal = render(&app);
+    assert_shows(&terminal, "00-first", "the rail names the first stage");
+    assert_shows(&terminal, "10-second", "the rail names the second stage");
     assert!(
-        detail.contains("stage.needs_input") || detail.contains("work.needs_input"),
-        "the recent-events tail must show the transition events:\n{detail}"
+        !screen_text(&terminal).contains('%'),
+        "never a percent bar (Decision T2-50)"
+    );
+
+    // Evidence: the raw journal window for this Work alone.
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    let terminal = render(&app);
+    assert_shows(&terminal, "stage.entered", "a raw journal kind");
+
+    // Esc returns to exactly where it was opened from, and drops the fetch.
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc);
+    assert!(app.open_work.is_none(), "Esc closes the surface");
+    assert!(app.work_screen.is_none());
+    assert_eq!(
+        app.destination,
+        Destination::Fleet,
+        "back to exactly where it was opened from"
     );
 
     // --- an SSE event drives a re-render ------------------------------------
@@ -320,47 +387,380 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         "a work.submitted event must be classified as state-bearing"
     );
     app.refresh(&client).await.expect("refresh after the event");
-    app.screen = Screen::Fleet;
     assert_shows(
         &render(&app),
-        &fresh,
+        &fresh[..12],
         "work that arrived over SSE while the TUI was open",
     );
 
-    // --- the advertised write keys are real verbs ---------------------------
-    app.detail_id = Some(asking.clone());
-    let respond = app.on_key(ratatui::crossterm::event::KeyCode::Char('i'));
-    assert_eq!(respond, tui::Action::None, "the prompt opens first");
-    for c in "3 attempts".chars() {
+    // --- Home's New Work submission is a real POST /v1/work, not decoration
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('1')); // Home; re-focuses the form
+    for c in "submitted from the tui".chars() {
         app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
     }
+    // Tab past workflow/backend/profile/workspace/repositories/turns/ceiling
+    // to the `[ Run Work ]` control, then submit.
+    for _ in 0..8 {
+        app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    }
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    let Action::Submit(body) = action else {
+        panic!("expected a submission, got {action:?}");
+    };
+    assert_eq!(body["intent"], "submitted from the tui");
+    assert_eq!(body["created_by"], "tui");
+    let outcome = app.execute(&client, Action::Submit(body)).await;
+    assert_eq!(outcome, Action::Refresh);
+    assert!(
+        app.home.last_error.is_none(),
+        "the daemon must accept it: {:?}",
+        app.home.last_error
+    );
+    assert!(
+        app.home.intent.is_empty(),
+        "the draft clears once the daemon accepts it"
+    );
+
+    let fleet = client.fleet().await.expect("read back");
+    assert!(
+        fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .any(|w| w["intent"] == "submitted from the tui"),
+        "the TUI's New Work form must actually reach the daemon: {fleet}"
+    );
+
+    handle.shutdown().await;
+}
+
+// -------------------------------------------------------- T1c: mutations
+
+/// Respond (§15.1's `ANSWER` composer, §13.10's action matrix) reaches the
+/// real `POST /v1/work/{id}/input` — driven through the actual keymap
+/// (`r`, type the answer, Ctrl+Enter), not a hand-built `Action::Respond`.
+#[tokio::test]
+async fn t1c_respond_reaches_the_real_api_through_the_answer_composer() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(
+        data.path(),
+        [
+            FakeStep::needs_input("which retry budget?"),
+            FakeStep::complete(),
+        ],
+    )
+    .await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "ask a question", "solo").await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    let action = app.execute(&client, Action::OpenWork(id.clone())).await;
+    assert_eq!(action, Action::None);
+    assert_eq!(
+        app.work_screen.as_ref().unwrap().work()["work"]["state"],
+        "needs_input"
+    );
+
+    assert_eq!(
+        app.on_key(ratatui::crossterm::event::KeyCode::Char('r')),
+        Action::None,
+        "'r' focuses the answer composer, it does not itself mutate"
+    );
+    for c in "forty turns".chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    let ctrl_enter = ratatui::crossterm::event::KeyEvent::new(
+        ratatui::crossterm::event::KeyCode::Enter,
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+    let action = app.on_key(ctrl_enter);
+    assert_eq!(
+        action,
+        Action::Respond {
+            id: id.clone(),
+            input: "forty turns".to_string(),
+        }
+    );
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(
+        outcome,
+        Action::Refresh,
+        "a mutation always asks to refresh"
+    );
+    assert!(
+        app.status.contains(&format!("responded to {id}")),
+        "{}",
+        app.status
+    );
+
+    let work = client.work(&id).await.expect("read back");
+    assert_eq!(
+        work["work"]["state"], "completed",
+        "the real POST /v1/work/{{id}}/input resumed the turn, which the \
+         script's next step then completes — a decoration would have left \
+         this Work parked on needs_input forever: {work}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Cancel (§13.10/§15.5) reaches the real `POST /v1/work/{id}/cancel`,
+/// driven through the confirmation overlay's own deliberate Enter.
+#[tokio::test]
+async fn t1c_cancel_reaches_the_real_api_through_the_confirmation() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::waiting("queued upstream")]).await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "wait around", "solo").await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.execute(&client, Action::OpenWork(id.clone())).await;
+    assert_eq!(
+        app.work_screen.as_ref().unwrap().work()["work"]["state"],
+        "waiting"
+    );
+
+    assert_eq!(
+        app.on_key(ratatui::crossterm::event::KeyCode::Char('c')),
+        Action::None
+    );
+    assert!(
+        app.overlay.is_some(),
+        "'c' must open the cancel confirmation before anything is sent"
+    );
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert_eq!(action, Action::Cancel(id.clone()));
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::Refresh);
+    assert!(app.overlay.is_none(), "success closes the confirmation");
+
+    let work = client.work(&id).await.expect("read back");
+    assert_eq!(work["work"]["state"], "canceled", "{work}");
+
+    handle.shutdown().await;
+}
+
+/// Retry (§13.10/§15.5) reaches the real `POST /v1/work/{id}/retry`.
+#[tokio::test]
+async fn t1c_retry_reaches_the_real_api_through_the_confirmation() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) =
+        start_fake(data.path(), [FakeStep::fail("boom"), FakeStep::complete()]).await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "fail then retry", "solo").await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.execute(&client, Action::OpenWork(id.clone())).await;
+    assert_eq!(
+        app.work_screen.as_ref().unwrap().work()["work"]["state"],
+        "failed"
+    );
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('t'));
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert_eq!(action, Action::Retry(id.clone()));
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::Refresh);
+
+    let work = client.work(&id).await.expect("read back");
+    assert_eq!(
+        work["work"]["state"], "completed",
+        "retry re-entered the stage, which the script's next step completes: {work}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Extend (§13.10/§15.5) reaches the real `POST /v1/work/{id}/extend` with
+/// the explicit turns the operator typed, and never implicitly retries
+/// (§13.9's closing rule) — the Work stays `blocked` afterward.
+#[tokio::test]
+async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::blocked("envelope exhausted")]).await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "run out of turns", "solo").await;
+
+    let before = client.work(&id).await.expect("read back");
+    assert_eq!(before["work"]["state"], "blocked");
+    let cap_before = before["envelope"]["turn_cap"].as_u64().expect("turn_cap");
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.execute(&client, Action::OpenWork(id.clone())).await;
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    for c in "5".chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // field -> Confirm
     let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
     assert_eq!(
         action,
-        tui::Action::Respond(asking.clone(), "3 attempts".to_string())
+        Action::Extend {
+            id: id.clone(),
+            additional_turns: 5,
+        }
     );
-    app.execute(&client, action).await;
-    let after = client.work(&asking).await.expect("read back");
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::Refresh);
+    assert!(app.overlay.is_none(), "success closes the confirmation");
+
+    let after = client.work(&id).await.expect("read back");
     assert_eq!(
-        after["work"]["state"], "completed",
-        "the TUI's respond key must actually answer the work: {after}"
+        after["envelope"]["turn_cap"].as_u64(),
+        Some(cap_before + 5),
+        "{after}"
+    );
+    assert_eq!(
+        after["work"]["state"], "blocked",
+        "extend must not implicitly retry: {after}"
     );
 
-    app.detail_id = None;
-    app.screen = Screen::Fleet;
-    app.selected = app
-        .rows
-        .iter()
-        .position(|row| row.id == fresh)
-        .expect("the fresh work is listed");
-    app.on_key(ratatui::crossterm::event::KeyCode::Char('c'));
-    let action = app.on_key(ratatui::crossterm::event::KeyCode::Char('y'));
-    assert_eq!(action, tui::Action::Cancel(fresh.clone()));
-    app.execute(&client, action).await;
-    let after = client.work(&fresh).await.expect("read back");
+    handle.shutdown().await;
+}
+
+/// §12.1 end to end: the Add-repo form's real `POST /v1/estate/repos` —
+/// kicked off the render loop rather than awaited inline (the spinner/
+/// elapsed rule), per T3's own routes over `crate::domain::manifest::
+/// add_repo`. `App::poll_background` (called every loop tick in production,
+/// polled directly here) is what notices the clone finished and closes the
+/// overlay.
+#[tokio::test]
+async fn t3_estate_add_repo_reaches_the_real_api_off_the_render_loop() {
+    // The default `<estate_root>/.sergeant/data` layout — `src/api.rs`'s
+    // `resolve_estate_root` walks up from the daemon's own data dir to find
+    // it, so the daemon must actually be started on a data dir nested under
+    // a real `sergeant.toml`, not a bare tempdir.
+    let estate_root = TempDir::new().expect("tempdir");
+    std::fs::write(
+        estate_root.path().join("sergeant.toml"),
+        "[estate]\nname = \"t3-tui-estate\"\n",
+    )
+    .expect("write sergeant.toml");
+    let data_dir = estate_root.path().join(".sergeant/data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let source = TempDir::new().expect("tempdir");
+    init_repo(source.path());
+
+    let (handle, _fake) = start_fake(&data_dir, []).await;
+    let client = client_for(&handle);
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus first
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('4'));
+    assert_eq!(app.destination, Destination::Estate);
+    let opened = app.on_key(ratatui::crossterm::event::KeyCode::Char('a'));
     assert_eq!(
-        after["work"]["state"], "canceled",
-        "the TUI's cancel key must actually cancel the work: {after}"
+        opened,
+        Action::None,
+        "opening the form is local, not a mutation"
+    );
+
+    for c in "svc-a".chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // -> origin
+    for c in source.path().to_str().expect("utf8 path").chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // -> instructions
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // -> confirm
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert_eq!(
+        action,
+        Action::AddRepo {
+            name: "svc-a".to_string(),
+            origin: Some(source.path().to_str().expect("utf8 path").to_string()),
+            instructions: None,
+        }
+    );
+
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(
+        outcome,
+        Action::None,
+        "the clone runs off the render loop — execute must return immediately, not await it"
+    );
+    assert!(
+        app.overlay.is_some(),
+        "the overlay stays open showing the spinner until the background add finishes"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let needs_refresh = loop {
+        let needs_refresh = app.poll_background();
+        if app.estate.pending_repo_add.is_none() {
+            break needs_refresh;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the background add-repo task must finish and be noticed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        needs_refresh,
+        "a successful add must ask for a refresh: {}",
+        app.status
+    );
+    assert!(app.overlay.is_none(), "success closes the add-repo overlay");
+    assert!(app.status.contains("repo added"), "{}", app.status);
+
+    app.refresh(&client).await.expect("re-read after the add");
+    assert!(
+        app.estate.repos.iter().any(|r| r["name"] == "svc-a"),
+        "the real POST must have declared the repo, not just returned success: {:?}",
+        app.estate.repos
+    );
+
+    handle.shutdown().await;
+}
+
+/// §12.3: Health renders the real `GET /v1/doctor` report — status, check
+/// name, and detail per check, reached by navigating there through the
+/// keymap (Estate's own Tab cycles Repositories → Groups → Health) rather
+/// than poking internal state the TUI itself cannot reach any other way.
+#[tokio::test]
+async fn t3_estate_health_renders_the_real_doctor_report() {
+    let data = TempDir::new().expect("tempdir");
+    let (handle, _fake) = start_fake(data.path(), []).await;
+    let client = client_for(&handle);
+
+    let mut app = App::new();
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus first
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('4'));
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // Repositories -> Groups
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // Groups -> Health
+    app.refresh(&client).await.expect("first read");
+
+    let terminal = render(&app);
+    assert_shows(&terminal, "git", "the doctor report's git check");
+    assert_shows(
+        &terminal,
+        "disk_pressure",
+        "the doctor report's disk_pressure check",
     );
 
     handle.shutdown().await;
@@ -372,12 +772,12 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
 /// checked where §30 puts it.)
 #[test]
 fn t1_the_tui_has_no_private_shortcut() {
-    let tui = code_only(&read_source("tui.rs"));
+    let tui = code_only(&read_tui_source());
     assert_eq!(
         crate_paths(&tui),
         vec!["api".to_string()],
-        "tui.rs may name crate::api and nothing else — a private shortcut here \
-         means the API is incomplete (§30)"
+        "the tui module tree may name crate::api and nothing else — a private \
+         shortcut here means the API is incomplete (§30)"
     );
     assert!(
         tui.contains("ApiClient"),
@@ -841,17 +1241,17 @@ async fn t1_the_events_endpoint_filters_and_tails_by_work() {
 
 // ------------------------------------------------------------ TUI resilience
 
-/// A TUI holding a detail screen for a work the daemon no longer has falls
-/// back to the fleet instead of painting a corpse.
+/// A TUI holding the canonical Work stub open for a work the daemon no
+/// longer has falls back to Fleet instead of painting a corpse.
 ///
 /// The data dir can be replaced under a running client (a restore, a wiped
-/// scratch dir, a `--data-dir` pointed somewhere else) and the detail screen
-/// is the one part of `App` that keeps asking about a specific id. A refresh
-/// that answered 404 used to be indistinguishable from a refresh that failed:
-/// this arm is why the screen recovers rather than either erroring out or
-/// re-rendering the last body it happened to hold.
+/// scratch dir, a `--data-dir` pointed somewhere else) and `App::open_work`
+/// is the one part of `App` that keeps asking about a specific id — T1a's
+/// stub does that purely from the already-loaded Fleet projection (no
+/// per-work API call yet; that is T1b's job), so the fallback rule is
+/// "still in the refreshed Fleet rows or not", checked in `App::refresh`.
 #[tokio::test]
-async fn a_detail_screen_whose_work_vanished_falls_back_to_the_fleet() {
+async fn a_work_view_whose_work_vanished_falls_back_to_fleet() {
     let data = TempDir::new().expect("tempdir");
     let repo = TempDir::new().expect("tempdir");
     init_repo(repo.path());
@@ -862,29 +1262,31 @@ async fn a_detail_screen_whose_work_vanished_falls_back_to_the_fleet() {
     let client = client_for(&handle);
 
     let mut app = App::new();
-    app.detail_id = Some(work_id.clone());
-    app.screen = Screen::Detail;
     app.refresh(&client).await.expect("first read");
     assert!(
-        !app.detail_events.is_empty(),
-        "the detail screen starts with a real work's events"
+        app.rows.iter().any(|row| row.id == work_id),
+        "the work is in the fleet before it vanishes"
     );
+    app.open_work = Some(tui::OpenWork {
+        id: "01NOSUCHWORKATALL".to_string(),
+        from: Destination::Fleet,
+    });
 
-    // The work the screen is showing is gone; the fleet behind it is not.
-    app.detail_id = Some("01NOSUCHWORKATALL".to_string());
+    // The work the stub is showing is gone; the fleet behind it is not.
     app.refresh(&client)
         .await
         .expect("a work that vanished is not a client failure");
 
-    assert_eq!(app.screen, Screen::Fleet, "the screen falls back");
-    assert_eq!(app.detail_id, None, "and stops asking about the dead id");
-    assert_eq!(app.detail, Value::Null);
-    assert!(
-        app.detail_events.is_empty(),
-        "nothing of the vanished work is left to paint"
+    assert_eq!(
+        app.open_work, None,
+        "the surface falls back rather than painting a corpse"
     );
     assert!(
-        !app.rows.is_empty(),
+        app.work_screen.is_none(),
+        "its fetched data must not survive the fallback either"
+    );
+    assert!(
+        app.rows.iter().any(|row| row.id == work_id),
         "the fleet it fell back to is the live one"
     );
     assert!(
@@ -2258,7 +2660,7 @@ fn the_tui_stack_is_ratatui_with_crossterm_reached_through_it() {
         "ratatui is the §34-named TUI dependency and must stay declared"
     );
 
-    let tui = code_only(&read_source("tui.rs"));
+    let tui = code_only(&read_tui_source());
     assert!(
         tui.contains("ratatui::crossterm::"),
         "the TUI must reach crossterm through ratatui's re-export"
@@ -2384,13 +2786,13 @@ fn t4_a_client_that_applies_the_knob_is_quiet_about_it() {
 /// internals somebody thought to name, and `BlobStore` was not one of them.
 #[test]
 fn t5_the_tui_is_a_client_like_any_other() {
-    let source = code_only(&read_source("tui.rs"));
+    let source = code_only(&read_tui_source());
     let paths = crate_paths(&source);
     assert_eq!(
         paths,
         vec!["api".to_string()],
-        "tui.rs may reach the crate only through `crate::api` — the API client \
-         surface — but names: {paths:?}"
+        "the tui module tree may reach the crate only through `crate::api` — \
+         the API client surface — but names: {paths:?}"
     );
     for forbidden in [
         "ApiState",
@@ -2990,6 +3392,40 @@ fn read_source(name: &str) -> String {
         .join("src")
         .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"))
+}
+
+/// The whole `src/tui/` module tree, concatenated.
+///
+/// T1a restructured the M6-era single `src/tui.rs` into a module tree
+/// (`src/tui/mod.rs` plus submodules) — the structural scans below
+/// (`t5`/`t1_the_tui_has_no_private_shortcut`) must see every file in it, not
+/// just `mod.rs`, or a submodule could reach past `crate::api` invisibly to
+/// them. This is the file-discovery half of that split; the scans'
+/// assertions themselves (what paths are allowed, what tokens are forbidden)
+/// are unchanged.
+fn read_tui_source() -> String {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("tui");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("read dir entry under {dir:?}: {e}"))
+                .path()
+        })
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() > 1,
+        "expected the tui module tree to have split into more than one file under {dir:?}, found {files:?}"
+    );
+    files
+        .into_iter()
+        .map(|path| std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The same file with its `//`-comments removed.
@@ -3656,6 +4092,39 @@ fn the_perf_clock_guard_fails_loudly_instead_of_a_malformed_timestamp() {
     assert!(
         output.status.success(),
         "the perf clock guard's selftest must pass\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// -------------------------------------------------- shipping-gate #120 pin
+
+/// #120: no-mistakes resolves its diff base by running `git ls-remote
+/// --symref origin HEAD` against this repo's `origin` remote (a live,
+/// non-bare working copy, not a fixed-default-branch host) and rebasing
+/// onto it; when a checkout was cut from that same tip, the resulting diff
+/// is genuinely empty and no-mistakes silently fast-paths to `outcome:
+/// passed` without running review/test/document/lint. The fix (this repo's
+/// own `docs/gauntlet/runs/t-series-build-2026-08-16/plan.md` names it
+/// explicitly) is a pre-flight guard in `scripts/gate.sh` that replicates
+/// that same base detection and refuses loudly instead. Same pattern as the
+/// coverage harness and perf clock guard self-tests above: a shell script
+/// outside the gate is a script whose checks are claims, and this suite
+/// already owns `scripts/`.
+#[test]
+fn the_shipping_gate_refuses_rather_than_silently_fast_pathing_on_120s_empty_diff() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/gate-guard-selftest.sh");
+    assert!(script.exists(), "scripts/gate-guard-selftest.sh must exist");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/gate-guard-selftest.sh");
+    assert!(
+        output.status.success(),
+        "the shipping gate's #120 empty-diff guard selftest must pass\n--- stdout ---\n{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
