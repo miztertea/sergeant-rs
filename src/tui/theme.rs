@@ -106,8 +106,10 @@ impl Tier {
     }
 }
 
-/// One important state's glyph (§8.4). Every glyph is one cell wide; ASCII
-/// throughout, so no fallback table is needed for reduced Unicode capability.
+/// One important state's glyph (§8.4). Every glyph is exactly one cell wide
+/// (`·`/`✓` included — narrow in every measured terminal font, not merely
+/// ASCII) and printable in any UTF-8-capable terminal, so no fallback table
+/// is needed for reduced Unicode capability.
 pub fn state_glyph(state: &str) -> &'static str {
     match state {
         "pending" => "\u{b7}", // ·
