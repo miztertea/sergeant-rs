@@ -22,9 +22,24 @@ An investigation ticket is created only for a genuinely blocking unknown, naming
   (trigger: an unknown is identified while drafting a ticket breakdown; outcome: investigation tickets are created sparingly and each has a named deliverable)
   — `BU-P4-065`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Extract Decisions and Unknowns, L60-62)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Judging whether an unknown is genuinely blocking versus answerable from existing evidence (`BU-P4-065`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- The evidence for whether an unknown is genuinely blocking is itself ambiguous or contested (e.g. one reading of the source material treats it as blocking, another as safely deferrable): state what was checked and ask rather than resolving the disagreement unilaterally.
+
+### Completion boundary
+This stage may complete only once an investigation ticket exists for every genuinely blocking unknown, each naming its exact deliverable — or the stage has stopped at the J0 case above.
+
+### Decision evidence
+The extracted decisions and unknowns are this stage's own durable output, recorded per `output/README.md`.
 
 ## Output
 
