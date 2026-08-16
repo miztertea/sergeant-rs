@@ -444,6 +444,10 @@ impl App {
         match key {
             KeyCode::Char('~') => self.drawer_open = !self.drawer_open,
             KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
+            // §7.4/§8.9: mouse capture stays disabled, so the connection
+            // detail overlay (issue #154) needs its own dedicated keyboard
+            // trigger rather than a click on the header's indicator.
+            KeyCode::Char('c') => self.overlay = Some(Overlay::ConnectionDetail),
             KeyCode::Char('1') => self.goto(Destination::Home),
             KeyCode::Char('2') => self.goto(Destination::Fleet),
             KeyCode::Char('3') => self.goto(Destination::Workflows),
@@ -1072,6 +1076,32 @@ mod tests {
         app.on_key(KeyCode::Char('?'));
         assert_eq!(app.overlay, Some(Overlay::Help));
         app.on_key(KeyCode::Esc);
+        assert!(app.overlay.is_none());
+    }
+
+    /// Issue #154: unlike every other overlay in §7.4's fixed set,
+    /// `Overlay::ConnectionDetail` had no key binding anywhere — `c` opens
+    /// it globally (mouse capture stays disabled, §8.9), and it closes the
+    /// same way `Help`/`SlashPalette` already do.
+    #[test]
+    fn connection_detail_opens_on_c_and_closes_on_esc_q_or_question_mark() {
+        let mut app = App::new();
+        app.on_key(KeyCode::Esc); // reach global focus from Home
+
+        assert!(app.overlay.is_none());
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        app.on_key(KeyCode::Esc);
+        assert!(app.overlay.is_none());
+
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        app.on_key(KeyCode::Char('q'));
+        assert!(app.overlay.is_none());
+
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        app.on_key(KeyCode::Char('?'));
         assert!(app.overlay.is_none());
     }
 

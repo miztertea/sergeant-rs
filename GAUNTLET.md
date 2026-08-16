@@ -102,6 +102,17 @@ never assigned to T2, T3, or T4 — `Overlay::SlashPalette::owner()` says so
 in the running code, and the proposal's own implementation-status note
 (added this entry) says so in prose. Tracked for a future round, not lost.
 
+**A third gap, found unnamed — now closed.** `Overlay::ConnectionDetail`
+(§7.4/§8.1) had no render body and, unlike every other overlay this entry
+lists, no key binding anywhere opened it — never named as deferred like
+the two gaps above, just silently absent (issue #154). Closed by a
+follow-up Work on `integration/t-series-followup-2026-08-16`: a dedicated
+`c` key (mouse capture stays disabled per §8.9, so no click target was
+possible) opens a read-only panel over the live/reconnecting/auth-failed
+state `src/tui/connection.rs` already tracked — no new state added.
+`Overlay::ConnectionDetail::owner()` now returns `None` alongside the
+rest of this entry's built overlays.
+
 **Evidence discipline, not narrated.** Every merge in this table was
 gated on an independent post-merge `cargo test` run by Captain (never the
 dispatched Work's own self-report) — two of the ten Works (T1b, and the

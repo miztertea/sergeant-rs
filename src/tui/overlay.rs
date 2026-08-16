@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use crate::api::field_text;
 
 use super::app::App;
+use super::connection::Live;
 use super::estate::{
     RepoOverlayMode, add_repo_body, group_form_body, remove_repo_body, retained_body,
 };
@@ -60,8 +61,11 @@ impl Overlay {
     /// The later Work that actually implements this overlay's content —
     /// `None` for the ones already built: [`Overlay::Help`] (T1a), T1c's
     /// four real confirmations (§13.10/§15.5), T2's live-catalog
-    /// [`Overlay::WorkflowChooser`] (§11.4, §15.4), and T3's three Estate
-    /// panels (§12.1/§12.2/§12.4).
+    /// [`Overlay::WorkflowChooser`] (§11.4, §15.4), T3's three Estate
+    /// panels (§12.1/§12.2/§12.4), and [`Overlay::ConnectionDetail`]
+    /// (§7.4/§8.1, issue #154 — a follow-up Work, since T1c's own scope note
+    /// only named the slash palette and the Workflows `@` chooser half as
+    /// deferred).
     fn owner(self) -> Option<&'static str> {
         match self {
             Overlay::Help
@@ -72,12 +76,12 @@ impl Overlay {
             | Overlay::WorkflowChooser
             | Overlay::RepoAddRemove
             | Overlay::GroupEditRemove
-            | Overlay::RetainedPreview => None,
+            | Overlay::RetainedPreview
+            | Overlay::ConnectionDetail => None,
             // §15.3 is explicitly out of T1c's scope (deferred alongside
             // §15.4's Workflows half and §15.6) — not this Work, and not yet
             // reassigned to a later one by name.
             Overlay::SlashPalette => Some("a later Work (§15.3)"),
-            Overlay::ConnectionDetail => Some("a later Work"),
         }
     }
 }
@@ -90,6 +94,7 @@ Navigation
   Tab / S-Tab cycle destinations
   ~           toggle the Attention drawer
   ?           this help
+  c           connection detail (live/reconnecting/auth failed)
   q / Esc     back, or quit from a top-level destination
 
 Fleet
@@ -147,6 +152,7 @@ pub fn render(frame: &mut Frame, area: Rect, overlay: Overlay, app: &App) {
         Overlay::GroupEditRemove => group_form_body(&app.estate.group_form),
         Overlay::RetainedPreview => retained_body(&app.estate),
         Overlay::WorkflowChooser => workflow_chooser_body(app),
+        Overlay::ConnectionDetail => connection_detail_body(app),
         _ => format!(
             "{} is not built in this Work.\n\n{} implements it.\n\nEsc closes this panel.",
             overlay.title(),
@@ -327,6 +333,43 @@ fn workflow_chooser_body(app: &App) -> String {
     lines.join("\n")
 }
 
+/// §7.4/§8.1, issue #154: a read-only view over the connection state
+/// already tracked in [`super::connection`] for the header's own indicator
+/// (`app.live`, [`Live::label`]) and the footer's own status line
+/// (`app.status`) — no new state, just both put in one place with the
+/// explanation the one-line header has no room for.
+fn connection_detail_body(app: &App) -> String {
+    let (state, detail) = match app.live {
+        Live::Attached => (
+            "live",
+            "The SSE tail is attached; events are applied as they arrive.",
+        ),
+        Live::Reconnecting => (
+            "reconnecting",
+            "The tail dropped and the loop is retrying on its own capped \
+             exponential backoff (issue #16) — recovery does not wait on a \
+             keystroke, but this screen does not claim to be live again \
+             until it actually is.",
+        ),
+        Live::AuthFailed => (
+            "auth failed",
+            "The daemon rejected this client's token. Automatic retries \
+             stopped: a rejected token will not start working just \
+             because this process asks again — restart sgt to pick up a \
+             fresh one.",
+        ),
+    };
+    let mut body = format!(
+        "state    {state}\nheader   {}\n\n{detail}",
+        app.live.label()
+    );
+    if !app.status.is_empty() {
+        body.push_str(&format!("\n\nlast status\n  {}", app.status));
+    }
+    body.push_str("\n\nEsc/q closes this panel.");
+    body
+}
+
 /// A `percent_x` × `percent_y` box, centered in `area`.
 fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let [area] = Layout::vertical([Constraint::Percentage(percent_y)])
@@ -344,7 +387,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn help_t1c_t2_and_t3_panels_are_built_here() {
+    fn help_t1c_t2_t3_and_connection_detail_panels_are_built_here() {
         for built in [
             Overlay::Help,
             Overlay::CancelConfirmation,
@@ -355,15 +398,15 @@ mod tests {
             Overlay::RepoAddRemove,
             Overlay::GroupEditRemove,
             Overlay::RetainedPreview,
+            Overlay::ConnectionDetail,
         ] {
             assert!(
                 built.owner().is_none(),
                 "{built:?} must be built in this Work"
             );
         }
-        for later in [Overlay::SlashPalette, Overlay::ConnectionDetail] {
-            assert!(later.owner().is_some(), "{later:?} must name who builds it");
-        }
+        let later = Overlay::SlashPalette;
+        assert!(later.owner().is_some(), "{later:?} must name who builds it");
     }
 
     /// §15.4/§11.4: the chooser lists the live catalog by name, with the
@@ -477,6 +520,56 @@ mod tests {
             body.contains(&u64::MAX.to_string()),
             "the sum must saturate at u64::MAX, not panic or wrap: {body}"
         );
+    }
+
+    #[test]
+    fn connection_detail_shows_live_when_attached() {
+        let app = App::new();
+        assert_eq!(app.live, Live::Attached, "a fresh app assumes the tail");
+        let body = connection_detail_body(&app);
+        assert!(body.contains("live"), "{body}");
+        assert!(!body.to_lowercase().contains("reconnecting"), "{body}");
+    }
+
+    #[test]
+    fn connection_detail_names_reconnecting_and_the_automatic_retry() {
+        let mut app = App::new();
+        app.live = Live::Reconnecting;
+        let body = connection_detail_body(&app);
+        assert!(body.contains("reconnecting"), "{body}");
+        assert!(
+            body.to_lowercase().contains("backoff"),
+            "the automatic-retry explanation must be present: {body}"
+        );
+    }
+
+    #[test]
+    fn connection_detail_names_auth_failure_and_that_retries_stopped() {
+        let mut app = App::new();
+        app.live = Live::AuthFailed;
+        let body = connection_detail_body(&app);
+        assert!(body.contains("auth failed"), "{body}");
+        assert!(
+            body.to_lowercase().contains("stopped"),
+            "the terminal-failure explanation must be present: {body}"
+        );
+    }
+
+    #[test]
+    fn connection_detail_includes_the_last_status_line_when_present() {
+        let mut app = App::new();
+        app.live = Live::Reconnecting;
+        app.status = "live tail closed — reconnecting…".to_string();
+        let body = connection_detail_body(&app);
+        assert!(body.contains("live tail closed — reconnecting…"), "{body}");
+    }
+
+    #[test]
+    fn connection_detail_omits_the_last_status_section_when_empty() {
+        let mut app = App::new();
+        app.status = String::new();
+        let body = connection_detail_body(&app);
+        assert!(!body.contains("last status"), "{body}");
     }
 
     #[test]
