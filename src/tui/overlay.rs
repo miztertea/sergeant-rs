@@ -19,6 +19,9 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use crate::api::field_text;
 
 use super::app::App;
+use super::estate::{
+    RepoOverlayMode, add_repo_body, group_form_body, remove_repo_body, retained_body,
+};
 use super::theme::Token;
 
 /// §7.4's fixed set, in the order it lists them.
@@ -55,23 +58,24 @@ impl Overlay {
     }
 
     /// The later Work that actually implements this overlay's content —
-    /// `None` for the ones already built: [`Overlay::Help`] (T1a) and
-    /// T1c's four real confirmations (§13.10/§15.5).
+    /// `None` for the ones already built: [`Overlay::Help`] (T1a), T1c's
+    /// four real confirmations (§13.10/§15.5), and T3's three Estate panels
+    /// (§12.1/§12.2/§12.4).
     fn owner(self) -> Option<&'static str> {
         match self {
             Overlay::Help
             | Overlay::CancelConfirmation
             | Overlay::RetryConfirmation
             | Overlay::ExtendEnvelope
-            | Overlay::ReapConfirmation => None,
+            | Overlay::ReapConfirmation
+            | Overlay::RepoAddRemove
+            | Overlay::GroupEditRemove
+            | Overlay::RetainedPreview => None,
             // §15.3 is explicitly out of T1c's scope (deferred alongside
             // §15.4's Workflows half and §15.6) — not this Work, and not yet
             // reassigned to a later one by name.
             Overlay::SlashPalette => Some("a later Work (§15.3)"),
             Overlay::WorkflowChooser => Some("T2 (§20.3's workflow discovery)"),
-            Overlay::RepoAddRemove | Overlay::GroupEditRemove | Overlay::RetainedPreview => {
-                Some("T3 (§20.4's Estate work)")
-            }
             Overlay::ConnectionDetail => Some("a later Work"),
         }
     }
@@ -131,6 +135,16 @@ pub fn render(frame: &mut Frame, area: Rect, overlay: Overlay, app: &App) {
         Overlay::RetryConfirmation => retry_body(app),
         Overlay::ExtendEnvelope => extend_body(app),
         Overlay::ReapConfirmation => reap_body(app),
+        Overlay::RepoAddRemove => match &app.estate.repo_form.mode {
+            RepoOverlayMode::Add => {
+                add_repo_body(&app.estate.repo_form, app.estate.pending_repo_add.as_ref())
+            }
+            RepoOverlayMode::ConfirmRemove { name } => {
+                remove_repo_body(name, app.estate.repo_form.last_error.as_deref())
+            }
+        },
+        Overlay::GroupEditRemove => group_form_body(&app.estate.group_form),
+        Overlay::RetainedPreview => retained_body(&app.estate),
         _ => format!(
             "{} is not built in this Work.\n\n{} implements it.\n\nEsc closes this panel.",
             overlay.title(),
@@ -269,13 +283,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn help_and_the_four_t1c_confirmations_are_built_here() {
+    fn help_t1c_and_t3_panels_are_built_here() {
         for built in [
             Overlay::Help,
             Overlay::CancelConfirmation,
             Overlay::RetryConfirmation,
             Overlay::ExtendEnvelope,
             Overlay::ReapConfirmation,
+            Overlay::RepoAddRemove,
+            Overlay::GroupEditRemove,
+            Overlay::RetainedPreview,
         ] {
             assert!(
                 built.owner().is_none(),
@@ -285,9 +302,6 @@ mod tests {
         for later in [
             Overlay::SlashPalette,
             Overlay::WorkflowChooser,
-            Overlay::RepoAddRemove,
-            Overlay::GroupEditRemove,
-            Overlay::RetainedPreview,
             Overlay::ConnectionDetail,
         ] {
             assert!(later.owner().is_some(), "{later:?} must name who builds it");

@@ -639,6 +639,133 @@ async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
     handle.shutdown().await;
 }
 
+/// §12.1 end to end: the Add-repo form's real `POST /v1/estate/repos` —
+/// kicked off the render loop rather than awaited inline (the spinner/
+/// elapsed rule), per T3's own routes over `crate::domain::manifest::
+/// add_repo`. `App::poll_background` (called every loop tick in production,
+/// polled directly here) is what notices the clone finished and closes the
+/// overlay.
+#[tokio::test]
+async fn t3_estate_add_repo_reaches_the_real_api_off_the_render_loop() {
+    // The default `<estate_root>/.sergeant/data` layout — `src/api.rs`'s
+    // `resolve_estate_root` walks up from the daemon's own data dir to find
+    // it, so the daemon must actually be started on a data dir nested under
+    // a real `sergeant.toml`, not a bare tempdir.
+    let estate_root = TempDir::new().expect("tempdir");
+    std::fs::write(
+        estate_root.path().join("sergeant.toml"),
+        "[estate]\nname = \"t3-tui-estate\"\n",
+    )
+    .expect("write sergeant.toml");
+    let data_dir = estate_root.path().join(".sergeant/data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let source = TempDir::new().expect("tempdir");
+    init_repo(source.path());
+
+    let (handle, _fake) = start_fake(&data_dir, []).await;
+    let client = client_for(&handle);
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus first
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('4'));
+    assert_eq!(app.destination, Destination::Estate);
+    let opened = app.on_key(ratatui::crossterm::event::KeyCode::Char('a'));
+    assert_eq!(
+        opened,
+        Action::None,
+        "opening the form is local, not a mutation"
+    );
+
+    for c in "svc-a".chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // -> origin
+    for c in source.path().to_str().expect("utf8 path").chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // -> instructions
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // -> confirm
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert_eq!(
+        action,
+        Action::AddRepo {
+            name: "svc-a".to_string(),
+            origin: Some(source.path().to_str().expect("utf8 path").to_string()),
+            instructions: None,
+        }
+    );
+
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(
+        outcome,
+        Action::None,
+        "the clone runs off the render loop — execute must return immediately, not await it"
+    );
+    assert!(
+        app.overlay.is_some(),
+        "the overlay stays open showing the spinner until the background add finishes"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let needs_refresh = loop {
+        let needs_refresh = app.poll_background();
+        if app.estate.pending_repo_add.is_none() {
+            break needs_refresh;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the background add-repo task must finish and be noticed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        needs_refresh,
+        "a successful add must ask for a refresh: {}",
+        app.status
+    );
+    assert!(app.overlay.is_none(), "success closes the add-repo overlay");
+    assert!(app.status.contains("repo added"), "{}", app.status);
+
+    app.refresh(&client).await.expect("re-read after the add");
+    assert!(
+        app.estate.repos.iter().any(|r| r["name"] == "svc-a"),
+        "the real POST must have declared the repo, not just returned success: {:?}",
+        app.estate.repos
+    );
+
+    handle.shutdown().await;
+}
+
+/// §12.3: Health renders the real `GET /v1/doctor` report — status, check
+/// name, and detail per check, reached by navigating there through the
+/// keymap (Estate's own Tab cycles Repositories → Groups → Health) rather
+/// than poking internal state the TUI itself cannot reach any other way.
+#[tokio::test]
+async fn t3_estate_health_renders_the_real_doctor_report() {
+    let data = TempDir::new().expect("tempdir");
+    let (handle, _fake) = start_fake(data.path(), []).await;
+    let client = client_for(&handle);
+
+    let mut app = App::new();
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus first
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('4'));
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // Repositories -> Groups
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // Groups -> Health
+    app.refresh(&client).await.expect("first read");
+
+    let terminal = render(&app);
+    assert_shows(&terminal, "git", "the doctor report's git check");
+    assert_shows(
+        &terminal,
+        "disk_pressure",
+        "the doctor report's disk_pressure check",
+    );
+
+    handle.shutdown().await;
+}
+
 /// Acceptance 1's structural half, stated for the TUI alone: the terminal UI
 /// reaches state through the API client and nothing else. (Acceptance 5
 /// applies the same rule to both clients at once; this is the §30 sentence

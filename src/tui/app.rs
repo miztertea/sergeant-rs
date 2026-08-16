@@ -10,6 +10,10 @@ use serde_json::Value;
 use crate::api::{ApiClient, ClientError};
 
 use super::connection::Live;
+use super::estate::{
+    EstateOutcome, EstateScreen, GroupFormOutcome, PendingRepoAdd, PendingRepoAddOutcome,
+    RepoFormOutcome,
+};
 use super::fleet::{FleetOutcome, FleetScreen, WorkRow, fleet_rows};
 use super::home::{HomeOutcome, NewWorkForm};
 use super::overlay::Overlay;
@@ -92,6 +96,31 @@ pub enum Action {
     Extend { id: String, additional_turns: u32 },
     /// §15.5: confirmed from [`Overlay::ReapConfirmation`].
     Reap(String),
+    /// §12.1/§16.2: `POST /v1/estate/repos`, confirmed from
+    /// [`Overlay::RepoAddRemove`]'s add mode. Runs off the render loop
+    /// (§12.1's spinner/elapsed rule) — see [`App::execute`].
+    AddRepo {
+        name: String,
+        origin: Option<String>,
+        instructions: Option<String>,
+    },
+    /// §12.1/§16.2: `DELETE /v1/estate/repos/{name}`, confirmed from
+    /// [`Overlay::RepoAddRemove`]'s remove mode.
+    RemoveRepo(String),
+    /// §12.2/§16.2: `POST /v1/estate/groups`, confirmed from
+    /// [`Overlay::GroupEditRemove`]'s edit mode.
+    AddGroup {
+        name: String,
+        repos: Vec<String>,
+        brief: Option<String>,
+    },
+    /// §12.2/§16.2: `DELETE /v1/estate/groups/{name}`, confirmed from
+    /// [`Overlay::GroupEditRemove`]'s remove mode.
+    RemoveGroup { name: String, repos: Vec<String> },
+    /// §12.3/§12.4: Health's disk-pressure detail asking to open
+    /// [`Overlay::RetainedPreview`] — `GET /v1/retained`, the same
+    /// estate-wide read [`Action::Reap`] already has a client method for.
+    LoadRetained,
 }
 
 /// Live state for the one confirmation overlay open, if any (§7.4: the
@@ -135,6 +164,15 @@ pub struct App {
     /// The confirmation overlay's own live state (§15.5) — reset whenever an
     /// overlay opens or closes.
     pub pending_action: PendingAction,
+    /// Estate's three sub-screens (§12) and their edit forms.
+    pub estate: EstateScreen,
+    /// The Work id [`Overlay::ReapConfirmation`] acts on when it was opened
+    /// from [`Overlay::RetainedPreview`] (§12.4) rather than from an open
+    /// Work surface — `None` the rest of the time. [`App::open_work_id`]
+    /// stays the source inside an open Work; this is Estate's own source,
+    /// so the same confirmation panel and [`Action::Reap`] serve both without
+    /// a second reap implementation.
+    pub retained_reap_id: Option<String>,
     /// Whether the global Attention drawer is showing (§7.3: opens by
     /// default at Wide; `~` toggles it at any tier).
     pub drawer_open: bool,
@@ -162,6 +200,8 @@ impl App {
             work_screen: None,
             overlay: None,
             pending_action: PendingAction::default(),
+            estate: EstateScreen::default(),
+            retained_reap_id: None,
             drawer_open: true,
             system: Value::default(),
             last_seq: 0,
@@ -201,7 +241,58 @@ impl App {
                 }
             }
         }
+        // §12: read only while Estate is in front — the same
+        // fetch-what-the-current-screen-shows discipline as `work_screen`
+        // above, so browsing Home or Fleet never costs an extra doctor run.
+        // Best-effort, same reasoning as `work_screen`'s: a failed estate
+        // read must not blank fleet/system data that loaded fine.
+        if self.destination == Destination::Estate {
+            match client.repos().await {
+                Ok(result) => {
+                    self.estate.repos = result["repos"].as_array().cloned().unwrap_or_default();
+                }
+                Err(e) => self.estate.last_error = Some(e.to_string()),
+            }
+            match client.groups().await {
+                Ok(result) => {
+                    self.estate.groups = result["groups"].as_array().cloned().unwrap_or_default();
+                }
+                Err(e) => self.estate.last_error = Some(e.to_string()),
+            }
+            match client.doctor().await {
+                Ok(result) => self.estate.doctor = result,
+                Err(e) => self.estate.last_error = Some(e.to_string()),
+            }
+            self.estate.clamp();
+        }
         Ok(())
+    }
+
+    /// Non-blocking poll of any Estate mutation kicked off the render loop
+    /// (§12.1) — called every loop tick, whether or not a key arrived, so a
+    /// slow `git clone` finishes on its own schedule instead of waiting for
+    /// the next keystroke. Returns whether the screen needs a re-read.
+    pub fn poll_background(&mut self) -> bool {
+        match self.estate.poll() {
+            Some(PendingRepoAddOutcome::InProgress) | None => false,
+            Some(PendingRepoAddOutcome::Done(result)) => {
+                self.estate.pending_repo_add = None;
+                match result {
+                    Ok(_) => {
+                        self.status = "repo added".to_string();
+                        if self.overlay == Some(Overlay::RepoAddRemove) {
+                            self.overlay = None;
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        self.status = format!("add repo failed: {e}");
+                        self.estate.repo_form.last_error = Some(e.to_string());
+                        false
+                    }
+                }
+            }
+        }
     }
 
     /// Fold one live event into the app. Returns whether the screens need
@@ -270,7 +361,35 @@ impl App {
                 FleetOutcome::None => Action::None,
                 FleetOutcome::Open(id) => Action::OpenWork(id),
             },
-            Destination::Workflows | Destination::Estate => Action::None,
+            Destination::Workflows => Action::None,
+            // §12: Tab/BackTab are Estate's own (sub-tab switching, guarded
+            // out of `on_key_global` below) — everything else it does not
+            // recognize falls through to `EstateOutcome::None`.
+            Destination::Estate => match self.estate.on_key(key.code) {
+                EstateOutcome::None => Action::None,
+                EstateOutcome::OpenAddRepo => {
+                    self.estate.repo_form.reset_for_add();
+                    self.overlay = Some(Overlay::RepoAddRemove);
+                    Action::None
+                }
+                EstateOutcome::OpenRemoveRepo(name) => {
+                    self.estate.repo_form.reset_for_remove(name);
+                    self.overlay = Some(Overlay::RepoAddRemove);
+                    Action::None
+                }
+                EstateOutcome::OpenGroupEdit => {
+                    let existing = self.estate.selected_group().cloned();
+                    self.estate.group_form.reset_for_edit(existing.as_ref());
+                    self.overlay = Some(Overlay::GroupEditRemove);
+                    Action::None
+                }
+                EstateOutcome::OpenGroupRemove(name) => {
+                    self.estate.group_form.reset_for_remove(name);
+                    self.overlay = Some(Overlay::GroupEditRemove);
+                    Action::None
+                }
+                EstateOutcome::OpenRetained => Action::LoadRetained,
+            },
         }
     }
 
@@ -284,8 +403,15 @@ impl App {
             KeyCode::Char('2') => self.goto(Destination::Fleet),
             KeyCode::Char('3') => self.goto(Destination::Workflows),
             KeyCode::Char('4') => self.goto(Destination::Estate),
-            KeyCode::Tab => self.goto(self.destination.next()),
-            KeyCode::BackTab => self.goto(self.destination.prev()),
+            // §12: inside Estate, Tab/BackTab switch its own Repositories/
+            // Groups/Health sub-tabs instead — the guard leaves them
+            // unmatched here so they fall through to `EstateScreen::on_key`.
+            KeyCode::Tab if self.destination != Destination::Estate => {
+                self.goto(self.destination.next())
+            }
+            KeyCode::BackTab if self.destination != Destination::Estate => {
+                self.goto(self.destination.prev())
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.quit = true;
                 return Some(Action::Quit);
@@ -308,6 +434,7 @@ impl App {
     fn close_overlay(&mut self) {
         self.overlay = None;
         self.pending_action = PendingAction::default();
+        self.retained_reap_id = None;
     }
 
     fn on_key_overlay(&mut self, key: KeyEvent) -> Action {
@@ -315,12 +442,10 @@ impl App {
             return Action::None;
         };
         match overlay {
-            // The four T1c owns render real, live content but share the same
-            // fixed set of controls with the others: Esc/q aborts, Enter (on
-            // Confirm) fires the mutation. Tab has nothing to move to.
-            Overlay::CancelConfirmation
-            | Overlay::RetryConfirmation
-            | Overlay::ReapConfirmation => {
+            // T1c owns render real, live content but share the same fixed
+            // set of controls: Esc/q aborts, Enter (on Confirm) fires the
+            // mutation. Tab has nothing to move to.
+            Overlay::CancelConfirmation | Overlay::RetryConfirmation => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
                     KeyCode::Enter => {
@@ -331,9 +456,101 @@ impl App {
                         return match overlay {
                             Overlay::CancelConfirmation => Action::Cancel(id),
                             Overlay::RetryConfirmation => Action::Retry(id),
-                            Overlay::ReapConfirmation => Action::Reap(id),
                             _ => unreachable!("matched above"),
                         };
+                    }
+                    _ => {}
+                }
+                Action::None
+            }
+            // Same fixed controls as above, but the Work id can come from
+            // either an open Work surface (§13.10) or §12.4's Retained
+            // preview — [`App::retained_reap_id`] is Estate's own source, so
+            // this stays the one Reap implementation either way.
+            Overlay::ReapConfirmation => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+                    KeyCode::Enter => {
+                        let Some(id) = self
+                            .open_work_id()
+                            .or_else(|| self.retained_reap_id.clone())
+                        else {
+                            self.close_overlay();
+                            return Action::None;
+                        };
+                        return Action::Reap(id);
+                    }
+                    _ => {}
+                }
+                Action::None
+            }
+            // §12.1's Add/Remove Repository panel — form input reaches
+            // `RepoForm::on_key`, and the outcome either closes the overlay
+            // locally (an abort) or asks the loop to run the mutation.
+            Overlay::RepoAddRemove => {
+                match self.estate.repo_form.on_key(key) {
+                    RepoFormOutcome::None => {}
+                    RepoFormOutcome::Close => self.overlay = None,
+                    RepoFormOutcome::Submit {
+                        name,
+                        origin,
+                        instructions,
+                    } => {
+                        return Action::AddRepo {
+                            name,
+                            origin,
+                            instructions,
+                        };
+                    }
+                    RepoFormOutcome::ConfirmRemove(name) => return Action::RemoveRepo(name),
+                }
+                Action::None
+            }
+            // §12.2's create/extend/remove-members/remove-group panel, same
+            // shape as `RepoAddRemove` above.
+            Overlay::GroupEditRemove => {
+                match self.estate.group_form.on_key(key) {
+                    GroupFormOutcome::None => {}
+                    GroupFormOutcome::Close => self.overlay = None,
+                    GroupFormOutcome::Submit { name, repos, brief } => {
+                        return Action::AddGroup { name, repos, brief };
+                    }
+                    GroupFormOutcome::ConfirmRemove { name, repos } => {
+                        return Action::RemoveGroup { name, repos };
+                    }
+                }
+                Action::None
+            }
+            // §12.4's estate-wide retained-state list: browse with j/k,
+            // `p`/Enter opens the same [`Overlay::ReapConfirmation`] T1c
+            // already built rather than a second reap implementation.
+            Overlay::RetainedPreview => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let len = self.estate.retained.len();
+                        if len > 0 {
+                            self.estate.retained_selected =
+                                (self.estate.retained_selected + 1) % len;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        let len = self.estate.retained.len();
+                        if len > 0 {
+                            self.estate.retained_selected =
+                                (self.estate.retained_selected + len - 1) % len;
+                        }
+                    }
+                    KeyCode::Char('p') | KeyCode::Enter => {
+                        if let Some(id) = self
+                            .estate
+                            .selected_retained()
+                            .and_then(|e| e["work_id"].as_str())
+                        {
+                            self.retained_reap_id = Some(id.to_string());
+                            self.pending_action = PendingAction::default();
+                            self.overlay = Some(Overlay::ReapConfirmation);
+                        }
                     }
                     _ => {}
                 }
@@ -380,15 +597,13 @@ impl App {
                 }
                 Action::None
             }
-            // Every overlay a later Work owns (§7.4's note): the mechanism
-            // this Work built at T1a — open, close, restore focus for free —
-            // with no content of its own yet.
+            // Every overlay still owned by a later Work (§7.4's note) plus
+            // Help (content-built at T1a, but generic close-only controls
+            // are all it ever needs): the mechanism this Work built at
+            // T1a — open, close, restore focus for free.
             Overlay::Help
             | Overlay::SlashPalette
             | Overlay::WorkflowChooser
-            | Overlay::RepoAddRemove
-            | Overlay::GroupEditRemove
-            | Overlay::RetainedPreview
             | Overlay::ConnectionDetail => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.overlay = None,
@@ -576,6 +791,87 @@ impl App {
                     }
                 }
                 Action::Refresh
+            }
+            // §12.1: kicked off, not awaited — a real `git clone` can take
+            // real wall-clock time, and [`App::poll_background`] (called
+            // every loop tick, key or not) is what notices it finished. The
+            // overlay's own body shows the spinner and elapsed time while
+            // `estate.pending_repo_add` is `Some`.
+            Action::AddRepo {
+                name,
+                origin,
+                instructions,
+            } => {
+                let client = client.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (spawn_name, spawn_origin, spawn_instructions) =
+                    (name.clone(), origin.clone(), instructions.clone());
+                tokio::spawn(async move {
+                    let result = client
+                        .add_repo(
+                            &spawn_name,
+                            spawn_origin.as_deref(),
+                            spawn_instructions.as_deref(),
+                        )
+                        .await;
+                    let _ = tx.send(result);
+                });
+                self.estate.repo_form.last_error = None;
+                self.estate.pending_repo_add = Some(PendingRepoAdd::new(name, rx));
+                Action::None
+            }
+            Action::RemoveRepo(name) => {
+                match client.remove_repo(&name).await {
+                    Ok(_) => {
+                        self.status = format!("removed repo {name}");
+                        self.overlay = None;
+                    }
+                    Err(e) => {
+                        self.status = format!("remove repo failed: {e}");
+                        self.estate.repo_form.last_error = Some(e.to_string());
+                    }
+                }
+                Action::Refresh
+            }
+            Action::AddGroup { name, repos, brief } => {
+                match client.add_group(&name, &repos, brief.as_deref()).await {
+                    Ok(_) => {
+                        self.status = format!("group {name} updated");
+                        self.overlay = None;
+                    }
+                    Err(e) => {
+                        self.status = format!("group update failed: {e}");
+                        self.estate.group_form.last_error = Some(e.to_string());
+                    }
+                }
+                Action::Refresh
+            }
+            Action::RemoveGroup { name, repos } => {
+                match client.remove_group(&name, &repos).await {
+                    Ok(_) => {
+                        self.status = format!("group {name} updated");
+                        self.overlay = None;
+                    }
+                    Err(e) => {
+                        self.status = format!("group remove failed: {e}");
+                        self.estate.group_form.last_error = Some(e.to_string());
+                    }
+                }
+                Action::Refresh
+            }
+            Action::LoadRetained => {
+                match client.retained().await {
+                    Ok(result) => {
+                        self.estate.retained =
+                            result["retained"].as_array().cloned().unwrap_or_default();
+                        self.estate.retained_selected = 0;
+                        self.overlay = Some(Overlay::RetainedPreview);
+                    }
+                    Err(e) => {
+                        self.status = format!("could not load retained state: {e}");
+                    }
+                }
+                Action::None
             }
             other => other,
         }

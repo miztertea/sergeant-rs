@@ -147,8 +147,8 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App, tier: Tier) {
 
 /// §18.1: drawer | primary body | contextual rail, all inline. The rail's
 /// content is destination-specific and only defined for Home (Recent
-/// Outputs, §9.4) and Fleet (selected Work preview, §10.1) — Workflows and
-/// Estate are stubs with nothing yet to preview there.
+/// Outputs, §9.4) and Fleet (selected Work preview, §10.1) — §12 names no
+/// rail content for Estate, so it (like Workflows) has none.
 fn draw_wide(frame: &mut Frame, area: Rect, app: &App) {
     let has_rail = matches!(app.destination, Destination::Home | Destination::Fleet);
     // §8.10's spacing scale: `region` (3 cells) is the outer margin between
@@ -190,7 +190,7 @@ fn draw_primary(frame: &mut Frame, area: Rect, app: &App, tier: Tier) {
         Destination::Home => home::render(frame, area, &app.home, admission_paused),
         Destination::Fleet => fleet::render(frame, area, &app.rows, &app.fleet, tier),
         Destination::Workflows => workflows::render(frame, area),
-        Destination::Estate => estate::render(frame, area),
+        Destination::Estate => estate::render(frame, area, &app.estate),
     }
 }
 
@@ -516,6 +516,12 @@ where
                         break 'session;
                     }
                 }
+            }
+            // §12.1: a repo add kicked off the render loop is polled every
+            // tick, key or not — a slow `git clone` must finish on its own
+            // schedule, not wait for the next keystroke.
+            if app.poll_background() {
+                needs_refresh = true;
             }
             if needs_refresh && let Err(e) = app.refresh(client).await {
                 app.status = format!("refresh failed: {e}");
