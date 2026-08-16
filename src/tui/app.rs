@@ -1560,6 +1560,25 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_reap_confirmation_with_both_an_open_work_and_a_retained_selection_reaps_the_retained_id()
+     {
+        // §15.3's `/retained` can now open the Retained preview without
+        // first closing an open Work, so both `open_work` and
+        // `retained_reap_id` can be set at once when Enter confirms the
+        // reap — the explicit Retained selection must still win, exactly
+        // as `reap_identity` displays it.
+        let mut app = app_with_open_work("a", "completed_dirty");
+        app.retained_reap_id = Some("01RET".to_string());
+        app.overlay = Some(Overlay::ReapConfirmation);
+
+        assert_eq!(
+            app.on_key(KeyCode::Enter),
+            Action::Reap("01RET".to_string()),
+            "the Retained selection takes precedence over the open Work's id"
+        );
+    }
+
+    #[test]
     fn repo_add_remove_ignores_further_keys_while_a_repo_add_is_pending() {
         // §12.1's review fix: once a background AddRepo is in flight,
         // repeated Enter presses on the still-open overlay must not
