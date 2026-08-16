@@ -1818,7 +1818,7 @@ Retain and update the original proposal's contract:
 
 ## 19.5 Estate parity tests
 
-**Decision T2-64 (R2; L7):** For every shared repo/group operation, run the CLI and the shared function against equivalent fixtures and assert the same structured result and filesystem/manifest outcome.
+**Decision T2-64 (R2; L7):** For every repo/group operation, run the CLI (which calls `crate::domain::manifest` directly and locally) and the TUI (which calls the same `manifest` functions through the `/v1/estate/repos`/`/v1/estate/groups` routes via `ApiClient`, per §16.2) against equivalent fixtures and assert the same structured result and filesystem/manifest outcome.
 
 Pin:
 
