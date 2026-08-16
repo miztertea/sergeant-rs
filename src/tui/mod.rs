@@ -113,7 +113,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App, tier: Tier) {
     if app.open_work.is_some() {
-        work_view::render(frame, area, app.open_row());
+        work_view::render(frame, area, app.work_screen.as_ref(), app.live);
         return;
     }
     match tier {
@@ -176,7 +176,7 @@ fn draw_wide(frame: &mut Frame, area: Rect, app: &App) {
         match app.destination {
             Destination::Home => home::render_recent_outputs(frame, chunks[next], &app.rows),
             Destination::Fleet => {
-                work_view::render(frame, chunks[next], app.fleet.selected_row(&app.rows))
+                work_view::render_preview(frame, chunks[next], app.fleet.selected_row(&app.rows))
             }
             Destination::Workflows | Destination::Estate => {}
         }
@@ -261,7 +261,7 @@ fn footer_line(app: &App) -> Paragraph<'_> {
     let keys = if app.overlay.is_some() {
         "Esc/q close"
     } else if app.open_work.is_some() {
-        "Esc/q back"
+        "Tab/S-Tab or 1-5 switch view · j/k move · Esc/q back"
     } else if app.destination == Destination::Home && app.home.wants_text_focus() {
         "Tab next field · Enter next field/submit · Esc leave the form"
     } else if app.destination == Destination::Fleet && app.fleet.wants_text_focus() {
@@ -676,17 +676,46 @@ mod tests {
     }
 
     #[test]
-    fn fleet_enter_opens_a_stub_work_surface_that_shows_the_selected_row() {
+    fn fleet_enter_asks_to_open_the_work_surface() {
         let mut app = App::new();
         app.rows = fleet::fleet_rows(&json!({"works": [
             {"id": "01ABC", "state": "running", "intent": "an in-flight thing"},
         ]}));
         app.on_key(KeyCode::Esc);
         app.on_key(KeyCode::Char('2'));
-        app.on_key(KeyCode::Enter);
+        assert_eq!(
+            app.on_key(KeyCode::Enter),
+            Action::OpenWork("01ABC".to_string())
+        );
+    }
+
+    /// Once `App::execute` has fetched a Work (T1b's real surface, not a
+    /// stub), the canonical Work surface draws its Thread tab by default,
+    /// with the Work's identity and intent on screen and the tab bar naming
+    /// every §13.2 view.
+    #[test]
+    fn an_open_work_surface_draws_the_thread_tab_and_the_full_view_bar() {
+        let mut app = App::new();
+        app.rows = fleet::fleet_rows(&json!({"works": [
+            {"id": "01ABC", "state": "running", "intent": "an in-flight thing"},
+        ]}));
+        app.open_work = Some(OpenWork {
+            id: "01ABC".to_string(),
+            from: Destination::Fleet,
+        });
+        app.work_screen = Some(work_view::WorkScreen::from_parts(
+            "01ABC".to_string(),
+            json!({"work": {"id": "01ABC", "intent": "an in-flight thing", "state": "running"}}),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
         let text = screen_text(&app);
         assert!(text.contains("01ABC"), "the opened work's id: {text}");
         assert!(text.contains("an in-flight thing"), "its intent: {text}");
+        for tab in ["Thread", "Workflow", "Evidence", "Graph", "Details"] {
+            assert!(text.contains(tab), "the tab bar must name {tab}: {text}");
+        }
     }
 
     /// The loop ends when the terminal goes away, without needing the reader
