@@ -99,3 +99,34 @@ confirmation for them and the user explicitly requested them.
 | Command behavior differs from documentation | Report the mismatch, trust the measured `--help`/observed behavior, and name the stale doc as a fix candidate — don't silently paper over it. |
 | Question actually requires estate/repo state | Load `estate-navigation` (`sgt repo list`, `sgt doctor`) rather than answering from memory. |
 | Question actually requires submitting or mutating work | Hand off to the standard workflow loop (`AGENTS.md`) / `sgt run`; this skill stays strictly read-only. |
+
+## Bounded judgment
+
+### This skill may decide
+- Which primary document answers a classified question.
+- How to phrase the `Answer/Command/Requires/Verify/Docs` response.
+- How to respond to a missing primary document or an observed doc/behavior
+  mismatch: report and stop, or report and flag, rather than guess.
+
+### This skill must ask the user
+- Nothing — this skill is read-only and does not itself reach J0; every
+  unresolved condition it can encounter (missing doc, stale doc, a
+  question needing estate state or mutation) routes to a stated report or
+  a named hand-off, not a live question of its own.
+
+### This skill must not do
+- Answer from memory when a primary document is missing.
+- Assume `sgt` command/flag syntax instead of running `--help`.
+- Invent a command, flag, state transition, or safety guarantee.
+- Include a destructive-operation example unless the documentation
+  requires confirmation for it and the user explicitly requested it.
+- Continue answering once the question actually requires estate/repo state
+  or work submission — `AGENTS.md`'s routing table settles ownership of
+  that hand-off (J3: a settled authoritative record, not a J5 prohibition
+  — corrected 2026-08-16, ICM-R2 pilot review) — hand off instead.
+
+### Durable handoff
+None. This skill produces no promotable artifact; the only "handoff" is
+routing to a different skill (`estate-navigation`) or `sgt run` when the
+user's need turns out not to be read-only, at which point this skill's own
+procedure ends.
