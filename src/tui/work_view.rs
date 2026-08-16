@@ -121,6 +121,11 @@ pub enum WorkScreenOutcome {
     /// composer opens `Overlay::SlashPalette` (App-level state) instead of
     /// being typed literally.
     OpenSlashPalette,
+    /// No local WorkScreen binding claimed this key (issue #154's follow-up):
+    /// the caller falls it through to `App::on_key_global` instead of
+    /// discarding it, so e.g. `c` reaches `Overlay::ConnectionDetail`
+    /// whenever cancel isn't currently offered.
+    Unhandled,
 }
 
 /// The canonical Work surface's own state: the four fetched reads, which tab
@@ -345,7 +350,7 @@ impl WorkScreen {
             KeyCode::Char('p') if self.action_available("reap") => {
                 return WorkScreenOutcome::OpenReapConfirm;
             }
-            _ => {}
+            _ => return WorkScreenOutcome::Unhandled,
         }
         WorkScreenOutcome::None
     }
@@ -1854,7 +1859,10 @@ mod tests {
     #[test]
     fn r_opens_the_answer_composer_only_when_respond_is_offered() {
         let mut screen = screen_with("active", Vec::new());
-        assert_eq!(screen.on_key(KeyCode::Char('r')), WorkScreenOutcome::None);
+        assert_eq!(
+            screen.on_key(KeyCode::Char('r')),
+            WorkScreenOutcome::Unhandled
+        );
         assert!(!screen.answer_focused, "respond is not offered for active");
 
         let mut screen = screen_with("needs_input", Vec::new());

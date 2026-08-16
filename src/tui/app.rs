@@ -940,6 +940,13 @@ impl App {
                 self.overlay = Some(Overlay::SlashPalette);
                 Action::None
             }
+            // No local WorkScreen binding claimed this key: let the same
+            // global keymap browsing uses everywhere else see it, so e.g.
+            // `c` reaches `Overlay::ConnectionDetail` whenever cancel isn't
+            // currently offered on the open Work.
+            WorkScreenOutcome::Unhandled => {
+                self.on_key_global(key.code).unwrap_or(Action::None)
+            }
         }
     }
 
@@ -1451,14 +1458,47 @@ mod tests {
 
     #[test]
     fn an_action_key_is_a_no_op_when_the_matrix_does_not_offer_it() {
-        // completed offers only "inspect" (§13.10) — cancel/retry/extend/
-        // reap/respond must all be no-ops, not silently open a confirmation
-        // for a mutation the daemon would refuse anyway.
+        // completed offers only "inspect" (§13.10) — retry/extend/reap/
+        // respond must all be no-ops, not silently open a confirmation for a
+        // mutation the daemon would refuse anyway. `c` is exempt: when
+        // cancel isn't offered it falls through to the global keymap and
+        // opens `Overlay::ConnectionDetail` instead (issue #154's follow-up,
+        // covered separately below), so it isn't a plain no-op here.
         let mut app = app_with_open_work("a", "completed");
-        for key in ['c', 't', 'e', 'p', 'r'] {
+        for key in ['t', 'e', 'p', 'r'] {
             assert_eq!(app.on_key(KeyCode::Char(key)), Action::None);
             assert!(app.overlay.is_none(), "{key} must not open anything");
         }
+    }
+
+    /// Issue #154's follow-up: while a Work is open, `c` is the cancel
+    /// mnemonic exactly when cancel is offered (§13.10) — and falls through
+    /// to the same global `c` binding that opens `Overlay::ConnectionDetail`
+    /// everywhere else the moment cancel is not offered, rather than being
+    /// silently swallowed by the WorkScreen catch-all.
+    #[test]
+    fn c_opens_connection_detail_in_open_work_when_cancel_is_not_offered_and_still_cancels_when_it_is(
+    ) {
+        let mut app = app_with_open_work("a", "completed");
+        assert!(!app.work_screen.as_ref().unwrap().action_available("cancel"));
+        assert_eq!(app.on_key(KeyCode::Char('c')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::ConnectionDetail));
+        // still inside the open Work — didn't close it or the confirmation
+        // matrix by accident.
+        assert!(app.open_work.is_some());
+
+        app.on_key(KeyCode::Esc); // close the overlay, back to the open Work
+        assert!(app.overlay.is_none());
+        assert!(app.open_work.is_some());
+
+        let mut app = app_with_open_work("a", "blocked");
+        assert!(app.work_screen.as_ref().unwrap().action_available("cancel"));
+        assert_eq!(app.on_key(KeyCode::Char('c')), Action::None);
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::CancelConfirmation),
+            "cancel still wins whenever it's offered"
+        );
     }
 
     #[test]
