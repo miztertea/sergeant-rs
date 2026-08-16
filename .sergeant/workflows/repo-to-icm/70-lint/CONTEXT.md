@@ -37,6 +37,51 @@ mechanically, in `65-self-check` (`kind = "execute"`, N4) before this stage
 started; this stage folds its result in rather than re-running the
 validator against this workflow's own tree a second time.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+A governing constraint (J5, `references/mechanical-vs-substantive.md`'s own
+test): a defect this stage cannot repair without deciding something it was
+not given the authority to decide is never force-fixed to make the
+validator pass — it is logged as a finding for `80`/`90`.
+
+### J2 — delegated to this stage
+- Classifying each validator-reported defect as mechanical or substantive
+  per `references/mechanical-vs-substantive.md`'s test, and fixing every
+  mechanical one directly (re-running the validator until none remain).
+- Attributing a repository-wide `[S7]` finding correctly (recorded once,
+  under its own heading, never repeated under a candidate it happens to
+  surface under).
+
+### J1 — local choices allowed
+- The order candidates are processed in, so long as every candidate named
+  in `../60-draft/output/draft-report.md` is covered and this workflow's
+  own tree is covered via `65-self-check`'s result (not re-run).
+
+### J0 — must become `needs_input`
+- `../60-draft/output/draft-report.md` opens with `#
+  AMBIGUOUS — NOT RESOLVED` — do not proceed; follow `../_config/
+  run-discipline.md` §2.
+
+When genuinely unsure whether a defect is mechanical, this stage's own
+contract already resolves the tie: treat it as substantive and log it for
+`80`/`90` — this is not itself a needs_input escalation (the run continues;
+the finding travels forward as recorded signal), but it is the operative
+rule for every case this stage cannot cleanly place in J2.
+
+### Completion boundary
+This stage may complete only when `output/lint-report.md` covers every
+candidate named in `../60-draft/output/draft-report.md` **plus** this
+workflow's own tree (from `65-self-check`'s result), each candidate's
+defects classified mechanical-fixed or substantive-remaining, with no
+candidate silently skipped and this workflow's own tree not silently
+assumed clean.
+
+### Decision evidence
+`output/lint-report.md` — per-candidate mechanical-fixed vs. substantive-
+remaining defect lists — is this stage's decision record.
+
 ## What must become true here (durable outcome)
 
 `output/lint-report.md` exists, covering every candidate package named in

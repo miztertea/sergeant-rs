@@ -14,6 +14,53 @@ itself. Read it before doing anything else; it is where the subject
 repository, any explicit scope, and any explicit exclusions were named, if
 they were named at all.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+This stage inherits the workflow's own authority envelope narrowed to one
+question: establishing this run's contract, not deciding whether the run
+should happen (J4 — the Work's initiating task already decided that).
+
+### J2 — delegated to this stage
+- Resolving the subject repository's identity and pinned revision, per the
+  live-checkout-vs-vendored-subtree distinction above, when the Work's task
+  under-specifies the revision but the worktree resolves it unambiguously.
+- Recording a discrepancy when the resolved SHA disagrees with what the
+  task claimed, and choosing which resolution method to record.
+- Naming exclusions beyond the mandatory VCS/build-output/measurement-
+  reference-corpus set, when the Work's task implies but does not spell
+  them out.
+
+### J1 — local choices allowed
+- The exact prose used to restate the output-path convention and success
+  criteria in `contract.md` (§4–5 of "What must become true here") — the
+  content is fixed by the stages that follow it, only the wording is local.
+
+### J0 — must become `needs_input`
+- The subject repository, its revision, or the scope is ambiguous after
+  reading the Work's task and the worktree — do not pick a plausible
+  default. This engine gives an actor stage no way to pause its own turn
+  and wait for a human's answer mid-run, so the fail-closed action actually
+  available is the one this stage's contract already specifies: write
+  `output/contract.md` anyway, headed `# AMBIGUOUS — NOT RESOLVED`, naming
+  what is ambiguous and what was checked, and record **no** invented
+  subject, revision, or scope in its place. That written marker is this
+  stage's J0 turn-ending act on the current engine, in place of the
+  needs_input hold `@@bounded-judgment` describes for a platform that has
+  one.
+
+### Completion boundary
+This stage may complete only when `output/contract.md` exists and either
+(a) unambiguously states subject repository, revision, scope, exclusions
+(each with a reason), output paths, and success criteria, or (b) opens with
+`# AMBIGUOUS — NOT RESOLVED` per the J0 case above.
+
+### Decision evidence
+`output/contract.md` itself is this stage's decision record — the resolved
+revision, the resolution method used, and any discrepancy note live there,
+not in a separate log.
+
 ## What must become true here (durable outcome)
 
 A `contract.md` exists in `output/` that unambiguously answers, for this run

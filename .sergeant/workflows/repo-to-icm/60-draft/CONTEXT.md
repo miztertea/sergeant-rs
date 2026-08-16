@@ -20,6 +20,51 @@ worktree** — never `.sergeant/workflows/`. This is the draft boundary
 substitutes for the human review that promotion requires, so nothing this
 stage writes lands in the runnable namespace.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+A governing constraint (J5, `docs/icm/convention.md` §2 rule 4): generated
+content lands only under `.sergeant/drafts/workflows/`, never directly
+under `.sergeant/workflows/`, regardless of how correct this stage judges
+its own output to be — correctness never substitutes for the human review
+promotion requires. This stage may not assert `status: published` on
+anything it writes.
+
+### J2 — delegated to this stage
+- Resolving a candidate-name collision (against `.sergeant/workflows/`,
+  `.sergeant/drafts/workflows/`, every other candidate this run mints, and
+  `repo-to-icm` itself) by renaming, with the rename reason recorded.
+- Marking a stage or workflow candidate's `provenance.md` entry as a
+  "justified design inference" when it has no direct source evidence, with
+  a one-line reason — never inventing a citation to avoid this category.
+- Turning a `stage-context` attachment from `50-synthesize` into guidance
+  content inside its attached stage's own `CONTEXT.md`, rather than a new
+  stage directory.
+
+### J1 — local choices allowed
+- Section-by-section drafting order within `references/draft-package-
+  template.md`'s fixed shape.
+
+### J0 — must become `needs_input`
+- `../50-synthesize/output/candidates.md` opens with
+  `# AMBIGUOUS — NOT RESOLVED` — do not proceed; follow `../_config/
+  run-discipline.md` §2.
+
+### Completion boundary
+This stage may complete only when every workflow candidate from
+`50-synthesize` is materialized matching `references/draft-package-
+template.md` exactly, every stage and the workflow as a whole is traced in
+`provenance.md` (or explicitly marked a justified design inference), no
+candidate's own `NN-.../output/` holds anything but `README.md`, and
+`output/draft-report.md` records the manifest plus the carried-through
+permanent-instruction/obsolete-mechanism/engine-pressure lists verbatim.
+
+### Decision evidence
+Each materialized candidate's own `provenance.md`, and this stage's
+`output/draft-report.md` (collision renames and their reasons), are this
+stage's decision record.
+
 ## What must become true here (durable outcome)
 
 Every workflow candidate from `50-synthesize` is materialized as a package

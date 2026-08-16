@@ -16,6 +16,55 @@ files headed to extraction — which named partition they belong to. This is
 one of the workflow's own declared outputs (a "source inventory"), not
 scratch work for a later stage to redo.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Assigning exactly one of `references/dispositions.md`'s four dispositions
+  to each in-scope file, including the `decompose`-vs-`helper-evidence`
+  judgment call the reference file names as the one most likely to be
+  gotten wrong under time pressure — resolved conservatively toward
+  `decompose` per that file's stated asymmetry.
+- Grouping `decompose` rows into named, topically coherent partitions.
+- Treating a large uniform group (identically-shaped generated artifacts,
+  compiled bytecode caches) via a stated representative sample rather than
+  reading every file.
+- Recording an `obsolete-candidate` disposition, but only when a specific
+  settled fact can be named — absent one, the row is `decompose` or
+  `helper-evidence` instead (this is not a judgment call this stage may
+  resolve by hunch).
+
+### J1 — local choices allowed
+- Partition naming style and enumeration order, so long as every
+  `decompose` row lands in exactly one named partition a reader could
+  summarize in one sentence.
+
+### J0 — must become `needs_input`
+- `contract.md` opens with `# AMBIGUOUS — NOT RESOLVED` — do not proceed;
+  follow `../_config/run-discipline.md` §2 instead of this stage's ordinary
+  work.
+
+This stage's own volume limit is not a J0 case: if the in-scope volume
+genuinely cannot be fully dispositioned within one turn, the honest
+response is to finish as much as the turn allows, in a stated deterministic
+order, and record plainly which paths were not reached — this is recorded
+coverage-gap signal for the workflow's grammar-pressure report (`../_config/
+run-discipline.md`; `90-reconcile/references/reconciliation-method.md` §3),
+not an ambiguity requiring escalation, and not a defect to hide by rounding
+an incomplete inventory up to "done."
+
+### Completion boundary
+This stage may complete only when `output/inventory.md` accounts for every
+file in scope named or implied by `contract.md` (or honestly records which
+paths a volume-limited turn did not reach), with every `decompose` row in
+exactly one named partition and the disposition/partition counts summing
+back to the total files enumerated.
+
+### Decision evidence
+`output/inventory.md` itself — the disposition and reason recorded per row
+— is this stage's decision record.
+
 ## What must become true here (durable outcome)
 
 `output/inventory.md` exists and accounts for **every file in scope named or

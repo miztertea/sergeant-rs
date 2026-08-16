@@ -20,6 +20,50 @@ per `references/synthesis-method.md`'s seven buckets. This stage clusters and
 names; it does not materialize files under the draft namespace — that is
 `60-draft`'s job.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+A governing constraint (J5, `../_config/icm-ladder.md` §6.6 / `docs/icm/
+record-shapes.md` §6 rule 4): clustering groups by behavioral contract —
+what a unit does, for whom — never by originating source file. A cluster
+that reproduces the inventory's own file list one-for-one is a defect this
+stage must name, not something it may quietly reshape into a tidier bucket.
+
+### J2 — delegated to this stage
+- Ordering stage candidates within a workflow candidate by the
+  `trigger`→`outcome` chain across member behavior units, recording a
+  one-line reason for any genuinely ambiguous ordering call.
+- Naming each candidate (kebab-case, checked for collision against every
+  other candidate this run mints and against both admitted and draft
+  workflow trees).
+- Recording an `## Unattached records` entry when a `stage-context`,
+  `helper`, or `stage` record names a `workflow`/`stage` with no
+  corresponding candidate, rather than inventing one to attach it to.
+- Flagging the over-promotion tell on bucket 5 (shared helper/context)
+  groupings, naming which files mirror one-to-one.
+
+### J1 — local choices allowed
+- The order buckets are worked in beyond "in order" (the seven-bucket
+  sequence itself is fixed by `references/synthesis-method.md`), and
+  internal formatting of `output/candidates.md`.
+
+### J0 — must become `needs_input`
+- `../40-classify/output/classifications.ndjson` opens with
+  `# AMBIGUOUS — NOT RESOLVED` — do not proceed; follow `../_config/
+  run-discipline.md` §2.
+
+### Completion boundary
+This stage may complete only when every classification record from
+`../40-classify/output/classifications.ndjson` appears in exactly one
+bucket appearance (including an `## Unattached records` appearance where
+applicable), and no candidate is named without at least one member record
+citing it.
+
+### Decision evidence
+`output/candidates.md` — its per-bucket rationale for ordering, naming, and
+any `## Unattached records` entries — is this stage's decision record.
+
 ## What must become true here (durable outcome)
 
 `output/candidates.md` exists, organized by the seven buckets in

@@ -17,6 +17,48 @@ repository's specific filenames and old implementation mechanisms — while
 leaving the evidence fields (`id`, `source.*`) untouched, per
 `references/normalization-method.md`.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+A governing constraint (J5, inherited from `../_config/evidence-policy.md`
+and this stage's own contract, not this stage's to reopen): `source.path`,
+`source.locator`, `source.quote`, `source.quote_hash` are never rewritten
+here — that boundary is fixed above this stage's authority, not a judgment
+call it makes.
+
+### J2 — delegated to this stage
+- Deciding whether a unit's `statement` (or `scope`/`trigger`/`outcome`)
+  leaks a specific mechanism and needs rewriting versus can be carried
+  through with at most cosmetic cleanup.
+- Splitting a unit that normalization reveals to be conjoined, assigning
+  new `id`s and recording the split in `notes` on both halves.
+- Re-assessing `confidence` honestly when a rewrite exposes that the
+  statement leans more on inference than the source directly supports.
+
+### J1 — local choices allowed
+- The exact rewritten wording of a `statement`, so long as it preserves the
+  source-supported meaning and drops the mechanism into `notes` rather than
+  deleting it.
+
+### J0 — must become `needs_input`
+- `../20-harvest/output/behavior-units.ndjson` opens with
+  `# AMBIGUOUS — NOT RESOLVED` — do not proceed; follow `../_config/
+  run-discipline.md` §2.
+
+### Completion boundary
+This stage may complete only when every unit from the upstream file is
+accounted for in `output/behavior-units.normalized.ndjson` — rewritten,
+carried through unchanged with a note, or split into successor units — with
+no unit silently disappearing, and with `representation`/`workflow`/
+`stage`/`rationale`/`alternatives_considered`/`engine_gap` left unassigned
+(that is `40-classify`'s contract, not this one's).
+
+### Decision evidence
+`output/behavior-units.normalized.ndjson`'s own `notes` fields (split
+records, mechanism preserved from the original, confidence re-assessment)
+are this stage's decision record.
+
 ## What must become true here (durable outcome)
 
 `output/behavior-units.normalized.ndjson` exists, one record per line, with

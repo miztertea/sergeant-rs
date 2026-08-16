@@ -19,13 +19,26 @@ repository instruction surface).
 
 ## 6.1a — Does this procedure decide what Work should exist, or execute one already admitted?
 
-Added by `docs/adr/0013-icm-r0-owner-rulings.md` decision 1
-(`reference/proposal-icm-r-procedure-authority.md` §3.3, Finding ICMR-F3):
-§6.2's own question — "does it have a recognizable trigger, a bounded
-outcome, and a completion condition?" — is necessary for a workflow but
-not sufficient. A Captain skill can have all three too. This question must
-be asked and answered **before** §6.2, not skipped past the way §6.3 was
-historically skipped past §6.5 (the same failure mode, one rung earlier).
+*(Citation corrected ICM-R2, `docs/gauntlet/runs/icm-r2/repo-to-icm/
+adjudication-draft.md`: the ICM-R1 landing that added this section
+(commit `dd3c0ef`) attributed it to `docs/adr/0013-icm-r0-owner-rulings.md`
+**decision 1**, which is "Names" — accepting "Placement Ladder (PL)" and
+"Bounded-Judgment Ladder (J)" as terms — and has no bearing on this
+discriminator. The actual grounding, confirmed against
+`reference/proposal-icm-r-procedure-authority.md` §3.3 and its own §19
+decision list, is Finding **ICMR-F3** from the ICM-R0 gauntlet
+(`docs/gauntlet/runs/icm-r0/`), which motivated this section directly —
+not any of the twelve owner-ruled decisions in ADR 0013, none of which
+covers the driver/admission-boundary discriminator itself. This section's
+own *content* is unaffected; only the attribution below is corrected.)*
+
+Added following the ICM-R0 gauntlet's Finding ICMR-F3
+(`reference/proposal-icm-r-procedure-authority.md` §3.3): §6.2's own
+question — "does it have a recognizable trigger, a bounded outcome, and a
+completion condition?" — is necessary for a workflow but not sufficient. A
+Captain skill can have all three too. This question must be asked and
+answered **before** §6.2, not skipped past the way §6.3 was historically
+skipped past §6.5 (the same failure mode, one rung earlier).
 
 **The discriminator:** if the procedure's job is to converse with the
 user, shape or revise intent, decide whether work stays direct or becomes

@@ -18,6 +18,54 @@ behavior unit, one classification record per unit, per
 representation; it does not draft, cluster, or materialize anything —
 that is `50-synthesize`'s and `60-draft`'s job.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+A governing constraint (J5, from `../_config/icm-ladder.md` itself): the
+ladder's rungs are asked **in order**, 6.1 through 6.7, stopping at the
+first that answers yes — this stage may not skip ahead to a rung that
+"feels right" before ruling out every lower one, and may not classify
+`helper`/`shared-helper`/`shared-context` without first stating an explicit
+§6.3 answer in `rationale`.
+
+### J2 — delegated to this stage
+- Answering each ladder question and selecting the rung, for every
+  normalized unit, with `rationale` stating why that rung and not an
+  adjacent one.
+- Applying heightened scrutiny to a unit whose behavior falls into one of
+  the five consequence classes before accepting a `helper`/`shared-helper`
+  classification for it.
+- Resolving a unit genuinely torn between two adjacent rungs to one rung,
+  recording both in `alternatives_considered` and stating the tension
+  honestly in `rationale` — this is a delegated call, not an escalation;
+  `80-adversarial-review` exists to challenge it.
+- Writing the full six-field `engine_gap` template for an `engine-gap`
+  classification, or declining the classification outright if any field
+  would read "would be convenient."
+- Running this stage's own over-promotion self-check (step 7) on its
+  `helper`/`shared-helper` output before handing it downstream.
+
+### J1 — local choices allowed
+- The order in which normalized units are processed, so long as the whole
+  input file is processed and no unit is skipped or classified twice.
+
+### J0 — must become `needs_input`
+- `../30-normalize/output/behavior-units.normalized.ndjson` opens with
+  `# AMBIGUOUS — NOT RESOLVED` — do not proceed; follow `../_config/
+  run-discipline.md` §2.
+
+### Completion boundary
+This stage may complete only when `output/classifications.ndjson` classifies
+every unit from the upstream file exactly once, each record meeting
+`references/classification-record-shape.md`'s bar for `rationale` and
+`alternatives_considered`, and the over-promotion self-check (step 7) has
+been run against this run's own `helper`/`shared-helper` output.
+
+### Decision evidence
+`output/classifications.ndjson`'s own `rationale`/`alternatives_considered`
+fields, per record, are this stage's decision record.
+
 ## What must become true here (durable outcome)
 
 `output/classifications.ndjson` exists, one record per line, with every unit

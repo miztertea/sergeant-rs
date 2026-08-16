@@ -41,6 +41,53 @@ accepted repairs, assemble the measurement package, consolidate the
 grammar-pressure report, and finalize this workflow's own per-run
 `output/` dispositions.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+A governing constraint (J5, `docs/icm/convention.md` §6.2/§6.3): this is
+the one point in the run where earlier stages' already-written content may
+be edited — every other stage's output is otherwise immutable once
+written. That authority is scoped to applying an *accepted* finding's
+repair, not to reopening settled content on this stage's own initiative.
+
+### J2 — delegated to this stage
+- `accept`/`reject`/`park` on every finding in
+  `../80-adversarial-review/output/findings.ndjson`, with a one-line
+  reason, and applying the accepted repair directly to the affected file.
+- Assembling `output/measurement-package.md`'s internally-computable
+  dimensions from upstream stats, and stating plainly which five §9.9
+  dimensions this run cannot cover from inside its own blindness boundary.
+- Consolidating `output/grammar-pressure.ndjson` from genuinely recorded
+  behavior-level and meta-level moments — never inventing one that was not
+  actually recorded upstream, and never inflating "ran out of turn budget"
+  into an engine-gap record.
+
+### J1 — local choices allowed
+- Ordering within `output/adjudication-log.md` beyond "one entry per
+  finding" — the required content (disposition + reason) is fixed.
+
+### J0 — must become `needs_input`
+- Any Inputs-table artifact opens with `# AMBIGUOUS — NOT RESOLVED` — do
+  not proceed with steps 1–4; follow `../_config/run-discipline.md` §2
+  instead: record which upstream stage never got real facts to work with,
+  and close the run honestly rather than adjudicating and measuring
+  against artifacts known to be hollow.
+
+### Completion boundary
+This stage may complete only after, in order: every finding disposed with a
+reason and accepted repairs applied (`output/adjudication-log.md`); the
+measurement package assembled, naming the five dimensions not covered here
+(`output/measurement-package.md`); the grammar-pressure report consolidated
+(`output/grammar-pressure.ndjson`); and `../scripts/finalize.py` run for
+real, with its result recorded.
+
+### Decision evidence
+`output/adjudication-log.md` (accept/reject/park + reason per finding) is
+this stage's primary decision record; `output/measurement-package.md` and
+`output/grammar-pressure.ndjson` record the measurement and grammar-
+pressure judgments respectively.
+
 ## What must become true here (durable outcome)
 
 `output/adjudication-log.md` disposes every finding in

@@ -22,6 +22,49 @@ adjudication (2026-08-12) asks the first real execute stage to
 demonstrate, and exactly the kind of judgment an actor turn should not be
 spending tokens re-deriving every run.
 
+## Bounded judgment
+
+*(added ICM-R2, `docs/adr/0013-icm-r0-owner-rulings.md` decision 4;
+`docs/icm/convention.md` §6.1: every actor stage carries this section
+always, "even when it is only 'inherits workflow envelope unchanged' —
+omission is never ambiguous." This is a `kind = "execute"` stage, not an
+actor turn, so proposal §7.3's carve-out applies: "An execute stage does
+not need model judgment, but its stage contract still states which
+outcomes are mechanical and which ambiguous conditions block rather than
+guess.")*
+
+No J2/J1/J0 ladder applies here — there is no actor turn to exercise
+judgment inside. The pinned container runs `validate-structure.py`
+unmodified against this workflow's own tree and captures its combined
+stdout/stderr verbatim; sergeant reads only the container's exit code to
+decide the stage outcome (§11.2). The only two outcomes this stage can
+produce are both mechanical, not judged:
+
+- **Exit 0 (validator PASS)** completes the stage.
+- **Exit 1 (validator FAIL)** fails the stage. This is real signal, not a
+  container bug — it means this run's own worktree has a structural defect
+  the validator caught mechanically. `70-lint`, the next actor stage, owns
+  the judgment about what a FAIL here means for the rest of the run; this
+  stage never interprets its own result beyond the exit code the engine
+  already reads.
+
+There is no ambiguous condition this stage's own contract asks it to
+block on — an ambiguity in the *validator's own logic* (e.g. a crash
+distinct from a clean FAIL) would surface as a non-0/non-1 exit or missing
+output file, which is `70-lint`'s job to notice and treat as substantive
+signal when it reads `output/self-check-result.txt`, not something this
+execute stage can itself escalate.
+
+### Completion boundary
+This stage completes when the container exits 0, and fails when it exits
+1 — mechanically, per the pinned command in `workflow.toml`. No other
+completion path exists.
+
+### Decision evidence
+`output/self-check-result.txt` (the container's captured output) is the
+entire record; there is no separate judgment to log because none was
+exercised.
+
 ## What must become true here (durable outcome)
 
 `output/self-check-result.txt` exists in the materialized worktree,

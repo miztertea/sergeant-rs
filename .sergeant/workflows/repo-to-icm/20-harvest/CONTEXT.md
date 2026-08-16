@@ -22,6 +22,57 @@ and, for every file, deliberately sweep it for the five consequence classes
 `references/consequence-class-checklist.md` names, not just whatever
 behavior happens to stand out on a first read.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Identifying each independently-triggerable behavior in a file and
+  splitting conjoined ones into separate units, per
+  `../_config/evidence-policy.md`'s "One behavior per unit."
+- Assigning `confidence` (`high`/`medium`/`low`) per unit, honestly
+  reflecting how directly the source supports the statement.
+- Applying the five consequence-class hunt questions to every `decompose`
+  file and recording, per class, either the covering `behavior_id`(s) or
+  `swept, none found` — never a blank cell.
+- Marking a unit `citation: disputed` with `confidence: low` when a
+  statement cannot be re-anchored to a real contiguous span, rather than
+  dropping it silently.
+
+### J1 — local choices allowed
+- The `id` numbering scheme, when the run's contract does not name one
+  (pick one, hold it for the whole run).
+- Which file within a partition to read first, so long as partition order
+  itself follows `output/partition-ledger.md`.
+
+### J0 — must become `needs_input`
+- `contract.md` or `inventory.md` opens with `# AMBIGUOUS — NOT RESOLVED`
+  — do not proceed; follow `../_config/run-discipline.md` §2.
+
+This stage's own volume limit is not a J0 case, and neither is an
+unverifiable citation (handled by the J2 `citation: disputed` path above).
+When a turn will not finish every `pending` partition, the honest response
+is `references/partition-checkpoint-protocol.md`'s own shape: stop cleanly
+at a partition boundary, write the ledger honestly, and end the turn — the
+closest local analog to a J0 hold this engine's actual grammar supports,
+since no actor-initiated mid-turn pause exists yet (the same limitation
+`00-contract`'s fail-closed marker works around).
+
+### Completion boundary
+This stage may complete only when every partition in
+`output/partition-ledger.md` is `done` — meaning every file in it has been
+read, extracted (or explicitly judged zero-unit, with a stated reason), and
+swept per `references/consequence-class-checklist.md` — with
+`output/behavior-units.ndjson` and `output/consequence-class-sweep.md`
+correspondingly complete. A ledger with any `pending` row means the durable
+outcome was not met this attempt; that is recorded honestly, not silently
+rounded up.
+
+### Decision evidence
+`output/behavior-units.ndjson` (per-unit `confidence`/`notes`) and
+`output/consequence-class-sweep.md` are this stage's decision record; the
+partition ledger records checkpoint/retry decisions.
+
 ## What must become true here (durable outcome)
 
 Three things, together:

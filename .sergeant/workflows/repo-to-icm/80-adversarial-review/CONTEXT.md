@@ -50,6 +50,50 @@ self-consistency — to everything this run has produced so far. Produce
 findings; do not fix anything yourself (reconciliation and repair are
 `90-reconcile`'s job).
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+A governing constraint (J5, this stage's own contract and `docs/icm/
+convention.md` §4.9's producer-does-not-self-promote rule): this stage may
+not edit the implementation under review, and may not assign
+accept/reject/park to its own findings — both are `90-reconcile`'s
+authority, kept in a separate, later execution deliberately so the review
+stays independent (`docs/icm/convention.md` §6.3).
+
+### J2 — delegated to this stage
+- Judging each finding's `severity` (`high`/`medium`/`low`) per the
+  definitions in this stage's own record shape below.
+- Classifying an ambiguous blindness-boundary hit (a `reference-corpus`
+  string this stage cannot place as citation or as policy-quoting prose
+  from context alone) as `medium` rather than guessing `high` or `low`.
+- Deciding which citation sample and which engine-gap records genuinely
+  received "tried harder than the classifying stage did" re-attempts, and
+  stating so in `output/review-summary.md`.
+
+### J1 — local choices allowed
+- The order candidates and axes are worked through, so long as
+  `output/review-summary.md` states which candidates and axes were
+  actually applied.
+
+### J0 — must become `needs_input`
+- Any Inputs-table artifact opens with `# AMBIGUOUS — NOT RESOLVED` — that
+  propagation failing to reach this stage's own inputs cleanly is itself a
+  Boundary Honesty finding to record (name the artifact, quote its "What is
+  ambiguous" line); do not silently review artifacts resting on an
+  unresolved contract as if they were ordinary output.
+
+### Completion boundary
+This stage may complete only when `output/findings.ndjson` exists
+(possibly empty, only after real effort under all four axes) and
+`output/review-summary.md` states which candidates and axes were actually
+applied, with finding counts by axis and severity.
+
+### Decision evidence
+`output/findings.ndjson` and `output/review-summary.md` are this stage's
+decision record; a finding not written down did not happen, as far as
+`90-reconcile` is concerned.
+
 ## What must become true here (durable outcome)
 
 `output/findings.ndjson` exists (possibly empty, if genuinely nothing was

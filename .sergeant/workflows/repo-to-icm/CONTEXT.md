@@ -17,6 +17,78 @@ reviewed generator run) to promote — nothing this workflow writes is
 runnable procedure until a human crosses the publication boundary
 (`docs/icm/convention.md` §2).
 
+## Authority envelope
+
+*(added ICM-R2, `docs/adr/0013-icm-r0-owner-rulings.md` decision 4;
+`docs/icm/convention.md` §6.1; proposal §7.2 — this workflow's own
+Layer-1 orientation previously carried no explicit authority-envelope
+section, which is itself the kind of omission decision 4 exists to
+close.)*
+
+This workflow receives an already-admitted Work intent: generate draft ICM
+candidates for a named subject repository, or measure this workflow's own
+recall/precision against a frozen reference corpus. It never decides, and
+is never asked to decide, *whether* that generation should happen — that
+decision (workflow selection, subject repository, and any explicit scope
+or exclusions) was already made before `00-contract` began, by whatever
+Captain skill or human admitted this Work.
+
+### Workflow may decide
+- The subject repository's pinned revision, in-scope paths, and exclusions,
+  when the Work's task under-specifies them but the worktree itself
+  resolves the ambiguity unambiguously (`00-contract`).
+- The placement (representation) and disposition of every behavior unit it
+  extracts, subject to `_config/icm-ladder.md`'s rung order and
+  `80-adversarial-review`'s independent challenge before any of it is
+  treated as settled (`40-classify` through `90-reconcile`).
+- Mechanical repairs to a materialized draft package's structure
+  (`70-lint`, per `references/mechanical-vs-substantive.md` — never a
+  substantive boundary call).
+- How many attempts `20-harvest` needs to work through a partition set
+  (retry sequencing, `references/partition-checkpoint-protocol.md`) — a
+  local, reversible execution choice, not a scope change.
+- `accept`/`reject`/`park` on every `80-adversarial-review` finding, and the
+  repair applied for an accepted one (`90-reconcile`, the one point in a
+  run where an earlier stage's already-written content may be edited).
+
+### Workflow may not decide
+- Whether a materialized draft package is promoted into
+  `.sergeant/workflows/` — this workflow never writes there and never
+  asserts `status: published` on anything it produces
+  (`docs/icm/convention.md` §2 rules 3–4).
+- Whether a permanent-instruction candidate is actually folded into
+  `AGENTS.md` — candidates are listed, never edited into `AGENTS.md` by
+  this workflow (`references/synthesis-method.md` bucket 4).
+- Whether a surviving `engine-gap` claim triggers an engine change — it is
+  evidence for `docs/gauntlet/`'s engine-pressure record, never
+  self-authorizing (`docs/icm/record-shapes.md` §5 rule 6).
+- The subject repository's identity or revision when the Work's task and
+  the worktree conflict or are both silent — `00-contract` fails closed
+  rather than guessing.
+
+### Human or Captain gates
+- Promotion of any draft package from `.sergeant/drafts/workflows/` to
+  `.sergeant/workflows/` is a distinct, human-reviewed act performed
+  outside this workflow (`docs/icm/convention.md` §2).
+- Resolving a run whose `00-contract` output opens
+  `# AMBIGUOUS — NOT RESOLVED`: a human or orchestrating caller must supply
+  the missing fact and cause a fresh run or retry (`_config/
+  run-discipline.md` §2) — no stage in this workflow can do this itself.
+- Resolving a `20-harvest` partition ledger left with any `pending` row
+  after a turn ends (`references/partition-checkpoint-protocol.md`) —
+  same shape: a human or caller must notice and issue another attempt.
+- Acting on any surviving `engine-gap` claim recorded in
+  `90-reconcile/output/grammar-pressure.ndjson`.
+
+### Decision record
+There is no single cross-run decision log file. Material decisions are
+recorded where they are made: `40-classify`'s `rationale`/
+`alternatives_considered` per classification record, `80-adversarial-
+review`'s `output/findings.ndjson`, and `90-reconcile`'s `output/
+adjudication-log.md` (`accept`/`reject`/`park`, each with a reason). Each
+stage's own declared `output/` artifact (`output/README.md`) is that
+stage's decision record.
+
 ## The blindness rule (read before touching anything)
 
 This run's central safety constraint — for a **measurement** run, every
