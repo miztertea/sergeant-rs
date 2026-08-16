@@ -1,132 +1,120 @@
 # T-SERIES-1 — fidelity refuter
 
 Axis: fidelity. Assigned file:
-`docs/gauntlet/runs/t-series-1/critics/fidelity.md`. Four findings (F1-F4),
-all on the proposal itself (front matter/header, §12.3, §23.2, §5.5). Did
-not read any other axis's critic or refuter output. Re-derived every
-citation independently: re-read the full proposal at
-`reference/proposal-tui-t-series.md` (2305 lines), the predecessor's actual
-text at both commits the critic names, the relevant `src/cli.rs` doctor
-module in full, ADR 0009 in full, and `gh pr view 111` directly rather than
-trusting the critic's transcript of any of these.
+`docs/gauntlet/runs/t-series-1/critics/fidelity.md`. Four findings (F1–F4),
+all warning/info severity, none claimed to invalidate a section's premise.
+Re-verified every factual predicate independently — did not take the
+critic's excerpts, line numbers, or `gh`/`git` output on trust — against
+`reference/proposal-tui-t-series.md`, the real repository tree, `git log`/
+`git show`/`git merge-base` on the actual objects cited, ADR 0009's full
+text, and live GitHub state via `gh`. Also spot-checked a sample of the
+critic's "found clean" section (crossterm/ratatui versions, the workflow
+catalog count, the `Screen` enum, bare-`sgt` behavior, issue #26 and PR #111
+GitHub state) as a fabrication check in the spirit of the FOUNDATION-1
+refuter's caught fabricated-quote precedent — no fabrication found; every
+one of those spot-checked claims holds.
 
 ## F1 — "Supersedes" citation points to a commit that never contained the predecessor
 
 **Verdict: CONFIRMED, severity as-is (warning).**
 
-Independently reran the critic's own checks: `git show
-a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6:reference/proposal-tui-t-series.md`
-fails with "exists on disk, but not in ...", confirming the commit is real
-(merge of PR #43, 2026-08-11 00:58) but does not contain the file. `git log
---all --oneline -- reference/proposal-tui-t-series.md` shows exactly two
-commits for the file's whole history: `2000a22` (this proposal) and `a9a25fa`
-("Execution-surface test (owner ruling)...", 2026-08-11 15:28, whose own
-commit message confirms "T-series TUI proposal vendored"). `git merge-base
---is-ancestor a9a25fa... 242abe3...` returns true, confirming the critic's
-claim that the predecessor is reachable from the proposal's own pinned audit
-revision.
+Independently reran the critic's checks rather than trusting them:
 
-Nothing in this refutes cleanly. The citation is mechanically wrong exactly
-as described: `supersedes.revision` and the header link both point to the
-commit the predecessor's own `audit_revision` field recorded, not the commit
-that actually contains the predecessor's text — a distinguishable, checkable
-error, not a stylistic complaint. A reader clicking the header's GitHub link
-gets a live 404, independently verified via the same reasoning (no GitHub API
-call needed once `git show` fails locally — the object simply is not in that
-tree).
+- `git show a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6:reference/proposal-tui-t-series.md`
+  fails with "exists on disk, but not in a5fb875…" — confirmed verbatim.
+- `git log --all --oneline -- reference/proposal-tui-t-series.md` returns
+  exactly two commits ever: `a9a25fa` (the predecessor) and `2000a22`
+  ("T-SERIES-1: revised operator-cockpit proposal, gate lifted, gauntlet
+  contract" — this proposal itself). `a5fb875` genuinely has no relationship
+  to the file at all.
+- `git merge-base --is-ancestor a9a25fa 242abe3` exits 0 — confirmed `a9a25fa`
+  really is an ancestor of the proposal's own pinned audit revision, so the
+  critic's proposed fix location is real and reachable.
+- `a9a25fa`'s actual commit timestamp is 2026-08-11 15:28:30 — matches the
+  critic's "roughly 14.5 hours later" claim relative to `a5fb875`'s
+  2026-08-11 00:58:23 (14.5 hours, exact).
 
-Severity: warning is correct, not higher. The proposal's own §23 content —
-what the finding's remediation matters for — was independently checked by
-this refuter against the *correct* predecessor commit (`a9a25fa`) in F3
-below, and every §23.1/most-of-§23.2 disposition traced cleanly. So the
-broken citation does not appear to have caused a downstream fidelity failure
-in the proposal's actual disposition claims; it is a dangling pointer, fixed
-by repointing two fields to `a9a25fa`. Not info, because the axis's own
-named check method (contract §1: "check each disposition against that
-predecessor's actual text") is completely blocked for anyone who trusts the
-citation as given rather than independently locating the file — that is a
-real, if mechanically fixable, defect in the document's verifiability, which
-is more than a wording nit.
+No factual gap in the finding. On severity: the contract's fidelity axis
+description explicitly names "check each disposition against that
+predecessor's actual text rather than trusting the label" as this axis's
+own method — a broken link at the exact citation meant to enable that check
+is squarely on-axis, arguing against downgrading to info. Against
+upgrading: the critic themself performed the correction (locating `a9a25fa`
+via a two-commit file history) in minutes, and every §23 disposition in the
+report was in fact checked against the real predecessor text despite the
+broken pointer — so the defect never actually blocked verification in
+practice, only misdirects a reader who clicks the header's GitHub link.
+Warning is the right severity: real, reader-facing, mechanically fixable,
+zero normative impact.
 
-## F2 — §12.3's Doctor check list names checks that do not exist and omits two that do
+## F2 — §12.3's Doctor check list names checks that don't exist and omits two that do
 
 **Verdict: CONFIRMED, severity as-is (warning).**
 
-Independently grepped `src/cli.rs`'s `mod doctor` for every `Check::ok`/
-`Check::warn`/`Check::fail` name-string literal, and separately confirmed the
-assembly order via `doctor::run`'s own body (`src/cli.rs:1751-1777`):
-`git_check()`, `claude_check()`, `environment_check()`, `data_dir_check`,
-`docker_check`, `journal_check`, `projection_check`, `daemon_check`,
-`permission_mode_check`, `estate_check`, `disk_pressure_check` — eleven
-checks, names `git`, `claude`, `environment`, `data_dir`, `docker`,
-`journal`, `projection`, `daemon`, `permission_mode`, `estate`,
-`disk_pressure`. No check is named `installation` or `profiles` anywhere in
-the module. Went one step further than the critic and checked whether
-`Report`'s own doc comments or `print()` output might group checks under an
-"installation" category header that could make the proposal's word choice a
-defensible paraphrase rather than an error — they do not: `Report::print()`
-(`src/cli.rs:1721-1745`) emits one flat line per check by its literal `name`
-field, no section headers, no synonyms. The word "installation" in the
-source appears only in doc-comment prose describing what `healthy()` means
-conceptually (`src/cli.rs:1684-1686`), never as a rendered check name. Also
-confirmed the critic's `permission_mode` ↔ "profiles" mapping is not a
-stretch: `permission_mode_check`'s own body (`src/cli.rs:1794-1814`) reports
-declared profiles by name and is the only check that mentions "profiles" at
-all.
+Independently grepped every `Check::ok`/`Check::warn`/`Check::fail` call
+site in `src/cli.rs`'s doctor module rather than trusting the critic's list.
+The real check names, straight from source: `git` (1978,1982,1987),
+`claude` (2008,2010), `environment` (2051,2058), `data_dir`
+(2297,2265,2284,2302), `docker` (2139,2144), `journal` (2358,2369,2384,2395),
+`projection` (2437,2441), `daemon` (2464,2473,2491,2500,2514),
+`permission_mode` (1810,1811,1829,1831,1832,1835,1836), `estate`
+(1871,1872,1881,1882,1889,1895,1896,1956,1957,1965), `disk_pressure`
+(2191,2192,2202,2203,2211,2212,2213) — eleven checks total, exactly matching
+the critic's list. Grepped separately for `"installation"` and `"profiles"`
+as check-name string literals: zero hits anywhere in `src/cli.rs`. Read the
+proposal's actual §12.3 text at line 1153: "Current checks include
+installation, environment, data directory, Docker, journal, projection,
+daemon, estate, profiles, and disk pressure." — quote is accurate, not
+mischaracterized. `git` and `claude` are absent from that sentence;
+`permission_mode` doesn't appear under any name.
 
-Also checked whether this list is repeated or depended on anywhere else in
-the proposal that would raise its severity — grepped the full document for
-"installation" and "profiles" outside §12.3: both appear only in loose
-prose ("Is the installation healthy?" in §2.1's rhetorical question list,
-"installation checks" as a category label in §5.3) never as a second,
-consistent binding claim, and §19.6 (Doctor parity)'s acceptance criterion
-("no check disappears or changes status/remedy between surfaces") does not
-hardcode any of the wrong names. So the defect is contained to one
-prose sentence and does not propagate into a testable acceptance criterion.
-Warning, not higher, is the correct severity — confirmed, not upgraded.
+Finding fully holds. On severity: the critic's own note that Decision
+T2-45 pins Health to render `DoctorReport.checks` unmodified — verified by
+reading that decision in the proposal, present as cited — means this cannot
+regress into a build defect; it's purely a reader-expectation defect in
+prose. That argues against upgrading past warning. It does not argue for
+downgrading to info either: unlike F4, this naming isn't inherited from an
+existing codebase imprecision (no `installation`/`profiles` string appears
+anywhere in `src/cli.rs`) — it looks like invented-for-the-proposal
+labeling rather than an echoed error, which is a materially different (more
+attributable to the proposal itself) class of mistake than F4's. Warning
+stands.
 
 ## F3 — §23.2 labels the predecessor's silence on repo/group as a "previous decision" being revised
 
-**Verdict: CONFIRMED, severity as-is (warning), with one refinement.**
+**Verdict: CONFIRMED, severity as-is (warning).**
 
-Read the predecessor's full text (`a9a25fa`, 1943 lines, `/tmp/predecessor.md`
-in this session) independently. Grepped `\brepo\b`, `\bgroup\b`, `\bestate\b`
-as whole words rather than substrings (the critic's own write-up mentions
-"repo" and "group" without specifying word-boundary grep, so this refuter
-re-ran it stricter to check for a false negative): `estate` — zero matches
-anywhere in the predecessor. `group` — exactly two matches, both non-Estate
-uses ("group, sort, filter, truncate... Fleet rows client-side" at line 439,
-a UI-list verb; "Within each group, Work remains ordered..." at line 525,
-referring to Attention-drawer buckets, not an Estate group). `repo` as a
-whole word does not appear at all; every hit for the substring "repo" is
-"repository" used generically (the codebase, or "repository-owned
-procedure"), never a distinct estate/repo-management concept. The four nav
-citations the critic gives (lines 78, 484, 496, 723) all independently
-confirmed as exactly `Home    Fleet    Workflows`, no Estate tab. The
-predecessor's explicit non-goals list (§5.2, Decision T-20, read in full)
-enumerates journal search, new Work states, workflow authoring, file/diff
-views, host metrics, OpenTelemetry, mouse, web redesign, graph canvas,
-plugin framework, archival semantics, and issues #26/#45 — repo/group
-management is absent from this list too, in either direction. The critic's
-conclusion holds: 2026-08-11 did not rule on estate administration at all,
-so "Revised" mischaracterizes new scope as a reversed prior decision.
+Extracted the predecessor at `a9a25fa` fresh via `git show
+a9a25fa:reference/proposal-tui-t-series.md` (1943 lines, matching the
+critic's count) and grepped it independently for `repo|group|estate`
+case-insensitively. Every "repo" hit is the generic noun "repository" (the
+daemon, repository-owned workflows, repository files) — none refers to a
+distinct repo/group management screen or decision. Confirmed the specific
+citations: line 73 area has "This proposal makes bare `sgt` the primary
+interactive surface" and the exact nav block; Decision T-21 at that location
+pins top nav to exactly `Home Fleet Workflows` with an explicit list of
+what's *not* there (no Work tab, no Journal tab, no System tab) — Estate is
+not even named as a considered-and-excluded option, consistent with the
+critic's "did not address estate administration at all" reading rather than
+"considered it and put it outside." Confirmed the contrast case: Decision
+T-18 at predecessor line 417 reads verbatim "Doctor remains a CLI-only
+diagnostic. The TUI has a small connection overlay, not a System dashboard"
+— a real, explicit, named ruling, unlike the repo/group row. Confirmed the
+proposal's actual §23.2 row text at line 2151: "Repo/group outside TUI |
+Full current lifecycle included through extract-on-contact" — quote
+accurate.
 
-Refinement on severity, considered and rejected as a downgrade: the
-"Doctor CLI-only" row in the same table is a genuine, citable revision
-(predecessor's Decision T-18, "Doctor remains a CLI-only diagnostic," read
-verbatim at line 417) — so the table format itself is capable of accurate
-rows, meaning this row's inaccuracy is not a systemic table-format
-limitation but a specific false claim about what 2026-08-11 decided. That
-argues for keeping warning rather than downgrading to info (unlike F4, which
-echoes a pre-existing repository-wide imprecision, this row invents a
-disposition — a subtly different failure). Considered arguing for an
-*upgrade*: overstating new scope as "already revised from a prior decision"
-could cause a reader to under-scrutinize genuinely novel territory (Estate
-repo/group) as merely a revisited call. But the critic's own text confirms
-the substantive Estate content is independently well-specified elsewhere
-(§12, §16.2) and does not itself rest on the false "revision" framing for
-justification — the mislabeling doesn't hide or license unreviewed content,
-it just misdescribes provenance. Warning, unchanged, is correct.
+Finding fully holds; the critic's own contrast (T-18 as a genuine revision
+example in the same table) is real and sharpens the point rather than being
+a rhetorical flourish. On severity: this sits exactly on the axis's
+explicitly named method (grade §23 disposition labels against actual
+predecessor text, not the label), which argues it deserves full attention,
+but the critic's own assessment that the underlying substantive decision
+(Estate as first-class, full lifecycle) is correctly and independently
+scoped elsewhere (§12, §16.2) means no decision is wrong — only a table's
+provenance framing. Same category and consequence as F1: a mislabeled
+citation/provenance claim, mechanically fixable, zero normative drift.
+Warning is consistent with F1's calibration and correct.
 
 ## F4 — §5.5 credits ADR 0009 with moving two surfaces that were already in the no-spawn set before it
 
@@ -134,58 +122,52 @@ it just misdescribes provenance. Warning, unchanged, is correct.
 
 Read ADR 0009 in full independently. Its Decision section verbatim: "`status`,
 `work show`/`list`/`transcript`, `analytics`, and the TUI join `sgt doctor`,
-`sgt watch`, and `sgt daemon stop` in the no-spawn set" — word-for-word match
-to the critic's quote. Its Context section states R-WATCH-3 already ruled
-`watch`'s no-auto-spawn membership "owner-ruled 2026-08-13," one day before
-ADR 0009's own "Accepted, 2026-08-14" status line. So Doctor and Watch are
-pre-existing members being joined, not moved by this ADR — the critic's read
-is correct. Independently found the same `src/cli.rs:1341` doc comment the
-critic cites ("Used by `watch`, `status`, `work show`/`list`/`transcript`,
-`analytics`, and `tui` — every verb ADR 0009 moved into the no-spawn set"),
-confirming this exact imprecision predates the proposal in the repository's
-own code.
+`sgt watch`, and `sgt daemon stop` in the no-spawn set" — confirms Doctor and
+Watch are the pre-existing set being *joined*, not moved by this ADR. Its
+Context section states `docs/gauntlet/contracts/WATCH.md`'s R-WATCH-3 (Watch's
+no-auto-spawn ruling) was "owner-ruled 2026-08-13," one day before ADR 0009's
+own "Accepted, 2026-08-14" status line — independently confirmed by reading
+`docs/gauntlet/contracts/WATCH.md:71`, which dates R-WATCH-3 to exactly
+2026-08-13. So the chronology the critic relies on is real, not asserted.
+Read the proposal's actual §5.5 text at line 416: "ADR 0009 moved `status`,
+Work reads, analytics, Watch, Doctor, and TUI into the no-auto-spawn set." —
+quote accurate; Doctor and Watch are indeed listed as if moved by ADR 0009
+alongside the four surfaces it actually did move. Grepped `src/cli.rs` for
+"ADR 0009" and found line 1341's doc comment: "`analytics`, and `tui` —
+every verb ADR 0009 moved into the no-spawn set" — confirms the critic's
+claim that this exact imprecision already exists in the repository's own
+code, independent of the proposal.
 
-Checked one thing the critic did not explicitly verify: whether the
-imprecision changes what Decision T2-16 (the proposal's own decision that
-depends on this sentence) actually commits to. T2-16 reads "`sgt tui`
-continues to refuse without a running daemon..." — "continues to," present
-tense, does not depend on which ADR is credited with which surface's
-membership, only on the end state (all six surfaces refuse today), which is
-independently true. So the attribution error is fully inert with respect to
-the proposal's own binding decision, same conclusion the critic reached.
-Info, not warning, is correct — this is strictly narrower in consequence
-than F1-F3, all three of which affect either a citation's resolvability
-(F1), a reader's mental model of literal rendered output (F2), or how much
-scrutiny a section invites (F3); F4 affects none of these.
+Finding holds with no gap. On severity: agree with info, and would resist
+any upgrade — the critic's own "does the section survive" check (Decision
+T2-16's operative dependency is "all six surfaces are no-spawn today," which
+is true regardless of attribution) is correct on inspection: nothing built
+on this sentence cares which ADR gets credit for which subset. The fact
+that the exact same imprecision is already sitting in merged, shipped code
+comments is a real mitigating fact, not critic editorializing — it means a
+reader who cross-checks the proposal against the codebase (as this axis
+exists to make them do) would find the *code* agrees with the proposal's
+phrasing, so the defect is unusually low-stakes even among this report's
+already-low-severity findings. Info, not warning, is correct.
 
 ## Summary
 
 | Finding | Verdict | Severity change |
 |---|---|---|
-| F1 | CONFIRMED | none (warning) |
-| F2 | CONFIRMED | none (warning) |
-| F3 | CONFIRMED | none (warning) |
-| F4 | CONFIRMED | none (info) |
+| F1 | CONFIRMED | none (warning, unchanged) |
+| F2 | CONFIRMED | none (warning, unchanged) |
+| F3 | CONFIRMED | none (warning, unchanged) |
+| F4 | CONFIRMED | none (info, unchanged) |
 
-All four findings survive independent re-derivation from source, not the
-critic's transcripts of it. None invalidate any section's premise — every
-finding's own "does the section survive the correction" analysis was
-independently re-checked and holds. No fabricated citations found in this
-axis's report (contrast FOUNDATION-1's fidelity F2, where the refuter caught
-an invented contract quote — no equivalent problem exists here; every quote
-and line-number citation in this critic's report resolved to real text at
-the cited location). No downgrade or upgrade of any severity is warranted;
-the critic's own severity assignments already track the actual gradient of
-consequence correctly (F1-F3 warning for reader-facing or verifiability
-defects, F4 info for an inert attribution nit).
-
-Also independently re-verified the critic's scope note: `gh pr view 111
---json state,mergedAt,mergeCommit` confirms `MERGED`, `mergedAt:
-2026-08-15T15:28:02Z`, merge commit `3a46b87c...` — matching the critic's
-citation exactly. Agree with the critic's own scoping: this is a currency/
-staleness question the contract assigns to `assumptions`, not `fidelity`
-("is every factual claim true *as of this session*" vs. fidelity's "does the
-proposal say what the repository actually contains and decided" — PR #111's
-technical content, which is fidelity's remit, was independently confirmed
-accurate regardless of the branch's merge status). Not a fidelity finding
-either the critic or this refuter should be raising.
+All four findings survive independent, adversarial re-verification against
+primary sources — none were mischaracterized, none rest on a citation that
+doesn't check out, and none had their severity miscalibrated in either
+direction. No fabricated citation or invented contract quote was found in
+this report (the failure mode the FOUNDATION-1 fidelity refuter caught in
+its own F2). Spot-checks of the critic's "found clean" section (crossterm/
+ratatui dependency graph, the 23-entry workflow catalog, the `Screen` enum,
+bare-`sgt` routing, issue #26 and PR #111's live GitHub state) all
+independently confirmed accurate. Consistent with the critic's own
+conclusion: no finding here invalidates any section's premise; all four are
+mechanically fixable prose/citation accuracy defects, not scope or
+consequence errors.
