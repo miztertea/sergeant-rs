@@ -18,9 +18,6 @@ The two axes are reported separately, never merged or reranked.
 
 ## Behavior contract
 
-- **The Spec review axis asks whether the code faithfully implements the originating issue, PRD, or spec.**
-  (trigger: a diff is being reviewed; outcome: a Spec-axis assessment is produced)
-  — `BU-P2-002`, `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (front matter / Process intro, lines 9-9)
 - **The two sub-agent reports are presented under separate `## Standards` and `## Spec` headings, verbatim or lightly cleaned, and must never be merged or reranked against each other since the two axes are deliberately kept separate.**
   (trigger: both sub-agent reports have returned; outcome: a combined report exists with the two axes still clearly distinguishable)
   — `BU-P2-016`, `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (Step 5: Aggregate, lines 78-78)
