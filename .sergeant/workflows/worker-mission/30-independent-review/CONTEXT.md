@@ -22,9 +22,24 @@ Every axis named in the brief's authoritative list runs as a separate, non-conta
   (trigger: a worker reaches its pre-completion independent-review gate; outcome: review coverage is deterministic and driven by the dispatching context (the brief), not silently narrowed by whatever generic skill text happens to be loaded)
   — `BU-P7-013`, `reference/sergeant-upstream/templates/worker-brief.md` (section '### 7. Independent {{REVIEW_AXIS_LABEL}}-axis review')
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- None beyond ordinary tool mechanics of dispatching the parallel sub-reviews.
+
+### J1 — local choices allowed
+- Formatting/ordering of the unblended per-axis output sections.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when every axis named in the brief's authoritative list has run as a separate, non-contaminating parallel review, with outputs unblended — never narrowed to whatever fewer axes a loaded review skill happens to name (J5, `BU-P7-013`).
+
+### Decision evidence
+The per-axis review outputs are this stage's own decision record.
 
 ## Output
 

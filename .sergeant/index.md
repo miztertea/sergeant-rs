@@ -36,7 +36,6 @@ history.
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
 | `resolving-merge-conflicts` | published | [`workflows/resolving-merge-conflicts/index.md`](workflows/resolving-merge-conflicts/index.md) |
-| `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 | `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
 | `to-tickets` | published | [`workflows/to-tickets/index.md`](workflows/to-tickets/index.md) |
 | `triage` | published | [`workflows/triage/index.md`](workflows/triage/index.md) |

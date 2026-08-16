@@ -24,9 +24,29 @@ A worker starts against a rendered brief.
 | `30-independent-review` | actor-stage (§6.4, judgment) | Every axis named in the brief's authoritative list runs as a separate, non-contaminating parallel review; outputs unblended. |
 | `40-escalate-or-continue` | actor-stage (§6.4, judgment) | A new gate is published only when a monotonic generation actually advanced; the handshake is acknowledged, accepted, acted on once, and marked complete. Publish result runs after, on the concluding path (folded helper). |
 
+## Authority envelope
+
+This workflow receives an already-admitted Work intent (a rendered mission brief from a dispatching supervisor).
+
+### Workflow may decide
+- Classifying pinned work into exactly one of the five named triage categories (`10-triage-and-route`).
+- Which concrete Work-scoping details to hand the selected discipline (`20-implement`).
+
+### Workflow may not decide
+- Whether a straddling work item belongs to a single triage category when none is clearly dominant — J0 (`10-triage-and-route`).
+- Whether to narrow independent-review coverage below the brief's own authoritative axis list (`30-independent-review`).
+- Whether a repeated blocker counts as a new gate absent a monotonic generation advance (`40-escalate-or-continue`).
+
+### Human or Captain gates
+- A straddling triage classification.
+- Every escalation the handshake actually reaches.
+
+### Decision record
+Material decisions are recorded per-stage in each stage's own output artifact.
+
 ## Relationships to other workflows
 
-- `20-implement` delegates to **diagnose-bug, prototype, tdd, implement, or deepen-module (whichever 10-triage-and-route selected)**.
+- `20-implement` delegates to **diagnose-bug, prototype, implement, or deepen-module** (whichever `10-triage-and-route` selected), each dispatched as its own separately-admitted Work — or, when the TDD discipline is selected directly, applies **`@@tdd`**/**`@@test-quality`** in place (`tdd`'s own ICM-R3 REHOME, confirmed).
 
 ## Adjudication note (A4)
 
@@ -42,4 +62,4 @@ invocations" sections.
 
 ## Provenance
 
-See `provenance.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.
+See `docs/gauntlet/promoted-provenance/worker-mission.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 correction: the prior text pointed at a workflow-local `provenance.md` that does not exist under `.sergeant/workflows/worker-mission/`.)

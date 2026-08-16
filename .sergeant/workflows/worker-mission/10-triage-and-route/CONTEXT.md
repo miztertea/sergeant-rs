@@ -22,9 +22,24 @@ Refs are fetched and a fixed base commit pinned, with base SHA/commit list/diff 
   (trigger: a worker has read a task and must decide how to proceed; outcome: the worker enters exactly one of five known procedural branches instead of guessing a generic implementation path)
   — `BU-P7-007`, `reference/sergeant-upstream/templates/worker-brief.md` (section '### 2. Route the work')
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim. The helper invocation below runs first, mechanically, to establish the fixed scope this judgment then triages against.
+Apply `@@bounded-judgment`. The helper invocation below runs first, mechanically, to establish the fixed scope this judgment then triages against.
+
+### J2 — delegated to this stage
+- Classifying the pinned work into exactly one of the five named categories (huge/foggy, hard bug or perf regression, uncertain design/UI, approved feature/fix, merge/rebase conflict), per `BU-P7-007`.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics — classification is the only material decision this stage makes, and it is J2.
+
+### J0 — must become `needs_input`
+- **The work straddles more than one of the five categories and no single classification is clearly dominant** (e.g. a hard bug that also requires an uncertain design call before it can be fixed). The five categories are mutually exclusive by construction, each loading a materially different procedure with a different authority envelope — classifying a straddling case is not the same delegation as choosing among genuinely exclusive categories, and guessing silently picks the wrong downstream procedure. (Parallel finding to `deepen-module`'s own structurally identical five-vs-four-category branching point, `docs/gauntlet/runs/icm-r3/deepen-module/review.md`.)
+
+### Completion boundary
+This stage may complete only when scope is pinned and the work is classified into exactly one of the five categories (or raised as `needs_input` per the straddling case above).
+
+### Decision evidence
+The chosen category and its rationale are this stage's own durable output (`output/README.md`); no separate decision log.
 
 ## Additional note
 

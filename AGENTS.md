@@ -230,8 +230,9 @@ itself is absent or unreadable; don't reconstruct the procedure from
 memory in that case. <!-- BU-0022, BU-0023, BU-0024 -->
 
 Most of the 126-unit corpus this rewrite consumed belongs to specific
-published workflows (`tdd`, `prototype`, `wayfinder`, `to-tickets`,
-`triage`, `diagnose-bug`) rather than to this always-on file — the full
+published workflows and shared contexts (`.sergeant/common/contexts/tdd.md`
+and `test-quality.md`, `prototype`, `wayfinder`, `to-tickets`, `triage`,
+`diagnose-bug`) rather than to this always-on file — the full
 per-unit disposition, including everything ruled not-adopted and why
 (among the not-adopted: two upstream skills this repo has no live package
 for yet, `codebase-design` and `domain-modeling` — only frozen evidence

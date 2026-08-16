@@ -19,7 +19,8 @@ this record or by this pass.
     "tdd's own two current, independently-checkpointed stages (00-agree-seams, 10-red-green-cycle), each a fresh execution today when tdd is dispatched directly",
     "code-review's own four current, independently-checkpointed stages (00-pin-fixed-point, 10-identify-spec-source, 20-30-parallel-review, 40-aggregate), each a fresh execution today, plus its own settled Authority envelope",
     "the identical 'context composition today ... which does not exist yet' hedge already present, unaddressed, at every current call site: implement/10-implement-with-tdd/CONTEXT.md, implement/30-review/CONTEXT.md (prior revision), and worker-mission/20-implement/CONTEXT.md",
-    "docs/gauntlet/runs/icm-r3/tdd/review.md's independent finding that tdd's own REHOME producer draft never weighed this exact alternative, for the identical underlying shape"
+    "docs/gauntlet/runs/icm-r3/tdd/review.md's independent finding that tdd's own REHOME producer draft never weighed this exact alternative, for the identical underlying shape",
+    "worker-mission/10-triage-and-route/CONTEXT.md's own self-flagged 'Additional note', independent of this claim: 'This is the branching point that raises engine-gap G6 (child-procedure invocation with its own checkpoints) ... It survives partially: representable today only by inlining the chosen discipline's stages, losing independent parent/child checkpoint and recovery visibility' -- generalizing this claim's shape across five delegation targets (diagnose-bug, prototype, tdd, implement, deepen-module) rather than implement's own two (ICM-R3, BU-WM-12)"
   ],
   "lower_rungs_attempted": [
     "shared context (@@tdd, as drafted for tdd's disputed REHOME)",
