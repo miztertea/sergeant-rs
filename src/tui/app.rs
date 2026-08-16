@@ -1315,6 +1315,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn esc_on_reap_confirmation_opened_from_retained_preview_restores_the_preview() {
+        // §12.4: Reap reached from the Retained preview (no open Work
+        // behind it) must back out to that preview on Esc/q, not vanish
+        // to no overlay at all — the review fix this guards against a
+        // regression of.
+        let mut app = App::new();
+        app.retained_reap_id = Some("01RET".to_string());
+        app.overlay = Some(Overlay::ReapConfirmation);
+
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RetainedPreview),
+            "Esc must restore the Retained preview, not close everything"
+        );
+        assert!(
+            app.retained_reap_id.is_none(),
+            "the reap target is cleared once the confirmation is backed out of"
+        );
+    }
+
+    #[test]
+    fn esc_on_reap_confirmation_opened_from_an_open_work_still_closes_fully() {
+        // The open-Work path (§13.10) has no Retained preview to return
+        // to, so Esc must behave as it always has: close the overlay.
+        let mut app = app_with_open_work("a", "completed_dirty");
+        app.on_key(KeyCode::Char('p'));
+        assert_eq!(app.overlay, Some(Overlay::ReapConfirmation));
+
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert!(app.overlay.is_none(), "no Retained preview to fall back to");
+    }
+
+    #[test]
+    fn repo_add_remove_ignores_further_keys_while_a_repo_add_is_pending() {
+        // §12.1's review fix: once a background AddRepo is in flight,
+        // repeated Enter presses on the still-open overlay must not
+        // resubmit — only Esc/q may act, and only to close.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::RepoAddRemove);
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        app.estate.pending_repo_add = Some(PendingRepoAdd::new("svc-a".to_string(), rx));
+
+        assert_eq!(
+            app.on_key(KeyCode::Enter),
+            Action::None,
+            "Enter while pending must not fire a second AddRepo"
+        );
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::RepoAddRemove),
+            "the overlay stays open showing the spinner"
+        );
+        assert!(
+            app.estate.pending_repo_add.is_some(),
+            "the in-flight add is left untouched"
+        );
+
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert!(app.overlay.is_none(), "Esc still closes the overlay");
+    }
+
     #[tokio::test]
     async fn a_rejected_cancel_keeps_the_confirmation_open_with_the_error_and_still_refreshes() {
         let mut app = app_with_open_work("a", "blocked");

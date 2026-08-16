@@ -448,6 +448,38 @@ mod tests {
     }
 
     #[test]
+    fn extend_confirmation_saturates_instead_of_overflowing_u64() {
+        // Review fix: `cap + added` panics (debug) / wraps (release) once
+        // the sum exceeds u64::MAX; `saturating_add` must clamp instead of
+        // either.
+        let mut app = App::new();
+        app.rows = super::super::fleet::fleet_rows(&json!({"works": [
+            {"id": "01WORK", "state": "blocked", "intent": "fix the thing"},
+        ]}));
+        app.open_work = Some(super::super::OpenWork {
+            id: "01WORK".to_string(),
+            from: super::super::Destination::Fleet,
+        });
+        app.work_screen = Some(super::super::work_view::WorkScreen::from_parts(
+            "01WORK".to_string(),
+            json!({
+                "work": {"id": "01WORK", "intent": "fix the thing", "state": "blocked"},
+                "stage": {"stage_id": "10-implement", "attempt": 2},
+                "envelope": {"turn_cap": u64::MAX - 1, "turns_spawned": 3},
+            }),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        app.pending_action.extend_turns = "5".to_string();
+        let body = extend_body(&app);
+        assert!(
+            body.contains(&u64::MAX.to_string()),
+            "the sum must saturate at u64::MAX, not panic or wrap: {body}"
+        );
+    }
+
+    #[test]
     fn reap_confirmation_states_the_branch_is_retained() {
         let app = app_with_open_work("completed_dirty");
         let body = reap_body(&app);
