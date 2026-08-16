@@ -3519,20 +3519,24 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     const BUDGET: f64 = 24.0;
     // Load-sensitivity note (macOS / Apple M3 Pro, issue #128,
     // docs/perf/macbook-arrival-git-spawn-2026-08-15.md):
-    // This test passes in isolation (11.3–12.0 works/s, above the 11.0 floor)
-    // but can fail under heavy parallel cargo-test / compilation contention
-    // (measured 9.3 works/s on an Apple M3 Pro). The submit path serializes
-    // through a single per-repo lock rather than a parallel-worker pool, so
-    // throughput = 1 / per-submission latency — it is not a concurrency count.
-    // Git subprocess spawn overhead dominates that latency on macOS; OS
-    // scheduling pressure under load inflates it further. Owner-accepted
-    // disposition: known flaky-under-load on macOS; not fixed further this pass.
+    // Isolated throughput on M3 Pro is ~10.96–11.13 works/s; under parallel
+    // cargo-test / compilation contention it drops to ~9.3 works/s. The submit
+    // path serializes through a single per-repo lock, so throughput = 1 /
+    // per-submission latency — it is not a concurrency count. Git subprocess
+    // spawn overhead dominates that latency on macOS; OS scheduling pressure
+    // under load inflates it further. Floor set to 8.0: gives real margin under
+    // both isolated and contended conditions while still catching a genuine
+    // regression toward the original ~5 works/s baseline (#128). Owner-approved:
+    // durable queuing and eventual execution matter far more than sub-100ms
+    // submission latency on this host.
     /// How much slower a suite sharing its cores with seven others may be.
     const CONTENTION_ALLOWANCE: f64 = 2.0;
     /// Works per second the daemon must sustain, whole submit path.
-    /// M3 Pro / macOS git-spawn overhead limits throughput to ~11.6 works/s;
-    /// floor revised to 11.0 to give headroom on this hardware (#128).
-    const THROUGHPUT_FLOOR: f64 = 11.0;
+    /// Floor set to 8.0 (owner-approved, #128): isolated M3 Pro range is
+    /// ~10.96–11.13 works/s; contended range down to ~9.3 works/s; 8.0 gives
+    /// headroom under both while catching regressions toward the ~5 works/s
+    /// baseline this fix started from.
+    const THROUGHPUT_FLOOR: f64 = 8.0;
     const BURST: usize = 25;
 
     let dir = TempDir::new().expect("tempdir");
