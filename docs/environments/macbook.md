@@ -13,6 +13,29 @@ pasted verbatim — the probe reported them wrong on this host, not merely
 durable record. Root cause and independent verification for both are in
 "Probe defects found on this host" below the table.
 
+## ADR 0001 (D8) bar — cleared
+
+Full suite run 2026-08-15 on the final merged tip (`f0ec0b0`,
+`integration/macbook-arrival-2026-08-15`), `$SGT_DATA_DIR` unset (this
+checkout is now itself a live `sgt` estate — see the m8_estate_cli note
+below): **655 tests, 655 passed, 0 failed, 0 `SKIPPED-ENV`, 4 `#[ignore]`d**
+(opt-in `SERGEANT_CLAUDE_TESTS` suite, not environment skips). `#18`/`#81`/
+`#82`'s `UNVERIFIED` markers are gone from `src/platform/{process,disk,data_dir}.rs`;
+`#85`'s remains in `fs_locking.rs`, correctly not claimed — no real
+`statfs`/`getmntinfo`/`diskutil` detection was built.
+
+Two confounds surfaced and resolved during this run, neither a regression:
+- With `$SGT_DATA_DIR` set (as this session's harness sets it, since this
+  checkout became a live estate mid-sprint via `sgt repo add`), four
+  `tests/m8_estate_cli.rs` tests fail — they assert an isolated tempdir data
+  dir but pick up the ambient real one instead. Confirmed by unsetting the
+  var: clean. Not a code defect; a fact for anyone running this suite from
+  inside a Sergeant-managed checkout of itself to know.
+- `run_turns_and_ceiling_secs_override_the_envelope_for_one_work` flaked
+  once (a real daemon's health check timing out at 10s under host load
+  from everything else running this session) — reproduced 3/3 clean in
+  isolation immediately after.
+
 Facts measured 2026-08-15 on host "US-DWDVHVG44T"
 
 | Fact | Measured value | Evidence |
