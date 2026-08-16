@@ -40,9 +40,26 @@ The structured branch-sync state is processed rather than improvised: sync / con
   (trigger: branch_sync is blocked; outcome: recovery only ever uses the three named remediation paths, never an improvised git operation)
   — `BU-P1-079`, `reference/sergeant-upstream/README.md` (README.md L300)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Reading the structured `branch_sync` object and dispatching to the correct named path (`sync`, `continue_active_run`, `recover_custody`) per its `next_action.code` (`BU-P2-089`–`092`).
+- Choosing `axi sync --recover` versus `no-mistakes rerun` when `recover_custody` applies (`BU-P2-092`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics — every response to `branch_sync` is a named, structured path (J2); nothing here is a local improvisation.
+
+### J0 — must become `needs_input`
+- **A dirty or diverged worktree blocks recovery and the offered structured choices (`--keep-local` or the anchored `refs/no-mistakes/recover/<run>` ref) don't resolve which to pick without more context** (`BU-P2-093`).
+- Any temptation to reset, stash, force-push, or replace the branch to escape a blocked sync — never an available response; if the structured choices don't cover the situation, that is itself the `needs_input` condition (`BU-P1-079`).
+
+### Completion boundary
+This stage may complete only when the branch-sync state has been processed through one of its named structured paths, never an improvised git operation.
+
+### Decision evidence
+The `next_action.code` acted on and the chosen recovery path (where applicable) are this stage's own decision record; no separate file.
 
 ## Output
 

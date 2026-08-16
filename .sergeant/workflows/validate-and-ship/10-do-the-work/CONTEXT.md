@@ -25,9 +25,25 @@ Only the task's own changes are committed, on a non-default feature branch, with
   (trigger: the task's changes have been made; outcome: the work lands as a commit on a non-default feature branch before validation can proceed)
   — `BU-P2-061`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 2, lines 39-42)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Isolating exactly which working-tree changes belong to the task (versus pre-existing unrelated changes) requires judgment, not a mechanical diff.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Isolating exactly which working-tree changes belong to the task versus pre-existing unrelated changes, and committing only the former (`BU-P2-060`).
+- Deciding whether a feature branch must be created first (the user was on the repository's default branch) or already exists (`BU-P2-061`).
+
+### J1 — local choices allowed
+- Commit message wording, provided scope is correctly isolated per `BU-P2-060`.
+
+### J0 — must become `needs_input`
+- A working-tree change cannot be confidently attributed to the task or to a pre-existing unrelated edit — guessing risks committing someone else's in-progress work.
+
+### Completion boundary
+This stage may complete only when the task's own changes, and only those, are committed on a non-default feature branch.
+
+### Decision evidence
+The commit itself is the durable record of scope; no separate decision log.
 
 ## Additional note
 

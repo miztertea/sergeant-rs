@@ -58,11 +58,13 @@ These three checkpoints were classified at extraction as deterministic machinery
   (trigger: the validation worker is about to invoke no-mistakes against the isolated snapshot; outcome: the exact code that was reviewed is the exact code that gets validated — no substitution window)
   — `BU-P6-044`, `reference/sergeant-upstream/bin/sgt-validation-worker` (L123-129)
 
-`BU-P6-129` (the coarse "launching validation is its own bounded, independently invocable procedure" claim) is cited at workflow level in `provenance.md`, not repeated here: per N1 adjudication A10 (finding N1-BH-08) it is `confidence: low` and narrowed to that coarse boundary claim in the corpus, since its four original sub-claims are now separately, more strongly cited above.
+`BU-P6-129` (the coarse "launching validation is its own bounded, independently invocable procedure" claim) is cited at workflow level in `docs/gauntlet/promoted-provenance/validate-and-ship.md`, not repeated here: per N1 adjudication A10 (finding N1-BH-08) it is `confidence: low` and narrowed to that coarse boundary claim in the corpus, since its four original sub-claims are now separately, more strongly cited above.
 
 ## Helper: repo-level pre-push gate (re-homed from the demoted `repo-release-verification` package, N1 adjudication A6)
 
-`repo-release-verification` was demoted from a standalone workflow (finding N1-BH-06: it was file-shape mirroring — §6.2's workflow test was never actually argued for it). Its behavior is this repository's own git pre-push hook, which mechanically gates *every* push in this repository (not only pushes made during this workflow) — the closest binding checkpoint to it in `validate-and-ship` is the point where committed work is about to be handed to the pipeline for the first time, which is this stage's own precondition chain. See `provenance.md`'s "Re-homed from repo-release-verification (A6)" section for the full re-homing record.
+`repo-release-verification` was demoted from a standalone workflow (finding N1-BH-06: it was file-shape mirroring — §6.2's workflow test was never actually argued for it). Its behavior, per the cited upstream source, is a git pre-push hook that would mechanically gate *every* push in the repository it's installed in (not only pushes made during this workflow) — the closest binding checkpoint to it in `validate-and-ship` is the point where committed work is about to be handed to the pipeline for the first time, which is this stage's own precondition chain. See `docs/gauntlet/promoted-provenance/validate-and-ship.md`'s "Re-homed from repo-release-verification (A6)" section for the full re-homing record.
+
+**Not currently installed in this repository (corrected 2026-08-16, ICM-R2 pilot review, BU-VAS-06).** The two behavior units below are cited from `reference/sergeant-upstream/`'s frozen evidence — the source project being reconciled, not this repository's live tooling. This repository's own git hooks directory contains no `pre-push` hook (checked directly; only stock `.sample` files are present), and no `scripts/hooks/pre-push` exists anywhere under this repository's tree — `scripts/gate.sh` is the only shipping-adjacent script under `scripts/`, and it is a manually-invoked wrapper, not a git hook. The two units below describe what the upstream re-homing found, not a live mechanism in effect here; do not treat this section as evidence that pushes in this repository are currently gated.
 
 - **Before every git push, the drain test suite must run and pass; the push is blocked on failure unless the operator explicitly opts out with git push --no-verify.**
   (trigger: operator runs git push; outcome: push proceeds only after the drain suite passes, or the operator explicitly consents to skipping validation)
@@ -71,9 +73,26 @@ These three checkpoints were classified at extraction as deterministic machinery
   (trigger: required validation tooling is missing on push; outcome: a push with unrunnable validation is blocked with a diagnosis, never silently allowed through)
   — `BU-P6-008`, `reference/sergeant-upstream/scripts/hooks/pre-push` (L29-33, L35-39)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Deciding once, per run, whether the intent transport is a private file path or argv — probed against the installed build's real capability, never assumed (`BU-P6-134`, `BU-P8-085`).
+- Resolving validation-run ownership per the explicit-claim rule (`BU-P6-143`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics — every material choice in this stage is either a J5 privacy/consent constraint or an explicitly delegated J2 transport decision; there is no local, non-contractual choice left over.
+
+### J0 — must become `needs_input`
+- The argv transport may only be selected with the operator's explicit, per-run consent (`BU-P6-134`) — absent that consent, this stage does not choose argv on its own initiative.
+- **The push/pr/ci authority gap named at workflow level (`## Authority envelope`, BU-VAS-15) is not resolved here or anywhere else in this package** — if this stage's own precondition chain is ever extended to cover push/PR/CI (it currently is not), that extension inherits the same J0 status until the owner rules on it.
+
+### Completion boundary
+This stage may complete only when the transport decision is made, recorded twice for audit, and the coordinator-launched entry's readiness/reservation/snapshot preconditions (where applicable) all hold.
+
+### Decision evidence
+The transport decision and its consent record are the audit log named in `BU-P8-087` — the append-only launch log is this stage's own decision-evidence surface, not a separate file.
 
 ## Output
 

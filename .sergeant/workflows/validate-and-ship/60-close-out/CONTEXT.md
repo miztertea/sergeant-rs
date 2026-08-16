@@ -54,9 +54,26 @@ Stop driving at `checks-passed`; on `failed`/`cancelled`, fix on the same branch
   (trigger: coordinator-owned no-mistakes validation is launched, possibly after a pane handover; outcome: validation authority is unambiguous and independently verified, matching the worker-brief's own rule that the coordinator owns every no-mistakes gate and a worker pane may never approve or route one)
   — `BU-P7-104`, `reference/sergeant-upstream/tests/sgt-validate-test.sh` (line 1180)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Distinguishing `checks-passed`/`passed`/`failed`/`cancelled` and taking the matching path — stop and hand off, fix and re-drive, or explain the blocker (`BU-P2-086`–`088`).
+- Summarizing what the pipeline found and fixed for the user (`BU-P2-097`).
+
+### J1 — local choices allowed
+- Summary wording, provided every pipeline-made fix is explicitly acknowledged (`BU-P2-097`).
+
+### J0 — must become `needs_input`
+- A `failed`/`cancelled` outcome whose blocker cannot be concretely fixed or concretely explained — silence is never an option (`BU-P2-088`).
+- This stage's own `checks-passed`/`passed` outcomes presuppose a PR already exists and CI already ran — **this stage does not itself open that PR or trigger that CI; that authorization is the unresolved gap named at workflow level (`## Authority envelope`, BU-VAS-15) and in `40-drive-gates`'s own `## Bounded judgment`.** If this stage is ever reached without a human-authorized PR/CI having actually happened, that is itself a `J0` condition, not something to paper over by describing the expected happy path as if it occurred.
+
+### Completion boundary
+This stage may complete only at a terminal or near-terminal pipeline outcome, with the user given an honest, itemized summary — never left at a failed outcome in silence.
+
+### Decision evidence
+The outcome acted on and the summary given are this stage's own decision record; ownership-transfer logging (below) is separate and mechanical.
 
 ## Output
 

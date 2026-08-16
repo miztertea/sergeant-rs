@@ -93,11 +93,30 @@ Every gate resolved by exactly one response; ask-user findings relayed verbatim 
   (trigger: a no-mistakes finding needs a disposition applied (e.g. routed to td as debt); outcome: a finding's routing is deterministic and inspectable — the exact fields passed to td are asserted, not merely 'some td call happened')
   — `BU-P7-065`, `reference/sergeant-upstream/tests/sgt-no-mistakes-finding-test.sh` (lines 50-70, 88-90)
 
-This stage's outcome is also produced in part by running **route-review-findings** to its own completion for the routing step above (context composition today — see `docs/icm/convention.md` §4 on `@@name` versus true nested-workflow invocation, which does not exist yet).
+This stage's routing step above is performed directly by this stage via the `sgt-no-mistakes-finding` helper — **corrected 2026-08-16, ICM-R2 pilot review (BU-VAS-10):** the prior text here claimed delegation to a package named `route-review-findings`; no such package exists (retriaged to unbuilt CLI-verb candidates, `docs/icm/retriage-2026-08-11.md` line 52). There is no nested-workflow invocation here, nor a `@@name` shared-context composition — just this stage's own helper.
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Authorizing `auto-fix` findings on its own judgment (`BU-P2-080`).
+- Approving a gate whose findings are all `auto-fix` or `no-op` (`BU-P2-098`).
+- Classifying a no-mistakes finding's severity/kind for `td` routing eligibility per the deterministic helper's own contract (`BU-P6-023`, folded helper below) — mechanical, not this stage's own judgment call, but this stage invokes it.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics — every gate response is either a J2 auto-fix/no-op authorization or a J0 ask-user escalation; there is no local, non-contractual choice in between at this stage.
+
+### J0 — must become `needs_input`
+- **Every `ask-user` gate finding, without exception** — relayed verbatim (id, file, full description, not paraphrased or pre-judged) and never resolved autonomously (`BU-P2-098`, `BU-P2-099`). This is the canonical worked precedent the whole Bounded-Judgment Ladder generalizes from (`reference/proposal-icm-r-procedure-authority.md` §3.4).
+- **The push/pr/ci authority gap (BU-VAS-15, full record in the workflow-level `CONTEXT.md`'s `## Authority envelope`).** This stage drives every gate — including any `push`/`pr`/`ci` steps a launched run's pipeline includes — to a terminal outcome, and nothing in this stage's own contract, or anywhere else in this package, names an authority boundary for autonomous publication. Measured live twice (`docs/gauntlet/runs/path-to-mac-2026-08-15/retrospective.md` §3.1; `docs/gauntlet/runs/macbook-arrival-2026-08-15/retrospective.md` §3, "#123 materialized, not just predicted"). **This clause is a citable placeholder, not a resolution** — the underlying policy question (should this stage, when driving a dispatched run, ever autonomously push/open a PR/trigger CI, and under what recorded consent) is a live, separate owner decision this stage does not make on its own initiative. Until ruled on, treat any push/PR/CI step this stage's driven run reaches as `needs_input`, per this ladder's own J0 procedure — do not silently apply `scripts/gate.sh`'s `--skip push,pr,ci` behavior here, since that script is not part of this stage's own contract and this stage has no way to know its flags.
+- `--yes` unattended consent for a Sergeant-coordinated run — the absolute-never reading, not the vendored gate skill's documented standing-consent exception (Conflict X3 below).
+
+### Completion boundary
+This stage may complete only when every gate reaches exactly one response — auto-fix, no-op, or ask-user relayed and resolved by the user — and every actionable finding is routed to a deduplicated owning-repo task.
+
+### Decision evidence
+Each gate's own findings table (id, severity, action, disposition) is this stage's decision record; a `J0` stop is recorded in the turn's own `needs_input` question per `@@bounded-judgment`'s canonical shape.
 
 ## Additional note
 

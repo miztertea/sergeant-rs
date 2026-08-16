@@ -27,11 +27,32 @@ Implementation, native tests, lint and independent review are complete and the c
 | `50-reconcile-custody` | actor-stage (§6.4, judgment) | The structured branch-sync state is processed rather than improvised: sync / continue / recover-custody, never reset, stash, force or branch replacement. |
 | `60-close-out` | actor-stage (§6.4, judgment) | Stop driving at `checks-passed`; on `failed`/`cancelled`, fix on the same branch and re-drive; summarize what the pipeline found and fixed; any coordinator ownership transfer during the run is durably logged. Folds a demoted checkpoint (N1 adjudication A4). |
 
-`00-verify-readiness`, `10-acquire-launch-reservation`, and `20-reserve-isolated-snapshot` (original numbering) were demoted per N1 adjudication A4 and folded into `20-select-intent-transport`; `60-route-findings` was demoted and folded into `40-drive-gates`; `90-handover-log` was demoted and folded into `60-close-out`. See each surviving stage's own `CONTEXT.md` and `provenance.md`'s "Adjudication A4" section for the per-stage keep/demote reasoning. `00-check-scope` and `10-do-the-work` were restored (never dissolved) and `40-start-run` (original numbering, now `30-start-run`) was re-rung to an actor stage, per N1 adjudication A5 (finding N1-BH-04) — see `provenance.md`'s "Adjudication A5" section. `repo-release-verification` was demoted from a standalone workflow and re-homed into `20-select-intent-transport` per N1 adjudication A6 — see `provenance.md`'s "Re-homed from repo-release-verification (A6)" section.
+`00-verify-readiness`, `10-acquire-launch-reservation`, and `20-reserve-isolated-snapshot` (original numbering) were demoted per N1 adjudication A4 and folded into `20-select-intent-transport`; `60-route-findings` was demoted and folded into `40-drive-gates`; `90-handover-log` was demoted and folded into `60-close-out`. See each surviving stage's own `CONTEXT.md` and `docs/gauntlet/promoted-provenance/validate-and-ship.md`'s "Adjudication A4" section for the per-stage keep/demote reasoning. `00-check-scope` and `10-do-the-work` were restored (never dissolved) and `40-start-run` (original numbering, now `30-start-run`) was re-rung to an actor stage, per N1 adjudication A5 (finding N1-BH-04) — see that same file's "Adjudication A5" section. `repo-release-verification` was demoted from a standalone workflow and re-homed into `20-select-intent-transport` per N1 adjudication A6 — see that same file's "Re-homed from repo-release-verification (A6)" section.
 
 ## Relationships to other workflows
 
-- `40-drive-gates` delegates part of its outcome to **route-review-findings** (folded from the demoted `60-route-findings`).
+- `40-drive-gates` folds the finding-routing behavior formerly attributed to a package named `route-review-findings`, which was never built (retriaged to CLI-SURFACE/NET-NEW-SURFACE unbuilt verb candidates, `docs/icm/retriage-2026-08-11.md` line 52, `docs/icm/re-homing-record-2026-08-12.md` line 29). The actual live mechanism is `sgt-no-mistakes-finding`'s deterministic routing, already folded into `40-drive-gates` as its own helper. **Corrected 2026-08-16, ICM-R2 pilot review (BU-VAS-10):** the prior text here named `route-review-findings` as a currently-invoked delegate; no such package exists.
+
+## Authority envelope
+
+This workflow receives an already-admitted Work intent (either the coordinator-launched entry's readiness-verified handoff, or the directly-invoked entry's live `/no-mistakes` request).
+
+### Workflow may decide
+- The invocation mode (validate-only vs. task-first) and how a specific user request translates into concrete pipeline flags (`00-check-scope`).
+- How to authorize `auto-fix`/`no-op` gate findings on its own judgment (`40-drive-gates`).
+- How to process a structured branch-sync state deterministically (`50-reconcile-custody`).
+
+### Workflow may not decide
+- Whether to resolve an `ask-user` gate finding — it is relayed verbatim to the user, never resolved autonomously (`40-drive-gates`).
+- Whether a dispatched run of this workflow may autonomously push a branch, open a pull request, or trigger CI — **currently unclassified** (BU-VAS-15; see the stage-level `J0` note in `40-drive-gates/CONTEXT.md`). This is a live, unresolved owner decision, not a workflow authority this package grants itself.
+- To edit the pipeline-owned worktree, abort, or rerun mid-gate to escape a finding.
+
+### Human or Captain gates
+- Every `ask-user` gate finding.
+- The push/pr/ci authority gap (BU-VAS-15) until the owner rules on it.
+
+### Decision record
+Material decisions are recorded per-stage in each stage's own `## Bounded judgment` section below and in the gate's own findings table (`40-drive-gates`).
 
 ## Notes for reviewers
 
@@ -43,4 +64,4 @@ Per A11, the reader-note previously repeating "read `pane`/`tmux` as this projec
 
 ## Provenance
 
-See `provenance.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.
+See `docs/gauntlet/promoted-provenance/validate-and-ship.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. **Corrected 2026-08-16, ICM-R2 pilot review (BU-VAS-10):** this and every other in-package citation previously pointed at a co-located `provenance.md` that does not exist anywhere in this package — apparently never carried over when the package was promoted out of its draft-workflow location.
