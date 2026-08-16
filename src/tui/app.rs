@@ -507,8 +507,11 @@ impl App {
             SlashCommand::Fleet => self.leave_open_work_and_goto(Destination::Fleet),
             SlashCommand::Workflows => self.leave_open_work_and_goto(Destination::Workflows),
             SlashCommand::Estate => self.leave_open_work_and_goto(Destination::Estate),
-            // §15.6's "q / Esc: back": leaves the open Work, same as Esc
-            // there — with none open there is nowhere to go back to.
+            // §15.6's "q / Esc: back": leaves the open Work, the same
+            // effect Esc has there. Unlike Esc/q, this does not also quit
+            // from a top-level destination — `/quit` already names that
+            // outright, so with no Work open this is a deliberate no-op
+            // rather than an exit hidden behind a menu pick.
             SlashCommand::Back => {
                 if self.open_work.is_some() {
                     self.open_work = None;
@@ -516,6 +519,12 @@ impl App {
                 }
             }
             SlashCommand::Refresh => return Action::Refresh,
+            // §12.4's Retained preview: the `r` mnemonic only surfaces this
+            // from Estate/Health with the `disk_pressure` check selected,
+            // but the read itself (`GET /v1/retained`) is estate-wide, so
+            // the palette reaches it from anywhere, same as /evidence,
+            // /graph, and /details reach their tabs outside the mnemonic's
+            // own digit-key context.
             SlashCommand::Retained => return Action::LoadRetained,
             SlashCommand::Help => self.overlay = Some(Overlay::Help),
             SlashCommand::Quit => {
@@ -534,9 +543,15 @@ impl App {
             // Durable/destructive per §15.5: this only ever opens the same
             // confirmation the mnemonic key does — the mutation itself
             // still waits on that overlay's own deliberate Confirm.
-            SlashCommand::Cancel => self.open_action_confirmation("cancel", Overlay::CancelConfirmation),
-            SlashCommand::Retry => self.open_action_confirmation("retry", Overlay::RetryConfirmation),
-            SlashCommand::Extend => self.open_action_confirmation("extend", Overlay::ExtendEnvelope),
+            SlashCommand::Cancel => {
+                self.open_action_confirmation("cancel", Overlay::CancelConfirmation)
+            }
+            SlashCommand::Retry => {
+                self.open_action_confirmation("retry", Overlay::RetryConfirmation)
+            }
+            SlashCommand::Extend => {
+                self.open_action_confirmation("extend", Overlay::ExtendEnvelope)
+            }
             SlashCommand::Reap => self.open_action_confirmation("reap", Overlay::ReapConfirmation),
             SlashCommand::Evidence => self.show_work_tab(Tab::Evidence),
             SlashCommand::Graph => self.show_work_tab(Tab::Graph),
@@ -616,12 +631,13 @@ impl App {
             }
             // Same fixed controls as above, but the Work id can come from
             // either an open Work surface (§13.10) or §12.4's Retained
-            // preview — [`App::retained_reap_id`] is Estate's own source, so
-            // this stays the one Reap implementation either way.
+            // preview — [`App::retained_reap_id`] is Estate's own source,
+            // and takes precedence over an open Work when both are present,
+            // so this stays the one Reap implementation either way.
             Overlay::ReapConfirmation => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') => {
-                        if self.open_work_id().is_none() && self.retained_reap_id.is_some() {
+                        if self.retained_reap_id.is_some() {
                             self.overlay = Some(Overlay::RetainedPreview);
                             self.pending_action = PendingAction::default();
                             self.retained_reap_id = None;
@@ -630,9 +646,17 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
+                        // `retained_reap_id` is the explicit selection made
+                        // inside §12.4's Retained preview, so it takes
+                        // precedence over an open Work — `/retained`
+                        // (§15.3) can now reach this preview with a Work
+                        // open, and reaping must target what the user
+                        // actually picked there, not whatever Work happens
+                        // to be open underneath.
                         let Some(id) = self
-                            .open_work_id()
-                            .or_else(|| self.retained_reap_id.clone())
+                            .retained_reap_id
+                            .clone()
+                            .or_else(|| self.open_work_id())
                         else {
                             self.close_overlay();
                             return Action::None;
@@ -799,7 +823,7 @@ impl App {
             Overlay::SlashPalette => {
                 let len = SlashCommand::ALL.len();
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.close_overlay(),
                     KeyCode::Down | KeyCode::Char('j') => {
                         if self.slash_palette_index + 1 < len {
                             self.slash_palette_index += 1;

@@ -359,7 +359,12 @@ fn extend_body(app: &App) -> String {
 /// reaped, even though [`super::app::App::execute`]'s own `Action::Reap`
 /// correctly acts on `retained_reap_id` either way.
 fn reap_identity(app: &App) -> (String, String) {
-    if app.open_work.is_some() {
+    // `retained_reap_id` is the explicit selection made inside §12.4's
+    // Retained preview, so it takes precedence over an open Work — the
+    // two can now both be set at once since §15.3's `/retained` reaches
+    // that preview without first leaving an open Work (see the matching
+    // precedence in `App::on_key_overlay`'s `ReapConfirmation` arm).
+    if app.retained_reap_id.is_none() && app.open_work.is_some() {
         return work_identity(app);
     }
     let id = app

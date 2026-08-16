@@ -283,9 +283,16 @@ impl WorkScreen {
     }
 
     /// §15.3's `/evidence`, `/graph`, `/details` commands: the same tab
-    /// switch the `1`-`5` digit keys already perform.
+    /// switch the `1`-`5` digit keys already perform. Those digit keys are
+    /// only reachable with the `ANSWER` composer unfocused (`on_key`
+    /// routes to `on_key_answer` first when it's focused) — the palette
+    /// has no such precondition, so this must drop focus itself or a
+    /// palette pick made mid-answer would switch the visible tab while
+    /// keys kept routing into the hidden draft.
     pub fn show_tab(&mut self, tab: Tab) {
         self.tab = tab;
+        self.answer_focused = false;
+        self.answer_send_focused = false;
     }
 
     pub fn on_key(&mut self, key: impl Into<KeyEvent>) -> WorkScreenOutcome {
@@ -1952,6 +1959,28 @@ mod tests {
             screen.answer_send_focused = false;
         }
         assert!(!screen.answer_focused);
+    }
+
+    /// §15.3: `/evidence`, `/graph`, `/details` reach `show_tab` while the
+    /// `ANSWER` composer may still be focused (the palette opens from
+    /// there via `/`). `on_key` routes to `on_key_answer` first whenever
+    /// `answer_focused` is set, so without this the visible tab would
+    /// change while keys kept landing in the hidden draft.
+    #[test]
+    fn show_tab_drops_answer_focus_so_the_new_tab_receives_keys() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        assert!(screen.answer_focused);
+        screen.show_tab(Tab::Evidence);
+        assert!(!screen.answer_focused);
+        assert!(!screen.answer_send_focused);
+        assert_eq!(screen.tab, Tab::Evidence);
+        screen.on_key(KeyCode::Char('j'));
+        assert_eq!(
+            screen.answer.text(),
+            "",
+            "'j' navigated the tab, not the hidden draft"
+        );
     }
 
     #[test]

@@ -76,18 +76,14 @@ impl Composer {
         ComposerOutcome::None
     }
 
-    /// §15.3's trigger condition (Decision T2-55): every line above the
-    /// cursor, and every character on the cursor's own line up to the
-    /// cursor, is blank — so a `/` typed here can only be the start of a
-    /// command, never a character inside typed text.
+    /// §15.3's trigger condition (Decision T2-55): the whole draft is
+    /// blank — every line, not just the ones up to the cursor — so a `/`
+    /// typed here can only become the draft's first non-whitespace
+    /// character, never a character inserted ahead of text that's already
+    /// there (e.g. after moving the cursor back to column 0 on a
+    /// non-blank line).
     fn at_first_nonwhitespace(&self) -> bool {
-        let cursor = self.area.cursor();
-        let lines = self.area.lines();
-        lines[..cursor.0].iter().all(|line| line.trim().is_empty())
-            && lines[cursor.0]
-                .chars()
-                .take(cursor.1)
-                .all(char::is_whitespace)
+        self.area.lines().iter().all(|line| line.trim().is_empty())
     }
 
     /// Ask to submit the current draft outright — the Tab-to-Send-then-Enter
@@ -240,7 +236,10 @@ mod tests {
     fn slash_elsewhere_in_the_draft_stays_literal_text() {
         let mut composer = Composer::new();
         for c in "fix the /path".chars() {
-            assert_eq!(composer.on_key(key(KeyCode::Char(c))), ComposerOutcome::None);
+            assert_eq!(
+                composer.on_key(key(KeyCode::Char(c))),
+                ComposerOutcome::None
+            );
         }
         assert_eq!(composer.text(), "fix the /path");
     }
