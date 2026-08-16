@@ -690,12 +690,13 @@ impl App {
                 }
                 Action::None
             }
-            // Every overlay still owned by a later Work (§7.4's note) plus
-            // Help (content-built at T1a, but generic close-only controls
-            // are all it ever needs): the mechanism this Work built at
-            // T1a — open, close, restore focus for free. RepoAddRemove,
-            // GroupEditRemove, and RetainedPreview have their own real arms
-            // above (T3); WorkflowChooser has its own real arm above (T2).
+            // SlashPalette is still owned by a later Work (§7.4's note);
+            // Help and ConnectionDetail have real content (T1a and issue
+            // #154 respectively) but need nothing beyond the generic
+            // close-only controls this Work built at T1a — open, close,
+            // restore focus for free. RepoAddRemove, GroupEditRemove, and
+            // RetainedPreview have their own real arms above (T3);
+            // WorkflowChooser has its own real arm above (T2).
             Overlay::Help | Overlay::SlashPalette | Overlay::ConnectionDetail => {
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.overlay = None,
