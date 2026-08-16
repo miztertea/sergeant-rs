@@ -400,3 +400,50 @@ Rules:
    that embeds judgment the ladder would classify as rung §6.4 is a
    violation — the judgment must surface into the stage context, not stay
    buried in script logic no reviewer will read as procedure.
+
+## 6. Placement and Authority (ICM-R, `docs/adr/0013-icm-r0-owner-rulings.md`)
+
+Two ladders, canonical sources fixed elsewhere, referenced here rather than
+restated:
+
+- **Placement Ladder (PL-0..PL-7)** — `reference/proposal-icm-r-procedure-
+  authority.md` §5. Answers "what is the lowest-authority, smallest-surface
+  representation that faithfully owns this behavior?" Extends this file's
+  own §6.1a/6.2 driver discriminator with the full PL rung set (Captain
+  skill, actor skill, workflow, stage, deterministic mechanism, engine
+  gap).
+- **Bounded-Judgment Ladder (J5..J0)** — `.sergeant/common/contexts/
+  bounded-judgment.md`, referenced as `@@bounded-judgment`. Answers "what
+  authority allows this actor to decide this material question without
+  returning to a human or higher authority?"
+
+### 6.1. Required sections
+
+Every workflow's Layer-1 `CONTEXT.md` carries an `## Authority envelope`
+section (what the workflow may decide, may not decide, which decisions are
+human/Captain gates, where material decisions are recorded). Every actor
+stage's `CONTEXT.md` carries a `## Bounded judgment` section (its J2
+delegations by name, its J1 local choices, what must become `needs_input`
+at J0, its completion boundary, where decisions are recorded) — always
+present, even when it is only "inherits workflow envelope unchanged"
+(decision 4: omission is never ambiguous). Every Captain skill's `SKILL.md`
+carries the same conceptual section adapted to its driver (what it may
+decide, what it must ask the user, what it must not do, its durable
+handoff if any).
+
+### 6.2. Review scope
+
+Independent review, and the "no producer self-promotes" rule (§2 above),
+apply to **promotable effects only** — artifacts that will be merged,
+published, installed, admitted, signed, released, or treated as settled
+(decision 6). Ephemeral output does not require a new Work merely to
+exist, and does not require review-of-the-review.
+
+### 6.3. Review independence
+
+A later stage in the *same* workflow may qualify as independent review
+when it has a fresh execution, explicit inputs (not inherited conversation
+state), a review-only contract, and no authority to edit the subject it
+reviews (decision 7). Independence lives in the execution boundary, not in
+whether the reviewer happens to share a workflow wrapper with the work it
+reviews.

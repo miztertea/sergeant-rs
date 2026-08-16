@@ -25,9 +25,26 @@ The correct one of the two invocation modes (validate-only or task-first) is ide
   (trigger: the user invokes the no-mistakes command, optionally with a specific request; outcome: user intent is translated into concrete CLI flags rather than passed through unparsed)
   — `BU-P2-058`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (invocation, lines 20-23)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Distinguishing "already committed, just validate" from "do the task first" and translating an ambiguous natural-language request into the correct CLI flag both require judgment, not a fixed lookup table.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Distinguishing "already committed, just validate" (validate-only) from "do the task first" (task-first) from the user's own invocation (`BU-P2-059`).
+- Translating an ambiguous natural-language request (e.g. "skip the lint step") into the correct `axi run` flag, consulting `axi run --help` rather than guessing the grammar (`BU-P2-058`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics — invocation-mode and flag-translation are the only material decisions this stage makes, and both are J2.
+
+### J0 — must become `needs_input`
+- The user's request cannot be mapped to any flag `axi run --help` actually offers.
+- The invocation mode is genuinely ambiguous from what the user said (neither clearly "already committed" nor clearly "do this task first").
+
+### Completion boundary
+This stage may complete only when the correct invocation mode is identified and any specific user request is translated into a concrete, verified pipeline flag.
+
+### Decision evidence
+The chosen mode and flag translation carry forward as this stage's own durable output (`output/README.md`); no separate decision log.
 
 ## Additional note
 

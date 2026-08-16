@@ -1,0 +1,14 @@
+# sergeant-setup — RETIRED at ICM-R2 (docs/gauntlet/runs/icm-r2/sergeant-setup/adjudication-draft.md,
+# SPLIT disposition). No stages survive; behavior absorbed into AGENTS.md
+# and skills/estate-navigation/SKILL.md, with two fragments parked pending a
+# sergeant.toml schema decision. Do not admit new Work against this workflow.
+#
+# Prior state (version 3, published) had two stages, itself narrowed from
+# eight at MVP-5 F2 (docs/icm/re-homing-record-2026-08-12.md). See
+# docs/gauntlet/promoted-provenance/sergeant-setup.md for the full original
+# citation trail.
+
+[workflow]
+name = "sergeant-setup"
+version = "4"
+stages = []

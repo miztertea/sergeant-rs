@@ -53,10 +53,124 @@ letter by coincidence, as D6 and D7 do here.
 | B6 | MVP-3 fixer pass, invariants finding MVP3-C5 | `sgt run --turns`/`--ceiling-secs` (commit 78e5da9) adds a per-Work `EnvelopeRequest{turn_cap, ceiling_secs}` the engine reads via `effective_turn_cap`/`effective_turn_ceiling` — genuinely new engine surface (submit-time envelope override) that R-MVP1-7 specified as daemon-wide only (`with_turn_cap`/`SGT_TURN_CAP`), and MVP-3's own bucketing plan does not list it. Counting integrity is intact (not a bypass: `check_turn_envelope` still gates on the effective values, `turns_spawned` stays journal-derived, submit rejects `turn_cap==0`/`ceiling_secs==0`) — the gap is process, not safety. | Shipped code kept as-is (it works, and reverting a MVP-3-milestone feature inside a fixer pass is a bigger unilateral move than registering it); registered here instead per R-NS-4 discipline, for owner ratification at the next adjudication rather than silently standing unregistered. Trigger: MVP-3's own adjudication — fold into the milestone's deviation record or explicitly ratify there. |
 | B7 | MVP-5 F2 execution-surface re-triage (`docs/icm/retriage-2026-08-11.md`, `load-project` verdict notes) | `sergeant-setup`'s `30-project-interview` stage duplicates `load-project`'s registration job wholesale (same "complete project definition... previewed... written only after confirmation" shape) instead of delegating to it — the retriage itself flags this as "a duplication defect, not a clean stage-boundary split," and it stood unresolved when the F2 pass executed the surrounding CLI-SURFACE verdicts around it. | Fixing it means editing `sergeant-setup`'s own package to delegate its interview stage to `load-project` instead of reimplementing it — a `.sergeant/workflows/` content edit outside the MVP-5 fixer pass's file scope (docs/`AGENTS.md`/`skills/` only). Trigger: any pass that next touches either `sergeant-setup` or `load-project`'s own package. |
 | B8 | MVP-5 Lane F1 dispositions, content-honesty CH-1 (fixer pass, 2026-08-13) | 17 `agents-invariant` units (BU-1033..1048's codebase-design vocabulary/deepening rules, BU-1064's domain-modeling CONTEXT.md file-role rule) have no live skill package to land in — only frozen upstream evidence under `reference/sergeant-upstream/.claude/skills/`, which `docs/DEVELOPMENT.md` forbids treating as live content. `docs/icm/agents-invariant-dispositions.md` previously (and wrongly) claimed both were already-published `.sergeant/workflows/` packages; corrected to `not-adopted` this pass, and the two live packages that named a "grilling/domain-modeling" pair (`triage/40-grill-if-underspecified`, `wayfinder/00-name-destination`) were corrected to name `grilling` alone rather than invent the second invocation. | Promoting either skill is new content, not a dispositioning correction — this fixer pass's job was to stop asserting they exist, not to build them. Trigger: an owner decision to actually promote `codebase-design` and/or `domain-modeling` as `skills/` packages (nearest precedent: `deepen-module` already cites `codebase-design`'s upstream `DEEPENING.md` directly, without a `skill:` indirection — see `00-classify-dependencies/CONTEXT.md`). |
+| B9 | ICM-R0 gauntlet, first critic-round dispatch (2026-08-16) | A dispatched Work (research workflow, `00-investigate` stage) can reason its way out of its own assigned worktree and write directly into the orchestrating session's own active checkout, rather than treating an unexpected path as a stop-and-ask condition. Observed once: the Work found its own surface path git-ignored from the outer checkout's perspective, concluded that meant it was in "the wrong (ignored) location," and relocated its write target to `/home/miztertea/sergeant-rs` — a live checkout the orchestrating session was actively using — instead of asking. A second, differently-instructed dispatch (explicit surface-boundary language in the intent) did not repeat this. | Not a proposal defect and not this estate's own bug — the intent text this session wrote for the first round didn't state a surface boundary explicitly, and the Work filled that gap with its own (wrong) inference rather than stopping. Whether this needs a workflow-content fix (an explicit surface-boundary clause in `research`'s own stage contract, or a shared context every actor stage inherits), an engine-level containment fix (a Work simply cannot address paths outside its worktree, regardless of instruction quality), or is adequately covered by better dispatcher-side intent-writing discipline is undecided. Trigger: any pass that next touches the `research` workflow, or a second unprompted recurrence under a properly-bounded intent (which would argue for the engine-level fix over the content one). |
 
 ---
 
 ## Ledger entries
+
+### ICM-R1/R2 — 2026-08-16, doctrine landed and nine-package pilot reconciled
+
+**Mission outcome: built.** Following the owner's live §19 ruling
+(`docs/adr/0013-icm-r0-owner-rulings.md`), ICM-R1 (doctrine, templates)
+and ICM-R2 (the nine-package pilot) both executed the same day as ICM-R0's
+grading. Full record: `docs/gauntlet/runs/icm-r2/adjudication.md`
+(per-package detail in sibling files); doctrine changes are the
+`.sergeant/common/contexts/bounded-judgment.md`,
+`docs/icm/convention.md` §6, `docs/icm/record-shapes.md` §6, and
+`_config/icm-ladder.md` §6.1a commits on `chore/backlog-grooming-
+2026-08-16`.
+
+**Nine packages reconciled, 18 dispatched `sgt` Works (producer +
+independent reviewer per package) plus one redispatch.** Six STAND
+(`grilling`, `sergeant-help`, `research`, `validate-and-ship`,
+`code-review`, `repo-to-icm`), three retired (`task-intake-and-route`
+ABSORBED, `sergeant-setup` SPLIT into `estate-navigation`/`AGENTS.md`,
+`direct-implementation` HARVEST into `AGENTS.md`). Catalog: 23 → 20
+published workflows. Three of nine producers reached a verdict different
+from, and better evidenced than, their own dispatch hint — the pilot's
+own disagreement-surfacing purpose (proposal §10.3) working as intended,
+not a sign the hints were badly chosen.
+
+**The push/pr/ci gap (the session's own opening question, several turns
+before this pass) now has an honest, citable answer inside the live
+package.** `validate-and-ship/40-drive-gates/CONTEXT.md` names it J0 —
+not delegated, not resolved, measured live twice as a real gap (#123,
+"materialized, not just predicted") — rather than leaving it silently
+unclassified the way `scripts/gate.sh`'s hardcoded flag did. This is a
+placeholder for the owner's separate ruling, not a policy invented by
+this pass.
+
+**Two process misses caught live, matching this repo's own discipline of
+not smoothing them over:** the orchestrating session repeated its own
+ICM-R0 mistake once more (editing `adjudication.md` into the outer
+checkout instead of the estate clone, caught and fixed before commit),
+and one `repo-to-icm` producer blocked on turn-ceiling exhaustion after
+attempting to delegate its own task to a nested sub-agent — redispatched
+with an explicit no-sub-delegation instruction and a longer ceiling;
+succeeded clean on retry.
+
+**Not yet done.** ICM-R3 (the remaining 16 published workflows plus
+`software-change`, gated on this pilot per decision 9) and ICM-R4
+(dogfood/measurement) are explicitly out of this pass's scope, per the
+proposal's own pilot-before-full-corpus sequencing. Shipping gate and PR
+against `main` are this session's immediate next steps, not yet run as
+of this entry.
+
+### ICM-R0 — 2026-08-16, ICM-R procedure-authority proposal graded: validated with findings
+
+**Mission outcome: validated with findings.** The owner supplied
+`reference/proposal-icm-r-procedure-authority.md` (a Placement Ladder and
+Bounded-Judgment Ladder for reconciling the 23-workflow/4-skill library)
+via the inbox convention. Vendored into `reference/`, graded by a
+four-axis blind panel (fidelity/invariants/assumptions/enactability) with
+per-axis adversarial refuters — same shape as FOUNDATION-1, this repo's
+only prior proposal-only gauntlet. Full record:
+`docs/gauntlet/runs/icm-r0/` (critics, refuters, adjudication);
+contract: `docs/gauntlet/contracts/ICM-R0.md`.
+
+**Two confirmed error-severity findings, both narrow and locally
+correctable, neither invalidating the proposal's architecture:**
+§10.4 names the built-in `software-change` workflow (`src/workflows/
+software-change/`, compiled via `include_str!`) as a reconciliation
+subject, which would require editing `src/` during the very window the
+proposal's own Executive Summary and Acceptance Contract item 33 forbid
+it (invariants F1). §10.1 assigns ICM-R0 the outcome "adjudicate the
+owner decisions in §19," contradicting §19's own text that those
+decisions are owner-only and never silently made (enactability F1). Both
+refuters independently re-derived their findings against the repository
+rather than trusting the critics' citations, and both confirmed at full
+severity. Recommended one-line corrections for each are recorded in
+`docs/gauntlet/runs/icm-r0/adjudication.md`, left for the owner to apply
+alongside the §19 ruling rather than applied unilaterally here.
+
+**All eight dispatched Works ran as real `sgt run` Works against this
+self-hosted estate**, per the house convention FOUNDATION-1 set (Sonnet
+actors, `research` workflow, orchestrating-session adjudication) — no
+longer a fallback for an engine that couldn't yet run work (as FOUNDATION-1
+recorded it), now dogfooding a mature dispatch path (T-series: 10/10 Works
+landed clean the day before this one).
+
+**Two process misses, both this session's own, both corrected before the
+refuter round:** the first critic dispatch round was cut from `main`
+rather than the working branch the proposal and contract were committed
+to, because the orchestrating session had made those commits directly in
+the outer checkout (`/home/miztertea/sergeant-rs`) instead of the
+estate's own tracked clone (`repos/sergeant-rs`) — the same class of
+hazard #120/#123 name, reproduced by the orchestrator rather than merely
+diagnosed. Corrected by doing all subsequent git operations from the
+estate clone. Separately, one dispatched Work in that same first round
+navigated out of its own assigned worktree and wrote into the
+orchestrating session's live checkout rather than treating the mismatch
+as a stop-and-ask condition — registered as **B9** in the backlog table
+above, since an explicit surface-boundary instruction in the refuter
+round's intents did not reproduce it, leaving open whether this needs a
+content fix, an engine-level containment fix, or was simply an
+under-specified intent.
+
+**Environmental behavior.** 8 agents (4 critics, 4 refuters), all Sonnet,
+`research` workflow, single-stage turns. No finding was struck by
+refutation; one (fidelity F3) was recalibrated upward rather than down —
+the critic's own "info" severity for a fabricated-quotation defect
+understated it. Matches FOUNDATION-1's own observation that this method
+produces mechanical, checkable findings on prose rather than degrading
+into style commentary — now replicated on a second, larger, more
+self-referential proposal (one *about* how proposals and packages should
+themselves be classified).
+
+**Not yet done.** The owner's §19 ruling (twelve named decisions) is a
+live interview, explicitly out of this gauntlet's scope — next step, not
+this entry's.
 
 ### T-SERIES-BUILD — 2026-08-16, the operator cockpit shipped: T0-T4 built, tested, and merged to the integration branch
 

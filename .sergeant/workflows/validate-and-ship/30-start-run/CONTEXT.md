@@ -67,9 +67,27 @@ A run exists on a feature branch with committed history, a verbatim intent, an i
   (trigger: a validation boundary is launched with the default profile; outcome: review/document stages are not duplicated when the coordinator already covered them)
   — `BU-P1-042`, `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L154-155)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Composing an intent string rich enough for the downstream review step to distinguish a deliberate decision from a mistake (`BU-P2-073`).
+- Discovering and handling an already-active in-flight run: reattach on the current branch when it matches HEAD, leave alone on another branch, never `abort` to bypass an active gate (`BU-P2-068`–`BU-P2-071`).
+- Following the exact remediation command a failed precondition returns (`BU-P2-067`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics — precondition checks are mechanical (repo initialized, feature branch, pipeline agent configured); the two decisions above are the only material judgment this stage exercises, and both are J2.
+
+### J0 — must become `needs_input`
+- **The push/pr/ci authority gap named at workflow level (`## Authority envelope`, BU-VAS-15) applies to this stage's own `axi run --intent` invocation** — this stage composes the run that eventually reaches `40-drive-gates`, and nothing in this stage's own contract authorizes what that run may publish. Unresolved until the owner rules on it.
+- A precondition failure's remediation command is ambiguous or does not resolve the actual failure.
+
+### Completion boundary
+This stage may complete only when a run exists on a feature branch with committed history, a verbatim intent, and either a fresh start or a correctly-reattached in-flight run — never a duplicate.
+
+### Decision evidence
+The composed intent string and the reattach/fresh-start choice are recorded in the run's own audit trail (`BU-P8-087`'s launch log); no separate decision file.
 
 ## Additional note
 

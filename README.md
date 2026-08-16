@@ -27,7 +27,7 @@ everything else here works without it, via the deterministic fake backend.
 ```sh
 gh repo clone miztertea/sergeant-rs
 cd sergeant-rs
-cargo install --path . --bin sgt   # first build compiles bundled DuckDB from scratch — honestly, north of 5 minutes cold (~10 min measured)
+cargo install --path . --bin sgt   # first build compiles bundled DuckDB from scratch — that ~10 min figure was measured on an ephemeral cloud container (2026-08-09); on a persistent dev host it's markedly faster
 ```
 
 That puts `sgt` on `$CARGO_HOME/bin` (usually `~/.cargo/bin`, already on

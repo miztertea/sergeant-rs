@@ -40,12 +40,52 @@ each question, offer your own recommended answer alongside it.
   any implementation, `sgt run` submission, or file edit driven by the
   interview's conclusions.
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+### This skill may decide
+- Which branch of the decision tree to walk next, and in what order,
+  provided every dependent decision is resolved before decisions that
+  depend on it.
+- Whether a given fact is discoverable by exploring the environment
+  (filesystem, `sgt doctor`, tests, docs, `--help`, any available tool)
+  rather than a genuine decision that must go to the user.
+- What recommended answer to offer alongside each question.
+
+### This skill must ask the user
+- Every genuine decision identified by the interview, one at a time,
+  waiting for the answer before asking the next.
+- Explicit confirmation that shared understanding has been reached,
+  before acting on any of the interview's conclusions.
+
+### This skill must not do
+- Run via `sgt run` or any durable Work dispatch — R-NS-6 places this
+  entirely inside the current conversation.
+- Ask more than one question at a time.
+- Act on the plan/decision/idea — implementation, `sgt run` submission,
+  or a file edit driven by the interview's conclusions — before the
+  user's explicit confirmation.
+- Present an unconfirmed, harness-degraded best guess as a reached shared
+  understanding; say so plainly instead.
+
+### Durable handoff
+None. This skill produces no promotable artifact of its own; a confirmed
+understanding is consumed directly in the same session (e.g. to shape a
+subsequent `sgt run` submission), not written to a Work surface.
+
 ## Failure behavior
 
-If the harness you're running under cannot actually pause mid-turn for a
-human answer (measured true for this host's `claude` CLI's non-interactive
-turns — see `docs/environments/cerberus.md`), a "grill" invocation degrades
-to your best-guess autonomous answers with nothing to confirm against. Say
+If this invocation has no live human who will send the next message — the
+harness is running headless/unattended, not mid-conversation with a
+person — a "grill" invocation degrades to your best-guess autonomous
+answers with nothing to confirm against. (Corrected 2026-08-16, ICM-R2
+pilot review: the prior text here cited `docs/environments/cerberus.md`
+for this claim, but that file measures a different mechanism entirely —
+the engine's `post_turn_summary`/`NeedsInput` signal for a dispatched
+workflow stage, not Captain-session turn-taking, which never goes through
+that machinery. The real distinguishing fact is self-evident from the
+harness's own execution mode and needs no engine-mechanics citation.) Say
 so plainly rather than presenting an unconfirmed guess as a reached shared
 understanding — that silent degradation is exactly the failure mode this
 package's retirement from the Work-dispatch surface was measured to avoid.

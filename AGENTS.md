@@ -50,7 +50,7 @@ that owns that topic wins. <!-- BU-0106 -->
 | Substantive procedural work has a matching published workflow | the workflow's own `index.md` under `.sergeant/workflows/<name>/`, discovered via `.sergeant/index.md` | That workflow's stages, inputs, and outputs |
 | A `@@name` reference appears in an active stage's `CONTEXT.md` | `.sergeant/common/contexts/<name>.md` | Shared context text, resolved by this exact rule and no other |
 
-`.sergeant/index.md` is the full catalog (23 published workflows at last
+`.sergeant/index.md` is the full catalog (20 published workflows at last
 count, plus the `skills/` operator-skills layer below it) — this table is
 not a copy of it and will not be kept in sync with every addition; consult
 the catalog directly when the intent doesn't obviously match a row above.
@@ -174,7 +174,16 @@ no need to survive a restart or run unattended. <!-- BU-0004, BU-0009 -->
 The harness (this session) owns that routing judgment; sergeant's core
 makes no claim about it (North Star ruling 4). Reach for `sgt run` when
 the work should be durable, resumable, and reviewable independent of this
-conversation continuing — not by default for everything.
+conversation continuing — not by default for everything. Direct,
+in-session implementation is never a lighter path: it still goes through
+task tracking, TDD-first implementation, native validation, independent
+review, and the shipping gate — the same gates dispatched work goes
+through, just without leaving the session. <!-- BU-P1-107 --> Before
+committing to direct mode over dispatch, reconcile running work the same
+way step 2 above does for a dispatch decision (`sgt work list`, `sgt repo
+list`) — direct mode does not exempt the session from checking whether
+another Work item or preserved worktree is already touching the same
+repository or task. <!-- BU-P1-009, BU-P8-056 -->
 
 ## Working on sergeant-rs itself
 
@@ -193,6 +202,11 @@ waives tests, review, or the shipping gate. <!-- BU-0018, BU-0113, BU-0114 -->
   own configuration, and never to `AGENTS.md` or `CLAUDE.md` in any repo.
   Re-running `sgt init` on an already-initialized estate is a no-op, not a
   reset. <!-- BU-1263, BU-1264, BU-1295 -->
+- `td`, Graphify, and Treehouse are never auto-initialized without an
+  explicit per-tool confirmation prompt; a declined prompt leaves state
+  unchanged and reports the skip, never a silent init and never a silent
+  drop. <!-- BU-P5-006, carried forward at ICM-R2 from the retired
+  sergeant-setup workflow, which previously owned this constraint -->
 - Prefer the `sgt` verbs above over ad hoc shell reconstructions of the
   same operation, and over manual process/tmux/git/fleet-file recovery;
   fall back to manual steps only when no verb covers it, and say so plus
