@@ -44,12 +44,13 @@ This workflow receives an already-admitted Work intent (either the coordinator-l
 
 ### Workflow may not decide
 - Whether to resolve an `ask-user` gate finding — it is relayed verbatim to the user, never resolved autonomously (`40-drive-gates`).
-- Whether a dispatched run of this workflow may autonomously push a branch, open a pull request, or trigger CI — **currently unclassified** (BU-VAS-15; see the stage-level `J0` note in `40-drive-gates/CONTEXT.md`). This is a live, unresolved owner decision, not a workflow authority this package grants itself.
 - To edit the pipeline-owned worktree, abort, or rerun mid-gate to escape a finding.
+
+### Resolved (was BU-VAS-15, issue #123)
+A dispatched run of this workflow never autonomously pushes a branch, opens a pull request, or triggers CI: `30-start-run`'s own `axi run` invocation always includes `--skip push,pr,ci` (its own J5 fixed rule) — this repository's own development practice (`docs/DEVELOPMENT.md`: publication stays human-owned), encoded as this workflow's own content. This is not a product-wide restriction Sergeant grants or withholds as an engine capability — Sergeant executes work, and autonomous push/PR/CI is the ordinary, correct behavior for a Work dispatched against an arbitrary repository. A user developing their own project writes their own workflow (or their own copy of this one) without this flag if they want autonomous publication there.
 
 ### Human or Captain gates
 - Every `ask-user` gate finding.
-- The push/pr/ci authority gap (BU-VAS-15) until the owner rules on it.
 
 ### Decision record
 Material decisions are recorded per-stage in each stage's own `## Bounded judgment` section below and in the gate's own findings table (`40-drive-gates`).

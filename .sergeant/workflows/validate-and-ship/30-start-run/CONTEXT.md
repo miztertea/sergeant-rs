@@ -57,6 +57,9 @@ A run exists on a feature branch with committed history, a verbatim intent, an i
 - **Starting the run (`no-mistakes axi run --intent "..."`) blocks until the first decision point or the end.**
   (trigger: the run is started; outcome: the actor's call does not return until a gate or a terminal outcome is reached)
   — `BU-P2-074`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Validate-and-decide step 1, lines 98-101)
+- **The invocation this stage issues always includes `--skip push,pr,ci`: `no-mistakes axi run --intent "..." --skip push,pr,ci`.** This is this workflow's own fixed content, not a product-wide restriction — Sergeant executes work, and autonomous push/PR/CI is the ordinary, correct behavior for a Work dispatched against an arbitrary repository. This specific workflow, shipped as this repository's own tool for developing itself, encodes this repository's own development practice (`docs/DEVELOPMENT.md`: "pushing and PR creation stay ours"). A user developing their own project is expected to write their own workflow (or their own copy of this one) without this flag if they want a dispatched Work to publish autonomously in their own repo.
+  (trigger: starting a validate-and-ship run; outcome: the pipeline never reaches its own push/pr/ci steps, so there is nothing left for a downstream stage to authorize or gate)
+  — resolves issue #123 (the prior gap: `scripts/gate.sh` carried this flag but the dispatch path never executed `gate.sh`; this stage now carries it directly, as its own workflow content).
 - **A clean no-mistakes run takes several minutes; invoking it during development or repeatedly restarting it multiplies that cost.**
   (trigger: considering whether to (re)start a no-mistakes run; outcome: runs are started deliberately, not repeatedly, to avoid multiplying cost)
   — `BU-P1-069`, `reference/sergeant-upstream/README.md` (README.md L264, restart cost)
@@ -71,6 +74,9 @@ A run exists on a feature branch with committed history, a verbatim intent, an i
 
 Apply `@@bounded-judgment`.
 
+### J5 — fixed rules, no interpretation
+- Every `axi run` invocation this stage issues includes `--skip push,pr,ci`, unconditionally — this repository's own development practice, encoded as this stage's own fixed content, not a per-run judgment call.
+
 ### J2 — delegated to this stage
 - Composing an intent string rich enough for the downstream review step to distinguish a deliberate decision from a mistake (`BU-P2-073`).
 - Discovering and handling an already-active in-flight run: reattach on the current branch when it matches HEAD, leave alone on another branch, never `abort` to bypass an active gate (`BU-P2-068`–`BU-P2-071`).
@@ -80,8 +86,9 @@ Apply `@@bounded-judgment`.
 - None beyond ordinary tool mechanics — precondition checks are mechanical (repo initialized, feature branch, pipeline agent configured); the two decisions above are the only material judgment this stage exercises, and both are J2.
 
 ### J0 — must become `needs_input`
-- **The push/pr/ci authority gap named at workflow level (`## Authority envelope`, BU-VAS-15) applies to this stage's own `axi run --intent` invocation** — this stage composes the run that eventually reaches `40-drive-gates`, and nothing in this stage's own contract authorizes what that run may publish. Unresolved until the owner rules on it.
 - A precondition failure's remediation command is ambiguous or does not resolve the actual failure.
+
+**Resolved (was BU-VAS-15's push/pr/ci placeholder):** this stage's `--skip push,pr,ci` (J5, above) means the run this stage starts never reaches a push/PR/CI step at all — there is no longer a live gap for `40-drive-gates` or any downstream stage to authorize.
 
 ### Completion boundary
 This stage may complete only when a run exists on a feature branch with committed history, a verbatim intent, and either a fresh start or a correctly-reattached in-flight run — never a duplicate.

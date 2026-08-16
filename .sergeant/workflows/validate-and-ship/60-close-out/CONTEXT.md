@@ -67,7 +67,7 @@ Apply `@@bounded-judgment`.
 
 ### J0 — must become `needs_input`
 - A `failed`/`cancelled` outcome whose blocker cannot be concretely fixed or concretely explained — silence is never an option (`BU-P2-088`).
-- This stage's own `checks-passed`/`passed` outcomes presuppose a PR already exists and CI already ran — **this stage does not itself open that PR or trigger that CI; that authorization is the unresolved gap named at workflow level (`## Authority envelope`, BU-VAS-15) and in `40-drive-gates`'s own `## Bounded judgment`.** If this stage is ever reached without a human-authorized PR/CI having actually happened, that is itself a `J0` condition, not something to paper over by describing the expected happy path as if it occurred.
+- This stage's own `checks-passed`/`passed` outcomes presuppose a PR already exists and CI already ran — **this stage does not itself open that PR or trigger that CI, and (since `30-start-run`'s fixed `--skip push,pr,ci`, resolving BU-VAS-15/issue #123) a dispatched run of this workflow never reaches those steps at all.** If this stage is ever reached at `checks-passed`/`passed` without an actual human-authorized PR/CI having happened outside this run, that is itself a `J0` condition, not something to paper over by describing the expected happy path as if it occurred.
 
 ### Completion boundary
 This stage may complete only at a terminal or near-terminal pipeline outcome, with the user given an honest, itemized summary — never left at a failed outcome in silence.

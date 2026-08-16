@@ -86,7 +86,8 @@ Apply `@@bounded-judgment`.
 
 ### J0 — must become `needs_input`
 - The argv transport may only be selected with the operator's explicit, per-run consent (`BU-P6-134`) — absent that consent, this stage does not choose argv on its own initiative.
-- **The push/pr/ci authority gap named at workflow level (`## Authority envelope`, BU-VAS-15) is not resolved here or anywhere else in this package** — if this stage's own precondition chain is ever extended to cover push/PR/CI (it currently is not), that extension inherits the same J0 status until the owner rules on it.
+
+**Resolved (was BU-VAS-15, issue #123):** see `30-start-run/CONTEXT.md`'s J5 rule — the `--skip push,pr,ci` flag is fixed workflow content on the invocation itself, not a precondition this stage's own chain needs to cover.
 
 ### Completion boundary
 This stage may complete only when the transport decision is made, recorded twice for audit, and the coordinator-launched entry's readiness/reservation/snapshot preconditions (where applicable) all hold.
