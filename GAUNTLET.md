@@ -118,6 +118,19 @@ entry used to cite — and its "not built in this Work" fallback became
 dead code and were removed rather than left stale, in the merge that
 brought all three branches together (2638dec).
 
+**Two regressions in the closing pair, caught by this session's own
+pre-push review, not by the branches' own tests.** #153's `@` chooser
+wiring (68b3cbd) moved the picked catalog entry onto the Workflows
+screen via `select_by_name`, but never accounted for a `/` filter
+already narrowing the list to something that excludes the pick — fixed
+by clearing a filter that would otherwise hide it (975a47b). #154's `c`
+binding (eee2c96) was tested only from global focus; opened from inside
+a Work, the WorkScreen's own catch-all silently swallowed it before it
+ever reached the global keymap — fixed by returning
+`WorkScreenOutcome::Unhandled` for keys no local binding claims, so they
+fall through the same way everywhere else (6970aa5), with a combined
+open-Work + Retained reap precedence test added alongside (38576a5).
+
 **Evidence discipline, not narrated.** Every merge in this table was
 gated on an independent post-merge `cargo test` run by Captain (never the
 dispatched Work's own self-report) — two of the ten Works (T1b, and the
