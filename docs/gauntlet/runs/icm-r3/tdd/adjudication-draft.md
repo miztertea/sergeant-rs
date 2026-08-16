@@ -66,13 +66,17 @@ assumed from the dispatch hint:
    listed *before* any of the other examples. This is not incidental
    phrasing; §5.5's Discriminator from PL-4 states plainly: "An actor
    skill does not independently own one admitted intent from start to
-   terminal Work outcome." `tdd` does not: its own two stages produce no
-   terminal, independently meaningful Work outcome — `00-agree-seams`
-   declares an `evidence`-only artifact and `10-red-green-cycle`'s
-   `promote` artifact is explicitly noted as unfinalized ("the workflow
-   has no dedicated finalize step... Disposition here is applied by human
-   review at merge time, not mechanically" — `10-red-green-cycle/output/
-   README.md`).
+   terminal Work outcome." `tdd` does not: it has no intent of its own to
+   own — its two stages exist only in service of whatever intent the
+   surrounding implementation Work already carries. (Corrected 2026-08-16,
+   ICM-R3 review: the earlier text here cited `10-red-green-cycle`'s
+   `promote` artifact disposition as evidence *against* a terminal
+   outcome — misread; `promote` means the artifact *does* survive into the
+   merge. The narrower, accurate gap the source note actually flags is
+   authoring, not placement: no dedicated finalize *stage* curates that
+   promotion mechanically, a human does it at merge time — irrelevant to
+   whether `tdd` is a workflow, since plenty of correctly-PL-4/5 packages
+   share that same authoring gap.)
 2. **`tdd` is never invoked directly by any current package.** Grepped
    every workflow and skill under `.sergeant/workflows/` and `skills/`:
    the only two references to `tdd` as something "run" are
@@ -89,15 +93,21 @@ assumed from the dispatch hint:
    PL-3 destination (§5.5: "A skill, workflow-local reference, or
    `.sergeant/common/` shared context") already in effect informally,
    under a PL-4 label.
-3. **Applying the execution-surface test directly** (`docs/icm/
-   convention.md` §2a): "would a human type `sgt run '<intent>'
-   --workflow tdd`?" A confirmed seam and a red-green cycle are not
-   themselves an intent with a terminal, mergeable outcome independent of
-   the surrounding implementation — the technique does the same
-   red/green/minimal-implementation thing on every invocation regardless
-   of what is being implemented, which is precisely §2a's "if the package
-   cannot absorb an intent — if it does the same thing every time — it is
-   not a workflow" test failing.
+3. **Corrected 2026-08-16, ICM-R3 review + owner ruling: the original
+   argument here (§2a's "does the same thing every time" test) is
+   withdrawn — as written it would disqualify every admitted workflow,
+   since all of them fix procedure while varying content
+   (`diagnose-bug` always reproduces/isolates/proves/remediates
+   regardless of which bug; that doesn't make it PL-3).** The actual
+   discriminator, put directly by the owner: `tdd` is a *technique* —
+   something an actor applies while it is already doing implementation
+   work — not a separate undertaking a caller hands off to and waits on.
+   Its current two-stage, fresh-execution shape is an artifact of how it
+   was extracted from the upstream corpus at N1, not evidence the
+   technique itself needs independent checkpoint/retry semantics. A
+   confirmed seam and a red-green cycle are not things one *dispatches
+   to*; they are how an actor conducts the implementation turn it is
+   already in.
 4. **`shared` is the correct modifier, not `local`** (proposal §5.10): two
    independent current consumers (`implement`, `worker-mission`) already
    apply the identical contract (same trigger — implementing test-first;
@@ -273,8 +283,36 @@ is superseded, not silently edited.
   drafted (its content is squarely `tdd`'s own source material); wiring
   other packages to it is not.
 
+- **PL-7 engine gap: file for real nested-workflow invocation so `tdd`'s
+  two stages keep independent fresh-execution and per-seam retry/
+  measurement, rather than collapsing into shared text a caller loads
+  inline.** Added 2026-08-16 per the ICM-R3 independent reviewer's
+  finding that this alternative was required to be weighed and was not
+  (`record-shapes.md` §5.9, §4 rule 1). **Rejected, with an explicit
+  mechanics-specific rationale this time, per owner ruling the same
+  day:** `tdd` is a technique, not a procedure with its own intent —
+  §5.5's own discriminator from PL-4 is exactly this: an actor skill
+  "does not independently own one admitted intent from start to terminal
+  Work outcome," and `tdd` never has one, it only ever operates inside
+  whatever intent the calling implementation Work already carries. The
+  per-seam retry/measurement `tdd` has *today* is a byproduct of how the
+  N1 extraction happened to draw stage boundaries around upstream prose,
+  not a property the technique requires to remain correct — a confirmed
+  seam and a red-green cycle are conducted *within* an actor's ongoing
+  implementation turn, not handed off to and awaited from a separate
+  execution. Losing that stage-level granularity when it folds into
+  `@@tdd` is therefore an acceptable, correctly-priced loss for a
+  technique this small (1–2 cycles per seam), not evidence Sergeant is
+  missing a needed capability. Filing a PL-7 claim here would be
+  inventing engine work to preserve boundaries that were never load-
+  bearing in the first place — exactly what §4.8's "lowest viable rung"
+  rule and the hard runtime freeze (ADR 0013 decision 10) both argue
+  against.
+
 ## Final disposition
-REHOME
+REHOME (confirmed, corrected — see "Driver and admission boundary" and
+"Alternatives considered" above for the 2026-08-16 corrections resolving
+this package's ICM-R3 reviewer dispute)
 
 ## Validation evidence
 
