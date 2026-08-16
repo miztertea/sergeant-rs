@@ -514,7 +514,15 @@ impl App {
             // this stays the one Reap implementation either way.
             Overlay::ReapConfirmation => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        if self.open_work_id().is_none() && self.retained_reap_id.is_some() {
+                            self.overlay = Some(Overlay::RetainedPreview);
+                            self.pending_action = PendingAction::default();
+                            self.retained_reap_id = None;
+                        } else {
+                            self.close_overlay();
+                        }
+                    }
                     KeyCode::Enter => {
                         let Some(id) = self
                             .open_work_id()
@@ -533,6 +541,12 @@ impl App {
             // `RepoForm::on_key`, and the outcome either closes the overlay
             // locally (an abort) or asks the loop to run the mutation.
             Overlay::RepoAddRemove => {
+                if self.estate.pending_repo_add.is_some() {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                        self.overlay = None;
+                    }
+                    return Action::None;
+                }
                 match self.estate.repo_form.on_key(key) {
                     RepoFormOutcome::None => {}
                     RepoFormOutcome::Close => self.overlay = None,

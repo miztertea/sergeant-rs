@@ -219,7 +219,7 @@ fn extend_body(app: &App) -> String {
     let pending = &app.pending_action;
     let added: Option<u64> = pending.extend_turns.trim().parse().ok();
     let resulting = match (current_cap, added) {
-        (Some(cap), Some(added)) if added > 0 => (cap + added).to_string(),
+        (Some(cap), Some(added)) if added > 0 => cap.saturating_add(added).to_string(),
         _ => "-".to_string(),
     };
     let field_marker = if pending.confirm_focused { "" } else { "_" };

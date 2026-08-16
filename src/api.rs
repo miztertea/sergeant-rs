@@ -2796,15 +2796,14 @@ async fn estate_add_group(
         blocking_sync(|| manifest::add_group(&estate_root, &name, &repos, brief.as_deref()));
     match result {
         Ok(()) => {
-            let workspace = match workspace_read(&estate_root) {
-                Ok(w) => w,
-                Err(resp) => return *resp,
+            let members = match workspace_read(&estate_root) {
+                Ok(w) => w
+                    .groups
+                    .get(&req.name)
+                    .map(|g| g.repos.clone())
+                    .unwrap_or_else(|| req.repos.clone()),
+                Err(_) => req.repos.clone(),
             };
-            let members = workspace
-                .groups
-                .get(&req.name)
-                .map(|g| g.repos.clone())
-                .unwrap_or_default();
             Json(json!({"name": req.name, "repos": members, "brief": req.brief})).into_response()
         }
         Err(e) => manifest_error_response(&e),
