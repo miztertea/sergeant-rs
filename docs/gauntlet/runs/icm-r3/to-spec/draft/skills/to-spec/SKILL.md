@@ -32,11 +32,20 @@ never via `sgt run`: there is no admitted-Work input that could carry
    already explored the repository to understand current state, do that
    first. Use the project's domain glossary vocabulary throughout, and
    respect any ADRs in the area you're touching.
-2. **Sketch the test seams before drafting the implementation section.**
-   Prefer an existing seam to a new one, and the highest seam possible.
-   Aim for as few new seams as possible — ideally exactly one. Then
-   confirm with the user, one exchange, that the proposed seams match
-   their expectations, before finalizing the spec.
+2. **Sketch the test seams before drafting the implementation section**,
+   using `@@tdd`'s definition of a seam (the public boundary you test at
+   — never against internals). Prefer an existing seam to a new one, and
+   the highest seam possible. Aim for as few new seams as possible —
+   ideally exactly one. Then confirm with the user, one exchange, that
+   the proposed seams match their expectations, before finalizing the
+   spec. **This is a distinct step from `@@tdd`'s own per-cycle seam
+   confirmation** (ICM-R3 note, resolving a duplication/drift risk the
+   independent reviewer flagged): here, seams are sketched once, at
+   spec-writing time, to shape the Testing Decisions section below;
+   `@@tdd`'s confirmation happens per red-green cycle, later, during
+   actual implementation. The two are related but not the same gate —
+   this skill does not duplicate `@@tdd`'s own content, it names the same
+   underlying concept (a seam) at an earlier point in the process.
 3. **Write the spec on the template below**, then publish it to the
    project's issue tracker and apply the ready-for-agent triage label.
 
@@ -163,3 +172,14 @@ The published spec ticket is the artifact of record — that publication
 itself invoke `sgt run`; if the resulting ticket is meant to become
 dispatched Work, that is a separate, later decision through the normal
 task-intake path.
+
+## Failure behavior
+
+If this invocation has no live human who will send the next message —
+the harness is running headless/unattended, not mid-conversation with a
+person — this skill cannot perform its own defining behavior: there is
+no "current conversation" to synthesize from, and the one-exchange seam
+confirmation in step 2 has no one to confirm with. Say so plainly and
+stop rather than fabricating a plan/design that was never actually
+discussed, or silently skipping the seam-confirmation exchange and
+finalizing an unconfirmed spec.
