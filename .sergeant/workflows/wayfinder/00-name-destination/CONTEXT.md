@@ -27,9 +27,27 @@ The destination is named via a grilling session; scope is settled first.
   BU-1064), so sharpening domain terminology folds into the `grilling`
   session below rather than a second invocation.
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- The destination is named by running **grilling** live, in-session — never by dispatching a Work item (R-NS-6: conversation is the harness's job, never engine work).
+
+### J2 — delegated to this stage
+- None beyond the delegated `grilling` session itself, which carries its own bounded judgment.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers; a `grilling` session's own J0 escalation applies while it runs.
+
+### Completion boundary
+This stage may complete only once the destination is named and scope is settled via the grilling session.
+
+### Decision evidence
+The named destination is this stage's own durable output, recorded per `output/README.md`.
 
 ## Delegation
 

@@ -22,9 +22,24 @@ One canonical intent revision exists and is written identically to fleet state a
   (trigger: sgt-dispatch runs against one or more repos; outcome: every downstream actor and process for this dispatch (implementer, reviewer, recovery, final validation) reads the same single canonical intent revision)
   — `BU-P8-059`, `reference/sergeant-upstream/docs/using-sergeant.md` (L54-58 (Dispatch mode))
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J1 — local choices allowed
+- Mechanical write order across fleet state and each selected worktree — the content is already decided, only the sequencing of writing it is local.
+
+### J5 — governing constraint
+- **One canonical `.sergeant-intent.md` revision is written identically to fleet state and every selected work surface** (`BU-P8-059`) — no actor discretion changes which revision is canonical.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when the one canonical intent revision exists and is written identically everywhere it must land.
+
+### Decision evidence
+The written intent revision is this stage's own durable output.
 
 ## Output
 

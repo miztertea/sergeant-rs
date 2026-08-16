@@ -33,9 +33,33 @@ Both intents are preserved, or one is picked with the trade-off recorded; behavi
   (trigger: validation has passed; outcome: the merge or rebase is fully completed and committed)
   — `BU-P3-050`, `reference/sergeant-upstream/.agents/skills/resolving-merge-conflicts/SKILL.md` (step 5, line 14)
 
-## Judgment required
+  If continuing the rebase surfaces a new conflict, treat it as a return to
+  this stage's own hunk-resolution behavior (`BU-P3-048`), not a fresh
+  unaddressed state.
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- Never invent new behavior; never abort the merge or rebase (`BU-P3-048`).
+
+### J2 — delegated to this stage
+- Preserve-both vs. pick-a-side, and which side matches the merge's stated goal (`BU-P3-048`).
+- What counts as breakage the merge caused among failing automated checks, and how to fix it, bounded by the J5 never-invent constraint (`BU-P3-049`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- The two sides are genuinely irreconcilable and no stated goal (from the Work intent, a commit message, or `10-research-intent`'s own findings) resolves which one governs: record both intents, state the trade-off, and ask the user to choose rather than resolving the tie unilaterally (`BU-P3-048`).
+- An automated check fails and the actor cannot establish that the failure is attributable to this merge, or the correct fix itself requires a judgment call beyond mechanical repair (i.e. not obviously implied by the hunk resolution already recorded): record what was checked and ask the user rather than guessing at the correct fix (`BU-P3-049`).
+
+### Completion boundary
+This stage may complete only once every hunk is resolved consistent with recorded intent, the project's automated checks pass, and the merge/rebase is carried to completion and committed — never aborted — or the stage has stopped at one of the J0 cases above.
+
+### Decision evidence
+Each hunk's resolution and any recorded trade-off are this stage's own durable output.
 
 ## Output
 

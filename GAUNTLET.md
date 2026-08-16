@@ -107,6 +107,68 @@ proposal's own pilot-before-full-corpus sequencing. Shipping gate and PR
 against `main` are this session's immediate next steps, not yet run as
 of this entry.
 
+### ICM-R3 — 2026-08-16, remaining 16 packages fully reconciled
+
+**Mission outcome: built.** Following the ICM-R1/R2 pilot's clean landing
+and the owner's own sequencing ("finish ICM and rationalize what workflows
+SHOULD be"), this pass reconciled every workflow package ICM-R2 left
+untouched. Full record: `docs/gauntlet/runs/icm-r3/adjudication.md`
+(per-package detail in sibling files), on branch
+`icm-r3-full-reconciliation-2026-08-16` (cut from `main` post-PR-#160
+merge, commit `22b7ec7`).
+
+**Sixteen packages reconciled, 32 dispatched `sgt` Works (producer +
+independent reviewer per package) across three waves, plus one final
+single-Work dispatch mechanically applying six already-adjudicated
+verdicts.** Thirteen STAND (`implement`, `worker-mission`, `diagnose-bug`,
+`prototype`, `deepen-module`, `dispatch`, `triage`, `wayfinder`,
+`resolving-merge-conflicts`, `vet-external-skill`, `recover-stalled-
+worker`, `cross-repo-work`, `to-tickets`), three retired (`tdd` REHOME
+into `.sergeant/common/contexts/{tdd,test-quality}.md`, `to-spec` REHOME
+into `skills/to-spec/SKILL.md`, `load-project` ABSORBED into
+`estate-navigation`). Catalog: 20 → 17 published workflows.
+
+**One disputed verdict resolved by direct owner ruling rather than left
+unresolved.** `tdd`'s producer found REHOME (only two stages, a technique
+not a workflow); its own independent reviewer disputed this, citing a
+missed PL-7 alternative. The owner ruled REHOME live, mid-session
+("that's it's only two stages, why is it a workflow? ... that sounds like
+a stage within a workflow") — the adjudication-draft was corrected to
+reflect the ruling's actual reasoning, not just its conclusion.
+
+**A structural fix, not just a content amendment.** `triage`'s independent
+reviewer found its `20-verify`/`30-recommend` stages in the wrong order —
+verify's own trigger text and the upstream source's own line order both
+place verification after recommendation. Renumbered to `20-recommend`/
+`30-verify`, `workflow.toml` version bumped 2→3, no behavior unit's
+content or placement rung changed.
+
+**Two operational lessons, both self-corrected mid-run, not smoothed
+over:**
+- Worktree-exclusivity friction: wave-1 parallel dispatch initially
+  instructed producers to check out a shared branch by name, which is
+  mutually exclusive across every worktree sharing the estate clone's
+  object store — including Captain's own checkout. Fixed by switching to
+  `git fetch origin <branch> && git checkout --detach FETCH_HEAD`, plus
+  moving Captain's own consolidation to a separate outer checkout.
+- A `git add`/commit silently dropped staged files despite its own commit
+  message claiming them (`to-spec`'s `skills/to-spec/SKILL.md` and
+  `AGENTS.md` routing row) — the same failure mode ICM-R2 hit once
+  already. Caught the same way: `git status` before moving on, not
+  assumed clean. Fixed with a follow-up commit.
+
+**A dispatch-strategy correction, taken live.** After ten packages were
+reconciled by hand, the owner observed the remaining six (all already
+producer+reviewer adjudicated — pure apply-the-verdict work) could be one
+`sgt run`. Dispatched as a single Work, which correctly matched the
+established commit-message and per-package-commit pattern from its own
+`git log` reading, without further guidance.
+
+**Not yet done.** Shipping gate and PR against `main` are this entry's
+immediate next steps. ICM-R4 (dogfood/measurement) and issue #123's actual
+push/pr/ci fix remain explicitly out of scope, per the proposal's own
+sequencing and the owner's own stated deferral.
+
 ### ICM-R0 — 2026-08-16, ICM-R procedure-authority proposal graded: validated with findings
 
 **Mission outcome: validated with findings.** The owner supplied

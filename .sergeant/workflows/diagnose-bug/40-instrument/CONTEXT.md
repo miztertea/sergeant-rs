@@ -31,9 +31,25 @@ One probe per prediction, one variable at a time, tagged logs.
   (trigger: diagnosing a performance regression specifically; outcome: a measured baseline exists before any fix is attempted)
   — `BU-P2-043`, `reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` (Phase 4: performance branch, lines 106-106)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Which instrumentation tool to reach for first, in the ordered preference (debugger/REPL, then targeted logs), and how to tag it (`BU-P2-041`, `BU-P2-042`).
+- For performance regressions specifically, establishing a baseline measurement before bisecting (`BU-P2-043`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when each prediction from `30-hypothesize` has its own tagged probe, one variable changed at a time.
+
+### Decision evidence
+The tagged probes and their results are this stage's own durable output.
 
 ## Output
 

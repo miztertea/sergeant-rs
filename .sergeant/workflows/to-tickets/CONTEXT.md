@@ -26,7 +26,50 @@ The user says "to tickets", "create issues", "create td tasks", "make epics", or
 
 ## Relationships to other workflows
 
-- `00-load-project-context` delegates to **load-project**.
+- `00-load-project-context` delegates to **estate-navigation** (retargeted
+  ICM-R3, 2026-08-16: `load-project` retired ABSORBED — its protective and
+  context-resolution intents are already owned by `estate-navigation` and
+  `sgt` itself, at a stronger rung; see `skills/estate-navigation/SKILL.md`).
+
+## Authority envelope
+
+This workflow receives an already-given artifact (a plan, spec,
+investigation, findings register, PR, or conversation) to break down; it
+does not itself decide whether that artifact should become Work.
+
+### Workflow may decide
+- Whether an unknown is genuinely blocking versus answerable from existing
+  evidence (`10-extract-decisions-and-unknowns`).
+- How to present the breakdown for confirmation, and what counts as "the
+  project explicitly supports more" concurrency (`20-confirm-breakdown`,
+  `40-report-frontier`).
+
+### Workflow may not decide
+- Automatically add td instructions to a repository's own guidance files
+  as a side effect (`00-load-project-context`).
+- Mark newly published tasks `in_progress`, or invent a native
+  cross-repository dependency edge td cannot enforce
+  (`20-confirm-breakdown`'s publish helper).
+- Dispatch any ticket unless the user asked to begin implementation —
+  reporting the frontier is never itself authorization
+  (`40-report-frontier`).
+
+### Human or Captain gates
+- Unless immediate publication was requested, confirming the proposed
+  breakdown's granularity, ownership, and blocking edges
+  (`20-confirm-breakdown`).
+- The evidence for whether an unknown is genuinely blocking is itself
+  ambiguous or contested (`10-extract-decisions-and-unknowns`).
+- A candidate ticket cannot be cleanly assigned a single owning repository
+  (`20-confirm-breakdown`).
+- A publish operation partially fails, leaving an internally-inconsistent
+  dependency graph (`20-confirm-breakdown`'s publish helper).
+
+### Decision record
+Material decisions (loaded context, extracted unknowns, the confirmed
+breakdown, published tickets, the reported frontier) are recorded in each
+stage's own turn and surfaced through `needs_input` where applicable; this
+workflow declares no separate decision-log file.
 
 ## Notes for reviewers
 

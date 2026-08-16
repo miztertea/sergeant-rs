@@ -22,9 +22,27 @@ An undocumented/unrecognized stall class escalates rather than being guessed at.
   (trigger: a failure is not covered by any existing troubleshooting entry; outcome: an undocumented failure always becomes a well-formed, reproducible, trackable task rather than being handled ad hoc and lost)
   — `BU-P8-109`, `reference/sergeant-upstream/docs/troubleshooting.md` (L242-244)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- An undocumented/unrecognized stall class is never guessed at — it always escalates (`BU-P8-109`).
+
+### J2 — delegated to this stage
+- How to conduct the `sergeant-help` documentation search and compose the `td` task's contents (reproduction, expected behavior, preserved state, acceptance criteria) (`BU-P8-109`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers — reaching this stage is itself the escalation for an undocumented stall class.
+
+### Completion boundary
+This stage may complete only once existing docs are searched via `sergeant-help` and a `td` task is created with exact reproduction, expected behavior, preserved state, and acceptance criteria.
+
+### Decision evidence
+The created `td` task is this stage's own durable output, recorded per `output/README.md`.
 
 ## Output
 

@@ -25,9 +25,25 @@ Old shallow-module tests are deleted; new tests assert through the interface onl
   (trigger: writing tests for a deepened module; outcome: tests remain green across internal refactors that don't change observable behavior)
   — `BU-P4-021`, `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` (Testing strategy, L37)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- None beyond ordinary tool mechanics of writing the interface-level tests.
+
+### J1 — local choices allowed
+- Test file organization and naming, within the target repository's own conventions.
+
+### J5 — governing constraints
+- **Delete the old shallow-module unit tests rather than keeping them alongside the new ones** — an unconditional discipline, not a case-by-case judgment call (`BU-P4-020`).
+- **Tests assert observable outcomes through the interface, never internal state** (`BU-P4-021`).
+
+### Completion boundary
+This stage may complete only when old shallow-module tests are deleted and new tests exist that assert only through the new interface.
+
+### Decision evidence
+The test suite change is this stage's own durable output.
 
 ## Output
 

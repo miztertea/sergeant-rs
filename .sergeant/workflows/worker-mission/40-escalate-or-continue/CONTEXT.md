@@ -25,9 +25,24 @@ A new gate is published only when a monotonic generation actually advanced; the 
   (trigger: a worker needs to publish a second (or later) blocking gate after a prior one was already resolved; outcome: each blocking gate is uniquely and monotonically identified, so a response can be proven to apply to the gate it was actually given for and not replayed against a stale one)
   — `BU-P7-012`, `reference/sergeant-upstream/templates/worker-brief.md` (section '### 4. Escalate and resume')
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim. The helper invocation below runs after this judgment, mechanically, only on the path where the mission concludes rather than escalates.
+Apply `@@bounded-judgment`. The helper invocation below runs after this judgment, mechanically, only on the path where the mission concludes rather than escalates.
+
+### J2 — delegated to this stage
+- Whether the mission escalates (publishes a new gate) or concludes, based on the current state.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage — the escalate/continue handshake and gate-generation ordering are J5 governing constraints (`BU-P7-009`, `BU-P7-012`), not choices this stage exercises judgment over.
+
+### Completion boundary
+This stage may complete only when the handshake (ack/accept/act-once/complete) is fully recorded for an escalation, or handoff evidence is recorded from the verified worktree for a conclusion — never left partially written.
+
+### Decision evidence
+The token file per handshake step, or the recorded handoff evidence, is this stage's own decision record.
 
 ## Additional note
 

@@ -28,7 +28,7 @@ Classified at extraction as deterministic machinery crossing this checkpoint (la
 
 ## Additional note
 
-Blocks on `drain-fleet`'s admission-block state — this is a real cross-workflow dependency (this stage's outcome is produced by running an entire other workflow to its own completion, not by swapping a local implementation detail), which is why it survives N1 adjudication A4's §6.3 reimplementation test and is kept as its own stage rather than folded elsewhere. See "Helper invocations" below for the preflight probing folded in ahead of it.
+**Corrected 2026-08-16, ICM-R3 (BU-DISP-15):** the prior text here and in "Delegation" below described this checkpoint as blocking on a `drain-fleet` workflow "run to its own completion." No package or CLI verb named `drain-fleet` exists in this repository — it names an open, unbuilt engine gap (**G4**, `docs/icm/re-homing-record-2026-08-12.md` line 28: a future fleet-wide drain/force-stop operation). This stage's own checkpoint — the fleet-wide admission lock held only across the first durable side effect, then released immediately — survives §6.3's reimplementation test on its own terms, independent of whether `drain-fleet` is ever built: it is this stage's own contract to hold and release the lock narrowly (`BU-P6-128`), not a delegation to another procedure. A future `drain-fleet`-equivalent operation would need to respect the same lock; this stage does not currently depend on one existing. See "Helper invocations" below for the preflight probing folded in ahead of it.
 
 ## Helper invocations (folded stages, N1 adjudication A4)
 
@@ -70,9 +70,24 @@ Blocks on `drain-fleet`'s admission-block state — this is a real cross-workflo
 
 **Caveat on `BU-P1-057`/`BU-P1-093`/`BU-P1-094`:** these units' literal text requires "persistent interactive sessions" and rejects "non-interactive launch modes" — that half of the statement is old Sergeant's tmux-pane launch mechanism, ruled obsolete and structurally reversed by this project's own deviation register (D2: headless `claude -p --resume` turns, no persistent pane). Preserve the *durable* part of these citations only: a harness/model/identity tuple is validated and rejected before any durable state exists, and a resumed worker inherits the same pin. Do not implement a literal interactive-session requirement from this stage.
 
-## Delegation
+## Bounded judgment
 
-This stage's outcome is produced by running **drain-fleet** to its own completion (context composition today — see `docs/icm/convention.md` §4 on `@@name` versus true nested-workflow invocation, which does not exist yet).
+Apply `@@bounded-judgment`.
+
+### J1 — local choices allowed
+- Local sequencing of exactly how the release is mechanically triggered, once the first side effect has landed.
+
+### J5 — governing constraint
+- **The admission lock is held only through the first durable side effect and released immediately afterward** (`BU-P6-128`) — a fixed protocol this stage follows, not a class of decision delegated to it. **Corrected 2026-08-16, ICM-R3:** previously stated J2; the independent reviewer found the hold window is not chosen among alternatives, it is fixed by contract.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when harness/model/identity are validated (preflight helper below) and the admission lock has been held across, then released after, exactly the first durable side effect.
+
+### Decision evidence
+The admission decision and lock hold/release timing are this stage's own durable output.
 
 ## Output
 

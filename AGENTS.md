@@ -47,6 +47,7 @@ that owns that topic wins. <!-- BU-0106 -->
 | The estate isn't set up yet, or `sgt doctor` reports a fixable install/config fault | `sgt init` / `sgt doctor` (not a skill — CLI verbs; see "When NOT to use `sgt`") | Estate scaffolding, install repair |
 | Before acting in an estate whose repos/groups/health aren't already confirmed this session | `estate-navigation` (`skills/estate-navigation/SKILL.md`) | Resolving declared repos/groups and syncing the working set — `sgt repo list`/`sgt group list`/`sgt doctor`/`sgt repo add` |
 | The user wants their plan/decision/idea interviewed and stress-tested, or invokes a "grill" trigger phrase | `grilling` (`skills/grilling/SKILL.md`), or `grill-with-docs` (`skills/grill-with-docs/SKILL.md`) when it should also produce ADRs/glossary entries | A live, in-session interview — never `sgt run` (R-NS-6) |
+| The user wants a design already discussed in this conversation turned into a spec-shaped ticket, or invokes a "spec this" trigger phrase | `to-spec` (`skills/to-spec/SKILL.md`) | Synthesizing this conversation's own content into a published spec — never `sgt run`, since a dispatched Work has no access to "what we've already discussed" |
 | Substantive procedural work has a matching published workflow | the workflow's own `index.md` under `.sergeant/workflows/<name>/`, discovered via `.sergeant/index.md` | That workflow's stages, inputs, and outputs |
 | A `@@name` reference appears in an active stage's `CONTEXT.md` | `.sergeant/common/contexts/<name>.md` | Shared context text, resolved by this exact rule and no other |
 
@@ -230,8 +231,9 @@ itself is absent or unreadable; don't reconstruct the procedure from
 memory in that case. <!-- BU-0022, BU-0023, BU-0024 -->
 
 Most of the 126-unit corpus this rewrite consumed belongs to specific
-published workflows (`tdd`, `prototype`, `wayfinder`, `to-tickets`,
-`triage`, `diagnose-bug`) rather than to this always-on file — the full
+published workflows and shared contexts (`.sergeant/common/contexts/tdd.md`
+and `test-quality.md`, `prototype`, `wayfinder`, `to-tickets`, `triage`,
+`diagnose-bug`) rather than to this always-on file — the full
 per-unit disposition, including everything ruled not-adopted and why
 (among the not-adopted: two upstream skills this repo has no live package
 for yet, `codebase-design` and `domain-modeling` — only frozen evidence

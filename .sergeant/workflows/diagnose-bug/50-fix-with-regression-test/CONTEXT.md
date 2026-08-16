@@ -31,9 +31,24 @@ A test exists at a correct seam before the fix, or the seam's absence is recorde
   (trigger: a correct seam has been identified; outcome: the fix is proven both at the minimal seam and against the original full scenario)
   — `BU-P2-047`, `reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` (Phase 5: procedure when a seam exists, lines 116-122)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Judging whether a candidate seam is load-bearing or too shallow (`BU-P2-045`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### Required fallback (not J0 — a named outcome, not an escalation)
+- **No correct seam exists.** Record the absence as the finding rather than silently skipping (`BU-P2-046`) — this is a required disposition the contract itself names, not a decision to ask the user about.
+
+### Completion boundary
+This stage may complete only when either a regression test exists at a correct seam, watched failing then passing, with the Phase 1 loop re-run against the original scenario (`BU-P2-047`) — or the seam's absence is recorded as the finding.
+
+### Decision evidence
+The regression test (or the recorded seam-absence finding) is this stage's own durable output.
 
 ## Output
 

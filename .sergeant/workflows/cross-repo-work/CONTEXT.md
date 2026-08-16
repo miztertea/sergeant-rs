@@ -28,7 +28,60 @@ Resolved project context shows more than one repository owns the requested outco
 ## Relationships to other workflows
 
 - `50-handoff-or-stop` delegates to **dispatch**.
-- `60-reconcile` *names* (does not invoke) `dispatch`'s fleet reconciliation and `reconcile-and-cleanup-fleet`'s cleanup as adjacent, owned procedures (N1 adjudication A8, BH-10).
+- `60-reconcile` *names* (does not invoke) `dispatch`'s fleet reconciliation
+  as an adjacent, owned procedure (N1 adjudication A8, BH-10). It does
+  **not** name a `reconcile-and-cleanup-fleet` package — no such package
+  exists (`docs/icm/re-homing-record-2026-08-12.md` line 25): its per-repo
+  teardown half was absorbed into `recovery.rs`'s automatic reconciliation,
+  and its multi-repo fleet-grouping/cleanup half is doctrinally unbuilt
+  (currently ruled out by the North Star's "fleet as a domain object"
+  line). The underlying wish for a real composed cleanup procedure is
+  recorded as evidence for existing engine-gap **G6**
+  (`reference-corpus/engine-pressure.md`), not as a currently owned
+  procedure this stage's output feeds.
+
+## Authority envelope
+
+This workflow receives an already-defined multi-repository objective; it
+does not itself decide whether work should exist, only how to decompose an
+already-scoped cross-repository objective into an ownership/dependency/
+delivery plan.
+
+### Workflow may decide
+- Which repository owns each required behavior, resolved from the project
+  graph and existing contracts first (`10-assign-ownership`).
+- Which evidence justifies a dependency edge, and how to break a
+  genuinely coupled cycle (`20-define-dependency-order`).
+- Each repository's concrete delivery-gate content from inspected state
+  and the dependency graph (`40-define-delivery-gates`).
+- Whether the user requested planning-only or implementation
+  (`50-handoff-or-stop`).
+- Which reconciled fact (PR/CI/thread/merge-order/deploy state) applies to
+  each named repository (`60-reconcile`).
+
+### Workflow may not decide
+- Ask the user about every ownership ambiguity rather than only genuinely
+  contested cross-repository ownership.
+- Let a cyclic dependency graph reach dispatch.
+- Stash, reset, switch, or clean repository state during planning.
+- Edit several repositories itself, or perform the dispatched worker's own
+  git mutations (`git checkout -b`, `git push -u origin`, `gh pr create`)
+  inline.
+- Report the cross-repo outcome complete without a terminal result or an
+  explicit preserved blocker for every named repository, or assert
+  anything about repos, tasks, or fleet state outside its own plan's repo
+  set.
+
+### Human or Captain gates
+- Genuinely contested cross-repository ownership (`10-assign-ownership`).
+- A required data/security/destructive decision for a repository's gate
+  that is still missing or unresolved (`40-define-delivery-gates`).
+
+### Decision record
+Material decisions (ownership assignments, dependency edges, delivery
+gates, the planning-only/implementation determination, reconciled facts)
+are recorded in each stage's own turn and surfaced through `needs_input`
+where applicable; this workflow declares no separate decision-log file.
 
 ## Adjudication notes (A4, A8)
 
@@ -53,6 +106,11 @@ child-workflow invocation exists at this milestone —
 real is recorded as evidence for existing engine-gap claim G6 in
 `reference-corpus/engine-pressure.md`, not filed as a new claim. See
 `60-reconcile/CONTEXT.md`'s "Scope note" for the stage-level disposition.
+
+**Correction (ICM-R3, 2026-08-16):** the A8 note previously also named
+`reconcile-and-cleanup-fleet` as an adjacent owned procedure for the
+multi-repo cleanup half. No such package exists — see "Relationships to
+other workflows" above for the corrected characterization.
 
 ## Provenance
 

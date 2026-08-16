@@ -159,9 +159,28 @@ Five stages extracted as their own candidates (ladder §6.5, "deterministic-mach
   (trigger: the interactive worker launches its harness process with a pinned provider/model tuple; outcome: recorded launch evidence is independently verifiable against the actual process's own observed argv/environment, not merely self-reported by the launching code)
   — `BU-P7-111`, `reference/sergeant-upstream/tests/sgt-worker-model-tuple-test.sh` (lines 6-9)
 
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- None beyond ordinary tool mechanics of running the five ordered helper invocations below.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- **A worker escalates.** Read its full context, evidence, exact question/blocker, recommendation, and options; obtain an explicit human decision **without inferring consequential intent**; deliver it to the exact task/repo pair (`BU-P5-067`) — mirroring `validate-and-ship/40-drive-gates`'s ask-user carve-out: this is never resolved autonomously.
+
+### Completion boundary
+This stage may complete only when the five helper invocations below have run in order and, for any escalation reached, a human decision has been obtained and durably delivered.
+
+### Decision evidence
+Escalation context and the delivered human decision are this stage's own durable output.
+
 ## Delegation
 
-This stage's outcome is produced by running **respond-to-worker** to its own completion (context composition today — see `docs/icm/convention.md` §4 on `@@name` versus true nested-workflow invocation, which does not exist yet).
+**Corrected 2026-08-16, ICM-R3 (BU-DISP-15's same class of defect):** the prior text here described escalation delivery as running a **respond-to-worker** workflow "to its own completion." No package or CLI verb named `respond-to-worker` exists in this repository. Escalation responses are delivered via the shipped `sgt respond` command (`POST /v1/work/{id}/input`, `docs/icm/re-homing-record-2026-08-12.md` line 22) — this stage's own contract, not a delegation to an unbuilt workflow.
 
 ## Output
 

@@ -22,9 +22,24 @@ The external skill's filesystem, shell, network, Git, and credential actions are
   (trigger: source confirmed; outcome: the skill's side-effect surface across five named categories is known)
   — `BU-P1-122`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L128, vet step 3)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Assessing the actual side-effect surface across the five named categories from source inspection (`BU-P1-122`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- A checked action is severe enough (e.g. credential exfiltration, arbitrary network egress, a destructive filesystem/Git action) that continuing would be irresponsible without a stop: record the finding and ask the user rather than silently proceeding to `30-verify-no-conflict`.
+
+### Completion boundary
+This stage may complete only once the skill's filesystem, shell, network, Git, and credential actions are checked across all five categories — or the stage has stopped at the J0 case above.
+
+### Decision evidence
+The checked action surface is this stage's own durable output, recorded per `output/README.md`.
 
 ## Output
 

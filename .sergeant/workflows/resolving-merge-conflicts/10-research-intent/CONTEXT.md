@@ -30,9 +30,24 @@ The intent behind each conflicting side is researched.
   (trigger: the workflow begins; outcome: the actor has an accurate picture of what is conflicting and why)
   — `BU-P3-046`, `reference/sergeant-upstream/.agents/skills/resolving-merge-conflicts/SKILL.md` (step 1, line 6)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Which primary sources (commit messages, PRs, issues/tickets) to inspect when tracing each side's original intent (`BU-P3-047`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- No commit message, PR, or issue/ticket can be found for one side's change: state what evidence was checked and ask the user for the missing context, or explicit permission to proceed on the visible diff alone, rather than guessing at unstated intent (`BU-P3-047`).
+
+### Completion boundary
+This stage may complete only once the current merge/rebase state is established and the intent behind each conflicting side is traced — or the stage has stopped at the J0 case above.
+
+### Decision evidence
+Traced intent per conflicting side is this stage's own durable output, recorded per `output/README.md`.
 
 ## Output
 

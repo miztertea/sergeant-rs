@@ -25,9 +25,29 @@ Non-main branches, uncommitted changes, ahead/behind state, active worktrees, an
   (trigger: delivery gates have been drafted for every repository; outcome: the plan's completion condition is explicit and checkable)
   — `BU-P5-050`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 76-77)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim. The helper invocation below runs first, mechanically, to gather the repository state this judgment then reasons about.
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- Repository state inspection is strictly read-only: never stash, reset, switch, or clean (`BU-P5-048`).
+- The plan's completion condition — brief + acceptance evidence + acyclic position for every owner — is fixed, not a judgment call (`BU-P5-050`).
+
+### J2 — delegated to this stage
+- Defining each repository's concrete delivery-gate content from the inspected state and dependency graph (`BU-P5-049`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- Repository state conflicts with the requested outcome: stop for a decision rather than routing it into the worker brief (`BU-P5-048`).
+- A required data/security/destructive decision for a repository's gate is still missing or unresolved (`BU-P5-049`).
+
+### Completion boundary
+This stage may complete only once every owning repository has one implementation brief, acceptance evidence, and an acyclic dependency position — or the stage has stopped at one of the J0 cases above.
+
+### Decision evidence
+The per-repository delivery gate is this stage's own durable output, recorded per `output/README.md`.
 
 ## Helper invocations (folded stages, N1 adjudication A4)
 

@@ -37,9 +37,24 @@ The loop goes red on the user's exact symptom and every remaining element is loa
   (trigger: reproduction is confirmed but minimization is incomplete, or vice versa; outcome: the actor is blocked from Phase 3 until both conditions hold)
   — `BU-P2-036`, `reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` (Phase 2 closing rule, lines 80-80)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- What to cut, and in what order, while minimizing (`BU-P2-033`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J5 — governing completion gate
+- **The actor must not proceed past this stage until the bug has been both reproduced and minimized** (`BU-P2-036`) — a governing stage-contract prohibition, not a discretionary choice.
+
+### Completion boundary
+This stage may complete only when the loop reproduces the user's exact symptom and every remaining element is load-bearing (removing any one makes it go green, `BU-P2-035`).
+
+### Decision evidence
+The minimized repro and what was cut are this stage's own durable output.
 
 ## Output
 

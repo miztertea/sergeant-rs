@@ -28,9 +28,24 @@ The objective is routed to the standard-isolated path or forced onto an explicit
   (trigger: sgt-dispatch is about to launch a worker for a stated objective; outcome: high-risk objectives are structurally forced through a stricter, validated intent path before any state is created; low-risk objectives use a lighter path)
   — `BU-P8-069`, `reference/sergeant-upstream/docs/using-sergeant.md` (L112-117)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- **An objective matching the fixed safety-sensitive keyword set (auth, security, secrets, payments, databases, migrations, production, destructive, persistent state, state transitions) cannot proceed on the standard-isolated path — it must be given an explicit `--intent-file`** (`BU-P6-048`, `BU-P8-069`). Not a delegated judgment call; the keyword match is fixed.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only when the objective is routed to exactly one path (standard-isolated or explicit-intent-file), per the fixed keyword classification.
+
+### Decision evidence
+The routing decision is this stage's own durable output.
 
 ## Output
 

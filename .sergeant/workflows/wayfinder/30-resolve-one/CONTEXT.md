@@ -40,9 +40,28 @@ Claim, resolve by type, record the answer as a resolution and a one-line pointer
   (trigger: an existing ticket is found to be out of scope during resolution; outcome: the map accurately distinguishes decisions actually made from work ruled out of scope)
   — `BU-P4-092`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Out of scope, L101)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J3 — settled authoritative record
+- Whether a ticket is HITL or AFK is settled by the ticket's own type label for the two types this package's stage prose names (research is AFK, task is either) (`BU-P4-085`, `BU-P4-086`, `BU-P4-087`).
+
+### J2 — delegated to this stage
+- Which ticket to choose when the user has not named one (`BU-P4-098`).
+- Whether an in-progress ticket turns out to be out of scope during resolution (`BU-P4-092`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- A HITL ticket's own question: the agent never answers on the human's behalf (`BU-P4-085`).
+
+### Completion boundary
+This stage may complete only once a ticket is claimed by self-assignment, resolved (or ruled out of scope), and its resolution recorded as a resolution comment, close, and Decisions-so-far pointer — with no more than one non-research ticket resolved per session.
+
+### Decision evidence
+Each ticket's resolution comment and the map's Decisions-so-far / Out of scope sections are this stage's own durable record.
 
 ## Output
 
