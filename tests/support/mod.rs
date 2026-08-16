@@ -17,9 +17,9 @@
 //! they run the binary, so a new test cannot quietly opt out of it: pointing
 //! `sgt` at a bare `TempDir` no longer type-checks.
 //!
-//! Kept deliberately dependency-free (`kill(1)` and `/proc`, both of which
-//! these suites already use) — a test rig is not a place to spend the
-//! milestone's dependency budget.
+//! Kept deliberately dependency-free (`kill(1)` and `src/platform/process.rs`'s
+//! `running_processes`, which these suites already use) — a test rig is not a
+//! place to spend the milestone's dependency budget.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

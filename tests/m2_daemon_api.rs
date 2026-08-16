@@ -3488,9 +3488,10 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 /// works/s at burst 50 on a quiet machine. This runs at burst 25 inside a
 /// suite that shares its cores with seven others, so the floor takes a 2×
 /// contention allowance: **12 works/s** on Linux. On M3 Pro / macOS,
-/// git-spawn overhead limits the fixed path to ~11.6 works/s, so the floor
-/// is revised to **11.0 works/s** on this hardware (#128). Two measurements
-/// make 11.0 the honest number rather than a round one:
+/// git-spawn overhead limits the fixed path to ~11.6 works/s under load, so
+/// the floor is revised to **8.0 works/s** on this hardware (#128,
+/// owner-approved). Two measurements make 8.0 the honest number rather than a
+/// round one:
 ///
 /// - the healthy path here runs 38 works/s idle and 33 works/s with the whole
 ///   suite in flight — 2.8× the Linux floor on a loaded host, which is margin
@@ -3499,7 +3500,7 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 ///   exists to catch imposes. Any effect of duration *d* serialized under the
 ///   submit guard caps throughput at `1/d` regardless of burst size or host
 ///   speed: the full-serialized baseline measures at 4.8 works/s and the
-///   regression-path simulation at 10.2 works/s — both well below 11.0.
+///   regression-path simulation at 10.2 works/s — both well below 8.0.
 ///
 /// The burst is 25 rather than 50 because the guard is bounded by the ceiling
 /// above, not by the burst, and 50 concurrent worktrees on a shared test host

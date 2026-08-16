@@ -15,12 +15,13 @@
 //! `ps`/`kill` invocation cannot be.
 //!
 //! The measured targets are Linux and macOS (ADR 0001 D1; WSL2 counts as
-//! Linux underneath, so it needs no third arm). **Every macOS-specific arm in
-//! this module is marked UNVERIFIED**: there is no macOS host in this estate
-//! yet (`docs/environments/`), and `docs/DEVELOPMENT.md`'s rule is
-//! measured-not-assumed. Those arms close their tracking issue (#81, #82,
-//! #18) only once someone runs the suite on a real macOS host and records it
-//! there — not when this module lands.
+//! Linux underneath, so it needs no third arm). macOS arms that have been
+//! verified on a real host carry a "Verified YYYY-MM-DD" note; those still
+//! unmeasured carry "UNVERIFIED". As of 2026-08-15 (Apple M3 Pro arrival,
+//! `docs/environments/macbook.md`): `process.rs`, `disk.rs`, and `data_dir.rs`
+//! are **verified** (#18, #81, #82 closed); `fs_locking.rs`'s macOS detection
+//! arm remains **UNVERIFIED** and reports `Reliability::Unknown` until #85 is
+//! measured there.
 
 pub mod data_dir;
 pub mod disk;

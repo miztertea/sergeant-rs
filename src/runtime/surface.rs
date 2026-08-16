@@ -531,11 +531,7 @@ fn materialize_one(
         let path = worktree_path.display().to_string();
         // Remove registry entry first so the branch is unreferenced.
         let _ = with_repository(&repository.path, || {
-            git(
-                &repository.path,
-                &["worktree", "remove", "--force", &path],
-            )
-            .map(|_| ())
+            git(&repository.path, &["worktree", "remove", "--force", &path]).map(|_| ())
         });
         // Delete the branch so a retry can re-create it with `-b`.
         let _ = git(&repository.path, &["branch", "-D", branch]);
@@ -1344,7 +1340,18 @@ fn add_worktree_no_checkout(
     start: &str,
 ) -> Result<(), SurfaceError> {
     let path = prepare_worktree_dir(worktree)?;
-    git(source, &["worktree", "add", "--no-checkout", "-b", branch, &path, start])?;
+    git(
+        source,
+        &[
+            "worktree",
+            "add",
+            "--no-checkout",
+            "-b",
+            branch,
+            &path,
+            start,
+        ],
+    )?;
     Ok(())
 }
 
@@ -2099,15 +2106,13 @@ mod tests {
         // Phase 1: create the repo and the initial commit WITHOUT the filter
         // configured — the filter's `required = true` would also block `git add`
         // (the clean step) if it were active during setup.
-        for args in [vec!["init", "-b", "main"]] {
-            Command::new("git")
-                .args(&args)
-                .current_dir(&source)
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_SYSTEM", "/dev/null")
-                .output()
-                .expect("git");
-        }
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&source)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
         // .gitattributes declares the filter; payload.txt is the file it targets.
         std::fs::write(
             source.join(".gitattributes"),
@@ -2190,11 +2195,10 @@ mod tests {
         }
 
         // Retry: must succeed because the branch slot was freed.
-        let surface = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec))
-            .expect(
-                "retry must succeed — branch was deleted so it can be recreated with -b; \
+        let surface = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec)).expect(
+            "retry must succeed — branch was deleted so it can be recreated with -b; \
                  if this fails with 'branch already exists', the cleanup is missing",
-            );
+        );
         assert!(surface.bindings[0].worktree_path.is_dir());
         teardown(&surface);
     }
