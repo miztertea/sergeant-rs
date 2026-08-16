@@ -21,7 +21,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,6 +29,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::Deferred;
+use crate::cli::doctor;
 use crate::daemon::{
     KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
     KIND_DAEMON_STOPPED,
@@ -38,6 +39,7 @@ use crate::domain::execution::{
     KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
+use crate::domain::manifest::{self, ManifestError};
 use crate::domain::work::{
     EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
     KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
@@ -48,6 +50,7 @@ use crate::domain::workflow::{
     KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED,
     KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
 };
+use crate::domain::workspace::{InstructionPolicy, Workspace};
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
@@ -396,6 +399,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/work/{id}/extend", post(work_extend))
         .route("/work/{id}/reap", post(reap_work))
         .route("/retained", get(list_retained))
+        .route(
+            "/estate/repos",
+            get(estate_list_repos).post(estate_add_repo),
+        )
+        .route("/estate/repos/{name}", delete(estate_remove_repo))
+        .route(
+            "/estate/groups",
+            get(estate_list_groups).post(estate_add_group),
+        )
+        .route("/estate/groups/{name}", delete(estate_remove_group))
+        .route("/doctor", get(doctor_report))
         .route("/admission/pause", post(pause_admission))
         .route("/graph/work/{id}", get(work_graph))
         .route("/analytics", get(analytics_index))
@@ -2424,6 +2438,323 @@ async fn list_retained(State(state): State<ApiState>) -> Response {
     Json(json!({"retained": entries})).into_response()
 }
 
+// ------------------------------------------------------------------ estate
+//
+// §16.2/§16.3: thin daemon-side wrappers over `crate::domain::manifest`'s
+// existing add_repo/remove_repo/add_group/remove_group and
+// `crate::cli::doctor`'s existing Report — no logic is duplicated here, and
+// none of it touches the journal or `Core`: manifest edits are not engine
+// state (R-NS-4, `src/domain/manifest.rs`'s own module doc), so unlike every
+// other mutation in this file there is no `command_id`/replay pair.
+
+/// The estate root these routes edit: an upward walk from this daemon's own
+/// `data_dir`, unscoped — correct for the default `<estate_root>/.sergeant/
+/// data` layout `sgt init` always produces, deterministic, and dependent on
+/// nothing but the one fact [`ApiState`] already carries.
+///
+/// The process's own working directory is deliberately **not** consulted —
+/// a long-running daemon's cwd is not reliably the estate root in every real
+/// deployment, and unlike a walk that simply finds nothing, a cwd that
+/// happens to sit inside a *different* estate (an unrelated git checkout
+/// that is itself one, `sgt`'s own self-hosting shape among them) would
+/// silently resolve to the wrong manifest rather than failing closed — the
+/// one outcome R-NS-4's discipline exists to prevent.
+fn resolve_estate_root(data_dir: &std::path::Path) -> Result<PathBuf, Box<Response>> {
+    match Workspace::estate_root(data_dir, None) {
+        Ok(Some(root)) => Ok(root),
+        Ok(None) => Err(Box::new(error_response(
+            StatusCode::NOT_FOUND,
+            "no_estate",
+            "no estate found walking up from this daemon's data dir (bounded at $HOME) — run \
+             `sgt init` first, or start the daemon on a data dir under the estate root",
+        ))),
+        Err(e) => Err(Box::new(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "estate_invalid",
+            e.to_string(),
+        ))),
+    }
+}
+
+/// Stable per-variant code for a [`ManifestError`], for the same
+/// `{"error": {"code", "message"}}` shape every other route answers with.
+fn manifest_error_code(e: &ManifestError) -> &'static str {
+    match e {
+        ManifestError::Io { .. } => "io",
+        ManifestError::Parse { .. } => "parse",
+        ManifestError::Locked { .. } => "locked",
+        ManifestError::Invalid { .. } => "invalid",
+        ManifestError::NoEstate { .. } => "no_estate",
+        ManifestError::InvalidName { .. } => "invalid_name",
+        ManifestError::RepoAlreadyDeclared { .. } => "repo_already_declared",
+        ManifestError::RepoNotDeclared { .. } => "repo_not_declared",
+        ManifestError::RepoInUseByGroups { .. } => "repo_in_use_by_groups",
+        ManifestError::GroupNotDeclared { .. } => "group_not_declared",
+        ManifestError::NotAGroupMember { .. } => "not_a_group_member",
+        ManifestError::ExistingPathNotAGitRepository { .. } => "existing_path_not_a_git_repository",
+        ManifestError::NoPathAndNoOrigin { .. } => "no_path_and_no_origin",
+        ManifestError::CloneFailed { .. } => "clone_failed",
+        ManifestError::MalformedSection { .. } => "malformed_section",
+    }
+}
+
+/// HTTP status for a [`ManifestError`]: 4xx where the caller can fix the
+/// request (a bad name, a dangling reference, a missing declaration), 502
+/// for a failed outbound clone, 409 for a concurrent-edit or already-exists
+/// conflict, 500 only where the local filesystem itself is unavailable.
+fn manifest_error_status(e: &ManifestError) -> StatusCode {
+    match e {
+        ManifestError::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        ManifestError::Parse { .. }
+        | ManifestError::Invalid { .. }
+        | ManifestError::ExistingPathNotAGitRepository { .. }
+        | ManifestError::MalformedSection { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        ManifestError::Locked { .. } | ManifestError::RepoAlreadyDeclared { .. } => {
+            StatusCode::CONFLICT
+        }
+        ManifestError::NoEstate { .. }
+        | ManifestError::RepoNotDeclared { .. }
+        | ManifestError::GroupNotDeclared { .. }
+        | ManifestError::NotAGroupMember { .. } => StatusCode::NOT_FOUND,
+        ManifestError::InvalidName { .. } | ManifestError::NoPathAndNoOrigin { .. } => {
+            StatusCode::BAD_REQUEST
+        }
+        ManifestError::RepoInUseByGroups { .. } => StatusCode::CONFLICT,
+        ManifestError::CloneFailed { .. } => StatusCode::BAD_GATEWAY,
+    }
+}
+
+/// The error body a [`ManifestError`] answers with — the exact refusal text
+/// (remedy included, per its own `Display`) `sgt repo`/`sgt group` already
+/// print, never a second explanation of the same defect.
+fn manifest_error_response(e: &ManifestError) -> Response {
+    error_response(
+        manifest_error_status(e),
+        manifest_error_code(e),
+        e.to_string(),
+    )
+}
+
+/// The declared repositories, read the same way `sgt repo list --json` does.
+fn workspace_read(estate_root: &std::path::Path) -> Result<Workspace, Box<Response>> {
+    Workspace::from_config_allow_empty(&estate_root.join(crate::domain::workspace::WORKSPACE_FILE))
+        .map_err(|e| {
+            Box::new(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "estate_invalid",
+                e.to_string(),
+            ))
+        })
+}
+
+/// `GET /v1/estate/repos` (§16.2) — the same read `sgt repo list --json`
+/// already performs, over the daemon's own estate.
+async fn estate_list_repos(State(state): State<ApiState>) -> Response {
+    let estate_root = match resolve_estate_root(&state.data_dir) {
+        Ok(root) => root,
+        Err(resp) => return *resp,
+    };
+    let workspace = match workspace_read(&estate_root) {
+        Ok(w) => w,
+        Err(resp) => return *resp,
+    };
+    let repos: Vec<Value> = workspace
+        .repositories
+        .iter()
+        .map(|r| {
+            json!({
+                "name": r.name,
+                "path": r.path,
+                "origin": workspace.repository_origin(&r.name),
+                "instructions": workspace.instruction_policy(&r.name).as_str(),
+            })
+        })
+        .collect();
+    Json(json!({"repos": repos})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AddRepoRequest {
+    name: String,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
+}
+
+/// `POST /v1/estate/repos` (§16.2) — `manifest::add_repo` exactly, including
+/// its populate-or-verify clone behavior, which is why this runs off the
+/// blocking pool rather than inline (§22.6's tradeoff, same shape as
+/// `reap_work`'s filesystem call): a real `git clone` can take real time,
+/// and nothing here holds the core guard while it runs — this route never
+/// touches `Core` at all.
+async fn estate_add_repo(
+    State(state): State<ApiState>,
+    body: Result<Json<AddRepoRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    let instructions = match req.instructions.as_deref() {
+        None => None,
+        Some("local") => Some(InstructionPolicy::Local),
+        Some("suppress") => Some(InstructionPolicy::Suppress),
+        Some(other) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("instructions {other:?} is not recognized (use \"local\" or \"suppress\")"),
+            );
+        }
+    };
+    let estate_root = match resolve_estate_root(&state.data_dir) {
+        Ok(root) => root,
+        Err(resp) => return *resp,
+    };
+    let name = req.name.clone();
+    let origin = req.origin.clone();
+    let result =
+        blocking_sync(|| manifest::add_repo(&estate_root, &name, origin.as_deref(), instructions));
+    match result {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "name": req.name,
+                "path": format!("repos/{}", req.name),
+                "origin": req.origin,
+                "instructions": req.instructions,
+            })),
+        )
+            .into_response(),
+        Err(e) => manifest_error_response(&e),
+    }
+}
+
+/// `DELETE /v1/estate/repos/{name}` (§16.2) — `manifest::remove_repo`
+/// exactly; the group-reference refusal it returns reaches the caller
+/// structured, not reworded.
+async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
+    let estate_root = match resolve_estate_root(&state.data_dir) {
+        Ok(root) => root,
+        Err(resp) => return *resp,
+    };
+    match blocking_sync(|| manifest::remove_repo(&estate_root, &name)) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => manifest_error_response(&e),
+    }
+}
+
+/// `GET /v1/estate/groups` (§16.2) — the same read `sgt group list --json`
+/// already performs.
+async fn estate_list_groups(State(state): State<ApiState>) -> Response {
+    let estate_root = match resolve_estate_root(&state.data_dir) {
+        Ok(root) => root,
+        Err(resp) => return *resp,
+    };
+    let workspace = match workspace_read(&estate_root) {
+        Ok(w) => w,
+        Err(resp) => return *resp,
+    };
+    let groups: Vec<Value> = workspace
+        .groups
+        .iter()
+        .map(|(name, g)| json!({"name": name, "repos": g.repos, "brief": g.brief}))
+        .collect();
+    Json(json!({"groups": groups})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct AddGroupRequest {
+    name: String,
+    #[serde(default)]
+    repos: Vec<String>,
+    #[serde(default)]
+    brief: Option<String>,
+}
+
+/// `POST /v1/estate/groups` (§16.2) — `manifest::add_group` exactly,
+/// including its mkdir-p create/extend semantics (creating an existing group
+/// unions in new members; re-adding a member already present is a no-op).
+async fn estate_add_group(
+    State(state): State<ApiState>,
+    body: Result<Json<AddGroupRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    let estate_root = match resolve_estate_root(&state.data_dir) {
+        Ok(root) => root,
+        Err(resp) => return *resp,
+    };
+    let name = req.name.clone();
+    let repos = req.repos.clone();
+    let brief = req.brief.clone();
+    let result =
+        blocking_sync(|| manifest::add_group(&estate_root, &name, &repos, brief.as_deref()));
+    match result {
+        Ok(()) => {
+            let workspace = match workspace_read(&estate_root) {
+                Ok(w) => w,
+                Err(resp) => return *resp,
+            };
+            let members = workspace
+                .groups
+                .get(&req.name)
+                .map(|g| g.repos.clone())
+                .unwrap_or_default();
+            Json(json!({"name": req.name, "repos": members, "brief": req.brief})).into_response()
+        }
+        Err(e) => manifest_error_response(&e),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RemoveGroupRequest {
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+/// `DELETE /v1/estate/groups/{name}` (§16.2) — `manifest::remove_group`
+/// exactly: an omitted or empty `repos` body removes the whole group,
+/// otherwise only the named members (each of which must already be one).
+async fn estate_remove_group(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let repos = if body.is_empty() {
+        Vec::new()
+    } else {
+        match serde_json::from_slice::<RemoveGroupRequest>(&body) {
+            Ok(r) => r.repos,
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("invalid JSON body: {e}"),
+                );
+            }
+        }
+    };
+    let estate_root = match resolve_estate_root(&state.data_dir) {
+        Ok(root) => root,
+        Err(resp) => return *resp,
+    };
+    match blocking_sync(|| manifest::remove_group(&estate_root, &name, &repos)) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => manifest_error_response(&e),
+    }
+}
+
+/// `GET /v1/doctor` (§16.3) — the same `doctor::Report::to_json()`
+/// `sgt doctor --json` already prints, computed exactly once here.
+async fn doctor_report(State(state): State<ApiState>) -> Response {
+    let report = doctor::run(&state.data_dir).await;
+    Json(report.to_json()).into_response()
+}
+
 /// Catch the analytical projection up to the journal, then hand it to `f`.
 ///
 /// The projection is folded lazily, at read time, rather than on every
@@ -3004,6 +3335,18 @@ impl ApiClient {
         Self::into_value(response).await
     }
 
+    /// Authenticated DELETE with a JSON body, returning the parsed body.
+    pub async fn delete(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
+        let response = self
+            .http
+            .delete(format!("{}{path}", self.endpoint))
+            .bearer_auth(&self.token)
+            .json(body)
+            .send()
+            .await?;
+        Self::into_value(response).await
+    }
+
     /// `GET /v1/system`.
     pub async fn system(&self) -> Result<Value, ClientError> {
         self.get("/v1/system").await
@@ -3095,6 +3438,67 @@ impl ApiClient {
             }),
         )
         .await
+    }
+
+    /// `GET /v1/estate/repos` (§16.2/§20.4) — declared repositories.
+    pub async fn repos(&self) -> Result<Value, ClientError> {
+        self.get("/v1/estate/repos").await
+    }
+
+    /// `POST /v1/estate/repos` (§16.2/§20.4) — `manifest::add_repo`.
+    pub async fn add_repo(
+        &self,
+        name: &str,
+        origin: Option<&str>,
+        instructions: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        self.post(
+            "/v1/estate/repos",
+            &json!({"name": name, "origin": origin, "instructions": instructions}),
+        )
+        .await
+    }
+
+    /// `DELETE /v1/estate/repos/{name}` (§16.2/§20.4) — `manifest::remove_repo`.
+    pub async fn remove_repo(&self, name: &str) -> Result<Value, ClientError> {
+        self.delete(&format!("/v1/estate/repos/{}", urlencode(name)), &json!({}))
+            .await
+    }
+
+    /// `GET /v1/estate/groups` (§16.2/§20.4) — declared groups.
+    pub async fn groups(&self) -> Result<Value, ClientError> {
+        self.get("/v1/estate/groups").await
+    }
+
+    /// `POST /v1/estate/groups` (§16.2/§20.4) — `manifest::add_group`'s
+    /// mkdir-p create/extend semantics.
+    pub async fn add_group(
+        &self,
+        name: &str,
+        repos: &[String],
+        brief: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        self.post(
+            "/v1/estate/groups",
+            &json!({"name": name, "repos": repos, "brief": brief}),
+        )
+        .await
+    }
+
+    /// `DELETE /v1/estate/groups/{name}` (§16.2/§20.4) — `manifest::remove_group`;
+    /// empty `repos` removes the whole group, otherwise just those members.
+    pub async fn remove_group(&self, name: &str, repos: &[String]) -> Result<Value, ClientError> {
+        self.delete(
+            &format!("/v1/estate/groups/{}", urlencode(name)),
+            &json!({"repos": repos}),
+        )
+        .await
+    }
+
+    /// `GET /v1/doctor` (§16.3/§20.4) — the same `doctor::Report` `sgt doctor
+    /// --json` prints.
+    pub async fn doctor(&self) -> Result<Value, ClientError> {
+        self.get("/v1/doctor").await
     }
 
     /// Open the SSE live tail at `GET /v1/events/stream?from=N`.
