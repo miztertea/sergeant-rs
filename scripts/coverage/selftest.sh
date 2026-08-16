@@ -18,7 +18,9 @@
 # Both fixes are pinned here rather than by a real collection run, which costs
 # ten minutes and a cold DuckDB build. The cases run against a scratch
 # COV_TARGET_DIR full of empty files with `.profraw` names, with COV_PROFDATA
-# stubbed to `/bin/true` — the mergeability classifier is a separate claim
+# stubbed to `true` (bare, PATH-resolved — `/bin/true` doesn't exist on macOS,
+# only `/usr/bin/true`; first measured on the MacBook Pro M3 Pro arrival trip,
+# 2026-08-15) — the mergeability classifier is a separate claim
 # with its own evidence (README measured claim 6) and is not what these cases
 # are about. Deliberately: the scratch dir's path contains digits, because
 # that is what made the C4 idiom wrong.
@@ -115,7 +117,7 @@ run() {
   set +e
   env COV_TARGET_DIR="$dir/target" \
       COV_ARTIFACTS="$dir/artifacts" \
-      COV_PROFDATA=/bin/true \
+      COV_PROFDATA=true \
       COV_MIN_FREE_GB=0 \
       "$SELF" --case "$name" > "$SCRATCH/$name.out" 2>&1
   RC=$?
@@ -144,7 +146,13 @@ if [ "$(field "$TSV/loss-undeclared-accounting.tsv" profraw_lost)" != "2" ]; the
   fail "the accounting tsv must record profraw_lost 2, got \
 '$(field "$TSV/loss-undeclared-accounting.tsv" profraw_lost)'"
 fi
-if [ "$(wc -l < "$TSV/loss-undeclared-profraw-lost.txt")" != "2" ]; then
+# Numeric, not string, comparison: BSD/macOS `wc -l` right-pads its count
+# with leading spaces even when reading from a redirected stdin ("       2"),
+# where GNU `wc -l` prints a bare "2" — a `!=` string compare against "2"
+# fails on macOS for a value that is in fact correct (first measured on the
+# MacBook Pro M3 Pro arrival trip, 2026-08-15). `-ne` compares numerically and
+# both shells' `[` implementations strip the padding for that context.
+if [ "$(wc -l < "$TSV/loss-undeclared-profraw-lost.txt")" -ne 2 ]; then
   fail "each lost profraw must be named in loss-undeclared-profraw-lost.txt"
 fi
 

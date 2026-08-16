@@ -37,8 +37,9 @@ PERF_CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 
 # Timing: CLOCK_REALTIME nanoseconds. `date +%s%N` costs a fork (~2 ms on this
 # container) which is the same order as the thing being measured, so the
-# fork-free bash-5 EPOCHREALTIME is preferred and `date` is the fallback. Same
-# clock, same units.
+# fork-free bash-5 EPOCHREALTIME is preferred; `date +%s%N` (Linux) is next;
+# `perl -MTime::HiRes` (#95's chosen macOS clock, below) is last before giving
+# up. Same clock, same units, throughout.
 perf_now_ns() {
   local t=${EPOCHREALTIME:-}
   if [ -n "$t" ]; then
@@ -49,26 +50,64 @@ perf_now_ns() {
   else
     local ns
     ns="$(date +%s%N)"
-    perf_require_numeric_ns "$ns"
-    printf '%s\n' "$ns"
+    if perf_is_numeric_ns "$ns"; then
+      printf '%s\n' "$ns"
+    else
+      ns="$(perf_perl_now_ns)"
+      perf_require_numeric_ns "$ns"
+      printf '%s\n' "$ns"
+    fi
   fi
 }
 
-# #95: `date +%s%N` is a GNU coreutils extension — BSD/macOS `date` (the only
-# path bash 3.2's macOS ever reaches, since EPOCHREALTIME needs bash 5.0)
-# silently emits the epoch seconds followed by a literal `N`, e.g.
-# "1786728341N". Fed straight into arithmetic that would be a silently wrong
-# measurement, not a crash — worse for a perf harness than refusing to run.
-# This is the one guard in scope here; which working clock macOS gets
-# instead (perl -MTime::HiRes, python3 time.time_ns() with its fork cost
-# measured, or documented millisecond resolution) is an open parameter left
-# for the platform that can actually time the candidates.
-perf_require_numeric_ns() {
+# #95, closed by measurement (MacBook Pro M3 Pro, 2026-08-15). `date +%s%N`
+# is a GNU coreutils extension — BSD/macOS `date` (the only path bash 3.2's
+# macOS ever reaches, since EPOCHREALTIME needs bash 5.0) silently emits the
+# epoch seconds followed by a literal `N`, e.g. "1786728341N". Fed straight
+# into arithmetic that would be a silently wrong measurement, not a crash —
+# worse for a perf harness than refusing to run, which is what
+# `perf_require_numeric_ns` still does if every clock below has failed.
+#
+# The clock chosen for that gap is `perl -MTime::HiRes` — measured against
+# the other two candidates on real Apple Silicon (M3 Pro) before choosing,
+# not assumed from either's reputation, per this trip's own instruction: 100
+# forked calls under real bash 3.2 semantics (`/bin/bash`, not the newer
+# Homebrew bash that happens to be first on this host's `$PATH`) cost 1.229s
+# for perl (~12.3 ms/call), 2.482s for python3 (~24.8 ms/call), and 0.538s
+# for a bare `date +%s` (~5.4 ms/call — already above the ~2 ms this comment
+# used to cite from the Linux container, so this hardware's raw fork cost is
+# itself higher across the board, not just perl's or python3's).
+#
+# Plain `date` was **not** picked despite being cheapest: neither GNU nor BSD
+# `date` has any subsecond format without `%N`, so "millisecond resolution"
+# via bare `date` is not actually on offer — the real choice is whole-second
+# resolution (useless for a harness whose own measured latencies are
+# tens-of-milliseconds, `docs/perf/n3-two-phase-boundary-2026-08-10.md`) or
+# paying a fork for real sub-millisecond precision. Between the two paid
+# options, perl measured at roughly half python3's cost and needs no new
+# dependency (preinstalled on macOS same as python3). This overhead is
+# real, not hidden: at ~12.3 ms/call, a mark taken before and after a target
+# operation costs ~25 ms of its own, non-trivial next to a submit-path
+# operation this repo's own perf floor already measures in the tens of
+# milliseconds (`t12_submission_throughput_has_an_automated_floor`,
+# issue #128) — callers on macOS should read absolute latencies with that
+# overhead in mind, not just relative comparisons across runs on the same
+# host.
+perf_perl_now_ns() {
+  perl -MTime::HiRes -e 'printf "%.0f\n", Time::HiRes::time()*1e9' 2>/dev/null
+}
+
+# Non-fatal numeric check — lets `perf_now_ns`/`perf_mark` try the next clock
+# tier instead of dying on the first non-numeric result.
+perf_is_numeric_ns() {
   case "$1" in
-    ''|*[!0-9]*)
-      perf_die "no working nanosecond clock: \$EPOCHREALTIME is unset (needs bash 5.0+; macOS ships 3.2.57) and 'date +%s%N' returned non-numeric '$1' (%N is a GNU coreutils extension BSD/macOS date does not implement). See issue #95 for the clock this platform still needs."
-      ;;
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
   esac
+}
+
+perf_require_numeric_ns() {
+  perf_is_numeric_ns "$1" || perf_die "no working nanosecond clock: \$EPOCHREALTIME is unset (needs bash 5.0+; macOS ships 3.2.57), 'date +%s%N' returned non-numeric '$1' (%N is a GNU coreutils extension BSD/macOS date does not implement), and 'perl -MTime::HiRes' (#95's chosen macOS clock) is not available either. See issue #95."
 }
 
 # perf_mark VAR — assign "now" in ns to VAR without forking a subshell.
@@ -87,7 +126,10 @@ perf_mark() {
     __perf_mark_val="${__perf_mark_sec}${__perf_mark_frac:0:9}"
   else
     __perf_mark_val="$(date +%s%N)"
-    perf_require_numeric_ns "$__perf_mark_val"
+    if ! perf_is_numeric_ns "$__perf_mark_val"; then
+      __perf_mark_val="$(perf_perl_now_ns)"
+      perf_require_numeric_ns "$__perf_mark_val"
+    fi
   fi
   printf -v "$1" '%s' "$__perf_mark_val"
 }

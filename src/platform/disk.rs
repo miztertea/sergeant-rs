@@ -78,9 +78,13 @@ fn raw_avail_kb(path: &Path) -> Option<u64> {
     parse_avail_kb(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// **UNVERIFIED** — never executed against a real macOS `df`. `--output` is
-/// a GNU extension BSD/macOS `df` does not have (#81's finding), so this
-/// drops it and leans on [`parse_bsd_avail_kb`] instead.
+/// **Verified 2026-08-15** on a real macOS host (Apple M3 Pro, macOS 26.6.1,
+/// `docs/environments/macbook.md`) — closes #81. `--output` is a GNU
+/// extension BSD/macOS `df` does not have, so this drops it and leans on
+/// [`parse_bsd_avail_kb`] instead; `tests/m6_surfaces.rs`'s doctor
+/// `disk_pressure` checks and `scripts/coverage/common.sh`'s own
+/// (separately GNU-only, separately fixed) `df` call both exercised the real
+/// `df` binary on this host during the same trip.
 #[cfg(target_os = "macos")]
 fn raw_avail_kb(path: &Path) -> Option<u64> {
     let output = Command::new("df").arg("-k").arg(path).output().ok()?;
