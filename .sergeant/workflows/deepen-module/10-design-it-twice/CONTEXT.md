@@ -21,19 +21,39 @@ At least 3 independently generated, structurally different designs, each under a
 - **When exploring alternative interfaces for a chosen deepening candidate, run a parallel-sub-agent pattern that produces several radically different designs before picking one, on the premise that a single first idea is unlikely to be the best.**
   (trigger: a deepening candidate has been chosen and alternative interface shapes should be explored before committing; outcome: multiple independently-produced interface designs exist and are compared before one is chosen)
   — `BU-P4-022`, `reference/sergeant-upstream/.agents/skills/codebase-design/DESIGN-IT-TWICE.md` (L3)
-- **Before spawning parallel design sub-agents, first produce and show the user a framing of the problem space (constraints, dependency category, an illustrative sketch), then proceed immediately to spawning sub-agents without waiting for a reply.**
+- **Before spawning parallel design sub-agents, first produce and show the user a framing of the problem space (constraints, dependency category, an illustrative sketch), then proceed immediately to spawning sub-agents without waiting for a reply — this is an unconditional discipline stated with no hedge or case-by-case carve-out, not a local implementation choice.**
   (trigger: framing has been produced for a design-it-twice pass; outcome: the user is informed of the problem framing concurrently with sub-agent work starting, rather than gating on their reply)
-  — `BU-P4-023`, `reference/sergeant-upstream/.agents/skills/codebase-design/DESIGN-IT-TWICE.md` (Process step 1, L17)
+  — `BU-P4-023`, `reference/sergeant-upstream/.agents/skills/codebase-design/DESIGN-IT-TWICE.md` (Process step 1, L17). **Corrected 2026-08-16, ICM-R3**: this unit's J-rung was previously stated as J1 (local, reversible); the independent reviewer found that inconsistent with this same table's own J5 treatment of `BU-P4-020`/`021`'s equally unconditional, no-hedge testing directives, and noted that whether this stage gates on a live reply is exactly the evidence the package's own placement argument (PL-4/PL-5, not PL-2) depends on — not a cosmetic choice. Re-rung to **J5**.
 - **Produce at least three independently-generated, radically different interface designs for the same deepening candidate, each under an explicit distinguishing design constraint (e.g. minimal interface, maximal flexibility, optimize the common case, ports-and-adapters).**
   (trigger: the problem space has been framed for a design-it-twice pass; outcome: three or more genuinely distinct candidate interface designs exist for comparison)
   — `BU-P4-024`, `reference/sergeant-upstream/.agents/skills/codebase-design/DESIGN-IT-TWICE.md` (Process step 2, L21)
+- **Each sub-agent's design brief must include both the `codebase-design` technique vocabulary and the project's own domain vocabulary (from the project's own `CONTEXT.md`), so a generated design speaks the codebase's actual language rather than a generic one.**
+  (trigger: briefing a parallel design sub-agent; outcome: every sub-agent's brief carries both the technique's own vocabulary and the target project's domain vocabulary)
+  — `BU-P4-025`, `reference/sergeant-upstream/.agents/skills/codebase-design/DESIGN-IT-TWICE.md` (Process step 2, L30). **Added 2026-08-16, ICM-R3**: extracted at N1, classified workflow-local, never actually written into this stage's contract until now.
 - **Present the several generated interface designs to the user one at a time so each can be absorbed, then compare them explicitly by depth (leverage at the interface), locality (where change concentrates), and seam placement, ending with an opinionated recommendation (including a hybrid if warranted) rather than a menu.**
   (trigger: multiple candidate designs have been produced; outcome: the user receives a structured comparison and a concrete recommendation, not a raw dump of options)
   — `BU-P4-026`, `reference/sergeant-upstream/.agents/skills/codebase-design/DESIGN-IT-TWICE.md` (Process step 3, L42)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- How to explore alternative designs, which constraints to assign each sub-agent, and how many designs to produce beyond the minimum three (`BU-P4-022`, `BU-P4-024`).
+- How to compare the produced designs and what to recommend (`BU-P4-026`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J5 — governing constraints
+- **Framing must be shown to the user, then sub-agents spawn immediately without waiting for a reply** — unconditional, not a case-by-case gate (`BU-P4-023`).
+- **Every sub-agent brief must include both the technique vocabulary and the project's own domain vocabulary** (`BU-P4-025`).
+
+### Completion boundary
+This stage may complete only when at least three structurally distinct designs exist, each under an explicit constraint, presented sequentially and compared by depth/locality/seam placement, ending in an opinionated recommendation.
+
+### Decision evidence
+The generated designs and the final recommendation are this stage's own durable output.
 
 ## Output
 
