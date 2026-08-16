@@ -329,3 +329,63 @@ Rules:
    contract accepts it (`docs/gauntlet/contracts/N1.md` Non-goals; proposal
    §21.8's trigger conditions for workflow composition are one example of
    the bar a claim must eventually clear).
+
+## 6. Package-adjudication record (ICM-R)
+
+Canonical shape for the ICM-R library-reconciliation pass
+(`reference/proposal-icm-r-procedure-authority.md` §8.13,
+`docs/adr/0013-icm-r0-owner-rulings.md`). One record per package under
+review, produced by the reconciliation's producer step and checked by its
+independent reviewer step (§6.2/6.3 in `convention.md`) before Captain's
+own reconcile-and-publish pass.
+
+```markdown
+# Package adjudication: <name>
+
+## Original intention
+
+## Current trigger and outcome
+
+## Driver and admission boundary
+
+## Behavior-unit dispositions
+
+| Unit | Source | PL rung | J boundary | Disposition | Destination |
+|---|---|---:|---|---|---|
+
+## Surviving package design
+
+## Inputs and outputs
+
+## Review and promotion policy
+
+## Alternatives considered
+
+## Final disposition
+STAND | REHOME | SPLIT | HARVEST | ABSORBED | FOLD | RETIRE
+
+## Validation evidence
+```
+
+Rules:
+
+1. **Behavior units before package verdict.** The `Behavior-unit
+   dispositions` table is filled in before `Final disposition` is chosen —
+   a package's overall verdict is synthesized from its units' individual
+   PL/J classifications, never decided first and back-filled (§8.8 of the
+   proposal; the same discipline this repo's classification-record rule
+   already requires at behavior-unit granularity, §4 above, applied now at
+   package granularity too).
+2. **`PL rung` and `J boundary` cite the ladders directly** (e.g. `PL-4`,
+   `J2`) — not a paraphrase. A unit surviving in a skill, workflow, or
+   stage states its J5 constraints, consumed J4 decisions, settled J3
+   records, delegated J2 classes, remaining J1 choices, and what must land
+   at J0, per `bounded-judgment.md`'s own worked-example discipline.
+3. **`Disposition` uses the modifier vocabulary** (STAND, REHOME, SPLIT,
+   HARVEST, ABSORBED, FOLD, RETIRE — proposal §5.10), not free text.
+4. **A source file mapping one-to-one onto a new package is not evidence
+   of correctness** — the same file-shape-mirroring failure §5 above
+   already warns against at the behavior-unit level (N2's `sgt-recover`/
+   `sgt-respond`/`sgt-watch` tell) applies here too: synthesis clusters by
+   behavioral contract and durable outcome, not by which file a unit
+   happened to originate in.

@@ -1160,12 +1160,14 @@ The identifier ICM-R is provisional. Contracts may rename it during adjudication
 Outcome:
 
 • challenge the two ladders for missing surfaces, authority conflicts, and over-escalation;
-• adjudicate the owner decisions in §19;
+• surface the owner decisions in §19 for adjudication (§19 itself settles who rules on them — not this outcome line; corrected per docs/gauntlet/runs/icm-r0/adjudication.md, enactability F1);
 • amend this proposal;
 • record accepted definitions and hard boundaries;
 • write no product or library changes.
 
 No code changes.
+
+**Complete.** Graded by the ICM-R0 gauntlet (docs/gauntlet/contracts/ICM-R0.md, docs/gauntlet/runs/icm-r0/): validated with findings, both corrected here. All twelve §19 decisions ruled by the owner, recorded in docs/adr/0013-icm-r0-owner-rulings.md.
 
 10.2 ICM-R1 — Doctrine, templates, and pilot instruments
 
@@ -1193,6 +1195,10 @@ Recommended pilot:
 |`validate-and-ship`    |Complex durable workflow with explicit authority distinctions    |
 |`code-review`          |Independent review workflow and multi-stage evidence handoff     |
 |`repo-to-icm`          |The classifier/generator that must consume the new method itself |
+|`research`             |Added by owner ruling (docs/adr/0013-icm-r0-owner-rulings.md decision 8): evidenced directly by the ICM-R0 gauntlet's own B9 finding — a dispatched `research` Work navigated out of its assigned worktree instead of stopping to ask. Its own pilot pass gives it a real stage-level Bounded-judgment section, including a surface-boundary clause, as a direct test against an observed failure rather than a hypothetical one.|
+|`direct-implementation`|Added by owner ruling (decision 9): named in §19 decision 9's own question but absent from this table as originally drafted. All three of the most disruptive rehome hypotheses (`task-intake-and-route`, `sergeant-setup`, `direct-implementation`) are tested in the pilot together, not staged across two phases.|
+
+Nine packages (owner-amended from the original seven, docs/adr/0013).
 
 Outcome:
 
@@ -1210,8 +1216,9 @@ Subject:
 
 • all 23 published workflows;
 • all four current operator skills;
-• every shared context, helper, and delegation they depend on;
-• the built-in software-change workflow as a separate embedded package.
+• every shared context, helper, and delegation they depend on.
+
+**Excluded from this workstream** (owner ruling, docs/adr/0013-icm-r0-owner-rulings.md decision 3, resolving invariants F1): the built-in software-change workflow. It lives at src/workflows/software-change/, compiled via include_str! — reconciling it as originally drafted here would edit src/ during this workstream's own declared freeze (§13.1's Explicitly out of scope list, Acceptance Contract item 33). It gets its own later pass, once the freeze lifts. Owner direction, same session: it should also be renamed (candidate: default/fallback) to make its generic-engine-fallback role unambiguous — a separate, deferred task, not a reason to skip evaluating its content eventually.
 
 Run in bounded waves organized by package relationships, not alphabetical order. A delegation cluster is adjudicated together so names never point at deleted or rehomed identities.
 
@@ -1644,20 +1651,29 @@ Any implementation or migration decision not represented here is logged in the m
 
 19. Owner Decisions Required at ICM-R0
 
-This proposal recommends defaults but does not silently make these owner rulings:
+**Ruled 2026-08-16 in full, live interview with the owner. Full record:
+docs/adr/0013-icm-r0-owner-rulings.md. Summarized inline below; the ADR is
+the citable source, not this list.**
 
-1. Names: Are Placement Ladder (PL) and Bounded-Judgment Ladder (J) the accepted terms and identifiers?
-2. Skill taxonomy: Do Captain skills and actor skills share the current skills/ root with metadata distinguishing driver, or should the repository use separate subdirectories/catalog sections?
-3. Universal scope: Does “every skill and workflow must be validated” include embedded software-change, shared contexts, and helpers as first-class review subjects? This proposal recommends yes, with validation depth proportional to effect.
-4. Stage requirement: Must every actor stage carry a local ## Bounded judgment section, or may a stage with no local specialization explicitly declare “inherits workflow envelope unchanged”? This proposal recommends an explicit local section either way so omission is never ambiguous.
-5. Decision recording: Must every J2 decision be recorded, or only material J2 decisions? This proposal recommends material decisions only.
-6. Generated-output invariant: Is independent review required for all generated files or only artifacts that will be promoted, merged, published, installed, admitted, signed, released, or treated as settled? This proposal recommends the latter.
-7. Review independence: May a later stage in the same workflow qualify as independent when it has a fresh execution, explicit inputs, a review-only contract, and no edit authority? This proposal recommends yes.
-8. Pilot corpus: Is the seven-package pilot in §10.3 accepted or amended?
-9. Likely rehomes: May the pilot explicitly test the hypotheses for task-intake-and-route, direct-implementation, and sergeant-setup, or must those remain untouched until the general method is proven on less controversial packages?
-10. Runtime freeze: Is “no Rust/runtime changes through ICM-R4” a hard contract or a default that an urgent, independently proven engine gap may interrupt? This proposal recommends a hard contract for this workstream; urgent runtime defects remain separate work.
-11. Proposal placement: Should this file land under reference/ as a proposal, with a later docs/gauntlet/contracts/ICM-R0.md, following the existing house pattern?
-12. Review workflow names: Should generic future review procedures be organized by artifact class (review-document, review-pr, review-skill, review-workflow) or be derived only after the corpus shows which distinctions matter? This proposal recommends deriving them during synthesis rather than pre-creating four wrappers.
+1. Names: Are Placement Ladder (PL) and Bounded-Judgment Ladder (J) the accepted terms and identifiers? **Ruled: accepted as written.**
+2. Skill taxonomy: Do Captain skills and actor skills share the current skills/ root with metadata distinguishing driver, or should the repository use separate subdirectories/catalog sections? **Ruled: shared root, driver: front-matter metadata, no subdirectory split.**
+3. Universal scope: Does “every skill and workflow must be validated” include embedded software-change, shared contexts, and helpers as first-class review subjects? This proposal recommends yes, with validation depth proportional to effect. **Ruled: yes for shared contexts/helpers; software-change explicitly excluded from this workstream (see §10.4) — resolves invariants F1.**
+4. Stage requirement: Must every actor stage carry a local ## Bounded judgment section, or may a stage with no local specialization explicitly declare “inherits workflow envelope unchanged”? This proposal recommends an explicit local section either way so omission is never ambiguous. **Ruled: accepted as recommended.**
+5. Decision recording: Must every J2 decision be recorded, or only material J2 decisions? This proposal recommends material decisions only. **Ruled: accepted as recommended.**
+6. Generated-output invariant: Is independent review required for all generated files or only artifacts that will be promoted, merged, published, installed, admitted, signed, released, or treated as settled? This proposal recommends the latter. **Ruled: accepted as recommended.**
+7. Review independence: May a later stage in the same workflow qualify as independent when it has a fresh execution, explicit inputs, a review-only contract, and no edit authority? This proposal recommends yes. **Ruled: yes — resolves enactability F3.**
+8. Pilot corpus: Is the seven-package pilot in §10.3 accepted or amended? **Ruled: accepted, amended to nine — `research` added (evidenced by ICM-R0's own B9 finding).**
+9. Likely rehomes: May the pilot explicitly test the hypotheses for task-intake-and-route, direct-implementation, and sergeant-setup, or must those remain untouched until the general method is proven on less controversial packages? **Ruled: yes, test all three now — `direct-implementation` added to the pilot (named in this question but absent from §10.3 as originally drafted).**
+10. Runtime freeze: Is “no Rust/runtime changes through ICM-R4” a hard contract or a default that an urgent, independently proven engine gap may interrupt? This proposal recommends a hard contract for this workstream; urgent runtime defects remain separate work. **Ruled: hard contract — resolves enactability F4.**
+11. Proposal placement: Should this file land under reference/ as a proposal, with a later docs/gauntlet/contracts/ICM-R0.md, following the existing house pattern? **Ruled: yes — already executed and exercised by the ICM-R0 gauntlet itself.**
+12. Review workflow names: Should generic future review procedures be organized by artifact class (review-document, review-pr, review-skill, review-workflow) or be derived only after the corpus shows which distinctions matter? This proposal recommends deriving them during synthesis rather than pre-creating four wrappers. **Ruled: accepted as recommended — no pre-created wrappers.**
+
+**Framing carried forward, not a numbered decision:** the owner's closing
+note on this ruling was that the current 23-workflow/4-skill corpus is
+understood as reference material to reconcile against, not settled
+procedure — consistent with Findings ICMR-F5/F6. The sequence is:
+understand what capabilities and work-types actually exist and need
+procedure, then build the workflows/skills proper.
 
 ────────
 

@@ -17,6 +17,34 @@ authority boundaries.)
 **Representation:** `agents-invariant` (→ `AGENTS.md` or another stable
 repository instruction surface).
 
+## 6.1a — Does this procedure decide what Work should exist, or execute one already admitted?
+
+Added by `docs/adr/0013-icm-r0-owner-rulings.md` decision 1
+(`reference/proposal-icm-r-procedure-authority.md` §3.3, Finding ICMR-F3):
+§6.2's own question — "does it have a recognizable trigger, a bounded
+outcome, and a completion condition?" — is necessary for a workflow but
+not sufficient. A Captain skill can have all three too. This question must
+be asked and answered **before** §6.2, not skipped past the way §6.3 was
+historically skipped past §6.5 (the same failure mode, one rung earlier).
+
+**The discriminator:** if the procedure's job is to converse with the
+user, shape or revise intent, decide whether work stays direct or becomes
+a durable Work, select a workflow/repositories/profile/envelope, or
+interpret a result back to the user — it cannot itself require an
+already-existing Work merely to make that decision. It receives no
+admitted intent; it produces one.
+
+**Representation:** `captain-skill` (→ `skills/<name>/SKILL.md`, per the
+Placement Ladder's PL-2 — see `reference/proposal-icm-r-procedure-
+authority.md` §5.4 for the full rung and its worked examples) if the
+answer is "decides what Work should exist." Continue to §6.2 only if the
+answer is "executes an already-admitted intent."
+
+A unit that is a reusable reasoning or operating technique used *inside*
+either a Captain interaction or a workflow stage, without owning a
+complete durable Work lifecycle itself, is neither — see PL-3 (`actor
+skill`) in the Placement Ladder.
+
 ## 6.2 — Is it a reusable procedural outcome?
 
 Does it have a recognizable trigger, a bounded outcome, and a completion
