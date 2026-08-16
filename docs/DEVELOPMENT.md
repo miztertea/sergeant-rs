@@ -40,11 +40,11 @@ A local agent execution daemon (`sgt`): durable Work items run staged workflows 
 - **Work state ≠ process state.** A Claude "session" is a durable conversation identity; the OS process exists per turn. Restart reconciliation (`src/runtime/recovery.rs`) resumes only on unambiguous evidence; ambiguity fails closed into `blocked` with a reason, never a guess.
 - **Adjacent-append crash windows** are this architecture's recurring hazard (LESSONS L6): any path appending two causally-linked events must tolerate the second one missing or write one compound event. Check for this class in review of any journal-touching change.
 
-Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integration tests need the lib target). `src/domain/` = types, `src/runtime/` = journal/projections/engine/recovery/router/analytics/graph, `src/backend/` = the §15 `Backend` trait + claude/fake/docker (docker runs `kind = "execute"` workflow stages; codex is a doc-stub per D6), `src/platform/` = the ADR 0002 platform boundary (`#[cfg]`-selected modules, not a trait — disk/data_dir/process facts, each with an UNVERIFIED macOS arm), `src/{api,cli,tui,daemon,harness,telemetry,watch}.rs` = surfaces (the embedded dashboard, `src/web.rs`, is deleted — ADR 0011; `harness` is the `sgt <harness>` compose-and-exec boundary, ADR 0006).
+Layout: single crate, lib + thin `main.rs` (`src/lib.rs` declares modules; integration tests need the lib target). `src/domain/` = types, `src/runtime/` = journal/projections/engine/recovery/router/analytics/graph, `src/backend/` = the §15 `Backend` trait + claude/fake/docker (docker runs `kind = "execute"` workflow stages; codex is a doc-stub per D6), `src/platform/` = the ADR 0002 platform boundary (`#[cfg]`-selected modules, not a trait — disk/data_dir/process facts; macOS arms for disk/data_dir/process verified 2026-08-15, fs_locking still UNVERIFIED pending #85), `src/{api,cli,tui,daemon,harness,telemetry,watch}.rs` = surfaces (the embedded dashboard, `src/web.rs`, is deleted — ADR 0011; `harness` is the `sgt <harness>` compose-and-exec boundary, ADR 0006).
 
 ## Testing rules specific to this repo
 
-- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m10_harness.rs` (the count is a smoke check, not a budget — re-measure with `cargo test` rather than trusting any prose figure; coverage baseline convention: `docs/perf/baseline-mvp-2026-08-12.md`). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps by `/proc` argv scan on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
+- Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m10_harness.rs` (the count is a smoke check, not a budget — re-measure with `cargo test` rather than trusting any prose figure; coverage baseline convention: `docs/perf/baseline-mvp-2026-08-12.md`). Suites that spawn daemons MUST go through `tests/support/mod.rs`'s `DataDir` guard — the `sgt(...)` helpers take `&DataDir` so an unreaped auto-spawned daemon is a type error, and the guard reaps via `daemon_pids` (platform-correct: `/proc` on Linux, `ps` on macOS) on Drop. This exists because a measured leak accumulated ~89 orphan daemons in a day.
 - A fix without a test that fails when the fix is reverted is not done (LESSONS L7). Every advertised backend capability flag needs a contract test against the installed harness (L8).
 - The Claude adapter's behavior is *measured*, never assumed from docs — exit codes lie, `subtype` lies, model aliases silently substitute (L1). The version gate is pinned in `src/backend/claude.rs`; re-measure on any CLI version bump.
 - **Code is code (R-S0-12).** Any diff that changes executable behavior — `src/`, `tests/`, `scripts/`, CI config, workflow `.js` — takes the full multi-axis loop (panel, adversarial verify, fix, adjudication). Measurement-template exemptions cover only phases that write no code; a builder's self-probe is panel input, never a substitute (L13).
@@ -67,10 +67,22 @@ in `AGENTS.md` instead.
   never waives them. <!-- BU-0018, BU-0113 -->
 - Never push directly to a default branch; a session working here still goes
   through a branch and review like any other change. <!-- BU-0114 -->
-- A workflow stage or actor executing inside a worktree never invokes
+- **Superseded by ADR 0005 (2026-08-14), "Gating becomes a dispatched
+  Work" — read that ADR before relying on this bullet.** The rule below is
+  kept, not deleted, per L20's ruling that a document says what we knew when
+  it was written and a superseded rule stays legible rather than being
+  quietly edited away; it was never wrong when written; it predates the
+  engine being able to run work at all, so nothing contradicted it until
+  gating itself became dispatchable. What now governs: gating is a
+  dispatched Work like any other — it mints and owns its own isolated
+  surface, which is the same single-owner posture the original rule below
+  was protecting, so there is nothing left for an "actor never invokes the
+  gate" exception to guard against. Captain adjudicates a gate Work's
+  findings; Sgt executes the gate itself. Original text, historical:
+  *"A workflow stage or actor executing inside a worktree never invokes
   `scripts/gate.sh`/no-mistakes itself — only the top-level orchestrating
   session owns a shipping-gate run, matching the single-owner posture the
-  engine itself enforces on the data dir. <!-- BU-0041, BU-0122, BU-1196 -->
+  engine itself enforces on the data dir."* <!-- BU-0041, BU-0122, BU-1196 -->
 - A command's own `--help`, its emitted usage/error contract, and its tests
   are the authority over prose when they disagree; file an issue on the
   mismatch rather than trusting either doc silently. <!-- BU-0107 -->

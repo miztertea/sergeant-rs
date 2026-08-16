@@ -1765,7 +1765,20 @@ mod tests {
             std::fs::canonicalize(&found_root).ok(),
             std::fs::canonicalize(root).ok()
         );
-        assert_eq!(data_dir, Some(root.join("custom-data")));
+        // Canonicalized on both sides, same as `found_root` above: `root`
+        // (production) is already canonical (`find_estate_upward_bounded`
+        // canonicalizes `start` before walking up), but this test's own
+        // `root` local is `TempDir`'s raw path. On Linux those happen to be
+        // identical; on macOS `/var` is a symlink to `/private/var` (like
+        // `/tmp` -> `/private/tmp`), so the raw and canonical forms diverge
+        // and a direct comparison fails there (#127, first measured on the
+        // MacBook Pro M3 Pro arrival trip, 2026-08-15).
+        assert_eq!(
+            data_dir
+                .as_deref()
+                .and_then(|p| std::fs::canonicalize(p).ok()),
+            std::fs::canonicalize(root.join("custom-data")).ok()
+        );
     }
 
     // ---- R-MVP1-12: estate discovery past inner `.git` --------------------

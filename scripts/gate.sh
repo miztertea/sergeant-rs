@@ -88,10 +88,49 @@ start_daemon() {
 
 daemon_env_ok() {
   local pid="$1"
-  grep -qz CARGO_TARGET_DIR "/proc/$pid/environ" || return 1
-  if is_root; then
-    grep -qz IS_SANDBOX "/proc/$pid/environ" || return 1
+  # On Linux, /proc/<pid>/environ exposes the daemon's live environment to a
+  # same-user reader without special entitlements — use it when present.  This
+  # is the authoritative check for the hazard this function protects against:
+  # a supervisor (systemd) silently discarding env vars set on `daemon start`.
+  if [ -f "/proc/$pid/environ" ]; then
+    grep -qz CARGO_TARGET_DIR "/proc/$pid/environ" || return 1
+    if is_root; then
+      grep -qz IS_SANDBOX "/proc/$pid/environ" || return 1
+    fi
+    return 0
   fi
+  # /proc/<pid>/environ is absent.  Two distinct cases:
+  #
+  # (a) /proc IS mounted on this host (Linux) but the daemon's entry is gone:
+  #     the daemon died in the window between daemon_pid() reading the pid file
+  #     and this check.  Return 1 so the caller's restart block fires.
+  if [ -d /proc ]; then
+    return 1
+  fi
+  #
+  # (b) /proc does NOT exist at all (macOS and any other non-Linux host): the
+  #     OS does not expose another process's environment to same-user readers
+  #     without debugger-level entitlements — measured directly on macOS 26.6.1:
+  #     both `ps -E -p <pid>` and `ps eww -p <pid>` return empty for a
+  #     same-user child process (#130).
+  #
+  # The hazard this check guards against is a *supervisor* (systemd) stripping
+  # env vars before the daemon sees them.  On hosts where systemd manages the
+  # daemon, we cannot safely waive the check — that is exactly the failure
+  # mode — so fail explicitly with a diagnostic rather than silently returning
+  # success.  On hosts without a systemd unit the daemon forks directly and
+  # inherits the invoking shell's environment, which this script has already
+  # configured (the `export CARGO_TARGET_DIR=…` at the top and the explicit
+  # inline `CARGO_TARGET_DIR=…` prefix in start_daemon()).  Trust inheritance
+  # there; no platform-independent verification is possible or needed.
+  local unit
+  unit="$(systemd_unit)"
+  if [ -n "$unit" ]; then
+    echo "gate.sh: cannot verify daemon env on this host (no /proc, systemd unit '$unit' present) — env verification is required when a supervisor manages the daemon; confirm CARGO_TARGET_DIR is visible via \`systemctl --user show-environment\` before running the gate" >&2
+    return 1
+  fi
+  # Direct-fork, no /proc — env inherited from this script's own shell, which
+  # already exports CARGO_TARGET_DIR (and IS_SANDBOX when root).  Return 0.
   return 0
 }
 

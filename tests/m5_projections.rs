@@ -2490,7 +2490,22 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
     assert_eq!(repositories.len(), 1);
     let repo_out = &repositories[0];
     assert_eq!(repo_out["repository"], "solo");
-    assert_eq!(repo_out["source_repo"], repo.display().to_string());
+    // Canonicalized on both sides: production reports the canonical path (the
+    // surface machinery resolves symlinks when it records source_repo), and
+    // on macOS the test's own raw TempDir path differs from its canonical
+    // form (`/var` is a symlink to `/private/var`, same family as
+    // `/tmp` -> `/private/tmp`) — first measured on the MacBook Pro M3 Pro
+    // arrival trip, 2026-08-15, same root cause as
+    // `domain::workspace::tests::estate_data_dir_is_found_even_when_the_rest_of_the_manifest_is_structurally_broken`.
+    assert_eq!(
+        std::fs::canonicalize(
+            repo_out["source_repo"]
+                .as_str()
+                .expect("source_repo string")
+        )
+        .ok(),
+        std::fs::canonicalize(&repo).ok()
+    );
     assert_eq!(repo_out["retained_branch"], format!("sergeant/{work_id}"));
     assert_eq!(repo_out["disposition"], "removed");
     // Nothing was ever committed inside the worktree, so the finalize commit

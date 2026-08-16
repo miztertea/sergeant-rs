@@ -3,6 +3,10 @@
 //!
 //! Startup order is the safety argument:
 //!
+//! 0. refuse outright if the data dir's filesystem is one where advisory
+//!    locking is unreliable (#85, ADR 0003 D6) — the lock taken in step 1
+//!    would not actually exclude a second daemon there, and that failure is
+//!    silent until two daemons are racing the same data dir;
 //! 1. take the exclusive daemon lock in the data dir (second daemon fails
 //!    closed before touching anything);
 //! 2. open the journal (which holds its own exclusive lock — belt and
@@ -36,6 +40,7 @@ use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
 use crate::domain::event::{EventDraft, EventSource};
+use crate::platform::fs_locking::{self, Reliability};
 use crate::runtime::analytics::{Analytics, AnalyticsError};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
@@ -110,6 +115,21 @@ pub enum DaemonError {
     /// Another live daemon holds this data dir's exclusive lock.
     #[error("another daemon already owns this data dir (daemon.lock is held)")]
     Locked,
+    /// #85, ADR 0003 D6: the data dir sits on a filesystem where advisory
+    /// locking (`flock`) is unreliable, so the exclusive lock above cannot be
+    /// trusted to actually exclude a second daemon. Refused before the lock
+    /// is even attempted, never merely warned about.
+    #[error(
+        "{data_dir} sits on a {filesystem} filesystem, where advisory locking is unreliable; refusing to start there — {remedy}"
+    )]
+    UnreliableFilesystem {
+        /// The data dir that was refused.
+        data_dir: PathBuf,
+        /// The offending filesystem type, as the mount table names it.
+        filesystem: String,
+        /// What to do about it.
+        remedy: String,
+    },
     /// Journal failure (open, replay, or append).
     #[error(transparent)]
     Journal(#[from] JournalError),
@@ -265,6 +285,23 @@ pub async fn start(data_dir: &Path) -> Result<DaemonHandle, DaemonError> {
     start_with(data_dir, DaemonConfig::default()).await
 }
 
+/// #85, ADR 0003 D6: turn a filesystem-reliability verdict into the daemon's
+/// refusal, or lack of one. Split out from the call to
+/// [`fs_locking::detect_for_path`] itself so this decision — refuse only on
+/// a *confirmed* bad filesystem, never on an inconclusive probe — is
+/// testable without a real `drvfs`/NFS/SMB mount anywhere in the test
+/// sandbox (`platform::fs_locking`'s own tests cover the detection half).
+fn refuse_if_unreliable(data_dir: &Path, reliability: Reliability) -> Result<(), DaemonError> {
+    match reliability {
+        Reliability::Unreliable { filesystem } => Err(DaemonError::UnreliableFilesystem {
+            data_dir: data_dir.to_path_buf(),
+            remedy: fs_locking::remedy(&filesystem),
+            filesystem,
+        }),
+        Reliability::Reliable | Reliability::Unknown { .. } => Ok(()),
+    }
+}
+
 /// Start the daemon on `data_dir`. Returns once it is serving and the
 /// runtime descriptor is published.
 pub async fn start_with(
@@ -272,6 +309,14 @@ pub async fn start_with(
     config: DaemonConfig,
 ) -> Result<DaemonHandle, DaemonError> {
     create_dir_all_durable(data_dir)?;
+
+    // 0. #85 / ADR 0003 D6: refuse outright on a filesystem where advisory
+    // locking is unreliable — before the lock below is even attempted, since
+    // a lock that silently does not hold fails in a way nobody notices until
+    // two daemons are racing the same data dir. An inconclusive probe (e.g.
+    // today's always-Unknown macOS arm) does not refuse — see
+    // `refuse_if_unreliable`.
+    refuse_if_unreliable(data_dir, fs_locking::detect_for_path(data_dir))?;
 
     // 1. Exclusive daemon lock: a second daemon on the same data dir fails
     // closed here, before touching journal or descriptor. The OS releases
@@ -1329,5 +1374,58 @@ mod tests {
              queue, and the export never happened: {finished:?}"
         );
         assert_eq!(finished[0].name, "work");
+    }
+
+    /// #85, ADR 0003 D6: `start_with`'s pre-lock refusal, tested at the seam
+    /// that does not need a real `drvfs`/NFS/SMB mount — `refuse_if_unreliable`
+    /// takes an already-computed [`Reliability`] rather than calling
+    /// `fs_locking::detect_for_path` itself. Reverting the `Unreliable` match
+    /// arm to also return `Ok(())` (i.e. dropping the refusal) fails this
+    /// immediately.
+    #[test]
+    fn refuse_if_unreliable_blocks_on_a_confirmed_bad_filesystem() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let err = refuse_if_unreliable(
+            dir.path(),
+            Reliability::Unreliable {
+                filesystem: "drvfs".to_string(),
+            },
+        )
+        .expect_err("a confirmed-bad filesystem must be refused");
+        match err {
+            DaemonError::UnreliableFilesystem {
+                data_dir,
+                filesystem,
+                remedy,
+            } => {
+                assert_eq!(data_dir, dir.path());
+                assert_eq!(filesystem, "drvfs");
+                assert!(
+                    remedy.contains("drvfs"),
+                    "the remedy must name the offending filesystem: {remedy}"
+                );
+            }
+            other => panic!("expected UnreliableFilesystem, got {other:?}"),
+        }
+    }
+
+    /// The other half of the asymmetry: neither an ordinary filesystem nor an
+    /// inconclusive probe may refuse. Collapsing `Unknown` into the refusal
+    /// arm would brick daemon start on the very platform (macOS, today)
+    /// whose detection is unmeasured — this fails the moment that happens.
+    #[test]
+    fn refuse_if_unreliable_allows_reliable_and_unknown() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        assert!(refuse_if_unreliable(dir.path(), Reliability::Reliable).is_ok());
+        assert!(
+            refuse_if_unreliable(
+                dir.path(),
+                Reliability::Unknown {
+                    reason: "cannot be measured on this platform".to_string(),
+                },
+            )
+            .is_ok(),
+            "an inconclusive probe must never refuse"
+        );
     }
 }

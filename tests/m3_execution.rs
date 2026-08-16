@@ -2003,6 +2003,19 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
 
     handle.shutdown().await;
 
+    // Capture the first execution ID and its OBSERVE count now — after the
+    // first daemon's completion driver has stopped, before the second daemon's
+    // reconciliation runs.  The 200 ms completion-driver interval can fire any
+    // number of times during the first daemon's lifetime (a timing fact that
+    // varies by host and scheduler); pinning the *delta* rather than the total
+    // makes the assertion below robust against those extra pre-restart polls.
+    let first_execution = durable.starts()[0].execution_id.clone();
+    let obs_before_reconcile = durable
+        .observations()
+        .iter()
+        .filter(|id| **id == first_execution)
+        .count();
+
     // While the daemon was down, the surviving session finished its stage.
     durable.complete_live_executions();
 
@@ -2082,21 +2095,21 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
 
     // Reconciliation asked the surviving session what it was doing exactly
     // once, and the resumed run acted on *that* answer rather than asking a
-    // second time — two OBSERVEs are not guaranteed to agree, and the run
-    // would then be driven from an answer no decision was made on. The
-    // survivor's first execution was observed once while it was running,
-    // before the restart, and once by reconciliation: a third would be the
-    // duplicate this pins against.
-    let first_execution = durable.starts()[0].execution_id.clone();
-    let observes = durable
+    // second time — two OBSERVEs are not guaranteed to agree, and driving
+    // from a second would mean acting on an answer no recorded decision was
+    // made on.  The diff `obs_after_reconcile - obs_before_reconcile` isolates
+    // exactly what reconciliation contributed, independent of how many times
+    // the first daemon's completion driver polled `first_execution`.
+    let obs_after_reconcile = durable
         .observations()
         .iter()
         .filter(|id| **id == first_execution)
         .count();
     assert_eq!(
-        observes,
-        2,
-        "one OBSERVE before the restart, one to reconcile: got {:?}",
+        obs_after_reconcile - obs_before_reconcile,
+        1,
+        "reconciliation must observe the survivor's first execution exactly once \
+         (not zero, not twice): got {:?}",
         durable.observations()
     );
 
@@ -2333,9 +2346,128 @@ async fn a_dirty_worktree_is_retained_and_recorded_at_teardown() {
             .contains("half-done.rs"),
         "the evidence must name what was found: {report}"
     );
+    // #109: the dirty *state* survives teardown, never the directory it
+    // happened to live in — the worktree itself is reclaimed once its
+    // content is captured as a patch.
     assert!(
-        worktree.join("half-done.rs").is_file(),
-        "a dirty worktree must survive teardown"
+        !worktree.exists(),
+        "#109: the reclaimed worktree directory must be gone"
+    );
+    let patch_path = PathBuf::from(
+        report["bindings"][0]["patch"]["path"]
+            .as_str()
+            .expect("a captured patch path"),
+    );
+    let patch_text = std::fs::read_to_string(&patch_path).expect("read the captured patch");
+    assert!(
+        patch_text.contains("half-done.rs") && patch_text.contains("fn main()"),
+        "the captured patch must hold what the dirty worktree actually had: {patch_text}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// #109's inspect and dispose verbs, end to end through the real API: a
+/// dirty worktree's teardown shows up in `GET /v1/retained`; `POST
+/// /v1/work/{id}/reap` refuses without confirmation and destroys the
+/// captured patch once confirmed; and the entry is gone from `/v1/retained`
+/// afterward. Reverting either handler (dropping the confirm gate, or
+/// `surface::reap` itself) fails a different assertion here.
+#[tokio::test]
+async fn retained_lists_a_dirty_teardown_and_reap_disposes_of_it_only_when_confirmed() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "leaves a mess for #109",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+    std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty the worktree");
+
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // The inspect verb finds it.
+    let retained = get(&client, &handle, "/v1/retained").await;
+    let entries = retained["retained"].as_array().expect("retained array");
+    let entry = entries
+        .iter()
+        .find(|e| e["work_id"] == work_id)
+        .expect("the dirty binding is listed");
+    assert_eq!(entry["repository"], "solo");
+    assert_eq!(entry["disposition"], "retained_dirty");
+    let bytes = entry["bytes"].as_u64().expect("bytes");
+    assert!(bytes > 0, "a real patch has a nonzero size: {entry}");
+    let patch_path = PathBuf::from(entry["path"].as_str().expect("patch path"));
+    assert!(
+        patch_path.is_file(),
+        "the patch the inspect verb names must actually exist"
+    );
+
+    // Reap refuses without confirmation, and destroys nothing.
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/reap"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        patch_path.is_file(),
+        "an unconfirmed reap must not touch anything"
+    );
+
+    // Confirmed, it actually reaps.
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/reap"),
+        json!({"command_id": ulid(), "confirm": true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["report"]["bindings"][0]["outcome"]["outcome"], "reaped",
+        "{body}"
+    );
+    assert_eq!(
+        body["report"]["bindings"][0]["outcome"]["bytes"], bytes,
+        "the freed size must match what was actually there: {body}"
+    );
+    assert!(!patch_path.exists(), "reap must actually delete the patch");
+
+    // And it is gone from the inspect view.
+    let retained_after = get(&client, &handle, "/v1/retained").await;
+    assert!(
+        retained_after["retained"]
+            .as_array()
+            .expect("retained array")
+            .iter()
+            .all(|e| e["work_id"] != work_id),
+        "a reaped binding must not still be listed: {retained_after}"
     );
 
     handle.shutdown().await;
@@ -2416,9 +2548,11 @@ async fn a_stranded_completion_is_not_reported_as_plain_completed() {
         body["output"]["repositories"][0]["disposition"], "retained_dirty",
         "{body}"
     );
+    // #109: the dirty state survives teardown as a captured patch, not the
+    // worktree directory itself.
     assert!(
-        worktree.join("half-done.rs").is_file(),
-        "a dirty worktree must survive teardown: {body}"
+        !worktree.exists(),
+        "#109: the reclaimed worktree directory must be gone: {body}"
     );
 
     // The one thing an operator reads first must not say plain `completed`.

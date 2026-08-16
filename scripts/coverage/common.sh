@@ -69,8 +69,29 @@ cov_fail() {
 # the whole report down with it (measured: one unmergeable profraw makes
 # `cargo llvm-cov report` exit 1 with "no profile can be merged").
 cov_preflight_disk() {
-  local free
-  free="$(df -BG --output=avail "$COV_ROOT" | tail -1 | tr -dc '0-9')"
+  local free_kb free
+  # `-BG --output=avail` is GNU coreutils only ("invalid option -- B" on
+  # BSD/macOS df) — the exact same fact #81 already measured and fixed for
+  # `src/platform/disk.rs`, but this script has its own separate df call that
+  # fix never touched (first measured on the MacBook Pro M3 Pro arrival trip,
+  # 2026-08-15). Mirrors that fix's shape: GNU's `--output=avail` (one
+  # column, no header) tried first, falling back to POSIX `-k` plus a
+  # positional lookup of the "Available" header BSD/macOS df names instead.
+  # `|| true` on the attempt itself: under `set -euo pipefail`, `df`'s own
+  # nonzero exit on an unrecognized flag would otherwise abort the script
+  # right here (df's BSD usage-error status, 64, propagating as the whole
+  # script's exit code) before ever reaching the fallback below — measured
+  # the hard way on this same trip: the first version of this fix still
+  # hardcoded `--output=avail` in this branch and silently killed every
+  # stage before `cov_stage_begin` finished.
+  free_kb="$(df -k --output=avail "$COV_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')" || true
+  if [ -z "$free_kb" ]; then
+    free_kb="$(df -k "$COV_ROOT" | awk '
+      NR == 1 { for (i = 1; i <= NF; i++) if (tolower($i) == "available") col = i }
+      NR == 2 { print $col }
+    ')"
+  fi
+  free="$((${free_kb:-0} / 1024 / 1024))"
   cov_say "disk: ${free} GB free (floor ${COV_MIN_FREE_GB} GB)"
   if [ "${free:-0}" -lt "$COV_MIN_FREE_GB" ]; then
     cov_fail "only ${free} GB free at $COV_ROOT; the floor is ${COV_MIN_FREE_GB} GB (R-S0-6)"
@@ -110,7 +131,13 @@ cov_profraw_list() {
   # yet, and `find` on a missing directory is a nonzero exit that `set -e`
   # would turn into a stage failure. An empty list is the right answer.
   [ -d "$COV_TARGET_DIR" ] || return 0
-  find "$COV_TARGET_DIR" -maxdepth 1 -name '*.profraw' -printf '%f\n' 2>/dev/null | sort
+  # `-printf` is a GNU findutils extension — BSD/macOS find refuses it
+  # outright ("unknown primary or operator"), which aborted every stage
+  # before it ever reached `cov_stage_end` (first measured on the MacBook
+  # Pro M3 Pro arrival trip, 2026-08-15, via `the_coverage_harness_grades_its_own_accounting`).
+  # `-exec basename {} \;` is the POSIX-portable equivalent, supported by
+  # both GNU and BSD find.
+  find "$COV_TARGET_DIR" -maxdepth 1 -name '*.profraw' -exec basename {} \; 2>/dev/null | sort
 }
 
 # Is one profraw readable by the toolchain's own llvm-profdata? This is the

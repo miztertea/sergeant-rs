@@ -17,9 +17,9 @@
 //! they run the binary, so a new test cannot quietly opt out of it: pointing
 //! `sgt` at a bare `TempDir` no longer type-checks.
 //!
-//! Kept deliberately dependency-free (`kill(1)` and `/proc`, both of which
-//! these suites already use) — a test rig is not a place to spend the
-//! milestone's dependency budget.
+//! Kept deliberately dependency-free (`kill(1)` and `src/platform/process.rs`'s
+//! `running_processes`, which these suites already use) — a test rig is not a
+//! place to spend the milestone's dependency budget.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -102,6 +102,105 @@ pub(crate) fn disk_backed_tmp_base() -> Option<PathBuf> {
     var_tmp.is_dir().then(|| var_tmp.join("sgt-rs-tests"))
 }
 
+/// Marker `[DataDir::new]` writes into every rig it creates, naming the pid
+/// of the process that owns it.
+///
+/// #113: a suite process that gets `SIGKILL`ed mid-run (the R-MVP1-7
+/// ceiling, or the harness killing a backgrounded `cargo test`) never runs
+/// `Drop` — no destructor of any kind reaches a rig left behind that way, so
+/// this marker plus [`reap_orphaned_rigs`] is the mechanism that does,
+/// checked at the start of the *next* run rather than relied on from the
+/// dead one.
+pub(crate) const RIG_OWNER_PID_FILE: &str = ".owner-pid";
+
+fn write_owner_pid(dir: &Path) {
+    let _ = std::fs::write(dir.join(RIG_OWNER_PID_FILE), std::process::id().to_string());
+}
+
+/// Whether `pid` is currently a live process, decided the same
+/// platform-correct way the product itself decides it — never a bare
+/// `/proc` read.
+///
+/// **W7 (#113 platform-correctness fixer).** This function used to read
+/// `Path::new("/proc").join(pid.to_string()).is_dir()` directly, with no
+/// `cfg` guard at all. macOS has no `/proc`, so on macOS that check is
+/// `false` for *every* pid, including live ones, and
+/// [`reap_orphaned_rigs`] would then delete the rig of a run that is still
+/// using it — exactly the "reaping a live run's state would be a worse
+/// defect than the leak this closes" failure that function's own doc
+/// comment calls out.
+///
+/// Ponytail rung **R1** (reuse existing machinery, not a new one):
+/// [`platform::process::process_alive`](sergeant_rs::platform::process::process_alive)
+/// (`src/platform/process.rs`) already solves this identical fact behind
+/// the ADR 0002 platform boundary — `#[cfg(target_os = "linux")]` reads
+/// `/proc` exactly as this function used to, `#[cfg(target_os = "macos")]`
+/// shells to `kill -0` (marked **UNVERIFIED** there — never run on a real
+/// macOS host; verified by running `src/platform/process.rs`'s suite, and
+/// this reaper's own suite, on one), and it is `pub`, so this integration
+/// test can reach it directly. Its own fail-closed direction — assume
+/// alive, never conclude a pid is gone, on a platform this cannot evidence
+/// — is exactly the direction this reaper needs, for free. **R7 (a second,
+/// locally `cfg`-gated copy) was considered and rejected**: duplicating the
+/// macOS arm here would be a second UNVERIFIED implementation to keep in
+/// sync with `process.rs`'s own — the reinvention this sprint's own review
+/// exists to catch (`LESSONS.md` L18; this is the third instance of it in
+/// this sprint alone). The module doc's "dependency-free" pledge above is
+/// about spending this crate's *external* dependency budget; reusing this
+/// crate's own already-public platform module is not that.
+fn pid_is_alive(pid: u32) -> bool {
+    sergeant_rs::platform::process::process_alive(pid)
+}
+
+/// Reap rig directories directly under `base` whose owning process is no
+/// longer alive, returning the paths removed.
+///
+/// This is the start-of-run reaper #113 asks for, not another `Drop` guard —
+/// `Drop` is structurally incapable of running for a `SIGKILL`ed process, so
+/// the only cleanup that survives the way these processes actually die is
+/// one that runs when the *next* run starts. [`DataDir::new`] calls this
+/// before creating its own rig, so it sweeps up whatever the last run left.
+///
+/// A directory with no readable [`RIG_OWNER_PID_FILE`] marker (predates this
+/// fix, or is mid-write) is left alone rather than guessed about, and so is
+/// one whose marker names a pid still present in `/proc` — that second check
+/// is what makes this safe to call from a suite running concurrently with
+/// others sharing the same base directory: reaping a live run's state would
+/// be a worse defect than the leak this closes.
+///
+/// Ponytail rung **R7** (new machinery): R2 (reuse `DataDir`'s existing
+/// `Drop`-based daemon reaper) fails outright — `Drop` cannot run for a
+/// `SIGKILL`ed process, which is the whole premise of #113. R4 (a bare
+/// `/proc` liveness check) is necessary but not sufficient alone; it supplies
+/// no reap-at-start trigger without the marker file pairing it to a rig. R5
+/// doesn't apply — this stays dependency-free per the module doc above. The
+/// marker-plus-scan pair is the minimum that works.
+pub(crate) fn reap_orphaned_rigs(base: &Path) -> Vec<PathBuf> {
+    let mut reaped = Vec::new();
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return reaped;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(path.join(RIG_OWNER_PID_FILE)) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            reaped.push(path);
+        }
+    }
+    reaped
+}
+
 /// A temporary sergeant data dir that reaps the daemons running on it.
 ///
 /// Construct one wherever a test points the `sgt` binary at a data dir: any
@@ -135,9 +234,13 @@ impl DataDir {
             };
         };
         std::fs::create_dir_all(&base).expect("create disk-backed test tmp base dir");
-        Self {
-            temp: tempfile::Builder::new().tempdir_in(&base).expect("tempdir"),
-        }
+        // #113: sweep up whatever a prior, SIGKILLed run left behind before
+        // adding this run's own rig — the only cleanup point that survives
+        // how those processes actually die.
+        reap_orphaned_rigs(&base);
+        let temp = tempfile::Builder::new().tempdir_in(&base).expect("tempdir");
+        write_owner_pid(temp.path());
+        Self { temp }
     }
 
     /// The path to hand to `--data-dir`.
@@ -190,42 +293,46 @@ impl Drop for DataDir {
     }
 }
 
-/// The pids of `sgt … --data-dir <dir> … daemon` processes, from `/proc`.
+/// The pids of `sgt … --data-dir <dir> … daemon` processes.
 ///
 /// Matched on argv, not on a substring of the joined command line: the data
 /// dir has to be the actual value of `--data-dir`, and `daemon` an actual
 /// argument, so a test *client* command that merely mentions the path (or a
 /// grep of this very file) is not mistaken for a daemon.
+///
+/// **First-contact macOS fix (path-to-mac.md trip, 2026-08-15).** This used
+/// to read `/proc` directly with no `cfg` guard at all — on macOS
+/// `std::fs::read_dir("/proc")` simply errors, so this silently returned an
+/// empty `Vec` for every call, on every host, including ones with a live
+/// daemon: `DataDir::Drop`'s survivor assertion never fires (masking a real
+/// leak), and any test asserting a specific spawned count (e.g.
+/// `the_data_dir_guard_reaps_the_daemon_a_client_command_spawns`) sees `[]`
+/// and fails. Same Ponytail **R1** reuse [`pid_is_alive`] above already
+/// applies: [`sergeant_rs::platform::process::running_processes`]
+/// (`src/platform/process.rs`) is the same pid+argv fact behind the ADR 0002
+/// platform boundary, `#[cfg]`-correct on both Linux (`/proc`) and macOS
+/// (`ps -axo pid=,command=`) — reusing it here rather than adding a second,
+/// locally `cfg`-gated copy is the same R7-rejection reasoning `pid_is_alive`
+/// already argues.
 pub fn daemon_pids(data_dir: &Path) -> Vec<u32> {
     let wanted = data_dir.to_string_lossy().to_string();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Some(processes) = sergeant_rs::platform::process::running_processes() else {
         return Vec::new();
     };
     let mut pids = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let argv: Vec<String> = String::from_utf8_lossy(&raw)
-            .split('\0')
-            .filter(|arg| !arg.is_empty())
-            .map(str::to_string)
-            .collect();
-        let Some(program) = argv.first() else {
+    for process in processes {
+        let Some(program) = process.argv.first() else {
             continue;
         };
         let is_sgt = PathBuf::from(program)
             .file_name()
             .is_some_and(|name| name == "sgt");
-        let names_dir = argv
+        let names_dir = process
+            .argv
             .windows(2)
             .any(|pair| pair[0] == "--data-dir" && pair[1] == wanted);
-        if is_sgt && names_dir && argv.iter().any(|arg| arg == "daemon") {
-            pids.push(pid);
+        if is_sgt && names_dir && process.argv.iter().any(|arg| arg == "daemon") {
+            pids.push(process.pid);
         }
     }
     pids.sort_unstable();

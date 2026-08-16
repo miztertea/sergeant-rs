@@ -131,6 +131,158 @@ dispatched as its own `sgt` Work rather than hand-edited by this
 adjudication, so it receives the same review stage every other piece of
 this unit did.
 
+### MACBOOK-ARRIVAL-1 — 2026-08-15, a plan graded before it governed: validated with findings, no section sent back
+
+**Mission outcome: validated with findings.** Artifact:
+`docs/gauntlet/runs/macbook-arrival-2026-08-15/plan.md` — a three-Work sprint
+(WA/WB/WC) plus a dependent gate Work (WD), closing out the three genuinely
+open findings from the MacBook arrival trip (#128, #129, #130). Authored
+in-session after the owner ruled the session's own prior conduct that trip
+**draft evidence, not delivered process**: no plan filed, no workflow named,
+no dispatched Work tracking the effort, and the shipping gate hand-driven in
+direct contradiction of ADR 0005. This unit is the correction. Contract:
+`docs/gauntlet/contracts/MACBOOK-ARRIVAL-1.md`. Full record in
+`docs/gauntlet/runs/macbook-arrival-2026-08-15/` (`critics/`, `refuters/`,
+`adjudication.md`).
+
+**Verdicts.** 13 findings across four axes: 11 confirmed, 0 outright
+refutations, 2 partial refutations (each narrowing a WARNING to INFO by
+disproving the feared mechanism while confirming a real, narrower one in its
+place).
+
+| Axis | Findings | Refuted | Confirmed | Moves |
+|---|---|---|---|---|
+| fidelity | 5 (1 + 4 PLAUSIBLE) | 0 | 5 | none |
+| assumptions | 2 | 0 | 2 | none |
+| enactability | 3 | 1 (structural arm) | 3, one narrowed | 1 down |
+| invariants | 3 | 1 (structural arm) | 3, one narrowed | 1 down |
+
+**Three axes converged on one citation, independently.** Fidelity,
+enactability, and invariants each separately found the plan's R6 misattributed
+a stage-30 citation to stage 20. The invariants refuter went one step further
+and found the citation also named the wrong *tool* — an unrelated upstream
+script (`sgt-validate`) that `validate-and-ship`'s actual stages never invoke.
+The real, narrower, surviving risk: `no-mistakes axi run --skip` is a real
+flag with no mechanical guard against it, an executor-honesty risk rather
+than a default-path trap — both refuters landed on the same downgrade
+independently.
+
+**A plan-review panel this small still earned its full four axes** (this
+unit's own contract Unknown #2, quoting the "small diffs batch into the next
+larger panel" economy revision's own text: *"the review still happens; the
+ceremony doesn't multiply"* — misapplied by the orchestrator mid-session as
+grounds to skip review outright, corrected before dispatch). Third
+plan-shaped unit on this repo (`FOUNDATION-1`, `PATH-TO-MAC-1` precede it);
+third all-Sonnet panel, second data point with a Sonnet-5 (not Fable)
+orchestrator.
+
+**Environmental behavior.** 8 dispatched Works (4 blind critics, 4 batched
+refuters), all `--workflow research`, all `completed` on first attempt, zero
+`needs_input`, zero failures. Every "completed" claim independently verified
+against `git log`/`git diff --stat` on the Work's own branch before being
+trusted — none accepted on the Work's self-report alone. Estate-wide
+`sgt --json watch --follow`, armed via the harness's `Monitor` tool rather
+than a bare backgrounded shell command specifically because the prior
+sprint's own retrospective records that exact failure mode (backgrounded
+`sgt watch` killed at ~160s). This estate had never been set up on this host
+before this unit — `sgt repo add` + a branch-pointed clone were this unit's
+own Wave 0, a first-contact step the prior sprint's plan didn't need.
+
+### PATH-TO-MAC-1 — 2026-08-15, a plan graded before it governed: two sections sent back, premise disproved
+
+**Mission outcome: sent back on §4/§5, validated with findings elsewhere.** The
+first unit in this ledger to reach *sent back* on any section. Artifact:
+`docs/gauntlet/runs/path-to-mac-2026-08-15/plan.md` at `d86885f` — a six-Work
+sprint plan, authored in one pass by the orchestrating session from an owner
+interview, with no prior review. Contract:
+`docs/gauntlet/contracts/PATH-TO-MAC-1.md`. Full record in that run directory
+(`critics/`, `refuters/`, `adjudication.md`).
+
+FOUNDATION-1's own test is why this is *sent back* rather than *validated with
+findings*: that unit's outcome held because every finding's verdict was that its
+section survived a local correction. Not true here. §4 and §5 rested on the
+premise that #18, #81 and #82 needed building. **All three were already built** —
+complete, dual-platform, unit-tested implementations shipping in the binary,
+each blocked only on a macOS host to flip an `UNVERIFIED` marker
+(`src/platform/{process,disk,data_dir}.rs`, landed in `4eadc50`). No local
+correction repairs a section whose subject does not exist. Only #85 was
+genuinely unbuilt.
+
+**Root cause is L18, and it recurred within the same sprint.** The plan was
+derived from the issue tracker and the authoring session's memory of it, never
+from the current `src/platform/`. Then wave 1 found **#94 already fixed too**
+(ADR 0007's `stranded_completion`/`reported_state` shipping `completed_dirty`,
+commits `90b8c23`/`1c27a54`, both ancestors) — and `completed_dirty` had been
+printed by the **first `sgt status` of the session**. The panel caught the
+platform case only because the brief happened to ask about that module; nothing
+asked about #94. **Consequence for method: "does the product already do this?"
+must be a mechanical planning step with a named artifact to check, not a
+question someone thinks to ask.** L18 already says the comparison list is
+re-derived from the product every pass; what it lacked was a trigger.
+
+**Verdicts.** 22 findings across four axes: 18 confirmed, 6 PLAUSIBLE, 1 central
+claim refuted, 2 sub-claims refuted inside otherwise-confirmed findings, 5
+severity moves (2 up, 2 down, 1 non-finding upgraded to a finding).
+
+| Axis | Findings | Refuted | Confirmed | Moves |
+|---|---|---|---|---|
+| fidelity | 4 | 0 outright (1 partial) | 3 + 1 PLAUSIBLE | reasoning downgraded |
+| invariants | 4 | 1 sub-claim | 2 + 2 PLAUSIBLE | none |
+| enactability | 6 | 0 | 6 | 1 upgrade |
+| assumptions | 8 | 1 central | 7 + 3 PLAUSIBLE | 1 down, 2 up |
+
+**The false absence is the method finding.** Two blind seats independently
+reported a quoted objection as *invented*, both from greps scoped to `docs/`,
+`reference/`, `GAUNTLET.md`, `LESSONS.md` — excluding `src/`, where it lives
+verbatim. The fidelity refuter re-ran the critic's own stated command, got three
+hits where the critic reported one, and traced the phrase into
+`src/backend/docker.rs`'s git history. **Both critics proposed deleting the
+claim; applying that would have removed a true, sourced statement.** This is L23
+occurring inside two reports that themselves cite L23 — the third recorded
+instance of a pattern surviving being named, and the first where the correction
+itself would have caused the damage.
+
+**A panel disagreement was signal, not noise.** `enactability` explicitly
+declined to find on the plan's #108 ruling; `assumptions` graded the same text
+an error. The enactability refuter settled it by reading `src/watch.rs` rather
+than reasoning: the dead-man test returns an ordinary `Err` and completes
+normally, so no `SIGKILL` is involved and `Drop` runs. A "nothing found" from
+one seat is not evidence of nothing. The plan's ruling was corrected and the
+mis-attached rationale became its own issue (#113).
+
+**Contract Unknowns, answered.** (1) A four-axis document panel earned its
+seats twice — `assumptions` alone produced the platform-state table that sent
+§4/§5 back. (2) **An all-Sonnet panel held**: 8 seats, all Sonnet, all 1 turn of
+25, ~2,300 lines of findings and verdicts, producing a refutation, an upgrade,
+two downgrades, and a refutation of the orchestrator's own hypothesis. Second
+data point after FOUNDATION-1; `gauntlet-pattern.md`'s reservation of Opus for
+blind adversarial review has now not been needed twice. (3) `research` served as
+a critic seat — its durable outcome (primary sources only, every claim traced,
+one cited Markdown file) is a critic's contract nearly verbatim. Friction worth
+recording: it carries no notion of a *verdict*, so refuters invented
+CONFIRMED/REFUTED/DOWNGRADED from the brief. A dedicated seat workflow would
+carry that vocabulary and the probe-hygiene rules structurally.
+
+**A specific line of attack moved every outcome, again.** All four refuters were
+given one; all four moved something. FOUNDATION-1 recorded this from three axes;
+two units now show it, and it should be treated as standing refuter-brief
+practice rather than a per-unit choice.
+
+**Environmental behavior.** 9 dispatched Works: 1 two-axis `code-review` first
+pass (5/25 turns, owner-ruled "a good first pass but not the right instrument"),
+4 blind critics and 4 batched refuters (1/25 turns each). Zero `needs_input`,
+zero failures, zero leaked surfaces. One product defect surfaced by running the
+loop: **a dispatched Work cannot resolve GitHub issue numbers** — the estate
+clone's only remote is a local path, so `gh` fails with a misdirecting auth
+remedy while `gh auth status` shows a valid account; one seat honestly recorded
+an issue as PLAUSIBLE rather than guessing. Filed as **#112**; worked around in
+this estate by adding a `github` remote. The orchestrator's own instruments
+failed twice in the same class the unit was studying — three backgrounded
+watchers killed at ~160s, and a replacement monitor that failed silently on a
+shell syntax error — recorded because *an observer that fails quietly is
+indistinguishable from a subject that has not moved*, which is #90 and #94's
+shape pointed at the harness.
+
 ### ADR 0008 — 2026-08-14, manifest authority over its own state location: (b) implemented, (a) pinned unchanged, (c) re-ruled and #64 closed without code
 
 **Mission outcome: shipped.** Implements proposal §5.4 / ADR 0008, a Work

@@ -15,9 +15,15 @@
 //!   for "should I spawn a second daemon over this one" is the opposite of
 //!   the one above.
 //!
-//! Both are Linux-only via `/proc` today; both get a macOS arm here, and
-//! **both macOS arms are UNVERIFIED** — never executed on a real macOS host.
-//! They close #18 when someone measures them there, not when this lands.
+//! Both are Linux-only via `/proc` today; both get a macOS arm here.
+//! **Verified on a real macOS host 2026-08-15** (Apple M3 Pro, macOS 26.6.1,
+//! `docs/environments/macbook.md`, the path-to-mac.md arrival trip): the full
+//! suite ran real `ps`/`kill` calls end to end (`tests/m4_backends.rs`'s
+//! liveness tests, `tests/support/mod.rs`'s `daemon_pids` reaper, and
+//! `tests/m6_surfaces.rs`'s `tui_pid`, all of which reuse
+//! [`running_processes`] rather than duplicating a `/proc`-only scan — three
+//! duplicate copies of that same scan were found and fixed to reuse this
+//! module during the same trip). Closes #18.
 
 /// One running process a liveness scan can see: its pid, and — wherever the
 /// platform can produce it — its argv, already tokenized into separate
@@ -117,10 +123,10 @@ fn parse_ps_output(stdout: &str) -> Vec<ProcessArgv> {
     processes
 }
 
-/// **UNVERIFIED** — never executed against a real macOS host. There is no
-/// `/proc` to scan; `ps -axo pid=,command=` lists every process with its pid
-/// and full command line in one shot. Parsing is [`parse_ps_output`], pinned
-/// by tests below.
+/// **Verified 2026-08-15** on a real macOS host (Apple M3 Pro, macOS 26.6.1)
+/// — closes #18. There is no `/proc` to scan; `ps -axo pid=,command=` lists
+/// every process with its pid and full command line in one shot. Parsing is
+/// [`parse_ps_output`], pinned by tests below.
 #[cfg(target_os = "macos")]
 fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
     let output = std::process::Command::new("ps")
@@ -133,10 +139,11 @@ fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
     Some(parse_ps_output(&String::from_utf8_lossy(&output.stdout)))
 }
 
-/// **UNVERIFIED** — never executed against a real macOS host. `kill -0`
-/// signals nothing; a zero exit means the pid exists and this user may
-/// signal it. Shells to the same `kill` binary `cli.rs`'s graceful-stop path
-/// already invokes for SIGTERM, so this adds no new external dependency.
+/// **Verified 2026-08-15** on a real macOS host (Apple M3 Pro, macOS 26.6.1)
+/// — closes #18. `kill -0` signals nothing; a zero exit means the pid exists
+/// and this user may signal it. Shells to the same `kill` binary `cli.rs`'s
+/// graceful-stop path already invokes for SIGTERM, so this adds no new
+/// external dependency.
 #[cfg(target_os = "macos")]
 fn raw_process_alive(pid: u32) -> bool {
     std::process::Command::new("kill")

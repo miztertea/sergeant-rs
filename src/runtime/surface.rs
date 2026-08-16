@@ -207,16 +207,43 @@ impl WorkSurface {
     }
 }
 
+/// Where #109's captured dirty-state patch was written, and how large it
+/// is — enough for an operator (or `sgt work reap`) to reason about what is
+/// actually on disk without re-reading it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchInfo {
+    /// The patch file's path, under the surface root (sibling to the
+    /// worktree it replaced — `remove_surface_root`'s own fail-closed
+    /// `remove_dir` is what keeps the root alive once this is the only
+    /// thing left inside it).
+    pub path: PathBuf,
+    /// The patch file's size in bytes.
+    pub bytes: u64,
+}
+
 /// What happened to one binding at teardown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
 pub enum BindingDisposition {
     /// The worktree was clean and has been removed.
     Removed,
-    /// The worktree had uncommitted or untracked changes: retained, recorded.
+    /// The worktree had uncommitted or untracked changes: the dirty state
+    /// is retained, never the directory it happened to live in (#109, owner
+    /// ruling R4: *"The journal is the real artifact. Let's keep the disk
+    /// clean."*).
     RetainedDirty {
         /// `git status --porcelain` output, as evidence.
         changes: String,
+        /// Where the dirty state was captured as a patch, once the worktree
+        /// directory itself was reclaimed (see [`retain_dirty`]). `None`
+        /// means the capture could not be trusted — a submodule-bearing
+        /// worktree, or a git failure partway through — so teardown fell
+        /// back to retaining the whole directory, exactly as it did before
+        /// #109. `#[serde(default)]` so every binding journaled before this
+        /// field existed deserializes as that same fallback, which is
+        /// honest: those really did retain the whole directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        patch: Option<PatchInfo>,
     },
     /// The worktree path was already gone: recorded, not treated as success.
     Missing,
@@ -428,20 +455,95 @@ fn materialize_one(
             source_repo: repository.path.display().to_string(),
         });
     }
-    let (base_sha, base_branch, head_sha) = with_repository(&repository.path, || {
-        let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
-        // A detached HEAD has no branch name; record the fact rather than
-        // inventing one.
-        let base_branch = git(
-            &repository.path,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-        )
-        .unwrap_or_else(|_| "(detached)".to_string());
+    // Read HEAD metadata **before** taking the per-repository lock.  Both
+    // calls touch only `.git/HEAD` and ref storage — they do not access the
+    // worktree registry (`.git/worktrees/`) that `with_repository` protects.
+    // Running them before acquiring the lock lets concurrent submissions that
+    // target the same repository overlap this work rather than serializing all
+    // four git spawns per materialization behind a single gate.
+    //
+    // Correctness under a concurrent HEAD advance: `base_sha` is passed
+    // explicitly to `git worktree add` rather than "HEAD", so the new
+    // worktree lands at the commit we recorded here even if the branch tip
+    // moves between this read and the add.  The provenance record and the
+    // actual checkout agree with each other; a one-commit lag behind the tip
+    // is the same fact it was before (the submit captured a snapshot of HEAD
+    // at request time, and that snapshot is what the run executes on).
+    let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
+    // A detached HEAD has no branch name; record the fact rather than
+    // inventing one.
+    let base_branch = git(
+        &repository.path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .unwrap_or_else(|_| "(detached)".to_string());
 
-        add_worktree(&repository.path, &worktree_path, branch, &base_sha)?;
-        let head_sha = git(&worktree_path, &["rev-parse", "HEAD"])?;
-        Ok::<_, SurfaceError>((base_sha, base_branch, head_sha))
+    // Only `git worktree add` touches `.git/worktrees/` — the operation the
+    // per-repository lock exists to serialize.  Hold it for exactly that span
+    // and nothing more.
+    //
+    // `--no-checkout` skips the working-tree file population inside the lock.
+    // `git reset --hard HEAD` (which reads only the object store and writes
+    // to the worktree directory) runs after the lock releases so that
+    // concurrent submissions against the same repository can overlap it with
+    // the next submission's registry write — shaving the lock-held time from
+    // ~57 ms (full add + checkout) to ~43 ms (registry write only) per work.
+    //
+    // Correctness: `--no-checkout` still creates the branch at `base_sha` and
+    // sets HEAD in the new worktree to that branch, so `checkout_worktree`
+    // below populates exactly the same content as a full add would have.  The
+    // checkout completes before `materialize_one` returns, so no caller ever
+    // sees a worktree with its branch set but its files absent.
+    with_repository(&repository.path, || {
+        add_worktree_no_checkout(&repository.path, &worktree_path, branch, &base_sha)
     })?;
+    // Outside the per-repository lock: populate the working tree.
+    //
+    // `git reset --hard HEAD` is used rather than `git checkout HEAD` for two
+    // reasons:
+    //
+    // 1. Detached-HEAD avoidance.  After `--no-checkout`, HEAD is a symref to
+    //    the work branch.  `git checkout HEAD` resolves "HEAD" to the commit
+    //    SHA and performs a commit-level checkout, which DETACHES HEAD from the
+    //    branch.  Commits the runner makes in a detached-HEAD worktree do not
+    //    advance the branch, silently losing the run's output on teardown.
+    //    `git reset --hard HEAD` resolves HEAD to the same commit but leaves
+    //    HEAD's branch-pointer intact.
+    //
+    // 2. `--no-checkout` leaves the index empty (it does NOT pre-populate it
+    //    as a regular checkout would).  `git reset --hard HEAD` both fills the
+    //    index from HEAD's tree and writes those files to disk — a single
+    //    command that does exactly what we need.
+    //
+    // Unlike `add_worktree_from` (where a git failure is atomic — either the
+    // whole add lands or nothing is written), a `checkout_worktree` failure
+    // here leaves behind durable side-effects from the preceding
+    // `add_worktree_no_checkout`: a branch ref, a `.git/worktrees/<name>/`
+    // registry entry, and an empty worktree directory.  The caller's
+    // `materialize` cannot see these because no `RepositoryBinding` is
+    // returned, so it cannot drive teardown for them.  Roll them back inline
+    // before returning the error.  Both cleanups are best-effort: stale
+    // registry entries are reaped by `git worktree prune` on the next
+    // teardown for this repository; orphaned branches would block a retry (the
+    // engine calls `materialize` again with `-b <same-branch>`, which fails if
+    // the branch exists), so deleting the branch is the more important step.
+    if let Err(checkout_err) = checkout_worktree(&worktree_path) {
+        let path = worktree_path.display().to_string();
+        // Remove registry entry first so the branch is unreferenced.
+        let _ = with_repository(&repository.path, || {
+            git(&repository.path, &["worktree", "remove", "--force", &path]).map(|_| ())
+        });
+        // Delete the branch so a retry can re-create it with `-b`.
+        let _ = git(&repository.path, &["branch", "-D", branch]);
+        return Err(checkout_err);
+    }
+
+    // `git worktree add --no-checkout -b <branch> <path> <sha>` creates the
+    // branch at `<sha>` and sets HEAD in the new worktree to that branch.
+    // `git reset --hard HEAD` (above) does not run any `post-checkout` hook,
+    // so HEAD in the worktree stays at exactly `base_sha`.  `head_sha` is
+    // recorded as `base_sha` — correct by construction.
+    let head_sha = base_sha.clone();
 
     Ok(RepositoryBinding {
         repository: repository.name.clone(),
@@ -710,6 +812,231 @@ pub fn teardown(surface: &WorkSurface) -> TeardownReport {
     }
 }
 
+/// One binding a Work's teardown left something on disk for — #109's
+/// inspect verb (`sgt work retained`): what is retained, why, and how
+/// large. Never includes `Removed`/`Missing` bindings, since there is
+/// nothing there for an operator to act on.
+#[derive(Debug, Clone, Serialize)]
+pub struct RetainedBinding {
+    /// Repository name.
+    pub repository: String,
+    /// Where the retained content actually lives: the patch file when
+    /// [`retain_dirty`] captured one *and* removed the worktree, otherwise
+    /// the worktree directory itself (the submodule/capture-failure
+    /// fallback, a captured patch whose worktree removal then failed, or a
+    /// `RetainedError`).
+    pub path: PathBuf,
+    /// `retained_dirty` or `retained_error` — the same bare-tag spelling
+    /// `sgt work show`'s output pointer already uses, so a client never has
+    /// to reconcile two vocabularies for the same fact.
+    pub reason: &'static str,
+    /// The evidence teardown recorded: `git status --porcelain` output for
+    /// `retained_dirty`, Git's own diagnostic for `retained_error`.
+    pub detail: String,
+    /// Size in bytes: exact for a captured patch, best-effort
+    /// ([`directory_size`]) for a still-retained directory.
+    pub bytes: u64,
+}
+
+/// #109's inspect verb, the pure decode: every binding in `teardown` that
+/// still holds disk past a clean removal. A live filesystem read
+/// ([`directory_size`]) for the directory-fallback case, not a size cached
+/// at teardown time — so this always reports what is *actually* on disk
+/// right now, including after a partial `sgt work reap` or an out-of-band
+/// change, rather than trusting a number that can go stale the moment
+/// anything else touches the path.
+pub fn retained_bindings(teardown: &TeardownReport) -> Vec<RetainedBinding> {
+    teardown
+        .bindings
+        .iter()
+        .filter_map(|b| match &b.disposition {
+            BindingDisposition::RetainedDirty {
+                changes,
+                patch: Some(info),
+            } => {
+                // Live check, not the size journaled at teardown time: a
+                // `sgt work reap` since then (or anything else that removed
+                // the file) must not keep showing up here — the same
+                // "report what is actually on disk right now" rule
+                // `directory_size`'s callers below already follow.
+                if !info.path.is_file() {
+                    return None;
+                }
+                Some(RetainedBinding {
+                    repository: b.repository.clone(),
+                    path: info.path.clone(),
+                    reason: "retained_dirty",
+                    detail: changes.clone(),
+                    bytes: info.bytes,
+                })
+            }
+            BindingDisposition::RetainedDirty {
+                changes,
+                patch: None,
+            } => {
+                if !b.worktree_path.exists() {
+                    return None;
+                }
+                Some(RetainedBinding {
+                    repository: b.repository.clone(),
+                    path: b.worktree_path.clone(),
+                    reason: "retained_dirty",
+                    detail: changes.clone(),
+                    bytes: directory_size(&b.worktree_path),
+                })
+            }
+            BindingDisposition::RetainedError { detail } => {
+                if !b.worktree_path.exists() {
+                    return None;
+                }
+                Some(RetainedBinding {
+                    repository: b.repository.clone(),
+                    path: b.worktree_path.clone(),
+                    reason: "retained_error",
+                    detail: detail.clone(),
+                    bytes: directory_size(&b.worktree_path),
+                })
+            }
+            BindingDisposition::Removed | BindingDisposition::Missing => None,
+        })
+        .collect()
+}
+
+/// What happened when [`reap`] tried to dispose of one binding's retained
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ReapOutcome {
+    /// The retained state was permanently discarded.
+    Reaped {
+        /// What was freed.
+        bytes: u64,
+    },
+    /// Nothing was retained for this binding (`Removed`/`Missing`, or an
+    /// earlier reap already cleared it) — a no-op, not a failure.
+    NothingRetained,
+    /// Left alone, on purpose: `RetainedError` means teardown could not
+    /// even establish that this worktree was clean (`git status` itself
+    /// failed), so there is no evidence a forced removal here would be
+    /// discarding only what teardown already knows about, rather than real
+    /// uncommitted work nothing ever captured. Ambiguity fails closed
+    /// (`AGENTS.md`) — resolve the underlying git error and let teardown
+    /// re-run instead.
+    Skipped {
+        /// Why this binding was left alone.
+        reason: String,
+    },
+    /// The reap attempt itself failed (git or the filesystem refused).
+    Failed {
+        /// The underlying diagnostic.
+        detail: String,
+    },
+}
+
+/// One binding's [`reap`] outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingReap {
+    /// Repository name.
+    pub repository: String,
+    /// What happened.
+    pub outcome: ReapOutcome,
+}
+
+/// [`reap`]'s outcome for a whole Work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReapReport {
+    /// Work whose retained state was reaped.
+    pub work_id: String,
+    /// Per-binding outcomes.
+    pub bindings: Vec<BindingReap>,
+}
+
+/// #109's dispose verb: permanently discard whatever `RetainedDirty`
+/// bindings still hold for this Work — the captured patch, or, in the
+/// submodule/capture-failure fallback (or a captured patch whose worktree
+/// removal then failed), the worktree directory itself.
+///
+/// A deliberate, explicit, human-invoked action, never run on its own:
+/// `AGENTS.md`'s guardrail puts preserved state (a retained branch, a
+/// journal, a Work record) outside anything standing authorization may
+/// destroy, and this is how a human destroys the *dirty-state* half of it
+/// on purpose, once they have decided they no longer need it (typically
+/// after reading it via [`retained_bindings`]). It never touches the
+/// retained *branch* — teardown's branch-retention guarantee is
+/// unconditional (§11) and this function has no path that reaches it.
+///
+/// Scoped to `RetainedDirty` only, matching [`ReapOutcome::Skipped`]'s
+/// reasoning: a `RetainedError` binding has no evidence backing a forced
+/// removal, so it is reported, not touched.
+pub fn reap(surface: &WorkSurface, teardown: &TeardownReport) -> ReapReport {
+    let bindings = teardown
+        .bindings
+        .iter()
+        .map(|b| BindingReap {
+            repository: b.repository.clone(),
+            outcome: reap_binding(surface, b),
+        })
+        .collect();
+    remove_surface_root(&surface.root);
+    ReapReport {
+        work_id: teardown.work_id.clone(),
+        bindings,
+    }
+}
+
+fn reap_binding(surface: &WorkSurface, binding: &BindingTeardown) -> ReapOutcome {
+    match &binding.disposition {
+        BindingDisposition::RetainedDirty {
+            patch: Some(info), ..
+        } => match std::fs::remove_file(&info.path) {
+            Ok(()) => ReapOutcome::Reaped { bytes: info.bytes },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReapOutcome::NothingRetained,
+            Err(e) => ReapOutcome::Failed {
+                detail: e.to_string(),
+            },
+        },
+        BindingDisposition::RetainedDirty { patch: None, .. } => {
+            if !binding.worktree_path.exists() {
+                return ReapOutcome::NothingRetained;
+            }
+            // The directory is still a real, registered git worktree (that
+            // is exactly why it was never removed at teardown) — going
+            // through git rather than a raw recursive delete keeps the
+            // source repository's own worktree registry consistent, the
+            // same as every other removal this module ever does.
+            let Some(source) = surface
+                .bindings
+                .iter()
+                .find(|b| b.repository == binding.repository)
+                .map(|b| b.source_path.clone())
+            else {
+                return ReapOutcome::Failed {
+                    detail: "no surface binding recorded for this repository; cannot resolve \
+                             which source repository's worktree registry to update"
+                        .to_string(),
+                };
+            };
+            let bytes = directory_size(&binding.worktree_path);
+            let path = binding.worktree_path.display().to_string();
+            match with_repository(&source, || {
+                git(&source, &["worktree", "remove", "--force", &path])
+            }) {
+                Ok(_) => ReapOutcome::Reaped { bytes },
+                Err(e) => ReapOutcome::Failed {
+                    detail: e.to_string(),
+                },
+            }
+        }
+        BindingDisposition::RetainedError { detail } => ReapOutcome::Skipped {
+            reason: format!(
+                "teardown could not establish this worktree was clean ({detail}); resolve the \
+                 underlying git error and retry teardown instead of reaping"
+            ),
+        },
+        BindingDisposition::Removed | BindingDisposition::Missing => ReapOutcome::NothingRetained,
+    }
+}
+
 /// Remove the per-work surface root, but only once nothing is left inside it.
 ///
 /// `remove_dir` *is* the whole guard, and deliberately so: it refuses a
@@ -750,32 +1077,171 @@ fn prune_stale_worktrees(source: &Path) {
     let _ = git(source, &["worktree", "prune"]);
 }
 
-fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
-    with_repository(&binding.source_path, || teardown_binding_locked(binding))
+/// #109 (R4): retention preserves the dirty *state*, never the whole
+/// directory it happened to live in — `target/` and every other gitignored
+/// artifact must never be in scope (owner ruling, plan v2 R4/R12: *"The
+/// journal is the real artifact. Let's keep the disk clean."*). Measured
+/// motivation: three `retained_dirty` surfaces held 30 GB, essentially all
+/// of it gitignored `target/` (#109).
+///
+/// `git add -A` (respects `.gitignore`, so `target/` is never staged) plus
+/// `git diff --cached --binary` captures every tracked modification *and*
+/// every untracked-but-wanted file in one patch — the same trick that
+/// answers the issue's hard case, an untracked file worth keeping beside
+/// untracked build output that is not. A `git bundle` was considered and
+/// rejected: its advantage is self-contained branch history, and teardown
+/// already keeps that for free by never deleting the branch (§11) — a
+/// bundle would only duplicate it. A `git stash` was rejected too: it lives
+/// in the *source* repository's own reflog, subject to that repository's
+/// own housekeeping, rather than travelling with the surface the way a file
+/// under the surface root does.
+///
+/// Fails closed onto the pre-#109 behavior — the whole worktree directory
+/// left in place, nothing removed — whenever the capture cannot be fully
+/// trusted: a worktree that declares submodules (a nested repository's own
+/// uncommitted content never appears in the parent's `git add -A`, only its
+/// commit pointer does, so a patch here could silently under-capture it),
+/// or any git/io failure along the way. Only once the patch is durably on
+/// disk does this remove the worktree, and only with `--force` — safe here
+/// specifically because everything `git status --porcelain` just reported
+/// has already been captured.
+fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposition {
+    if binding.worktree_path.join(".gitmodules").exists() {
+        return BindingDisposition::RetainedDirty {
+            changes,
+            patch: None,
+        };
+    }
+    let Some(patch) = capture_dirty_patch(binding) else {
+        return BindingDisposition::RetainedDirty {
+            changes,
+            patch: None,
+        };
+    };
+    let path = binding.worktree_path.display().to_string();
+    // The patch is already durable regardless of what happens next, so
+    // nothing captured can be lost. But if the worktree removal below fails,
+    // the directory is still on disk — reporting `patch: Some` in that case
+    // would make it invisible to `retained_bindings`/`reap_binding`, which
+    // only look for the worktree directory when `patch` is `None`. Falling
+    // back to the same `patch: None` shape the submodule/capture-failure
+    // paths above already use keeps that directory discoverable and
+    // reclaimable (`reap_binding`'s `patch: None` arm retries the same `git
+    // worktree remove`); the now-redundant patch file (its content already
+    // sitting uncommitted in the still-present directory) is removed
+    // best-effort so it does not become its own untracked leak.
+    match git(
+        &binding.source_path,
+        &["worktree", "remove", "--force", &path],
+    ) {
+        Ok(_) => BindingDisposition::RetainedDirty {
+            changes,
+            patch: Some(patch),
+        },
+        Err(_) => {
+            let _ = std::fs::remove_file(&patch.path);
+            BindingDisposition::RetainedDirty {
+                changes,
+                patch: None,
+            }
+        }
+    }
 }
 
-fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
-    // Read the retained branch's tip before anything else. Teardown always
-    // keeps the branch regardless of what happens to the worktree below, so
-    // this is available in every disposition — including `Missing`, where
-    // there is no worktree left to read a HEAD from at all.
+/// Stage everything `.gitignore` does not exclude (`git add -A`), diff it
+/// against `HEAD` (`git diff --cached --binary`), and write the result
+/// durably under the surface root, sibling to the worktree it is about to
+/// replace. `None` on any failure — a caller that gets `None` back must not
+/// remove anything, since nothing was actually captured.
+fn capture_dirty_patch(binding: &RepositoryBinding) -> Option<PatchInfo> {
+    git(&binding.worktree_path, &["add", "-A"]).ok()?;
+    let diff = git(&binding.worktree_path, &["diff", "--cached", "--binary"]).ok()?;
+    // Defensive: the caller already confirmed `git status --porcelain` was
+    // non-empty, so an empty diff here means something about the capture
+    // did not actually see what made the worktree dirty — fail closed
+    // rather than reclaim a directory whose content was never written down.
+    if diff.is_empty() {
+        return None;
+    }
+    let path = binding
+        .worktree_path
+        .parent()?
+        .join(format!("{}.dirty.patch", binding.repository));
+    crate::runtime::fsutil::write_atomic(&path, diff.as_bytes()).ok()?;
+    Some(PatchInfo {
+        path,
+        bytes: diff.len() as u64,
+    })
+}
+
+/// Best-effort recursive size of everything under `path`, in bytes — disk-
+/// usage evidence for an operator (`sgt work retained`), not an accounting
+/// system. Errors partway (permissions, a vanished entry mid-walk) are
+/// swallowed: a size that is merely a lower bound because of one unreadable
+/// subtree is more useful than refusing to answer at all.
+pub fn directory_size(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return metadata.len();
+    };
+    entries
+        .flatten()
+        .map(|entry| directory_size(&entry.path()))
+        .sum()
+}
+
+fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
+    // Read the retained branch's tip **before** taking the per-repository lock.
+    // This call reads from ref storage only — it does not access the worktree
+    // registry (`.git/worktrees/`) that `with_repository` protects, so running
+    // it before the lock lets concurrent teardowns that target the same
+    // repository do this work in parallel rather than serializing behind the
+    // gate that only `git worktree remove` actually needs.
+    //
+    // Teardown always keeps the branch regardless of what happens to the
+    // worktree below, so `final_sha` is available in every disposition —
+    // including `Missing`, where there is no worktree left to read a HEAD from.
     let final_sha = git(
         &binding.source_path,
         &["rev-parse", &format!("refs/heads/{}", binding.work_branch)],
     )
     .ok();
+
     if !binding.worktree_path.exists() {
         // The directory is gone, but the source repository still lists it;
         // unregister it now so a later rematerialize at the same path is
-        // possible. This does not change the disposition below either way.
-        prune_stale_worktrees(&binding.source_path);
+        // possible.  `git worktree prune` modifies the registry → lock.
+        with_repository(&binding.source_path, || {
+            prune_stale_worktrees(&binding.source_path);
+        });
         return (BindingDisposition::Missing, final_sha);
     }
+
+    // Check whether the worktree is clean **before** taking the per-repository
+    // lock.  `git status --porcelain` runs in the linked worktree and reads
+    // the shared object store (read-only) plus the worktree-local index — it
+    // does not touch `.git/worktrees/`, so it is safe outside the lock.
+    //
+    // TOCTOU note: if the worktree becomes dirty between this read and the
+    // `git worktree remove` below, git's own pre-removal dirty check fires and
+    // refuses the removal, surfacing a `RetainedError` rather than silently
+    // destroying content — the same fail-closed outcome the explicit status
+    // check produces, so the window carries no correctness risk.
     match git(&binding.worktree_path, &["status", "--porcelain"]) {
         Ok(changes) if !changes.is_empty() => {
-            return (BindingDisposition::RetainedDirty { changes }, final_sha);
+            // Dirty: `retain_dirty` captures a patch and calls `git worktree
+            // remove --force`, which does touch the registry.  Hold the lock
+            // for that entire path.
+            let disposition =
+                with_repository(&binding.source_path, || retain_dirty(binding, changes));
+            return (disposition, final_sha);
         }
-        Ok(_) => {}
+        Ok(_) => {} // clean — proceed to the removal below
         Err(e) => {
             // Cannot establish that it is clean ⇒ must not remove it.
             return (
@@ -786,49 +1252,60 @@ fn teardown_binding_locked(binding: &RepositoryBinding) -> (BindingDisposition, 
             );
         }
     }
+
+    // Clean path: only `git worktree remove` touches the registry.
     let path = binding.worktree_path.display().to_string();
-    let disposition = match git(&binding.source_path, &["worktree", "remove", &path]) {
-        Ok(_) => BindingDisposition::Removed,
-        // #22: git unconditionally refuses to remove a worktree that
-        // contains a submodule — "working trees containing submodules
-        // cannot be moved or removed" — regardless of whether anything in
-        // it is actually dirty. Left as `RetainedError` unconditionally,
-        // *every* submodule-bearing surface would leak its worktree on
-        // every single ordinary, successful teardown, forever (measured:
-        // this module's own `a_submodule_is_populated_into_the_
-        // materialized_worktree` failed here before this arm existed). The
-        // `git status --porcelain` check just above already answers
-        // whether the submodule itself has anything uncommitted — it
-        // recurses into a registered submodule by default and would have
-        // returned `RetainedDirty` already if so — so reaching this arm at
-        // all means the only reason git refused is the policy, not the
-        // content, and retrying with `--force` destroys nothing §11 does
-        // not already know is safe to remove.
-        Err(e) if e.to_string().contains("containing submodules") => {
-            match git(
-                &binding.source_path,
-                &["worktree", "remove", "--force", &path],
-            ) {
-                Ok(_) => BindingDisposition::Removed,
-                Err(e) => BindingDisposition::RetainedError {
-                    detail: e.to_string(),
-                },
+    let disposition = with_repository(&binding.source_path, || {
+        match git(&binding.source_path, &["worktree", "remove", &path]) {
+            Ok(_) => BindingDisposition::Removed,
+            // #22: git unconditionally refuses to remove a worktree that
+            // contains a submodule — "working trees containing submodules
+            // cannot be moved or removed" — regardless of whether anything in
+            // it is actually dirty. Left as `RetainedError` unconditionally,
+            // *every* submodule-bearing surface would leak its worktree on
+            // every single ordinary, successful teardown, forever (measured:
+            // this module's own `a_submodule_is_populated_into_the_
+            // materialized_worktree` failed here before this arm existed). The
+            // `git status --porcelain` check just above already answers
+            // whether the submodule itself has anything uncommitted — it
+            // recurses into a registered submodule by default and would have
+            // returned `RetainedDirty` already if so — so reaching this arm at
+            // all means the only reason git refused is the policy, not the
+            // content, and retrying with `--force` destroys nothing §11 does
+            // not already know is safe to remove.
+            Err(e) if e.to_string().contains("containing submodules") => {
+                match git(
+                    &binding.source_path,
+                    &["worktree", "remove", "--force", &path],
+                ) {
+                    Ok(_) => BindingDisposition::Removed,
+                    Err(e) => BindingDisposition::RetainedError {
+                        detail: e.to_string(),
+                    },
+                }
             }
+            Err(e) => BindingDisposition::RetainedError {
+                detail: e.to_string(),
+            },
         }
-        Err(e) => BindingDisposition::RetainedError {
-            detail: e.to_string(),
-        },
-    };
+    });
     (disposition, final_sha)
 }
 
-fn add_worktree(
-    source: &Path,
-    worktree: &Path,
-    branch: &str,
-    start: &str,
-) -> Result<(), SurfaceError> {
-    add_worktree_from(source, worktree, branch, start, true)
+/// Ensure the parent directory of `worktree` exists and return the path as a
+/// display string, ready to pass to `git worktree add`.
+///
+/// Both [`add_worktree_from`] and [`add_worktree_no_checkout`] need the same
+/// directory-creation guard before their `git` invocation; this helper keeps
+/// the logic in one place.
+fn prepare_worktree_dir(worktree: &Path) -> Result<String, SurfaceError> {
+    if let Some(parent) = worktree.parent() {
+        create_dir_all_durable(parent).map_err(|source| SurfaceError::Io {
+            path: parent.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(worktree.display().to_string())
 }
 
 fn add_worktree_from(
@@ -838,19 +1315,68 @@ fn add_worktree_from(
     start: &str,
     create_branch: bool,
 ) -> Result<(), SurfaceError> {
-    if let Some(parent) = worktree.parent() {
-        create_dir_all_durable(parent).map_err(|source| SurfaceError::Io {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
-    let path = worktree.display().to_string();
+    let path = prepare_worktree_dir(worktree)?;
     let args: Vec<&str> = if create_branch {
         vec!["worktree", "add", "-b", branch, &path, start]
     } else {
         vec!["worktree", "add", &path, start]
     };
     git(source, &args)?;
+    Ok(())
+}
+
+/// `git worktree add --no-checkout`: create the branch, write the registry
+/// entry, and set HEAD in the new worktree — but do *not* populate the
+/// working-tree files. Callers must follow up with [`checkout_worktree`].
+///
+/// Holding only the registry write under the per-repository lock (see
+/// [`with_repository`]) lets the file-level checkout — which touches only the
+/// object store (read-only) and the new worktree directory — run after the
+/// lock releases and overlap with the next submission's registry write.
+fn add_worktree_no_checkout(
+    source: &Path,
+    worktree: &Path,
+    branch: &str,
+    start: &str,
+) -> Result<(), SurfaceError> {
+    let path = prepare_worktree_dir(worktree)?;
+    git(
+        source,
+        &[
+            "worktree",
+            "add",
+            "--no-checkout",
+            "-b",
+            branch,
+            &path,
+            start,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Populate the working tree of a worktree created with
+/// `git worktree add --no-checkout`.
+///
+/// `--no-checkout` leaves both the index and the working tree empty; only HEAD
+/// (a symref to the work branch) and the `.git/worktrees/<name>/` registry
+/// entry are written.  `git reset --hard HEAD` fills the index from HEAD's
+/// tree and writes those files to disk — the minimal operation that brings the
+/// worktree to a usable state.
+///
+/// `git reset --hard` is chosen over `git checkout HEAD` for two reasons:
+/// - `checkout HEAD` resolves `HEAD` as a commitish and performs a
+///   commit-level switch, which **detaches HEAD** from the work branch.
+///   Commits made in a detached-HEAD worktree do not advance the branch,
+///   silently losing run output on teardown.
+/// - `reset --hard HEAD` leaves the symref intact (HEAD stays → work branch).
+///
+/// This call touches neither the worktree registry (`.git/worktrees/`) nor
+/// the source repository's ref storage, so it is safe to run after the
+/// per-repository lock releases and overlap with the next submission's
+/// registry write.
+fn checkout_worktree(worktree: &Path) -> Result<(), SurfaceError> {
+    git(worktree, &["reset", "--hard", "HEAD"])?;
     Ok(())
 }
 
@@ -1082,26 +1608,43 @@ mod tests {
 
     /// §12 makes retry the one door back out of failed, blocked and waiting,
     /// and retry re-attaches the worktrees teardown removed. A worktree that
-    /// teardown *retained* (dirty, so fail-closed left it alone) and that
-    /// was then deleted out of band is the case nothing else prunes: git
-    /// still has it registered, and without a prune every `worktree add` at
-    /// that path fails for good, wedging retry permanently.
+    /// teardown *retained whole* (fail-closed left it alone) and that was
+    /// then deleted out of band is the case nothing else prunes: git still
+    /// has it registered, and without a prune every `worktree add` at that
+    /// path fails for good, wedging retry permanently.
+    ///
+    /// #109 narrows how often the whole directory is what is retained — an
+    /// ordinary dirty worktree now gets its state captured as a patch and
+    /// the directory itself reclaimed via a real `git worktree remove`,
+    /// which never leaves this staleness behind in the first place. The
+    /// submodule fallback is the case that still can: `retain_dirty` leaves
+    /// the directory (and its git registration) untouched, so this test
+    /// exercises that path to keep covering the recovery this docstring
+    /// describes.
     #[test]
     fn a_worktree_deleted_after_a_dirty_teardown_can_still_be_rematerialized() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
-        let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01STALE", std::slice::from_ref(&spec)).expect("materialize");
+        let inner = repo(&dir.path().join("inner"));
+        let outer = repo(&dir.path().join("outer"));
+        declare_submodule(&outer.path, &inner.path, "vendored");
+
+        let surface = materialize(data.path(), "01STALE", std::slice::from_ref(&outer))
+            .expect("materialize a repository with a submodule");
         let worktree = surface.bindings[0].worktree_path.clone();
 
-        // Uncommitted work: teardown retains it, and therefore never prunes.
+        // Uncommitted work: teardown retains it whole, and therefore never
+        // prunes.
         std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty");
         let report = teardown(&surface);
         assert!(matches!(
             report.bindings[0].disposition,
-            BindingDisposition::RetainedDirty { .. }
+            BindingDisposition::RetainedDirty { patch: None, .. }
         ));
+        assert!(
+            worktree.exists(),
+            "the submodule fallback keeps the whole directory"
+        );
 
         // ...and then it is deleted by something that is not sergeant.
         std::fs::remove_dir_all(&worktree).expect("delete out of band");
@@ -1272,19 +1815,31 @@ mod tests {
         );
 
         // A retained worktree keeps its root: teardown fails closed, and the
-        // root is where the retained thing lives.
+        // root is where the retained *state* lives. #109: not the whole
+        // directory — that gets reclaimed once its dirty state is captured
+        // as a patch, which is exactly what keeps the root non-empty.
         let dirty_spec = repo(&dir.path().join("dirty"));
         let dirty = materialize(data.path(), "01DIRTY", std::slice::from_ref(&dirty_spec))
             .expect("materialize dirty");
         std::fs::write(dirty.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
         let report = teardown(&dirty);
-        assert!(matches!(
-            report.bindings[0].disposition,
-            BindingDisposition::RetainedDirty { .. }
-        ));
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let patch = patch
+            .as_ref()
+            .expect("an ordinary (non-submodule) dirty worktree must capture a patch");
         assert!(
-            dirty.root.is_dir() && dirty.bindings[0].worktree_path.is_dir(),
-            "uncommitted work is never removed, and neither is the root holding it"
+            dirty.root.is_dir() && patch.path.is_file(),
+            "the dirty state is retained as a patch under the root, not the whole directory"
+        );
+        assert!(
+            !dirty.bindings[0].worktree_path.exists(),
+            "#109: the reclaimed worktree directory itself must be gone"
         );
     }
 
@@ -1501,9 +2056,9 @@ mod tests {
         // removed: a submodule that never finished initializing has nothing
         // of its own for `git status --porcelain` to find dirty (there is no
         // checked-out submodule content yet to be dirty), so the force-retry
-        // `teardown_binding_locked` uses for git's blanket "containing
-        // submodules" refusal cleans it up rather than leaving it parked
-        // with a permanent `RetainedError`.
+        // `teardown_binding` uses for git's blanket "containing submodules"
+        // refusal cleans it up rather than leaving it parked with a permanent
+        // `RetainedError`.
         assert_eq!(teardown.bindings.len(), 1);
         assert_eq!(teardown.bindings[0].repository, "solo");
         assert_eq!(
@@ -1519,8 +2074,137 @@ mod tests {
         assert!(teardown.clean);
     }
 
-    /// The force-retry `teardown_binding_locked` uses for git's blanket
-    /// "containing submodules" refusal must never bypass real dirtiness —
+    /// Fix 3 — `--no-checkout` + `checkout_worktree` cleanup (L7 pin).
+    ///
+    /// After `add_worktree_no_checkout` creates a branch ref and a
+    /// `.git/worktrees/<name>/` registry entry, `checkout_worktree`
+    /// (`git reset --hard HEAD`) populates the working tree.  If that second
+    /// step fails, `materialize_one` must clean up both the registry entry
+    /// **and the branch** before returning the error — otherwise a retry would
+    /// call `git worktree add -b <same-branch> …` and fail because the branch
+    /// already exists, permanently wedging the work.
+    ///
+    /// The trigger: a smudge filter configured as `required` that always exits
+    /// non-zero.  Git runs smudge filters when checking out files; with
+    /// `required = true` a non-zero exit is a hard error on the whole reset.
+    /// `git worktree add --no-checkout` skips the checkout, so the filter does
+    /// not fire there — only during `checkout_worktree`.
+    ///
+    /// The key assertion (the pin): after the failed materialize, a second
+    /// call to materialize for the same work-id must succeed.  It can only
+    /// succeed if the branch was deleted — `git worktree add -b` fails if the
+    /// branch already exists.
+    #[test]
+    fn a_checkout_failure_after_no_checkout_add_does_not_strand_the_branch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+
+        // Build a repository whose checkout step always fails: a file subject
+        // to a required smudge filter that always exits non-zero.
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).expect("source dir");
+        // Phase 1: create the repo and the initial commit WITHOUT the filter
+        // configured — the filter's `required = true` would also block `git add`
+        // (the clean step) if it were active during setup.
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&source)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        // .gitattributes declares the filter; payload.txt is the file it targets.
+        std::fs::write(
+            source.join(".gitattributes"),
+            "payload.txt filter=always-fail\n",
+        )
+        .expect(".gitattributes");
+        std::fs::write(source.join("payload.txt"), "content\n").expect("payload.txt");
+        for args in [vec!["add", "."], vec!["commit", "-m", "initial"]] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&source)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        // Phase 2: arm the smudge filter AFTER the commit so it does not
+        // interfere with the clean-side of `git add`.  The filter is written
+        // to the local repo config so sergeant's `git reset --hard HEAD`
+        // (which does not suppress local config) reads it.
+        for args in [
+            vec!["config", "filter.always-fail.smudge", "false"],
+            vec!["config", "filter.always-fail.required", "true"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&source)
+                .output()
+                .expect("git config");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let spec = RepositorySpec {
+            name: "source".to_string(),
+            path: source.to_path_buf(),
+        };
+
+        // First attempt: add_worktree_no_checkout succeeds (no checkout →
+        // smudge filter not triggered), checkout_worktree fails (smudge
+        // filter exits 1), cleanup runs.
+        let err = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec))
+            .expect_err("checkout_worktree failure must propagate as an error");
+        assert!(
+            matches!(err, SurfaceError::Git { .. }),
+            "expected a git error from the reset --hard, got: {err}"
+        );
+
+        // The branch add_worktree_no_checkout created must be gone.  Without
+        // the `git branch -D` cleanup, the retry below would hit:
+        //   fatal: A branch named 'sergeant/01CHECKFAIL' already exists.
+        let branch = work_branch("01CHECKFAIL");
+        assert!(
+            !git_succeeds(
+                &source,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}")
+                ]
+            ),
+            "branch must be deleted by the checkout-failure cleanup — if it remains, \
+             a retry fails to re-create it and the work is wedged permanently"
+        );
+
+        // Remove the failing filter so the retry can actually complete.
+        for args in [
+            vec!["config", "--unset", "filter.always-fail.smudge"],
+            vec!["config", "--unset", "filter.always-fail.required"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(&source)
+                .output()
+                .expect("git config --unset");
+        }
+
+        // Retry: must succeed because the branch slot was freed.
+        let surface = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec)).expect(
+            "retry must succeed — branch was deleted so it can be recreated with -b; \
+                 if this fails with 'branch already exists', the cleanup is missing",
+        );
+        assert!(surface.bindings[0].worktree_path.is_dir());
+        teardown(&surface);
+    }
+
+    /// The force-retry `teardown_binding` uses for git's blanket "containing
+    /// submodules" refusal must never bypass real dirtiness —
     /// uncommitted content genuinely *inside* the submodule is exactly what
     /// §11's fail-closed rule exists to protect. `git status --porcelain`
     /// already recurses into a registered submodule by default (measured,
@@ -1560,10 +2244,28 @@ mod tests {
         assert!(
             matches!(
                 &report.bindings[0].disposition,
-                BindingDisposition::RetainedDirty { changes } if changes.contains("vendored")
+                BindingDisposition::RetainedDirty { changes, .. } if changes.contains("vendored")
             ),
             "must be retained as dirty (not silently force-removed): {:?}",
             report.bindings[0].disposition
+        );
+        // #109: a submodule-bearing worktree is the fallback case teardown
+        // still retains the *whole directory* for, because `git add -A` in
+        // the superproject cannot see the submodule's own uncommitted
+        // content — only its commit pointer. `patch` staying `None` is what
+        // proves the capture path was skipped rather than silently
+        // under-capturing it.
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert!(
+            patch.is_none(),
+            "a submodule-bearing worktree must fall back to whole-directory retention, \
+             not a patch that cannot see inside the submodule: {patch:?}"
         );
         assert!(
             worktree.exists() && worktree.join("vendored").join("actors-work.txt").is_file(),
@@ -1921,5 +2623,275 @@ mod tests {
             attach(data.path(), "01EMPTY", "01TARGET", &[]),
             Err(SurfaceError::NoRepositories)
         ));
+    }
+
+    // ------------------------------------------------------------- #109
+
+    /// The retention-scope clause itself, pinned end to end: a dirty
+    /// worktree with a genuinely wanted untracked file *and* gitignored
+    /// build output produces a patch that captures the former and excludes
+    /// the latter, and the (potentially huge) directory is gone afterward.
+    /// Reverting `retain_dirty`/`capture_dirty_patch` back to "leave the
+    /// whole directory" fails the `!worktree.exists()` assertion; reverting
+    /// to "stage everything, ignoring .gitignore" would fail the
+    /// `!patch_text.contains("compiled output")` assertion instead.
+    #[test]
+    fn teardown_captures_an_untracked_wanted_file_and_excludes_gitignored_build_output() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01SCOPE", std::slice::from_ref(&spec)).expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        std::fs::write(worktree.join(".gitignore"), "target/\n").expect(".gitignore");
+        git_as_test_identity(&worktree, &["add", ".gitignore"]);
+        git_as_test_identity(&worktree, &["commit", "-m", "ignore target/"]);
+
+        // A file worth keeping, never `git add`ed — exactly #109's "hard
+        // case".
+        std::fs::write(worktree.join("new-module.rs"), "fn wanted() {}\n").expect("untracked");
+        // Gitignored build output, large in spirit — #109's whole point is
+        // that this must never end up retained.
+        std::fs::create_dir_all(worktree.join("target")).expect("target dir");
+        std::fs::write(worktree.join("target").join("big.bin"), "compiled output")
+            .expect("build artifact");
+
+        let report = teardown(&surface);
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let patch = patch.as_ref().expect("must capture a patch");
+        assert!(
+            !worktree.exists(),
+            "the directory — target/ included — must be gone, not just the tracked bits"
+        );
+
+        let patch_text = std::fs::read_to_string(&patch.path).expect("read captured patch");
+        assert!(
+            patch_text.contains("new-module.rs") && patch_text.contains("fn wanted()"),
+            "the untracked-but-wanted file must be captured: {patch_text}"
+        );
+        assert!(
+            !patch_text.contains("target/big.bin") && !patch_text.contains("compiled output"),
+            "gitignored build output must never enter the patch: {patch_text}"
+        );
+        assert_eq!(
+            patch.bytes,
+            patch_text.len() as u64,
+            "the recorded size must match what was actually written"
+        );
+    }
+
+    /// no-mistakes review fix: if `retain_dirty` captures the patch but the
+    /// `git worktree remove --force` that follows fails, the worktree
+    /// directory is still on disk — reporting `patch: Some` in that case (the
+    /// pre-fix behavior) would make the directory invisible to
+    /// [`retained_bindings`]/`reap_binding`, which only look for it when
+    /// `patch` is `None`, leaking it permanently. `git worktree lock` makes
+    /// the removal fail deterministically, without needing root or a
+    /// filesystem-specific immutable bit.
+    #[test]
+    fn a_dirty_worktree_whose_removal_fails_falls_back_to_the_directory_not_a_leaked_patch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01LOCKED", std::slice::from_ref(&spec)).expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty");
+        // A single `--force` (what `retain_dirty` actually passes) refuses on
+        // a locked worktree — "use 'remove -f -f' to override" — so this
+        // reliably fails the removal after the patch capture already
+        // succeeded, without touching filesystem permissions.
+        git(
+            &spec.path,
+            &["worktree", "lock", &worktree.display().to_string()],
+        )
+        .expect("lock the worktree");
+
+        let report = teardown(&surface);
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert!(
+            patch.is_none(),
+            "a failed removal must fall back to patch: None, not report a patch over a \
+             directory that never actually went away: {patch:?}"
+        );
+        assert!(
+            worktree.exists(),
+            "the directory git refused to remove must still be there"
+        );
+
+        // The fix's whole point: `retained_bindings` must still find it, via
+        // the directory rather than a patch file that (best-effort) no
+        // longer exists.
+        let retained = retained_bindings(&report);
+        let entry = retained
+            .iter()
+            .find(|r| r.repository == "solo")
+            .unwrap_or_else(|| {
+                panic!("the locked binding must still be discoverable: {retained:?}")
+            });
+        assert_eq!(
+            entry.path, worktree,
+            "must point at the surviving directory"
+        );
+
+        // Cleanup: unlock so the tempdir's own teardown can remove it.
+        let _ = git(
+            &spec.path,
+            &["worktree", "unlock", &worktree.display().to_string()],
+        );
+    }
+
+    /// [`retained_bindings`] (`sgt work retained`'s inspect verb): a
+    /// captured patch reports its exact known size; a `RetainedError`
+    /// binding — no patch, since nothing was ever captured for it — is
+    /// still surfaced, with a live directory-size measurement rather than a
+    /// stale or absent one.
+    #[test]
+    fn retained_bindings_reports_a_captured_patch_and_a_retained_error_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(data.path(), "01INSPECT", std::slice::from_ref(&spec))
+            .expect("materialize");
+        std::fs::write(surface.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
+        let report = teardown(&surface);
+
+        let error_binding = BindingTeardown {
+            repository: "other".to_string(),
+            worktree_path: dir.path().join("some-other-worktree"),
+            work_branch: "sergeant/01INSPECT".to_string(),
+            final_sha: None,
+            disposition: BindingDisposition::RetainedError {
+                detail: "fatal: could not read status".to_string(),
+            },
+        };
+        std::fs::create_dir_all(&error_binding.worktree_path).expect("stand-in directory");
+        std::fs::write(error_binding.worktree_path.join("evidence.txt"), "12345").expect("file");
+
+        let mut combined = report.clone();
+        combined.bindings.push(error_binding);
+
+        let retained = retained_bindings(&combined);
+        assert_eq!(
+            retained.len(),
+            2,
+            "both bindings hold something: {retained:?}"
+        );
+
+        let BindingDisposition::RetainedDirty {
+            patch: Some(expected),
+            ..
+        } = &combined.bindings[0].disposition
+        else {
+            panic!(
+                "expected a captured patch: {:?}",
+                combined.bindings[0].disposition
+            );
+        };
+        let dirty = retained
+            .iter()
+            .find(|r| r.repository == "solo")
+            .expect("the captured-patch binding");
+        assert_eq!(dirty.reason, "retained_dirty");
+        assert!(dirty.bytes > 0);
+        assert_eq!(dirty.path, expected.path);
+        assert_eq!(dirty.bytes, expected.bytes);
+
+        let errored = retained
+            .iter()
+            .find(|r| r.repository == "other")
+            .expect("the RetainedError binding");
+        assert_eq!(errored.reason, "retained_error");
+        assert_eq!(
+            errored.bytes, 5,
+            "directory_size must measure the stand-in file"
+        );
+    }
+
+    /// [`reap`]: a captured patch is deleted and its exact size is reported
+    /// freed; a `RetainedError` binding is left alone (no evidence backs a
+    /// forced removal), and a `RetainedDirty` binding with no patch
+    /// (submodule fallback) is force-removed through git rather than a raw
+    /// delete, keeping the source repository's own worktree registry
+    /// truthful.
+    #[test]
+    fn reap_deletes_a_captured_patch_and_leaves_a_retained_error_binding_alone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01REAP", std::slice::from_ref(&spec)).expect("materialize");
+        std::fs::write(surface.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
+        let mut report = teardown(&surface);
+        let BindingDisposition::RetainedDirty {
+            patch: Some(before),
+            ..
+        } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected a captured patch: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let patch_path = before.path.clone();
+        let expected_bytes = before.bytes;
+        assert!(patch_path.is_file(), "the patch must exist before reaping");
+
+        report.bindings.push(BindingTeardown {
+            repository: "other".to_string(),
+            worktree_path: dir.path().join("untouched"),
+            work_branch: "sergeant/01REAP".to_string(),
+            final_sha: None,
+            disposition: BindingDisposition::RetainedError {
+                detail: "fatal: could not read status".to_string(),
+            },
+        });
+
+        let reaped = reap(&surface, &report);
+        assert_eq!(reaped.work_id, "01REAP");
+
+        let solo = reaped
+            .bindings
+            .iter()
+            .find(|b| b.repository == "solo")
+            .expect("solo's reap outcome");
+        assert_eq!(
+            solo.outcome,
+            ReapOutcome::Reaped {
+                bytes: expected_bytes
+            }
+        );
+        assert!(!patch_path.exists(), "the patch must actually be deleted");
+
+        let other = reaped
+            .bindings
+            .iter()
+            .find(|b| b.repository == "other")
+            .expect("other's reap outcome");
+        assert!(
+            matches!(&other.outcome, ReapOutcome::Skipped { .. }),
+            "a RetainedError binding must be left alone: {:?}",
+            other.outcome
+        );
+
+        // Nothing left in the root once the only retained artifact is gone.
+        assert!(
+            !surface.root.exists(),
+            "reaping the last retained artifact must let the root go too"
+        );
     }
 }
