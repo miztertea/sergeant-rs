@@ -154,13 +154,16 @@ pub enum FleetOutcome {
     Open(String),
 }
 
-/// Fleet's own screen state: selection, filters, and whether the filter text
-/// field currently has keyboard focus.
+/// Fleet's own screen state: selection, filters, whether the filter text
+/// field currently has keyboard focus, and whether the Medium tier's
+/// selected-preview toggle (§10.1/§18.2: "selected preview below or
+/// toggle") is open.
 #[derive(Debug, Default)]
 pub struct FleetScreen {
     pub selected: usize,
     pub filters: Filters,
     pub filter_focus: bool,
+    pub preview_open: bool,
 }
 
 impl FleetScreen {
@@ -234,6 +237,9 @@ impl FleetScreen {
             KeyCode::Char('x') if !self.filters.is_default() => {
                 self.filters = Filters::default();
             }
+            // §10.1/§18.2's Medium-tier "selected preview below or toggle" —
+            // a no-op at any other tier, harmlessly (nothing reads it there).
+            KeyCode::Char('v') => self.preview_open = !self.preview_open,
             KeyCode::Enter => {
                 if let Some(id) = self.selected_id(rows) {
                     return FleetOutcome::Open(id);
@@ -260,8 +266,18 @@ fn next_state_filter(current: Option<&str>) -> Option<String> {
 // -------------------------------------------------------------- rendering
 
 /// Draw the Fleet browser: filters, then the Work list, composed per §10.1's
-/// responsive layout.
+/// responsive layout — §18.1's Wide filters+table (the contextual rail's own
+/// preview pane is `mod.rs`'s job, drawn beside this), §18.2's Medium
+/// list-with-toggle (`v` opens a preview pane below the list), and §18.3's
+/// Narrow stacked rows with the filter itself promoted to a full-body
+/// overlay while it has focus (tight columns make a slim top line hard to
+/// read while typing).
 pub fn render(frame: &mut Frame, area: Rect, rows: &[WorkRow], screen: &FleetScreen, tier: Tier) {
+    if tier == Tier::Narrow && screen.filter_focus {
+        render_filter_overlay(frame, area, screen);
+        return;
+    }
+
     let visible = screen.visible(rows);
     let title = format!(
         "Fleet — {} work{}{}",
@@ -296,11 +312,47 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[WorkRow], screen: &FleetScr
         return;
     }
 
+    // §18.2/§10.1: Medium's "selected preview below or toggle" — a bottom
+    // pane that opens only when the operator asks for it (`v`), since
+    // Medium has no reserved rail columns to spend on it unconditionally.
+    let (list_area, preview_area) = if tier == Tier::Medium && screen.preview_open {
+        let [list, preview] = ratatui::layout::Layout::vertical([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .areas(list_area);
+        (list, Some(preview))
+    } else {
+        (list_area, None)
+    };
+
     match tier {
         Tier::Narrow => render_stacked(frame, list_area, &visible, screen.selected),
         Tier::Medium => render_table(frame, list_area, &visible, screen.selected, false),
         _ => render_table(frame, list_area, &visible, screen.selected, true),
     }
+
+    if let Some(preview_area) = preview_area {
+        let selected = visible.get(screen.selected).copied();
+        super::work_view::render_preview(frame, preview_area, selected);
+    }
+}
+
+/// §18.3: Narrow's filter, promoted to a full-body overlay while it has
+/// focus (mirrors how the Attention drawer and contextual rail themselves
+/// become full-body overlays at Narrow, §18.3's own rule, rather than a
+/// second, competing mechanism).
+fn render_filter_overlay(frame: &mut Frame, area: Rect, screen: &FleetScreen) {
+    let block = Block::bordered()
+        .title("Fleet Filter")
+        .border_style(Style::default().fg(Token::Focus.rgb()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let text = format!(
+        "filter> {}_\n\nEnter/Esc applies and returns to the list.",
+        screen.filters.text
+    );
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
 fn filter_line(screen: &FleetScreen) -> Paragraph<'static> {
@@ -318,7 +370,8 @@ fn filter_line(screen: &FleetScreen) -> Paragraph<'static> {
         format!("filter> {}_", screen.filters.text)
     } else {
         format!(
-            "filter: {} · state {state} · nonterminal {nonterminal}  ('/' filter · 's' state · 'a' nonterminal · 'x' clear)",
+            "filter: {} · state {state} · nonterminal {nonterminal}  \
+             ('/' filter · 's' state · 'a' nonterminal · 'v' preview · 'x' clear)",
             if screen.filters.text.is_empty() {
                 "-"
             } else {
@@ -675,5 +728,93 @@ mod tests {
             parse_rfc3339_secs("2024-01-01T00:00:00Z"),
             Some(1_704_067_200)
         );
+    }
+
+    // --------------------------------------------- T1c: responsive Fleet
+
+    fn render_text(rows: &[WorkRow], screen: &FleetScreen, tier: Tier, width: u16) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
+            .expect("terminal");
+        terminal
+            .draw(|frame| render(frame, frame.area(), rows, screen, tier))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer.cell((x, y)).map_or(" ", |c| c.symbol()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn v_toggles_the_medium_preview_pane() {
+        let rows = fleet_rows(&fleet_of(&[("a", "running")]));
+        let mut screen = FleetScreen::default();
+        assert!(!screen.preview_open);
+        screen.on_key(KeyCode::Char('v'), &rows);
+        assert!(screen.preview_open);
+        screen.on_key(KeyCode::Char('v'), &rows);
+        assert!(!screen.preview_open);
+    }
+
+    #[test]
+    fn medium_shows_the_preview_pane_only_once_toggled_open() {
+        let rows = fleet_rows(&fleet_of(&[("needle-id", "running")]));
+        let mut screen = FleetScreen::default();
+        let text = render_text(&rows, &screen, Tier::Medium, 120);
+        assert!(
+            !text.contains("Enter opens the full Work surface"),
+            "closed by default: {text}"
+        );
+
+        screen.preview_open = true;
+        let text = render_text(&rows, &screen, Tier::Medium, 120);
+        assert!(
+            text.contains("Enter opens the full Work surface"),
+            "the preview pane must appear once opened: {text}"
+        );
+    }
+
+    #[test]
+    fn wide_ignores_the_medium_toggle_since_the_rail_is_always_inline() {
+        let rows = fleet_rows(&fleet_of(&[("a", "running")]));
+        let screen = FleetScreen {
+            preview_open: true,
+            ..FleetScreen::default()
+        };
+        let text = render_text(&rows, &screen, Tier::Wide, 200);
+        assert!(
+            !text.contains("Enter opens the full Work surface"),
+            "Wide's rail is `mod.rs`'s job, not Fleet's own preview toggle: {text}"
+        );
+    }
+
+    #[test]
+    fn narrow_promotes_a_focused_filter_to_a_full_body_overlay() {
+        let rows = fleet_rows(&fleet_of(&[("a", "running")]));
+        let screen = FleetScreen {
+            filter_focus: true,
+            filters: Filters {
+                text: "bud".to_string(),
+                ..Filters::default()
+            },
+            ..FleetScreen::default()
+        };
+        let text = render_text(&rows, &screen, Tier::Narrow, 80);
+        assert!(text.contains("Fleet Filter"), "{text}");
+        assert!(text.contains("bud"), "{text}");
+    }
+
+    #[test]
+    fn narrow_shows_the_ordinary_stacked_list_when_the_filter_is_not_focused() {
+        let rows = fleet_rows(&fleet_of(&[("a", "running")]));
+        let screen = FleetScreen::default();
+        let text = render_text(&rows, &screen, Tier::Narrow, 80);
+        assert!(!text.contains("Fleet Filter"), "{text}");
+        assert!(text.contains("intent for a"), "{text}");
     }
 }

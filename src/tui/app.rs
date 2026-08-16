@@ -4,7 +4,7 @@
 //! per-destination screens in [`super::home`], [`super::fleet`],
 //! [`super::workflows`], and [`super::estate`].
 
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use serde_json::Value;
 
 use crate::api::{ApiClient, ClientError};
@@ -81,6 +81,36 @@ pub enum Action {
     /// §13.5's bounded "load older": grow the open Work's Evidence window
     /// and re-fetch.
     LoadOlderEvidence,
+    /// §15.1's `ANSWER` composer, deliberately submitted (§15.2/§15.5).
+    Respond { id: String, input: String },
+    /// §15.5: confirmed from [`Overlay::CancelConfirmation`].
+    Cancel(String),
+    /// §15.5: confirmed from [`Overlay::RetryConfirmation`].
+    Retry(String),
+    /// §15.5: confirmed from [`Overlay::ExtendEnvelope`], with the explicit
+    /// added-turns value the operator entered.
+    Extend { id: String, additional_turns: u32 },
+    /// §15.5: confirmed from [`Overlay::ReapConfirmation`].
+    Reap(String),
+}
+
+/// Live state for the one confirmation overlay open, if any (§7.4: the
+/// mechanism in [`super::overlay`] is a fixed, dataless set of panels; this
+/// is the one variant's worth of payload [`Overlay::ExtendEnvelope`] and its
+/// siblings actually need — the digits typed so far, which control has
+/// focus, and the last rejected attempt).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PendingAction {
+    /// §15.5's "explicit added-turns input" — digits only.
+    pub extend_turns: String,
+    /// Whether the Confirm control (rather than the turns field) has focus —
+    /// Tab moves between them (§15.2). Cancel/Retry/Reap have no field to
+    /// leave, so Confirm is always the target there.
+    pub confirm_focused: bool,
+    /// Set when a confirmed mutation comes back with a structured error —
+    /// shown inline rather than the overlay silently closing on a race
+    /// (§13.10's closing lines).
+    pub last_error: Option<String>,
 }
 
 /// The TUI's whole state: what was read from the API, and where the cursor is.
@@ -102,6 +132,9 @@ pub struct App {
     pub work_screen: Option<WorkScreen>,
     /// The one open overlay, if any (§7.4).
     pub overlay: Option<Overlay>,
+    /// The confirmation overlay's own live state (§15.5) — reset whenever an
+    /// overlay opens or closes.
+    pub pending_action: PendingAction,
     /// Whether the global Attention drawer is showing (§7.3: opens by
     /// default at Wide; `~` toggles it at any tier).
     pub drawer_open: bool,
@@ -128,6 +161,7 @@ impl App {
             open_work: None,
             work_screen: None,
             overlay: None,
+            pending_action: PendingAction::default(),
             drawer_open: true,
             system: Value::default(),
             last_seq: 0,
@@ -206,8 +240,14 @@ impl App {
         }
     }
 
-    /// Interpret one keystroke.
-    pub fn on_key(&mut self, key: KeyCode) -> Action {
+    /// Interpret one keystroke. `impl Into<KeyEvent>` rather than a bare
+    /// `KeyEvent` so every existing call site that only ever named a
+    /// `KeyCode` — every test in this tree, and every one in
+    /// `tests/m6_surfaces.rs` — keeps compiling unchanged (crossterm's own
+    /// `From<KeyCode> for KeyEvent` fills in empty modifiers), while the
+    /// production loop forwards the full event `Ctrl+Enter` needs (§15.2).
+    pub fn on_key(&mut self, key: impl Into<KeyEvent>) -> Action {
+        let key: KeyEvent = key.into();
         if self.overlay.is_some() {
             return self.on_key_overlay(key);
         }
@@ -216,7 +256,7 @@ impl App {
         }
 
         if !self.wants_text_focus()
-            && let Some(action) = self.on_key_global(key)
+            && let Some(action) = self.on_key_global(key.code)
         {
             return action;
         }
@@ -226,7 +266,7 @@ impl App {
                 HomeOutcome::None => Action::None,
                 HomeOutcome::Submit(body) => Action::Submit(body),
             },
-            Destination::Fleet => match self.fleet.on_key(key, &self.rows) {
+            Destination::Fleet => match self.fleet.on_key(key.code, &self.rows) {
                 FleetOutcome::None => Action::None,
                 FleetOutcome::Open(id) => Action::OpenWork(id),
             },
@@ -255,24 +295,122 @@ impl App {
         Some(Action::None)
     }
 
-    fn on_key_overlay(&mut self, key: KeyCode) -> Action {
-        match key {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.overlay = None,
-            _ => {}
+    /// The id of the Work a confirmation overlay acts on — always the one
+    /// currently open, since these overlays only ever reach the keymap from
+    /// inside the canonical Work surface (§13.10).
+    fn open_work_id(&self) -> Option<String> {
+        self.open_work.as_ref().map(|w| w.id.clone())
+    }
+
+    /// Abort the open confirmation overlay without effect (§15.5's Esc
+    /// path): nothing is sent, and the pending draft is dropped since it was
+    /// never a durable Work draft to begin with.
+    fn close_overlay(&mut self) {
+        self.overlay = None;
+        self.pending_action = PendingAction::default();
+    }
+
+    fn on_key_overlay(&mut self, key: KeyEvent) -> Action {
+        let Some(overlay) = self.overlay else {
+            return Action::None;
+        };
+        match overlay {
+            // The four T1c owns render real, live content but share the same
+            // fixed set of controls with the others: Esc/q aborts, Enter (on
+            // Confirm) fires the mutation. Tab has nothing to move to.
+            Overlay::CancelConfirmation
+            | Overlay::RetryConfirmation
+            | Overlay::ReapConfirmation => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+                    KeyCode::Enter => {
+                        let Some(id) = self.open_work_id() else {
+                            self.close_overlay();
+                            return Action::None;
+                        };
+                        return match overlay {
+                            Overlay::CancelConfirmation => Action::Cancel(id),
+                            Overlay::RetryConfirmation => Action::Retry(id),
+                            Overlay::ReapConfirmation => Action::Reap(id),
+                            _ => unreachable!("matched above"),
+                        };
+                    }
+                    _ => {}
+                }
+                Action::None
+            }
+            Overlay::ExtendEnvelope => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        self.pending_action.confirm_focused = !self.pending_action.confirm_focused;
+                    }
+                    KeyCode::Backspace if !self.pending_action.confirm_focused => {
+                        self.pending_action.extend_turns.pop();
+                    }
+                    KeyCode::Char(c)
+                        if !self.pending_action.confirm_focused && c.is_ascii_digit() =>
+                    {
+                        self.pending_action.extend_turns.push(c);
+                    }
+                    KeyCode::Enter if !self.pending_action.confirm_focused => {
+                        self.pending_action.confirm_focused = true;
+                    }
+                    KeyCode::Enter if self.pending_action.confirm_focused => {
+                        let parsed = self.pending_action.extend_turns.trim().parse::<u32>();
+                        let Some(id) = self.open_work_id() else {
+                            self.close_overlay();
+                            return Action::None;
+                        };
+                        match parsed {
+                            Ok(additional_turns) if additional_turns > 0 => {
+                                return Action::Extend {
+                                    id,
+                                    additional_turns,
+                                };
+                            }
+                            _ => {
+                                self.pending_action.last_error = Some(
+                                    "enter a whole number of turns greater than zero".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                Action::None
+            }
+            // Every overlay a later Work owns (§7.4's note): the mechanism
+            // this Work built at T1a — open, close, restore focus for free —
+            // with no content of its own yet.
+            Overlay::Help
+            | Overlay::SlashPalette
+            | Overlay::WorkflowChooser
+            | Overlay::RepoAddRemove
+            | Overlay::GroupEditRemove
+            | Overlay::RetainedPreview
+            | Overlay::ConnectionDetail => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => self.overlay = None,
+                    _ => {}
+                }
+                Action::None
+            }
         }
-        Action::None
     }
 
     /// Every key inside an open Work surface is the surface's own to
     /// interpret (§13.2's tab switching and each tab's local navigation) —
-    /// `App` only acts on the two outcomes that reach outside the surface
-    /// itself: closing it, and asking for an API round trip Evidence's
-    /// bounded "load older" needs.
-    fn on_key_open_work(&mut self, key: KeyCode) -> Action {
+    /// `App` only acts on the outcomes that reach outside the surface
+    /// itself: closing it, an API round trip Evidence's bounded "load
+    /// older" needs, a deliberately submitted Answer (§15.1/§15.2), and
+    /// opening one of §13.10's confirmation overlays (the mutation itself
+    /// waits on that overlay's own deliberate Confirm, per §15.5).
+    fn on_key_open_work(&mut self, key: KeyEvent) -> Action {
         let Some(screen) = self.work_screen.as_mut() else {
             // The opening fetch is still in flight: only Esc/q is
             // meaningful yet (there is nothing else to navigate).
-            if matches!(key, KeyCode::Esc | KeyCode::Char('q')) {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.open_work = None;
             }
             return Action::None;
@@ -285,6 +423,36 @@ impl App {
                 Action::None
             }
             WorkScreenOutcome::LoadOlder => Action::LoadOlderEvidence,
+            WorkScreenOutcome::Respond(input) => {
+                let Some(id) = self.open_work_id() else {
+                    return Action::None;
+                };
+                Action::Respond { id, input }
+            }
+            WorkScreenOutcome::AnswerRefused => {
+                self.status = "answer is empty".to_string();
+                Action::None
+            }
+            WorkScreenOutcome::OpenCancelConfirm => {
+                self.pending_action = PendingAction::default();
+                self.overlay = Some(Overlay::CancelConfirmation);
+                Action::None
+            }
+            WorkScreenOutcome::OpenRetryConfirm => {
+                self.pending_action = PendingAction::default();
+                self.overlay = Some(Overlay::RetryConfirmation);
+                Action::None
+            }
+            WorkScreenOutcome::OpenExtendEnvelope => {
+                self.pending_action = PendingAction::default();
+                self.overlay = Some(Overlay::ExtendEnvelope);
+                Action::None
+            }
+            WorkScreenOutcome::OpenReapConfirm => {
+                self.pending_action = PendingAction::default();
+                self.overlay = Some(Overlay::ReapConfirmation);
+                Action::None
+            }
         }
     }
 
@@ -331,6 +499,83 @@ impl App {
                     self.status = format!("could not load older evidence: {e}");
                 }
                 Action::None
+            }
+            // §15.1's Answer, deliberately submitted. The draft clears only
+            // once the daemon accepts it (§15.2/§9.2's rule, reused here) —
+            // a failure leaves it exactly as the operator wrote it.
+            Action::Respond { id, input } => {
+                match client.respond(&id, &input).await {
+                    Ok(_) => {
+                        self.status = format!("responded to {id}");
+                        if let Some(screen) = &mut self.work_screen {
+                            screen.clear_answer();
+                        }
+                    }
+                    Err(e) => {
+                        self.status = format!("respond failed: {e}");
+                    }
+                }
+                Action::Refresh
+            }
+            // §13.10's closing lines: the daemon is authoritative, so every
+            // one of these four always asks for a refresh — a race that
+            // rejects the mutation still gets the true current state, and
+            // the error is recorded on the still-open overlay rather than
+            // the overlay silently vanishing (§15.5).
+            Action::Cancel(id) => {
+                match client.cancel(&id).await {
+                    Ok(_) => {
+                        self.status = format!("canceled {id}");
+                        self.close_overlay();
+                    }
+                    Err(e) => {
+                        self.status = format!("cancel failed: {e}");
+                        self.pending_action.last_error = Some(e.to_string());
+                    }
+                }
+                Action::Refresh
+            }
+            Action::Retry(id) => {
+                match client.retry(&id).await {
+                    Ok(_) => {
+                        self.status = format!("retrying {id}");
+                        self.close_overlay();
+                    }
+                    Err(e) => {
+                        self.status = format!("retry failed: {e}");
+                        self.pending_action.last_error = Some(e.to_string());
+                    }
+                }
+                Action::Refresh
+            }
+            Action::Extend {
+                id,
+                additional_turns,
+            } => {
+                match client.extend(&id, additional_turns).await {
+                    Ok(_) => {
+                        self.status = format!("extended {id} by {additional_turns} turns");
+                        self.close_overlay();
+                    }
+                    Err(e) => {
+                        self.status = format!("extend failed: {e}");
+                        self.pending_action.last_error = Some(e.to_string());
+                    }
+                }
+                Action::Refresh
+            }
+            Action::Reap(id) => {
+                match client.reap(&id, true).await {
+                    Ok(_) => {
+                        self.status = format!("reaped {id}");
+                        self.close_overlay();
+                    }
+                    Err(e) => {
+                        self.status = format!("reap failed: {e}");
+                        self.pending_action.last_error = Some(e.to_string());
+                    }
+                }
+                Action::Refresh
             }
             other => other,
         }
@@ -392,7 +637,7 @@ mod tests {
         for c in "call 1-800 and say q, then ~ and 4".chars() {
             app.on_key(KeyCode::Char(c));
         }
-        assert_eq!(app.home.intent, "call 1-800 and say q, then ~ and 4");
+        assert_eq!(app.home.intent.text(), "call 1-800 and say q, then ~ and 4");
         assert_eq!(
             app.destination,
             Destination::Home,
@@ -423,7 +668,8 @@ mod tests {
         assert_eq!(app.destination, Destination::Home);
         app.on_key(KeyCode::Char('x'));
         assert_eq!(
-            app.home.intent, "x",
+            app.home.intent.text(),
+            "x",
             "the form is editable again, not treated as a nav key"
         );
     }
@@ -541,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn submitting_an_unreachable_daemon_preserves_the_draft_and_reports_the_error() {
         let mut app = App::new();
-        app.home.intent = "fix the thing".to_string();
+        app.home.intent.set_text("fix the thing");
         let client = ApiClient::new("http://127.0.0.1:1", "t").expect("client");
         // Route straight through the executor with a hand-built body instead
         // of walking every Tab press — the form's own submission-shape tests
@@ -555,8 +801,174 @@ mod tests {
         );
         assert!(app.home.last_error.is_some(), "the failure is reported");
         assert_eq!(
-            app.home.intent, "fix the thing",
+            app.home.intent.text(),
+            "fix the thing",
             "and the draft survives it"
+        );
+    }
+
+    // ------------------------------------------------- T1c: mutation wiring
+
+    /// An app with `id` open at `state` — every mutation-keymap test starts
+    /// from here, since respond/cancel/retry/extend/reap only ever reach the
+    /// keymap from inside the canonical Work surface.
+    fn app_with_open_work(id: &str, state: &str) -> App {
+        let mut app = App::new();
+        app.rows = fleet_rows(&fleet_of(&[(id, state)]));
+        app.destination = Destination::Fleet;
+        app.open_work = Some(OpenWork {
+            id: id.to_string(),
+            from: Destination::Fleet,
+        });
+        app.work_screen = Some(WorkScreen::from_parts(
+            id.to_string(),
+            json!({
+                "work": {"id": id, "intent": "fix the thing", "state": state},
+                "stage": {"stage_id": "10-implement", "attempt": 2},
+                "envelope": {"turn_cap": 12, "turns_spawned": 3},
+            }),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        app
+    }
+
+    #[test]
+    fn c_opens_the_cancel_confirmation_and_esc_aborts_it_without_effect() {
+        let mut app = app_with_open_work("a", "blocked");
+        assert_eq!(app.on_key(KeyCode::Char('c')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::CancelConfirmation));
+
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert!(app.overlay.is_none(), "Esc aborts, no request queued");
+    }
+
+    #[test]
+    fn enter_on_the_cancel_confirmation_asks_to_cancel_the_open_work() {
+        let mut app = app_with_open_work("a", "blocked");
+        app.on_key(KeyCode::Char('c'));
+        assert_eq!(
+            app.on_key(KeyCode::Enter),
+            Action::Cancel("a".to_string()),
+            "the deliberate Enter on Confirm is what actually asks to mutate"
+        );
+    }
+
+    #[test]
+    fn an_action_key_is_a_no_op_when_the_matrix_does_not_offer_it() {
+        // completed offers only "inspect" (§13.10) — cancel/retry/extend/
+        // reap/respond must all be no-ops, not silently open a confirmation
+        // for a mutation the daemon would refuse anyway.
+        let mut app = app_with_open_work("a", "completed");
+        for key in ['c', 't', 'e', 'p', 'r'] {
+            assert_eq!(app.on_key(KeyCode::Char(key)), Action::None);
+            assert!(app.overlay.is_none(), "{key} must not open anything");
+        }
+    }
+
+    #[test]
+    fn t_opens_retry_and_p_opens_reap_only_where_the_matrix_allows_them() {
+        let mut app = app_with_open_work("a", "failed");
+        assert_eq!(app.on_key(KeyCode::Char('t')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::RetryConfirmation));
+        assert_eq!(
+            app.on_key(KeyCode::Char('p')),
+            Action::None,
+            "reap is not offered for failed"
+        );
+
+        let mut app = app_with_open_work("a", "completed_dirty");
+        assert_eq!(app.on_key(KeyCode::Char('p')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::ReapConfirmation));
+    }
+
+    #[test]
+    fn extend_requires_a_nonzero_turn_count_before_confirming() {
+        let mut app = app_with_open_work("a", "blocked");
+        assert_eq!(app.on_key(KeyCode::Char('e')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::ExtendEnvelope));
+
+        // Confirm with nothing typed: refused, overlay stays open with a
+        // reason rather than silently doing nothing (§15.5).
+        app.on_key(KeyCode::Tab); // field -> Confirm
+        assert_eq!(app.on_key(KeyCode::Enter), Action::None);
+        assert!(app.overlay.is_some(), "the overlay stays open on refusal");
+        assert!(app.pending_action.last_error.is_some());
+
+        // Back to the field, type digits, confirm for real.
+        app.on_key(KeyCode::Tab); // Confirm -> field
+        for c in "5".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        app.on_key(KeyCode::Tab); // field -> Confirm
+        assert_eq!(
+            app.on_key(KeyCode::Enter),
+            Action::Extend {
+                id: "a".to_string(),
+                additional_turns: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn r_focuses_the_answer_composer_and_ctrl_enter_asks_to_respond() {
+        let mut app = app_with_open_work("a", "needs_input");
+        assert_eq!(app.on_key(KeyCode::Char('r')), Action::None);
+        for c in "go ahead".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        let ctrl_enter = KeyEvent::new(
+            KeyCode::Enter,
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert_eq!(
+            app.on_key(ctrl_enter),
+            Action::Respond {
+                id: "a".to_string(),
+                input: "go ahead".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_cancel_keeps_the_confirmation_open_with_the_error_and_still_refreshes() {
+        let mut app = app_with_open_work("a", "blocked");
+        app.overlay = Some(Overlay::CancelConfirmation);
+        let client = ApiClient::new("http://127.0.0.1:1", "t").expect("client");
+        let outcome = app.execute(&client, Action::Cancel("a".to_string())).await;
+        assert_eq!(outcome, Action::Refresh, "a race still triggers a refresh");
+        assert_eq!(
+            app.overlay,
+            Some(Overlay::CancelConfirmation),
+            "the screen (the open confirmation) is preserved, not silently closed"
+        );
+        assert!(app.pending_action.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_respond_preserves_the_draft() {
+        let mut app = app_with_open_work("a", "needs_input");
+        app.on_key(KeyCode::Char('r'));
+        for c in "the answer".chars() {
+            app.on_key(KeyCode::Char(c));
+        }
+        let client = ApiClient::new("http://127.0.0.1:1", "t").expect("client");
+        let outcome = app
+            .execute(
+                &client,
+                Action::Respond {
+                    id: "a".to_string(),
+                    input: "the answer".to_string(),
+                },
+            )
+            .await;
+        assert_eq!(outcome, Action::Refresh);
+        assert!(app.status.contains("respond failed"), "{}", app.status);
+        assert_eq!(
+            app.work_screen.as_ref().unwrap().answer_text_for_test(),
+            "the answer",
+            "a failed respond must not clear the draft"
         );
     }
 }

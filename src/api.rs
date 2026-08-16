@@ -3056,6 +3056,27 @@ impl ApiClient {
         .await
     }
 
+    /// `POST /v1/work/{id}/retry` with a fresh command id (§26).
+    pub async fn retry(&self, id: &str) -> Result<Value, ClientError> {
+        self.post(
+            &format!("/v1/work/{id}/retry"),
+            &json!({"command_id": ulid::Ulid::generate().to_string()}),
+        )
+        .await
+    }
+
+    /// `POST /v1/work/{id}/extend` with a fresh command id (§26).
+    pub async fn extend(&self, id: &str, additional_turns: u32) -> Result<Value, ClientError> {
+        self.post(
+            &format!("/v1/work/{id}/extend"),
+            &json!({
+                "command_id": ulid::Ulid::generate().to_string(),
+                "additional_turns": additional_turns,
+            }),
+        )
+        .await
+    }
+
     /// `GET /v1/retained` — #109's inspect verb: every repository binding
     /// any terminal Work's teardown left something on disk for, estate-wide.
     pub async fn retained(&self) -> Result<Value, ClientError> {

@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event as TermEvent, KeyEvent, KeyEventKind};
 
 /// How long the key reader waits between polls before checking for shutdown.
 pub const KEY_POLL: Duration = Duration::from_millis(200);
@@ -54,7 +54,7 @@ impl KeyReader {
     /// Start reading keys off `tick` into `keys`.
     pub fn spawn(
         mut tick: impl FnMut() -> ReaderTick + Send + 'static,
-        keys: tokio::sync::mpsc::UnboundedSender<KeyCode>,
+        keys: tokio::sync::mpsc::UnboundedSender<KeyEvent>,
     ) -> Self {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -85,8 +85,10 @@ impl KeyReader {
 /// One turn of the key reader: what the terminal produced, or that it is over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderTick {
-    /// A key was pressed.
-    Key(KeyCode),
+    /// A key was pressed. The full event (code, modifiers, kind, state) is
+    /// kept — §8.8's Decision T2-32 — so a caller can tell `Enter` from
+    /// `Ctrl+Enter` (§15.2), which a bare `KeyCode` cannot.
+    Key(KeyEvent),
     /// Nothing happened within the poll window.
     Idle,
     /// The terminal ended — end of input, or a read that failed. Terminal in
@@ -104,7 +106,7 @@ pub enum ReaderTick {
 pub fn read_keys(
     mut tick: impl FnMut() -> ReaderTick,
     stop: &std::sync::mpsc::Receiver<()>,
-    keys: &tokio::sync::mpsc::UnboundedSender<KeyCode>,
+    keys: &tokio::sync::mpsc::UnboundedSender<KeyEvent>,
 ) {
     loop {
         // Asked to stop, or the loop that asked is gone: either way, done.
@@ -176,12 +178,81 @@ pub fn guarded_tick(tty: &TtyWatch, poll: fn() -> ReaderTick) -> ReaderTick {
 pub fn crossterm_poll() -> ReaderTick {
     match event::poll(KEY_POLL) {
         Ok(true) => match event::read() {
-            Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => ReaderTick::Key(key.code),
+            Ok(TermEvent::Key(key)) if key.kind == KeyEventKind::Press => ReaderTick::Key(key),
             Ok(_) => ReaderTick::Idle,
             Err(_) => ReaderTick::Ended,
         },
         Ok(false) => ReaderTick::Idle,
         Err(_) => ReaderTick::Ended,
+    }
+}
+
+/// §8.8's Decision T2-32: opportunistically request disambiguated modified
+/// keys (e.g. distinguishing `Ctrl+Enter` from plain `Enter`) so §15.2's
+/// submit key is reachable directly rather than only through the Tab-to-Send
+/// fallback. Generic over the sink so the escape sequence itself — not a
+/// live terminal — is what a test can check; failure is nonfatal (many
+/// terminals do not support the Kitty keyboard protocol), which is exactly
+/// why Ctrl+Enter is never the only route to submit.
+pub fn push_keyboard_enhancement<W: std::io::Write>(out: &mut W) {
+    use event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    let _ = ratatui::crossterm::execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+}
+
+/// The other half of [`push_keyboard_enhancement`] — always run before
+/// [`ratatui::try_restore`], on every exit path (see `super::run`), the same
+/// way this module already restores raw mode on every path.
+pub fn pop_keyboard_enhancement<W: std::io::Write>(out: &mut W) {
+    use event::PopKeyboardEnhancementFlags;
+    let _ = ratatui::crossterm::execute!(out, PopKeyboardEnhancementFlags);
+}
+
+#[cfg(test)]
+mod keyboard_enhancement_tests {
+    use super::*;
+
+    #[test]
+    fn push_and_pop_write_the_kitty_protocol_escape_sequences() {
+        let mut buf = Vec::new();
+        push_keyboard_enhancement(&mut buf);
+        let text = String::from_utf8(buf).expect("ansi escapes are valid utf8");
+        assert!(
+            text.starts_with("\u{1b}[>") && text.ends_with('u'),
+            "a CSI '>flags u' push sequence: {text:?}"
+        );
+
+        let mut buf = Vec::new();
+        pop_keyboard_enhancement(&mut buf);
+        let text = String::from_utf8(buf).expect("ansi escapes are valid utf8");
+        assert!(
+            text.starts_with("\u{1b}[<") && text.ends_with('u'),
+            "a CSI '<N u' pop sequence: {text:?}"
+        );
+    }
+
+    /// A sink that always errors, standing in for a terminal that does not
+    /// support the Kitty protocol (or has no controlling terminal at all,
+    /// as this suite itself runs under). Neither call may panic or return
+    /// a `Result` the caller is forced to handle — that is the "nonfatal"
+    /// half of Decision T2-32.
+    struct AlwaysErrors;
+
+    impl std::io::Write for AlwaysErrors {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no such terminal"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("no such terminal"))
+        }
+    }
+
+    #[test]
+    fn a_sink_that_refuses_the_write_is_not_fatal() {
+        push_keyboard_enhancement(&mut AlwaysErrors);
+        pop_keyboard_enhancement(&mut AlwaysErrors);
     }
 }
 
@@ -381,6 +452,11 @@ pub(crate) static SIGNALS_QUIET: tokio::sync::Mutex<()> = tokio::sync::Mutex::co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::KeyCode;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
 
     /// The signal arm, exercised for real: install the handlers, send this
     /// process a SIGTERM, and require the future to resolve.
@@ -418,14 +494,14 @@ mod tests {
     /// `Ended`, so a regression fails the test instead of hanging it.
     #[test]
     fn the_key_reader_stops_when_the_terminal_ends() {
-        let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+        let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
         // Kept alive: a dropped sender is itself a stop, and this test is
         // about the *tick* ending the loop.
         let (_stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
         let script = [
             ReaderTick::Idle,
-            ReaderTick::Key(KeyCode::Char('j')),
+            ReaderTick::Key(key(KeyCode::Char('j'))),
             ReaderTick::Ended,
         ];
         let mut calls = 0usize;
@@ -444,7 +520,7 @@ mod tests {
             &keys_tx,
         );
         assert_eq!(calls, script.len(), "every tick was consumed, and no more");
-        assert_eq!(keys.try_recv().ok(), Some(KeyCode::Char('j')));
+        assert_eq!(keys.try_recv().ok(), Some(key(KeyCode::Char('j'))));
         assert!(keys.try_recv().is_err(), "only the key was forwarded");
 
         // The other two ways the loop is over, for completeness: a stop
@@ -463,7 +539,7 @@ mod tests {
             || {
                 sends += 1;
                 assert!(sends < 3, "a closed key channel must end the reader");
-                ReaderTick::Key(KeyCode::Char('k'))
+                ReaderTick::Key(key(KeyCode::Char('k')))
             },
             &stop_rx,
             &keys_tx,
@@ -647,7 +723,7 @@ mod tests {
         use std::time::Instant;
 
         // A reader that returns promptly is waited for and joined.
-        let (keys_tx, _keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+        let (keys_tx, _keys) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
         let reader = KeyReader::spawn(|| ReaderTick::Ended, keys_tx);
         assert_eq!(
             reader.shutdown(),
@@ -658,7 +734,7 @@ mod tests {
         // A reader stuck inside its tick — crossterm's poll on a dead pty is
         // the real one — is left to die with the process.
         const WEDGE: Duration = Duration::from_secs(5);
-        let (keys_tx, _keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+        let (keys_tx, _keys) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
         let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
         let reader = KeyReader::spawn(
             move || {

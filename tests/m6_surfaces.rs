@@ -126,6 +126,23 @@ fn write_workflow(root: &Path) {
     }
 }
 
+/// A one-stage workflow — T1c's mutation tests each drive exactly one Work
+/// through exactly one stage, so a single-stage fixture keeps each test's
+/// `FakeStep` script trivially "one step per turn", with no risk of a
+/// second Work's launch or a retry's re-entry consuming the wrong entry off
+/// a queue shared with anything else.
+fn write_solo_workflow(root: &Path) {
+    let dir = root.join(".sergeant/workflows/solo");
+    std::fs::create_dir_all(&dir).expect("workflow dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"solo\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+    )
+    .expect("workflow.toml");
+    std::fs::create_dir_all(dir.join("00-only")).expect("stage dir");
+    std::fs::write(dir.join("00-only").join("CONTEXT.md"), "context").expect("CONTEXT.md");
+}
+
 async fn start_fake(
     data_dir: &Path,
     script: impl IntoIterator<Item = FakeStep>,
@@ -412,6 +429,211 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
             .iter()
             .any(|w| w["intent"] == "submitted from the tui"),
         "the TUI's New Work form must actually reach the daemon: {fleet}"
+    );
+
+    handle.shutdown().await;
+}
+
+// -------------------------------------------------------- T1c: mutations
+
+/// Respond (§15.1's `ANSWER` composer, §13.10's action matrix) reaches the
+/// real `POST /v1/work/{id}/input` — driven through the actual keymap
+/// (`r`, type the answer, Ctrl+Enter), not a hand-built `Action::Respond`.
+#[tokio::test]
+async fn t1c_respond_reaches_the_real_api_through_the_answer_composer() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(
+        data.path(),
+        [
+            FakeStep::needs_input("which retry budget?"),
+            FakeStep::complete(),
+        ],
+    )
+    .await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "ask a question", "solo").await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    let action = app.execute(&client, Action::OpenWork(id.clone())).await;
+    assert_eq!(action, Action::None);
+    assert_eq!(
+        app.work_screen.as_ref().unwrap().work()["work"]["state"],
+        "needs_input"
+    );
+
+    assert_eq!(
+        app.on_key(ratatui::crossterm::event::KeyCode::Char('r')),
+        Action::None,
+        "'r' focuses the answer composer, it does not itself mutate"
+    );
+    for c in "forty turns".chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    let ctrl_enter = ratatui::crossterm::event::KeyEvent::new(
+        ratatui::crossterm::event::KeyCode::Enter,
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+    let action = app.on_key(ctrl_enter);
+    assert_eq!(
+        action,
+        Action::Respond {
+            id: id.clone(),
+            input: "forty turns".to_string(),
+        }
+    );
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(
+        outcome,
+        Action::Refresh,
+        "a mutation always asks to refresh"
+    );
+    assert!(
+        app.status.contains(&format!("responded to {id}")),
+        "{}",
+        app.status
+    );
+
+    let work = client.work(&id).await.expect("read back");
+    assert_eq!(
+        work["work"]["state"], "completed",
+        "the real POST /v1/work/{{id}}/input resumed the turn, which the \
+         script's next step then completes — a decoration would have left \
+         this Work parked on needs_input forever: {work}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Cancel (§13.10/§15.5) reaches the real `POST /v1/work/{id}/cancel`,
+/// driven through the confirmation overlay's own deliberate Enter.
+#[tokio::test]
+async fn t1c_cancel_reaches_the_real_api_through_the_confirmation() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::waiting("queued upstream")]).await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "wait around", "solo").await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.execute(&client, Action::OpenWork(id.clone())).await;
+    assert_eq!(
+        app.work_screen.as_ref().unwrap().work()["work"]["state"],
+        "waiting"
+    );
+
+    assert_eq!(
+        app.on_key(ratatui::crossterm::event::KeyCode::Char('c')),
+        Action::None
+    );
+    assert!(
+        app.overlay.is_some(),
+        "'c' must open the cancel confirmation before anything is sent"
+    );
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert_eq!(action, Action::Cancel(id.clone()));
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::Refresh);
+    assert!(app.overlay.is_none(), "success closes the confirmation");
+
+    let work = client.work(&id).await.expect("read back");
+    assert_eq!(work["work"]["state"], "canceled", "{work}");
+
+    handle.shutdown().await;
+}
+
+/// Retry (§13.10/§15.5) reaches the real `POST /v1/work/{id}/retry`.
+#[tokio::test]
+async fn t1c_retry_reaches_the_real_api_through_the_confirmation() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) =
+        start_fake(data.path(), [FakeStep::fail("boom"), FakeStep::complete()]).await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "fail then retry", "solo").await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.execute(&client, Action::OpenWork(id.clone())).await;
+    assert_eq!(
+        app.work_screen.as_ref().unwrap().work()["work"]["state"],
+        "failed"
+    );
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('t'));
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert_eq!(action, Action::Retry(id.clone()));
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::Refresh);
+
+    let work = client.work(&id).await.expect("read back");
+    assert_eq!(
+        work["work"]["state"], "completed",
+        "retry re-entered the stage, which the script's next step completes: {work}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Extend (§13.10/§15.5) reaches the real `POST /v1/work/{id}/extend` with
+/// the explicit turns the operator typed, and never implicitly retries
+/// (§13.9's closing rule) — the Work stays `blocked` afterward.
+#[tokio::test]
+async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
+    let data = TempDir::new().expect("tempdir");
+    let repo = TempDir::new().expect("tempdir");
+    init_repo(repo.path());
+    write_solo_workflow(repo.path());
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::blocked("envelope exhausted")]).await;
+    let client = client_for(&handle);
+    let id = submit(&handle, repo.path(), "run out of turns", "solo").await;
+
+    let before = client.work(&id).await.expect("read back");
+    assert_eq!(before["work"]["state"], "blocked");
+    let cap_before = before["envelope"]["turn_cap"].as_u64().expect("turn_cap");
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.execute(&client, Action::OpenWork(id.clone())).await;
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    for c in "5".chars() {
+        app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
+    }
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab); // field -> Confirm
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert_eq!(
+        action,
+        Action::Extend {
+            id: id.clone(),
+            additional_turns: 5,
+        }
+    );
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::Refresh);
+    assert!(app.overlay.is_none(), "success closes the confirmation");
+
+    let after = client.work(&id).await.expect("read back");
+    assert_eq!(
+        after["envelope"]["turn_cap"].as_u64(),
+        Some(cap_before + 5),
+        "{after}"
+    );
+    assert_eq!(
+        after["work"]["state"], "blocked",
+        "extend must not implicitly retry: {after}"
     );
 
     handle.shutdown().await;
