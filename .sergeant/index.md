@@ -8,12 +8,19 @@ Root catalog (`docs/icm/convention.md` §1 rule 1; `docs/icm/record-shapes.md`
 workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 §3 rule 2, the same anti-duplication rule that governs `AGENTS.md`).
 
-23 packages (down from 35 at the MVP-5 F2 execution-surface re-triage,
-2026-08-12): 12 retired — 9 CLI-SURFACE, 1 OPERATOR-SKILL, and the 2
-R-NS-6-dissolved `grilling`/`grill-with-docs` — to
-`skills/` (operator skills, this repository's canonical skill root) or to
-`docs/icm/re-homing-record-2026-08-12.md` (CLI-verb candidates and engine
-gaps). Provenance for every retired package is preserved in git history.
+20 packages (down from 35 at the MVP-5 F2 execution-surface re-triage,
+2026-08-12; down from 23 at ICM-R2, 2026-08-16). Prior retirements: 12 —
+9 CLI-SURFACE, 1 OPERATOR-SKILL, and the 2 R-NS-6-dissolved
+`grilling`/`grill-with-docs` — to `skills/` (operator skills, this
+repository's canonical skill root) or to `docs/icm/re-homing-record-
+2026-08-12.md` (CLI-verb candidates and engine gaps). ICM-R2 retirements
+(`docs/gauntlet/runs/icm-r2/`, `docs/adr/0013-icm-r0-owner-rulings.md`):
+`task-intake-and-route` (ABSORBED — every behavior already duplicated on
+an already-published surface), `sergeant-setup` (SPLIT — folded into
+`skills/estate-navigation/SKILL.md` and `AGENTS.md`'s Guardrails),
+`direct-implementation` (HARVEST — folded into `AGENTS.md`'s "When NOT to
+use `sgt`"). Provenance for every retired package is preserved in git
+history.
 
 | Workflow | Status | Index |
 |---|---|---|
@@ -21,7 +28,6 @@ gaps). Provenance for every retired package is preserved in git history.
 | `cross-repo-work` | published | [`workflows/cross-repo-work/index.md`](workflows/cross-repo-work/index.md) |
 | `deepen-module` | published | [`workflows/deepen-module/index.md`](workflows/deepen-module/index.md) |
 | `diagnose-bug` | published | [`workflows/diagnose-bug/index.md`](workflows/diagnose-bug/index.md) |
-| `direct-implementation` | published | [`workflows/direct-implementation/index.md`](workflows/direct-implementation/index.md) |
 | `dispatch` | published | [`workflows/dispatch/index.md`](workflows/dispatch/index.md) |
 | `implement` | published | [`workflows/implement/index.md`](workflows/implement/index.md) |
 | `load-project` | published | [`workflows/load-project/index.md`](workflows/load-project/index.md) |
@@ -30,8 +36,6 @@ gaps). Provenance for every retired package is preserved in git history.
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
 | `resolving-merge-conflicts` | published | [`workflows/resolving-merge-conflicts/index.md`](workflows/resolving-merge-conflicts/index.md) |
-| `sergeant-setup` | published | [`workflows/sergeant-setup/index.md`](workflows/sergeant-setup/index.md) |
-| `task-intake-and-route` | published | [`workflows/task-intake-and-route/index.md`](workflows/task-intake-and-route/index.md) |
 | `tdd` | published | [`workflows/tdd/index.md`](workflows/tdd/index.md) |
 | `to-spec` | published | [`workflows/to-spec/index.md`](workflows/to-spec/index.md) |
 | `to-tickets` | published | [`workflows/to-tickets/index.md`](workflows/to-tickets/index.md) |

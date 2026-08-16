@@ -1,6 +1,6 @@
 ---
 name: estate-navigation
-description: Resolve an estate's declared repositories, groups, and health before acting in it, and bring its working set up to date — sergeant-rs's equivalent of upstream's sgt-context/sgt-sync.
+description: Resolve an estate's declared repositories, groups, and health before acting in it, bring its working set up to date, register new repos/groups interactively, and file tracked work for gaps `sgt doctor` can't remedy — sergeant-rs's equivalent of upstream's sgt-context/sgt-sync/sergeant-setup.
 ---
 
 Content ported from `reference/sergeant-upstream`'s core function map
@@ -16,6 +16,14 @@ not re-created here; this skill teaches the equivalent judgment against
 sergeant-rs's actual estate model (`sergeant.toml`'s `[estate]`/`[[repo]]`/
 `[group.<name>]`, per `docs/gauntlet/contracts/MVP-1.md`).
 
+**Extended at ICM-R2** (`docs/gauntlet/runs/icm-r2/sergeant-setup/
+adjudication-draft.md`) to absorb `sergeant-setup`'s two remaining live
+behaviors — interactive repo/group registration and capability-gap tracking
+— now that package retired. Both new sections below are live, Captain-
+session judgment (PL-2): they decide whether Work should exist (a registered
+repo/group, a filed td issue), which is why they belong here rather than in
+an admitted background workflow.
+
 ## When to use
 
 Before acting on an estate whose repositories, groups, or health you haven't
@@ -23,7 +31,8 @@ already confirmed this session — never infer which repo or estate you're in
 from the current directory (`AGENTS.md`'s standard workflow loop step 1
 already states this as always-on policy; load this skill when a task needs
 more estate-navigation detail than that one line covers, e.g. "what's
-registered", "sync my repos", "is repo X declared").
+registered", "sync my repos", "is repo X declared", "register a new repo/
+group", "set up this estate", "file a ticket for a missing prerequisite").
 
 ## Resolving estate context (the `sgt-context` equivalent)
 
@@ -69,6 +78,46 @@ not a bug to work around.
   group) while any group still lists it as a member; never deletes
   `repos/<name>` from disk.
 
+## Registering repos and groups interactively
+
+When a user wants to set up or extend an estate rather than just navigate an
+existing one (former `sergeant-setup` `30-project-interview`,
+`BU-P5-024`'s transplantable fragment): ask, one at a time, waiting for each
+answer:
+
+1. For each repository to add: its name, its clone origin URL (or confirm
+   it's already cloned at `repos/<name>`), and which group(s) it belongs to
+   if the estate uses groups.
+2. Run `sgt repo add <name> --origin <url>` per repository — this call is
+   already idempotent (verifies rather than re-clones if the directory
+   exists) and already scoped to `sergeant.toml`/`repos/` only, so no
+   separate preview-and-confirm ceremony is needed before it: the command
+   itself is the confirmable, individually-reversible unit (`sgt repo
+   remove` undoes one entry), not a single monolithic file write.
+3. For group membership, use `sgt group add` (or the manifest's
+   `[group.<name>]` table directly) to record it.
+
+**What this does not cover, on purpose.** The retired interview also asked
+for per-repo role, a free-text `agent_instructions` block (default and per-
+group), and a project-level GitHub identity. None of these have a
+`sergeant.toml` field today (`docs/gauntlet/contracts/MVP-1.md` — the schema
+has `[[repo]] instructions = "local" | "suppress"`, not free text, and no
+GitHub-identity or Graphify-path field at the estate level). Don't invent
+values for fields that don't exist; if a user asks for one of these, say
+plainly that sergeant-rs's estate model doesn't have that field yet rather
+than fabricating a place to put the answer.
+
+## Filing tracked work for a gap `sgt doctor` can't remedy
+
+When `sgt doctor` reports a failing check it names no remedy for, or a
+required/optional prerequisite is otherwise confirmed unsupported (former
+`sergeant-setup` `05-file-capability-gaps`, `BU-P5-012`): draft a `td` issue
+— title, description, acceptance criteria — and show it in full for explicit
+`y`/`yes` approval before creating it. On decline, do not create it; report
+the gap plainly (in the session or in the estate-health summary you're
+already giving the user) instead of silently dropping it or silently filing
+it without consent.
+
 ## Guardrails this inherits from `AGENTS.md`
 
 `sgt init`/`sgt repo add`/`sgt group add` write only within the estate they
@@ -77,4 +126,41 @@ configuration, and never to `AGENTS.md` or `CLAUDE.md` in any repo. A
 missing tool or capability surfaces as `sgt doctor`'s named remedy, never a
 silent skip or an invented workaround — the "no pull verb yet" gap above is
 exactly that kind of honestly-named gap, not license to script something new
-against the daemon's state.
+against the daemon's state. `td`, Graphify, and Treehouse are never
+auto-initialized without an explicit per-tool confirmation prompt — if
+consent is declined, leave the state unchanged and report the skip.
+
+## Bounded judgment
+
+*(Added ICM-R2, closing a pre-existing gap this skill predated —
+`docs/adr/0013-icm-r0-owner-rulings.md` decision 4; `docs/icm/
+convention.md` §6.1 — flagged by the pilot's independent reviewer as a gap
+the sergeant-setup fold made worse by adding new judgment content without
+it.)*
+
+### This skill may decide
+- Whether a fact is already resolvable from `sgt doctor`/`sgt repo list`/
+  `sgt group list` output rather than a genuine registration decision.
+- How to phrase a drafted `td` issue (title, description, acceptance
+  criteria) for the user's approval.
+
+### This skill must ask the user
+- Every repository/group registration field one at a time, waiting for
+  each answer (name, origin, group membership).
+- Explicit `y`/`yes` approval before filing a `td` issue for a capability
+  gap — never filed on decline.
+- Explicit per-tool confirmation before `td`, Graphify, or Treehouse is
+  auto-initialized.
+
+### This skill must not do
+- Invent a value for a `sergeant.toml` field that doesn't exist (per-repo
+  role, free-text `agent_instructions`, a project-level GitHub identity) —
+  say plainly the estate model doesn't have that field yet.
+- Write outside `sergeant.toml`/`repos/`, or to `AGENTS.md`/`CLAUDE.md` in
+  any repo.
+- Silently drop a capability gap or silently file a `td` issue without
+  consent.
+
+### Durable handoff
+A registered repo/group (`sergeant.toml`) or a filed `td` issue, only on
+explicit consent. No other promotable artifact.
