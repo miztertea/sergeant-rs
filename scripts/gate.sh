@@ -158,4 +158,45 @@ if [ -z "$pid" ] || ! daemon_env_ok "$pid"; then
   }
 fi
 
+# #120 pre-flight: no-mistakes's own rebase step resolves its diff base by
+# running `git ls-remote --symref origin HEAD` against this repo's `origin`
+# remote (a live, non-bare working copy on hosts like this one — not a
+# fixed-default-branch host), then rebases the run's branch onto that ref.
+# When this checkout was cut from that same tip, the rebase produces a
+# genuinely empty diff and no-mistakes silently fast-paths to `outcome:
+# passed` without running review/test/document/lint (issue #120). There is
+# no upstream flag to pin an explicit base, and no-mistakes is a separate
+# installed binary, not this repo's code — this guard only replicates its
+# base detection, read-only, and refuses loudly rather than let the false
+# green happen. Empirically verified (issue #120 thread, and this repo's own
+# `scripts/gate-guard-selftest.sh`) that the three-dot form matches
+# no-mistakes's actual rebase-then-diff outcome: the two-dot form instead
+# reports non-empty whenever origin's base has advanced independently of
+# this checkout, even when this checkout itself has zero unique commits and
+# would rebase to an empty diff — a false negative that would defeat this
+# guard's entire purpose.
+guard_against_empty_diff_base() {
+  local symref base_ref
+  symref="$(git -C "$REPO_ROOT" ls-remote --symref origin HEAD 2>/dev/null \
+    | awk '$1 == "ref:" && $3 == "HEAD" { print $2; exit }' || true)"
+  if [ -z "$symref" ]; then
+    echo "gate.sh: could not resolve origin's default branch via 'git ls-remote --symref origin HEAD' - cannot check for #120's empty-diff false-green, refusing to guess" >&2
+    exit 1
+  fi
+  if ! git -C "$REPO_ROOT" fetch --quiet origin "$symref"; then
+    echo "gate.sh: could not fetch '$symref' from origin to check for #120's empty-diff false-green" >&2
+    exit 1
+  fi
+  base_ref="$(git -C "$REPO_ROOT" rev-parse --verify -q FETCH_HEAD || true)"
+  if [ -z "$base_ref" ]; then
+    echo "gate.sh: fetched '$symref' from origin but could not resolve FETCH_HEAD - cannot check for #120's empty-diff false-green" >&2
+    exit 1
+  fi
+  if git -C "$REPO_ROOT" diff --quiet "$base_ref...HEAD"; then
+    echo "gate.sh: refusing to run - diff against origin's detected default branch ($symref) is empty. A no-mistakes gate run from here would silently fast-path to 'outcome: passed' without running review/test/document/lint (issue #120). Get real commits onto this branch ahead of $symref before gating." >&2
+    exit 1
+  fi
+}
+guard_against_empty_diff_base
+
 exec no-mistakes axi run --intent "$intent" --skip push,pr,ci "$@"
