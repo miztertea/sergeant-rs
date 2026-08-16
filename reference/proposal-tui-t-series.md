@@ -7,9 +7,9 @@ description: >-
   for setting intent, operating durable Work, discovering admitted workflows,
   managing the estate, and reading health and evidence. This revision
   supersedes the 2026-08-11 T-Series proposal, consumes the shipped North Star
-  MVP and WATCH surfaces, accounts for the current open integration branch,
-  and constrains implementation through the Taste design audit and the
-  repository's Ponytail ladder.
+  MVP and WATCH surfaces, accounts for PR #111's now-merged integration
+  branch, and constrains implementation through the Taste design audit and
+  the repository's Ponytail ladder.
 status: proposed
 resource: sergeant-rs
 tags:
@@ -27,18 +27,20 @@ audit_revision: 242abe3c4a889c2b666c7ce34b32812dd1ee8d61
 integration_review:
   pull_request: 111
   branch: integration/path-to-mac-2026-08-15
-  revision: 251a6f1c09caee95fcac30f724dab0ece166cae0
+  revision: bceed965c24de7fa781001e3bd7835d8ef58b139
+  merged: true
+  merge_commit: 3a46b87c17d249655708ed5ac32f6704738776cf
 supersedes:
   path: reference/proposal-tui-t-series.md
-  revision: a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6
+  revision: a9a25fa68938323d9585edc687fbf0e965084c2e
 relationship: >-
   Complete revision of the existing T-Series proposal, not a competing
   proposal. It preserves the journal-first daemon, Work-centered domain,
   API-only boundary for daemon-owned facts, terminal-lifecycle guarantees,
   and separate P2-JOURNAL program. It updates the proposed interface for the
   shipped MVP, explicit sgt tui entry point, WATCH, transcript, output,
-  envelope, Estate, dashboard deletion, completed_dirty, and the current
-  integration branch's candidate retained-state surfaces.
+  envelope, Estate, dashboard deletion, completed_dirty, and PR #111's now-
+  merged retained-state surfaces.
 ---
 
 # Sergeant-rs T-Series
@@ -46,8 +48,8 @@ relationship: >-
 
 **Status:** Proposed  
 **Main audit basis:** [`miztertea/sergeant-rs@242abe3`](https://github.com/miztertea/sergeant-rs/tree/242abe3c4a889c2b666c7ce34b32812dd1ee8d61)  
-**Concurrent integration review:** [PR #111 at `251a6f1`](https://github.com/miztertea/sergeant-rs/pull/111)  
-**Supersedes:** [`reference/proposal-tui-t-series.md@a5fb875`](https://github.com/miztertea/sergeant-rs/blob/a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6/reference/proposal-tui-t-series.md)  
+**Merged integration review:** [PR #111 at `bceed96`](https://github.com/miztertea/sergeant-rs/pull/111), merged into `main` at [`3a46b87`](https://github.com/miztertea/sergeant-rs/commit/3a46b87c17d249655708ed5ac32f6704738776cf)  
+**Supersedes:** [`reference/proposal-tui-t-series.md@a9a25fa`](https://github.com/miztertea/sergeant-rs/blob/a9a25fa68938323d9585edc687fbf0e965084c2e/reference/proposal-tui-t-series.md)  
 **Interactive entry point:** `sgt tui`; bare `sgt` remains the static estate-aware homepage  
 **Primary objective:** Make the existing durable delegation loop obvious, beautiful, and operable from one keyboard-first terminal cockpit  
 **Daemon mutation boundary:** Submit, respond, retry, extend, cancel, and any accepted retained-state disposal retain their daemon/API meanings  
@@ -254,19 +256,18 @@ At this revision:
 - the workflow root catalog lists 23 admitted workflows;
 - Ratatui 0.30.2 is installed and Crossterm is consumed through Ratatui's re-export.
 
-## 3.3 Open integration branch
+## 3.3 Integration branch, now merged
 
-The current open integration surface is:
+PR #111 merged into `main` at 2026-08-15T15:28:02Z, per `gh pr view 111`:
 
 ```text
 PR #111
 integration/path-to-mac-2026-08-15
-head = 251a6f1c09caee95fcac30f724dab0ece166cae0
+head = bceed965c24de7fa781001e3bd7835d8ef58b139
+merge commit = 3a46b87c17d249655708ed5ac32f6704738776cf
 ```
 
-The branch is not binding main truth. Its PR explicitly says it is not ready to merge because the shipping gate produced false passed verdicts and #120 remains open.
-
-The branch nonetheless contains directly relevant candidate surfaces:
+The branch's candidate surfaces are now shipped fact on `main`:
 
 - ceiling interruption lands in `blocked` rather than wedged `active`;
 - human transcript rendering includes journal timestamps;
@@ -274,11 +275,11 @@ The branch nonetheless contains directly relevant candidate surfaces:
 - `GET /v1/retained` and `sgt work retained` inspect retained state;
 - `POST /v1/work/{id}/reap` and `sgt work reap` explicitly dispose retained dirty state after confirmation.
 
-[PR #111](https://github.com/miztertea/sergeant-rs/pull/111) is reviewed as a concurrent dependency, never treated as merged.
+The shipping-gate defect that made the PR's own pre-merge gate runs unreliable, issue #120, is a separate, still-open risk. It is not resolved by the merge — it is tracked in §19.12 and acceptance item 57 (§21).
 
-**Decision T2-06 (R1):** T0 pins the actual implementation base after PR #111 is either merged or explicitly excluded. No T-Series screen may claim an integration-only fact before that disposition.
+**Decision T2-06 (R1):** Resolved. T0 pins the actual implementation base as `main` post-merge, including PR #111's surfaces.
 
-**Decision T2-07 (R2):** If the retained/reap surfaces land, consume them in Work output and Health drill-down. If they do not land, omit those controls completely; do not ship placeholders.
+**Decision T2-07 (R2):** Resolved, no longer conditional. The retained/reap surfaces are consumed in Work output and Health drill-down.
 
 ## 3.4 Audit corpus
 
@@ -397,14 +398,17 @@ The workflow catalog remains the one proposed read-only addition because workflo
 
 Repo/group commands are deliberately local manifest operations. Doctor must work when no daemon is running. Forcing them through new daemon routes solely for UI purity would violate their existing lifecycle semantics.
 
-**Decision T2-14 (R2/R6):** The TUI consumes repo/group and Doctor behavior through narrow typed local operations extracted from the current CLI implementation. The CLI and TUI format the same outcomes differently.
+**Decision T2-14 (R2/R6): blocked pending an explicit ruling.** As drafted, the TUI would consume repo/group and Doctor behavior through narrow typed local operations extracted from the current CLI implementation — the CLI and TUI formatting the same outcomes differently. This would be a second crate-internal reach path into `tui.rs` beyond `crate::api`, which `tests/m6_surfaces.rs`'s `t5_the_tui_is_a_client_like_any_other` rejects today by construction, and `t5b_the_structural_scan_sees_every_spelling_of_a_path` specifically hardens against being fooled by an unusual `use` spelling. This decision does not pick a side; it names the two live options for the proposal's owner to rule on:
 
-This is an explicit refinement of the old "TUI imports only ApiClient" source-scan rule:
+- extend the daemon API with new authenticated routes for repo/group and Doctor, reached via `ApiClient` like everything else, leaving `t5`/`t5b` untouched; or
+- explicitly revise `t5`/`t5b`, with a stated justification for why estate-local, non-daemon operations become a second sanctioned reach path for `tui.rs`.
+
+This is an explicit refinement of the old "TUI imports only ApiClient" source-scan rule, contingent on which option the ruling selects:
 
 ```text
 daemon-owned facts     ApiClient only
-estate manifest edits  shared local Estate operations
-installation checks    shared local Doctor report
+estate manifest edits  shared local Estate operations, or ApiClient if the API is extended
+installation checks    shared local Doctor report, or ApiClient if the API is extended
 ```
 
 ## 5.4 SSE remains invalidation
@@ -413,13 +417,13 @@ installation checks    shared local Doctor report
 
 ## 5.5 Observation never materializes the daemon
 
-ADR 0009 moved `status`, Work reads, analytics, Watch, Doctor, and TUI into the no-auto-spawn set.
+Watch and Doctor already belonged to the no-auto-spawn set; ADR 0009 joined `status`, Work reads, analytics, and TUI to it. All six are no-spawn today.
 
 **Decision T2-16 (R2):** `sgt tui` continues to refuse without a running daemon and names `sgt doctor` or a dispatching verb as the remedy. The Estate/Health screens do not create an offline exception inside the TUI.
 
 ## 5.6 Execution is not dialogue
 
-R-NS-6 distinguishes execution mechanics from the harness-owned conversation. `respond` answers a parked request. It is not a generic message operation.
+R-NS-6 distinguishes execution mechanics from the harness-owned conversation. `respond` answers a parked request. It is not a generic message operation. Whether a transport's actor can ask mid-run is itself a measured per-transport capability with runtime withdrawal, never new hold machinery; its named consequence is that the WORKFLOW-IF-E3 category is empty and grilling-class packages are operator skills.
 
 **Decision T2-17 (R1/R2):** T-Series adds no arbitrary active-turn guidance, continuous chat, embedded harness session, or PTY supervision.
 
@@ -458,7 +462,7 @@ T-Series may:
 5. add one authenticated read-only workflow catalog route over admitted procedure;
 6. display the authoritative Work transcript and Work-local event evidence;
 7. display output pointer, teardown, reservation, execution, stage executor, envelope, and reported state;
-8. invoke current respond, retry, extend, cancel, and conditional retained-state disposal semantics;
+8. invoke current respond, retry, extend, cancel, and retained-state disposal semantics;
 9. expose the complete existing repo/group lifecycle through Estate;
 10. expose Doctor checks and named remedies through Estate/Health;
 11. derive a global Attention drawer from Work state;
@@ -492,7 +496,7 @@ T-Series may:
 - mouse-enabled text editing;
 - a second durable notification/read-state store;
 - archive, snooze, pin, or dismissal semantics for Work;
-- silent consumption of unmerged PR #111 features.
+- consumption of any candidate surface beyond what PR #111 actually shipped.
 
 ---
 
@@ -533,7 +537,7 @@ Fleet
 Workflow recent-run row derived from loaded Fleet
 Attention drawer
 Graph or analytics result carrying work_id
-Retained-state result if PR #111 lands
+Retained-state result
 ```
 
 `Esc` returns to the exact prior destination, filter, selection, focus, and scroll position.
@@ -957,7 +961,7 @@ canceled
 
 Enter opens canonical Work. Mutations are available through the contextual palette and confirmations, not single-key destructive shortcuts.
 
-If PR #111 lands, retained-state markers may appear on relevant terminal rows only when the current API reports them.
+Retained-state markers may appear on relevant terminal rows only when the current API reports them.
 
 ---
 
@@ -993,6 +997,12 @@ The route reuses:
 It performs no mutation and appends no event.
 
 **Decision T2-40 (R2/R6/R7):** Add one workflow catalog projection because the TUI must not privately reinterpret executable procedure.
+
+Failed lower rungs:
+
+- R1 fails: workflow discovery in the TUI is a settled requirement, not an unproven need.
+- R2 fails: no existing authenticated route already exposes the catalog to a client.
+- R6 fails: a new authenticated route, its own versioned response contract, and the Axum handler wiring it requires are more than a tiny local composition or extraction.
 
 Representative entry:
 
@@ -1150,7 +1160,7 @@ remedy
 
 It does not reinvent health policy.
 
-Current checks include installation, environment, data directory, Docker, journal, projection, daemon, estate, profiles, and disk pressure. If PR #111 lands, filesystem reliability joins the report.
+Current checks include git, claude, environment, data directory, Docker, journal, projection, daemon, permission_mode, estate, and disk pressure. Filesystem reliability joins the report, per PR #111.
 
 **Decision T2-45 (R2/R6):** Extract Doctor's structured `Check`/`Report` result from CLI formatting and let both CLI and TUI consume it.
 
@@ -1158,9 +1168,9 @@ Health is not a resource dashboard. Disk facts appear only when Doctor already m
 
 A selected failing/warning check receives one clear detail/remedy panel.
 
-## 12.4 Retained state, conditional on PR #111
+## 12.4 Retained state
 
-If the integration branch's retained/reap surfaces merge:
+The integration branch's retained/reap surfaces are merged:
 
 - Health's disk-pressure detail may open a Retained Work overlay;
 - Work Details may show the retained binding, path, reason, and byte count;
@@ -1168,7 +1178,7 @@ If the integration branch's retained/reap surfaces merge:
 - Reap requires explicit confirmation;
 - retained branches remain outside the deletion path.
 
-**Decision T2-46 (R2):** Retained-state UI is conditional consumption of a real merged API, not a T-Series invention.
+**Decision T2-46 (R2):** Retained-state UI is consumption of a real merged API, not a T-Series invention.
 
 ## 12.5 What Estate excludes
 
@@ -1224,7 +1234,7 @@ GET /v1/work/{id}/transcript
 GET /v1/events?work_id=<id>&limit=<bounded>
 ```
 
-Transcript turns carry causal sequence and, once PR #111 or equivalent lands, visible journal timestamps. Event history supplies stage, execution, surface, envelope, and lifecycle system lines.
+Transcript turns carry causal sequence and, per PR #111, visible journal timestamps. Event history supplies stage, execution, surface, envelope, and lifecycle system lines.
 
 The two streams are merged by journal sequence where possible.
 
@@ -1322,7 +1332,7 @@ surface bindings
 teardown
 output pointer
 envelope
-conditional retained state
+retained state
 ```
 
 ## 13.8 Output
@@ -1364,7 +1374,7 @@ latest envelope extension evidence
 | blocked | disabled | retry, extend where relevant, cancel, inspect |
 | failed | disabled | retry, cancel, inspect |
 | completed | disabled | inspect output/evidence |
-| completed_dirty | disabled | inspect output/retained state; conditional reap |
+| completed_dirty | disabled | inspect output/retained state; reap |
 | canceled | disabled | inspect |
 
 The daemon is authoritative. Races return structured errors, preserve the screen, and trigger refresh.
@@ -1454,15 +1464,10 @@ Core vocabulary:
 /graph
 /details
 /analytics
-/help
-/quit
-```
-
-Conditional if merged:
-
-```text
 /retained
 /reap
+/help
+/quit
 ```
 
 Explicitly absent:
@@ -1533,10 +1538,13 @@ cancel
 graph
 analytics
 workflow_catalog
-conditional retained/reap
+retained
+reap
 ```
 
 ## 16.2 Estate operations
+
+Blocked pending the same client-boundary ruling named in §5.3/Decision T2-14: whether repo/group behavior reaches `tui.rs` through shared local typed functions (as illustrated below) or through new authenticated `ApiClient` routes. The shape below assumes the former; if the ruling selects the latter, these functions back new API handlers instead of being called directly from `tui.rs`.
 
 Current CLI repo/group behavior should move behind small typed functions only when Estate consumes it.
 
@@ -1570,6 +1578,8 @@ CLI owns Clap/stdout/JSON/exit code. TUI owns forms/focus/rendering.
 **Decision T2-57 (R2/R6):** Extract on contact. Do not build `ApplicationService`, `CommandBus`, a generic command trait, or a second internal API.
 
 ## 16.3 Doctor report
+
+Blocked pending the same client-boundary ruling named in §5.3/Decision T2-14: whether Doctor's report reaches `tui.rs` through the shared local report (as illustrated below) or through a new authenticated `ApiClient` route. The shape below assumes the former; if the ruling selects the latter, this report backs a new API handler instead of being read directly from `tui.rs`.
 
 Illustrative, nonbinding shape:
 
@@ -1820,7 +1830,7 @@ Pin:
 
 The CLI text/JSON and TUI Health consume one `DoctorReport`. Tests assert no check disappears or changes status/remedy between surfaces.
 
-If PR #111 lands, filesystem reliability is included.
+Filesystem reliability is included, per PR #111.
 
 ## 19.7 Live daemon tests
 
@@ -1839,17 +1849,14 @@ Using fake backend:
 - state race refresh;
 - Watch-state attention transition.
 
-## 19.8 Integration branch conditional tests
-
-If retained/reap lands:
+## 19.8 Retained/reap tests
 
 - retained list is API-backed;
 - preview does not mutate or auto-spawn;
 - reap requires confirmation;
 - branch survives;
 - exact per-binding result renders;
-- Health disk detail reaches retained overlay;
-- no placeholder remains when endpoint is absent.
+- Health disk detail reaches retained overlay.
 
 ## 19.9 Reconnect and lifecycle
 
@@ -1877,7 +1884,7 @@ Attention open/closed/overlay
 palette/chooser/confirmations
 reconnecting/auth-failed
 terminal-too-small
-conditional retained/reap
+retained/reap
 ```
 
 Assertions:
@@ -1923,10 +1930,15 @@ This is one program with bounded slices. No slice waits for a universal refactor
 
 ## 20.1 T0: Adjudication and revision freeze
 
-- review this proposal through the repository's proposal gauntlet;
+T0 begins only once a proposal-grading gauntlet unit has closed against this document, e.g. T-SERIES-1.
+
+T0's first required output is the client-boundary ruling named in §5.3/§16.2/§16.3's Decision T2-14: whether repo/group and Doctor behavior reaches `tui.rs` by extending the daemon API with new authenticated routes reached via `ApiClient` (leaving `tests/m6_surfaces.rs`'s `t5_the_tui_is_a_client_like_any_other` and `t5b_the_structural_scan_sees_every_spelling_of_a_path` untouched), or by explicitly revising `t5`/`t5b` with a stated justification for a second sanctioned reach path. This ruling is recorded as an amendment to this proposal and a `GAUNTLET.md` entry — the same closure artifact convention T4 uses in §20.5. T1 is not dispatchable until it resolves.
+
+Remaining T0 tasks:
+
 - pin current main and integration disposition;
 - re-audit CLI/API/TUI/workflow catalog;
-- validate workflow catalog route;
+- contract the workflow catalog route's response shape;
 - spike `ratatui-textarea` dependency resolution;
 - contract the visual token set and responsive geometries;
 - write T1 only after rulings.
@@ -1940,6 +1952,10 @@ No product code.
 - responsive Fleet;
 - canonical Work shell;
 - transcript-backed Thread;
+- Workflow rail (§13.4);
+- Evidence (§13.5);
+- Graph (§13.6);
+- Details (§13.7);
 - output/envelope/completed-dirty;
 - respond/retry/extend/cancel;
 - multiline composer;
@@ -1963,7 +1979,7 @@ This produces visible value without Estate extraction or workflow-catalog API co
 - Groups full lifecycle;
 - extract Doctor report;
 - Health;
-- conditional retained/reap consumption;
+- retained/reap consumption;
 - no generic service layer.
 
 ## 20.5 T4: Close-out and polish
@@ -1975,6 +1991,8 @@ This produces visible value without Estate extraction or workflow-catalog API co
 - README and help updates;
 - ledger/lessons/ADR/proposal supersession updates;
 - explicit handoff to P2-JOURNAL.
+
+T4 cannot close on acceptance item 57 (§21) until issue #120 is independently resolved, or T4 manually verifies a non-empty diff before trusting a shipping-gate `passed` result.
 
 ## 20.6 Parallel boundaries
 
@@ -2041,8 +2059,8 @@ T-Series is complete when:
 51. Every major empty/loading/error/confirmation state exists.
 52. Every major surface passes semantic/geometry tests at 80x24, 120x36, 180x48.
 53. Existing PTY, signal, shutdown, idle-CPU, no-spawn, and reconnect tests remain green.
-54. If PR #111 lands, retained/reap is consumed only through its real API and confirmation contract.
-55. If PR #111 does not land, no retained/reap placeholder or claim remains.
+54. Retained/reap is consumed only through its real API and confirmation contract.
+55. (Vacuous: PR #111 has merged, so the "no retained/reap placeholder if it does not land" branch this item described can no longer fire.)
 56. The final screenshots come from the real TUI, not image-generation mockups.
 57. The shipping gate actually executes and passes; a skipped false-green is failure.
 58. The ledger records every amendment, R7, deferred finding, and integration disposition.
@@ -2060,15 +2078,15 @@ The rung is the lowest viable resolution.
 | T2-03 | R2 | Organize around operator questions of current Work |
 | T2-04 | R2 | Grade the complete delegation loop |
 | T2-05 | R1/R2 | Preserve sound old decisions and remove superseded premises |
-| T2-06 | R1 | Do not treat open PR #111 as merged truth |
-| T2-07 | R2 | Consume retained/reap only if its real surface lands |
+| T2-06 | R1 | Resolved: T0 pins `main` post-merge, including PR #111's surfaces |
+| T2-07 | R2 | Resolved: retained/reap is consumed, its real surface having landed |
 | T2-08 | R2 | Use Taste as design audit, not web implementation authority |
 | T2-09 | R1 | Reject military styling |
 | T2-10 | R5 | Bind visual variance/motion/density |
 | T2-11 | R5 | Reduce boxes before adding ornament |
 | T2-12 | R2 | Work remains the durable center |
 | T2-13 | R2 | Daemon-owned facts remain ApiClient-only |
-| T2-14 | R2/R6 | Share local Estate/Doctor behavior without daemon tunneling |
+| T2-14 | R2/R6 | Blocked pending an explicit ruling on the client-boundary open question (§5.3) |
 | T2-15 | R2 | SSE invalidates; authoritative reads decide |
 | T2-16 | R2 | TUI remains no-auto-spawn |
 | T2-17 | R1/R2 | Respond is not generalized into continuous chat |
@@ -2100,7 +2118,7 @@ The rung is the lowest viable resolution.
 | T2-43 | R2/R6 | Reuse repo lifecycle through shared operations |
 | T2-44 | R2/R6 | Full group lifecycle parity |
 | T2-45 | R2/R6 | Doctor and Health consume one report |
-| T2-46 | R2 | Retained UI is conditional on merged surfaces |
+| T2-46 | R2 | Retained UI consumes the now-merged surfaces |
 | T2-47 | R2 | Intent/state/procedure/stage/envelope lead Work |
 | T2-48 | R2/R5 | Thread/Workflow/Evidence/Graph/Details |
 | T2-49 | R2 | Thread is journal-backed only |
@@ -2148,7 +2166,7 @@ Any implementation decision not represented here is logged in the milestone repo
 | Bare `sgt` is the TUI | `sgt tui` is explicit; bare `sgt` remains homepage |
 | Home/Fleet/Workflows | Estate added as full destination |
 | Doctor CLI-only | Shared Doctor report powers Estate/Health |
-| Repo/group outside TUI | Full current lifecycle included through extract-on-contact |
+| Repo/group not addressed by the predecessor | Full current lifecycle included through extract-on-contact |
 | Local custom editor | Maintained text-area dependency preferred under a hard compatibility gate |
 | Submit/respond/retry/cancel | Extend added and kept distinct |
 | Event-derived conversation | Authoritative transcript becomes Thread backbone |
@@ -2256,7 +2274,7 @@ The proposal is violated if any implementation:
 18. fails to pop keyboard enhancement flags on an exit path;
 19. lets Health disagree with `sgt doctor`;
 20. deletes a repository directory on declaration removal;
-21. uses PR #111 facts as shipped before merge;
+21. claims a fact beyond what PR #111 actually shipped;
 22. trusts a shipping gate that skipped its stages;
 23. ships screenshots generated from design-image tooling rather than the application;
 24. passes only because a whole-frame snapshot was updated to match a regression.
@@ -2274,7 +2292,7 @@ The proposal is violated if any implementation:
 - [WATCH contract](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/gauntlet/contracts/WATCH.md)
 - [ADR 0006 harness passthrough](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/docs/adr/0006-harness-passthrough.md)
 - [Existing T-Series proposal](https://github.com/miztertea/sergeant-rs/blob/242abe3c4a889c2b666c7ce34b32812dd1ee8d61/reference/proposal-tui-t-series.md)
-- [Open integration PR #111](https://github.com/miztertea/sergeant-rs/pull/111)
+- [Merged integration PR #111](https://github.com/miztertea/sergeant-rs/pull/111)
 
 ## 24.3 Design and implementation references
 
