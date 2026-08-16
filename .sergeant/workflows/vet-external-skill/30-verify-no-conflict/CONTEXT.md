@@ -22,9 +22,27 @@ The external skill does not conflict with repository AGENTS.md or safety policy.
   (trigger: actions checked; outcome: no adopted skill contradicts the repository's own instruction or safety policy)
   — `BU-P1-123`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L129, vet step 4)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- No adopted skill may contradict repository instruction or safety policy (workflow-level constraint, `BU-P1-123` restates it as a check at this stage).
+
+### J2 — delegated to this stage
+- Judging whether a given instruction or action in the skill is in fact a conflict.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- A conflict with repository `AGENTS.md` or safety policy is found: record the conflict and ask the user rather than proceeding to `50-test-in-disposable-copy` past a discovered conflict.
+
+### Completion boundary
+This stage may complete only once the skill is verified not to conflict with repository `AGENTS.md` or safety policy — or the stage has stopped at the J0 case above.
+
+### Decision evidence
+The conflict verdict is this stage's own durable output, recorded per `output/README.md`.
 
 ## Output
 

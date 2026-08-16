@@ -18,13 +18,45 @@ For Sergeant-owned skills: update this repository through a reviewed PR and run 
 
 ## Behavior contract
 
-- **For Sergeant-owned skills, update this repository through a reviewed PR and run tests/instruction-policy-test.sh plus the full Sergeant test suite.**
+- **For Sergeant-owned skills, update this repository through a reviewed PR and run the repository's own instruction-policy test plus the full test suite.**
   (trigger: updating a Sergeant-owned skill; outcome: no Sergeant-owned skill changes ship without passing review and the full test suite, including the instruction-policy test)
   — `BU-P1-127`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L142-144, Sergeant-owned update path)
 
-## Judgment required
+  **Source-fidelity correction (ICM-R3, 2026-08-16):** the upstream text
+  names a literal path, `tests/instruction-policy-test.sh`. This
+  repository's own `tests/` does not contain that script (it contains
+  `estate_routes.rs`, `m1_event_core.rs`, ... `t2_workflow_catalog.rs`);
+  the only file with that name lives at
+  `reference/sergeant-upstream/tests/instruction-policy-test.sh`, frozen
+  source-project evidence, not this repository's own live tooling. This
+  package is generic per-repository guidance: run whichever instruction-
+  policy check and full test suite the *target* repository (the one
+  whose Sergeant-owned skill is being updated) actually names, not this
+  literal upstream path.
 
-Reclassified from `stage (§6.3, deterministic-machinery candidate)` to actor-stage at N1 adjudication A4: the checkpoint here is not running the test suite (deterministic machinery) but the decision that gates it — updating only through a reviewed PR, i.e. human review plus a passing instruction-policy test and full suite before changes ship. That decision survives any reimplementation of how the tests themselves are run (§6.3's test), so it is genuine judgment: the acting harness must prepare the change for review and confirm the gating conditions are met, or explain why not — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+## Bounded judgment
+
+Reclassified from `stage (§6.3, deterministic-machinery candidate)` to actor-stage at N1 adjudication A4: the checkpoint here is not running the test suite (deterministic machinery) but the decision that gates it — updating only through a reviewed PR, i.e. human review plus a passing instruction-policy test and full suite before changes ship. That decision survives any reimplementation of how the tests themselves are run (§6.3's test), so it is genuine judgment (PL-5).
+
+Apply `@@bounded-judgment`.
+
+### J5 — governing constraint
+- No Sergeant-owned skill change ships without a reviewed PR and a passing instruction-policy test plus full suite.
+
+### J2 — delegated to this stage
+- Identifying which instruction-policy check and test suite the target repository actually names, per the source-fidelity correction above.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only once the change is submitted through a reviewed PR and the instruction-policy test plus full suite both pass.
+
+### Decision evidence
+The PR link and test results are this stage's own durable output, recorded per `output/README.md`.
 
 ## Additional note
 

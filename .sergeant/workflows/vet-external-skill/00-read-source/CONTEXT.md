@@ -22,9 +22,24 @@ The external skill's complete SKILL.md and referenced scripts are read before ad
   (trigger: vet-external-skill workflow entered; outcome: the skill's full instructions and scripts are read, not sampled)
   — `BU-P1-120`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L126, vet step 1)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- What counts as a "referenced script" — following the skill's own reference graph to completion rather than reading only the top-level file (`BU-P1-120`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only once the skill's complete `SKILL.md` and every referenced script have been read in full, not sampled.
+
+### Decision evidence
+The read evidence is this stage's own durable output, recorded per `output/README.md`.
 
 ## Output
 
