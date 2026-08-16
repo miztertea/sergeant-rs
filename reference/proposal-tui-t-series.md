@@ -748,9 +748,23 @@ no search/regex feature
 no mouse requirement
 no editor-owned submit behavior
 pure access to the local draft for testing
+the m6_surfaces Ratatui/Crossterm gate test still passes unmodified
 ```
 
 If that proof fails, the dependency is refused and the bounded local-editor fallback from the original proposal is used. The user-visible contract does not change.
+
+**T0 ran this spike on 2026-08-16, read-only (no edit to this repository's `Cargo.toml`/`Cargo.lock`), and it proves the dependency admitted. Outcome per condition:**
+
+1. **One resolved Ratatui version.** Both this repository's `Cargo.lock` and a scratch crate (`ratatui = "0.30.2"` + `ratatui-textarea = "0.9.2"`, built outside this repository) resolve exactly one `ratatui`: `0.30.2`. `ratatui-textarea` depends on `ratatui-core`/`ratatui-widgets` at the same versions Ratatui itself pins — no second Ratatui line.
+2. **One resolved Crossterm version, shared.** In the scratch crate, `cargo tree -i crossterm` shows exactly one resolved `crossterm` (`0.29.0`), reached by both `ratatui` and `ratatui-textarea` through the same `ratatui-crossterm v0.1.2` crate — `ratatui-textarea` has no `crossterm` dependency of its own; its `crossterm` feature (`crossterm = ["dep:ratatui-crossterm"]`, `default = ["crossterm"]`) routes through the identical shared crate Ratatui already uses. This repository's own `Cargo.lock` additionally carries a second, unrelated `crossterm 0.28.1` pulled in by `comfy-table` (a `duckdb`/`arrow-cast` transitive dependency, for the DuckDB journal feature — nothing to do with the TUI). That duplication predates this spike, is untouched by it, and does not grow to a third version when `ratatui-textarea` is added: it would still resolve to the exact same shared `0.29.0` Ratatui already pulls.
+3. **No direct conflicting crossterm edge.** Confirmed by the same `cargo tree -i crossterm` output above — `ratatui-textarea` has zero direct edge to `crossterm`; its only path to it is through `ratatui-crossterm`, the identical crate Ratatui itself depends on.
+4. **No search/regex feature.** `cargo add ratatui-textarea --dry-run` against this repository's actual `Cargo.toml` (aborted before any file was written) reports the feature set that would be added: `+ crossterm`, `- arbitrary`, `- portable-atomic`, `- search`, `- serde`, `- termion`, `- termwiz`. The crate's own `Cargo.toml` confirms `default = ["crossterm"]` and `search = ["dep:regex"]` — `regex` is not pulled in without explicitly opting into the `search` feature, which this proposal does not request.
+5. **No mouse requirement.** `ratatui-textarea-0.9.2/src/input/crossterm.rs` optionally maps `MouseEventKind::ScrollUp`/`ScrollDown` into `Key::MouseScrollUp`/`MouseScrollDown` *if* the host application forwards a `crossterm::event::Event::Mouse` into `TextArea::input()`. Nothing in the crate requires mouse capture or calls it unprompted. Decision T2-33 keeps mouse capture disabled entirely, so the host never enables `EnableMouseCapture` and never forwards a `Mouse` event — this optional path stays permanently unused.
+6. **No editor-owned submit behavior.** `TextArea::input()` (`textarea.rs:283`) maps `Key::Enter` to `insert_newline()` only (`textarea.rs:296-301`, `:730-734`) — there is no submit/send concept anywhere in the crate. The host decides whether a keystroke means "newline" or "submit" by choosing whether to call `.input()` at all before forwarding it, exactly as §8.8's `Ctrl+Enter`-vs-`Enter` distinction already requires independent of this dependency.
+7. **Pure access to the local draft for testing.** `pub fn lines(&self) -> &[String]` and `pub fn into_lines(self) -> Vec<String>` (`textarea.rs:2170`, `:2186`) read the buffer directly with no terminal, render, or event-loop dependency — usable from a plain unit test.
+8. **The m6_surfaces gate test still passes unmodified.** `cargo test --test m6_surfaces the_tui_stack_is_ratatui_with_crossterm_reached_through_it` against this repository as-is: `test result: ok. 1 passed; 0 failed`. `git status` before and after the spike (including this test run) shows no working-tree change — the spike touched no product file.
+
+All eight conditions hold. The dependency is admitted, gated as above; T1 implements the narrow wrapper described in Decision T2-31.
 
 ## 8.8 Enhanced keyboard protocol
 
@@ -775,6 +789,51 @@ Push/pop is integrated into the existing terminal lifecycle guard and tested on 
 ## 8.9 Mouse
 
 **Decision T2-33 (R1):** Mouse capture remains disabled. Every action is reachable, visible, and testable from the keyboard.
+
+## 8.10 Locked visual tokens and responsive geometries
+
+**Decision T2-65 (R5):** §8.1's semantic tokens and §18's responsive compositions are prose descriptions of an intended system; T0 finalizes them as concrete, implementable values here so T1 does not invent numbers. Every named ratatui `Color` variant below is already in use in the current M6 `src/tui.rs` (`Cyan`, `DarkGray`, `Green`, `Red`, `Yellow` — no `Rgb`/truecolor call exists there today); the truecolor column is new for T1 and the ANSI column is its fallback, per §8.1's existing "falls back to standard/256-color equivalents" rule — not a second, competing rule.
+
+### Color roles
+
+| Token | Truecolor (`Color::Rgb`) | 256-color index | ANSI/16-color fallback (`ratatui::style::Color`) |
+|---|---|---:|---|
+| background | `#0c0f13` (12,15,19) | 233 | `Black` |
+| surface | `#12161c` (18,22,28) | 234 | `Black` |
+| surface-muted | `#181d25` (24,29,37) | 235 | `DarkGray` |
+| border | `#2b323c` (43,50,60) | 238 | `DarkGray` |
+| text | `#e6e9ef` (230,233,239) | 253 | `White` |
+| muted | `#7c8695` (124,134,149) | 245 | `Gray` |
+| focus/accent | `#57b6c9` (87,182,201) | 73 | `Cyan` |
+| success | `#3fb968` (63,185,104) | 77 | `Green` |
+| attention (gold) | `#d7a72c` (215,167,44) | 178 | `Yellow` |
+| warning (amber) | `#d68a3c` (214,138,60) | 173 | `Yellow` — amber has no distinct 16-color slot; per §8.1 it collapses onto the same fallback as attention/gold at that tier, distinguished by label text and glyph, never by color alone (§19.11's "no color-only states") |
+| danger | `#e0564f` (224,86,79) | 203 | `Red` |
+| info/reference (violet) | `#a487e0` (164,135,224) | 140 | `Magenta` |
+
+Terminal-capability detection follows existing Crossterm/terminfo practice already governing §8.1; a capability that cannot report truecolor or 256-color uses the ANSI column outright. No token is ever pure `Black`/`White` at the truecolor tier, satisfying T2-25's "no pure black/white requirement" while still giving `Black`/`White` as an honest 16-color-terminal fallback name.
+
+### Spacing scale
+
+A terminal cell is the only unit; there is no sub-cell spacing.
+
+| Scale step | Cells | Use |
+|---|---:|---|
+| none | 0 | a divider or border glyph touches its neighboring region directly |
+| inline | 1 | gap between a state glyph and its label; blank column between adjacent metadata fields within one row |
+| block | 2 | a focusable `Block`'s interior left/right padding; a blank row separating two stacked sections that have no divider between them |
+| region | 3 | outer margin between the Attention drawer or contextual rail and the primary body at Wide composition (§18.1) |
+
+### Responsive breakpoints (§18.1-18.3, locked)
+
+| Tier | Columns | Drawer | Contextual rail | Primary body |
+|---|---|---|---|---|
+| Wide | ≥ 150 | inline, fixed 28 cols | inline, fixed 32 cols | remaining columns (≥ 90) |
+| Medium | 100-149 | inline-optional, fixed 24 cols when open; overlay when closed-then-toggled | folded into a selectable subview inside the primary body, no reserved columns | remaining columns |
+| Narrow | 80-99 | full-body overlay, temporarily replaces the primary body | full-body overlay, temporarily replaces the primary body | entire body when no overlay is open |
+| Below 80 columns, or below 24 rows | — | — | — | §17.7's terminal-too-small notice; no composition is attempted |
+
+The 24-row floor (§18.4) is symmetric with the 80-column floor: either one being violated hands off to §17.7 rather than a degraded layout attempt. §19.10's geometry matrix (`80x24`, `120x36`, `180x48`) exercises Narrow, Medium, and Wide respectively at representative interior sizes.
 
 ---
 
@@ -1005,29 +1064,88 @@ Failed lower rungs:
 - R2 fails: no existing authenticated route already exposes the catalog to a client.
 - R6 fails: a new authenticated route, its own versioned response contract, and the Axum handler wiring it requires are more than a tiny local composition or extraction.
 
-Representative entry:
+**T0 finalized this schema on 2026-08-16, grounded in `src/domain/workflow.rs`'s `WorkflowDefinition`/`StageDefinition` and each workflow's own `index.md` front matter (`.sergeant/workflows/implement/index.md` read as the concrete example). No field below is invented; every one is traced to a real struct field or a real front-matter key. `status`/`description`/`tags` require T2 to add `index.md` front-matter parsing — no code path reads it today (`.sergeant/index.md`'s own root table is hand-maintained prose, never machine-read); this is new T2 loader work, not a T0 finding.**
+
+Success response, `200`, `Content-Type: application/json`:
 
 ```json
 {
-  "name": "implement",
-  "version": "2",
-  "status": "published",
-  "source": "repository",
-  "description": "...",
-  "tags": ["implementation"],
-  "content_hash": "...",
-  "stages": [
+  "workflows": [
     {
-      "id": "10-plan",
-      "kind": "actor",
-      "harness": null,
-      "profile": "planner"
+      "name": "implement",
+      "version": "2",
+      "source": "/home/operator/repos/payments/.sergeant/workflows/implement",
+      "content_hash": "9f2b1c4d5e6f...  (64 lowercase hex chars, BLAKE3)",
+      "status": "published",
+      "description": "Implement a piece of work from a spec or ticket set, explicit-invocation-only.",
+      "tags": ["implementation", "explicit-invocation"],
+      "stages": [
+        { "id": "10-implement-with-tdd", "kind": "actor", "harness": null, "profile": null, "requires_ask": false },
+        { "id": "30-review", "kind": "actor", "harness": null, "profile": null, "requires_ask": false }
+      ]
     }
   ]
 }
 ```
 
-The exact response is contracted before implementation.
+When no repository catalog resolves for `cwd` and the built-in fallback answers instead (`WorkflowDefinition::embedded()`, name always `software-change`):
+
+```json
+{
+  "workflows": [
+    {
+      "name": "software-change",
+      "version": "1",
+      "source": "embedded",
+      "content_hash": "...  (64 lowercase hex chars)",
+      "stages": [
+        { "id": "00-prepare", "kind": "actor", "harness": null, "profile": null, "requires_ask": false },
+        { "id": "10-implement", "kind": "actor", "harness": null, "profile": null, "requires_ask": false },
+        { "id": "20-review", "kind": "actor", "harness": null, "profile": null, "requires_ask": false },
+        { "id": "30-close", "kind": "actor", "harness": null, "profile": null, "requires_ask": false }
+      ]
+    }
+  ]
+}
+```
+
+`status`, `description`, and `tags` are absent (not `null` — omitted) for the embedded entry: it has no `index.md` to read them from.
+
+**`workflows[]` — CatalogEntry:**
+
+| Field | Type | Required | Source |
+|---|---|---|---|
+| `name` | string | yes | `WorkflowDefinition.name` (`workflow.toml` `[workflow].name`) |
+| `version` | string | yes | `WorkflowDefinition.version` (`workflow.toml` `[workflow].version`; a quoted TOML string, e.g. `"2"`, never numeric) |
+| `source` | string | yes | `WorkflowDefinition.source` verbatim: the literal `"embedded"`, or the loaded workflow directory's path (`root.join(".sergeant/workflows").join(name)`, typically absolute) — the proposal's earlier `"source": "repository"` example did not match any real value and is corrected here |
+| `content_hash` | string, 64-char lowercase hex | yes | `WorkflowDefinition.content_hash` — BLAKE3 over a canonical projection of name/version/stage identity; `source` is deliberately excluded from the hash |
+| `status` | string | no — absent for the embedded entry | the workflow's own `index.md` front matter `status:` field, verbatim. Today this route only ever returns catalog-listed workflows, so the value is always `"published"` in practice (T2-39 excludes drafts before they reach this route); any other value observed here is a loader defect, not a UI state to design for |
+| `description` | string | no — absent for the embedded entry | the workflow's own `index.md` front matter `description:` field, verbatim |
+| `tags` | array of string | no — absent for the embedded entry (never an empty array standing in for "none") | the workflow's own `index.md` front matter `tags:` field, verbatim |
+| `stages` | array of StageEntry, non-empty | yes | `WorkflowDefinition.stages`, in pinned execution order |
+
+**`workflows[].stages[]` — StageEntry:**
+
+| Field | Type | Required | Source |
+|---|---|---|---|
+| `id` | string | yes | `StageDefinition.id` (directory name, e.g. `"10-plan"`) |
+| `kind` | `"actor"` \| `"execute"` | yes | `StageDefinition.kind` (`#[serde(rename_all = "snake_case")]`; TOML omission defaults to `"actor"`, but the resolved value is always present in the response) |
+| `harness` | string or `null` | yes, nullable | `StageDefinition.harness` — `null` means "use the Work actor default" |
+| `profile` | string or `null` | yes, nullable | `StageDefinition.profile` — `null` means "use the Work/profile default" |
+| `requires_ask` | boolean | yes | `StageDefinition.requires_ask` (defaults `false`) |
+
+Deliberately excluded from `StageEntry`: `context` (the stage's full `CONTEXT.md` prompt text — never surfaced by this or any current route) and `execute` (the pinned container spec: image/command/workdir/workspace_access/network/env, present internally only when `kind == "execute"`, currently only `NetworkPolicy::None` → `"none"` exists as a variant). §11.3's Detail view lists only stage order, stage kind, and declared harness/profile; §6.2 excludes a "generalized backend capability matrix." Neither field is needed by any T-Series UI surface today; both stay server-side until a concrete consumer requires them (§16.6's forward rule).
+
+**Edge shapes, not errors:**
+
+- `200` with `{"workflows": []}` when `cwd` resolves to a workspace with no admitted catalog and the embedded fallback itself fails to load (fails closed, per §19.4) — an empty array, not a `4xx`.
+- `200` with a single-entry `{"workflows": [...]}` (the embedded `software-change` entry) when no repository catalog resolves but the embedded fallback loads.
+
+**Errors**, in the same structured `error.name`/`error.detail`/`error.remedy` shape every other authenticated route already uses:
+
+- `400` when `cwd` is missing, not percent-decodable, or not an absolute path.
+
+No mutation. No event append (unchanged from the original minimum addition above).
 
 ## 11.3 Screen
 
@@ -1949,6 +2067,14 @@ Decision T2-14 (§5.3/§16.2/§16.3) was resolved by the proposal's owner on 202
 
 No product code.
 
+### T0 record (run 2026-08-16)
+
+**Main and integration disposition, pinned.** `gh pr view 111` and `gh pr view 126` both report `MERGED` into `main`: PR #111 at merge commit `3a46b87c17d249655708ed5ac32f6704738776cf` (2026-08-15T15:28:02Z), PR #126 at merge commit `0a3b5eb83367ce28ceab41088348344e08c19e30` (2026-08-16T02:03:26Z). `integration/t-series-2026-08-15`'s current head is a merge commit (`991e258`) whose second parent is `0a3b5eb` directly — `git merge-base --is-ancestor` confirms both merge commits are ancestors of the branch head. The branch is caught up to `main` as of the merge commit already on it; no action was needed.
+
+**CLI/API/TUI/workflow-catalog re-audit: no drift found.** `git diff --stat 3a46b87..HEAD -- src/cli.rs src/api.rs src/tui.rs .sergeant/index.md` is empty — none of these four files changed at all between PR #111's merge and the current branch head, including across PR #126 (which touched `src/daemon.rs`, `src/platform/*`, `src/runtime/engine.rs`, `src/runtime/surface.rs`, and tests — perf/reliability work unrelated to the CLI/API/TUI surface this proposal audits). Every factual claim already in this proposal that names these four files was spot-checked directly against the current repository and holds: the Doctor check set (`git`, `claude`, `environment`, `data_dir`, `docker`, `journal`, `projection`, `daemon`, `permission_mode`, `estate`, `disk_pressure`, `filesystem`, all in `src/cli.rs`'s `mod doctor`) matches §12.3 exactly; `Command::Tui` and the `extend`/`retained`/`reap` routes exist in `src/api.rs` as described; `completed_dirty` is already a recognized state in both `src/watch.rs` and `src/tui.rs`; `.sergeant/index.md` still lists exactly 23 published workflows; `Cargo.lock` still pins `ratatui 0.30.2` with Crossterm reached only through `ratatui-crossterm` (§8.7's spike, below, is the first place this is proven rather than merely observed). Nothing new since PR #126 landed falls outside what the T-SERIES-1 gauntlet's assumptions axis already covered.
+
+The workflow catalog route's schema (§11.2) and the `ratatui-textarea` spike (§8.7) are recorded in place in their own sections rather than duplicated here; §8's visual token table is likewise recorded in §8.10.
+
 ## 20.2 T1: Cockpit foundation and immediate Work value
 
 - application shell and `Home / Fleet / Workflows / Estate` navigation;
@@ -2141,6 +2267,7 @@ The rung is the lowest viable resolution.
 | T2-62 | R5 | Three responsive compositions |
 | T2-63 | R2 | TestBackend semantics and geometry over whole-frame goldens |
 | T2-64 | R2 | Pin CLI/TUI Estate parity and mutation behavior |
+| T2-65 | R5 | Lock §8's color roles, spacing scale, and §18's breakpoint geometries as concrete values |
 
 Any implementation decision not represented here is logged in the milestone report. Every new R7 names failed lower rungs.
 
