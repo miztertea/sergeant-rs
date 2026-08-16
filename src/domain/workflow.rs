@@ -58,6 +58,14 @@ pub const CONTEXT_FILE: &str = "CONTEXT.md";
 pub const DEFAULT_WORKFLOW: &str = "software-change";
 /// Source marker for the embedded built-in workflow.
 pub const SOURCE_EMBEDDED: &str = "embedded";
+/// A workflow directory's own OKF front-matter file (`docs/icm/
+/// record-shapes.md` §1) — distinct from the root catalog below.
+pub const INDEX_FILE: &str = "index.md";
+/// The root workflow catalog (`docs/icm/record-shapes.md` §1 rule 2,
+/// `docs/icm/convention.md` §1 rule 1): "the list, not an entry". Lists every
+/// `status: published` workflow under [`WORKFLOW_ROOT`]; drafts and
+/// unindexed directories are never in it (§11.1's Decision T2-39).
+pub const ROOT_CATALOG_FILE: &str = ".sergeant/index.md";
 
 /// Event kind: a work bound to a resolved workflow definition.
 pub const KIND_WORKFLOW_BOUND: &str = "workflow.bound";
@@ -762,9 +770,202 @@ impl WorkflowDefinition {
     }
 }
 
+/// Authored fields from a workflow's own `index.md` front matter
+/// (`docs/icm/record-shapes.md` §1) — the part of a [`CatalogEntry`] that
+/// `workflow.toml` does not carry. `tags` is `None` when the front matter
+/// declares no `tags:` key at all, never an empty list standing in for
+/// "none" (§11.2's CatalogEntry table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowIndexFrontMatter {
+    /// `status:` verbatim (expected to always be `"published"` here: T2-39
+    /// excludes drafts before a name ever reaches [`catalog`]).
+    pub status: String,
+    /// `description:` verbatim.
+    pub description: String,
+    /// `tags:` verbatim, or `None` if the front matter never declared the key.
+    pub tags: Option<Vec<String>>,
+}
+
+/// One entry of the read-only workflow catalog `GET /v1/workflows` projects
+/// (§11.2): a resolved [`WorkflowDefinition`] plus whatever its own
+/// `index.md` says. `front_matter` is `None` only for the embedded fallback,
+/// which has no `index.md` to read (§11.2's "absent for the embedded entry").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    /// The resolved workflow: name, version, source, content hash, stages.
+    pub definition: WorkflowDefinition,
+    /// The workflow's own `index.md` front matter, when it has one.
+    pub front_matter: Option<WorkflowIndexFrontMatter>,
+}
+
 /// Directory a named workflow would live in for a workspace root.
 pub fn workflow_dir(root: &Path, name: &str) -> PathBuf {
     root.join(WORKFLOW_ROOT).join(name)
+}
+
+/// The read-only workflow catalog `GET /v1/workflows` projects (§11.2,
+/// Decisions T2-39/T2-40): every root-indexed `status: published` workflow
+/// under `root`'s [`WORKFLOW_ROOT`], in the root catalog's own listed order,
+/// each paired with its own `index.md` front matter. This never scans
+/// [`WORKFLOW_ROOT`] itself for directories — a name the root catalog does
+/// not list is never admitted, so drafts (which live under a different tree
+/// entirely, `.sergeant/drafts/workflows/`) and unindexed directories are
+/// excluded by construction, not by an extra filter.
+///
+/// A listed name whose `workflow.toml` fails to load, or whose own
+/// `index.md` front matter is missing or malformed, is dropped from the
+/// result rather than admitted half-described or failing the whole read —
+/// this is what "missing/malformed/disagreeing records fail closed" (§19.4)
+/// means at catalog scope: one bad entry costs that entry, not the read.
+///
+/// Returns an empty `Vec` when `root` has no [`ROOT_CATALOG_FILE`] at all —
+/// "no admitted catalog here", the caller's cue to fall back to the embedded
+/// workflow (§11.2's edge shapes).
+pub fn catalog(root: &Path) -> Vec<CatalogEntry> {
+    let Ok(text) = std::fs::read_to_string(root.join(ROOT_CATALOG_FILE)) else {
+        return Vec::new();
+    };
+    root_catalog_names(&text)
+        .into_iter()
+        .filter_map(|name| {
+            let definition = WorkflowDefinition::resolve(root, &name).ok()?;
+            let front_matter = read_index_front_matter(&workflow_dir(root, &name))?;
+            Some(CatalogEntry {
+                definition,
+                front_matter: Some(front_matter),
+            })
+        })
+        .collect()
+}
+
+/// Parse [`ROOT_CATALOG_FILE`]'s Markdown table for the `Workflow` names
+/// whose `Status` column reads exactly `published`. `.sergeant/index.md`'s
+/// own text (`docs/icm/record-shapes.md` §1 rule 2) is the example shape:
+///
+/// ```text
+/// | Workflow | Status | Index |
+/// |---|---|---|
+/// | `code-review` | published | [`workflows/code-review/index.md`](...) |
+/// ```
+///
+/// Any line that is not a data row (the header, the separator, prose) simply
+/// fails one of the two checks below and is skipped — there is no separate
+/// "is this a data row" pass to keep in sync with them.
+fn root_catalog_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.trim().split('|').map(str::trim).collect();
+            // A data row is `| name | status | index |`, which splits (on
+            // the leading/trailing `|`) into `["", name, status, index, ""]`.
+            if cells.len() < 4 {
+                return None;
+            }
+            let name = cells[1].trim_matches('`');
+            if name.is_empty() || cells[2] != "published" {
+                return None;
+            }
+            Some(name.to_string())
+        })
+        .collect()
+}
+
+/// Read and parse one workflow directory's own `index.md` front matter
+/// (`docs/icm/record-shapes.md` §1). `None` on any I/O failure, missing
+/// closing delimiter, or missing required field (`status`/`description`) —
+/// [`catalog`] treats that the same as the workflow not existing.
+fn read_index_front_matter(workflow_dir: &Path) -> Option<WorkflowIndexFrontMatter> {
+    let text = std::fs::read_to_string(workflow_dir.join(INDEX_FILE)).ok()?;
+    parse_index_front_matter(&text)
+}
+
+/// Parse `status`/`description`/`tags` out of an `index.md`'s front matter.
+///
+/// No general YAML parser is pulled in for this: the shape
+/// `docs/icm/record-shapes.md` §1 normatively fixes is fixed and narrow — a
+/// `---`-delimited block of `key: value` lines, an optional `>-`/`|-` folded
+/// or literal block scalar for `description`, and an optional `- item` list
+/// for `tags` — so a parser scoped to exactly that shape is the tiny local
+/// composition R6 asks for over a heavyweight dependency for three known
+/// fields. `kind`, `name`, and `version` are deliberately not read here:
+/// [`CatalogEntry`] takes `name`/`version` from `workflow.toml` (§11.2's
+/// table), and `kind`/`name` agreement is `docs/icm/record-shapes.md`'s own
+/// authoring-time invariant, not something this read-only projection checks.
+fn parse_index_front_matter(text: &str) -> Option<WorkflowIndexFrontMatter> {
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut status: Option<String> = None;
+    let mut description: Option<String> = None;
+    let mut tags: Option<Vec<String>> = None;
+    let mut in_description_block = false;
+    let mut in_tags_block = false;
+    for line in lines {
+        if line.trim() == "---" {
+            return Some(WorkflowIndexFrontMatter {
+                status: status?,
+                description: description?,
+                tags,
+            });
+        }
+        if in_description_block && (line.starts_with(' ') || line.starts_with('\t')) {
+            let text = line.trim();
+            if !text.is_empty()
+                && let Some(d) = &mut description
+            {
+                if !d.is_empty() {
+                    d.push(' ');
+                }
+                d.push_str(text);
+            }
+            continue;
+        }
+        in_description_block = false;
+        if in_tags_block {
+            let trimmed = line.trim_start();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                if let Some(tags) = &mut tags {
+                    tags.push(item.trim().trim_matches('"').to_string());
+                }
+                continue;
+            }
+            in_tags_block = false;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "status" => status = Some(value.trim_matches('"').to_string()),
+            "description" => {
+                if matches!(value, ">-" | ">" | "|-" | "|") {
+                    in_description_block = true;
+                    description = Some(String::new());
+                } else {
+                    description = Some(value.trim_matches('"').to_string());
+                }
+            }
+            "tags" => {
+                if value.is_empty() {
+                    in_tags_block = true;
+                    tags = Some(Vec::new());
+                } else {
+                    tags = Some(
+                        value
+                            .trim_start_matches('[')
+                            .trim_end_matches(']')
+                            .split(',')
+                            .map(|s| s.trim().trim_matches('"').to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_descriptor(text: &str, path: &str) -> Result<WorkflowFile, WorkflowError> {
@@ -1897,5 +2098,219 @@ mod tests {
             matches!(&err, WorkflowError::DuplicateStage { stage, .. } if stage == "00-only"),
             "expected DuplicateStage naming the repeated id, got {err}"
         );
+    }
+
+    // --------------------------------------------- T2: catalog / front matter
+
+    /// The concrete shape `docs/icm/record-shapes.md` §1 gives as its
+    /// canonical example: a folded `>-` description and a bulleted `tags`
+    /// list, both parsed out alongside the plain `status` scalar.
+    #[test]
+    fn front_matter_parses_the_documented_shape() {
+        let text = concat!(
+            "---\n",
+            "kind: workflow\n",
+            "name: diagnose-bug\n",
+            "status: published\n",
+            "version: 3\n",
+            "description: >-\n",
+            "  Reproduce, isolate, prove, remediate and verify a defect.\n",
+            "tags:\n",
+            "  - debugging\n",
+            "  - defect\n",
+            "  - investigation\n",
+            "---\n",
+            "\n",
+            "# Diagnose Bug\n",
+        );
+        let fm = parse_index_front_matter(text).expect("parses");
+        assert_eq!(fm.status, "published");
+        assert_eq!(
+            fm.description,
+            "Reproduce, isolate, prove, remediate and verify a defect."
+        );
+        assert_eq!(
+            fm.tags,
+            Some(vec![
+                "debugging".to_string(),
+                "defect".to_string(),
+                "investigation".to_string()
+            ])
+        );
+    }
+
+    /// A workflow whose front matter never declares `tags:` gets `None`, not
+    /// an empty `Vec` standing in for "none" (§11.2's CatalogEntry table).
+    #[test]
+    fn front_matter_with_no_tags_key_is_none_not_an_empty_list() {
+        let text = concat!(
+            "---\n",
+            "kind: workflow\n",
+            "name: implement\n",
+            "status: published\n",
+            "version: 2\n",
+            "description: A one-line description.\n",
+            "---\n",
+        );
+        let fm = parse_index_front_matter(text).expect("parses");
+        assert_eq!(fm.description, "A one-line description.");
+        assert_eq!(fm.tags, None);
+    }
+
+    /// Missing the closing delimiter, or missing a required field, both fail
+    /// closed rather than returning a partially-filled record.
+    #[test]
+    fn front_matter_fails_closed_when_malformed_or_incomplete() {
+        assert!(parse_index_front_matter("status: published\n").is_none());
+        assert!(parse_index_front_matter("---\nstatus: published\n").is_none());
+        assert!(
+            parse_index_front_matter("---\ndescription: only a description\n---\n").is_none(),
+            "status is required too"
+        );
+    }
+
+    /// The root catalog's own documented table shape: only `published` rows
+    /// contribute a name, and the header/separator rows are silently skipped
+    /// as a side effect of not matching a data row — not by special-casing
+    /// their literal text.
+    #[test]
+    fn root_catalog_names_keeps_only_published_rows_in_order() {
+        let text = concat!(
+            "# Sergeant workflow catalog\n",
+            "\n",
+            "| Workflow | Status | Index |\n",
+            "|---|---|---|\n",
+            "| `code-review` | published | [`workflows/code-review/index.md`](workflows/code-review/index.md) |\n",
+            "| `some-draft` | draft | [`workflows/some-draft/index.md`](workflows/some-draft/index.md) |\n",
+            "| `implement` | published | [`workflows/implement/index.md`](workflows/implement/index.md) |\n",
+        );
+        assert_eq!(
+            root_catalog_names(text),
+            vec!["code-review".to_string(), "implement".to_string()]
+        );
+    }
+
+    /// Writes a minimal admitted workflow (`workflow.toml` + one stage +
+    /// `index.md`) under `root`'s `.sergeant/workflows/<name>/`.
+    fn write_catalog_workflow(root: &Path, name: &str, status: &str) {
+        let wf = workflow_dir(root, name);
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            format!("[workflow]\nname = \"{name}\"\nversion = \"1\"\nstages = [\"00-only\"]\n"),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-only", "do the thing");
+        std::fs::write(
+            wf.join(INDEX_FILE),
+            format!(
+                "---\nkind: workflow\nname: {name}\nstatus: {status}\nversion: 1\n\
+                 description: A one-line description of {name}.\ntags:\n  - t\n---\n"
+            ),
+        )
+        .expect("index.md");
+    }
+
+    /// Writes the root catalog naming exactly `names` as published.
+    fn write_root_catalog(root: &Path, names: &[&str]) {
+        let mut body = String::from(
+            "# Sergeant workflow catalog\n\n| Workflow | Status | Index |\n|---|---|---|\n",
+        );
+        for name in names {
+            body.push_str(&format!(
+                "| `{name}` | published | [`workflows/{name}/index.md`](workflows/{name}/index.md) |\n"
+            ));
+        }
+        std::fs::create_dir_all(root.join(".sergeant")).expect(".sergeant dir");
+        std::fs::write(root.join(ROOT_CATALOG_FILE), body).expect("root catalog");
+    }
+
+    /// The end-to-end happy path: a root-indexed, published workflow with a
+    /// well-formed `index.md` comes back as one fully-described entry.
+    #[test]
+    fn catalog_returns_a_root_indexed_published_workflow_fully_described() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_catalog_workflow(root, "implement", "published");
+        write_root_catalog(root, &["implement"]);
+
+        let entries = catalog(root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].definition.name, "implement");
+        let fm = entries[0].front_matter.as_ref().expect("front matter");
+        assert_eq!(fm.status, "published");
+        assert_eq!(fm.tags, Some(vec!["t".to_string()]));
+    }
+
+    /// A workflow directory that exists on disk but is never named in the
+    /// root catalog is excluded — the catalog only ever walks names the root
+    /// index gives it, never the directory itself (§19.4 "unindexed
+    /// directory excluded").
+    #[test]
+    fn catalog_excludes_an_unindexed_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_catalog_workflow(root, "implement", "published");
+        write_catalog_workflow(root, "shadow", "published");
+        write_root_catalog(root, &["implement"]); // "shadow" deliberately omitted
+
+        let entries = catalog(root);
+        let names: Vec<&str> = entries.iter().map(|e| e.definition.name.as_str()).collect();
+        assert_eq!(names, vec!["implement"]);
+    }
+
+    /// A row the root catalog itself marks `draft` never contributes a name
+    /// to resolve, so it cannot appear regardless of what sits on disk
+    /// (§19.4 "drafts excluded").
+    #[test]
+    fn catalog_excludes_a_row_the_root_catalog_marks_draft() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_catalog_workflow(root, "implement", "published");
+        write_catalog_workflow(root, "half-baked", "draft");
+        std::fs::create_dir_all(root.join(".sergeant")).expect(".sergeant dir");
+        std::fs::write(
+            root.join(ROOT_CATALOG_FILE),
+            "| Workflow | Status | Index |\n|---|---|---|\n\
+             | `implement` | published | [x](x) |\n\
+             | `half-baked` | draft | [x](x) |\n",
+        )
+        .expect("root catalog");
+
+        let entries = catalog(root);
+        let names: Vec<&str> = entries.iter().map(|e| e.definition.name.as_str()).collect();
+        assert_eq!(names, vec!["implement"]);
+    }
+
+    /// A name the root catalog lists as published, but whose own `index.md`
+    /// cannot be parsed, is dropped from the catalog rather than admitted
+    /// half-described (§19.4 "missing/malformed/disagreeing records fail
+    /// closed").
+    #[test]
+    fn catalog_drops_an_entry_with_a_malformed_index_md() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_catalog_workflow(root, "implement", "published");
+        // A second, well-formed workflow whose index.md is then corrupted.
+        write_catalog_workflow(root, "broken", "published");
+        std::fs::write(
+            workflow_dir(root, "broken").join(INDEX_FILE),
+            "not front matter at all",
+        )
+        .expect("corrupt index.md");
+        write_root_catalog(root, &["implement", "broken"]);
+
+        let entries = catalog(root);
+        let names: Vec<&str> = entries.iter().map(|e| e.definition.name.as_str()).collect();
+        assert_eq!(names, vec!["implement"]);
+    }
+
+    /// No `.sergeant/index.md` at all under `root` is "no admitted catalog
+    /// here" — an empty `Vec`, not a panic or an error, the caller's cue to
+    /// fall back to the embedded workflow.
+    #[test]
+    fn catalog_is_empty_with_no_root_catalog_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        assert!(catalog(dir.path()).is_empty());
     }
 }

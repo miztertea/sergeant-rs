@@ -55,20 +55,21 @@ impl Overlay {
     }
 
     /// The later Work that actually implements this overlay's content —
-    /// `None` for the ones already built: [`Overlay::Help`] (T1a) and
-    /// T1c's four real confirmations (§13.10/§15.5).
+    /// `None` for the ones already built: [`Overlay::Help`] (T1a), T1c's
+    /// four real confirmations (§13.10/§15.5), and T2's live-catalog
+    /// [`Overlay::WorkflowChooser`] (§11.4, §15.4).
     fn owner(self) -> Option<&'static str> {
         match self {
             Overlay::Help
             | Overlay::CancelConfirmation
             | Overlay::RetryConfirmation
             | Overlay::ExtendEnvelope
-            | Overlay::ReapConfirmation => None,
+            | Overlay::ReapConfirmation
+            | Overlay::WorkflowChooser => None,
             // §15.3 is explicitly out of T1c's scope (deferred alongside
             // §15.4's Workflows half and §15.6) — not this Work, and not yet
             // reassigned to a later one by name.
             Overlay::SlashPalette => Some("a later Work (§15.3)"),
-            Overlay::WorkflowChooser => Some("T2 (§20.3's workflow discovery)"),
             Overlay::RepoAddRemove | Overlay::GroupEditRemove | Overlay::RetainedPreview => {
                 Some("T3 (§20.4's Estate work)")
             }
@@ -131,6 +132,7 @@ pub fn render(frame: &mut Frame, area: Rect, overlay: Overlay, app: &App) {
         Overlay::RetryConfirmation => retry_body(app),
         Overlay::ExtendEnvelope => extend_body(app),
         Overlay::ReapConfirmation => reap_body(app),
+        Overlay::WorkflowChooser => workflow_chooser_body(app),
         _ => format!(
             "{} is not built in this Work.\n\n{} implements it.\n\nEsc closes this panel.",
             overlay.title(),
@@ -252,6 +254,28 @@ fn reap_body(app: &App) -> String {
     body
 }
 
+/// §15.4/§11.4: Home's `@` chooser over the live catalog `App::refresh`
+/// already loaded — no second query, just the same `app.workflows.entries`
+/// the Workflows destination itself reads.
+fn workflow_chooser_body(app: &App) -> String {
+    if app.workflows.entries.is_empty() {
+        return "No workflows available (the catalog has not loaded, or is empty).\n\n\
+                Esc/q closes."
+            .to_string();
+    }
+    let mut lines = vec!["j/k move · Enter selects · Esc/q aborts\n".to_string()];
+    for (i, entry) in app.workflows.entries.iter().enumerate() {
+        let name = field_text(&entry["name"]);
+        let marker = if i == app.workflow_chooser_index {
+            "▶ "
+        } else {
+            "  "
+        };
+        lines.push(format!("{marker}{name}"));
+    }
+    lines.join("\n")
+}
+
 /// A `percent_x` × `percent_y` box, centered in `area`.
 fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
     let [area] = Layout::vertical([Constraint::Percentage(percent_y)])
@@ -269,13 +293,14 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn help_and_the_four_t1c_confirmations_are_built_here() {
+    fn help_the_four_t1c_confirmations_and_t2s_workflow_chooser_are_built_here() {
         for built in [
             Overlay::Help,
             Overlay::CancelConfirmation,
             Overlay::RetryConfirmation,
             Overlay::ExtendEnvelope,
             Overlay::ReapConfirmation,
+            Overlay::WorkflowChooser,
         ] {
             assert!(
                 built.owner().is_none(),
@@ -284,7 +309,6 @@ mod tests {
         }
         for later in [
             Overlay::SlashPalette,
-            Overlay::WorkflowChooser,
             Overlay::RepoAddRemove,
             Overlay::GroupEditRemove,
             Overlay::RetainedPreview,
@@ -292,6 +316,28 @@ mod tests {
         ] {
             assert!(later.owner().is_some(), "{later:?} must name who builds it");
         }
+    }
+
+    /// §15.4/§11.4: the chooser lists the live catalog by name, with the
+    /// highlighted entry marked.
+    #[test]
+    fn workflow_chooser_lists_the_live_catalog_with_the_highlighted_entry_marked() {
+        let mut app = App::new();
+        app.workflows.set_entries(vec![
+            json!({"name": "implement", "version": "2", "source": "/x", "content_hash": "a", "stages": []}),
+            json!({"name": "diagnose-bug", "version": "3", "source": "/x", "content_hash": "b", "stages": []}),
+        ]);
+        app.workflow_chooser_index = 1;
+        let body = workflow_chooser_body(&app);
+        assert!(body.contains("implement"), "{body}");
+        assert!(body.contains("▶ diagnose-bug"), "{body}");
+    }
+
+    #[test]
+    fn workflow_chooser_with_no_catalog_loaded_says_so_rather_than_showing_an_empty_list() {
+        let app = App::new();
+        let body = workflow_chooser_body(&app);
+        assert!(body.to_lowercase().contains("no workflows"), "{body}");
     }
 
     fn app_with_open_work(state: &str) -> App {

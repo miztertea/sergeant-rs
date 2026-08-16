@@ -14,6 +14,7 @@ use super::fleet::{FleetOutcome, FleetScreen, WorkRow, fleet_rows};
 use super::home::{HomeOutcome, NewWorkForm};
 use super::overlay::Overlay;
 use super::work_view::{WorkScreen, WorkScreenOutcome};
+use super::workflows::{WorkflowsOutcome, WorkflowsScreen};
 
 /// §7.1's top-level destinations, in their displayed order.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -124,6 +125,8 @@ pub struct App {
     pub home: NewWorkForm,
     /// Fleet's selection and local filters.
     pub fleet: FleetScreen,
+    /// Workflows' loaded catalog, selection, and local `@` filter (§11).
+    pub workflows: WorkflowsScreen,
     /// The canonical Work surface, if one is open over `destination`.
     pub open_work: Option<OpenWork>,
     /// The open Work surface's own fetched data and tab/scroll state
@@ -135,6 +138,11 @@ pub struct App {
     /// The confirmation overlay's own live state (§15.5) — reset whenever an
     /// overlay opens or closes.
     pub pending_action: PendingAction,
+    /// [`Overlay::WorkflowChooser`]'s own live state: which catalog entry is
+    /// highlighted (§15.4's "On Home, `@` selects the existing workflow
+    /// request field"). Reset whenever the overlay opens or closes, the same
+    /// as `pending_action` above.
+    pub workflow_chooser_index: usize,
     /// Whether the global Attention drawer is showing (§7.3: opens by
     /// default at Wide; `~` toggles it at any tier).
     pub drawer_open: bool,
@@ -158,10 +166,12 @@ impl App {
             destination: Destination::default(),
             home: NewWorkForm::default(),
             fleet: FleetScreen::default(),
+            workflows: WorkflowsScreen::default(),
             open_work: None,
             work_screen: None,
             overlay: None,
             pending_action: PendingAction::default(),
+            workflow_chooser_index: 0,
             drawer_open: true,
             system: Value::default(),
             last_seq: 0,
@@ -183,6 +193,21 @@ impl App {
         let fleet = client.fleet().await?;
         self.rows = fleet_rows(&fleet);
         self.fleet.clamp(&self.rows);
+        // §11: the catalog Workflows and Home's `@` chooser both read is
+        // fetched here alongside Fleet, not lazily on first visit to either
+        // — best-effort, like the open Work's own refresh below, so a
+        // daemon that cannot answer this one read does not blank the rest
+        // of an otherwise-successful refresh.
+        if let Ok(cwd) = std::env::current_dir() {
+            match client.workflows(&cwd).await {
+                Ok(body) => {
+                    let entries = body["workflows"].as_array().cloned().unwrap_or_default();
+                    self.workflows.set_entries(entries);
+                    self.workflows.last_error = None;
+                }
+                Err(e) => self.workflows.last_error = Some(e.to_string()),
+            }
+        }
         if let Some(open) = &self.open_work {
             if !self.rows.iter().any(|row| row.id == open.id) {
                 // The work vanished (a data dir replaced under us, or it aged
@@ -236,7 +261,8 @@ impl App {
         match self.destination {
             Destination::Home => self.home.wants_text_focus(),
             Destination::Fleet => self.fleet.wants_text_focus(),
-            Destination::Workflows | Destination::Estate => false,
+            Destination::Workflows => self.workflows.wants_text_focus(),
+            Destination::Estate => false,
         }
     }
 
@@ -265,12 +291,32 @@ impl App {
             Destination::Home => match self.home.on_key(key) {
                 HomeOutcome::None => Action::None,
                 HomeOutcome::Submit(body) => Action::Submit(body),
+                // §15.4: `@` on Home's workflow field opens the live-catalog
+                // chooser instead of typing a literal `@` — the overlay is
+                // `App`-level state, so `Home` only asks for it.
+                HomeOutcome::OpenWorkflowChooser => {
+                    self.workflow_chooser_index = 0;
+                    self.overlay = Some(Overlay::WorkflowChooser);
+                    Action::None
+                }
             },
             Destination::Fleet => match self.fleet.on_key(key.code, &self.rows) {
                 FleetOutcome::None => Action::None,
                 FleetOutcome::Open(id) => Action::OpenWork(id),
             },
-            Destination::Workflows | Destination::Estate => Action::None,
+            // §11.4's "Use in New Work": hands the chosen name to Home's
+            // form and switches there, refocusing it exactly as pressing
+            // `1` would (§9.2's "entering Home always re-focuses the
+            // intent editor").
+            Destination::Workflows => match self.workflows.on_key(key.code) {
+                WorkflowsOutcome::None => Action::None,
+                WorkflowsOutcome::UseInNewWork(name) => {
+                    self.home.workflow = name;
+                    self.goto(Destination::Home);
+                    Action::None
+                }
+            },
+            Destination::Estate => Action::None,
         }
     }
 
@@ -380,12 +426,41 @@ impl App {
                 }
                 Action::None
             }
+            // §15.4/§11.4's live-catalog chooser: j/k move the highlighted
+            // entry, Enter selects it onto Home's workflow field and closes,
+            // Esc/q aborts with the field untouched.
+            Overlay::WorkflowChooser => {
+                let entries = self.workflows.entries.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.close_overlay(),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.workflow_chooser_index + 1 < entries {
+                            self.workflow_chooser_index += 1;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.workflow_chooser_index = self.workflow_chooser_index.saturating_sub(1);
+                    }
+                    KeyCode::Enter => {
+                        if let Some(name) = self
+                            .workflows
+                            .entries
+                            .get(self.workflow_chooser_index)
+                            .and_then(|e| e["name"].as_str())
+                        {
+                            self.home.workflow = name.to_string();
+                        }
+                        self.close_overlay();
+                    }
+                    _ => {}
+                }
+                Action::None
+            }
             // Every overlay a later Work owns (§7.4's note): the mechanism
             // this Work built at T1a — open, close, restore focus for free —
             // with no content of its own yet.
             Overlay::Help
             | Overlay::SlashPalette
-            | Overlay::WorkflowChooser
             | Overlay::RepoAddRemove
             | Overlay::GroupEditRemove
             | Overlay::RetainedPreview
@@ -944,6 +1019,95 @@ mod tests {
             "the screen (the open confirmation) is preserved, not silently closed"
         );
         assert!(app.pending_action.last_error.is_some());
+    }
+
+    // --------------------------------------------------- T2: workflow discovery
+
+    fn app_with_workflows(names: &[&str]) -> App {
+        let mut app = App::new();
+        app.destination = Destination::Workflows;
+        app.workflows.set_entries(
+            names
+                .iter()
+                .map(|name| {
+                    json!({
+                        "name": name,
+                        "version": "1",
+                        "source": "/repo/.sergeant/workflows/".to_string() + name,
+                        "content_hash": "a".repeat(64),
+                        "status": "published",
+                        "stages": [],
+                    })
+                })
+                .collect(),
+        );
+        app
+    }
+
+    /// §15.4/§11.4: choosing "Use in New Work" from Workflows hands the
+    /// selected name to Home's field and switches there, refocused exactly
+    /// as pressing `1` would.
+    #[test]
+    fn use_in_new_work_sets_homes_workflow_field_and_switches_to_home() {
+        let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
+        app.workflows.on_key(KeyCode::Char('j')); // select diagnose-bug
+        assert_eq!(app.on_key(KeyCode::Char('u')), Action::None);
+        assert_eq!(app.destination, Destination::Home);
+        assert_eq!(app.home.workflow, "diagnose-bug");
+    }
+
+    /// §15.4's Home half: `@` on the workflow field opens the live-catalog
+    /// chooser; j/k move the highlight; Enter selects it onto the field and
+    /// closes the overlay.
+    #[test]
+    fn at_sign_on_homes_workflow_field_opens_the_chooser_and_enter_selects_it() {
+        let mut app = App::new();
+        app.workflows.set_entries(vec![
+            json!({"name": "implement", "version": "1", "source": "/x", "content_hash": "a", "stages": []}),
+            json!({"name": "diagnose-bug", "version": "1", "source": "/x", "content_hash": "b", "stages": []}),
+        ]);
+        app.on_key(KeyCode::Tab); // intent -> workflow
+        assert_eq!(app.on_key(KeyCode::Char('@')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::WorkflowChooser));
+
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.on_key(KeyCode::Enter), Action::None);
+        assert!(app.overlay.is_none(), "selecting closes the chooser");
+        assert_eq!(app.home.workflow, "diagnose-bug");
+    }
+
+    /// Esc/q aborts the chooser without touching the field it was opened
+    /// from (§15.5-shaped: nothing is applied on abort).
+    #[test]
+    fn esc_aborts_the_workflow_chooser_without_changing_the_field() {
+        let mut app = App::new();
+        app.home.workflow = "implement".to_string();
+        app.workflows.set_entries(vec![
+            json!({"name": "diagnose-bug", "version": "1", "source": "/x", "content_hash": "b", "stages": []}),
+        ]);
+        app.on_key(KeyCode::Tab);
+        app.on_key(KeyCode::Char('@'));
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.home.workflow, "implement", "the field is untouched");
+    }
+
+    /// The `@` filter field on the Workflows destination owns the keyboard
+    /// exactly like Home's and Fleet's own text fields — `2`/`4` etc. must
+    /// not be hijacked as destination-nav while typing a filter.
+    #[test]
+    fn workflows_at_sign_filter_owns_the_keyboard_like_any_other_text_field() {
+        let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
+        app.on_key(KeyCode::Char('@'));
+        app.on_key(KeyCode::Char('4')); // would otherwise jump to Estate
+        assert_eq!(app.destination, Destination::Workflows);
+        app.on_key(KeyCode::Esc);
+        app.on_key(KeyCode::Char('4'));
+        assert_eq!(
+            app.destination,
+            Destination::Estate,
+            "global nav works again once the filter is left"
+        );
     }
 
     #[tokio::test]
