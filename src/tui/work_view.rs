@@ -457,42 +457,50 @@ impl WorkScreen {
                     .collect()
             })
             .unwrap_or_default();
+        // §11.5's Decision T2-41: this tab shows the workflow definition
+        // *pinned* when this Work bound (`workflow.bound`, journaled once
+        // and never re-derived) — distinct from, and never silently
+        // reconciled with, the live catalog the Workflows destination shows
+        // for what *new* Work can bind now. A later edit to the same-named
+        // workflow's files never moves what is shown here.
+        let label = Line::from(Span::styled(
+            "pinned at bind time — see Workflows for what new Work can bind now",
+            Style::default().fg(Token::Muted.rgb()),
+        ));
         if stage_ids.is_empty() {
-            return vec![Line::from("No pinned workflow yet.")];
+            return vec![label, Line::from("No pinned workflow yet.")];
         }
         let current_index = self.work["stage"]["index"].as_u64();
         let attempt = self.work["stage"]["attempt"].as_u64().unwrap_or(1);
         let executor = &self.work["stage"]["executor"];
-        stage_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                let i = i as u64;
-                let (glyph, style) = match current_index {
-                    Some(cur) if i < cur => ("✓", Style::default().fg(Token::Success.rgb())),
-                    Some(cur) if i == cur => ("⠹", Style::default().fg(Token::Focus.rgb())),
-                    _ => ("·", Style::default().fg(Token::Muted.rgb())),
-                };
-                let mut spans = vec![
-                    Span::styled(format!("{glyph} "), style),
-                    Span::styled(id.clone(), style),
-                ];
-                if current_index == Some(i) {
-                    let mut suffix = format!("  attempt {attempt}");
-                    if let Some(harness) = executor["harness"].as_str() {
-                        suffix.push_str(&format!("  {harness}"));
-                        if let Some(profile) = executor["profile"]["name"].as_str() {
-                            suffix.push_str(&format!(" ({profile})"));
-                        }
+        let mut lines = vec![label, Line::default()];
+        lines.extend(stage_ids.iter().enumerate().map(|(i, id)| {
+            let i = i as u64;
+            let (glyph, style) = match current_index {
+                Some(cur) if i < cur => ("✓", Style::default().fg(Token::Success.rgb())),
+                Some(cur) if i == cur => ("⠹", Style::default().fg(Token::Focus.rgb())),
+                _ => ("·", Style::default().fg(Token::Muted.rgb())),
+            };
+            let mut spans = vec![
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(id.clone(), style),
+            ];
+            if current_index == Some(i) {
+                let mut suffix = format!("  attempt {attempt}");
+                if let Some(harness) = executor["harness"].as_str() {
+                    suffix.push_str(&format!("  {harness}"));
+                    if let Some(profile) = executor["profile"]["name"].as_str() {
+                        suffix.push_str(&format!(" ({profile})"));
                     }
-                    spans.push(Span::styled(
-                        suffix,
-                        Style::default().fg(Token::Muted.rgb()),
-                    ));
                 }
-                Line::from(spans)
-            })
-            .collect()
+                spans.push(Span::styled(
+                    suffix,
+                    Style::default().fg(Token::Muted.rgb()),
+                ));
+            }
+            Line::from(spans)
+        }));
+        lines
     }
 
     // ----------------------------------------------------------- Evidence
@@ -1576,21 +1584,27 @@ mod tests {
             .iter()
             .map(|l| l.to_string())
             .collect();
-        assert_eq!(lines.len(), 3);
+        // §11.5's Decision T2-41 label, then a blank line, then the three
+        // stage rows.
+        assert_eq!(lines.len(), 5);
         assert!(
-            lines[0].starts_with('✓'),
+            lines[0].contains("pinned at bind time"),
+            "the pinned-vs-live label leads the tab: {lines:?}"
+        );
+        assert!(
+            lines[2].starts_with('✓'),
             "earlier stage is done: {lines:?}"
         );
         assert!(
-            lines[1].starts_with('⠹'),
+            lines[3].starts_with('⠹'),
             "current stage is in progress: {lines:?}"
         );
         assert!(
-            lines[1].contains("attempt 2"),
+            lines[3].contains("attempt 2"),
             "attempt number shown: {lines:?}"
         );
         assert!(
-            lines[2].starts_with('·'),
+            lines[4].starts_with('·'),
             "future stage is not entered: {lines:?}"
         );
         assert!(

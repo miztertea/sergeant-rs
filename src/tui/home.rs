@@ -70,6 +70,11 @@ pub enum HomeOutcome {
     None,
     /// The `POST /v1/work` body, ready for `ApiClient::post`.
     Submit(Value),
+    /// §15.4's Home half: "`@` selects the existing workflow request field
+    /// and renders a chip outside durable intent" — pressed on the workflow
+    /// field, this opens the live-catalog chooser (`Overlay::WorkflowChooser`,
+    /// App-level state) instead of typing a literal `@`.
+    OpenWorkflowChooser,
 }
 
 /// §9.1's New Work fields. §15.1's `INTENT` context: the intent field is
@@ -169,6 +174,13 @@ impl NewWorkForm {
                 if let Some(field) = self.field_mut() {
                     field.pop();
                 }
+            }
+            // §15.4: `@` on the workflow field opens the live-catalog
+            // chooser rather than being typed literally — checked before the
+            // generic `Char(c)` arm below, which still handles `@` typed
+            // into any other field exactly as before.
+            KeyCode::Char('@') if FIELDS[self.focus] == Field::Workflow => {
+                return HomeOutcome::OpenWorkflowChooser;
             }
             KeyCode::Char(c) => {
                 if let Some(field) = self.field_mut() {
@@ -371,12 +383,27 @@ fn field_line<'a>(form: &'a NewWorkForm, field: Field, focused: bool) -> Line<'a
         Field::CeilingSecs => form.ceiling_secs.as_str(),
         Field::Submit => "",
     };
+    let label_span = Span::styled(
+        format!("{:<13}", field.label()),
+        Style::default().fg(Token::Muted.rgb()),
+    );
+    // §15.4: a workflow chosen from the live catalog renders as a chip
+    // (`[name]`) outside durable intent — visually distinct from the plain
+    // text every other field is, since it is a selection, not free text.
+    if field == Field::Workflow && !value.is_empty() {
+        let cursor = if focused { "_" } else { "" };
+        return Line::from(vec![
+            label_span,
+            Span::styled(
+                format!("[{value}]"),
+                base.fg(Token::Focus.rgb()).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(cursor),
+        ]);
+    }
     let cursor = if focused { "_" } else { "" };
     Line::from(vec![
-        Span::styled(
-            format!("{:<13}", field.label()),
-            Style::default().fg(Token::Muted.rgb()),
-        ),
+        label_span,
         Span::styled(format!("{value}{cursor}"), base),
     ])
 }
@@ -566,6 +593,42 @@ mod tests {
             "keep me",
             "the draft survives a validation error"
         );
+    }
+
+    /// §15.4: `@` on the workflow field asks `App` to open the chooser
+    /// rather than typing a literal `@` into the field.
+    #[test]
+    fn at_sign_on_the_workflow_field_asks_to_open_the_chooser() {
+        let mut form = NewWorkForm::default();
+        form.on_key(KeyCode::Tab); // intent -> workflow
+        assert_eq!(
+            form.on_key(KeyCode::Char('@')),
+            HomeOutcome::OpenWorkflowChooser
+        );
+        assert_eq!(form.workflow, "", "no literal '@' was typed into the field");
+    }
+
+    /// `@` typed into any other field is still ordinary text — only the
+    /// workflow field intercepts it.
+    #[test]
+    fn at_sign_on_another_field_is_ordinary_text() {
+        let mut form = NewWorkForm::default();
+        for _ in 0..2 {
+            form.on_key(KeyCode::Tab); // intent -> workflow -> backend
+        }
+        assert_eq!(form.on_key(KeyCode::Char('@')), HomeOutcome::None);
+        assert_eq!(form.backend, "@");
+    }
+
+    #[test]
+    fn a_chosen_workflow_renders_as_a_bracketed_chip() {
+        let form = NewWorkForm {
+            workflow: "implement".to_string(),
+            ..NewWorkForm::default()
+        };
+        let line = field_line(&form, Field::Workflow, false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("[implement]"), "{text}");
     }
 
     #[test]

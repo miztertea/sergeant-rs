@@ -46,9 +46,9 @@ use crate::domain::work::{
     KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
 };
 use crate::domain::workflow::{
-    KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
+    self, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
     KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED,
-    KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
+    KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
 use crate::domain::workspace::{InstructionPolicy, Workspace};
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
@@ -417,6 +417,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/events", get(event_history))
         .route("/events/stream", get(event_stream))
         .route("/system", get(system_info))
+        .route("/workflows", get(list_workflows))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer,
@@ -1739,6 +1740,106 @@ async fn pause_admission(
 async fn list_work(State(state): State<ApiState>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
     Json(fleet_body(&core, &state.engine)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowsQuery {
+    /// The client's working directory — workspace discovery (§9) starts
+    /// here, exactly as [`Origin::cwd`] does for `POST /v1/work`, so what
+    /// this route shows as available matches what submission would actually
+    /// resolve (§19.4's "cwd discovery matches submission").
+    cwd: String,
+}
+
+/// One `CatalogEntry.stages[]` element (§11.2's StageEntry): order, kind,
+/// declared harness/profile, and whether the stage asks — nothing else.
+/// `context` (a stage's full prompt) and `execute` (the pinned container
+/// spec) are deliberately never serialized here; no current TUI surface
+/// needs either (§11.2, §11.3, §6.2's capability-matrix exclusion).
+fn stage_entry_json(stage: &crate::domain::workflow::StageDefinition) -> Value {
+    json!({
+        "id": stage.id,
+        "kind": stage.kind.as_str(),
+        "harness": stage.harness,
+        "profile": stage.profile,
+        "requires_ask": stage.requires_ask,
+    })
+}
+
+/// One `workflows[]` element (§11.2's CatalogEntry): `WorkflowDefinition`
+/// fields verbatim, plus `status`/`description`/`tags` from the workflow's
+/// own `index.md` front matter when it has one — omitted entirely (not
+/// `null`, not `[]`) for the embedded fallback, which has none.
+fn catalog_entry_json(entry: &workflow::CatalogEntry) -> Value {
+    let mut value = json!({
+        "name": entry.definition.name,
+        "version": entry.definition.version,
+        "source": entry.definition.source,
+        "content_hash": entry.definition.content_hash,
+        "stages": entry.definition.stages.iter().map(stage_entry_json).collect::<Vec<_>>(),
+    });
+    if let Some(fm) = &entry.front_matter {
+        let object = value.as_object_mut().expect("built as an object above");
+        object.insert("status".to_string(), json!(fm.status));
+        object.insert("description".to_string(), json!(fm.description));
+        if let Some(tags) = &fm.tags {
+            object.insert("tags".to_string(), json!(tags));
+        }
+    }
+    value
+}
+
+/// The catalog `GET /v1/workflows` answers with, for a resolved `cwd`
+/// (§11.2, Decisions T2-39/T2-40): the repository's own root-indexed
+/// published workflows when one resolves and has any, else the embedded
+/// `software-change` fallback, else (only when the embedded fallback itself
+/// fails to load) an empty list — fails closed per §19.4, never a `4xx` for
+/// this shape.
+fn workflow_catalog_entries(cwd: &std::path::Path, data_dir: &std::path::Path) -> Vec<Value> {
+    let repo_entries = match Workspace::discover_scoped(cwd, Some(data_dir)) {
+        Ok(workspace) => workflow::catalog(&workspace.root),
+        Err(_) => Vec::new(),
+    };
+    let entries = if !repo_entries.is_empty() {
+        repo_entries
+    } else {
+        match WorkflowDefinition::embedded() {
+            Ok(definition) => vec![workflow::CatalogEntry {
+                definition,
+                front_matter: None,
+            }],
+            Err(_) => Vec::new(),
+        }
+    };
+    entries.iter().map(catalog_entry_json).collect()
+}
+
+/// `GET /v1/workflows?cwd=<percent-encoded path>` — the read-only workflow
+/// catalog (§11.2): what the client's own submission could bind now. Reuses
+/// the same workspace discovery [`submit_work`]'s plan does, the same
+/// workflow loader and validation, the root publication boundary
+/// (§11.1, [`workflow::catalog`]), and the same embedded fallback. Performs
+/// no mutation, holds no core lock (nothing here reads or writes registry
+/// state), and appends no event.
+async fn list_workflows(
+    State(state): State<ApiState>,
+    query: Result<Query<WorkflowsQuery>, QueryRejection>,
+) -> Response {
+    let req = match parse_query(query) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    let cwd = PathBuf::from(&req.cwd);
+    if !cwd.is_absolute() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_cwd",
+            "cwd must be an absolute path",
+        );
+    }
+    let data_dir = state.data_dir.clone();
+    let workflows = blocking(move || workflow_catalog_entries(&cwd, &data_dir)).await;
+    Json(json!({"workflows": workflows})).into_response()
 }
 
 /// `GET /v1/work/{id}` — one work record, with its stage, surface and
@@ -3424,6 +3525,17 @@ impl ApiClient {
     /// any terminal Work's teardown left something on disk for, estate-wide.
     pub async fn retained(&self) -> Result<Value, ClientError> {
         self.get("/v1/retained").await
+    }
+
+    /// `GET /v1/workflows?cwd=<percent-encoded path>` — the read-only
+    /// workflow catalog (§11.2): what new Work submitted from `cwd` could
+    /// bind now.
+    pub async fn workflows(&self, cwd: &std::path::Path) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/workflows?cwd={}",
+            urlencode(&cwd.display().to_string())
+        ))
+        .await
     }
 
     /// `POST /v1/work/{id}/reap` with a fresh command id (§26) — #109's

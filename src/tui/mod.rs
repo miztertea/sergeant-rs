@@ -150,7 +150,10 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &App, tier: Tier) {
 /// Outputs, §9.4) and Fleet (selected Work preview, §10.1) — §12 names no
 /// rail content for Estate, so it (like Workflows) has none.
 fn draw_wide(frame: &mut Frame, area: Rect, app: &App) {
-    let has_rail = matches!(app.destination, Destination::Home | Destination::Fleet);
+    let has_rail = matches!(
+        app.destination,
+        Destination::Home | Destination::Fleet | Destination::Workflows
+    );
     // §8.10's spacing scale: `region` (3 cells) is the outer margin between
     // the drawer or contextual rail and the primary body at Wide.
     let gap = Constraint::Length(theme::spacing::REGION);
@@ -179,7 +182,10 @@ fn draw_wide(frame: &mut Frame, area: Rect, app: &App) {
             Destination::Fleet => {
                 work_view::render_preview(frame, chunks[next], app.fleet.selected_row(&app.rows))
             }
-            Destination::Workflows | Destination::Estate => {}
+            Destination::Workflows => {
+                workflows::render_recent_work(frame, chunks[next], &app.rows, &app.workflows)
+            }
+            Destination::Estate => {}
         }
     }
 }
@@ -189,7 +195,7 @@ fn draw_primary(frame: &mut Frame, area: Rect, app: &App, tier: Tier) {
     match app.destination {
         Destination::Home => home::render(frame, area, &app.home, admission_paused),
         Destination::Fleet => fleet::render(frame, area, &app.rows, &app.fleet, tier),
-        Destination::Workflows => workflows::render(frame, area),
+        Destination::Workflows => workflows::render(frame, area, &app.workflows),
         Destination::Estate => estate::render(frame, area, &app.estate),
     }
 }
