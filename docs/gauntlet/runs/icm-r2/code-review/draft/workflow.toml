@@ -1,0 +1,24 @@
+# code-review — admitted workflow (N1, docs/gauntlet/contracts/N1.md;
+# reference-corpus/synthesis.md §1, candidate W24). Reviews a diff on two
+# parallel, non-contaminating axes — Standards and Spec — via isolated
+# sub-reviews, reported side by side.
+#
+# Four ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4).
+#
+# Revised at ICM-R2 (docs/gauntlet/runs/icm-r2/code-review/
+# adjudication-draft.md): the prior revision's 20-parallel-review-standards
+# and 30-parallel-review-spec stages merge into 20-30-parallel-review, so
+# BU-P2-003/BU-P2-012's single-message, two-call concurrent dispatch can be
+# represented inside one stage rather than split across two sequential
+# engine stages.
+#
+# Originally promoted per docs/icm/promotion-spec-2026-08-11.md; full
+# behavior-unit citation trail for the prior revision archived at
+# docs/gauntlet/promoted-provenance/code-review.md.
+
+[workflow]
+name = "code-review"
+version = "2"
+stages = ["00-pin-fixed-point", "10-identify-spec-source", "20-30-parallel-review", "40-aggregate"]
