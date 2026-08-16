@@ -577,6 +577,25 @@ fn geometry_palette_chooser_and_confirmations() {
         );
     }
 
+    // Issue #154: `Overlay::ConnectionDetail` had no render body and no key
+    // binding anywhere — this follow-up Work built both. Proven at every
+    // size, for every `Live` state, that the real body renders rather than
+    // the fixed "not built in this Work" placeholder every unbuilt overlay
+    // still falls back to (still proven above for the slash palette below).
+    for live in [Live::Attached, Live::Reconnecting, Live::AuthFailed] {
+        let mut detail = App::new();
+        detail.live = live;
+        detail.overlay = Some(Overlay::ConnectionDetail);
+        for (w, h) in SIZES {
+            let text = text_of(&draw_at(&detail, w, h));
+            assert!(
+                !text.contains("not built in this Work"),
+                "{live:?} connection detail at {w}x{h} must render its real body: {text}"
+            );
+            assert!(text.contains("Esc"), "{live:?} at {w}x{h}: {text}");
+        }
+    }
+
     // §15.3's slash palette: T1c deferred it and no later T-series Work
     // (T2, T3, this one) has claimed it — real gap, not silently dropped
     // (see this Work's commit message). Rendered here anyway so the fixed

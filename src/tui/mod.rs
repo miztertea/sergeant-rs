@@ -296,7 +296,7 @@ fn footer_line(app: &App) -> Paragraph<'_> {
     } else if app.destination == Destination::Fleet && app.fleet.wants_text_focus() {
         "type to filter · Enter/Esc apply"
     } else {
-        "1-4 destinations · Tab cycle · ~ drawer · ? help · q quit"
+        "1-4 destinations · Tab cycle · ~ drawer · c connection · ? help · q quit"
     };
     Paragraph::new(Line::from(vec![
         Span::styled(keys, Style::default().fg(Token::Muted.rgb())),
