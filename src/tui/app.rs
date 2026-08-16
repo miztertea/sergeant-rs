@@ -882,9 +882,13 @@ impl App {
     /// interpret (§13.2's tab switching and each tab's local navigation) —
     /// `App` only acts on the outcomes that reach outside the surface
     /// itself: closing it, an API round trip Evidence's bounded "load
-    /// older" needs, a deliberately submitted Answer (§15.1/§15.2), and
-    /// opening one of §13.10's confirmation overlays (the mutation itself
-    /// waits on that overlay's own deliberate Confirm, per §15.5).
+    /// older" needs, a deliberately submitted Answer (§15.1/§15.2), opening
+    /// one of §13.10's confirmation overlays (the mutation itself waits on
+    /// that overlay's own deliberate Confirm, per §15.5), and — when the
+    /// surface claims no local binding for the key at all (issue #154's
+    /// follow-up) — falling through to the same global keymap browsing
+    /// uses everywhere else, so e.g. `c` still reaches
+    /// `Overlay::ConnectionDetail` whenever cancel isn't currently offered.
     fn on_key_open_work(&mut self, key: KeyEvent) -> Action {
         let Some(screen) = self.work_screen.as_mut() else {
             // The opening fetch is still in flight: only Esc/q is
@@ -944,9 +948,7 @@ impl App {
             // global keymap browsing uses everywhere else see it, so e.g.
             // `c` reaches `Overlay::ConnectionDetail` whenever cancel isn't
             // currently offered on the open Work.
-            WorkScreenOutcome::Unhandled => {
-                self.on_key_global(key.code).unwrap_or(Action::None)
-            }
+            WorkScreenOutcome::Unhandled => self.on_key_global(key.code).unwrap_or(Action::None),
         }
     }
 
@@ -1477,8 +1479,8 @@ mod tests {
     /// everywhere else the moment cancel is not offered, rather than being
     /// silently swallowed by the WorkScreen catch-all.
     #[test]
-    fn c_opens_connection_detail_in_open_work_when_cancel_is_not_offered_and_still_cancels_when_it_is(
-    ) {
+    fn c_opens_connection_detail_in_open_work_when_cancel_is_not_offered_and_still_cancels_when_it_is()
+     {
         let mut app = app_with_open_work("a", "completed");
         assert!(!app.work_screen.as_ref().unwrap().action_available("cancel"));
         assert_eq!(app.on_key(KeyCode::Char('c')), Action::None);

@@ -94,7 +94,11 @@ impl WorkflowsScreen {
             self.selected = index;
             return;
         }
-        if !self.entries.iter().any(|e| e["name"].as_str() == Some(name)) {
+        if !self
+            .entries
+            .iter()
+            .any(|e| e["name"].as_str() == Some(name))
+        {
             return;
         }
         self.filter.clear();
