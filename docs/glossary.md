@@ -5,9 +5,33 @@ Terms fixed by the 2026-08-14 cross-platform decisions
 `docs/adr/0004-cross-platform-development-constraints.md`), and by a
 second, later interview the same day, the "grill-with-docs" round
 (`docs/adr/0005-gating-becomes-a-dispatched-work.md` through
-`docs/adr/0011-delete-the-dashboard.md`). Definitions here are the
+`docs/adr/0011-delete-the-dashboard.md`), and by a third interview on
+2026-08-16, the ICM-R0 owner rulings
+(`docs/adr/0013-icm-r0-owner-rulings.md`). Definitions here are the
 vocabulary those ADRs use; read the ADR itself for the decision and its
 rationale.
+
+**Placement Ladder (PL).** `reference/proposal-icm-r-procedure-authority.md`'s
+eight-rung classification (PL-0 absorbed/obsolete through PL-7 engine gap)
+answering "what is the lowest-authority, smallest-surface representation
+that faithfully owns this behavior?" — applied to one source-cited
+behavior unit at a time, stopping at the first rung that honestly holds.
+Distinct from the pre-existing decomposition ladder in
+`.sergeant/workflows/repo-to-icm/_config/icm-ladder.md`: PL extends it
+with the driver/admission-boundary discriminator (Captain versus
+stage-actor versus deterministic versus runtime; pre-Work versus in-Work
+versus post-Work) the prior ladder lacked. Ratified as accepted vocabulary
+by `docs/adr/0013-icm-r0-owner-rulings.md`'s decision 1.
+
+**Bounded-Judgment Ladder (J).** The companion six-rung ladder (J5
+governing constraint through J0 not-delegated/conflicting/risk-changing)
+answering "what authority allows this actor to decide this material
+question without returning to a human or higher authority?" A stage or
+skill cites the first rung that actually resolves a material decision; a
+J0 landing means stop and produce one precise question rather than guess.
+`validate-and-ship/40-drive-gates`'s existing auto-fix/no-op/ask-user
+finding split is the concrete precedent this ladder generalizes. Ratified
+alongside PL by `docs/adr/0013-icm-r0-owner-rulings.md`'s decision 1.
 
 **Measured target.** A platform (Linux, macOS, or Windows-via-WSL2 per
 `docs/adr/0001-platform-targets-and-measurement-posture.md`'s D1) that has
