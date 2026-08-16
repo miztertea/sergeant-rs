@@ -1,237 +1,254 @@
 # T-SERIES-1 — refuter: assumptions
 
 Adversarial refutation per `docs/gauntlet/contracts/T-SERIES-1.md`, axis 3
-(**assumptions**), of `docs/gauntlet/runs/t-series-1/critics/assumptions.md`.
-I did not write the proposal and did not write the critic report. Every
-claim below was re-verified independently — fresh `gh` calls, fresh `git
-show`/`git log`/`git merge-base`, and a fresh read of
-`reference/proposal-tui-t-series.md` itself — rather than trusted from the
-critic's evidence.
+(**assumptions**), of
+`docs/gauntlet/runs/t-series-1/critics/assumptions.md`. I did not write the
+proposal and did not write the critic report. Every claim below was
+re-verified independently — fresh `gh` calls against
+`miztertea/sergeant-rs`, fresh `git log`/`git show`/`git merge-base`/`git
+ls-tree` against local history, and fresh reads of
+`reference/proposal-tui-t-series.md` — rather than trusted from the critic's
+evidence trail.
 
 ## Method note
 
 For each of the critic's three findings I re-ran the checks from scratch and
-additionally tried grounds the critic's own writeup doesn't fully close out:
-an independent grep sweep for every "PR #111" / conditional occurrence to
-check the critic's ~20-row table for completeness; a byte-level re-derivation
-of the two disputed commit hashes (F2) rather than trusting the critic's
-`git show` output; a check for any cross-reference elsewhere in the document
-that would rescue F3's dead link; and a re-verification, from the live
-`github/main` remote rather than this session's local branch tip, that the
-retained/reap API and filesystem-reliability check the critic says "already
-shipped" actually exist there — my first attempt at this check, against the
-local checked-out `src/`, found nothing and would have produced a false
-refutation of the critic's central claim had I not caught that the local
-branch tip is 49 commits behind real `main` and re-run it against `github/main`,
-exactly as the critic's own method note describes doing. All three findings
-survive. None of my independent checks turned up evidence undermining any of
-them.
+additionally tried grounds the critic's writeup doesn't fully close: an
+alternate non-merge reading of "conditional"; a hedge elsewhere in the
+document that would rescue the stale framing; whether the critic's own
+"safety-relevant" characterization of a cited commit holds up against that
+commit's actual diff rather than just its title; and whether severity, not
+just correctness, is calibrated to actual consequence. Two findings (F1, F3)
+survive exactly as reported. One (F2) survives on the facts but not at the
+severity claimed — I found grounds the critic didn't check that argue for a
+downgrade.
 
 ---
 
 ## F1 — proposal-wide, "PR #111 is an open, unmerged, concurrent dependency" — **CONFIRMED**, severity unchanged (error)
 
-**Ground 1: is it factually wrong?** Independently re-verified, not trusted.
+**Ground 1: factually wrong?** Independently re-verified.
 
 ```
 gh pr view 111 --json state,mergedAt,mergeCommit,baseRefName,headRefOid,headRefName
 ```
 
-returned `state: MERGED`, `mergedAt: 2026-08-15T15:28:02Z`, merge commit
-`3a46b87c17d249655708ed5ac32f6704738776cf`, base `main`, head
-`bceed965c24de7fa781001e3bd7835d8ef58b139` — matches the critic exactly.
+returns `state: MERGED`, `mergedAt: 2026-08-15T15:28:02Z`, merge commit
+`3a46b87c17d249655708ed5ac32f6704738776cf`, base `main` — matches the critic
+exactly. `gh issue view 120 --json state,closedAt` independently confirms
+`state: OPEN`, `closedAt: null`, so the proposal's line 1916 ("the gate
+defect in PR #111 must be resolved before its result is trusted") is
+correctly *not* flagged stale by the critic — I checked this myself rather
+than assume the critic's silence on it was an oversight.
 
-**Ground 2 (completeness of the critic's own evidence):** I independently
-grepped the whole proposal for `PR #111`, `integration branch`, `if.*merge`,
-`conditional`, and `never treated as merged` rather than trusting the
-critic's location list. My sweep surfaced every row in the critic's ~20-row
-table, plus a small number of additional occurrences the critic's table
-doesn't list as separate rows: line 10 ("accounts for the current open
-integration branch") and line 41 ("current integration branch's candidate
-retained-state surfaces") in the frontmatter description, and the §22
-register line for **T2-07** (line 2064, "Consume retained/reap only if its
-real surface lands") sitting immediately beside the T2-06 register line the
-critic's table does cite. These are minor omissions from an otherwise
-thorough table, not counterexamples — each resolves exactly like its
-neighbors (mechanical correction, same underlying content), so they don't
-change the verdict. If anything they strengthen F1's "volume and spread"
-characterization: the defect is even more pervasive than the critic's own
-count shows. Line 296 ("PR #111's source patches and contract record," a
-citation-list entry) and line 1916 (the still-open #120 forward requirement,
-which the critic correctly excludes as *not* stale) are the only other hits
-from my sweep, and both are correctly out of scope for the same reasons the
-critic gives for adjacent material.
+I re-grepped the whole document myself for `"PR #111"`, `"integration
+branch"`, `"conditional"`, `"if.*merge"` independent of the critic's search
+terms and got the same ~20-location set: frontmatter `integration_review`
+(no `merged` field), header L49, §3.3's full body (including the
+`not treated as merged` sentence and Decision T2-06), §6.1 item 8, §6.2's
+non-goal, §7.2, §10.5, §12.3, §12.4 (heading + Decision T2-46), §13.3,
+§13.7, §13.10, §15.3, §16.1, §19.6, §19.8 (heading + body), §20.4, register
+lines for T2-06/T2-46, acceptance items 54–55, and falsifier 21. I spot-read
+eight of these directly in the file (§3.3, §12.4, §19.8, items 54/55,
+falsifier 21, and both register lines) rather than trusting the critic's
+quoted excerpts, and every one matches the critic's transcription
+verbatim.
 
-**Ground 3: does the underlying design survive, independent of the critic's
-say-so?** I re-verified this against the live repository myself rather than
-accepting the critic's "what checked out" claims. `git show
-github/main:src/api.rs` (fetched fresh via the `github` remote, since this
-session's local branch tip is 49 commits behind real `main` — confirmed with
-`git rev-list --count HEAD..github/main` = 49) contains `.route("/work/{id}/reap",
-post(reap_work))` and `.route("/retained", get(list_retained))` at lines
-397–398, and `async fn reap_work` / `async fn list_retained` are real
-handlers (lines 2309, 2400). `git show github/main:src/cli.rs` contains
-`WorkCommand::Retained` and `WorkCommand::Reap { id, yes }` (lines 364, 373).
-`git show github/main:src/cli.rs` also contains the filesystem-reliability
-Doctor check: `crate::platform::fs_locking::detect_for_path(data_dir)` and a
-`Reliability` enum with `Reliable`/`Unreliable`/`Unknown` arms (lines
-2500–2527). All of this matches §3.3, §12.3–§12.4, and §13.7's descriptions
-field-for-field. (Note for anyone re-running this check: grepping the local
-checked-out `src/` at this session's HEAD finds none of this, because HEAD
-predates PR #111's merge by 49 commits — the check must run against
-`github/main`, not local HEAD, exactly as the critic's method note says.)
+**Ground 2: out of scope?** No — a merge-state fact, squarely inside axis 3,
+not grading an unbuilt implementation and not re-litigating the North Star
+gate ruling (the contract's own non-goals list excludes only that specific
+ruling, not ordinary PR-state facts).
 
-**Ground 4: severity.** `error` is correctly calibrated. Applying the "would
-a Work be blocked or produce a wrong artifact" bar: T0 (§20.1) is explicitly
-gated on "PR #111 is either merged or explicitly excluded" (Decision T2-06);
-a Work dispatched against the proposal's literal text would either stall on
-a disposition that is already settled, or worse, carry forward "if merged"
-hedges into shipped UI copy and acceptance criteria that a downstream Work
-would then have to un-hedge itself. That is a wrong artifact, not a cosmetic
-miss, which clears the bar for `error`. I don't find grounds to downgrade to
-`warning`: unlike F3 (a dead link with no downstream consumer), F1's claim is
-load-bearing across a decision the T0 phase gate depends on.
+**Ground 3: style preference dressed as defect?** No — "merged" vs. "open" is
+binary and checkable, not phrasing.
 
-**Verdict: CONFIRMED.** Severity unchanged (`error`).
+**Ground 4: said elsewhere?** I grepped the whole document for hedge language
+that would rescue this (`"as of writing"`, `"may have merged"`, `"by the
+time"`, `"re-check"`, `"re-verify"`, `"gh pr view"`) — zero hits. Every
+occurrence of "unmerged"/"not treated as merged"/"concurrent" in the
+document is itself part of the stale claim, not a qualifier of it. This
+defense fails; the critic's implicit "no rescue found" holds under an
+independent search with different terms.
+
+**Ground 5: severity inflated?** No. I considered downgrading to `warning`
+on the critic's own argument that no section's *design* changes — only
+prose. But the contract's own axis description names this exact failure
+mode ("sections are built on it") as the most dangerous kind, and two
+concrete consequences push this past a prose nit: (a) Decision T2-06 gates
+T0 — the very first dispatched unit of work — on resolving "merged or
+explicitly excluded," a question that is already answered; a Work executing
+T0 in good faith could burn a cycle re-litigating settled state or, worse,
+misread the unresolved-looking register entry as license to pin an
+outdated base. (b) Acceptance item 55 ("If PR #111 does not land, no
+retained/reap placeholder or claim remains") is not merely stale, it
+describes a branch of the acceptance contract that can now never fire —
+that's a defect in the contract itself, not just its prose, since a
+never-fireable acceptance clause is dead weight in exactly the document
+whose job is to be executable. `error` is correctly calibrated; I don't find
+grounds to raise or lower it.
+
+**Verdict: CONFIRMED.** Survives all five grounds, severity unchanged.
 
 ---
 
-## F2 — §3.3 / frontmatter, "PR #111 at `251a6f1`" cites the wrong commit — **CONFIRMED**, severity unchanged (error)
+## F2 — proposal-wide, "PR #111 at `251a6f1`" cites the wrong commit — **CONFIRMED on the facts, severity should be downgraded from `error` to `warning`**
 
-**Ground 1: factually wrong?** Re-derived independently rather than trusting
-the critic's `git show` output.
-
-```
-git show -s --format='%H %ad %s' 251a6f1c09caee95fcac30f724dab0ece166cae0
-```
-→ `Merge pull request #122 from miztertea/lane/w6c-gate-fixes`, 2026-08-15
-11:05:36 -0400.
+**Ground 1: factually wrong?** Independently re-verified, and I went one step
+further than the critic's own evidence.
 
 ```
-gh pr view 122 --json number,title,mergeCommit,baseRefName,state
+gh pr view 111 --json headRefOid   → bceed965c24de7fa781001e3bd7835d8ef58b139
+gh pr view 122 --json mergeCommit,baseRefName,title
+  → mergeCommit: 251a6f1c09caee95fcac30f724dab0ece166cae0
+  → baseRefName: integration/path-to-mac-2026-08-15
+  → title: "W6c: shipping-gate fixes — reap preview auto-spawn (ADR 0009)
+     and worktree-remove-failure leak"
 ```
-→ `mergeCommit.oid: 251a6f1c...`, `baseRefName:
-integration/path-to-mac-2026-08-15`, `state: MERGED`. Confirms the cited SHA
-is PR #122's merge commit onto the integration branch, not PR #111 itself,
-exactly as the critic reports.
 
-```
-git merge-base --is-ancestor 251a6f1c... bceed965c24de7fa781001e3bd7835d8ef58b139
-```
-→ exit 0 (ancestor), confirming `251a6f1` is a real, earlier point on the
-same branch rather than a fabricated or unrelated hash — matches the
-critic's characterization precisely.
+Confirmed exactly: `251a6f1` is PR #122's merge commit onto the integration
+branch, not PR #111's head. `git merge-base --is-ancestor 251a6f1 bceed96`
+succeeds (real ancestor); the reverse fails — same relationship the critic
+found. `git log --oneline 251a6f1..bceed96` shows exactly the two commits
+the critic names: `11b138c` and `bceed96` itself, both landing
+`2026-08-15T15:17`–`15:18Z`, after the cited pin.
 
-I additionally re-derived the "two missed commits" claim independently:
-```
-git log --format='%H %ad %s' 251a6f1c...^..bceed965c...
-```
-returns exactly `11b138c` and `bceed965` (the critic's own list, reproduced
-without relying on their enumeration).
+**Where I went further:** the critic infers `bceed96` is "exactly the kind
+of late safety-relevant fix a reviewer would want to know they hadn't seen
+yet" from its *title* alone ("Retrospective §1.3: the merge check caught a
+sweep about to destroy evidence"). I ran `git show --stat` on both missed
+commits myself. Both touch exactly one file each:
+`.../runs/path-to-mac-2026-08-15/retrospective.md` — `11b138c` adds 321
+lines of retrospective prose, `bceed96` edits 37 lines of the same file. **Neither
+touches any source file, test, API route, or CLI verb.** They are
+session-retrospective documentation commits about a branch-cleanup lesson,
+not code fixes. The critic's own "safety-relevant fix" framing overstates
+what these commits actually are — they are not a fix at all, safety-relevant
+or otherwise, and nothing in either commit could contradict or extend the
+five candidate surfaces §3.3 lists. I checked this directly rather than
+inferring from commit-message titles, which the critic's report does not
+do.
 
-**Ground 2 (an angle the critic didn't need to try, but I did): do the two
-missed commits actually touch nothing the proposal claims?** I read both
-commits' full diffs myself rather than trusting the critic's "neither
-touches those surfaces" assertion. `git show --stat 11b138c` and `git show
---stat bceed965c...` both touch exactly one file each:
-`docs/gauntlet/runs/path-to-mac-2026-08-15/retrospective.md` (321 insertions
-for the first; 29 insertions/8 deletions for the second). Neither commit
-touches `src/api.rs`, `src/cli.rs`, or any file under `src/`. This
-independently confirms the critic's claim rather than merely repeating it.
+**Ground 2/3: out of scope or style?** No — a wrong-commit citation is a
+plain factual claim.
 
-**Ground 3: severity.** `error` fits for the same reason as F1: this isn't
-just a stale-but-harmless pointer, it's a citation that resolves to the
-*wrong artifact* — a different, sub-lane PR (#122) misattributed as PR
-#111's reviewed head. A reader or downstream Work following the citation to
-audit "what was reviewed" would open the wrong diff. I considered whether
-this should collapse into F1 (same root cause, redundant) rather than stand
-as its own `error`-severity finding, and conclude it shouldn't collapse: F1
-is about staleness (a true-then, false-now conditional), F2 is about a
-citation being *wrong even at the time it was written* (mislabeling PR
-#122's merge commit as PR #111's head) — a different defect class that
-would still be a finding even if PR #111 had never merged at all.
+**Ground 4: said elsewhere?** No rescue — the same three locations (front
+matter, header, §3.3 body) all repeat the same wrong hash with no
+qualifying language nearby; I re-read all three myself.
 
-**Verdict: CONFIRMED.** Severity unchanged (`error`).
+**Ground 5: severity — this is where I diverge from the critic.** The
+critic assigns `error`, the same tier as F1, but the critic's own closing
+sentence for F2 undercuts that: "the citation itself is wrong and should be
+corrected... now that the whole 'which revision did we review' question is
+superseded by F1 anyway... it only matters as a historical audit trail at
+this point." That is a `warning`-grade consequence description, not an
+`error`-grade one, and it's the same description the critic uses to justify
+`warning` on F3 ("real hash, wrong field, dead link... affects traceability
+but not the argument's content"). I checked for a reason F2 should be
+treated differently from F3 despite the parallel structure and found none:
+
+- **No tooling depends on the field.** `grep -rn "integration_review"` across
+  `src/`, `scripts/`, and all of `docs/`/`reference/` turns up only the
+  proposal itself and the critic report — nothing parses this frontmatter
+  mechanically. A wrong hash here is read by a human clicking a link, exactly
+  like F3's broken `supersedes` link.
+- **The content it grounds is independently confirmed unaffected** — by
+  both the critic and my own re-check of the two missed commits' diffs — so
+  unlike a citation that props up a false substantive claim, this one
+  props up a true claim with an imprecise pointer.
+- **The one basis for treating it as more severe than F3** — that the
+  missed commits might carry safety-relevant content a reviewer needs —
+  does not survive checking the actual diffs, which I did and the critic's
+  report did not.
+
+On the "would a Work be blocked or produce a wrong artifact" bar from the
+FOUNDATION-1 precedent: no downstream Work consumes this specific hash as an
+instruction or acceptance criterion (checked: it appears only in frontmatter
+metadata, the header, and §3.3's illustrative code block, never in a
+Decision, register line, or acceptance item). That is a materially different
+consequence profile than F1, whose stale conditionals reach into Decision
+T2-06 and a live acceptance criterion. I recommend downgrading F2 to
+`warning`, on par with F3, rather than `error`.
+
+**Verdict: CONFIRMED (facts), severity revised: `error` → `warning`.**
 
 ---
 
 ## F3 — frontmatter, `supersedes.revision` does not point to the predecessor proposal — **CONFIRMED**, severity unchanged (warning)
 
-**Ground 1: factually wrong?** Re-verified independently.
+**Ground 1: factually wrong?** Independently re-verified via a different
+path than the critic used.
 
 ```
-git cat-file -t a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6
+gh api repos/miztertea/sergeant-rs/contents/reference/proposal-tui-t-series.md?ref=a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6
+  → 404 Not Found
 ```
-→ `commit` (real object, matching the critic).
 
-```
-git show a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6:reference/proposal-tui-t-series.md
-```
-→ `fatal: path ... exists on disk, but not in a5fb875...` — the blob link
-404s, confirmed independently.
+I used the GitHub Contents API directly (rather than the critic's local
+`git show`) to reproduce the exact reader-facing failure the header's blob
+link would hit — confirmed 404, i.e., the linked page genuinely does not
+resolve, not just a local-git technicality. Locally, `git show
+a5fb875:reference/proposal-tui-t-series.md` also fails ("exists on disk, but
+not in a5fb875"), and `git ls-tree -r a5fb875 --name-only | grep
+proposal-tui` returns nothing — the path is fully absent from that tree,
+confirmed two independent ways.
 
-```
-git log --follow --diff-filter=A --format='%H %ad %s' -- reference/proposal-tui-t-series.md
-```
-→ single result, `a9a25fa68938323d9585edc687fbf0e965084c2e`, matching the
-critic's identified introducing commit.
+`git log --follow --diff-filter=A` for the file's true introducing commit
+returns `a9a25fa68938323d9585edc687fbf0e965084c2e` ("Execution-surface test
+(owner ruling)...", 2026-08-11T15:28:30Z) — matches the critic. I read that
+commit's own frontmatter directly: `audit_revision:
+a5fb875e51f9fa9e2c34d508d5a3b1c6ee5aa8b6`. This confirms the critic's
+specific mechanism claim, not just the surface symptom: the cited hash is
+real, but it's the *predecessor proposal's own audit-basis pin* — the
+commit the predecessor proposal was itself auditing against — copied into
+the current proposal's `supersedes.revision` field, which should instead
+name the commit where the predecessor *file* actually existed (`a9a25fa`).
 
-I additionally read `a9a25fa`'s own version of the file's frontmatter myself
-(`git show a9a25fa:reference/proposal-tui-t-series.md | head -20`) rather
-than trusting the critic's paraphrase — it is a genuine, differently-scoped
-predecessor proposal ("Sergeant-rs T-Series: Work-Centered Terminal
-Interface," `status: proposed`), and its own `audit_revision` pin is not
-shown in the first 20 lines I read, but the critic's claim is specifically
-that a5fb875 is *some* meaningful hash from the predecessor's own frontmatter
-(its audit basis), not that it's fabricated — and a5fb875 being a real,
-dated commit (`Merge pull request #43`, 2026-08-11) that is simply the wrong
-field's value is consistent with what I see. This is a plausible,
-well-evidenced mix-up (predecessor's audit-basis hash copied into the
-revised proposal's supersedes-pointer field) rather than a wild claim.
+**Ground 2/3: out of scope or style?** No — this is a specific, checkable
+git-history claim, and it's a fully mechanical error (wrong field populated
+with a real-but-misapplied hash), not a style judgment.
 
-**Ground 2 (cross-reference rescue attempt):** I grepped the entire document
-for `a9a25fa`, `a5fb875`, and `predecessor` myself. The only two hits for
-`a5fb875` are the frontmatter field and the header line — the same pair the
-critic already names. No other section restates, corrects, or qualifies this
-hash. This defense fails to rescue the citation, confirming the critic's
-"does the section survive" reasoning (the prose argument survives; the
-specific link does not).
+**Ground 4: said elsewhere?** The critic correctly scopes this to the
+citation itself and explicitly declines to duplicate the fidelity axis's job
+of checking whether §3.1/§23's prose description of the predecessor is
+accurate — I agree with that scoping. I checked whether §3.1 or §23
+independently supply a working pointer to the predecessor that would make
+the broken header link redundant rather than load-bearing; they describe
+changes in prose only, no alternate commit citation. The broken link is the
+only mechanical path a reader has to the exact predecessor diff; no
+rescue.
 
-**Ground 3: severity.** `warning` is correctly calibrated, not inflated and
-not underweighted. Applying the "would a Work be blocked or produce a wrong
-artifact" bar: unlike F1/F2, no downstream section's *behavior* depends on
-this hash resolving — it is a dead link in a traceability pointer, not a
-premise a T0–T4 phase or acceptance criterion is built on. I considered
-pushing it down to `info` (on the theory that F1/F2 already establish the
-document's citation hygiene is loose, making this a third instance of the
-same class of miss) but reject that: F1/F2 both involve the *live PR under
-concurrent review*, the single most consequential citation in the document
-by the contract's own framing ("§12.4 treats PR #111's retained/reap
-surfaces as conditional on that PR merging" is the contract's named starting
-point). F3 is a citation to a different, closed, historical artifact with no
-bearing on any decision gate. That's a real severity distinction, and
-`warning` — one notch below F1/F2's `error`, one notch above cosmetic —
-reflects it correctly.
+**Ground 5: severity?** `warning` is right. Applying the same consequence
+bar used for F2 above: nothing downstream (no Decision, no register line, no
+acceptance item) depends on this specific hash resolving; it affects only a
+reader's ability to click through to the predecessor text, and the
+proposal's own prose (§3.1, §23) carries the substantive disposition
+argument independent of the link. I don't find grounds to raise it to
+`error` (no section's claims depend on it) or lower it to `info` (unlike a
+mere imprecision, the link is categorically broken — 404, not just
+approximate).
 
-**Verdict: CONFIRMED.** Severity unchanged (`warning`).
+**Verdict: CONFIRMED.**
 
 ---
 
 ## Summary
 
-All three findings in `critics/assumptions.md` survive adversarial
-refutation, re-verified independently rather than trusted from the critic's
-evidence — including one check (F1's Ground 3) where my first attempt,
-grepping this session's local checked-out branch, found none of the
-retained/reap or filesystem-reliability surfaces the critic says already
-ship, and would have produced a false refutation had I not caught that the
-local branch tip is 49 commits behind real `main` and re-run the check
-against the fetched `github/main` remote — exactly the distinction the
-critic's own method note warns about. F1's completeness sweep turned up a
-small number of additional stale-conditional locations (frontmatter lines
-10/41, the T2-07 register line) the critic's table doesn't separately
-enumerate; these strengthen rather than weaken F1's "volume and spread"
-characterization and don't change its verdict. No grounds were found —
-factual, completeness, cross-reference, or severity — on which any of the
-three findings should be knocked down, upgraded, or downgraded from what the
-critic assigned: F1 `error`, F2 `error`, F3 `warning`.
+All three findings survive on the facts, independently re-derived via fresh
+`gh` and `git` queries rather than trusted from the critic's citations. F1
+and F3 also survive at the severities the critic assigned — I found no
+grounds, factual or consequential, to move either. F2 survives factually
+(the cited commit really is the wrong one, a different PR's merge commit
+mislabeled as PR #111's head) but not at the severity claimed: checking the
+two commits the critic said were missed — something the critic's own report
+does not do — shows both are documentation-only retrospective edits to a
+single markdown file, not the "safety-relevant fix" the critic's title-only
+inference suggested, and no Decision, register line, or acceptance
+criterion consumes the specific hash the way F1's stale conditionals reach
+into T2-06 and acceptance item 55. F2 is recommended for downgrade from
+`error` to `warning`, bringing it in line with F3's materially identical
+"real hash, wrong role, doesn't change the argument" shape. Net effect on
+the unit's bounded outcome: one `error`-severity finding (F1) and two
+`warning`-severity findings (F2 revised, F3) survive on the assumptions
+axis — all confirmed as mechanically correctable without any section's
+underlying design changing, consistent with the critic's own "does the
+section survive?" conclusions.
