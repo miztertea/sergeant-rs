@@ -1,21 +1,24 @@
 //! Overlays (§7.4, Decision T2-24): a small fixed set of contextual views,
 //! not a modal framework or second navigation system.
 //!
-//! The *mechanism* — how one opens, closes, and restores focus — is this
-//! Work's job; most of the individual overlays' content is later Works'
-//! (the workflow chooser needs T2's catalog, repo/group add-remove and the
-//! retained-state preview need T3's Estate routes, cancel confirmation and
-//! extend-envelope need T1c's mutations). Opening an overlay never mutates
-//! the destination state underneath it — [`super::app::App::on_key`] simply
-//! routes every keystroke to the overlay instead of the destination while
-//! one is open — so closing it "restores focus" for free: nothing under it
-//! ever moved.
+//! The *mechanism* — how one opens, closes, and restores focus — is T1a's
+//! job; T1c fills in the four real confirmations respond/retry/extend/
+//! cancel need (§13.10/§15.5). What is left for later Works: the workflow
+//! chooser (T2's catalog), repo/group add-remove and the retained-state
+//! preview (T3's Estate routes), and the slash palette (§15.3, explicitly
+//! out of T1c's scope). Opening an overlay never mutates the destination
+//! state underneath it — [`super::app::App::on_key`] simply routes every
+//! keystroke to the overlay instead of the destination while one is open —
+//! so closing it "restores focus" for free: nothing under it ever moved.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
+use crate::api::field_text;
+
+use super::app::App;
 use super::theme::Token;
 
 /// §7.4's fixed set, in the order it lists them.
@@ -25,7 +28,9 @@ pub enum Overlay {
     WorkflowChooser,
     Help,
     CancelConfirmation,
+    RetryConfirmation,
     ExtendEnvelope,
+    ReapConfirmation,
     RepoAddRemove,
     GroupEditRemove,
     RetainedPreview,
@@ -39,7 +44,9 @@ impl Overlay {
             Overlay::WorkflowChooser => "Choose a Workflow",
             Overlay::Help => "Help",
             Overlay::CancelConfirmation => "Cancel Work?",
+            Overlay::RetryConfirmation => "Retry?",
             Overlay::ExtendEnvelope => "Extend Envelope",
+            Overlay::ReapConfirmation => "Reap?",
             Overlay::RepoAddRemove => "Repository",
             Overlay::GroupEditRemove => "Group",
             Overlay::RetainedPreview => "Retained State",
@@ -48,13 +55,19 @@ impl Overlay {
     }
 
     /// The later Work that actually implements this overlay's content —
-    /// `None` for [`Overlay::Help`], which T1a implements in full.
+    /// `None` for the ones already built: [`Overlay::Help`] (T1a) and
+    /// T1c's four real confirmations (§13.10/§15.5).
     fn owner(self) -> Option<&'static str> {
         match self {
-            Overlay::Help => None,
-            Overlay::SlashPalette | Overlay::CancelConfirmation | Overlay::ExtendEnvelope => {
-                Some("T1c (§20.2's mutation and composer work)")
-            }
+            Overlay::Help
+            | Overlay::CancelConfirmation
+            | Overlay::RetryConfirmation
+            | Overlay::ExtendEnvelope
+            | Overlay::ReapConfirmation => None,
+            // §15.3 is explicitly out of T1c's scope (deferred alongside
+            // §15.4's Workflows half and §15.6) — not this Work, and not yet
+            // reassigned to a later one by name.
+            Overlay::SlashPalette => Some("a later Work (§15.3)"),
             Overlay::WorkflowChooser => Some("T2 (§20.3's workflow discovery)"),
             Overlay::RepoAddRemove | Overlay::GroupEditRemove | Overlay::RetainedPreview => {
                 Some("T3 (§20.4's Estate work)")
@@ -64,8 +77,8 @@ impl Overlay {
     }
 }
 
-/// The keymap this Work actually wires up — the one overlay with real
-/// content (§15.6).
+/// §15.6's fixed keymap reference, derived from the same key/action table
+/// the footer uses.
 const HELP_TEXT: &str = "\
 Navigation
   1-4         Home / Fleet / Workflows / Estate
@@ -80,16 +93,30 @@ Fleet
   /           filter by text
   s           cycle the state filter
   a           toggle nonterminal-only
+  v           toggle the selected-preview pane (Medium tier)
   x           clear filters
 
 Home
   Tab / S-Tab move between fields
-  Enter       next field, or submit from [ Run Work ]
+  Ctrl+Enter  submit from the INTENT composer directly
+  Enter       newline in INTENT, else next field / submit from [ Run Work ]
+
+Open Work
+  Tab / S-Tab or 1-5  switch view
+  j/k                 move
+  r                    respond (when offered)
+  c / t / e / p        cancel / retry / extend / reap (when offered) —
+                        opens a confirmation; Enter there sends it
+  Esc / q              back
 ";
 
 /// Draw the overlay over `area`, clearing what was there first (§8.3's
-/// `Clear`) so a contextual panel never shows through stale cells.
-pub fn render(frame: &mut Frame, area: Rect, overlay: Overlay) {
+/// `Clear`) so a contextual panel never shows through stale cells. `app`
+/// supplies the live content T1c's four real confirmations need (the open
+/// Work's own facts, and the one overlay's worth of in-progress state on
+/// [`super::app::PendingAction`]) — every other overlay in the fixed set
+/// ignores it.
+pub fn render(frame: &mut Frame, area: Rect, overlay: Overlay, app: &App) {
     let panel = centered(area, 70, 60);
     frame.render_widget(Clear, panel);
     let block = Block::bordered()
@@ -98,14 +125,131 @@ pub fn render(frame: &mut Frame, area: Rect, overlay: Overlay) {
     let inner = block.inner(panel);
     frame.render_widget(block, panel);
 
-    let body = match overlay.owner() {
-        None => HELP_TEXT.to_string(),
-        Some(owner) => format!(
-            "{} is not built in this Work.\n\n{owner} implements it.\n\nEsc closes this panel.",
-            overlay.title()
+    let body = match overlay {
+        Overlay::Help => HELP_TEXT.to_string(),
+        Overlay::CancelConfirmation => cancel_body(app),
+        Overlay::RetryConfirmation => retry_body(app),
+        Overlay::ExtendEnvelope => extend_body(app),
+        Overlay::ReapConfirmation => reap_body(app),
+        _ => format!(
+            "{} is not built in this Work.\n\n{} implements it.\n\nEsc closes this panel.",
+            overlay.title(),
+            overlay.owner().unwrap_or("a later Work"),
         ),
     };
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+}
+
+/// The open Work's id and intent — every confirmation names the Work it
+/// acts on (§15.5).
+fn work_identity(app: &App) -> (String, String) {
+    let id = app
+        .open_work
+        .as_ref()
+        .map(|w| w.id.clone())
+        .unwrap_or_else(|| "-".to_string());
+    let intent = app
+        .work_screen
+        .as_ref()
+        .map(|s| field_text(&s.work()["work"]["intent"]))
+        .unwrap_or_else(|| "-".to_string());
+    (id, intent)
+}
+
+/// §15.5: "Cancel: confirmation naming Work."
+fn cancel_body(app: &App) -> String {
+    let (id, intent) = work_identity(app);
+    let mut body = format!(
+        "Cancel this Work?\n\n  {intent}\n  {id}\n\nThis asks the daemon to cancel it. \
+         It cannot be undone.\n\nEnter confirms · Esc/q aborts, nothing is sent."
+    );
+    if let Some(error) = &app.pending_action.last_error {
+        body.push_str(&format!("\n\nlast attempt failed: {error}"));
+    }
+    body
+}
+
+/// §15.5: "Retry: confirmation naming stage/attempt."
+fn retry_body(app: &App) -> String {
+    let (id, intent) = work_identity(app);
+    let (stage, attempt) = app
+        .work_screen
+        .as_ref()
+        .map(|s| {
+            let w = s.work();
+            (
+                field_text(&w["stage"]["stage_id"]),
+                field_text(&w["stage"]["attempt"]),
+            )
+        })
+        .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
+    let mut body = format!(
+        "Retry this Work?\n\n  {intent}\n  {id}\n\n  stage    {stage}\n  attempt  {attempt}\n\n\
+         Retries re-enter the current stage.\n\nEnter confirms · Esc/q aborts, nothing is sent."
+    );
+    if let Some(error) = &app.pending_action.last_error {
+        body.push_str(&format!("\n\nlast attempt failed: {error}"));
+    }
+    body
+}
+
+/// §15.5: "Extend: explicit added turns and resulting cap."
+fn extend_body(app: &App) -> String {
+    let (id, intent) = work_identity(app);
+    let current_cap = app
+        .work_screen
+        .as_ref()
+        .and_then(|s| s.work()["envelope"]["turn_cap"].as_u64());
+    let pending = &app.pending_action;
+    let added: Option<u64> = pending.extend_turns.trim().parse().ok();
+    let resulting = match (current_cap, added) {
+        (Some(cap), Some(added)) if added > 0 => (cap + added).to_string(),
+        _ => "-".to_string(),
+    };
+    let field_marker = if pending.confirm_focused { "" } else { "_" };
+    let confirm_marker = if pending.confirm_focused { " <" } else { "" };
+    let mut body = format!(
+        "Extend the turn envelope?\n\n  {intent}\n  {id}\n\n  \
+         current cap    {}\n  add turns       {}{field_marker}\n  resulting cap   {resulting}\n\n\
+         [ confirm ]{confirm_marker}\n\n\
+         Tab moves between the turns field and Confirm · Enter on the field \
+         moves to Confirm · Enter on Confirm sends it · Esc/q aborts.",
+        current_cap
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        if pending.extend_turns.is_empty() {
+            "-"
+        } else {
+            pending.extend_turns.as_str()
+        },
+    );
+    if let Some(error) = &pending.last_error {
+        body.push_str(&format!("\n\n{error}"));
+    }
+    body
+}
+
+/// §15.5: "Reap: preview exact paths/bytes and state that retained branch
+/// remains." The current Work read does not surface paths/bytes (only
+/// `/v1/retained`, an estate-wide read T3's Estate surface owns, §20.4) —
+/// per this Work's own scope note, a minimal confirmation stating the
+/// branch is retained is what ships here rather than blocking on that data.
+fn reap_body(app: &App) -> String {
+    let (id, intent) = work_identity(app);
+    let mut body = format!(
+        "Reap this Work's retained state?\n\n  {intent}\n  {id}\n\n\
+         Reap disposes local retained artifacts (worktrees/branches this daemon \
+         still holds for review). The retained branch itself is not deleted — \
+         only local disposal happens here.\n\n\
+         Exact paths and bytes are not previewed here: that detail comes from \
+         the estate-wide `/v1/retained` read, outside this Work's four Work-\
+         scoped reads (T3's Estate surface, §20.4).\n\n\
+         Enter confirms · Esc/q aborts, nothing is sent."
+    );
+    if let Some(error) = &app.pending_action.last_error {
+        body.push_str(&format!("\n\nlast attempt failed: {error}"));
+    }
+    body
 }
 
 /// A `percent_x` × `percent_y` box, centered in `area`.
@@ -122,15 +266,25 @@ fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn only_help_is_implemented_in_this_work() {
-        assert!(Overlay::Help.owner().is_none());
+    fn help_and_the_four_t1c_confirmations_are_built_here() {
+        for built in [
+            Overlay::Help,
+            Overlay::CancelConfirmation,
+            Overlay::RetryConfirmation,
+            Overlay::ExtendEnvelope,
+            Overlay::ReapConfirmation,
+        ] {
+            assert!(
+                built.owner().is_none(),
+                "{built:?} must be built in this Work"
+            );
+        }
         for later in [
             Overlay::SlashPalette,
             Overlay::WorkflowChooser,
-            Overlay::CancelConfirmation,
-            Overlay::ExtendEnvelope,
             Overlay::RepoAddRemove,
             Overlay::GroupEditRemove,
             Overlay::RetainedPreview,
@@ -138,5 +292,73 @@ mod tests {
         ] {
             assert!(later.owner().is_some(), "{later:?} must name who builds it");
         }
+    }
+
+    fn app_with_open_work(state: &str) -> App {
+        let mut app = App::new();
+        app.rows = super::super::fleet::fleet_rows(&json!({"works": [
+            {"id": "01WORK", "state": state, "intent": "fix the thing"},
+        ]}));
+        app.open_work = Some(super::super::OpenWork {
+            id: "01WORK".to_string(),
+            from: super::super::Destination::Fleet,
+        });
+        app.work_screen = Some(super::super::work_view::WorkScreen::from_parts(
+            "01WORK".to_string(),
+            json!({
+                "work": {"id": "01WORK", "intent": "fix the thing", "state": state},
+                "stage": {"stage_id": "10-implement", "attempt": 2},
+                "envelope": {"turn_cap": 12, "turns_spawned": 3},
+            }),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        app
+    }
+
+    #[test]
+    fn cancel_confirmation_names_the_work() {
+        let app = app_with_open_work("blocked");
+        let body = cancel_body(&app);
+        assert!(body.contains("fix the thing"));
+        assert!(body.contains("01WORK"));
+    }
+
+    #[test]
+    fn retry_confirmation_names_stage_and_attempt() {
+        let app = app_with_open_work("failed");
+        let body = retry_body(&app);
+        assert!(body.contains("10-implement"));
+        assert!(body.contains("2"));
+    }
+
+    #[test]
+    fn extend_confirmation_shows_the_resulting_cap_once_turns_are_entered() {
+        let mut app = app_with_open_work("blocked");
+        app.pending_action.extend_turns = "5".to_string();
+        let body = extend_body(&app);
+        assert!(body.contains("current cap"));
+        assert!(body.contains("12"));
+        assert!(
+            body.contains("17"),
+            "12 + 5 must be shown before confirming: {body}"
+        );
+    }
+
+    #[test]
+    fn extend_confirmation_shows_no_resulting_cap_until_turns_are_entered() {
+        let app = app_with_open_work("blocked");
+        let body = extend_body(&app);
+        assert!(body.contains("resulting cap   -"), "{body}");
+    }
+
+    #[test]
+    fn reap_confirmation_states_the_branch_is_retained() {
+        let app = app_with_open_work("completed_dirty");
+        let body = reap_body(&app);
+        assert!(
+            body.to_lowercase().contains("not deleted") || body.to_lowercase().contains("remains")
+        );
     }
 }

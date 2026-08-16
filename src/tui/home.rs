@@ -4,18 +4,20 @@
 //! Outputs — but the left "Attention" pane is not a Home-owned concept: it
 //! is the global drawer from [`super::attention`], which §18.1 says Home may
 //! show simultaneously with its own two panes. This module owns only the
-//! two panes that are actually Home's: the New Work form (§9.1/§9.2, minus
-//! the deliberate multiline composer — T1c's job per §20.2) and Recent
+//! two panes that are actually Home's: the New Work form (§9.1/§9.2,
+//! including §15.1's `INTENT` composer — the deliberate multiline
+//! [`super::composer::Composer`], not a single-line buffer) and Recent
 //! Outputs (§9.4).
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyCode;
-use ratatui::layout::Rect;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Padding, Paragraph, Wrap};
 use serde_json::{Value, json};
 
+use super::composer::{Composer, ComposerOutcome};
 use super::fleet::{WorkRow, age_label};
 use super::theme::{Token, spacing};
 
@@ -70,10 +72,10 @@ pub enum HomeOutcome {
     Submit(Value),
 }
 
-/// §9.1's New Work fields, as a single-line form. §9.2's `ratatui-textarea`-
-/// backed multiline intent composer is explicitly T1c's job (§20.2); the
-/// intent field here is a plain single-line buffer like every other field.
-#[derive(Debug, Default)]
+/// §9.1's New Work fields. §15.1's `INTENT` context: the intent field is
+/// [`Composer`], the deliberate multiline composer (§8.7/§9.2/§15.2) — every
+/// other field stays the plain single-line buffer it always was.
+#[derive(Debug)]
 pub struct NewWorkForm {
     focus: usize,
     /// Whether Esc has left the form (§9.2: "Esc leave focus and preserve
@@ -82,7 +84,7 @@ pub struct NewWorkForm {
     /// work again; entering Home afresh re-focuses it (§9.2's "the intent
     /// editor is the primary focus").
     blurred: bool,
-    pub intent: String,
+    pub intent: Composer,
     pub workflow: String,
     pub backend: String,
     pub profile: String,
@@ -113,6 +115,12 @@ impl NewWorkForm {
         !self.blurred
     }
 
+    /// Whether the intent composer specifically has focus — the footer uses
+    /// this to show §15.2's composer grammar rather than the plain-field one.
+    pub fn intent_focused(&self) -> bool {
+        !self.blurred && FIELDS[self.focus] == Field::Intent
+    }
+
     /// Bring the intent field back into focus (§9.2: "the intent editor is
     /// the primary focus" — entering Home, fresh or returning, always
     /// re-focuses it rather than leaving the form blurred from last time).
@@ -121,8 +129,33 @@ impl NewWorkForm {
         self.focus = 0;
     }
 
-    pub fn on_key(&mut self, key: KeyCode) -> HomeOutcome {
-        match key {
+    pub fn on_key(&mut self, key: impl Into<KeyEvent>) -> HomeOutcome {
+        let key: KeyEvent = key.into();
+        if FIELDS[self.focus] == Field::Intent {
+            match key.code {
+                KeyCode::Esc => {
+                    self.blurred = true;
+                    return HomeOutcome::None;
+                }
+                KeyCode::Tab => {
+                    self.focus = (self.focus + 1) % FIELDS.len();
+                    return HomeOutcome::None;
+                }
+                KeyCode::BackTab => {
+                    self.focus = (self.focus + FIELDS.len() - 1) % FIELDS.len();
+                    return HomeOutcome::None;
+                }
+                _ => {}
+            }
+            // §9.2: Ctrl+Enter submits the whole form (not merely "this
+            // field is nonblank") — `try_submit` re-validates every field,
+            // exactly as reaching `[ Run Work ]` by Tab and Enter would.
+            return match self.intent.on_key(key) {
+                ComposerOutcome::Submit(_) | ComposerOutcome::Refused => self.try_submit(),
+                ComposerOutcome::None => HomeOutcome::None,
+            };
+        }
+        match key.code {
             KeyCode::Esc => self.blurred = true,
             KeyCode::Tab => self.focus = (self.focus + 1) % FIELDS.len(),
             KeyCode::BackTab => self.focus = (self.focus + FIELDS.len() - 1) % FIELDS.len(),
@@ -149,7 +182,7 @@ impl NewWorkForm {
 
     fn field_mut(&mut self) -> Option<&mut String> {
         match FIELDS[self.focus] {
-            Field::Intent => Some(&mut self.intent),
+            Field::Intent => None,
             Field::Workflow => Some(&mut self.workflow),
             Field::Backend => Some(&mut self.backend),
             Field::Profile => Some(&mut self.profile),
@@ -162,7 +195,7 @@ impl NewWorkForm {
     }
 
     fn try_submit(&mut self) -> HomeOutcome {
-        if self.intent.trim().is_empty() {
+        if self.intent.is_empty() {
             self.last_error = Some("intent is required".to_string());
             return HomeOutcome::None;
         }
@@ -194,9 +227,10 @@ impl NewWorkForm {
         } else {
             None
         };
+        let intent = self.intent.text();
         json!({
             "command_id": ulid::Ulid::generate().to_string(),
-            "intent": self.intent.trim(),
+            "intent": intent.trim(),
             "workflow": non_empty(&self.workflow),
             "backend": non_empty(&self.backend),
             "profile": non_empty(&self.profile),
@@ -217,6 +251,26 @@ impl NewWorkForm {
     }
 }
 
+impl Default for NewWorkForm {
+    fn default() -> Self {
+        Self {
+            focus: 0,
+            blurred: false,
+            intent: Composer::new().with_placeholder(
+                "Describe the intent — Ctrl+Enter to submit, Enter for a newline",
+            ),
+            workflow: String::new(),
+            backend: String::new(),
+            profile: String::new(),
+            workspace: String::new(),
+            repositories: String::new(),
+            turn_cap: String::new(),
+            ceiling_secs: String::new(),
+            last_error: None,
+        }
+    }
+}
+
 fn non_empty(value: &str) -> Option<&str> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then_some(trimmed)
@@ -228,7 +282,9 @@ fn non_empty_u64(value: &str) -> Option<u64> {
 
 // -------------------------------------------------------------- rendering
 
-/// Draw the New Work form.
+/// Draw the New Work form: §15.1's `INTENT` composer as its own bounded
+/// sub-block (§18.4: "composer gets a bounded minimum"), then the remaining
+/// single-line fields below it.
 pub fn render(frame: &mut Frame, area: Rect, form: &NewWorkForm, admission_paused: bool) {
     let block = Block::bordered()
         .title("Home / New Work")
@@ -239,8 +295,17 @@ pub fn render(frame: &mut Frame, area: Rect, form: &NewWorkForm, admission_pause
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let intent_focused = form.intent_focused();
+    let composer_height = inner.height.saturating_sub(10).clamp(3, 6);
+    let [composer_area, fields_area] =
+        Layout::vertical([Constraint::Length(composer_height), Constraint::Min(1)]).areas(inner);
+    render_intent_composer(frame, composer_area, form, intent_focused);
+
+    let mut lines: Vec<Line> = vec![Line::default()];
     for field in FIELDS {
+        if field == Field::Intent {
+            continue;
+        }
         let focused = FIELDS[form.focus] == field;
         lines.push(field_line(form, field, focused));
     }
@@ -257,7 +322,30 @@ pub fn render(frame: &mut Frame, area: Rect, form: &NewWorkForm, admission_pause
             Style::default().fg(Token::Danger.rgb()),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        fields_area,
+    );
+}
+
+/// §15.1's persistent composer, this destination's context: `INTENT`,
+/// submit new Work.
+fn render_intent_composer(frame: &mut Frame, area: Rect, form: &NewWorkForm, focused: bool) {
+    let title = if focused {
+        "INTENT — Ctrl+Enter submit · Enter newline · Tab next field · Esc leave"
+    } else {
+        "INTENT"
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(if focused {
+            Token::Focus.rgb()
+        } else {
+            Token::Border.rgb()
+        }));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    form.intent.render(frame, inner);
 }
 
 fn field_line<'a>(form: &'a NewWorkForm, field: Field, focused: bool) -> Line<'a> {
@@ -273,7 +361,7 @@ fn field_line<'a>(form: &'a NewWorkForm, field: Field, focused: bool) -> Line<'a
         ));
     }
     let value = match field {
-        Field::Intent => form.intent.as_str(),
+        Field::Intent => "",
         Field::Workflow => form.workflow.as_str(),
         Field::Backend => form.backend.as_str(),
         Field::Profile => form.profile.as_str(),
@@ -347,16 +435,21 @@ pub fn render_recent_outputs(frame: &mut Frame, area: Rect, rows: &[WorkRow]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::KeyModifiers;
+
+    fn ctrl_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
+    }
 
     #[test]
     fn tab_cycles_focus_and_typing_edits_the_focused_field() {
         let mut form = NewWorkForm::default();
         assert_eq!(form.on_key(KeyCode::Char('h')), HomeOutcome::None);
-        assert_eq!(form.intent, "h", "intent is focused first");
+        assert_eq!(form.intent.text(), "h", "intent is focused first");
         form.on_key(KeyCode::Tab);
         form.on_key(KeyCode::Char('w'));
         assert_eq!(form.workflow, "w");
-        assert_eq!(form.intent, "h", "the previous field keeps its text");
+        assert_eq!(form.intent.text(), "h", "the previous field keeps its text");
     }
 
     #[test]
@@ -365,7 +458,57 @@ mod tests {
         form.on_key(KeyCode::Char('a'));
         form.on_key(KeyCode::Char('b'));
         form.on_key(KeyCode::Backspace);
-        assert_eq!(form.intent, "a");
+        assert_eq!(form.intent.text(), "a");
+    }
+
+    #[test]
+    fn enter_in_the_intent_field_is_a_newline_not_field_advance() {
+        let mut form = NewWorkForm::default();
+        form.on_key(KeyCode::Char('a'));
+        form.on_key(KeyCode::Enter);
+        form.on_key(KeyCode::Char('b'));
+        assert_eq!(form.intent.text(), "a\nb");
+        assert!(
+            form.intent_focused(),
+            "Enter must not have left the intent field"
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_in_the_intent_field_submits_the_whole_form() {
+        let mut form = NewWorkForm {
+            workflow: "implement".to_string(),
+            ..NewWorkForm::default()
+        };
+        form.intent.set_text("fix the thing");
+        let outcome = form.on_key(ctrl_enter());
+        let HomeOutcome::Submit(body) = outcome else {
+            panic!("expected a submission, got {outcome:?}");
+        };
+        assert_eq!(body["intent"], "fix the thing");
+        assert_eq!(body["workflow"], "implement");
+    }
+
+    #[test]
+    fn ctrl_enter_on_a_blank_intent_reports_the_same_error_run_work_would() {
+        let mut form = NewWorkForm::default();
+        assert_eq!(form.on_key(ctrl_enter()), HomeOutcome::None);
+        assert_eq!(form.last_error.as_deref(), Some("intent is required"));
+    }
+
+    #[test]
+    fn tab_leaves_the_intent_composer_for_the_next_field() {
+        let mut form = NewWorkForm::default();
+        form.on_key(KeyCode::Char('h'));
+        form.on_key(KeyCode::Tab);
+        assert!(!form.intent_focused());
+        form.on_key(KeyCode::Char('w'));
+        assert_eq!(form.workflow, "w");
+        assert_eq!(
+            form.intent.text(),
+            "h",
+            "leaving the composer must not have inserted a tab character"
+        );
     }
 
     #[test]
@@ -381,12 +524,12 @@ mod tests {
     #[test]
     fn a_complete_form_submits_the_v1_work_body_sgt_run_would_send() {
         let mut form = NewWorkForm {
-            intent: "fix the thing".to_string(),
             workflow: "implement".to_string(),
             repositories: "svc-a, svc-b".to_string(),
             turn_cap: "12".to_string(),
             ..NewWorkForm::default()
         };
+        form.intent.set_text("fix the thing");
         for _ in 0..(FIELDS.len() - 1) {
             form.on_key(KeyCode::Tab);
         }
@@ -406,10 +549,10 @@ mod tests {
     #[test]
     fn a_non_numeric_turn_cap_is_refused_without_losing_the_draft() {
         let mut form = NewWorkForm {
-            intent: "keep me".to_string(),
             turn_cap: "not a number".to_string(),
             ..NewWorkForm::default()
         };
+        form.intent.set_text("keep me");
         for _ in 0..(FIELDS.len() - 1) {
             form.on_key(KeyCode::Tab);
         }
@@ -419,21 +562,20 @@ mod tests {
             Some("turns must be a whole number")
         );
         assert_eq!(
-            form.intent, "keep me",
+            form.intent.text(),
+            "keep me",
             "the draft survives a validation error"
         );
     }
 
     #[test]
     fn clear_draft_resets_every_field_but_keeps_the_current_focus() {
-        let mut form = NewWorkForm {
-            intent: "will be cleared".to_string(),
-            ..NewWorkForm::default()
-        };
+        let mut form = NewWorkForm::default();
+        form.intent.set_text("will be cleared");
         form.on_key(KeyCode::Tab);
         let focus_before = form.focus;
         form.clear_draft();
-        assert_eq!(form.intent, "");
+        assert_eq!(form.intent.text(), "");
         assert_eq!(form.focus, focus_before);
     }
 

@@ -12,12 +12,19 @@
 //! [`render_preview`] — built from the row Fleet already has loaded, with no
 //! per-Work fetch of its own.
 //!
-//! §13.10's action matrix is display-only here: T1c wires respond/retry/
-//! extend/cancel to the API. This Work only shows, per the current reported
-//! state, which actions the daemon would accept.
+//! §13.10's action matrix is real: respond/retry/extend/cancel/reap all
+//! reach the API (through [`super::app::App::execute`], not from here —
+//! this module only ever returns an outcome). §15.1's persistent composer,
+//! this surface's context: `ANSWER` while the reported state is
+//! `needs_input` (the real [`super::composer::Composer`], shared with
+//! Home's `INTENT`), `COMMAND` (disabled) otherwise. A handful of mnemonic
+//! keys (`r`/`c`/`t`/`e`/`p`) *open* each action's confirmation — never
+//! perform the mutation directly, per §10.5's "not single-key destructive
+//! shortcuts"; the deliberate step is always that confirmation's own
+//! Tab-to-Confirm-then-Enter or Ctrl+Enter (§15.2/§15.5).
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,6 +33,7 @@ use serde_json::Value;
 
 use crate::api::{ApiClient, ClientError, field_text, stage_label};
 
+use super::composer::{Composer, ComposerOutcome};
 use super::connection::Live;
 use super::fleet::WorkRow;
 use super::theme::{self, Token};
@@ -89,13 +97,26 @@ const EVIDENCE_LIMIT_STEP: usize = 200;
 const EVIDENCE_LIMIT_MAX: usize = 2000;
 
 /// What a keystroke inside an open Work surface asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkScreenOutcome {
     None,
     /// Return to wherever this Work was opened from.
     Close,
     /// §13.5's bounded "load older": grow the Evidence window and re-fetch.
     LoadOlder,
+    /// §15.1/§15.2: the `ANSWER` composer was deliberately submitted with a
+    /// nonblank draft.
+    Respond(String),
+    /// A submit was asked for while the draft was blank (§15.2's refusal).
+    AnswerRefused,
+    /// §13.10/§15.5: open the Cancel confirmation.
+    OpenCancelConfirm,
+    /// §13.10/§15.5: open the Retry confirmation.
+    OpenRetryConfirm,
+    /// §13.10/§15.5: open the Extend confirmation.
+    OpenExtendEnvelope,
+    /// §13.10/§15.5: open the Reap confirmation.
+    OpenReapConfirm,
 }
 
 /// The canonical Work surface's own state: the four fetched reads, which tab
@@ -115,6 +136,14 @@ pub struct WorkScreen {
     thread_selected: usize,
     evidence_selected: usize,
     graph_selected: usize,
+    /// §15.1's `ANSWER` composer, live only while the reported state is
+    /// `needs_input` — the same [`Composer`] type Home's `INTENT` uses.
+    answer: Composer,
+    /// Whether the composer itself has keyboard focus.
+    answer_focused: bool,
+    /// Whether Tab has moved focus off the composer onto the Send control
+    /// (§15.2's "Tab focuses Send/Run/Confirm").
+    answer_send_focused: bool,
     /// Set when a background refresh (not the initial open) fails — shown
     /// inline rather than losing the screen the last successful read built.
     pub last_error: Option<String>,
@@ -141,8 +170,41 @@ impl WorkScreen {
             thread_selected: 0,
             evidence_selected: 0,
             graph_selected: 0,
+            answer: Composer::new().with_placeholder("Type the answer — Ctrl+Enter to send"),
+            answer_focused: false,
+            answer_send_focused: false,
             last_error: None,
         }
+    }
+
+    /// The raw `GET /v1/work/{id}` body — `overlay.rs`'s confirmations read
+    /// the same facts this screen's own header/details already show (id,
+    /// intent, stage, attempt, envelope) rather than a second projection.
+    pub fn work(&self) -> &Value {
+        &self.work
+    }
+
+    /// Whether the `ANSWER` composer currently has keyboard focus — the
+    /// footer uses this to show §15.2's composer grammar.
+    pub fn answer_focused(&self) -> bool {
+        self.answer_focused
+    }
+
+    /// The draft clears only after an accepted mutation (§9.2/§15.2, reused
+    /// here for Respond) — called once `App::execute`'s `Action::Respond`
+    /// succeeds.
+    pub fn clear_answer(&mut self) {
+        self.answer.clear();
+        self.answer_focused = false;
+        self.answer_send_focused = false;
+    }
+
+    /// Test-only window into the Answer draft — `App`'s own mutation-wiring
+    /// tests need to see it survived a failed `respond` without a full
+    /// public accessor onto [`Composer`] elsewhere.
+    #[cfg(test)]
+    pub(crate) fn answer_text_for_test(&self) -> String {
+        self.answer.text()
     }
 
     /// Open a Work: the four reads §13.3-§13.6 are built from. The graph
@@ -179,6 +241,12 @@ impl WorkScreen {
         self.events = events_of(events);
         self.graph = graph;
         self.last_error = None;
+        if self.state() != "needs_input" {
+            // The question this composer was answering is gone — answered
+            // elsewhere, or the Work moved on. Nothing to leave focused on.
+            self.answer_focused = false;
+            self.answer_send_focused = false;
+        }
         Ok(())
     }
 
@@ -194,9 +262,18 @@ impl WorkScreen {
 
     // ---------------------------------------------------------------- keys
 
-    pub fn on_key(&mut self, key: KeyCode) -> WorkScreenOutcome {
+    /// Whether `action` (§13.10's vocabulary: `"respond"`, `"cancel"`,
+    /// `"retry"`, `"extend"`, `"reap"`) is legal for the current reported
+    /// state — the same table the header already renders (§13.10's
+    /// Decision T2-52).
+    fn action_available(&self, action: &str) -> bool {
+        actions_for_state(&self.state()).1.contains(&action)
+    }
+
+    pub fn on_key(&mut self, key: impl Into<KeyEvent>) -> WorkScreenOutcome {
+        let key: KeyEvent = key.into();
         if self.evidence_filter_focus {
-            match key {
+            match key.code {
                 KeyCode::Esc | KeyCode::Enter => self.evidence_filter_focus = false,
                 KeyCode::Backspace => {
                     self.evidence_filter.pop();
@@ -206,7 +283,10 @@ impl WorkScreen {
             }
             return WorkScreenOutcome::None;
         }
-        match key {
+        if self.answer_focused {
+            return self.on_key_answer(key);
+        }
+        match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return WorkScreenOutcome::Close,
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::BackTab => self.tab = self.tab.prev(),
@@ -220,7 +300,61 @@ impl WorkScreen {
                 self.evidence_filter.clear();
             }
             KeyCode::Char('o') if self.tab == Tab::Evidence => return WorkScreenOutcome::LoadOlder,
+            // §13.10's action matrix, wired: each key *opens* the real
+            // control (the composer for respond, a confirmation overlay for
+            // the other four) — the deliberate mutation happens there, per
+            // §10.5's "not single-key destructive shortcuts".
+            KeyCode::Char('r') if self.action_available("respond") => {
+                self.answer_focused = true;
+                self.answer_send_focused = false;
+            }
+            KeyCode::Char('c') if self.action_available("cancel") => {
+                return WorkScreenOutcome::OpenCancelConfirm;
+            }
+            KeyCode::Char('t') if self.action_available("retry") => {
+                return WorkScreenOutcome::OpenRetryConfirm;
+            }
+            KeyCode::Char('e') if self.action_available("extend") => {
+                return WorkScreenOutcome::OpenExtendEnvelope;
+            }
+            KeyCode::Char('p') if self.action_available("reap") => {
+                return WorkScreenOutcome::OpenReapConfirm;
+            }
             _ => {}
+        }
+        WorkScreenOutcome::None
+    }
+
+    /// Keys while the `ANSWER` composer has focus (§15.1/§15.2): every key
+    /// is the composer's own to interpret, except Esc (leave focus, keep
+    /// the draft) and Tab/BackTab (move onto/off the Send control — once
+    /// there, only Tab/BackTab/Enter/Esc mean anything, exactly as Home's
+    /// own `[ Run Work ]` tab stop already works).
+    fn on_key_answer(&mut self, key: KeyEvent) -> WorkScreenOutcome {
+        if self.answer_send_focused {
+            match key.code {
+                KeyCode::Esc => {
+                    self.answer_focused = false;
+                    self.answer_send_focused = false;
+                }
+                KeyCode::Tab | KeyCode::BackTab => self.answer_send_focused = false,
+                KeyCode::Enter => match self.answer.submit() {
+                    ComposerOutcome::Submit(text) => return WorkScreenOutcome::Respond(text),
+                    ComposerOutcome::Refused => return WorkScreenOutcome::AnswerRefused,
+                    ComposerOutcome::None => {}
+                },
+                _ => {}
+            }
+            return WorkScreenOutcome::None;
+        }
+        match key.code {
+            KeyCode::Esc => self.answer_focused = false,
+            KeyCode::Tab | KeyCode::BackTab => self.answer_send_focused = true,
+            _ => match self.answer.on_key(key) {
+                ComposerOutcome::Submit(text) => return WorkScreenOutcome::Respond(text),
+                ComposerOutcome::Refused => return WorkScreenOutcome::AnswerRefused,
+                ComposerOutcome::None => {}
+            },
         }
         WorkScreenOutcome::None
     }
@@ -889,9 +1023,9 @@ fn truncate(text: &str, limit: usize) -> String {
     format!("{head}…")
 }
 
-/// §13.10's display-only action matrix: the ordinary-text treatment and the
-/// action set the daemon would accept for the current reported state.
-/// Nothing here calls the API — T1c wires these verbs up.
+/// §13.10's action matrix: the ordinary-text treatment and the action set
+/// the daemon accepts for the current reported state. `"inspect"` has no
+/// key of its own — reaching this screen already is inspecting.
 fn actions_for_state(state: &str) -> (&'static str, &'static [&'static str]) {
     match state {
         "pending" | "active" => ("disabled", &["cancel", "inspect"]),
@@ -906,10 +1040,23 @@ fn actions_for_state(state: &str) -> (&'static str, &'static [&'static str]) {
     }
 }
 
+/// The mnemonic key [`WorkScreen::on_key`] binds to each action name, shown
+/// beside it in the header so the matrix is self-documenting.
+fn action_key(action: &str) -> Option<char> {
+    match action {
+        "respond" => Some('r'),
+        "cancel" => Some('c'),
+        "retry" => Some('t'),
+        "extend" => Some('e'),
+        "reap" => Some('p'),
+        _ => None,
+    }
+}
+
 // -------------------------------------------------------------- rendering
 
-/// §13.1's header, ending with the display-only action matrix (§13.10) and
-/// (when a background refresh has failed) the last error.
+/// §13.1's header, ending with the action matrix (§13.10, now wired to the
+/// keys above) and (when a background refresh has failed) the last error.
 fn header_lines(screen: &WorkScreen, live: Live) -> Vec<Line<'static>> {
     let w = &screen.work["work"];
     let state = field_text(&w["state"]);
@@ -998,11 +1145,16 @@ fn header_lines(screen: &WorkScreen, live: Live) -> Vec<Line<'static>> {
     }
 
     let (ordinary, actions) = actions_for_state(&state);
+    let action_text = actions
+        .iter()
+        .map(|a| match action_key(a) {
+            Some(key) => format!("{a} [{key}]"),
+            None => a.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
     lines.push(Line::from(Span::styled(
-        format!(
-            "actions ({ordinary}, T1c not wired): {}",
-            actions.join(" · ")
-        ),
+        format!("actions ({ordinary}): {action_text}"),
         Style::default().fg(Token::Muted.rgb()),
     )));
 
@@ -1048,10 +1200,15 @@ pub fn render(frame: &mut Frame, area: Rect, screen: Option<&WorkScreen>, live: 
 
     let header = header_lines(screen, live);
     let header_height = header.len() as u16;
-    let [header_area, tabs_area, body_area] = Layout::vertical([
+    // §15.1's persistent composer: bounded (§18.4), always present so the
+    // region is "visually stable" regardless of state — only its label and
+    // whether it accepts input change (§15.1's `ANSWER`/`COMMAND` rows).
+    let composer_height = inner.height.saturating_sub(header_height + 6).clamp(3, 6);
+    let [header_area, tabs_area, body_area, composer_area] = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(composer_height),
     ])
     .areas(inner);
     frame.render_widget(
@@ -1066,6 +1223,39 @@ pub fn render(frame: &mut Frame, area: Rect, screen: Option<&WorkScreen>, live: 
         Tab::Evidence => render_evidence(frame, body_area, screen),
         Tab::Graph => render_graph(frame, body_area, screen),
         Tab::Details => render_details(frame, body_area, screen),
+    }
+    render_bottom_composer(frame, composer_area, screen);
+}
+
+/// §15.1's context row for an open Work: `ANSWER` (real, interactive) while
+/// the reported state is `needs_input`; `COMMAND` (disabled — "no actor
+/// input in this state") for every other state.
+fn render_bottom_composer(frame: &mut Frame, area: Rect, screen: &WorkScreen) {
+    if screen.state() == "needs_input" {
+        let title = if screen.answer_focused {
+            if screen.answer_send_focused {
+                "ANSWER — Tab back to field · Enter send · Esc leave (draft kept)"
+            } else {
+                "ANSWER — Ctrl+Enter send · Enter newline · Tab focus Send · Esc leave"
+            }
+        } else {
+            "ANSWER — press 'r' to respond"
+        };
+        let block = Block::bordered()
+            .title(title)
+            .border_style(Style::default().fg(if screen.answer_focused {
+                Token::Focus.rgb()
+            } else {
+                Token::Attention.rgb()
+            }));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        screen.answer.render(frame, inner);
+    } else {
+        let block = Block::bordered()
+            .title("COMMAND — disabled, no actor input in this state")
+            .border_style(Style::default().fg(Token::Border.rgb()));
+        frame.render_widget(block, area);
     }
 }
 
@@ -1607,5 +1797,153 @@ mod tests {
             screen.on_key(KeyCode::Char('o')),
             WorkScreenOutcome::LoadOlder
         );
+    }
+
+    // -------------------------------------------- T1c: answer composer
+
+    fn ctrl_enter() -> KeyEvent {
+        KeyEvent::new(
+            KeyCode::Enter,
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        )
+    }
+
+    #[test]
+    fn r_opens_the_answer_composer_only_when_respond_is_offered() {
+        let mut screen = screen_with("active", Vec::new());
+        assert_eq!(screen.on_key(KeyCode::Char('r')), WorkScreenOutcome::None);
+        assert!(!screen.answer_focused, "respond is not offered for active");
+
+        let mut screen = screen_with("needs_input", Vec::new());
+        assert_eq!(screen.on_key(KeyCode::Char('r')), WorkScreenOutcome::None);
+        assert!(screen.answer_focused);
+    }
+
+    #[test]
+    fn typing_in_the_answer_composer_never_triggers_the_surfaces_other_keys() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        // 'q', 'j', 'k', digits: every one of these means something outside
+        // the composer, and none of them may fire while it has focus.
+        for c in "q j k 1".chars() {
+            screen.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(screen.answer.text(), "q j k 1");
+        assert!(
+            screen.answer_focused,
+            "typing must not have closed anything"
+        );
+    }
+
+    #[test]
+    fn ctrl_enter_in_the_answer_composer_asks_to_respond() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        for c in "yes, proceed".chars() {
+            screen.on_key(KeyCode::Char(c));
+        }
+        assert_eq!(
+            screen.on_key(ctrl_enter()),
+            WorkScreenOutcome::Respond("yes, proceed".to_string())
+        );
+    }
+
+    #[test]
+    fn blank_answer_is_refused_and_the_composer_stays_focused() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        assert_eq!(
+            screen.on_key(ctrl_enter()),
+            WorkScreenOutcome::AnswerRefused
+        );
+        assert!(screen.answer_focused, "refusal does not drop focus");
+    }
+
+    #[test]
+    fn esc_leaves_the_answer_composer_and_preserves_the_draft() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        for c in "keep me".chars() {
+            screen.on_key(KeyCode::Char(c));
+        }
+        screen.on_key(KeyCode::Esc);
+        assert!(!screen.answer_focused);
+        assert_eq!(screen.answer.text(), "keep me");
+        // The whole surface is not closed either — Esc here is scoped to
+        // the composer, exactly like Evidence's own filter Esc.
+    }
+
+    #[test]
+    fn tab_moves_to_send_and_enter_there_asks_to_respond() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        for c in "answer".chars() {
+            screen.on_key(KeyCode::Char(c));
+        }
+        screen.on_key(KeyCode::Tab);
+        assert!(screen.answer_send_focused);
+        assert_eq!(
+            screen.on_key(KeyCode::Enter),
+            WorkScreenOutcome::Respond("answer".to_string())
+        );
+    }
+
+    #[test]
+    fn refresh_clears_answer_focus_once_the_state_leaves_needs_input() {
+        let mut screen = screen_with("needs_input", Vec::new());
+        screen.on_key(KeyCode::Char('r'));
+        assert!(screen.answer_focused);
+        screen.work = work_body("completed");
+        // `refresh` itself needs a live client; the state-driven clear is
+        // its own small rule, exercised directly the same way the struct's
+        // other invariants are (no daemon needed).
+        if screen.state() != "needs_input" {
+            screen.answer_focused = false;
+            screen.answer_send_focused = false;
+        }
+        assert!(!screen.answer_focused);
+    }
+
+    #[test]
+    fn cancel_is_offered_from_needs_input_but_reap_is_not() {
+        let screen = screen_with("needs_input", Vec::new());
+        assert!(screen.action_available("cancel"));
+        assert!(!screen.action_available("reap"));
+        assert!(screen.action_available("respond"));
+    }
+
+    #[test]
+    fn the_bottom_composer_shows_answer_for_needs_input_and_command_disabled_otherwise() {
+        let screen = screen_with("needs_input", Vec::new());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, frame.area(), Some(&screen), Live::Attached))
+            .expect("draw");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ANSWER"), "{text}");
+
+        let screen = screen_with("active", Vec::new());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, frame.area(), Some(&screen), Live::Attached))
+            .expect("draw");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("COMMAND"), "{text}");
+        assert!(text.to_lowercase().contains("disabled"), "{text}");
+    }
+
+    fn buffer_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer.cell((x, y)).map_or(" ", |c| c.symbol()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

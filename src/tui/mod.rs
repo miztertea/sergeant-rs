@@ -44,6 +44,7 @@
 
 mod app;
 mod attention;
+mod composer;
 mod connection;
 mod estate;
 mod fleet;
@@ -60,7 +61,7 @@ pub use fleet::WorkRow;
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -107,7 +108,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     frame.render_widget(footer_line(app), footer);
 
     if let Some(kind) = app.overlay {
-        overlay::render(frame, body, kind);
+        overlay::render(frame, body, kind, app);
     }
 }
 
@@ -261,9 +262,22 @@ fn footer_line(app: &App) -> Paragraph<'_> {
     let keys = if app.overlay.is_some() {
         "Esc/q close"
     } else if app.open_work.is_some() {
-        "Tab/S-Tab or 1-5 switch view · j/k move · Esc/q back"
+        // §15.1/§15.2: the composer's own grammar while `ANSWER` has focus,
+        // else the surface's ordinary navigation plus §13.10's action keys.
+        match app.work_screen.as_ref().map(|s| s.answer_focused()) {
+            Some(true) => {
+                "Ctrl+Enter send · Enter newline · Tab focus Send · Esc leave (draft kept)"
+            }
+            _ => {
+                "Tab/S-Tab or 1-5 switch view · j/k move · r/c/t/e/p act (where offered) · Esc/q back"
+            }
+        }
     } else if app.destination == Destination::Home && app.home.wants_text_focus() {
-        "Tab next field · Enter next field/submit · Esc leave the form"
+        if app.home.intent_focused() {
+            "Ctrl+Enter submit · Enter newline · Tab next field · Esc leave the form"
+        } else {
+            "Tab next field · Enter next field/submit · Esc leave the form"
+        }
     } else if app.destination == Destination::Fleet && app.fleet.wants_text_focus() {
         "type to filter · Enter/Esc apply"
     } else {
@@ -292,6 +306,10 @@ pub async fn run(client: ApiClient) -> Result<(), TuiError> {
     app.status = String::new();
 
     let mut terminal = ratatui::try_init()?;
+    // §8.8's Decision T2-32: opportunistic, nonfatal — paired with the pop
+    // below on every exit path, the same way raw mode itself is restored on
+    // every path regardless of how the loop ended.
+    terminal::push_keyboard_enhancement(&mut std::io::stdout());
     let result = event_loop(
         &mut terminal,
         &mut app,
@@ -299,6 +317,7 @@ pub async fn run(client: ApiClient) -> Result<(), TuiError> {
         TerminalProbes::production(),
     )
     .await;
+    terminal::pop_keyboard_enhancement(&mut std::io::stdout());
     // Restore is attempted on every path, including the hung-up one — the
     // ioctl half (raw mode) can still land even when the write half cannot.
     let restored = ratatui::try_restore();
@@ -351,7 +370,7 @@ where
     B: ratatui::backend::Backend,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<KeyCode>();
+    let (keys_tx, mut keys) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
     let TerminalProbes { watch: tty, tick } = probes;
     // crossterm's reader is blocking, so it lives on its own OS thread and
     // posts keystrokes into the async loop. It polls rather than blocking
@@ -533,6 +552,7 @@ fn terminal_error<E: std::error::Error + Send + Sync + 'static>(e: E) -> TuiErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::KeyCode;
     use serde_json::json;
 
     /// The header line as the text a terminal would show — rendered into a
@@ -656,7 +676,7 @@ mod tests {
     #[test]
     fn wide_home_shows_the_drawer_the_form_and_recent_outputs_at_once() {
         let mut app = App::new();
-        app.home.intent = "deliberately unused".to_string();
+        app.home.intent.set_text("deliberately unused");
         app.rows = fleet::fleet_rows(&json!({"works": [
             {"id": "needs-a-look", "state": "needs_input", "intent": "waiting on an answer"},
             {"id": "shipped", "state": "completed", "intent": "already done"},
