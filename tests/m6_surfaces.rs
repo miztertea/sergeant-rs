@@ -64,7 +64,7 @@ use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::runtime::journal::Journal;
-use sergeant_rs::tui::{self, App, Screen};
+use sergeant_rs::tui::{self, Action, App, Destination};
 
 mod support;
 use support::DataDir;
@@ -213,9 +213,13 @@ fn assert_shows(terminal: &Terminal<TestBackend>, needle: &str, what: &str) {
 
 // ------------------------------------------------------------------- 1. TUI
 
-/// Acceptance 1. The TUI's two screens render the contracted fields from a
-/// live daemon, a live SSE event drives a re-render, and its write keys are
-/// real verbs against the API — not decoration.
+/// Acceptance 1. The TUI's Fleet browser and canonical-Work stub render the
+/// contracted fields from a live daemon, a live SSE event drives a
+/// re-render, and Home's New Work submission is a real verb against the API
+/// — not decoration. (T1a replaces the M6-era two-screen Fleet/Detail TUI
+/// with `Home / Fleet / Workflows / Estate` navigation over a canonical Work
+/// stub; respond/retry/extend/cancel mutations are T1c's job, §20.2, so this
+/// acceptance test no longer drives them.)
 #[tokio::test]
 async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     let data = TempDir::new().expect("tempdir");
@@ -223,18 +227,15 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     init_repo(repo.path());
     write_workflow(repo.path());
 
-    // Two works: one that finishes, one that stops for an answer. Between
-    // them the fleet screen has to show two different states and the detail
-    // screen has something to say about stage, surface and execution.
+    // Two works: one that finishes, one that stops for an answer, so Fleet
+    // has to show two different states and the canonical Work stub has
+    // something to say about stage and workflow.
     let (handle, _fake) = start_fake(
         data.path(),
         [
             FakeStep::complete_with("first stage done"),
             FakeStep::complete(),
             FakeStep::needs_input("which retry budget?"),
-            // The fourth work below must be in a cancelable state when the
-            // cancel key reaches it — a completed work is not one.
-            FakeStep::needs_input("and how many retries here?"),
         ],
     )
     .await;
@@ -246,46 +247,60 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
 
-    // --- fleet screen ------------------------------------------------------
+    // --- Fleet ---------------------------------------------------------
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('2')); // Fleet
+    assert_eq!(app.destination, Destination::Fleet);
+
     let terminal = render(&app);
-    assert_shows(&terminal, &done, "completed work's id");
-    assert_shows(&terminal, &asking, "waiting work's id");
+    // Fleet's id column is §10.2's lowest-priority, "short id" field — it
+    // may truncate a full ULID under real terminal widths, so this checks a
+    // distinguishing prefix rather than the whole thing. The canonical Work
+    // stub below asserts the untruncated id.
+    assert_shows(&terminal, &done[..12], "completed work's id (prefix)");
+    assert_shows(&terminal, &asking[..12], "waiting work's id (prefix)");
     assert_shows(&terminal, "completed", "completed state");
     assert_shows(&terminal, "needs_input", "needs_input state");
     assert_shows(&terminal, "finish this one", "intent");
     assert_shows(&terminal, "00-first 1/2", "stage coordinate");
     assert_shows(&terminal, FAKE_BACKEND_NAME, "resolved backend");
-    assert_shows(&terminal, "fleet — 2 work", "fleet header");
+    assert_shows(&terminal, "Fleet — 2 works", "fleet header");
 
-    // --- detail screen -----------------------------------------------------
+    // --- the canonical Work stub (T1b builds the real surface) ----------
     let asking_row = app
         .rows
         .iter()
         .position(|row| row.id == asking)
         .expect("the waiting work is in the fleet");
-    app.selected = asking_row;
+    app.fleet.selected = asking_row;
     let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
     assert_eq!(
         action,
-        tui::Action::Refresh,
-        "enter opens the detail screen"
+        Action::None,
+        "opening the stub needs no API round trip"
     );
-    assert_eq!(app.screen, Screen::Detail);
-    app.refresh(&client).await.expect("detail read");
+    assert_eq!(
+        app.open_work,
+        Some(tui::OpenWork {
+            id: asking.clone(),
+            from: Destination::Fleet,
+        })
+    );
 
     let terminal = render(&app);
-    let detail = screen_text(&terminal);
     assert_shows(&terminal, &asking, "work id");
     assert_shows(&terminal, "ask me something", "intent");
     assert_shows(&terminal, "needs_input", "state");
     assert_shows(&terminal, "tiny", "workflow name");
     assert_shows(&terminal, "00-first 1/2", "stage");
     assert_shows(&terminal, "which retry budget?", "the stage's question");
-    assert_shows(&terminal, "fake-session-", "native session identity");
-    assert_shows(&terminal, "sergeant/", "the surface's work branch");
-    assert!(
-        detail.contains("stage.needs_input") || detail.contains("work.needs_input"),
-        "the recent-events tail must show the transition events:\n{detail}"
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc);
+    assert!(app.open_work.is_none(), "Esc returns from the stub");
+    assert_eq!(
+        app.destination,
+        Destination::Fleet,
+        "back to exactly where it was opened from"
     );
 
     // --- an SSE event drives a re-render ------------------------------------
@@ -320,47 +335,48 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         "a work.submitted event must be classified as state-bearing"
     );
     app.refresh(&client).await.expect("refresh after the event");
-    app.screen = Screen::Fleet;
     assert_shows(
         &render(&app),
-        &fresh,
+        &fresh[..12],
         "work that arrived over SSE while the TUI was open",
     );
 
-    // --- the advertised write keys are real verbs ---------------------------
-    app.detail_id = Some(asking.clone());
-    let respond = app.on_key(ratatui::crossterm::event::KeyCode::Char('i'));
-    assert_eq!(respond, tui::Action::None, "the prompt opens first");
-    for c in "3 attempts".chars() {
+    // --- Home's New Work submission is a real POST /v1/work, not decoration
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('1')); // Home; re-focuses the form
+    for c in "submitted from the tui".chars() {
         app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
     }
+    // Tab past workflow/backend/profile/workspace/repositories/turns/ceiling
+    // to the `[ Run Work ]` control, then submit.
+    for _ in 0..8 {
+        app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    }
     let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
-    assert_eq!(
-        action,
-        tui::Action::Respond(asking.clone(), "3 attempts".to_string())
+    let Action::Submit(body) = action else {
+        panic!("expected a submission, got {action:?}");
+    };
+    assert_eq!(body["intent"], "submitted from the tui");
+    assert_eq!(body["created_by"], "tui");
+    let outcome = app.execute(&client, Action::Submit(body)).await;
+    assert_eq!(outcome, Action::Refresh);
+    assert!(
+        app.home.last_error.is_none(),
+        "the daemon must accept it: {:?}",
+        app.home.last_error
     );
-    app.execute(&client, action).await;
-    let after = client.work(&asking).await.expect("read back");
-    assert_eq!(
-        after["work"]["state"], "completed",
-        "the TUI's respond key must actually answer the work: {after}"
+    assert!(
+        app.home.intent.is_empty(),
+        "the draft clears once the daemon accepts it"
     );
 
-    app.detail_id = None;
-    app.screen = Screen::Fleet;
-    app.selected = app
-        .rows
-        .iter()
-        .position(|row| row.id == fresh)
-        .expect("the fresh work is listed");
-    app.on_key(ratatui::crossterm::event::KeyCode::Char('c'));
-    let action = app.on_key(ratatui::crossterm::event::KeyCode::Char('y'));
-    assert_eq!(action, tui::Action::Cancel(fresh.clone()));
-    app.execute(&client, action).await;
-    let after = client.work(&fresh).await.expect("read back");
-    assert_eq!(
-        after["work"]["state"], "canceled",
-        "the TUI's cancel key must actually cancel the work: {after}"
+    let fleet = client.fleet().await.expect("read back");
+    assert!(
+        fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .any(|w| w["intent"] == "submitted from the tui"),
+        "the TUI's New Work form must actually reach the daemon: {fleet}"
     );
 
     handle.shutdown().await;
@@ -372,12 +388,12 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
 /// checked where §30 puts it.)
 #[test]
 fn t1_the_tui_has_no_private_shortcut() {
-    let tui = code_only(&read_source("tui.rs"));
+    let tui = code_only(&read_tui_source());
     assert_eq!(
         crate_paths(&tui),
         vec!["api".to_string()],
-        "tui.rs may name crate::api and nothing else — a private shortcut here \
-         means the API is incomplete (§30)"
+        "the tui module tree may name crate::api and nothing else — a private \
+         shortcut here means the API is incomplete (§30)"
     );
     assert!(
         tui.contains("ApiClient"),
@@ -841,17 +857,17 @@ async fn t1_the_events_endpoint_filters_and_tails_by_work() {
 
 // ------------------------------------------------------------ TUI resilience
 
-/// A TUI holding a detail screen for a work the daemon no longer has falls
-/// back to the fleet instead of painting a corpse.
+/// A TUI holding the canonical Work stub open for a work the daemon no
+/// longer has falls back to Fleet instead of painting a corpse.
 ///
 /// The data dir can be replaced under a running client (a restore, a wiped
-/// scratch dir, a `--data-dir` pointed somewhere else) and the detail screen
-/// is the one part of `App` that keeps asking about a specific id. A refresh
-/// that answered 404 used to be indistinguishable from a refresh that failed:
-/// this arm is why the screen recovers rather than either erroring out or
-/// re-rendering the last body it happened to hold.
+/// scratch dir, a `--data-dir` pointed somewhere else) and `App::open_work`
+/// is the one part of `App` that keeps asking about a specific id — T1a's
+/// stub does that purely from the already-loaded Fleet projection (no
+/// per-work API call yet; that is T1b's job), so the fallback rule is
+/// "still in the refreshed Fleet rows or not", checked in `App::refresh`.
 #[tokio::test]
-async fn a_detail_screen_whose_work_vanished_falls_back_to_the_fleet() {
+async fn a_work_view_whose_work_vanished_falls_back_to_fleet() {
     let data = TempDir::new().expect("tempdir");
     let repo = TempDir::new().expect("tempdir");
     init_repo(repo.path());
@@ -862,29 +878,27 @@ async fn a_detail_screen_whose_work_vanished_falls_back_to_the_fleet() {
     let client = client_for(&handle);
 
     let mut app = App::new();
-    app.detail_id = Some(work_id.clone());
-    app.screen = Screen::Detail;
     app.refresh(&client).await.expect("first read");
     assert!(
-        !app.detail_events.is_empty(),
-        "the detail screen starts with a real work's events"
+        app.rows.iter().any(|row| row.id == work_id),
+        "the work is in the fleet before it vanishes"
     );
+    app.open_work = Some(tui::OpenWork {
+        id: "01NOSUCHWORKATALL".to_string(),
+        from: Destination::Fleet,
+    });
 
-    // The work the screen is showing is gone; the fleet behind it is not.
-    app.detail_id = Some("01NOSUCHWORKATALL".to_string());
+    // The work the stub is showing is gone; the fleet behind it is not.
     app.refresh(&client)
         .await
         .expect("a work that vanished is not a client failure");
 
-    assert_eq!(app.screen, Screen::Fleet, "the screen falls back");
-    assert_eq!(app.detail_id, None, "and stops asking about the dead id");
-    assert_eq!(app.detail, Value::Null);
-    assert!(
-        app.detail_events.is_empty(),
-        "nothing of the vanished work is left to paint"
+    assert_eq!(
+        app.open_work, None,
+        "the stub falls back rather than painting a corpse"
     );
     assert!(
-        !app.rows.is_empty(),
+        app.rows.iter().any(|row| row.id == work_id),
         "the fleet it fell back to is the live one"
     );
     assert!(
@@ -2258,7 +2272,7 @@ fn the_tui_stack_is_ratatui_with_crossterm_reached_through_it() {
         "ratatui is the §34-named TUI dependency and must stay declared"
     );
 
-    let tui = code_only(&read_source("tui.rs"));
+    let tui = code_only(&read_tui_source());
     assert!(
         tui.contains("ratatui::crossterm::"),
         "the TUI must reach crossterm through ratatui's re-export"
@@ -2384,13 +2398,13 @@ fn t4_a_client_that_applies_the_knob_is_quiet_about_it() {
 /// internals somebody thought to name, and `BlobStore` was not one of them.
 #[test]
 fn t5_the_tui_is_a_client_like_any_other() {
-    let source = code_only(&read_source("tui.rs"));
+    let source = code_only(&read_tui_source());
     let paths = crate_paths(&source);
     assert_eq!(
         paths,
         vec!["api".to_string()],
-        "tui.rs may reach the crate only through `crate::api` — the API client \
-         surface — but names: {paths:?}"
+        "the tui module tree may reach the crate only through `crate::api` — \
+         the API client surface — but names: {paths:?}"
     );
     for forbidden in [
         "ApiState",
@@ -2990,6 +3004,40 @@ fn read_source(name: &str) -> String {
         .join("src")
         .join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"))
+}
+
+/// The whole `src/tui/` module tree, concatenated.
+///
+/// T1a restructured the M6-era single `src/tui.rs` into a module tree
+/// (`src/tui/mod.rs` plus submodules) — the structural scans below
+/// (`t5`/`t1_the_tui_has_no_private_shortcut`) must see every file in it, not
+/// just `mod.rs`, or a submodule could reach past `crate::api` invisibly to
+/// them. This is the file-discovery half of that split; the scans'
+/// assertions themselves (what paths are allowed, what tokens are forbidden)
+/// are unchanged.
+fn read_tui_source() -> String {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("tui");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|e| panic!("read dir entry under {dir:?}: {e}"))
+                .path()
+        })
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() > 1,
+        "expected the tui module tree to have split into more than one file under {dir:?}, found {files:?}"
+    );
+    files
+        .into_iter()
+        .map(|path| std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The same file with its `//`-comments removed.
