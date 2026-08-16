@@ -266,7 +266,7 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     assert_shows(&terminal, FAKE_BACKEND_NAME, "resolved backend");
     assert_shows(&terminal, "Fleet — 2 works", "fleet header");
 
-    // --- the canonical Work stub (T1b builds the real surface) ----------
+    // --- the canonical Work surface (§13, T1b) --------------------------
     let asking_row = app
         .rows
         .iter()
@@ -276,9 +276,15 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
     assert_eq!(
         action,
-        Action::None,
-        "opening the stub needs no API round trip"
+        Action::OpenWork(asking.clone()),
+        "opening the real surface asks for the fetch WorkScreen::load makes"
     );
+    assert!(
+        app.open_work.is_none(),
+        "not open until the fetch actually runs"
+    );
+    let outcome = app.execute(&client, action).await;
+    assert_eq!(outcome, Action::None);
     assert_eq!(
         app.open_work,
         Some(tui::OpenWork {
@@ -287,16 +293,45 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         })
     );
 
+    // Thread (default tab): the initial intent, the pinned workflow's own
+    // question surfaced as a gold ask card or, absent one from this fake
+    // backend, at minimum the header's above-the-fold pin.
     let terminal = render(&app);
     assert_shows(&terminal, &asking, "work id");
     assert_shows(&terminal, "ask me something", "intent");
     assert_shows(&terminal, "needs_input", "state");
     assert_shows(&terminal, "tiny", "workflow name");
-    assert_shows(&terminal, "00-first 1/2", "stage");
-    assert_shows(&terminal, "which retry budget?", "the stage's question");
+    assert_shows(&terminal, "00-first", "stage");
+    assert_shows(
+        &terminal,
+        "which retry budget?",
+        "the stage's question, pinned above the fold",
+    );
+    assert_shows(&terminal, "Thread", "the tab bar names Thread");
+    assert_shows(&terminal, "Workflow", "the tab bar names Workflow");
+    assert_shows(&terminal, "Evidence", "the tab bar names Evidence");
+    assert_shows(&terminal, "Graph", "the tab bar names Graph");
+    assert_shows(&terminal, "Details", "the tab bar names Details");
 
+    // Workflow: the pinned stage rail, not a percent bar.
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    let terminal = render(&app);
+    assert_shows(&terminal, "00-first", "the rail names the first stage");
+    assert_shows(&terminal, "10-second", "the rail names the second stage");
+    assert!(
+        !screen_text(&terminal).contains('%'),
+        "never a percent bar (Decision T2-50)"
+    );
+
+    // Evidence: the raw journal window for this Work alone.
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    let terminal = render(&app);
+    assert_shows(&terminal, "stage.entered", "a raw journal kind");
+
+    // Esc returns to exactly where it was opened from, and drops the fetch.
     app.on_key(ratatui::crossterm::event::KeyCode::Esc);
-    assert!(app.open_work.is_none(), "Esc returns from the stub");
+    assert!(app.open_work.is_none(), "Esc closes the surface");
+    assert!(app.work_screen.is_none());
     assert_eq!(
         app.destination,
         Destination::Fleet,
@@ -895,7 +930,11 @@ async fn a_work_view_whose_work_vanished_falls_back_to_fleet() {
 
     assert_eq!(
         app.open_work, None,
-        "the stub falls back rather than painting a corpse"
+        "the surface falls back rather than painting a corpse"
+    );
+    assert!(
+        app.work_screen.is_none(),
+        "its fetched data must not survive the fallback either"
     );
     assert!(
         app.rows.iter().any(|row| row.id == work_id),

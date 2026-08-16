@@ -13,6 +13,7 @@ use super::connection::Live;
 use super::fleet::{FleetOutcome, FleetScreen, WorkRow, fleet_rows};
 use super::home::{HomeOutcome, NewWorkForm};
 use super::overlay::Overlay;
+use super::work_view::{WorkScreen, WorkScreenOutcome};
 
 /// §7.1's top-level destinations, in their displayed order.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,6 +75,12 @@ pub enum Action {
     Refresh,
     /// `POST /v1/work` with this body (§9.1/§9.2's New Work submission).
     Submit(Value),
+    /// Open the canonical Work surface (§13) for this id: the four reads
+    /// `WorkScreen::load` needs, none of which the keymap can do itself.
+    OpenWork(String),
+    /// §13.5's bounded "load older": grow the open Work's Evidence window
+    /// and re-fetch.
+    LoadOlderEvidence,
 }
 
 /// The TUI's whole state: what was read from the API, and where the cursor is.
@@ -89,6 +96,10 @@ pub struct App {
     pub fleet: FleetScreen,
     /// The canonical Work surface, if one is open over `destination`.
     pub open_work: Option<OpenWork>,
+    /// The open Work surface's own fetched data and tab/scroll state
+    /// (§13) — `None` while `open_work` is `Some` but the opening fetch is
+    /// still in flight.
+    pub work_screen: Option<WorkScreen>,
     /// The one open overlay, if any (§7.4).
     pub overlay: Option<Overlay>,
     /// Whether the global Attention drawer is showing (§7.3: opens by
@@ -115,6 +126,7 @@ impl App {
             home: NewWorkForm::default(),
             fleet: FleetScreen::default(),
             open_work: None,
+            work_screen: None,
             overlay: None,
             drawer_open: true,
             system: Value::default(),
@@ -123,13 +135,6 @@ impl App {
             status: "loading…".to_string(),
             quit: false,
         }
-    }
-
-    /// The Fleet row backing the open canonical Work surface, if any and if
-    /// it is still in the loaded Fleet.
-    pub fn open_row(&self) -> Option<&WorkRow> {
-        let open = self.open_work.as_ref()?;
-        self.rows.iter().find(|row| row.id == open.id)
     }
 
     /// Re-read everything this app shows from the API.
@@ -144,13 +149,23 @@ impl App {
         let fleet = client.fleet().await?;
         self.rows = fleet_rows(&fleet);
         self.fleet.clamp(&self.rows);
-        if let Some(open) = &self.open_work
-            && !self.rows.iter().any(|row| row.id == open.id)
-        {
-            // The work vanished (a data dir replaced under us, or it aged
-            // out of what the daemon reports). Fall back rather than keep
-            // painting a corpse.
-            self.open_work = None;
+        if let Some(open) = &self.open_work {
+            if !self.rows.iter().any(|row| row.id == open.id) {
+                // The work vanished (a data dir replaced under us, or it aged
+                // out of what the daemon reports). Fall back rather than keep
+                // painting a corpse.
+                self.open_work = None;
+                self.work_screen = None;
+            } else if let Some(screen) = &mut self.work_screen {
+                // A live SSE-classified event or an explicit `r` re-reads
+                // everything this screen shows too — best-effort: a failed
+                // per-Work refresh must not blank a screen whose last
+                // successful read is still good, so the error lands on the
+                // screen itself rather than propagating out of here.
+                if let Err(e) = screen.refresh(client).await {
+                    screen.last_error = Some(e.to_string());
+                }
+            }
         }
         Ok(())
     }
@@ -213,13 +228,7 @@ impl App {
             },
             Destination::Fleet => match self.fleet.on_key(key, &self.rows) {
                 FleetOutcome::None => Action::None,
-                FleetOutcome::Open(id) => {
-                    self.open_work = Some(OpenWork {
-                        id,
-                        from: Destination::Fleet,
-                    });
-                    Action::None
-                }
+                FleetOutcome::Open(id) => Action::OpenWork(id),
             },
             Destination::Workflows | Destination::Estate => Action::None,
         }
@@ -254,12 +263,29 @@ impl App {
         Action::None
     }
 
+    /// Every key inside an open Work surface is the surface's own to
+    /// interpret (§13.2's tab switching and each tab's local navigation) —
+    /// `App` only acts on the two outcomes that reach outside the surface
+    /// itself: closing it, and asking for an API round trip Evidence's
+    /// bounded "load older" needs.
     fn on_key_open_work(&mut self, key: KeyCode) -> Action {
-        match key {
-            KeyCode::Esc | KeyCode::Char('q') => self.open_work = None,
-            _ => {}
+        let Some(screen) = self.work_screen.as_mut() else {
+            // The opening fetch is still in flight: only Esc/q is
+            // meaningful yet (there is nothing else to navigate).
+            if matches!(key, KeyCode::Esc | KeyCode::Char('q')) {
+                self.open_work = None;
+            }
+            return Action::None;
+        };
+        match screen.on_key(key) {
+            WorkScreenOutcome::None => Action::None,
+            WorkScreenOutcome::Close => {
+                self.open_work = None;
+                self.work_screen = None;
+                Action::None
+            }
+            WorkScreenOutcome::LoadOlder => Action::LoadOlderEvidence,
         }
-        Action::None
     }
 
     /// Execute an action against the API and record its outcome.
@@ -282,6 +308,29 @@ impl App {
                     }
                 }
                 Action::Refresh
+            }
+            Action::OpenWork(id) => {
+                match WorkScreen::load(client, &id).await {
+                    Ok(screen) => {
+                        self.work_screen = Some(screen);
+                        self.open_work = Some(OpenWork {
+                            id,
+                            from: self.destination,
+                        });
+                    }
+                    Err(e) => {
+                        self.status = format!("could not open work {id}: {e}");
+                    }
+                }
+                Action::None
+            }
+            Action::LoadOlderEvidence => {
+                if let Some(screen) = &mut self.work_screen
+                    && let Err(e) = screen.load_older(client).await
+                {
+                    self.status = format!("could not load older evidence: {e}");
+                }
+                Action::None
             }
             other => other,
         }
@@ -397,23 +446,57 @@ mod tests {
     }
 
     #[test]
-    fn fleet_enter_opens_the_canonical_work_stub_and_esc_returns() {
+    fn fleet_enter_asks_to_open_the_canonical_work_surface() {
         let mut app = App::new();
         app.rows = fleet_rows(&fleet_of(&[("a", "running"), ("b", "running")]));
         app.on_key(KeyCode::Esc); // leave Home's form focus
         app.on_key(KeyCode::Char('2')); // Fleet
         assert_eq!(app.destination, Destination::Fleet);
-        app.on_key(KeyCode::Enter);
         assert_eq!(
-            app.open_work,
-            Some(OpenWork {
-                id: "a".to_string(),
-                from: Destination::Fleet,
-            })
+            app.on_key(KeyCode::Enter),
+            Action::OpenWork("a".to_string()),
+            "opening the real surface needs the API reads WorkScreen::load makes — \
+             the keymap only asks for it, `execute` does the fetch"
         );
-        assert_eq!(app.open_row().map(|r| r.id.as_str()), Some("a"));
+        assert!(
+            app.open_work.is_none(),
+            "not open yet: the fetch this needs has not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_work_that_fails_to_load_reports_the_error_and_stays_closed() {
+        let mut app = App::new();
+        app.rows = fleet_rows(&fleet_of(&[("a", "running")]));
+        let client = ApiClient::new("http://127.0.0.1:1", "t").expect("client");
+        let outcome = app
+            .execute(&client, Action::OpenWork("a".to_string()))
+            .await;
+        assert_eq!(outcome, Action::None);
+        assert!(app.open_work.is_none());
+        assert!(app.work_screen.is_none());
+        assert!(app.status.contains("could not open work"), "{}", app.status);
+    }
+
+    #[test]
+    fn esc_closes_an_open_work_surface_and_returns_to_where_it_was_opened_from() {
+        let mut app = App::new();
+        app.rows = fleet_rows(&fleet_of(&[("a", "running")]));
+        app.destination = Destination::Fleet;
+        app.open_work = Some(OpenWork {
+            id: "a".to_string(),
+            from: Destination::Fleet,
+        });
+        app.work_screen = Some(WorkScreen::from_parts(
+            "a".to_string(),
+            json!({"work": {"id": "a", "intent": "x", "state": "running"}}),
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
         app.on_key(KeyCode::Esc);
         assert!(app.open_work.is_none());
+        assert!(app.work_screen.is_none());
         assert_eq!(
             app.destination,
             Destination::Fleet,
