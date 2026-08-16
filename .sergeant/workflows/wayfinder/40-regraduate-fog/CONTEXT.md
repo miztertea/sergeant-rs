@@ -28,9 +28,30 @@ Remaining fog is re-evaluated; the run loops back to `10-map-frontier` if fog re
   (trigger: a session is working through the map; outcome: the actor's own edits account for the possibility of concurrent external changes)
   — `BU-P4-100`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Work through the map, L128)
 
-## Judgment required
+## Bounded judgment
 
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
+Apply `@@bounded-judgment`.
+
+### J4 — explicit user or bound Work decision
+- An effort's own Notes may explicitly override the plan-don't-do default to carry execution into the map (`BU-P4-076`); the stage honors this without reconfirming it.
+
+### J5 — governing constraint
+- G7 (dynamic ticket graph, dynamically-discovered checkpoint graph) is closed — the loop back to `10-map-frontier` is represented as fresh re-invocation, not engine-level looping (`reference-corpus/synthesis.md` §5).
+
+### J2 — delegated to this stage
+- None beyond the plan-don't-do default itself, which is J4/J5 as above.
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- None specific to this stage beyond `@@bounded-judgment`'s general triggers.
+
+### Completion boundary
+This stage may complete only once remaining fog is re-evaluated; if fog remains, the workflow loops back to `10-map-frontier` via fresh re-invocation rather than an engine-level loop primitive.
+
+### Decision evidence
+The map's Not yet specified section is this stage's own durable record of what fog remains.
 
 ## Additional note
 

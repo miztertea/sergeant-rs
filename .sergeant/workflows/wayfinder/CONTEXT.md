@@ -28,10 +28,56 @@ A destination is named that requires mapping fog before it can be reached.
 
 - `00-name-destination` delegates to **grilling**.
 
+## Authority envelope
+
+This workflow receives an already-named (or, at `00-name-destination`,
+about-to-be-settled-live) destination and a bounded outcome.
+
+### Workflow may decide
+- Whether frontier-mapping surfaces enough fog to justify a map at all, or
+  whether the whole journey is small enough for one session (`10-map-frontier`).
+- Which foreseen decisions are sharp enough to become tickets now versus
+  staying in the fog (`10-map-frontier`).
+- Which ticket to resolve next when the user has not named one, and how to
+  classify a ticket's type (`30-resolve-one`).
+
+### Workflow may not decide
+- Answer on a human's behalf on a HITL ticket (`30-resolve-one`).
+- Resolve more than one non-research ticket per session, or skip claiming a
+  ticket by self-assignment before starting work.
+- Silently graduate out-of-scope work into a ticket.
+
+### Human or Captain gates
+- No fog found during frontier-mapping: the stage stops and asks the user
+  how to proceed rather than creating a trivial map (`10-map-frontier`).
+- Any HITL ticket's live exchange with the human (`30-resolve-one`).
+
+### Decision record
+Material decisions are recorded on the map itself (Decisions-so-far,
+Not yet specified, Out of scope) and in each ticket's resolution comment;
+this workflow declares no separate decision-log file.
+
+## Refer by name
+
+Every map and ticket is referred to by its name (title) in all
+human-facing narration — narration, the map's own Decisions-so-far — never
+by a bare id, number, or slug. The id and URL ride inside the name, never
+stand in for it. — `BU-P4-077`, `BU-P4-080`,
+`reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Refer by
+name, L17).
+
+This package is also the shared-by owner of `@@ticket-shaping` and
+`@@triage-state-machine` (`reference-corpus/shared-context-map.md` Part 2).
+As with `@@domain-modeling` above, no `.sergeant/common/contexts/
+{ticket-shaping,triage-state-machine}.md` file exists in this repo yet —
+only frozen upstream evidence; this is a cross-package materialization gap
+in the `@@name` shared-context catalog generally, not specific to this
+package.
+
 ## Notes for reviewers
 
-**N1 adjudication A4:** the former `20-create-tickets` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-map-frontier` as a helper invocation. `30-resolve-one`'s upstream Inputs pointer moves to `10-map-frontier`. No renumbering: `00`, `10`, `30`, `40` remain correctly ordered without `20`. See `provenance.md`'s "Adjudication A4" section.
+**N1 adjudication A4:** the former `20-create-tickets` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-map-frontier` as a helper invocation. `30-resolve-one`'s upstream Inputs pointer moves to `10-map-frontier`. No renumbering: `00`, `10`, `30`, `40` remain correctly ordered without `20`. See `docs/gauntlet/promoted-provenance/wayfinder.md`'s "Adjudication A4" section.
 
 ## Provenance
 
-See `provenance.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.
+See `docs/gauntlet/promoted-provenance/wayfinder.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.

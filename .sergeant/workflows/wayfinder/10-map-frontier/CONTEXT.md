@@ -31,17 +31,52 @@ Breadth-first mapping; stop and do not create a map if no fog exists; specifiabl
   (trigger: work is identified that lies beyond the chartered destination; outcome: scope creep is recorded explicitly rather than silently absorbed into the fog or the ticket graph)
   — `BU-P4-091`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Out of scope, L97)
 
-## Judgment required
-
-This is an actor stage (ladder §6.4): the acting harness must inspect evidence, choose among alternatives, ask the user where the behavior contract above requires it, or explain a decision — it is not mechanically executable from the contract alone. Treat the statements above as binding constraints on that judgment, not as a script to execute verbatim.
-
 ## Helper invocation: create tickets
 
-Demoted from a standalone stage (`20-create-tickets`) at N1 adjudication A4: its only stage-level justification was the §6.5 deterministic-machinery boilerplate, with no additional checkpoint argument, so it folds into this stage as a helper invocation performed once the frontier is mapped. No `kind = "execute"` stage exists in the current engine, so the acting harness performs the ticket-creation operation itself:
+Demoted from a standalone stage (`20-create-tickets`) at N1 adjudication A4: its only stage-level justification was the §6.5 deterministic-machinery boilerplate, with no additional checkpoint argument, so it folds into this stage as a helper invocation performed once the frontier is mapped.
+
+**Rung-rationale correction (ICM-R3, 2026-08-16):** the prior text here claimed "no `kind = \"execute\"` stage exists in the current engine" as part of this fold's justification. That is false as of this branch: `.sergeant/workflows/repo-to-icm/workflow.toml`'s `65-self-check` is a live `kind = "execute"` stage. Whether this two-pass ticket-creation fold should instead ride on a `kind = "execute"` stage after this actor stage is a real open question raised at `research/00-investigate/CONTEXT.md`'s equivalent correction and parked there, not resolved here. Until that's decided, the acting harness performs the ticket-creation operation itself:
 
 - **When creating a wayfinder map, create the tickets that can already be specified as child issues first, then wire their blocking edges in a second pass, because issues need ids before they can reference each other.**
   (trigger: specifiable decisions have been identified during charting; outcome: the resulting ticket set has correct blocking edges despite the two-pass creation order)
   — `BU-P4-096`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Chart the map, L114)
+
+## Helper invocation: map and ticket structure
+
+The structural mechanics the map and its tickets depend on, extracted at N1 and already classified as this package's own workflow-local helper content (`reference-corpus/helper-map.md` "Workflow-local helpers") but never landed in this stage until now:
+
+- **The map is a single issue on the repo's issue tracker, labelled `wayfinder:map`; its tickets are child issues of the map.**
+  — `BU-P4-078`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map, L21)
+- **The map is an index, not a store: it lists decisions made and points at the tickets that hold their detail, gisting and linking rather than restating.**
+  — `BU-P4-079`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map, L21)
+- **Each ticket is sized to one ~100K-token agent session and carries exactly one `wayfinder:<type>` label (`research`, `prototype`, `grilling`, `task`).**
+  — `BU-P4-081`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / Tickets, L27-30)
+- **A session claims a ticket by self-assignment before any work; the assignee is the claim, and an open, unassigned ticket is unclaimed.**
+  — `BU-P4-082`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / Tickets, L33)
+- **Blocking uses the tracker's native dependency relationship, falling back to a body convention only if the tracker lacks native blocking.**
+  — `BU-P4-083`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / Tickets, L34)
+- **Open tickets are not listed inline on the map; they are found by query.**
+  — `BU-P4-084`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / The map body, L23)
+
+## Bounded judgment
+
+Apply `@@bounded-judgment`.
+
+### J2 — delegated to this stage
+- Whether a foreseen decision is sharp enough to become a ticket now, or belongs in the fog (`BU-P4-089`).
+- Which work is out of scope versus still-fog (`BU-P4-091`).
+
+### J1 — local choices allowed
+- None beyond ordinary tool mechanics.
+
+### J0 — must become `needs_input`
+- Frontier-mapping surfaces no fog at all: stop, do not create a map, and ask the user how they would like to proceed (`BU-P4-095`).
+
+### Completion boundary
+This stage may complete only once the frontier has been mapped breadth-first, specifiable tickets are created and blocking edges wired, and remaining fog is recorded in Not yet specified — or the stage has stopped at the J0 no-fog case above.
+
+### Decision evidence
+The map itself (Not yet specified, Out of scope, the ticket set) is this stage's own durable record.
 
 ## Output
 
