@@ -78,12 +78,26 @@ impl WorkflowsScreen {
         self.visible().into_iter().nth(self.selected)
     }
 
-    /// Move the local selection onto the catalog entry named `name`, if it
-    /// is currently visible — how `Overlay::WorkflowChooser`'s Enter (opened
-    /// via `WorkflowsOutcome::OpenWorkflowChooser`) hands its pick back to
-    /// this screen, mirroring how the same overlay hands its pick to Home's
-    /// workflow field.
+    /// Move the local selection onto the catalog entry named `name` — how
+    /// `Overlay::WorkflowChooser`'s Enter (opened via
+    /// `WorkflowsOutcome::OpenWorkflowChooser`) hands its pick back to this
+    /// screen, mirroring how the same overlay hands its pick to Home's
+    /// workflow field. The chooser lists the full, unfiltered catalog
+    /// (§15.4), so `name` may not pass this screen's own local `/` filter;
+    /// in that case the filter is cleared so `name` becomes selectable.
     pub fn select_by_name(&mut self, name: &str) {
+        if let Some(index) = self
+            .visible()
+            .iter()
+            .position(|e| e["name"].as_str() == Some(name))
+        {
+            self.selected = index;
+            return;
+        }
+        if !self.entries.iter().any(|e| e["name"].as_str() == Some(name)) {
+            return;
+        }
+        self.filter.clear();
         if let Some(index) = self
             .visible()
             .iter()
@@ -547,6 +561,30 @@ mod tests {
         screen.set_entries(vec![entry("implement"), entry("diagnose-bug")]);
         screen.select_by_name("does-not-exist");
         assert_eq!(screen.selected_entry().unwrap()["name"], "implement");
+    }
+
+    #[test]
+    fn select_by_name_clears_a_stale_local_filter_that_hides_the_pick() {
+        let mut screen = WorkflowsScreen::default();
+        screen.set_entries(vec![entry("implement"), entry("diagnose-bug")]);
+        screen.on_key(KeyCode::Char('/'));
+        for c in "diag".chars() {
+            screen.on_key(KeyCode::Char(c));
+        }
+        screen.on_key(KeyCode::Enter);
+        assert_eq!(
+            screen.visible().len(),
+            1,
+            "the local filter is still narrowing the list"
+        );
+
+        screen.select_by_name("implement");
+
+        assert_eq!(
+            screen.selected_entry().unwrap()["name"],
+            "implement",
+            "a live-chooser pick must land even when it doesn't match a stale local filter"
+        );
     }
 
     #[test]
