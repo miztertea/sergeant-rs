@@ -3517,6 +3517,16 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 async fn t12_submission_throughput_has_an_automated_floor() {
     /// A-N3-1's amended budget, on a quiet machine at burst 50.
     const BUDGET: f64 = 24.0;
+    // Load-sensitivity note (macOS / Apple M3 Pro, issue #128,
+    // docs/perf/macbook-arrival-git-spawn-2026-08-15.md):
+    // This test passes in isolation (11.3–12.0 works/s, above the 11.0 floor)
+    // but can fail under heavy parallel cargo-test / compilation contention
+    // (measured 9.3 works/s on an Apple M3 Pro). The submit path serializes
+    // through a single per-repo lock rather than a parallel-worker pool, so
+    // throughput = 1 / per-submission latency — it is not a concurrency count.
+    // Git subprocess spawn overhead dominates that latency on macOS; OS
+    // scheduling pressure under load inflates it further. Owner-accepted
+    // disposition: known flaky-under-load on macOS; not fixed further this pass.
     /// How much slower a suite sharing its cores with seven others may be.
     const CONTENTION_ALLOWANCE: f64 = 2.0;
     /// Works per second the daemon must sustain, whole submit path.
