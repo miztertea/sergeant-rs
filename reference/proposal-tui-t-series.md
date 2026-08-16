@@ -398,17 +398,18 @@ The workflow catalog remains the one proposed read-only addition because workflo
 
 Repo/group commands are deliberately local manifest operations. Doctor must work when no daemon is running. Forcing them through new daemon routes solely for UI purity would violate their existing lifecycle semantics.
 
-**Decision T2-14 (R2/R6): blocked pending an explicit ruling.** As drafted, the TUI would consume repo/group and Doctor behavior through narrow typed local operations extracted from the current CLI implementation — the CLI and TUI formatting the same outcomes differently. This would be a second crate-internal reach path into `tui.rs` beyond `crate::api`, which `tests/m6_surfaces.rs`'s `t5_the_tui_is_a_client_like_any_other` rejects today by construction, and `t5b_the_structural_scan_sees_every_spelling_of_a_path` specifically hardens against being fooled by an unusual `use` spelling. This decision does not pick a side; it names the two live options for the proposal's owner to rule on:
+**Decision T2-14 (R2/R6): resolved — extend the daemon API.** The proposal's owner ruled on 2026-08-16: repo/group and Doctor behavior reaches `tui.rs` exclusively through new authenticated daemon API routes, consumed via `ApiClient` like every other daemon-owned fact. `tests/m6_surfaces.rs`'s `t5_the_tui_is_a_client_like_any_other` and `t5b_the_structural_scan_sees_every_spelling_of_a_path` are **not revised** — they remain exactly as they are today, unweakened. `tui.rs` gets no second crate-internal reach path.
 
-- extend the daemon API with new authenticated routes for repo/group and Doctor, reached via `ApiClient` like everything else, leaving `t5`/`t5b` untouched; or
-- explicitly revise `t5`/`t5b`, with a stated justification for why estate-local, non-daemon operations become a second sanctioned reach path for `tui.rs`.
+The CLI's existing local, no-daemon code paths — `crate::domain::manifest` for repo/group, `mod doctor`'s `Check`-producing functions for Doctor — are unchanged: the CLI keeps calling them directly, in-process, so `sgt doctor` and `sgt repo add` still work with no daemon running at all (needed for `sgt init` and pre-daemon diagnosis). The new API routes are thin daemon-side wrappers over those same existing functions; no logic is duplicated and no CLI behavior changes.
 
-This is an explicit refinement of the old "TUI imports only ApiClient" source-scan rule, contingent on which option the ruling selects:
+This is the option that actually satisfies "the CLI and TUI are both clients consuming the same core": repo/group and Doctor become core-owned state that both clients read identically, rather than a compromise of that principle. The CLI's direct local calls are a separate, deliberate exception for its own no-daemon requirement — not a second client-boundary path for `tui.rs`.
+
+This is an explicit refinement of the old "TUI imports only ApiClient" source-scan rule:
 
 ```text
 daemon-owned facts     ApiClient only
-estate manifest edits  shared local Estate operations, or ApiClient if the API is extended
-installation checks    shared local Doctor report, or ApiClient if the API is extended
+estate manifest edits  ApiClient only (CLI reaches crate::domain::manifest directly and locally, a separate no-daemon exception)
+installation checks    ApiClient only (CLI reaches mod doctor's Check-producing functions directly and locally, a separate no-daemon exception)
 ```
 
 ## 5.4 SSE remains invalidation
@@ -1544,62 +1545,67 @@ reap
 
 ## 16.2 Estate operations
 
-Blocked pending the same client-boundary ruling named in §5.3/Decision T2-14: whether repo/group behavior reaches `tui.rs` through shared local typed functions (as illustrated below) or through new authenticated `ApiClient` routes. The shape below assumes the former; if the ruling selects the latter, these functions back new API handlers instead of being called directly from `tui.rs`.
+Per §5.3/Decision T2-14, repo/group behavior reaches `tui.rs` exclusively through new authenticated `ApiClient` routes, thin daemon-side wrappers over the existing `crate::domain::manifest` functions the CLI already calls locally. No logic is duplicated; no CLI behavior changes.
 
-Current CLI repo/group behavior should move behind small typed functions only when Estate consumes it.
-
-Illustrative, nonbinding shape:
-
-```rust
-list_repositories(...)
-add_repository(...)
-remove_repository(...)
-
-list_groups(...)
-upsert_group(...)
-remove_group_members(...)
-remove_group(...)
-```
-
-The functions own:
+Route contracts:
 
 ```text
-manifest locking
-atomic writes
-validation
-clone/register behavior
-group reference refusal
-no-delete guarantee
-structured result/error/remedy
+GET /v1/estate/repos
+  -> 200 { repos: [ { name, path, origin?, instructions? }, ... ] }
+
+POST /v1/estate/repos
+  body { name, origin?, instructions? }        (manifest::add_repo)
+  -> 201 { name, path, origin?, instructions? }
+  -> error body carries the same structured ManifestError name/detail/remedy add_repo returns
+
+DELETE /v1/estate/repos/{name}
+  (manifest::remove_repo)
+  -> 204 on success
+  -> error body carries the same structured ManifestError (e.g. RepoInUseByGroups) remove_repo returns
+
+GET /v1/estate/groups
+  -> 200 { groups: [ { name, repos: [...], brief? }, ... ] }
+
+POST /v1/estate/groups
+  body { name, repos: [...], brief? }           (manifest::add_group, mkdir-p semantics: creating an
+                                                  existing group unions in new members; re-adding an
+                                                  existing member is a no-op)
+  -> 200 { name, repos: [...], brief? }
+
+DELETE /v1/estate/groups/{name}
+  body { repos?: [...] }                        (manifest::remove_group; omitted/empty repos removes
+                                                  the whole group, otherwise removes just the named
+                                                  members, each of which must already be a member)
+  -> 204 on success
+  -> error body carries the same structured ManifestError (e.g. NotAGroupMember) remove_group returns
 ```
 
-CLI owns Clap/stdout/JSON/exit code. TUI owns forms/focus/rendering.
+CLI owns Clap/stdout/JSON/exit code, calling `crate::domain::manifest` directly and locally — unchanged, so `sgt repo add`/`sgt group add`/etc. keep working with no daemon running (needed for `sgt init` and pre-daemon diagnosis). TUI owns forms/focus/rendering, calling only these routes via `ApiClient`.
 
-**Decision T2-57 (R2/R6):** Extract on contact. Do not build `ApplicationService`, `CommandBus`, a generic command trait, or a second internal API.
+**Decision T2-57 (R2/R6):** Extract on contact. Do not build `ApplicationService`, `CommandBus`, a generic command trait, or a second internal API. The daemon route handlers are thin wrappers, not a new abstraction layer.
 
 ## 16.3 Doctor report
 
-Blocked pending the same client-boundary ruling named in §5.3/Decision T2-14: whether Doctor's report reaches `tui.rs` through the shared local report (as illustrated below) or through a new authenticated `ApiClient` route. The shape below assumes the former; if the ruling selects the latter, this report backs a new API handler instead of being read directly from `tui.rs`.
+Per §5.3/Decision T2-14, Doctor's report reaches `tui.rs` exclusively through a new authenticated `ApiClient` route, a thin daemon-side wrapper over `mod doctor`'s existing `Check`-producing functions and `Report::to_json`, which the CLI already calls locally.
 
-Illustrative, nonbinding shape:
+Route contract:
 
-```rust
-DoctorReport {
-    checks: Vec<DoctorCheck>
-}
-
-DoctorCheck {
-    name
-    status
-    summary
-    detail
-    remedy
-}
+```text
+GET /v1/doctor
+  -> 200 the same Report::to_json() shape the CLI's `sgt doctor --json` already prints:
+     {
+       healthy: bool,
+       data_dir: string,
+       checks: [
+         { name, status: "ok" | "warn" | "fail", detail, remedy? },
+         ...
+       ]
+     }
 ```
 
-The current CLI text and JSON are rendered from that report. TUI Health renders the same report.
+The current CLI text and JSON are rendered from `doctor::Report` directly and locally — unchanged, so `sgt doctor` keeps working with no daemon running. TUI Health renders the same JSON shape, fetched via `ApiClient`.
 
-**Decision T2-58 (R2/R6):** Shared result, one diagnostic implementation.
+**Decision T2-58 (R2/R6):** Shared result, one diagnostic implementation — the daemon route serializes the same `Report` the CLI prints, never a second computation of the checks.
 
 ## 16.4 Workflow catalog
 
@@ -1828,7 +1834,7 @@ Pin:
 
 ## 19.6 Doctor parity
 
-The CLI text/JSON and TUI Health consume one `DoctorReport`. Tests assert no check disappears or changes status/remedy between surfaces.
+The CLI text/JSON renders `doctor::Report` directly and locally; TUI Health renders the same report's JSON, fetched via `ApiClient` from `GET /v1/doctor` (§16.3). Tests assert no check disappears or changes status/remedy between surfaces.
 
 Filesystem reliability is included, per PR #111.
 
@@ -1932,9 +1938,7 @@ This is one program with bounded slices. No slice waits for a universal refactor
 
 T0 begins only once a proposal-grading gauntlet unit has closed against this document, e.g. T-SERIES-1.
 
-T0's first required output is the client-boundary ruling named in §5.3/§16.2/§16.3's Decision T2-14: whether repo/group and Doctor behavior reaches `tui.rs` by extending the daemon API with new authenticated routes reached via `ApiClient` (leaving `tests/m6_surfaces.rs`'s `t5_the_tui_is_a_client_like_any_other` and `t5b_the_structural_scan_sees_every_spelling_of_a_path` untouched), or by explicitly revising `t5`/`t5b` with a stated justification for a second sanctioned reach path. This ruling is recorded as an amendment to this proposal and a `GAUNTLET.md` entry — the same closure artifact convention T4 uses in §20.5. T1 is not dispatchable until it resolves.
-
-Remaining T0 tasks:
+Decision T2-14 (§5.3/§16.2/§16.3) was resolved by the proposal's owner on 2026-08-16: extend the daemon API with new authenticated routes for repo/group and Doctor, reached via `ApiClient` (§5.3). T0 no longer needs to make this decision — it is already made; T0's remaining task is unchanged:
 
 - pin current main and integration disposition;
 - re-audit CLI/API/TUI/workflow catalog;
@@ -1974,11 +1978,11 @@ This produces visible value without Estate extraction or workflow-catalog API co
 
 ## 20.4 T3: Estate
 
-- extract repo/group operations on contact;
-- Repositories full lifecycle;
-- Groups full lifecycle;
-- extract Doctor report;
-- Health;
+- build the `/v1/estate/repos` and `/v1/estate/groups` API routes (§16.2) as thin wrappers over `crate::domain::manifest`;
+- Repositories full lifecycle, consumed via `ApiClient`;
+- Groups full lifecycle, consumed via `ApiClient`;
+- build the `/v1/doctor` API route (§16.3) as a thin wrapper over `mod doctor`;
+- Health, consumed via `ApiClient`;
 - retained/reap consumption;
 - no generic service layer.
 
@@ -2086,7 +2090,7 @@ The rung is the lowest viable resolution.
 | T2-11 | R5 | Reduce boxes before adding ornament |
 | T2-12 | R2 | Work remains the durable center |
 | T2-13 | R2 | Daemon-owned facts remain ApiClient-only |
-| T2-14 | R2/R6 | Blocked pending an explicit ruling on the client-boundary open question (§5.3) |
+| T2-14 | R2/R6 | Extend the daemon API for repo/group/Doctor; TUI stays ApiClient-only |
 | T2-15 | R2 | SSE invalidates; authoritative reads decide |
 | T2-16 | R2 | TUI remains no-auto-spawn |
 | T2-17 | R1/R2 | Respond is not generalized into continuous chat |
