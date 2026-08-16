@@ -406,6 +406,16 @@ impl App {
                     self.goto(Destination::Home);
                     Action::None
                 }
+                // §15.4's Workflows half (issue #153): `@` on the Workflows
+                // screen opens the same live-catalog chooser Home's
+                // workflow field opens — the overlay is `App`-level state,
+                // so `Workflows` only asks for it, exactly as `Home` does
+                // above.
+                WorkflowsOutcome::OpenWorkflowChooser => {
+                    self.workflow_chooser_index = 0;
+                    self.overlay = Some(Overlay::WorkflowChooser);
+                    Action::None
+                }
             },
             // §12: Tab/BackTab are Estate's own (sub-tab switching, guarded
             // out of `on_key_global` below) — everything else it does not
@@ -656,9 +666,14 @@ impl App {
                 }
                 Action::None
             }
-            // §15.4/§11.4's live-catalog chooser: j/k move the highlighted
-            // entry, Enter selects it onto Home's workflow field and closes,
-            // Esc/q aborts with the field untouched.
+            // §15.4/§11.4's live-catalog chooser, opened either from Home's
+            // workflow field or from the Workflows screen itself (issue
+            // #153): j/k move the highlighted entry, Esc/q aborts with
+            // nothing touched. Enter's destination depends on which screen
+            // asked for it — `self.destination` still names that screen,
+            // since opening the overlay never changes it: Home gets the
+            // pick onto its workflow field, Workflows moves its own
+            // selection onto the picked entry instead.
             Overlay::WorkflowChooser => {
                 let entries = self.workflows.entries.len();
                 match key.code {
@@ -672,13 +687,17 @@ impl App {
                         self.workflow_chooser_index = self.workflow_chooser_index.saturating_sub(1);
                     }
                     KeyCode::Enter => {
-                        if let Some(name) = self
+                        let picked = self
                             .workflows
                             .entries
                             .get(self.workflow_chooser_index)
                             .and_then(|e| e["name"].as_str())
-                        {
-                            self.home.workflow = name.to_string();
+                            .map(str::to_string);
+                        if let Some(name) = picked {
+                            match self.destination {
+                                Destination::Workflows => self.workflows.select_by_name(&name),
+                                _ => self.home.workflow = name,
+                            }
                         }
                         self.close_overlay();
                     }
@@ -1464,13 +1483,13 @@ mod tests {
         assert_eq!(app.home.workflow, "implement", "the field is untouched");
     }
 
-    /// The `@` filter field on the Workflows destination owns the keyboard
+    /// The `/` filter field on the Workflows destination owns the keyboard
     /// exactly like Home's and Fleet's own text fields — `2`/`4` etc. must
     /// not be hijacked as destination-nav while typing a filter.
     #[test]
-    fn workflows_at_sign_filter_owns_the_keyboard_like_any_other_text_field() {
+    fn workflows_slash_filter_owns_the_keyboard_like_any_other_text_field() {
         let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
-        app.on_key(KeyCode::Char('@'));
+        app.on_key(KeyCode::Char('/'));
         app.on_key(KeyCode::Char('4')); // would otherwise jump to Estate
         assert_eq!(app.destination, Destination::Workflows);
         app.on_key(KeyCode::Esc);
@@ -1479,6 +1498,51 @@ mod tests {
             app.destination,
             Destination::Estate,
             "global nav works again once the filter is left"
+        );
+    }
+
+    /// §15.4's Workflows half (issue #153): `@` while focused on the
+    /// Workflows screen itself opens the same live-catalog chooser Home's
+    /// workflow field opens; Enter here moves this screen's own selection
+    /// onto the picked entry instead of touching Home's field (`Overlay::
+    /// WorkflowChooser`'s Enter arm tells the two contexts apart by
+    /// `self.destination`, which opening the overlay never changes).
+    #[test]
+    fn at_sign_on_workflows_opens_the_chooser_and_enter_selects_it() {
+        let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
+        assert_eq!(app.on_key(KeyCode::Char('@')), Action::None);
+        assert_eq!(app.overlay, Some(Overlay::WorkflowChooser));
+
+        app.on_key(KeyCode::Char('j'));
+        assert_eq!(app.on_key(KeyCode::Enter), Action::None);
+        assert!(app.overlay.is_none(), "selecting closes the chooser");
+        assert_eq!(
+            app.destination,
+            Destination::Workflows,
+            "picking from Workflows stays on Workflows, unlike Home's field pick"
+        );
+        assert_eq!(
+            app.workflows.selected_entry().unwrap()["name"],
+            "diagnose-bug"
+        );
+        assert_eq!(
+            app.home.workflow, "",
+            "Home's own field is untouched by a pick made from Workflows"
+        );
+    }
+
+    /// Esc/q aborts the chooser without changing Workflows' own selection.
+    #[test]
+    fn esc_aborts_the_workflow_chooser_opened_from_workflows_without_changing_selection() {
+        let mut app = app_with_workflows(&["implement", "diagnose-bug"]);
+        app.on_key(KeyCode::Char('@'));
+        app.on_key(KeyCode::Char('j')); // highlight diagnose-bug in the chooser
+        assert_eq!(app.on_key(KeyCode::Esc), Action::None);
+        assert!(app.overlay.is_none());
+        assert_eq!(
+            app.workflows.selected_entry().unwrap()["name"],
+            "implement",
+            "the underlying selection is untouched"
         );
     }
 

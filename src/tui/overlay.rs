@@ -74,8 +74,9 @@ impl Overlay {
             | Overlay::GroupEditRemove
             | Overlay::RetainedPreview => None,
             // §15.3 is explicitly out of T1c's scope (deferred alongside
-            // §15.4's Workflows half and §15.6) — not this Work, and not yet
-            // reassigned to a later one by name.
+            // §15.4's Workflows half, since closed by issue #153, and
+            // §15.6) — not this Work, and not yet reassigned to a later one
+            // by name.
             Overlay::SlashPalette => Some("a later Work (§15.3)"),
             Overlay::ConnectionDetail => Some("a later Work"),
         }
@@ -305,9 +306,11 @@ fn reap_body(app: &App) -> String {
     body
 }
 
-/// §15.4/§11.4: Home's `@` chooser over the live catalog `App::refresh`
-/// already loaded — no second query, just the same `app.workflows.entries`
-/// the Workflows destination itself reads.
+/// §15.4/§11.4: the `@` chooser, opened from either Home's workflow field
+/// or the Workflows screen itself (issue #153), over the live catalog
+/// `App::refresh` already loaded — no second query, just the same
+/// `app.workflows.entries` the Workflows destination itself reads, and one
+/// piece of content shared by both trigger contexts.
 fn workflow_chooser_body(app: &App) -> String {
     if app.workflows.entries.is_empty() {
         return "No workflows available (the catalog has not loaded, or is empty).\n\n\
