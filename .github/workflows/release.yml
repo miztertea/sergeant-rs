@@ -8,16 +8,23 @@
 # anything.
 #
 # CO-VERSIONING CONSTRAINT (ADR 0014 decision 2, NORTH-STAR "Not true yet"
-# note, issue #165): v0.x.y is supposed to name ONE artifact identity — the
-# `sgt` binary AND the embedded distro it writes via `sgt init`. That
-# embedding does not exist yet: `sgt init` today writes only `sergeant.toml`,
-# `repos/`, and `.gitignore` (issue #165). This workflow therefore packages
-# and ships the binary alone and says so in the draft release body — it does
-# NOT claim to ship an embedded distro it cannot produce. NORTH-STAR's "Not
-# true yet" note is the standing record of this gap; nothing here weakens or
-# removes it. When issue #165 closes, this workflow's packaging step and its
-# release-body template both need a follow-up change to actually embed and
-# describe the distro — tracked here as a named gap, not silently assumed.
+# note): v0.x.y is supposed to name ONE artifact identity — the `sgt` binary
+# AND the embedded distro it writes via `sgt init`. That embedding does not
+# exist yet: `sgt init` today writes only `sergeant.toml`, `repos/`, and
+# `.gitignore`. This workflow therefore packages and ships the binary alone
+# and says so in the draft release body — it does NOT claim to ship an
+# embedded distro it cannot produce. NORTH-STAR's "Not true yet" note is the
+# standing record of this gap; nothing here weakens or removes it.
+#
+# Issue #165 (the originally-cited tracker for this) closed 2026-08-17 via
+# rung R2 — it made the gap visible (`sgt doctor` now reports a zero-package
+# estate) but explicitly rejected the full embedding fix as Phase 3's job
+# (reference/proposal-product-workspace-split.md). The embedding gap this
+# comment describes is therefore still real; #165 itself is just the wrong
+# citation for it now. There is no dedicated open issue for full distro
+# embedding yet — when Phase 3 lands (or a tracking issue is filed for it),
+# this workflow's packaging step and release-body template both need a
+# follow-up change to actually embed and describe the distro.
 #
 # GATE F (distro structural validator): see the "gate-f" job below. It is a
 # documented no-op, not a passing check — the validator lives in
@@ -346,11 +353,22 @@ jobs:
         with:
           subject-path: "release-assets/*.tar.xz"
 
-      - name: GitHub artifact attestations — SBOM
+      # One attest-sbom step per target: subject-path/sbom-path are 1:1 in
+      # this action, so a single step spanning both tar.xz files would
+      # attest the aarch64 archive against the x86_64 SBOM — wrong evidence
+      # for that platform, and a direct contradiction of the SBOM job's own
+      # point (target-scoped documents, not one generator for everything).
+      - name: GitHub artifact attestations — SBOM (x86_64-unknown-linux-gnu)
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-path: "release-assets/*.tar.xz"
+          subject-path: "release-assets/sergeant-rs-x86_64-unknown-linux-gnu.tar.xz"
           sbom-path: "release-assets/sgt_bin_x86_64-unknown-linux-gnu.cdx.json"
+
+      - name: GitHub artifact attestations — SBOM (aarch64-apple-darwin)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: "release-assets/sergeant-rs-aarch64-apple-darwin.tar.xz"
+          sbom-path: "release-assets/sgt_bin_aarch64-apple-darwin.cdx.json"
 
       - name: verify release manifest — every promised asset is present
         run: |
@@ -383,7 +401,8 @@ jobs:
             echo
             echo "**Co-versioning note:** this release ships the \`sgt\` binary only."
             echo "v${RELEASE_VERSION} does NOT yet ship an embedded distro — that"
-            echo "requires issue #165, which is still open. See CHANGELOG.md and"
+            echo "is Phase 3 scope (reference/proposal-product-workspace-split.md),"
+            echo "not yet tracked by a dedicated open issue. See CHANGELOG.md and"
             echo "NORTH-STAR.md's \"Not true yet\" note."
             echo
             echo "**Gate F (distro structural validator) did not run** — see issue #176."

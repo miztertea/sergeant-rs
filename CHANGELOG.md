@@ -32,12 +32,16 @@ released before a release can proceed.
 
 - **Co-versioning is not yet real.** ADR 0014 decision 2 names one artifact
   identity: the `sgt` binary *and* the embedded distro it writes via
-  `sgt init`. `sgt init` does not embed or write the distro yet (issue
-  #165; NORTH-STAR.md's "Not true yet" note, 2026-08-17, is unchanged by
-  this work). `release.yml` packages and ships the binary alone and says so
-  in the generated draft release body. A release published today would be
-  the binary only, not the co-versioned artifact ADR 0014 describes as the
-  destination.
+  `sgt init`. `sgt init` does not embed or write the distro yet
+  (NORTH-STAR.md's "Not true yet" note, 2026-08-17, is unchanged by this
+  work). Issue #165 tracked the visible symptom of this gap but closed
+  2026-08-17 via a visibility-only fix (`sgt doctor` now reports a
+  zero-package estate); it explicitly left full embedding to Phase 3
+  (`reference/proposal-product-workspace-split.md`), which has no dedicated
+  open issue yet. `release.yml` packages and ships the binary alone and
+  says so in the generated draft release body. A release published today
+  would be the binary only, not the co-versioned artifact ADR 0014
+  describes as the destination.
 - **Gate F (distro structural validator) does not run.** It lives in
   `sergeant-rs-workspace`'s `.sergeant/local/workflows/validate-distro/` by
   deliberate placement (ADR 0014 decision 5) and this repo's CI cannot
