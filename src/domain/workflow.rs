@@ -50,6 +50,12 @@ use crate::domain::is_plain_name;
 
 /// Workflow directory inside a repository (D1: `.depot/` upstream).
 pub const WORKFLOW_ROOT: &str = ".sergeant/workflows";
+/// A repository's own forked workflow packages. A package here shadows the
+/// stock package of the same name under [`WORKFLOW_ROOT`] by directory
+/// precedence — the same mechanism `/etc` vs `/usr/lib` uses (proposal §6
+/// Phase 3, Ponytail R4): whole-package override, never composition or
+/// stage-level merging (ADR 0014 decision 3, ADR 0016).
+pub const LOCAL_WORKFLOW_ROOT: &str = ".sergeant/local/workflows";
 /// Machine-readable workflow descriptor inside a workflow directory.
 pub const WORKFLOW_FILE: &str = "workflow.toml";
 /// Actor-readable stage context file inside a stage directory.
@@ -619,14 +625,20 @@ const EMBEDDED_CONTEXTS: &[(&str, &str)] = &[
 impl WorkflowDefinition {
     /// Resolve `name` for a workspace rooted at `root`.
     ///
-    /// A repository's own `.sergeant/workflows/<name>/` always wins; the
-    /// built-in `software-change` is the fallback when the repository ships
-    /// no workflow of that name.
+    /// A repository's own `.sergeant/local/workflows/<name>/` always wins
+    /// over the stock `.sergeant/workflows/<name>/` of the same name
+    /// (directory precedence, proposal §6 Phase 3 / Ponytail R4); stock in
+    /// turn wins over the built-in `software-change`, the fallback when the
+    /// repository ships no workflow of that name anywhere.
     pub fn resolve(root: &Path, name: &str) -> Result<Self, WorkflowError> {
         if !is_plain_name(name) {
             return Err(WorkflowError::InvalidName {
                 name: name.to_string(),
             });
+        }
+        let local_dir = local_workflow_dir(root, name);
+        if local_dir.join(WORKFLOW_FILE).is_file() {
+            return Self::load_dir(&local_dir);
         }
         let dir = workflow_dir(root, name);
         if dir.join(WORKFLOW_FILE).is_file() {
@@ -784,6 +796,11 @@ pub struct WorkflowIndexFrontMatter {
     pub description: String,
     /// `tags:` verbatim, or `None` if the front matter never declared the key.
     pub tags: Option<Vec<String>>,
+    /// `edition:` verbatim (`docs/icm/record-shapes.md` §1, ADR 0016): the
+    /// distro version that wrote this file as stock content. `None` if the
+    /// front matter never declared the key — pre-ADR-0016 content, or a
+    /// malformed fork.
+    pub edition: Option<String>,
 }
 
 /// One entry of the read-only workflow catalog `GET /v1/workflows` projects
@@ -801,6 +818,131 @@ pub struct CatalogEntry {
 /// Directory a named workflow would live in for a workspace root.
 pub fn workflow_dir(root: &Path, name: &str) -> PathBuf {
     root.join(WORKFLOW_ROOT).join(name)
+}
+
+/// Directory a named workflow's local fork would live in for a workspace
+/// root ([`LOCAL_WORKFLOW_ROOT`]).
+pub fn local_workflow_dir(root: &Path, name: &str) -> PathBuf {
+    root.join(LOCAL_WORKFLOW_ROOT).join(name)
+}
+
+/// Failure forking a stock workflow package into `.sergeant/local/workflows/`.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkflowForkError {
+    /// The requested name is not a plain directory name (same rule as
+    /// [`WorkflowDefinition::resolve`] — a name is joined straight onto both
+    /// workflow roots).
+    #[error("workflow name {name:?} is not a plain directory name")]
+    InvalidName {
+        /// The offending name.
+        name: String,
+    },
+    /// No stock package of this name exists to fork. Forking the embedded
+    /// `software-change` default is out of scope: it has no on-disk
+    /// directory to copy from (§6 Phase 3 scopes `sgt workflow fork` to
+    /// copying a stock *package*, not materializing the embedded one).
+    #[error("no stock workflow package {name:?} at {searched} — nothing to fork")]
+    NoStockPackage {
+        /// The offending name.
+        name: String,
+        /// Where a stock package was searched for.
+        searched: String,
+    },
+    /// A local package of this name already exists. `sgt workflow fork`
+    /// never silently overwrites a user's work (§6 Phase 3).
+    #[error("a local workflow package {name:?} already exists at {path}")]
+    LocalAlreadyExists {
+        /// The offending name.
+        name: String,
+        /// Where the existing local package lives.
+        path: String,
+    },
+    /// Copying the stock package's files failed partway through.
+    #[error("copying {from} to {to} failed: {source}")]
+    Io {
+        /// Source path.
+        from: String,
+        /// Destination path.
+        to: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// `sgt workflow fork <name>` (§6 Phase 3, Ponytail R7 — the one genuinely
+/// new verb the phase adds, claimed only because R2–R6 answer everything
+/// else: R4 covers resolution precedence, R6 covers drift as a string
+/// comparison, R2 covers surfacing drift through `sgt doctor`, and no
+/// existing verb copies a stock package to local with its `edition` stamp
+/// intact). Copies `.sergeant/workflows/<name>/` byte-for-byte into
+/// `.sergeant/local/workflows/<name>/`, preserving whatever `edition` the
+/// stock copy carried — a plain recursive copy leaves every file, including
+/// `index.md`'s front matter, untouched, so the fork stays comparable via
+/// ADR 0016's string comparison from the moment it's created. Refuses if a
+/// local package of this name already exists, or if there is no stock
+/// package to fork from.
+pub fn fork(root: &Path, name: &str) -> Result<PathBuf, WorkflowForkError> {
+    if !is_plain_name(name) {
+        return Err(WorkflowForkError::InvalidName {
+            name: name.to_string(),
+        });
+    }
+    let stock_dir = workflow_dir(root, name);
+    if !stock_dir.join(WORKFLOW_FILE).is_file() {
+        return Err(WorkflowForkError::NoStockPackage {
+            name: name.to_string(),
+            searched: stock_dir.display().to_string(),
+        });
+    }
+    let local_dir = local_workflow_dir(root, name);
+    if local_dir.exists() {
+        return Err(WorkflowForkError::LocalAlreadyExists {
+            name: name.to_string(),
+            path: local_dir.display().to_string(),
+        });
+    }
+    copy_dir_recursive(&stock_dir, &local_dir)?;
+    Ok(local_dir)
+}
+
+/// Recursively copy every file and subdirectory under `from` into `to`,
+/// creating `to` (and any intermediate directories) as needed.
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), WorkflowForkError> {
+    std::fs::create_dir_all(to).map_err(|source| WorkflowForkError::Io {
+        from: from.display().to_string(),
+        to: to.display().to_string(),
+        source,
+    })?;
+    let entries = std::fs::read_dir(from).map_err(|source| WorkflowForkError::Io {
+        from: from.display().to_string(),
+        to: to.display().to_string(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| WorkflowForkError::Io {
+            from: from.display().to_string(),
+            to: to.display().to_string(),
+            source,
+        })?;
+        let src_path = entry.path();
+        let dst_path = to.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|source| WorkflowForkError::Io {
+            from: src_path.display().to_string(),
+            to: dst_path.display().to_string(),
+            source,
+        })?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).map_err(|source| WorkflowForkError::Io {
+                from: src_path.display().to_string(),
+                to: dst_path.display().to_string(),
+                source,
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// The read-only workflow catalog `GET /v1/workflows` projects (§11.2,
@@ -872,13 +1014,16 @@ fn root_catalog_names(text: &str) -> Vec<String> {
 /// Read and parse one workflow directory's own `index.md` front matter
 /// (`docs/icm/record-shapes.md` §1). `None` on any I/O failure, missing
 /// closing delimiter, or missing required field (`status`/`description`) —
-/// [`catalog`] treats that the same as the workflow not existing.
-fn read_index_front_matter(workflow_dir: &Path) -> Option<WorkflowIndexFrontMatter> {
+/// [`catalog`] treats that the same as the workflow not existing. `pub(crate)`
+/// so `sgt doctor`'s edition-drift check (R2 — an existing surface, not a new
+/// one) can read a local package's `edition` the same way [`catalog`] does.
+pub(crate) fn read_index_front_matter(workflow_dir: &Path) -> Option<WorkflowIndexFrontMatter> {
     let text = std::fs::read_to_string(workflow_dir.join(INDEX_FILE)).ok()?;
     parse_index_front_matter(&text)
 }
 
-/// Parse `status`/`description`/`tags` out of an `index.md`'s front matter.
+/// Parse `status`/`description`/`tags`/`edition` out of an `index.md`'s
+/// front matter.
 ///
 /// No general YAML parser is pulled in for this: the shape
 /// `docs/icm/record-shapes.md` §1 normatively fixes is fixed and narrow — a
@@ -898,6 +1043,7 @@ fn parse_index_front_matter(text: &str) -> Option<WorkflowIndexFrontMatter> {
     let mut status: Option<String> = None;
     let mut description: Option<String> = None;
     let mut tags: Option<Vec<String>> = None;
+    let mut edition: Option<String> = None;
     let mut in_description_block = false;
     let mut in_tags_block = false;
     for line in lines {
@@ -906,6 +1052,7 @@ fn parse_index_front_matter(text: &str) -> Option<WorkflowIndexFrontMatter> {
                 status: status?,
                 description: description?,
                 tags,
+                edition,
             });
         }
         if in_description_block && (line.starts_with(' ') || line.starts_with('\t')) {
@@ -938,6 +1085,7 @@ fn parse_index_front_matter(text: &str) -> Option<WorkflowIndexFrontMatter> {
         let value = value.trim();
         match key {
             "status" => status = Some(value.trim_matches('"').to_string()),
+            "edition" => edition = Some(value.trim_matches('"').to_string()),
             "description" => {
                 if matches!(value, ">-" | ">" | "|-" | "|") {
                     in_description_block = true;
@@ -1268,6 +1416,148 @@ mod tests {
         assert_eq!(workflow.stages.len(), 1);
         assert_eq!(workflow.stages[0].context, "do the thing");
         assert_ne!(workflow.source, SOURCE_EMBEDDED);
+    }
+
+    /// §6 Phase 3 (R4): a local fork under `.sergeant/local/workflows/<name>/`
+    /// must resolve over a same-named stock package under
+    /// `.sergeant/workflows/<name>/` — directory precedence, not composition.
+    /// guard-map: swapping the precedence order in `resolve` (checking stock
+    /// before local) survives every stock-only test but fails this one.
+    #[test]
+    fn local_shadows_stock() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        let stock = workflow_dir(root, "example");
+        std::fs::create_dir_all(stock.join("00-only")).expect("stage dir");
+        std::fs::write(
+            stock.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+        )
+        .expect("descriptor");
+        std::fs::write(stock.join("00-only").join(CONTEXT_FILE), "stock").expect("context");
+
+        let local = local_workflow_dir(root, "example");
+        std::fs::create_dir_all(local.join("00-only")).expect("stage dir");
+        std::fs::write(
+            local.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"example\"\nversion = \"2\"\nstages = [\"00-only\"]\n",
+        )
+        .expect("descriptor");
+        std::fs::write(local.join("00-only").join(CONTEXT_FILE), "local").expect("context");
+
+        let workflow = WorkflowDefinition::resolve(root, "example").expect("resolve");
+        assert_eq!(workflow.version, "2", "local must win over stock");
+        assert_eq!(workflow.stages[0].context, "local");
+    }
+
+    /// §6 Phase 3 (R4): with no local fork, resolution falls back to the
+    /// stock package of the same name, unchanged from before local forks
+    /// existed at all.
+    /// guard-map: making resolution require a local package (or skip the
+    /// stock fallback) survives `local_shadows_stock` but fails this one.
+    #[test]
+    fn resolution_falls_back_to_stock_when_no_local_fork_exists() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        let stock = workflow_dir(root, "example");
+        std::fs::create_dir_all(stock.join("00-only")).expect("stage dir");
+        std::fs::write(
+            stock.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+        )
+        .expect("descriptor");
+        std::fs::write(stock.join("00-only").join(CONTEXT_FILE), "stock").expect("context");
+
+        let workflow = WorkflowDefinition::resolve(root, "example").expect("resolve");
+        assert_eq!(workflow.version, "1");
+        assert_eq!(workflow.stages[0].context, "stock");
+    }
+
+    /// §6 Phase 3 (R7): `fork` copies a stock package to
+    /// `.sergeant/local/workflows/<name>/`, preserving the `edition` marker
+    /// its `index.md` carried — the fork stays comparable via ADR 0016's
+    /// string comparison from the moment it exists.
+    /// guard-map: a `fork` that rewrites `edition` (or drops `index.md`
+    /// entirely) survives every other fork test but fails this one.
+    #[test]
+    fn fork_copies_stock_preserving_the_edition_marker() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        let stock = workflow_dir(root, "example");
+        std::fs::create_dir_all(stock.join("00-only")).expect("stage dir");
+        std::fs::write(
+            stock.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+        )
+        .expect("descriptor");
+        std::fs::write(stock.join("00-only").join(CONTEXT_FILE), "stock").expect("context");
+        std::fs::write(
+            stock.join(INDEX_FILE),
+            "---\nstatus: published\ndescription: an example\nedition: 0.1.0\n---\n",
+        )
+        .expect("index.md");
+
+        let forked = fork(root, "example").expect("fork");
+        assert_eq!(forked, local_workflow_dir(root, "example"));
+        assert!(forked.join(WORKFLOW_FILE).is_file());
+        assert!(forked.join("00-only").join(CONTEXT_FILE).is_file());
+        let front_matter = read_index_front_matter(&forked).expect("index.md front matter");
+        assert_eq!(front_matter.edition.as_deref(), Some("0.1.0"));
+
+        let resolved = WorkflowDefinition::resolve(root, "example").expect("resolve");
+        assert_eq!(resolved.version, "1", "the fork must now be what resolves");
+    }
+
+    /// §6 Phase 3 (R7): `fork` refuses to overwrite an existing local
+    /// package rather than silently clobbering a user's already-rewritten
+    /// fork.
+    /// guard-map: dropping the pre-existence check survives every other fork
+    /// test but fails this one (it would instead attempt — and possibly
+    /// partially succeed at — copying over the existing local files).
+    #[test]
+    fn fork_refuses_to_overwrite_an_existing_local_package() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        let stock = workflow_dir(root, "example");
+        std::fs::create_dir_all(stock.join("00-only")).expect("stage dir");
+        std::fs::write(
+            stock.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+        )
+        .expect("descriptor");
+        std::fs::write(stock.join("00-only").join(CONTEXT_FILE), "stock").expect("context");
+
+        let local = local_workflow_dir(root, "example");
+        std::fs::create_dir_all(&local).expect("local dir");
+        std::fs::write(local.join("sentinel"), "user work, do not touch").expect("sentinel");
+
+        let err = fork(root, "example").expect_err("must refuse");
+        assert!(
+            matches!(err, WorkflowForkError::LocalAlreadyExists { .. }),
+            "{err}"
+        );
+        assert!(
+            local.join("sentinel").is_file(),
+            "the user's existing local package must be untouched"
+        );
+        assert!(!local.join(WORKFLOW_FILE).is_file());
+    }
+
+    /// §6 Phase 3 (R7): `fork` refuses when there is no stock package of
+    /// that name to fork from at all.
+    #[test]
+    fn fork_refuses_when_no_stock_package_exists() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let err = fork(root, "ghost").expect_err("must refuse");
+        assert!(
+            matches!(err, WorkflowForkError::NoStockPackage { .. }),
+            "{err}"
+        );
     }
 
     /// The workflow name arrives from the API (`POST /v1/work`'s `workflow`

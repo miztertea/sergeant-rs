@@ -227,6 +227,12 @@ enum Command {
         #[command(subcommand)]
         command: GroupCommand,
     },
+    /// Manage the estate's local workflow forks (§6 Phase 3). A pure
+    /// filesystem copy — no daemon involved.
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
     /// Launch `claude` bound to this estate (ADR 0006, D2): compose an
     /// environment, bind the estate, then **exec** — replacing this `sgt`
     /// process with `claude`'s, never forking and supervising it. Everything
@@ -335,6 +341,22 @@ enum GroupCommand {
     List,
 }
 
+/// `sgt workflow ...` subcommands (§6 Phase 3).
+#[derive(Subcommand, Debug)]
+enum WorkflowCommand {
+    /// Copy a stock workflow package (`.sergeant/workflows/<name>/`) into
+    /// `.sergeant/local/workflows/<name>/`, where it shadows stock by name
+    /// (Ponytail R4/R7 — the one genuinely new verb §6 Phase 3 adds; see
+    /// `WorkflowForkError`'s variants for why R2–R6 don't already cover
+    /// this). Refuses if a local package of that name already exists —
+    /// never silently overwrites a user's fork — or if there is no stock
+    /// package of that name to fork from.
+    Fork {
+        /// Name of the stock workflow package to fork.
+        name: String,
+    },
+}
+
 /// `sgt work ...` subcommands.
 #[derive(Subcommand, Debug)]
 enum WorkCommand {
@@ -424,6 +446,12 @@ impl From<crate::domain::workspace::WorkspaceError> for CliError {
 
 impl From<crate::domain::manifest::ManifestError> for CliError {
     fn from(e: crate::domain::manifest::ManifestError) -> Self {
+        Self(e.to_string())
+    }
+}
+
+impl From<crate::domain::workflow::WorkflowForkError> for CliError {
+    fn from(e: crate::domain::workflow::WorkflowForkError) -> Self {
         Self(e.to_string())
     }
 }
@@ -981,6 +1009,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         }
         Command::Repo { command } => repo_command(sgt.json, &data_dir, command).await,
         Command::Group { command } => group_command(sgt.json, &data_dir, command).await,
+        Command::Workflow { command } => workflow_command(sgt.json, &data_dir, command).await,
         Command::Claude { args } => exec_harness("claude", &args, &data_dir),
         Command::Codex { args } => exec_harness("codex", &args, &data_dir),
         Command::Opencode { args } => exec_harness("opencode", &args, &data_dir),
@@ -1134,6 +1163,28 @@ async fn group_command(json: bool, data_dir: &Path, command: GroupCommand) -> Re
                         .unwrap_or_default();
                     println!("{}  [{}]{}", name, g.repos.join(", "), brief);
                 }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `sgt workflow fork` (§6 Phase 3): a pure filesystem copy under the
+/// estate root, same rationale as [`repo_command`]/[`group_command`] — no
+/// daemon involved.
+async fn workflow_command(
+    json: bool,
+    data_dir: &Path,
+    command: WorkflowCommand,
+) -> Result<(), CliError> {
+    let estate_root = discover_estate_root(data_dir)?;
+    match command {
+        WorkflowCommand::Fork { name } => {
+            let forked = crate::domain::workflow::fork(&estate_root, &name)?;
+            if json {
+                print_json(&json!({"forked": name, "path": forked.display().to_string()}));
+            } else {
+                println!("forked workflow {name} to {}", forked.display());
             }
             Ok(())
         }
@@ -2161,12 +2212,28 @@ pub(crate) mod doctor {
     /// here; this check exists so "zero" is something `sgt doctor` says out
     /// loud instead of a fact a submitter only learns from a 422.
     ///
+    /// §6 Phase 3 (Ponytail R2 — reuse this existing check surface rather
+    /// than add a sibling): also reports how many `.sergeant/local/
+    /// workflows/` packages shadow a same-named stock package, and, among
+    /// those, how many carry an `edition` (ADR 0016) older than the binary's
+    /// own version — the drift ADR 0016 makes checkable by plain string
+    /// comparison, without a `sgt workflow diff` verb (ADR 0014 decision 4).
+    /// A local package's `edition` is set once, at fork time, to whatever
+    /// the stock copy it forked from carried — which `sgt init`/update
+    /// always writes as the current distro version — so comparing a fork's
+    /// `edition` against the binary's own version is the same comparison
+    /// ADR 0016 describes against "the currently-shipped stock package's
+    /// edition", not a different one.
+    ///
     /// Same discovery as [`estate_check`]; silent (`ok`) outside any
-    /// estate. Zero packages is `warn`, not `fail`: the embedded default
-    /// still runs unnamed dispatch (§30), so an estate with none is
-    /// degraded, not broken.
+    /// estate. Zero stock packages is `warn`, not `fail`: the embedded
+    /// default still runs unnamed dispatch (§30), so an estate with none is
+    /// degraded, not broken. Drift among local packages is also `warn`, not
+    /// `fail`: a stale fork still runs — it is stale, not broken.
     fn workflows_check(data_dir: &Path) -> Check {
-        use crate::domain::workflow::WORKFLOW_ROOT;
+        use crate::domain::workflow::{
+            LOCAL_WORKFLOW_ROOT, WORKFLOW_ROOT, read_index_front_matter,
+        };
         use crate::domain::workspace::Workspace;
 
         let cwd = match std::env::current_dir() {
@@ -2205,13 +2272,66 @@ pub(crate) mod doctor {
         };
         names.sort();
 
+        let local_workflows_dir = estate_root.join(LOCAL_WORKFLOW_ROOT);
+        let mut local_names: Vec<String> = match std::fs::read_dir(&local_workflows_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                .filter(|entry| entry.path().join("workflow.toml").is_file())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        local_names.sort();
+
+        let stock: std::collections::BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        let shadowing: Vec<&String> = local_names
+            .iter()
+            .filter(|n| stock.contains(n.as_str()))
+            .collect();
+        let current_edition = env!("CARGO_PKG_VERSION");
+        let drifted: Vec<&String> = shadowing
+            .iter()
+            .filter(|n| {
+                read_index_front_matter(&local_workflows_dir.join(n))
+                    .and_then(|fm| fm.edition)
+                    .is_some_and(|edition| edition != current_edition)
+            })
+            .copied()
+            .collect();
+
+        let drift_suffix = if shadowing.is_empty() {
+            String::new()
+        } else if drifted.is_empty() {
+            format!(
+                "; {} local package(s) shadow stock, all at the current edition {current_edition:?}: {}",
+                shadowing.len(),
+                shadowing
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        } else {
+            format!(
+                "; {} local package(s) shadow stock, {} older than the current edition {current_edition:?}: {}",
+                shadowing.len(),
+                drifted.len(),
+                drifted
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        };
+
         if names.is_empty() {
             Check::warn(
                 "workflows",
                 format!(
                     "0 workflow packages declared under {} — only the built-in {:?} runs \
                      (unnamed dispatch, or `--workflow {:?}` explicitly); any other \
-                     `--workflow <name>` will 422",
+                     `--workflow <name>` will 422{drift_suffix}",
                     workflows_dir.display(),
                     crate::domain::workflow::DEFAULT_WORKFLOW,
                     crate::domain::workflow::DEFAULT_WORKFLOW,
@@ -2222,11 +2342,30 @@ pub(crate) mod doctor {
                     workflows_dir.display()
                 ),
             )
+        } else if !drifted.is_empty() {
+            Check::warn(
+                "workflows",
+                format!(
+                    "{} workflow package(s) declared: {}{drift_suffix}",
+                    names.len(),
+                    names.join(", ")
+                ),
+                format!(
+                    "run `sgt workflow fork <name>` again for {} to pick up the current stock \
+                     edition {current_edition:?} (ADR 0016 — this never overwrites a local \
+                     package by itself; remove the stale one first if you want the refork)",
+                    drifted
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            )
         } else {
             Check::ok(
                 "workflows",
                 format!(
-                    "{} workflow package(s) declared: {}",
+                    "{} workflow package(s) declared: {}{drift_suffix}",
                     names.len(),
                     names.join(", ")
                 ),
