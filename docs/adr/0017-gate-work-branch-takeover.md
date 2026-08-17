@@ -1,4 +1,4 @@
-# ADR 0016: A gate Work binds to the branch it reviews by sequenced takeover, not a fresh branch or a direct binding
+# ADR 0017: A gate Work binds to the branch it reviews by sequenced takeover, not a fresh branch or a direct binding
 
 **Status:** Accepted, 2026-08-17 (extracted; the underlying ruling and implementation land earlier, per FOUNDATION-1/§8.6 below).
 
