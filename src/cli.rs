@@ -502,6 +502,7 @@ fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
 }
 
 async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
+    let data_dir_flag = sgt.data_dir.clone();
     let data_dir = resolve_data_dir(sgt.data_dir)?;
     let Some(command) = sgt.command else {
         // ADR 0010 (D6, deviation from proposal §30 registered in
@@ -930,6 +931,12 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         Command::Init { name } => {
             let cwd = std::env::current_dir()?;
             let outcome = crate::domain::manifest::init_estate(&cwd, name.as_deref())?;
+            // Re-resolve now that `sergeant.toml` exists: the `data_dir`
+            // computed above ran before `init_estate` created it, so on a
+            // fresh estate estate discovery had nothing to find yet and
+            // this report would otherwise self-check the pre-estate
+            // fallback and call it `[ok]` (#164).
+            let data_dir = resolve_data_dir(data_dir_flag)?;
             let report = doctor::run(&data_dir).await;
             if sgt.json {
                 print_json(&json!({
