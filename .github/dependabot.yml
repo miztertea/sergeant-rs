@@ -1,0 +1,22 @@
+# Weekly, grouped updates — proposal-ci-cd-release-engineering.md §5.1: "Use a
+# weekly grouped update cadence to avoid a stream of one-line maintenance PRs."
+# No auto-merge: a bot PR takes the same required checks as any other PR.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

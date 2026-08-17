@@ -1,0 +1,52 @@
+# Dependency policy source of truth (proposal-ci-cd-release-engineering.md §5.2).
+#
+# Routine PRs run `cargo deny check bans licenses sources` (advisories stay a
+# separate security signal so a new RustSec advisory against an unchanged
+# Cargo.lock doesn't redden an unrelated PR). Release qualification runs the
+# full `cargo deny check`, including advisories.
+#
+# License allow-list is exactly what knowledge/evidence/ci-slice1-baseline-2026-08-17.md
+# measured against the unmodified graph: 27 distinct expressions across 409
+# resolved package versions, all ordinary permissive/public-domain terms.
+# `LGPL-2.1-or-later` — the one entry the baseline flagged as worth a specific
+# look rather than blanket admission — is deliberately NOT allowed here; see
+# the comment below.
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "CC0-1.0",
+  "Unlicense",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# LGPL-2.1-or-later appears once in the graph, inside an OR clause on a
+# dependency in the windows-sys/icu-adjacent cluster (baseline §3). Left off
+# the allow-list on purpose: it's the one expression in the measured set that
+# isn't a permissive/public-domain-style license, and it hasn't had an owner
+# ruling to admit it. Verified with `cargo deny check licenses` against this
+# allow-list: the crate's OR clause resolves to an already-allowed sibling
+# term, so `licenses ok` holds without adding LGPL-2.1-or-later here. If a
+# future dependency bump drops that sibling term from the OR clause, this
+# check starts failing on it — that failure is the intended fail-closed
+# behavior, not a regression to silently work around.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
