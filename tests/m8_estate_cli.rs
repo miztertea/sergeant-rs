@@ -711,6 +711,67 @@ fn data_dir_defaults_to_estate_local_when_no_flag_or_env() {
     }
 }
 
+/// guard-map (#164): `sgt init` itself, with no `--data-dir`/`SGT_DATA_DIR`,
+/// must report and create the estate-local data dir it just made
+/// `sergeant.toml` discoverable at — not the pre-estate fallback. `dispatch`
+/// resolves `data_dir` once at the top, before the `Init` handler runs
+/// `init_estate`; on a brand-new estate that resolution predates
+/// `sergeant.toml` existing, so unless the `Init` handler re-resolves after
+/// creating it, `init`'s own embedded doctor report silently checks (and
+/// reports `[ok]` for) `$XDG_DATA_HOME`/`$HOME` instead of
+/// `<estate_root>/.sergeant/data` — exactly the failure this issue names:
+/// `sgt init` scaffolds a `.gitignore` rule for `.sergeant/data` but a
+/// fresh estate's journal silently lands outside the estate, with `doctor`
+/// reporting healthy the whole time. Mutation this kills: reverting the
+/// `Command::Init` handler to use the `data_dir` resolved before
+/// `init_estate` instead of re-resolving afterward.
+#[test]
+fn init_reports_and_creates_the_estate_local_data_dir_not_the_pre_estate_fallback() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let xdg = estate.path().join("xdg-home");
+    let home = estate.path().join("home");
+
+    let result = run(
+        estate.path(),
+        None,
+        &[
+            ("XDG_DATA_HOME", xdg.to_str().expect("utf8")),
+            ("HOME", home.to_str().expect("utf8")),
+        ],
+        &["--json", "init"],
+    );
+    assert_eq!(
+        result.code,
+        Some(0),
+        "init must succeed\nstdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+
+    let reported = PathBuf::from(
+        result.json()["doctor"]["data_dir"]
+            .as_str()
+            .expect("doctor.data_dir"),
+    );
+    let expected = std::fs::canonicalize(estate.path())
+        .expect("canonical estate root")
+        .join(".sergeant/data");
+    let reported = std::fs::canonicalize(&reported).unwrap_or(reported);
+    assert_eq!(
+        reported, expected,
+        "init's own report must resolve to the estate-local data dir, not the pre-estate fallback"
+    );
+    assert!(
+        expected.is_dir(),
+        "init must leave the estate-local data dir created on disk, matching the \
+         .gitignore rule it scaffolds for .sergeant/data"
+    );
+    assert!(
+        !xdg.exists(),
+        "init must not touch the pre-estate XDG fallback once an estate is being created"
+    );
+}
+
 /// guard-map: the estate-resolved default is a new *fallback rung*, not a
 /// replacement — an explicit `--data-dir` flag, and separately
 /// `SGT_DATA_DIR`, both still take precedence over a discovered estate,
