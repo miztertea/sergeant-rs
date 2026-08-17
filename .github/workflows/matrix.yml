@@ -42,8 +42,9 @@ env:
 # Cancel a superseded PR run's still-queued/running matrix instead of letting
 # it burn its full ~10-60 min wall-clock (2 OSes, cold DuckDB build): wall
 # clock, not runner cost, is this repo's real CI constraint (ADR 0004, D9).
-# Scoped to pull_request only — a scheduled nightly run and a release run
-# must never cancel each other or a concurrent PR run.
+# cancel-in-progress only fires for a pull_request-triggered run; a
+# workflow_call or workflow_dispatch invocation never cancels another
+# in-flight qualification run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

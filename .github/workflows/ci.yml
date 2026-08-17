@@ -3,8 +3,9 @@ name: CI
 # ADR 0004 (D9): this is the cheap per-push tier — Linux fmt/clippy/test plus
 # a macOS lane, run on every push so wall-clock stays low (matrix jobs run
 # concurrently, so cost is max(job) not sum(job)). The full real-suite matrix
-# across all measured targets (ADR 0001 D1) runs only on PR-to-main, nightly,
-# and release — see matrix.yml.
+# across all measured targets (ADR 0001 D1) is a qualification capability, not
+# a routine trigger on this workflow — see matrix.yml (workflow_call /
+# workflow_dispatch, per ADR 0014 decision 9).
 on:
   # `on: [push, pull_request]` ran this battery twice for every push to a PR
   # branch — same commit, same result, twice the wait. Pushes are checked on
