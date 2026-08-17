@@ -21,7 +21,6 @@ The prototype and its answer are handed off.
 
 - **After building the variants, the actor hands the user the URL and variant keys; the most useful feedback typically recombines pieces across variants rather than picking one outright.**
   (trigger: the variant switcher is built and ready; outcome: the user has a shareable URL to explore variants and can express cross-variant preferences)
-  — `BU-P3-035`, `reference/sergeant-upstream/.agents/skills/prototype/UI.md` (process step5, line 96)
 
 ## Bounded judgment
 
@@ -37,7 +36,7 @@ Apply `@@bounded-judgment`.
 - None specific to this stage beyond `@@bounded-judgment`'s general triggers.
 
 ### Completion boundary
-This stage may complete only when the user has a shareable, runnable handoff and can express a preference (including cross-variant recombination, for the UI branch — `BU-P3-035`).
+This stage may complete only when the user has a shareable, runnable handoff and can express a preference (including cross-variant recombination, for the UI branch).
 
 ### Decision evidence
 The handoff artifact is this stage's own durable output.

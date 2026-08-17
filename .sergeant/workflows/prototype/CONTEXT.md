@@ -1,11 +1,9 @@
 # Prototype
 Draft workflow package — candidate **W21** `prototype` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
-it is never delivered as a stage's instructions; each stage's own
-`CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
-§1a rule 5).
+manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only — it is never delivered as a stage's
+instructions; each stage's own `CONTEXT.md` (Layer 2) is the actor's
+contract (`docs/icm/convention.md` §1a rule 5).
 
 ## Purpose
 
@@ -35,7 +33,7 @@ This workflow receives an already-admitted Work intent (a design question to san
 - Sub-shape, variant count, and structural divergence within the UI branch (`20U-build-variants`); interface/module design within the logic branch (`20L-build-logic`).
 
 ### Workflow may not decide
-- That a prototype has answered its question — this is always confirmed by the user, never inferred (`40-capture`, corrected at ICM-R3, `BU-PROTO-19`/`20`).
+- That a prototype has answered its question — this is always confirmed by the user, never inferred (`40-capture`, corrected at ICM-R3).
 - Whether to perform a real mutation in a UI variant, or expose the variant switcher in production (`20U-build-variants`, J5 constraints).
 
 ### Human or Captain gates

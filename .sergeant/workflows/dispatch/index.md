@@ -13,6 +13,13 @@ tags:
 
 # Dispatch
 
+Provenance for this template's rules (which behavior unit justifies each
+rule, and its upstream source) lives in `sergeant-rs-workspace`'s
+`knowledge/evidence/provenance/dispatch.md` — this package's `BU-####`
+citations and `reference/sergeant-upstream/` paths were stripped from the
+shipped template content below; the record of why each rule exists did
+not move with them.
+
 Six-stage admitted workflow (N1 reference corpus, `docs/gauntlet/contracts/N1.md`,
 candidate **W8** `dispatch`) that, given a project, a brief or tracked
 task, and a repository set, produces one durable task with an isolated
