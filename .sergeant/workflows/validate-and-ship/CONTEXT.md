@@ -1,11 +1,9 @@
 # Validate and Ship (no-mistakes)
 Draft workflow package — candidate **W18** `validate-and-ship` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
-it is never delivered as a stage's instructions; each stage's own
-`CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
-§1a rule 5).
+manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only — it is never delivered as a stage's
+instructions; each stage's own `CONTEXT.md` (Layer 2) is the actor's
+contract (`docs/icm/convention.md` §1a rule 5).
 
 ## Purpose
 
@@ -31,7 +29,7 @@ Implementation, native tests, lint and independent review are complete and the c
 
 ## Relationships to other workflows
 
-- `40-drive-gates` folds the finding-routing behavior formerly attributed to a package named `route-review-findings`, which was never built (retriaged to CLI-SURFACE/NET-NEW-SURFACE unbuilt verb candidates, `docs/icm/retriage-2026-08-11.md` line 52, `docs/icm/re-homing-record-2026-08-12.md` line 29). The actual live mechanism is `sgt-no-mistakes-finding`'s deterministic routing, already folded into `40-drive-gates` as its own helper. **Corrected 2026-08-16, ICM-R2 pilot review (BU-VAS-10):** the prior text here named `route-review-findings` as a currently-invoked delegate; no such package exists.
+- `40-drive-gates` folds the finding-routing behavior formerly attributed to a package named `route-review-findings`, which was never built (retriaged to CLI-SURFACE/NET-NEW-SURFACE unbuilt verb candidates, `docs/icm/retriage-2026-08-11.md` line 52, `docs/icm/re-homing-record-2026-08-12.md` line 29). The actual live mechanism is `sgt-no-mistakes-finding`'s deterministic routing, already folded into `40-drive-gates` as its own helper. **Corrected 2026-08-16, ICM-R2 pilot review:** the prior text here named `route-review-findings` as a currently-invoked delegate; no such package exists.
 
 ## Authority envelope
 
@@ -46,7 +44,7 @@ This workflow receives an already-admitted Work intent (either the coordinator-l
 - Whether to resolve an `ask-user` gate finding — it is relayed verbatim to the user, never resolved autonomously (`40-drive-gates`).
 - To edit the pipeline-owned worktree, abort, or rerun mid-gate to escape a finding.
 
-### Resolved (was `BU-VAS-15`, issue #123): a dispatched run of this workflow pushing a branch, opening a PR, or triggering CI is not a gap
+### Resolved (issue #123): a dispatched run of this workflow pushing a branch, opening a PR, or triggering CI is not a gap
 Push, PR-open, and CI-run are this workflow's ordinary, correct, ungated
 behavior — they create the review artifact, they don't bypass review. The
 sensitive action is merge, and merge is held structurally by this
@@ -65,12 +63,12 @@ Material decisions are recorded per-stage in each stage's own `## Bounded judgme
 
 ## Notes for reviewers
 
-**U2 verdict** (`reference-corpus/synthesis.md` §1): the §6.3 reimplementation test *does* discriminate cleanly here, but only after the source's flat command list is split by outcome — the things that failed the test and became helpers, not stages, are the individual commands (`axi`, `axi status`, `axi logs`, `axi abort`, `axi sync --check`; BU-P2-101), the output grammar (BU-P2-102), the `--intent-file`/`--intent` flag choice (BU-P1-071), and the branch-sync decision table (BU-P1-078).
+**U2 verdict** (`reference-corpus/synthesis.md` §1): the §6.3 reimplementation test *does* discriminate cleanly here, but only after the source's flat command list is split by outcome — the things that failed the test and became helpers, not stages, are the individual commands (`axi`, `axi status`, `axi logs`, `axi abort`, `axi sync --check`), the output grammar, the `--intent-file`/`--intent` flag choice, and the branch-sync decision table.
 
 **Two entry variants, redesigned per N1 adjudication A5.** Coordinator-launched entry begins at `20-select-intent-transport` (its folded helpers cover the readiness-marker, launch-reservation, and isolated-snapshot preconditions that only apply to a coordinator handing off an already-reviewed worker commit). Directly-invoked entry (`/no-mistakes`, run by the actor in the current session) begins at `00-check-scope`, proceeds through `10-do-the-work` in task-first mode, and rejoins the shared pipeline at `20-select-intent-transport`. `00-check-scope`/`10-do-the-work` were previously dissolved into workflow-level citations and prose rather than materialized as stages, to dodge an id collision with what were then `10-acquire-launch-reservation`/`20-reserve-isolated-snapshot` — adjudication A5 (finding N1-BH-04) confirmed that was a violation (id collisions are renamed, never dissolved) and directed their restoration; renumbering the whole package (see the stage table above) both resolved the collision and gave the two entry variants a coherent single ordered list, per convention.md's single-linear-stage-list model (no engine-level branching exists at this milestone).
 
-Per A11, the reader-note previously repeating "read `pane`/`tmux` as this project's durable session/execution identity" has been removed as redundant: the affected statements (`BU-P7-104`, `BU-P8-089`, both folded into `60-close-out`) are cited here already normalized to that reading in the corpus (`behavior-units/*.ndjson`); see deviation register D2 and obsolete-mechanism clusters M1-M4 (`reference-corpus/synthesis.md` §4) for the underlying obsolescence.
+Per A11, the reader-note previously repeating "read `pane`/`tmux` as this project's durable session/execution identity" has been removed as redundant: the affected statements (both folded into `60-close-out`) are cited here already normalized to that reading in the corpus; see deviation register D2 and obsolete-mechanism clusters M1-M4 (`reference-corpus/synthesis.md` §4) for the underlying obsolescence.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/validate-and-ship.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. **Corrected 2026-08-16, ICM-R2 pilot review (BU-VAS-10):** this and every other in-package citation previously pointed at a co-located `provenance.md` that does not exist anywhere in this package — apparently never carried over when the package was promoted out of its draft-workflow location.
+See `docs/gauntlet/promoted-provenance/validate-and-ship.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. **Corrected 2026-08-16, ICM-R2 pilot review:** this and every other in-package citation previously pointed at a co-located `provenance.md` that does not exist anywhere in this package — apparently never carried over when the package was promoted out of its draft-workflow location.
