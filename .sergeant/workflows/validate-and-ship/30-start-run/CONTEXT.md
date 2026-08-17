@@ -80,8 +80,9 @@ Apply `@@bounded-judgment`.
 - None beyond ordinary tool mechanics — precondition checks are mechanical (repo initialized, feature branch, pipeline agent configured); the two decisions above are the only material judgment this stage exercises, and both are J2.
 
 ### J0 — must become `needs_input`
-- **The push/pr/ci authority gap named at workflow level (`## Authority envelope`, BU-VAS-15) applies to this stage's own `axi run --intent` invocation** — this stage composes the run that eventually reaches `40-drive-gates`, and nothing in this stage's own contract authorizes what that run may publish. Unresolved until the owner rules on it.
 - A precondition failure's remediation command is ambiguous or does not resolve the actual failure.
+
+**Resolved (was `BU-VAS-15`, issue #123):** see the workflow-level `CONTEXT.md`'s "Resolved" note — this stage's `axi run --intent` invocation publishing (push/PR/CI) is this workflow's ordinary behavior, not a gap.
 
 ### Completion boundary
 This stage may complete only when a run exists on a feature branch with committed history, a verbatim intent, and either a fresh start or a correctly-reattached in-flight run — never a duplicate.
