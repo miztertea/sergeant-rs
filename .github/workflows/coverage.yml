@@ -21,6 +21,8 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
+permissions:
+  contents: read
 env:
   CARGO_TERM_COLOR: always
 jobs:
