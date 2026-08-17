@@ -21,8 +21,13 @@ treated provisional until ruled on.
 > **What authority allows this actor to decide this material question
 > without returning to a human or higher authority?**
 
-Rung definitions: `AGENTS.md`, AUTHORITY section. Check J5 through J0 in
-order there; cite the first rung that actually resolves the decision.
+Rung definitions, the conflict rule, and authority inheritance are all
+canonical in `AGENTS.md`'s AUTHORITY section. Check J5 through J0 in order
+there; cite the first rung that actually resolves the decision.
+
+This file carries only what `AGENTS.md` should not: how a **stage or
+skill** declares its own envelope, what a J0 escalation looks like on the
+wire, and where decisions get recorded.
 
 ## Stage/skill specialization
 
@@ -53,28 +58,6 @@ gathered, state a recommendation when one can be responsibly offered, and
 end the turn with one direct question so the existing backend signal
 places the Work in `needs_input`. For a Captain skill: ask the question
 live and wait for the user's answer before continuing.
-
-## Conflict rule
-
-Not a numeric override table. A user request that conflicts with binding
-policy does not become valid because J4 is "below" J5 — the conflict
-itself is J0 unless the governing source defines an authorized exception
-process.
-
-## Authority inheritance
-
-Narrowing only:
-
-```text
-repository / organizational doctrine
-        -> Work intent and explicit user decisions
-            -> workflow authority envelope
-                -> stage or skill specialization
-                    -> actor decision
-```
-
-A stage may narrow its workflow. A skill loaded by a stage may narrow the
-stage. Neither may widen the parent contract.
 
 ## Decision evidence
 

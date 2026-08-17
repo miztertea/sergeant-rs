@@ -322,8 +322,7 @@ violation. It is resolved by **moving canonicity, not by copying**:
 reduced to what only they need (stage-specialization contract,
 decision-evidence shape, conflict rule, authority inheritance, worked
 example) and reference `AGENTS.md` for the rungs. One canonical source per
-ladder, as rule 2 intends; `@@bounded-judgment` and `@@ponytail` still
-resolve per §4.
+ladder, as rule 2 intends; `@@bounded-judgment` still resolves per §4.
 
 Recorded here per `docs/adr/README.md`'s supersession convention — a later
 decision supersedes an earlier one and says so, rather than the two sitting
@@ -444,9 +443,9 @@ restated:
   worked example. Answers "what authority allows this actor to decide this
   material question without returning to a human or higher authority?"
 - **Ponytail Minimality Ladder (R1–R7)** — canonical rung definitions in
-  `AGENTS.md`; `.sergeant/common/contexts/ponytail.md` (`@@ponytail`)
-  retains the rung-logging convention. Answers "should this exist at all,
-  and at the lowest viable rung?"
+  `AGENTS.md`. No shared context: where rungs get logged in this
+  repository's artifacts is `docs/DEVELOPMENT.md`, which already owned that
+  rule. Answers "should this exist at all, and at the lowest viable rung?"
 
 ### 6.1. Required sections
 

@@ -82,13 +82,22 @@ docs, observability, recovery, or necessary architecture — those are part
 of correctness, not scope. Correctness constrains the destination;
 expertise constrains the path.
 
-This repo's rung-logging convention (how design decisions, deviation-
-register rows, and new dependencies record their rung) lives at
-`@@ponytail`.
+Where rungs get logged in this repository's own artifacts —
+ledger entries, deviation-register rows, new dependencies — is
+`docs/DEVELOPMENT.md`, which owns that rule.
 
 ### AUTHORITY — the Bounded-Judgment Ladder (J5–J0), then PACE
 
 *May I decide this?*
+
+**Cite your rung. Every material decision names the rung that resolved
+it and why — in the PR body, the commit message, the stage output, or the
+answer itself, whichever is the durable record for that piece of work. An
+uncited material decision is an incomplete one: the reader cannot tell
+whether authority was checked or assumed, which is the whole thing these
+ladders exist to make visible. This applies to both ladders — construction
+decisions cite an R-rung, authority decisions cite a J-rung, and a change
+can need both.**
 
 Check J5 through J0 in order; cite the first rung that actually resolves
 the decision. Governs **material** decisions — scope, acceptance,
@@ -152,6 +161,29 @@ authority is Contingency, not license to act.
 The stage/skill specialization contract (how a stage declares its J2/J1/J0
 narrowing), the Decision-evidence table shape, the conflict rule, and a
 worked example live at `@@bounded-judgment`.
+
+**Conflict rule.**
+
+Not a numeric override table. A user request that conflicts with binding
+policy does not become valid because J4 is "below" J5 — the conflict
+itself is J0 unless the governing source defines an authorized exception
+process.
+
+**Authority inheritance.**
+
+Narrowing only:
+
+```text
+repository / organizational doctrine
+        -> Work intent and explicit user decisions
+            -> workflow authority envelope
+                -> stage or skill specialization
+                    -> actor decision
+```
+
+A stage may narrow its workflow. A skill loaded by a stage may narrow the
+stage. Neither may widen the parent contract.
+
 
 ### ROUTING — dispatch vs. in-session
 
