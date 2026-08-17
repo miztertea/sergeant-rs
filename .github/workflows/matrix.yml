@@ -1,11 +1,15 @@
-# The full-suite tier (ADR 0004, D9). ci.yml's per-push tier is cheap by
-# design (Linux fmt/clippy/test + a macOS `cargo check`); this workflow is
-# what actually runs the real test suite on every measured target (ADR 0001,
-# D1) and only on the events where the wall-clock cost is worth paying:
-# PR-to-main, nightly, and a published release. This repo is public, so
-# macOS/Windows runner minutes are free and unmetered (ADR 0004, D9) — the
-# constraint here is wall-clock, and matrix jobs run concurrently, so this
-# tier costs max(job), not sum(job).
+# The full-suite tier. ci.yml's per-push tier is cheap by design (Linux
+# fmt/clippy/test + a macOS `cargo check`); this workflow is what actually
+# runs the real test suite on every measured target (ADR 0001, D1). It is a
+# qualification capability, not a calendar event: `workflow_call` lets the
+# release workflow invoke it before publication, and `workflow_dispatch`
+# lets a maintainer run it by hand against a risky branch. It is not
+# triggered by pull_request, a schedule, or a published release — the
+# CI/CD proposal §2.2/§16 and ADR 0014 decision 9 (which supersedes ADR
+# 0004 D9's PR-to-main/nightly/release topology) are why. This repo is
+# public, so macOS/Windows runner minutes are free and unmetered (ADR 0004,
+# D9) — the constraint here is wall-clock, and matrix jobs run
+# concurrently, so this tier costs max(job), not sum(job).
 #
 # Targets covered: Linux and macOS, both as real `cargo test` runs. Windows
 # is measured only via WSL2, never natively (ADR 0001, D1) — wiring a WSL2
@@ -26,14 +30,8 @@
 name: matrix
 
 on:
-  pull_request:
-    branches: [main]
-  schedule:
-    # Nightly, ahead of coverage.yml's weekly Monday 06:17 UTC run so the two
-    # heavy lanes don't contend for the same runner pool.
-    - cron: "30 5 * * *"
-  release:
-    types: [published]
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
