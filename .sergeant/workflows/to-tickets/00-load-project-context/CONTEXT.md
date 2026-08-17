@@ -20,14 +20,13 @@ Project context is loaded.
 
 - **When loading project context for ticket authoring, do not automatically add td instructions to a repository's own guidance files as a side effect.**
   (trigger: project context is being loaded, and the repo lacks td instructions; outcome: the repository's own guidance files are left untouched unless explicitly requested)
-  — `BU-P4-064`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Load Project Context, L46)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J5 — governing constraint
-- Do not automatically add td instructions to a repository's own guidance files as a side effect (`BU-P4-064`).
+- Do not automatically add td instructions to a repository's own guidance files as a side effect.
 
 ### J2 — delegated to this stage
 - None beyond the delegated context-loading itself, which carries its own bounded judgment.

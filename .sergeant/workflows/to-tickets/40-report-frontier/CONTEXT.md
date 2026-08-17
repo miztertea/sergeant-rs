@@ -20,20 +20,18 @@ One worker per owning repo is the default; reporting is not authorization to dis
 
 - **When reporting the dispatch frontier, recommend one worker per owning repository as the default concurrency, unless the project explicitly supports more.**
   (trigger: the dispatch frontier is being reported after publication; outcome: a sensible default concurrency is recommended alongside the frontier)
-  — `BU-P4-072`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Report the Dispatch Frontier, L181-182)
 - **Do not actually dispatch any ticket unless the user asked to begin implementation; reporting the frontier is not itself authorization to start work.**
   (trigger: the dispatch frontier and next commands have been reported; outcome: publication and reporting never silently trigger execution)
-  — `BU-P4-073`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Report the Dispatch Frontier, L189)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J5 — governing constraint
-- Never dispatch any ticket unless the user asked to begin implementation — reporting the frontier is never itself authorization (`BU-P4-073`).
+- Never dispatch any ticket unless the user asked to begin implementation — reporting the frontier is never itself authorization.
 
 ### J2 — delegated to this stage
-- What counts as "the project explicitly supports more" concurrency (`BU-P4-072`).
+- What counts as "the project explicitly supports more" concurrency.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
