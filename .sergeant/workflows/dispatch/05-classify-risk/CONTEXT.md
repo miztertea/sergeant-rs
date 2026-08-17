@@ -18,6 +18,8 @@ The objective is routed to the standard-isolated path or forced onto an explicit
 
 ## Behavior contract
 
+**Engine gap (skew-check-2026-08-17 finding 1, [issue #166](https://github.com/miztertea/sergeant-rs/issues/166)):** the three bullets below describe the upstream tool's `--intent-file` mechanism, which does not exist in the shipped `sgt` binary. `sgt run --help`'s full option list is `--data-dir`, `--workflow`, `--backend`, `--json`, `--profile`, `--repo`, `--group`, `--workspace`, `--turns`, `--ceiling-secs` — no intent-transport flag of any kind, and no other verb accepts one either. The only channel that reaches a Work at all today is `sgt run`'s plain-text positional `<INTENT>` argument, which the engine does not validate for required sections, path traversal, symlinks, or size. Until #166 is closed, this stage cannot structurally force a safety-sensitive objective through a validated intent path — the actor can only fold the eight required sections into that plain-text `<INTENT>` string by convention and record, in this stage's own output, that the safety-sensitive path was warranted even though nothing in the CLI enforced it. The keyword-match routing decision itself (below) still stands; what is missing is engine-side enforcement of where that routing leads.
+
 - **An objective whose text matches a fixed set of safety-sensitive or stateful keywords (auth, security, secrets, payments, databases, migrations, production, destructive, persistent state, state transitions) cannot proceed on the standard-isolated intent path and must instead be given an explicit --intent-file.**
   (trigger: a work objective is being auto-converted into a minimal standard-isolated intent; outcome: risky-sounding work can never proceed on the lightweight auto-generated intent path; it must be given an explicit, fuller intent document)
   — `BU-P6-048`, `reference/sergeant-upstream/bin/_sgt-intent.sh` (L215-217)
@@ -27,13 +29,14 @@ The objective is routed to the standard-isolated path or forced onto an explicit
 - **--intent-file is mandatory whenever the objective names auth/OAuth, security, secrets or credentials, payments, databases or migrations, stateful/production work, destructive work, persistent state, or state transitions; the intent file must contain the eight required sections, and malformed, missing, path-traversing, symlinked, or oversized input fails before any dispatch mutation, while every other objective uses the lighter standard-isolated path.**
   (trigger: sgt-dispatch is about to launch a worker for a stated objective; outcome: high-risk objectives are structurally forced through a stricter, validated intent path before any state is created; low-risk objectives use a lighter path)
   — `BU-P8-069`, `reference/sergeant-upstream/docs/using-sergeant.md` (L112-117)
+  — **not implemented by `sgt run`; see engine-gap note above ([#166](https://github.com/miztertea/sergeant-rs/issues/166)).**
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J5 — governing constraint
-- **An objective matching the fixed safety-sensitive keyword set (auth, security, secrets, payments, databases, migrations, production, destructive, persistent state, state transitions) cannot proceed on the standard-isolated path — it must be given an explicit `--intent-file`** (`BU-P6-048`, `BU-P8-069`). Not a delegated judgment call; the keyword match is fixed.
+- **An objective matching the fixed safety-sensitive keyword set (auth, security, secrets, payments, databases, migrations, production, destructive, persistent state, state transitions) cannot proceed on the standard-isolated path — it must be given an explicit `--intent-file`** (`BU-P6-048`, `BU-P8-069`). Not a delegated judgment call; the keyword match is fixed. **`--intent-file` itself does not exist in `sgt run` today** ([issue #166](https://github.com/miztertea/sergeant-rs/issues/166), see the engine-gap note under "Behavior contract" above) — until it does, satisfy this constraint by folding the required content into `sgt run`'s plain-text `<INTENT>` argument and recording, in this stage's output, that the safety-sensitive path applied even though the CLI could not structurally enforce it.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

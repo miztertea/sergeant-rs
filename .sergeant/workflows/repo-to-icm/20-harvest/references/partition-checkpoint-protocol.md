@@ -11,7 +11,7 @@ this protocol implements and the alternative it rejects.
 ## Why this works without a new engine capability
 
 `output/` is Git-tracked on this run's Work branch and persists across a
-stage retry (`sgt work retry` re-enters a stage as a fresh execution — fresh
+stage retry (`sgt retry` re-enters a stage as a fresh execution — fresh
 actor turn, fresh context window — against the artifacts already on disk;
 `docs/gauntlet/runs/n2-run2/grammar-pressure-report.md` GP-1 R1 measured
 this working in run 2's own journal). So a stage that stops partway through
@@ -107,7 +107,7 @@ partition:
   can tell real progress from a shortcut.
 - A ledger with any `pending` row at the end of an attempt is real signal —
   someone (a human operator, or an orchestrating caller of this Work) needs
-  to notice it and cause another attempt of this stage. `sgt work retry` is
+  to notice it and cause another attempt of this stage. `sgt retry` is
   **not** that mechanism (fixes #53; measured at N2 run 4, 2026-08-11,
   `docs/gauntlet/notes/n2-fake-backend-semantics.md`): retry is only legal
   against a failed/blocked/waiting stage, and this stage is neither —

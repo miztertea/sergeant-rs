@@ -11,19 +11,76 @@ with a dated entry.
 
 ## Destination
 
-*Sergeant is an AgentOS distro — a cloned directory of instructions,
-skills and conventions that turns a general-purpose coding harness into
-an operator of your estate — carried by `sgt`, a durable
-intent-execution engine that runs those intents to completion in
-isolated worktrees whether or not anyone is watching.*
+**REVISED 2026-08-17 (owner rulings, in dialogue with Captain; recorded in
+`docs/adr/0014-product-workspace-split-owner-rulings.md`).** The original
+destination paragraph is preserved below the revision, per this document's
+own rule that a superseded statement stays legible rather than being edited
+away. It was not wrong when written; two of its clauses have since been
+ruled false by decisions this repository has now taken.
 
-The finished loop: clone → `sgt` on PATH → `sgt init` (trust, estate,
-`repos/` working set) → open your harness → say *"let's work on the api
-bug"* → the harness shapes a structured intent, picks a workflow, drives
-the CLI on your behalf → walk away → return to a finished change on a
-retained branch, a readable transcript, and an honest, bounded cost.
-Acceptance: a stranger reaches that last step in under five minutes of
-setup. (Stranger onboarding itself is gated — see Waves.)
+*Sergeant is an AgentOS distro — instructions, skills and workflow
+templates embedded in `sgt` and written to your estate by `sgt init` —
+that turns a general-purpose coding harness into an operator of your
+estate, carried by a durable intent-execution engine that runs those
+intents to completion in isolated worktrees.*
+
+**Not true yet, and marked as such (2026-08-17).** The embedding clause
+above is the destination, not the current behavior: `sgt init` today
+writes `sergeant.toml`, `repos/`, and a `.gitignore`, and no workflow
+templates at all (issue #165; measured in
+`docs/gauntlet/runs/skew-check-2026-08-17/findings.md` findings 6 and 10).
+The Phase 0 skew check flagged this paragraph — revised the same day it
+was written — as a present-tense assertion of behavior the binary does not
+have, which is exactly the instruction-fiction class this document's own
+amendments were correcting. A destination document is entitled to describe
+where it is going; it is not entitled to describe that as already working.
+This note stands until `sgt init` actually writes the distro.
+
+The finished loop: `curl … | sh` → `sgt init` → `sgt claude` → say *"let's
+work on the payment api"*, *"why is the ingress controller erroring?"*,
+*"research this PRD across the backend group"* → Captain shapes those into
+intents and dispatches them → return to a finished change on a retained
+branch, a readable transcript, and an honest, bounded cost. **The intent
+carries its own authority: `needs_input` means the ladder ran out, not that
+a human is required.** The distro ships templates — ways you *could* work —
+and you write your own locals.
+
+Acceptance: the stranger gets from `curl` to that finished change without
+reading this repository.
+
+Three amendments are folded into the text above:
+
+1. **"A cloned directory of instructions, skills and conventions" is
+   struck.** It is now false twice: the distro is embedded in the binary
+   (ADR 0014 decision 1), and its contents are templates rather than
+   conventions (decision 3). This is a deliberate departure from firstmate's
+   distribution-unit claim — "there is no application to install, because
+   the cloned repository *is* the distro" — which the owner's own research
+   corpus names as the lineage's strongest available prior art. Recorded as
+   a departure, not an oversight.
+2. **"Whether or not anyone is watching" is struck.** Owner ruling: that
+   describes a consequence of durability, not the thesis. *"That's not what
+   sergeant is about. It's about executing intentions."* Durability serves
+   intent execution; unattendedness is what it buys, not what it is.
+3. **Stranger-first framing.** The destination is stated from the
+   Redditor's install line inward, rather than from this repository's
+   structure outward.
+
+Original text, historical (adjudicated 2026-08-11):
+
+> *Sergeant is an AgentOS distro — a cloned directory of instructions,
+> skills and conventions that turns a general-purpose coding harness into
+> an operator of your estate — carried by `sgt`, a durable
+> intent-execution engine that runs those intents to completion in
+> isolated worktrees whether or not anyone is watching.*
+>
+> The finished loop: clone → `sgt` on PATH → `sgt init` (trust, estate,
+> `repos/` working set) → open your harness → say *"let's work on the api
+> bug"* → the harness shapes a structured intent, picks a workflow, drives
+> the CLI on your behalf → walk away → return to a finished change on a
+> retained branch, a readable transcript, and an honest, bounded cost.
+> Acceptance: a stranger reaches that last step in under five minutes of
+> setup. (Stranger onboarding itself is gated — see Waves.)
 
 ## Ownership
 
@@ -135,6 +192,30 @@ predecessor) is queued for FOUNDATION-1-style proposal grading under
 sibling item sharing this gate's text — "stranger onboarding + prebuilt
 binary" — is untouched by this ruling and remains a separate, unscoped
 decision.
+
+**Amended 2026-08-17 (owner ruling; ADR 0014 decisions 8 and 9): the
+"stranger onboarding + prebuilt binary" gate is lifted.** The 2026-08-15
+amendment above deliberately left this sibling item gated and unscoped. It
+is now scoped. `~/inbox/proposal-ci-cd-release-engineering.md` (2026-08-16)
+designed the release channel that the prebuilt-binary half of this item
+requires, and did so without citing this document — reconciling carefully
+against ADRs 0001 and 0004 and the S-series while missing that its central
+deliverable sat behind this gate. That miss is itself the evidence: the
+gate was invisible from the neighborhood that needed it, which is the
+retrieval failure `reference/proposal-product-workspace-split.md` §2
+measures. Per this document's own rule ("binding until evidence beats it,
+then amended in place with a dated entry"), the gate yields.
+
+Scope of the lift: the prebuilt binary and its release pipeline are
+unblocked, re-scoped to carry **two artifact classes under one version** —
+binary plus embedded distro (ADR 0014 decisions 1 and 2). **Stranger
+onboarding itself remains gated**, on the split and doctrine work landing
+first: a `CONTRIBUTING.md` or a quickstart that points into 1,301 files of
+development record is a signpost into a swamp, and the acceptance test
+above ("without reading this repository") cannot pass until that is true.
+The proposal implementing this lift is queued for FOUNDATION-1-style
+proposal grading under `docs/gauntlet/contracts/SPLIT-1.md` before any
+build begins — the third such unit, after FOUNDATION-1 and T-SERIES-1.
 
 ## Gaps the record must close (owned by the MVP plan's buckets)
 
