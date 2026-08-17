@@ -20,7 +20,6 @@ One canonical intent revision exists and is written identically to fleet state a
 
 - **Dispatching creates or reuses td work, creates isolated worktrees, writes worker briefs, and records fleet state; it writes the same .sergeant-intent.md revision into fleet state and every selected worktree, and that one artifact is treated as canonical for implementation decisions, reviews, PR text, successor/recovery work, and final validation.**
   (trigger: sgt-dispatch runs against one or more repos; outcome: every downstream actor and process for this dispatch (implementer, reviewer, recovery, final validation) reads the same single canonical intent revision)
-  — `BU-P8-059`, `reference/sergeant-upstream/docs/using-sergeant.md` (L54-58 (Dispatch mode))
 
 ## Bounded judgment
 
@@ -30,7 +29,7 @@ Apply `@@bounded-judgment`.
 - Mechanical write order across fleet state and each selected worktree — the content is already decided, only the sequencing of writing it is local.
 
 ### J5 — governing constraint
-- **One canonical `.sergeant-intent.md` revision is written identically to fleet state and every selected work surface** (`BU-P8-059`) — no actor discretion changes which revision is canonical.
+- **One canonical `.sergeant-intent.md` revision is written identically to fleet state and every selected work surface** — no actor discretion changes which revision is canonical.
 
 ### J0 — must become `needs_input`
 - None specific to this stage beyond `@@bounded-judgment`'s general triggers.
