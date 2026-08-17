@@ -1944,6 +1944,7 @@ pub(crate) mod doctor {
         checks.push(daemon_check(data_dir).await);
         checks.push(permission_mode_check(data_dir));
         checks.push(estate_check(data_dir));
+        checks.push(workflows_check(data_dir));
         // N4/#23 (retention Rule B): disk pressure inside the data dir. Runs
         // after everything above regardless of their outcome — knowing "is
         // this installation about to run out of disk" does not depend on the
@@ -2137,6 +2138,92 @@ pub(crate) mod doctor {
             )
         } else {
             Check::warn("estate", details.join("; "), remedies.join("; "))
+        }
+    }
+
+    /// #165 (Ponytail R2 — visibility, not the fix): how many workflow
+    /// packages the estate declares under `.sergeant/workflows/`. A fresh
+    /// `sgt init` writes none — `WorkflowDefinition::resolve`
+    /// (`src/domain/workflow.rs`) only ever falls back to the binary's one
+    /// embedded package (`software-change`, [`crate::domain::workflow::
+    /// DEFAULT_WORKFLOW`]), so any other explicitly named workflow 422s at
+    /// submit with nothing in this report to explain why. The full fix —
+    /// `sgt init` writing real packages, or resolution falling back to a
+    /// binary-embedded set with more than one member — is Phase 3 embedding
+    /// (`reference/proposal-product-workspace-split.md`), out of scope
+    /// here; this check exists so "zero" is something `sgt doctor` says out
+    /// loud instead of a fact a submitter only learns from a 422.
+    ///
+    /// Same discovery as [`estate_check`]; silent (`ok`) outside any
+    /// estate. Zero packages is `warn`, not `fail`: the embedded default
+    /// still runs unnamed dispatch (§30), so an estate with none is
+    /// degraded, not broken.
+    fn workflows_check(data_dir: &Path) -> Check {
+        use crate::domain::workflow::WORKFLOW_ROOT;
+        use crate::domain::workspace::Workspace;
+
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                return Check::warn(
+                    "workflows",
+                    format!("cannot read the current directory: {e}"),
+                    "run `sgt doctor` from inside the estate you want checked",
+                );
+            }
+        };
+        let estate_root = match Workspace::estate_root(&cwd, Some(data_dir)) {
+            Ok(root) => root,
+            Err(e) => {
+                return Check::fail(
+                    "workflows",
+                    e.to_string(),
+                    "fix sergeant.toml at the file and location named above",
+                );
+            }
+        };
+        let Some(estate_root) = estate_root else {
+            return Check::ok("workflows", "not inside an estate — nothing to check");
+        };
+
+        let workflows_dir = estate_root.join(WORKFLOW_ROOT);
+        let mut names: Vec<String> = match std::fs::read_dir(&workflows_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                .filter(|entry| entry.path().join("workflow.toml").is_file())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        names.sort();
+
+        if names.is_empty() {
+            Check::warn(
+                "workflows",
+                format!(
+                    "0 workflow packages declared under {} — only the built-in {:?} runs \
+                     (unnamed dispatch, or `--workflow {:?}` explicitly); any other \
+                     `--workflow <name>` will 422",
+                    workflows_dir.display(),
+                    crate::domain::workflow::DEFAULT_WORKFLOW,
+                    crate::domain::workflow::DEFAULT_WORKFLOW,
+                ),
+                format!(
+                    "write a package to {}/<name>/workflow.toml before dispatching `--workflow \
+                     <name>` (#165 — sgt init does not scaffold any yet)",
+                    workflows_dir.display()
+                ),
+            )
+        } else {
+            Check::ok(
+                "workflows",
+                format!(
+                    "{} workflow package(s) declared: {}",
+                    names.len(),
+                    names.join(", ")
+                ),
+            )
         }
     }
 
