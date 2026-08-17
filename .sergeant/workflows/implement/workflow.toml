@@ -1,6 +1,6 @@
 # implement — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
 # candidate W23). Implements a piece of work from a spec or ticket set,
-# explicit-invocation-only (BU-P2-051). Promoted per
+# explicit-invocation-only. Promoted per
 # docs/icm/promotion-spec-2026-08-11.md; full behavior-unit citation trail
 # archived at docs/gauntlet/promoted-provenance/implement.md.
 #

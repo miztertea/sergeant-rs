@@ -1,8 +1,7 @@
 # Implement
 Draft workflow package — candidate **W23** `implement` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. Revised at ICM-R3
+manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
+Revised at ICM-R3
 (`docs/gauntlet/runs/icm-r3/implement/adjudication-draft.md`) per
 `reference/proposal-icm-r-procedure-authority.md` §8. This is Layer 1
 orientation only — it is never delivered as a stage's instructions; each
@@ -33,8 +32,8 @@ set to implement).
 
 ### Workflow may not decide
 - Whether to auto-load itself because a task merely looks like
-  implementation — J5, `BU-P2-051`/`BU-P3-004`: explicit-invocation-only,
-  never triggered implicitly.
+  implementation — J5: explicit-invocation-only, never triggered
+  implicitly.
 - Whether to write a test at an unconfirmed seam — J0, inherited from the
   `@@tdd` discipline this workflow applies in `10-implement-with-tdd` (see
   that stage's own Bounded judgment section).
@@ -77,7 +76,7 @@ evidence.
 
 ## Notes for reviewers
 
-Explicit-invocation-only (BU-P2-051) — this workflow must never be auto-loaded merely because the task looks like implementation; its cross-harness mirror is BU-P3-004.
+Explicit-invocation-only — this workflow must never be auto-loaded merely because the task looks like implementation; this rule is mirrored cross-harness as well.
 
 ICM-R3 revision (`docs/gauntlet/runs/icm-r3/implement/adjudication-draft.md`):
 both stages gain this `## Authority envelope` companion and their own
