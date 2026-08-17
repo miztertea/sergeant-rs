@@ -41,7 +41,7 @@ Apply `@@bounded-judgment`.
 - None beyond ordinary tool mechanics.
 
 ### J0 — must become `needs_input`
-- **Seam confirmation**, when the `tdd` branch applies: `@@tdd` requires no test is written at an unconfirmed seam — stated here explicitly rather than left implicit, per the same hidden-dependency finding `implement/10-implement-with-tdd` closed (`BU-TDD-04`).
+- **Seam confirmation**, when the `tdd` branch applies: `@@tdd` requires no test is written at an unconfirmed seam — stated here explicitly rather than left implicit, per the same hidden-dependency finding `implement/10-implement-with-tdd` closed.
 - Substituting this stage's own judgment for a dispatched discipline's own reported outcome.
 
 ### Completion boundary
