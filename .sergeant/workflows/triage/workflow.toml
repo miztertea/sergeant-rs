@@ -10,8 +10,8 @@
 # directory listing under this workflow's own tree MUST agree with it
 # lexically (docs/icm/convention.md §1 rule 4).
 #
-# Revised at ICM-R3 (docs/gauntlet/runs/icm-r3/triage/adjudication-draft.md,
-# BU-TRI-04): the prior numbering had 20-verify before 30-recommend, but
+# Revised at ICM-R3 (docs/gauntlet/runs/icm-r3/triage/adjudication-draft.md):
+# the prior numbering had 20-verify before 30-recommend, but
 # verify's own trigger text ("a recommendation has been given and
 # direction received") and the upstream source's own line order (recommend
 # at line 72, verify at line 74) both place verification after

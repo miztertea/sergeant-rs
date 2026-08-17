@@ -20,7 +20,6 @@ The spec source is identified via a fixed priority order ending in asking the us
 
 - **The spec source for the Spec axis is located in a fixed priority order: issue references in commit messages, then a path the user passed as an argument, then a PRD/spec file under docs/, specs/, or .scratch/ matching the branch or feature name, then — if nothing is found — asking the user; if the user says no spec exists, the Spec sub-agent is skipped and reports 'no spec available'.**
   (trigger: identifying what the Spec axis should compare against; outcome: a spec source is found, or the Spec review is explicitly skipped with a reason)
-  — `BU-P2-007`, `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (Step 2: Identify the spec source, lines 27-32)
 
 ## Judgment required
 
