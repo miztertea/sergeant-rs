@@ -17,9 +17,8 @@ stage contract actually points at.
 ## 1. The blindness rule
 
 If this run's purpose is **measurement** — comparing generated output
-against an already-adjudicated reference decomposition (as in the N2
-measurement run against `sergeant-rs-workspace/knowledge/evidence/reference/sergeant-upstream`, graded against
-`sergeant-rs-workspace/knowledge/evidence/reference-corpus/`) — then for the entire run, every stage's actor is
+against an already-adjudicated reference decomposition, graded against
+`sergeant-rs-workspace/knowledge/evidence/reference-corpus/` — then for the entire run, every stage's actor is
 **blind to `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`**: never open it, never grep it, never let
 it enter a prompt, never let a helper's output surface its contents. This
 is not a preference; contaminating the run with the answer key invalidates

@@ -59,10 +59,24 @@ contract is unchanged.
 Use when: a repository's procedural knowledge needs to be surfaced as
 reviewable ICM candidates — either to seed a first admitted decomposition
 of a new repository, or to measure this workflow's own recall/precision
-against an already-adjudicated reference corpus (as in the N2 measurement
-run against `sergeant-rs-workspace/knowledge/evidence/reference/sergeant-upstream`).
+against an already-adjudicated reference corpus in a blindness-run
+measurement (`_config/run-discipline.md` §1).
 
 Output always lands under `.sergeant/drafts/workflows/<candidate>/` in the
 run's own worktree (`docs/icm/convention.md` §2) — promotion to
 `.sergeant/workflows/` is a distinct, human-reviewed act this workflow
 never performs itself.
+
+**Worked-example identifier convention.** This package's own reference
+material (`20-harvest/references/`, `_config/evidence-policy.md`,
+`30-normalize/references/normalization-method.md`,
+`40-classify/references/classification-record-shape.md`,
+`90-reconcile/references/reconciliation-method.md`) demonstrates the
+behavior-unit record shape with worked JSON examples and harvest-progress
+tables. Those examples use `EX-####` identifiers — never `BU-####`, the
+real corpus namespace (`_config/evidence-policy.md`'s `id` field rule) —
+so a demonstration id can never be mistaken for a live citation into a
+corpus that does not ship with this package. A future author adding a
+worked example here must use `EX-####` (or another prefix that is
+obviously not `BU-`), never a real-looking `BU-####` value, fictional or
+otherwise.

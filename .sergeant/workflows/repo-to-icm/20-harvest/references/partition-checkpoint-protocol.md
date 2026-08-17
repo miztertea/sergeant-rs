@@ -31,8 +31,8 @@ recorded there:
 ```text
 | Partition | Status | Unit id range | Notes |
 |---|---|---|---|
-| root-level agent instructions | done | BU-0001–BU-0023 | |
-| bin: fleet dispatch & lifecycle (dispatch) | done | BU-0024–BU-0041 | |
+| root-level agent instructions | done | EX-0001–EX-0023 | |
+| bin: fleet dispatch & lifecycle (dispatch) | done | EX-0024–EX-0041 | |
 | bin: fleet dispatch & lifecycle (recovery) | pending | | not reached this attempt |
 ```
 

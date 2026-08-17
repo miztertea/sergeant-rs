@@ -151,7 +151,7 @@ Behavior-level (`source: behavior`) — `behavior_id` identifies the
 originating unit:
 
 ```json
-{"source": "behavior", "behavior_id": "BU-0117", "engine_gap": {"behavior": "...", "source_evidence": ["BU-0117"], "lower_rungs_attempted": ["..."], "why_each_fails": {"...": "..."}, "minimum_runtime_capability_required": "...", "observable_acceptance_test": "..."}}
+{"source": "behavior", "behavior_id": "EX-0117", "engine_gap": {"behavior": "...", "source_evidence": ["EX-0117"], "lower_rungs_attempted": ["..."], "why_each_fails": {"...": "..."}, "minimum_runtime_capability_required": "...", "observable_acceptance_test": "..."}}
 ```
 
 Meta-level (`source: meta`) — there is no behavior unit behind a meta-level

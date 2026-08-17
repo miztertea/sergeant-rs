@@ -36,8 +36,8 @@ covers that class for that file, or the literal text `swept, none found`.
 ```text
 | File | Safety | Identity | Recovery | Delivery | Human-decision |
 |---|---|---|---|---|---|
-| bin/sgt-drain-force | BU-0071 (start-time/PID-reuse check before signal) | swept, none found | swept, none found | swept, none found | swept, none found |
-| AGENTS.md | swept, none found | swept, none found | swept, none found | swept, none found | BU-0014 (standing-authorization scope) |
+| bin/sgt-drain-force | EX-0071 (start-time/PID-reuse check before signal) | swept, none found | swept, none found | swept, none found | swept, none found |
+| AGENTS.md | swept, none found | swept, none found | swept, none found | swept, none found | EX-0014 (standing-authorization scope) |
 ```
 
 ## The five hunt questions

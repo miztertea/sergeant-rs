@@ -18,7 +18,7 @@ job, not `20-harvest`'s or `30-normalize`'s):
 
 ```json
 {
-  "id": "BU-0042",
+  "id": "EX-0042",
   "statement": "Before changing a repository, verify that the requested repository belongs to the loaded project.",
   "source": {
     "path": "AGENTS.md",

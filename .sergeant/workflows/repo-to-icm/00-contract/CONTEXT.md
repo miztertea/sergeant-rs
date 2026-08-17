@@ -77,9 +77,10 @@ and this run alone:
      *something* — that something is the outer repository's own moving
      HEAD, not the subject's). Only here does "resolve `HEAD`" mean
      anything: `git -C <subject> rev-parse HEAD`.
-   - **The subject is a vendored subtree** (no `.git` of its own — e.g.
-     `sergeant-rs-workspace/knowledge/evidence/reference/sergeant-upstream`, tracked as ordinary files inside this
-     outer repository). Its pinned revision is not something to (re)derive
+   - **The subject is a vendored subtree** (no `.git` of its own — e.g. a
+     third-party corpus vendored under `third_party/<name>/`, tracked as
+     ordinary files inside this outer repository). Its pinned revision is
+     not something to (re)derive
      from `git rev-parse` inside it — there is no such object to resolve
      against. It is a recorded fact: look for that subject's own provenance
      document (a file like `UPSTREAM.md` alongside it, or named in the
