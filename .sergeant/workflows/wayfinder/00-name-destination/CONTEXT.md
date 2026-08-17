@@ -20,12 +20,10 @@ The destination is named via a grilling session; scope is settled first.
 
 - **Charting a wayfinder map first names the destination via a grilling session (settling scope first), then maps the frontier breadth-first across the whole space rather than deep on one thread.**
   (trigger: a loose, oversized idea is presented to be charted; outcome: the destination is fixed before any tickets are drafted)
-  — `BU-P4-094`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Chart the map, L111).
   Upstream names this a "grilling/domain-modeling session"; no
   `domain-modeling` skill package exists in this repo yet (only frozen
-  upstream evidence — see `docs/icm/agents-invariant-dispositions.md`
-  BU-1064), so sharpening domain terminology folds into the `grilling`
-  session below rather than a second invocation.
+  upstream evidence), so sharpening domain terminology folds into the
+  `grilling` session below rather than a second invocation.
 
 ## Bounded judgment
 

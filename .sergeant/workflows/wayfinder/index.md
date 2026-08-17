@@ -13,6 +13,10 @@ tags:
 
 # Wayfinder
 
+Provenance for this package's rules (the BU-#### citations and
+`reference/sergeant-upstream/` sources previously inline here) is recorded
+in `sergeant-rs-workspace`'s `knowledge/evidence/provenance/wayfinder.md`.
+
 Four-stage actor-only workflow (N1 reference corpus, candidate **W33**
 `wayfinder`, `docs/gauntlet/contracts/N1.md`) that maps an unfamiliar
 frontier of a codebase or problem space, ticket-izing decisions and

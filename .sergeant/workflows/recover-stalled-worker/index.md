@@ -13,6 +13,10 @@ tags:
 
 # Recover Stalled Worker
 
+Provenance for this package's rules (the BU-#### citations and
+`reference/sergeant-upstream/` sources previously inline here) is recorded
+in `sergeant-rs-workspace`'s `knowledge/evidence/provenance/recover-stalled-worker.md`.
+
 Three-stage actor-only workflow (N1 reference corpus,
 `docs/gauntlet/contracts/N1.md`, candidate **W11** `recover-stalled-worker`,
 `reference-corpus/synthesis.md` §1) for one bounded recovery attempt on a

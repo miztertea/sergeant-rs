@@ -1,7 +1,7 @@
 # Wayfinder
 Draft workflow package — candidate **W33** `wayfinder` from the N1
 manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
+decomposed from frozen upstream evidence per
 `reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
 it is never delivered as a stage's instructions; each stage's own
 `CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
@@ -62,9 +62,7 @@ this workflow declares no separate decision-log file.
 Every map and ticket is referred to by its name (title) in all
 human-facing narration — narration, the map's own Decisions-so-far — never
 by a bare id, number, or slug. The id and URL ride inside the name, never
-stand in for it. — `BU-P4-077`, `BU-P4-080`,
-`reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Refer by
-name, L17).
+stand in for it.
 
 This package is also the shared-by owner of `@@ticket-shaping` and
 `@@triage-state-machine` (`reference-corpus/shared-context-map.md` Part 2).

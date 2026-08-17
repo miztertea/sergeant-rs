@@ -13,6 +13,10 @@ tags:
 
 # Deepen Module
 
+Provenance for this package's rules (the BU-#### citations and
+`reference/sergeant-upstream/` sources previously inline here) is recorded
+in `sergeant-rs-workspace`'s `knowledge/evidence/provenance/deepen-module.md`.
+
 Three-stage actor-only workflow (`docs/gauntlet/contracts/N1.md`, candidate
 **W25**) that turns a shallow module into a deep one at a deliberately
 chosen seam: classify a dependency cluster's coupling, generate and compare

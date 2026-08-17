@@ -12,6 +12,10 @@ tags:
 
 # Cross-Repo Work
 
+Provenance for this package's rules (the BU-#### citations and
+`reference/sergeant-upstream/` sources previously inline here) is recorded
+in `sergeant-rs-workspace`'s `knowledge/evidence/provenance/cross-repo-work.md`.
+
 Five-stage actor-only workflow (N1 reference corpus, candidate **W7**
 `cross-repo-work`, `docs/gauntlet/contracts/N1.md`) that decomposes a
 requested outcome across the repositories that own it and defines

@@ -20,16 +20,12 @@ Breadth-first mapping; stop and do not create a map if no fog exists; specifiabl
 
 - **If breadth-first frontier-mapping surfaces no fog at all -- the whole journey is small enough for one session -- stop chartering, do not create a map, and ask the user how they would like to proceed instead.**
   (trigger: frontier-mapping during charting surfaces no remaining fog; outcome: a wayfinder map is not created for work that doesn't actually need one)
-  — `BU-P4-095`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Chart the map, L112)
 - **The map is deliberately incomplete: only decisions sharp enough to phrase precisely become tickets now, and everything else that's foreseeable but not yet phraseable stays recorded loosely as fog rather than being pre-sliced into ticket-sized pieces.**
   (trigger: charting or updating a map; outcome: the map never overcommits to decisions that aren't yet specifiable)
-  — `BU-P4-088`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Fog of war, L82)
 - **Whether something belongs in a ticket or in the fog is decided by whether the question can already be stated precisely, not by whether it can already be answered.**
   (trigger: deciding whether a foreseen decision should become a ticket now or stay in the fog; outcome: ticket-vs-fog placement is decided by a consistent, explicit test)
-  — `BU-P4-089`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Fog of war, L88)
 - **Out-of-scope work never belongs in the fog section, because fog only gathers toward the destination; work beyond the destination is recorded in its own Out of scope section instead, and out-of-scope work never later graduates into a ticket unless the destination itself is redrawn as a fresh effort.**
   (trigger: work is identified that lies beyond the chartered destination; outcome: scope creep is recorded explicitly rather than silently absorbed into the fog or the ticket graph)
-  — `BU-P4-091`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Out of scope, L97)
 
 ## Helper invocation: create tickets
 
@@ -39,38 +35,31 @@ Demoted from a standalone stage (`20-create-tickets`) at N1 adjudication A4: its
 
 - **When creating a wayfinder map, create the tickets that can already be specified as child issues first, then wire their blocking edges in a second pass, because issues need ids before they can reference each other.**
   (trigger: specifiable decisions have been identified during charting; outcome: the resulting ticket set has correct blocking edges despite the two-pass creation order)
-  — `BU-P4-096`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (Invocation / Chart the map, L114)
 
 ## Helper invocation: map and ticket structure
 
 The structural mechanics the map and its tickets depend on, extracted at N1 and already classified as this package's own workflow-local helper content (`reference-corpus/helper-map.md` "Workflow-local helpers") but never landed in this stage until now:
 
 - **The map is a single issue on the repo's issue tracker, labelled `wayfinder:map`; its tickets are child issues of the map.**
-  — `BU-P4-078`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map, L21)
 - **The map is an index, not a store: it lists decisions made and points at the tickets that hold their detail, gisting and linking rather than restating.**
-  — `BU-P4-079`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map, L21)
 - **Each ticket is sized to one ~100K-token agent session and carries exactly one `wayfinder:<type>` label (`research`, `prototype`, `grilling`, `task`).**
-  — `BU-P4-081`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / Tickets, L27-30)
 - **A session claims a ticket by self-assignment before any work; the assignee is the claim, and an open, unassigned ticket is unclaimed.**
-  — `BU-P4-082`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / Tickets, L33)
 - **Blocking uses the tracker's native dependency relationship, falling back to a body convention only if the tracker lacks native blocking.**
-  — `BU-P4-083`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / Tickets, L34)
 - **Open tickets are not listed inline on the map; they are found by query.**
-  — `BU-P4-084`, `reference/sergeant-upstream/.agents/skills/wayfinder/SKILL.md` (The Map / The map body, L23)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Whether a foreseen decision is sharp enough to become a ticket now, or belongs in the fog (`BU-P4-089`).
-- Which work is out of scope versus still-fog (`BU-P4-091`).
+- Whether a foreseen decision is sharp enough to become a ticket now, or belongs in the fog.
+- Which work is out of scope versus still-fog.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
 
 ### J0 — must become `needs_input`
-- Frontier-mapping surfaces no fog at all: stop, do not create a map, and ask the user how they would like to proceed (`BU-P4-095`).
+- Frontier-mapping surfaces no fog at all: stop, do not create a map, and ask the user how they would like to proceed.
 
 ### Completion boundary
 This stage may complete only once the frontier has been mapped breadth-first, specifiable tickets are created and blocking edges wired, and remaining fog is recorded in Not yet specified — or the stage has stopped at the J0 no-fog case above.
