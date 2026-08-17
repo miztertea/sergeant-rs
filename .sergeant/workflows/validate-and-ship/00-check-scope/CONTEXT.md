@@ -20,18 +20,16 @@ The correct one of the two invocation modes (validate-only or task-first) is ide
 
 - **no-mistakes has two invocation modes: validate-only, where the user's changes are already committed and the actor just validates and reports; and task-first, where the actor first carries out the described task, then validates the result.**
   (trigger: the user invokes /no-mistakes with or without a task description; outcome: the correct one of two distinct procedures is followed based on whether a task was given)
-  — `BU-P2-059`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Two ways to invoke, lines 30-31)
 - **When the user invokes /no-mistakes, the actor reports the outcome at the end; if the user asks for something specific (e.g. 'skip the lint step'), the actor translates that request into the matching `axi run` flag itself (e.g. `--skip=lint`), consulting `axi run --help` for available flags.**
   (trigger: the user invokes the no-mistakes command, optionally with a specific request; outcome: user intent is translated into concrete CLI flags rather than passed through unparsed)
-  — `BU-P2-058`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (invocation, lines 20-23)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Distinguishing "already committed, just validate" (validate-only) from "do the task first" (task-first) from the user's own invocation (`BU-P2-059`).
-- Translating an ambiguous natural-language request (e.g. "skip the lint step") into the correct `axi run` flag, consulting `axi run --help` rather than guessing the grammar (`BU-P2-058`).
+- Distinguishing "already committed, just validate" (validate-only) from "do the task first" (task-first) from the user's own invocation.
+- Translating an ambiguous natural-language request (e.g. "skip the lint step") into the correct `axi run` flag, consulting `axi run --help` rather than guessing the grammar.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics — invocation-mode and flag-translation are the only material decisions this stage makes, and both are J2.

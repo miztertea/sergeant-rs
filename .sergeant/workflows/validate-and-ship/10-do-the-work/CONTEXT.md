@@ -20,21 +20,19 @@ Only the task's own changes are committed, on a non-default feature branch, with
 
 - **In task-first mode, before changing or committing anything the actor inspects `git status`, preserves unrelated pre-existing uncommitted changes, and when committing, commits only the changes belonging to the user's task.**
   (trigger: task-first mode is entered; outcome: only the task's own changes are committed; unrelated pre-existing changes survive untouched)
-  — `BU-P2-060`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 1, lines 36-38)
 - **The actor makes the changes the task describes and commits them on a feature branch; if the user is on the repository's default branch, a feature branch must be created first, because the gate validates committed history on a non-default branch.**
   (trigger: the task's changes have been made; outcome: the work lands as a commit on a non-default feature branch before validation can proceed)
-  — `BU-P2-061`, `reference/sergeant-upstream/.agents/skills/no-mistakes/SKILL.md` (Task-first mode step 2, lines 39-42)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Isolating exactly which working-tree changes belong to the task versus pre-existing unrelated changes, and committing only the former (`BU-P2-060`).
-- Deciding whether a feature branch must be created first (the user was on the repository's default branch) or already exists (`BU-P2-061`).
+- Isolating exactly which working-tree changes belong to the task versus pre-existing unrelated changes, and committing only the former.
+- Deciding whether a feature branch must be created first (the user was on the repository's default branch) or already exists.
 
 ### J1 — local choices allowed
-- Commit message wording, provided scope is correctly isolated per `BU-P2-060`.
+- Commit message wording, provided scope is correctly isolated.
 
 ### J0 — must become `needs_input`
 - A working-tree change cannot be confidently attributed to the task or to a pre-existing unrelated edit — guessing risks committing someone else's in-progress work.

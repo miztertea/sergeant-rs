@@ -13,6 +13,10 @@ tags:
 
 # Validate and Ship (no-mistakes)
 
+Provenance for this package's rules (the BU-#### citations and
+`reference/sergeant-upstream/` sources previously inline here) is recorded
+in `sergeant-rs-workspace`'s `knowledge/evidence/provenance/validate-and-ship.md`.
+
 Seven-stage actor-only workflow (N1 reference corpus, candidate **W18**
 `validate-and-ship`, `docs/gauntlet/contracts/N1.md`) that is the single
 final shipping boundary: validate a committed change through the pipeline
