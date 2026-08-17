@@ -72,7 +72,7 @@ Apply `@@bounded-judgment`.
 This stage may complete only when a run exists on a feature branch with committed history, a verbatim intent, and either a fresh start or a correctly-reattached in-flight run — never a duplicate.
 
 ### Decision evidence
-The composed intent string and the reattach/fresh-start choice are recorded in the run's own audit trail; no separate decision file.
+The composed intent string and the reattach/fresh-start choice are recorded in the run's own audit trail (the launch log); no separate decision file.
 
 ## Additional note
 

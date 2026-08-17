@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """test-finalize-evidence-guard.py — proves finalize.py's evidence-preservation
-guard (GP-5b; docs/gauntlet/runs/n2-run2/grammar-pressure-report.md GP-5b;
+guard (GP-5b; sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/grammar-pressure-report.md GP-5b;
 issue #29) against a disposable git sandbox.
 
 WHAT THIS PROVES

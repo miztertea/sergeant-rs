@@ -22,8 +22,9 @@ The destination is named via a grilling session; scope is settled first.
   (trigger: a loose, oversized idea is presented to be charted; outcome: the destination is fixed before any tickets are drafted)
   Upstream names this a "grilling/domain-modeling session"; no
   `domain-modeling` skill package exists in this repo yet (only frozen
-  upstream evidence), so sharpening domain terminology folds into the
-  `grilling` session below rather than a second invocation.
+  upstream evidence — see `docs/icm/agents-invariant-dispositions.md`),
+  so sharpening domain terminology folds into the `grilling`
+  session below rather than a second invocation.
 
 ## Bounded judgment
 

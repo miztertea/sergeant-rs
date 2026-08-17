@@ -20,14 +20,13 @@ The external skill's filesystem, shell, network, Git, and credential actions are
 
 - **Check the external skill's filesystem, shell, network, Git, and credential actions.**
   (trigger: source confirmed; outcome: the skill's side-effect surface across five named categories is known)
-  — `BU-P1-122`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L128, vet step 3)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Assessing the actual side-effect surface across the five named categories from source inspection (`BU-P1-122`).
+- Assessing the actual side-effect surface across the five named categories from source inspection.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

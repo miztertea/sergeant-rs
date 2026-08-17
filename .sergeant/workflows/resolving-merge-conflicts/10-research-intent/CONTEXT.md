@@ -20,7 +20,6 @@ The intent behind each conflicting side is researched.
 
 - **For each conflict, the actor traces the original intent behind each side's change via commit messages, PRs, and issues/tickets before attempting resolution.**
   (trigger: conflicting hunks have been identified; outcome: the intent behind each conflicting change is understood before it is resolved)
-  — `BU-P3-047`, `reference/sergeant-upstream/.agents/skills/resolving-merge-conflicts/SKILL.md` (step 2, line 8)
 
 ## Helper: assess state (folded from demoted `00-assess-state`, N1 adjudication A4)
 
@@ -28,20 +27,19 @@ The intent behind each conflicting side is researched.
 
 - **The first checkpoint establishes the current merge/rebase state by inspecting git history and the conflicting files.**
   (trigger: the workflow begins; outcome: the actor has an accurate picture of what is conflicting and why)
-  — `BU-P3-046`, `reference/sergeant-upstream/.agents/skills/resolving-merge-conflicts/SKILL.md` (step 1, line 6)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Which primary sources (commit messages, PRs, issues/tickets) to inspect when tracing each side's original intent (`BU-P3-047`).
+- Which primary sources (commit messages, PRs, issues/tickets) to inspect when tracing each side's original intent.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
 
 ### J0 — must become `needs_input`
-- No commit message, PR, or issue/ticket can be found for one side's change: state what evidence was checked and ask the user for the missing context, or explicit permission to proceed on the visible diff alone, rather than guessing at unstated intent (`BU-P3-047`).
+- No commit message, PR, or issue/ticket can be found for one side's change: state what evidence was checked and ask the user for the missing context, or explicit permission to proceed on the visible diff alone, rather than guessing at unstated intent.
 
 ### Completion boundary
 This stage may complete only once the current merge/rebase state is established and the intent behind each conflicting side is traced — or the stage has stopped at the J0 case above.

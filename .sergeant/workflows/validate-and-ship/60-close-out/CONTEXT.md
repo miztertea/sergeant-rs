@@ -37,7 +37,7 @@ Stop driving at `checks-passed`; on `failed`/`cancelled`, fix on the same branch
 
 ## Helper: handover log (folded from demoted `90-handover-log`, N1 adjudication A4)
 
-`90-handover-log` was classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate; per adjudication A4 it is demoted and its behavior folded here as the concluding helper invocation of this checkpoint — any coordinator ownership transfer that occurred during the run is durably logged as this stage closes out. Statements below are already normalized per N1 adjudication A11 (the source's "pane" wording is old-Sergeant tmux mechanism; this project's durable execution/session identity replaces it — deviation register D2, `reference-corpus/synthesis.md` §4 clusters M1-M4):
+`90-handover-log` was classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate; per adjudication A4 it is demoted and its behavior folded here as the concluding helper invocation of this checkpoint — any coordinator ownership transfer that occurred during the run is durably logged as this stage closes out. Statements below are already normalized per N1 adjudication A11 (the source's "pane" wording is old-Sergeant tmux mechanism; this project's durable execution/session identity replaces it — deviation register D2, `sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §4 clusters M1-M4):
 
 - **Every ownership transfer is durably appended to an owner-only handover log recording timestamp, reason, repository, prior and new session, and both identity tuples, and a release token is consumed by the claim that uses it so it can never be replayed by a third pane later.**
   (trigger: an ownership claim or release occurs; outcome: every transfer is durably auditable and a release can never be reused by an unintended third party)
@@ -57,7 +57,7 @@ Apply `@@bounded-judgment`.
 
 ### J0 — must become `needs_input`
 - A `failed`/`cancelled` outcome whose blocker cannot be concretely fixed or concretely explained — silence is never an option.
-- This stage's own `checks-passed`/`passed` outcomes presuppose a PR already exists and CI already ran — this stage does not itself open that PR or trigger that CI, but that is expected, ordinary behavior, not an unresolved authority gap — resolved, see the workflow-level `CONTEXT.md`'s "Resolved" note. If this stage is ever reached at `checks-passed`/`passed` without a PR/CI having actually happened, that is itself a `J0` condition, not something to paper over by describing the expected happy path as if it occurred.
+- This stage's own `checks-passed`/`passed` outcomes presuppose a PR already exists and CI already ran — this stage does not itself open that PR or trigger that CI, but that is expected, ordinary behavior, not an unresolved authority gap (resolved — see the workflow-level `CONTEXT.md`'s "Resolved" note). If this stage is ever reached at `checks-passed`/`passed` without a PR/CI having actually happened, that is itself a `J0` condition, not something to paper over by describing the expected happy path as if it occurred.
 
 ### Completion boundary
 This stage may complete only at a terminal or near-terminal pipeline outcome, with the user given an honest, itemized summary — never left at a failed outcome in silence.

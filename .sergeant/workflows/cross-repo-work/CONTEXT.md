@@ -1,11 +1,9 @@
 # Cross-Repo Work
 Draft workflow package — candidate **W7** `cross-repo-work` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from frozen upstream evidence per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
-it is never delivered as a stage's instructions; each stage's own
-`CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
-§1a rule 5).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only — it is never delivered as a stage's
+instructions; each stage's own `CONTEXT.md` (Layer 2) is the actor's
+contract (`docs/icm/convention.md` §1a rule 5).
 
 ## Purpose
 
@@ -37,7 +35,7 @@ Resolved project context shows more than one repository owns the requested outco
   (currently ruled out by the North Star's "fleet as a domain object"
   line). The underlying wish for a real composed cleanup procedure is
   recorded as evidence for existing engine-gap **G6**
-  (`reference-corpus/engine-pressure.md`), not as a currently owned
+  (`sergeant-rs-workspace/knowledge/evidence/reference-corpus/engine-pressure.md`), not as a currently owned
   procedure this stage's output feeds.
 
 ## Authority envelope
@@ -104,7 +102,7 @@ as an adjacent owned procedure rather than pretending to invoke it (no
 child-workflow invocation exists at this milestone —
 `docs/icm/convention.md` §4 rule 1). The underlying wish to invoke it for
 real is recorded as evidence for existing engine-gap claim G6 in
-`reference-corpus/engine-pressure.md`, not filed as a new claim. See
+`sergeant-rs-workspace/knowledge/evidence/reference-corpus/engine-pressure.md`, not filed as a new claim. See
 `60-reconcile/CONTEXT.md`'s "Scope note" for the stage-level disposition.
 
 **Correction (ICM-R3, 2026-08-16):** the A8 note previously also named

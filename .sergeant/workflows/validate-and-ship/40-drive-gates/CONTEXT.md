@@ -85,10 +85,10 @@ Apply `@@bounded-judgment`.
 - None beyond ordinary tool mechanics — every gate response is either a J2 auto-fix/no-op authorization or a J0 ask-user escalation; there is no local, non-contractual choice in between at this stage.
 
 ### J0 — must become `needs_input`
-- **Every `ask-user` gate finding, without exception** — relayed verbatim (id, file, full description, not paraphrased or pre-judged) and never resolved autonomously. This is the canonical worked precedent the whole Bounded-Judgment Ladder generalizes from (`reference/proposal-icm-r-procedure-authority.md` §3.4).
+- **Every `ask-user` gate finding, without exception** — relayed verbatim (id, file, full description, not paraphrased or pre-judged) and never resolved autonomously. This is the canonical worked precedent the whole Bounded-Judgment Ladder generalizes from (`sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §3.4).
 - `--yes` unattended consent for a Sergeant-coordinated run — the absolute-never reading, not the vendored gate skill's documented standing-consent exception (Conflict X3 below).
 
-**Resolved (issue #123):** this stage driving a `push`/`pr`/`ci` step a launched run's pipeline includes is not an authority gap. Push and PR-open create the review artifact; CI-run validates it; none of them merge anything. The sensitive action is merge, held structurally by this repository's own GitHub configuration (`allow_auto_merge: false`, no branch protection on `main`), not by this stage's own contract. Measured live twice before this finding (`docs/gauntlet/runs/path-to-mac-2026-08-15/retrospective.md` §3.1; `docs/gauntlet/runs/macbook-arrival-2026-08-15/retrospective.md` §3) and once more misdiagnosed after it (`docs/gauntlet/runs/icm-sprint-2026-08-16/retrospective.md` §3) before being correctly closed.
+**Resolved (issue #123):** this stage driving a `push`/`pr`/`ci` step a launched run's pipeline includes is not an authority gap. Push and PR-open create the review artifact; CI-run validates it; none of them merge anything. The sensitive action is merge, held structurally by this repository's own GitHub configuration (`allow_auto_merge: false`, no branch protection on `main`), not by this stage's own contract. Measured live twice before this finding (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/path-to-mac-2026-08-15/retrospective.md` §3.1; `sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/macbook-arrival-2026-08-15/retrospective.md` §3) and once more misdiagnosed after it (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-sprint-2026-08-16/retrospective.md` §3) before being correctly closed.
 
 ### Completion boundary
 This stage may complete only when every gate reaches exactly one response — auto-fix, no-op, or ask-user relayed and resolved by the user — and every actionable finding is routed to a deduplicated owning-repo task.
@@ -98,7 +98,7 @@ Each gate's own findings table (id, severity, action, disposition) is this stage
 
 ## Additional note
 
-This is the judgment stage of the whole corpus — see `reference-corpus/synthesis.md` §1's stage table annotation. Conflict X3 (synthesis.md §6): whether `--yes` unattended consent may ever be used is contested between an absolute-never reading and a documented standing-consent exception in the vendored gate skill; this draft follows the absolute-never reading for Sergeant-coordinated runs and preserves the exception as evidence, not as an instruction to follow.
+This is the judgment stage of the whole corpus — see `sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §1's stage table annotation. Conflict X3 (synthesis.md §6): whether `--yes` unattended consent may ever be used is contested between an absolute-never reading and a documented standing-consent exception in the vendored gate skill; this draft follows the absolute-never reading for Sergeant-coordinated runs and preserves the exception as evidence, not as an instruction to follow.
 
 ## Output
 

@@ -40,7 +40,7 @@ happened to share one mechanism. If normalizing a unit forces you to write
 "and" to keep it accurate, split it: assign a new `id` to the second half,
 have both halves cite the same `source.quote`/`quote_hash` (the span
 supports both), and note the split in each unit's `notes` (e.g. "split from
-BU-0042 at normalization; see BU-0042a/b").
+EX-0042 at normalization; see EX-0042a/b").
 
 ## What you are not doing here
 

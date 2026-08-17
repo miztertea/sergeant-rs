@@ -1,6 +1,6 @@
 # recover-stalled-worker — admitted workflow (N1 reference corpus,
-# docs/gauntlet/contracts/N1.md; candidate W11,
-# reference-corpus/synthesis.md §1). One bounded recovery attempt for a
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md; candidate W11,
+# sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md §1). One bounded recovery attempt for a
 # stalled worker: converge on a replacement or escalate — never guess.
 #
 # Three actor stages (§6.4, judgment); N1 adjudication A4 folded three
@@ -9,7 +9,7 @@
 # invocations — no engine change, no behavior unit dropped. Promoted per
 # docs/icm/promotion-spec-2026-08-11.md; behavior-unit citations and the
 # full adjudication record are archived at
-# docs/gauntlet/promoted-provenance/recover-stalled-worker.md.
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/recover-stalled-worker.md.
 
 [workflow]
 name = "recover-stalled-worker"

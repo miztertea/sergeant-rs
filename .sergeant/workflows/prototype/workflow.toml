@@ -1,5 +1,5 @@
 # prototype — admitted workflow (N1 candidate W21,
-# docs/gauntlet/contracts/N1.md). Builds a throwaway prototype (logic/state
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md). Builds a throwaway prototype (logic/state
 # or UI) to answer one design question, then captures the validated result
 # into production code.
 #
@@ -9,7 +9,7 @@
 # non-selected one a documented no-op for a given run, rather than a
 # conditional-stage schema extension). Promoted per
 # docs/icm/promotion-spec-2026-08-11.md; full behavior-unit citation trail
-# archived at docs/gauntlet/promoted-provenance/prototype.md.
+# archived at sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/prototype.md.
 
 [workflow]
 name = "prototype"

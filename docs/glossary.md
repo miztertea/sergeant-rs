@@ -11,7 +11,7 @@ second, later interview the same day, the "grill-with-docs" round
 vocabulary those ADRs use; read the ADR itself for the decision and its
 rationale.
 
-**Placement Ladder (PL).** `reference/proposal-icm-r-procedure-authority.md`'s
+**Placement Ladder (PL).** `sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md`'s
 eight-rung classification (PL-0 absorbed/obsolete through PL-7 engine gap)
 answering "what is the lowest-authority, smallest-surface representation
 that faithfully owns this behavior?" — applied to one source-cited
@@ -137,7 +137,7 @@ than kept.
 **No-spawn set.** The verbs that must never auto-spawn a daemon just to
 observe it, per `docs/adr/0009-auto-spawn-never-on-observation.md`'s D5:
 `sgt doctor`, `sgt watch`, `sgt daemon stop` (ruled first for `watch` by
-`docs/gauntlet/contracts/WATCH.md`'s R-WATCH-3), and now also `status`,
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/WATCH.md`'s R-WATCH-3), and now also `status`,
 `work show`/`list`/`transcript`/`retained`, `work reap`'s unconfirmed
 preview (its `--yes` disposal path still mutates and stays outside this
 set), `analytics`, and the TUI. Auto-spawn survives only on verbs that

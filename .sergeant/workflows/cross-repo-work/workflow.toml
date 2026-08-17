@@ -1,9 +1,9 @@
-# cross-repo-work — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# cross-repo-work — admitted workflow (N1, sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md,
 # candidate W7). Decomposes a requested outcome across the repositories
 # that own it and defines delivery order before any dispatch happens.
 # Promoted per docs/icm/promotion-spec-2026-08-11.md; full behavior-unit
 # citation trail archived at
-# docs/gauntlet/promoted-provenance/cross-repo-work.md.
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/cross-repo-work.md.
 #
 # Five ordinary actor stages (N1 adjudication A4 folded
 # 30-inspect-repository-state into 40-define-delivery-gates as a

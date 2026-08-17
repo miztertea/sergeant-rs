@@ -29,10 +29,8 @@ A four-way classification determines whether a port is needed at all.
 
 - **Seam discipline: one adapter is a hypothetical seam, not yet worth exposing; two adapters (typically production plus test) justify making the seam real.**
   (trigger: deciding whether a classification result actually justifies exposing a port; outcome: a port is only exposed once at least two adapters genuinely need it, not on the mere possibility of a future second one)
-  **Added 2026-08-16, ICM-R3**: extracted at N1, classified workflow-local, never actually written into this stage's contract until now.
 - **Internal seams (private, test-only) are not exposed through the public interface merely because tests happen to use them.**
   (trigger: deciding what belongs on the deepened module's public interface; outcome: test-only access points stay internal rather than leaking into the public contract)
-  **Added 2026-08-16, ICM-R3**: the same gap as the previous bullet.
 
 ## Bounded judgment
 

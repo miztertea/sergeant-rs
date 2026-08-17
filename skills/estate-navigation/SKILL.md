@@ -1,10 +1,14 @@
 ---
 name: estate-navigation
 description: Resolve an estate's declared repositories, groups, and health before acting in it, bring its working set up to date, register new repos/groups interactively, and file tracked work for gaps `sgt doctor` can't remedy — sergeant-rs's equivalent of upstream's sgt-context/sgt-sync/sergeant-setup.
+edition: 0.1.0
 ---
 
-Content ported from `reference/sergeant-upstream`'s core function map
-(`docs/gauntlet/notes/upstream-core-function-map-2026-08-11.md`): `sgt-context`
+Provenance for this skill's citation record lives in
+`sergeant-rs-workspace`'s `knowledge/evidence/provenance/skills.md`.
+
+Content ported from the upstream core function map
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/upstream-core-function-map-2026-08-11.md`): `sgt-context`
 ("emit a project's layered agent-instructions block... for session start")
 and `sgt-sync` ("clone missing / pull existing repos") were each ruled
 **SKILL** by owner pre-ruling — "pure config read, no worktree or Work state
@@ -14,9 +18,9 @@ project registry, `yq`-parsed, with `defaults → group → repo` instruction
 layering the harness composed itself) does not exist in sergeant-rs and is
 not re-created here; this skill teaches the equivalent judgment against
 sergeant-rs's actual estate model (`sergeant.toml`'s `[estate]`/`[[repo]]`/
-`[group.<name>]`, per `docs/gauntlet/contracts/MVP-1.md`).
+`[group.<name>]`, per `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`).
 
-**Extended at ICM-R2** (`docs/gauntlet/runs/icm-r2/sergeant-setup/
+**Extended at ICM-R2** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/sergeant-setup/
 adjudication-draft.md`) to absorb `sergeant-setup`'s two remaining live
 behaviors — interactive repo/group registration and capability-gap tracking
 — now that package retired. Both new sections below are live, Captain-
@@ -81,8 +85,8 @@ not a bug to work around.
 ## Registering repos and groups interactively
 
 When a user wants to set up or extend an estate rather than just navigate an
-existing one (former `sergeant-setup` `30-project-interview`,
-`BU-P5-024`'s transplantable fragment): ask, one at a time, waiting for each
+existing one (former `sergeant-setup` `30-project-interview`'s
+transplantable fragment): ask, one at a time, waiting for each
 answer:
 
 1. For each repository to add: its name, its clone origin URL (or confirm
@@ -100,7 +104,7 @@ answer:
 **What this does not cover, on purpose.** The retired interview also asked
 for per-repo role, a free-text `agent_instructions` block (default and per-
 group), and a project-level GitHub identity. None of these have a
-`sergeant.toml` field today (`docs/gauntlet/contracts/MVP-1.md` — the schema
+`sergeant.toml` field today (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md` — the schema
 has `[[repo]] instructions = "local" | "suppress"`, not free text, and no
 GitHub-identity or Graphify-path field at the estate level). Don't invent
 values for fields that don't exist; if a user asks for one of these, say
@@ -111,7 +115,7 @@ than fabricating a place to put the answer.
 
 When `sgt doctor` reports a failing check it names no remedy for, or a
 required/optional prerequisite is otherwise confirmed unsupported (former
-`sergeant-setup` `05-file-capability-gaps`, `BU-P5-012`): draft a `td` issue
+`sergeant-setup` `05-file-capability-gaps`): draft a `td` issue
 — title, description, acceptance criteria — and show it in full for explicit
 `y`/`yes` approval before creating it. On decline, do not create it; report
 the gap plainly (in the session or in the estate-health summary you're

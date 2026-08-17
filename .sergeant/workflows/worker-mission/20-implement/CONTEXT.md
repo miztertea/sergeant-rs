@@ -24,7 +24,7 @@ No behavior units are cited directly against this stage; its content is wholly d
 
 Whichever discipline `10-triage-and-route` selected, dispatched as its own separately-admitted Work rather than pulled in as inline text — collapsing a real, checkpointed workflow into this single stage's context would destroy the independent checkpoints and authority envelope each of these packages exists to protect (`docs/icm/convention.md` §4 rule 1; same correction `implement`'s own `code-review` delegation required at ICM-R3):
 
-- **`diagnose-bug`, `prototype`, `implement`, or `deepen-module`** — each a separately-admitted PL-4 workflow with its own settled placement. Dispatch the chosen one as its own Work (`proposal-next-iteration-icm-workflows.md` §7.7); true nested-workflow invocation is the eventual correct fix, filed as an engine-gap claim (`docs/gauntlet/runs/icm-r3/implement/draft/engine-gap-nested-workflow-invocation.md` — this stage's own delegation pattern is additional source evidence for that same filed claim, not a second claim).
+- **`diagnose-bug`, `prototype`, `implement`, or `deepen-module`** — each a separately-admitted PL-4 workflow with its own settled placement. Dispatch the chosen one as its own Work (`proposal-next-iteration-icm-workflows.md` §7.7); true nested-workflow invocation is the eventual correct fix, filed as an engine-gap claim (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/implement/draft/engine-gap-nested-workflow-invocation.md` — this stage's own delegation pattern is additional source evidence for that same filed claim, not a second claim).
 - **`tdd`** — applies `@@tdd` and `@@test-quality` (`.sergeant/common/contexts/`), the same as `implement/10-implement-with-tdd`. `tdd`'s own ICM-R3 REHOME is confirmed by owner ruling after independent review.
 
 ## Bounded judgment
@@ -41,7 +41,7 @@ Apply `@@bounded-judgment`.
 - None beyond ordinary tool mechanics.
 
 ### J0 — must become `needs_input`
-- **Seam confirmation**, when the `tdd` branch applies: `@@tdd` requires no test is written at an unconfirmed seam — stated here explicitly rather than left implicit, per the same hidden-dependency finding `implement/10-implement-with-tdd` closed (`BU-TDD-04`).
+- **Seam confirmation**, when the `tdd` branch applies: `@@tdd` requires no test is written at an unconfirmed seam — stated here explicitly rather than left implicit, per the same hidden-dependency finding `implement/10-implement-with-tdd` closed.
 - Substituting this stage's own judgment for a dispatched discipline's own reported outcome.
 
 ### Completion boundary

@@ -74,7 +74,7 @@ try the loop without spending tokens.
 
 The images below are from the M6-era minimal Fleet/Detail TUI, superseded
 by the T-series `Home / Fleet / Workflows / Estate` cockpit
-(`reference/proposal-tui-t-series.md`) — real terminal PNG captures of the
+(`sergeant-rs-workspace/knowledge/evidence/reference/proposal-tui-t-series.md`) — real terminal PNG captures of the
 current TUI are a pending follow-up (no real-terminal session was
 available to capture them from). `docs/tui-screenshots/*.txt` has honest,
 current renders in the meantime — actual `ratatui::TestBackend` output
@@ -110,7 +110,7 @@ sgt tui                   # Home/Fleet/Workflows/Estate cockpit, live over SSE
 sgt                       # no subcommand: a homepage — logo, quickstart, no daemon contact
 ```
 
-**Wait for it, instead of polling** (`docs/gauntlet/contracts/WATCH.md`):
+**Wait for it, instead of polling** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/WATCH.md`):
 
 ```sh
 sgt watch <id>                # block until this Work needs attention or ends, then print it
@@ -239,11 +239,11 @@ Every state change — submit, worktree binding, stage entry, each model turn's 
 
 This — the engine described above — is the core `sgt` carries; everything under `.sergeant/`, `AGENTS.md`, and this repo's own skills is the OS layered on top of it. The full destination for both halves, and the rulings that shape them, is [`NORTH-STAR.md`](NORTH-STAR.md).
 
-This is a clean-room Rust successor to [callmeradical/sergeant](https://github.com/callmeradical/sergeant) — the Bash/tmux original whose failure modes became this project's regression-test catalog. The architecture is specified in [a full proposal](reference/proposal-depot-rust-execution-surface.md) committed to this repo; the ICM workflow model layered on top of it is specified in [its successor](reference/proposal-next-iteration-icm-workflows.md); every deviation from either is registered with rationale in [GAUNTLET.md](GAUNTLET.md).
+This is a clean-room Rust successor to [callmeradical/sergeant](https://github.com/callmeradical/sergeant) — the Bash/tmux original whose failure modes became this project's regression-test catalog. The architecture is specified in [a full proposal](sergeant-rs-workspace/knowledge/evidence/reference/proposal-depot-rust-execution-surface.md) committed to this repo; the ICM workflow model layered on top of it is specified in [its successor](sergeant-rs-workspace/knowledge/evidence/reference/proposal-next-iteration-icm-workflows.md); every deviation from either is registered with rationale in [GAUNTLET.md](GAUNTLET.md).
 
 ## Status
 
-The core engine and CLI (journal, projections, the Backend boundary — Claude, fake, and Docker execute stages — the estate manifest, and every verb in "Using sgt day-to-day" above) are built and gated on `cargo test`; the workflow catalog and this file are the OS layer built on top of it, both converging toward the ship gate in [`NORTH-STAR.md`](NORTH-STAR.md)'s MVP plan. The complete development record — every milestone, every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md); the method that produced it is in [reference/notes/gauntlet-pattern.md](reference/notes/gauntlet-pattern.md).
+The core engine and CLI (journal, projections, the Backend boundary — Claude, fake, and Docker execute stages — the estate manifest, and every verb in "Using sgt day-to-day" above) are built and gated on `cargo test`; the workflow catalog and this file are the OS layer built on top of it, both converging toward the ship gate in [`NORTH-STAR.md`](NORTH-STAR.md)'s MVP plan. The complete development record — every milestone, every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md); the method that produced it is in [sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md](sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md).
 
 ## Contributors
 
@@ -255,7 +255,7 @@ cargo test --test m4_backends              # one suite
 SERGEANT_CLAUDE_TESTS=1 cargo test --test m4_backends -- --ignored   # opt-in: real claude CLI, bills tokens
 ```
 
-The record that governs how this project decides things: [`NORTH-STAR.md`](NORTH-STAR.md) (the destination and the rulings), [`GAUNTLET.md`](GAUNTLET.md) (the append-only ledger — deviation register, backlog, per-milestone scorecards), [`LESSONS.md`](LESSONS.md) (binding lessons from what went wrong), `docs/gauntlet/contracts/` (what each milestone actually promised), and [`docs/adr/`](docs/adr/README.md) (architecture decisions that fix a shape once, with [`docs/glossary.md`](docs/glossary.md) for the vocabulary they fix).
+The record that governs how this project decides things: [`NORTH-STAR.md`](NORTH-STAR.md) (the destination and the rulings), [`GAUNTLET.md`](GAUNTLET.md) (the append-only ledger — deviation register, backlog, per-milestone scorecards), [`LESSONS.md`](LESSONS.md) (binding lessons from what went wrong), `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/` (what each milestone actually promised), and [`docs/adr/`](docs/adr/README.md) (architecture decisions that fix a shape once, with [`docs/glossary.md`](docs/glossary.md) for the vocabulary they fix).
 
 ## Lineage & License
 

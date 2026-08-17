@@ -1,11 +1,19 @@
+---
+known_gap_refs:
+  - ref: domain-modeling
+    reason: cross-package materialization gap in the @@name shared-context catalog; only frozen upstream evidence exists, no .sergeant/common/contexts/domain-modeling.md yet
+  - ref: ticket-shaping
+    reason: same materialization gap; this package is the shared-by owner but has not yet materialized the file
+  - ref: triage-state-machine
+    reason: same materialization gap; this package is the shared-by owner but has not yet materialized the file
+---
+
 # Wayfinder
 Draft workflow package — candidate **W33** `wayfinder` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from frozen upstream evidence per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
-it is never delivered as a stage's instructions; each stage's own
-`CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
-§1a rule 5).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only — it is never delivered as a stage's
+instructions; each stage's own `CONTEXT.md` (Layer 2) is the actor's
+contract (`docs/icm/convention.md` §1a rule 5).
 
 ## Purpose
 
@@ -65,7 +73,7 @@ by a bare id, number, or slug. The id and URL ride inside the name, never
 stand in for it.
 
 This package is also the shared-by owner of `@@ticket-shaping` and
-`@@triage-state-machine` (`reference-corpus/shared-context-map.md` Part 2).
+`@@triage-state-machine` (`sergeant-rs-workspace/knowledge/evidence/reference-corpus/shared-context-map.md` Part 2).
 As with `@@domain-modeling` above, no `.sergeant/common/contexts/
 {ticket-shaping,triage-state-machine}.md` file exists in this repo yet —
 only frozen upstream evidence; this is a cross-package materialization gap
@@ -74,8 +82,8 @@ package.
 
 ## Notes for reviewers
 
-**N1 adjudication A4:** the former `20-create-tickets` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-map-frontier` as a helper invocation. `30-resolve-one`'s upstream Inputs pointer moves to `10-map-frontier`. No renumbering: `00`, `10`, `30`, `40` remain correctly ordered without `20`. See `docs/gauntlet/promoted-provenance/wayfinder.md`'s "Adjudication A4" section.
+**N1 adjudication A4:** the former `20-create-tickets` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-map-frontier` as a helper invocation. `30-resolve-one`'s upstream Inputs pointer moves to `10-map-frontier`. No renumbering: `00`, `10`, `30`, `40` remain correctly ordered without `20`. See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/wayfinder.md`'s "Adjudication A4" section.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/wayfinder.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/wayfinder.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.

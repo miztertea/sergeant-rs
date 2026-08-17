@@ -29,14 +29,14 @@ confirm what looks reasonable at a glance.
 
 ## The blindness rule still applies to you
 
-This run's actors — including this stage — are blind to `reference-corpus/`
+This run's actors — including this stage — are blind to `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`
 for the entire run (`../00-contract`'s exclusion record is why it should
 never have entered scope downstream). **Do not open, grep the contents of,
-or read anything under `reference-corpus/`.** Your job is to challenge this
+or read anything under `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`.** Your job is to challenge this
 run's own internal consistency and evidentiary rigor, not to check it
 against a gold answer — that comparison is a separate process performed
 later, by different comparers, outside this workflow
-(`docs/gauntlet/contracts/N2.md` Outcome §3). Performing it here would both
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md` Outcome §3). Performing it here would both
 contaminate this run's own record and short-circuit the actual measurement
 this workflow exists to support. One of your checks (below) is specifically
 to verify no earlier stage crossed this line — that check does not require
@@ -129,13 +129,13 @@ against every candidate package `../60-draft` materialized:
    rung-specific reasoning and `observable_acceptance_test` for a checkable
    scenario; disqualify anything reading as "would be convenient."
 4. **Structural self-consistency** — three checks this stage can run
-   entirely blind, no `reference-corpus/` needed: recompute every
+   entirely blind, no `sergeant-rs-workspace/knowledge/evidence/reference-corpus/` needed: recompute every
    cross-artifact count rather than trusting a stated headline number;
    recompute `quote_hash` directly over each sampled record's *stored*
    `quote` field, not only over a re-located source span; sanity-check the
    `representation` distribution against the ladder's own shape. N2 run 2's
    own review pass missed all three while otherwise being genuinely
-   effortful (`docs/gauntlet/runs/n2-run2/comparison-c1-coverage-recall.md`
+   effortful (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-c1-coverage-recall.md`
    §4.1, `comparison-scorecard.md` D-1/D-6,
    `grammar-pressure-report.md` GP-6) — see
    `references/challenge-checklist.md` Axis 4 for the exact method.

@@ -45,7 +45,7 @@ Apply `@@bounded-judgment`.
 - None beyond ordinary tool mechanics — every response to `branch_sync` is a named, structured path (J2); nothing here is a local improvisation.
 
 ### J0 — must become `needs_input`
-- **A dirty or diverged worktree blocks recovery and the offered structured choices (`--keep-local` or the anchored `refs/no-mistakes/recover/<run>` ref) don't resolve which to pick without more context**.
+- **A dirty or diverged worktree blocks recovery and the offered structured choices (`--keep-local` or the anchored `refs/no-mistakes/recover/<run>` ref) don't resolve which to pick without more context.**
 - Any temptation to reset, stash, force-push, or replace the branch to escape a blocked sync — never an available response; if the structured choices don't cover the situation, that is itself the `needs_input` condition.
 
 ### Completion boundary

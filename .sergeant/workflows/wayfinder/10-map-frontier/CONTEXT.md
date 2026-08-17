@@ -38,7 +38,7 @@ Demoted from a standalone stage (`20-create-tickets`) at N1 adjudication A4: its
 
 ## Helper invocation: map and ticket structure
 
-The structural mechanics the map and its tickets depend on, extracted at N1 and already classified as this package's own workflow-local helper content (`reference-corpus/helper-map.md` "Workflow-local helpers") but never landed in this stage until now:
+The structural mechanics the map and its tickets depend on, extracted at N1 and already classified as this package's own workflow-local helper content (`sergeant-rs-workspace/knowledge/evidence/reference-corpus/helper-map.md` "Workflow-local helpers") but never landed in this stage until now:
 
 - **The map is a single issue on the repo's issue tracker, labelled `wayfinder:map`; its tickets are child issues of the map.**
 - **The map is an index, not a store: it lists decisions made and points at the tickets that hold their detail, gisting and linking rather than restating.**

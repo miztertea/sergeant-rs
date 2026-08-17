@@ -1,4 +1,0 @@
-[workflow]
-name = "review-finding-routing"
-version = "1"
-stages = ["01-route-finding", "02-reconcile-hand-edit"]

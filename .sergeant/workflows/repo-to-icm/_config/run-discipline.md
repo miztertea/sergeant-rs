@@ -17,16 +17,15 @@ stage contract actually points at.
 ## 1. The blindness rule
 
 If this run's purpose is **measurement** — comparing generated output
-against an already-adjudicated reference decomposition (as in the N2
-measurement run against `reference/sergeant-upstream`, graded against
-`reference-corpus/`) — then for the entire run, every stage's actor is
-**blind to `reference-corpus/`**: never open it, never grep it, never let
+against an already-adjudicated reference decomposition, graded against
+`sergeant-rs-workspace/knowledge/evidence/reference-corpus/` — then for the entire run, every stage's actor is
+**blind to `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`**: never open it, never grep it, never let
 it enter a prompt, never let a helper's output surface its contents. This
 is not a preference; contaminating the run with the answer key invalidates
-the measurement it exists to produce (`docs/gauntlet/contracts/N2.md`
+the measurement it exists to produce (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md`
 Outcome §2). A stage that needs to check its own output's shape uses
-`../scripts/validate-structure.py`, never `reference-corpus/lint.py` or any
-file under `reference-corpus/` — those are the graders' tools, applied
+`../scripts/validate-structure.py`, never `sergeant-rs-workspace/knowledge/evidence/reference-corpus/lint.py` or any
+file under `sergeant-rs-workspace/knowledge/evidence/reference-corpus/` — those are the graders' tools, applied
 *after* this run completes, by a separate comparison process this
 workflow's actors do not perform. If a stage's actor is ever tempted to
 peek "just to check the shape," that temptation is itself the signal to

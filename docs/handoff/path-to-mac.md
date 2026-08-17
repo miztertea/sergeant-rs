@@ -38,7 +38,7 @@ hardware to settle.
 None of this is build work — it's measurement. Do not reach for `fs4` /
 `sysinfo` / `directories` to replace any of #18/#81/#82's hand-rolled code;
 that premise was already raised and rejected this sprint
-(`docs/gauntlet/runs/path-to-mac-2026-08-15/adjudication.md`,
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/path-to-mac-2026-08-15/adjudication.md`,
 `src/platform/disk.rs:1-21`). A change that re-litigates that ruling must
 argue it's wrong, not merely note the hand-rolled code exists (**L3**).
 

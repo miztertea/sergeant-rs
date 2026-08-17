@@ -1,8 +1,7 @@
 # Diagnose Bug
 Draft workflow package — candidate **W20** `diagnose-bug` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only —
 it is never delivered as a stage's instructions; each stage's own
 `CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
 §1a rule 5).
@@ -35,12 +34,12 @@ This workflow receives an already-admitted Work intent (a reported defect to dia
 - Whether the fix implicates an architectural finding worth recording (`60-cleanup-and-postmortem`).
 
 ### Workflow may not decide
-- Proceeding past `10-build-feedback-loop` without a red-capable loop, or asking the user instead — J0 (`BU-P2-028`).
-- Proceeding past `20-reproduce-and-minimize` without both reproduction and minimization — J5 gate (`BU-P2-036`).
-- Skipping a phase without explicit justification (`reference/sergeant-upstream/.agents/skills/diagnosing-bugs/SKILL.md` line 8 — corrected 2026-08-16, ICM-R3: the prior citation for this constraint, `BU-P2-019`, bundles two non-contiguous upstream spans — front-matter line 3 and body line 8 — under one locator; the phase-skipping discipline itself is on line 8 only).
+- Proceeding past `10-build-feedback-loop` without a red-capable loop, or asking the user instead — J0.
+- Proceeding past `20-reproduce-and-minimize` without both reproduction and minimization — J5 gate.
+- Skipping a phase without explicit justification (corrected 2026-08-16, ICM-R3: the prior citation for this constraint bundled two non-contiguous upstream spans — front-matter line 3 and body line 8 — under one locator; the phase-skipping discipline itself is on line 8 only).
 
 ### Human or Captain gates
-- Phase 3's ranked-hypothesis display — advisory and non-blocking by the package's own text (`BU-P2-039`).
+- Phase 3's ranked-hypothesis display — advisory and non-blocking by the package's own text.
 - `10-build-feedback-loop`'s J0 escalation when no loop can be built.
 
 ### Decision record
@@ -52,4 +51,4 @@ Proposal §8.2's "strong low-ambiguity reference workflow" assessment holds — 
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/diagnose-bug.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 correction: the prior text pointed at a workflow-local `provenance.md` that does not exist under `.sergeant/workflows/diagnose-bug/`.)
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/diagnose-bug.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 correction: the prior text pointed at a workflow-local `provenance.md` that does not exist under `.sergeant/workflows/diagnose-bug/`.)

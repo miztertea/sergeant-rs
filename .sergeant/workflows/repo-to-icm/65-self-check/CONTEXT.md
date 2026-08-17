@@ -10,7 +10,7 @@
 
 This is a `kind = "execute"` stage (`workflow.toml`), not an actor turn —
 sergeant launches a pinned container directly, no harness/model involved,
-per N4 (`docs/gauntlet/contracts/N4.md` §11.2/§12.3). Its job is exactly
+per N4 (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N4.md` §11.2/§12.3). Its job is exactly
 what `70-lint`'s own "How to do it" step 6 used to ask an actor to do by
 hand: run `../scripts/validate-structure.py` with no path argument (the
 admitted-mode self-check, validating this workflow's own tree as it sits

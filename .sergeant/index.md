@@ -14,13 +14,13 @@ workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 the 2 R-NS-6-dissolved `grilling`/`grill-with-docs` — to `skills/`
 (operator skills, this repository's canonical skill root) or to
 `docs/icm/re-homing-record-2026-08-12.md` (CLI-verb candidates and engine
-gaps). ICM-R2 retirements (`docs/gauntlet/runs/icm-r2/`,
+gaps). ICM-R2 retirements (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/`,
 `docs/adr/0013-icm-r0-owner-rulings.md`): `task-intake-and-route`
 (ABSORBED — every behavior already duplicated on an already-published
 surface), `sergeant-setup` (SPLIT — folded into
 `skills/estate-navigation/SKILL.md` and `AGENTS.md`'s Guardrails),
 `direct-implementation` (HARVEST — folded into `AGENTS.md`'s "When NOT to
-use `sgt`"). ICM-R3 retirements (`docs/gauntlet/runs/icm-r3/`, all 16
+use `sgt`"). ICM-R3 retirements (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/`, all 16
 remaining unreconciled packages processed): `tdd` (REHOME — folded into
 `.sergeant/common/contexts/tdd.md` and `test-quality.md` as shared
 contexts, since it named only two stages and was a technique, not a
@@ -33,7 +33,7 @@ ICM-R3 packages (`implement`, `worker-mission`, `diagnose-bug`,
 `resolving-merge-conflicts`, `vet-external-skill`, `recover-stalled-
 worker`, `cross-repo-work`, `to-tickets`) all reached STAND, gaining the
 Authority-envelope/Bounded-judgment doctrine plus per-package in-place
-fixes; see each package's own `docs/gauntlet/runs/icm-r3/<pkg>/
+fixes; see each package's own `sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/<pkg>/
 adjudication-draft.md` for its diff. Provenance for every retired package
 is preserved in git history.
 

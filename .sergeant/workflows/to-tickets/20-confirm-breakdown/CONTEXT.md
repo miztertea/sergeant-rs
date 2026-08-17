@@ -20,7 +20,6 @@ Granularity, ownership and blocking edges are confirmed unless immediate publica
 
 - **Unless the user explicitly asked to publish immediately, present the proposed ticket breakdown first and ask only whether granularity, ownership, and blocking edges are correct -- do not re-ask about decisions already made.**
   (trigger: a candidate ticket breakdown has been drafted; outcome: the user confirms structural correctness before tickets are published)
-  — `BU-P4-068`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Confirm the Breakdown, L100-109)
 
 ## Ticket quality rules
 
@@ -32,38 +31,30 @@ pass's own scope excluded landing content in workflows — a promotion gap,
 not a placement error.
 
 - **Prefer vertical slices that produce independently verifiable behavior when drafting tickets.**
-  — `BU-1297`, `docs/icm/agents-invariant-dispositions.md` (line 197)
 - **Keep each ticket small enough for one fresh agent context.**
-  — `BU-1298`, `docs/icm/agents-invariant-dispositions.md` (line 198)
 - **Assign exactly one owning repository to each implementation ticket.**
-  — `BU-1299`, `docs/icm/agents-invariant-dispositions.md` (line 199)
 - **Use expand-migrate-contract for mechanical changes that cannot remain green as a vertical slice.**
-  — `BU-1301`, `docs/icm/agents-invariant-dispositions.md` (line 201)
 - **Create epics for coherent programs of work, not as substitutes for executable tickets.**
-  — `BU-1302`, `docs/icm/agents-invariant-dispositions.md` (line 202)
 - **Never duplicate an existing task tracker task or GitHub issue.**
-  — `BU-1303`, `docs/icm/agents-invariant-dispositions.md` (line 203)
 - **Preserve stable finding IDs such as `RBAC-P1-004` or `DATA-P0-002` in ticket titles.**
-  — `BU-1304`, `docs/icm/agents-invariant-dispositions.md` (line 204)
 - **A ticket is not ready unless its acceptance criteria are observable and its blockers are accurate.**
-  — `BU-1305`, `docs/icm/agents-invariant-dispositions.md` (line 205)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J4 — explicit user or bound Work decision
-- The user's own explicit "publish immediately" request governs whether to ask for confirmation at all (`BU-P4-068`).
+- The user's own explicit "publish immediately" request governs whether to ask for confirmation at all.
 
 ### J2 — delegated to this stage
-- How to present the breakdown for confirmation (`BU-P4-068`).
+- How to present the breakdown for confirmation.
 - Applying the ticket quality rules above to judge granularity, ownership, and readiness.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
 
 ### J0 — must become `needs_input`
-- A candidate ticket cannot be cleanly assigned a single owning repository (`BU-1299` conflicts with an irreducibly cross-repo unit of work).
+- A candidate ticket cannot be cleanly assigned a single owning repository (conflicts with an irreducibly cross-repo unit of work).
 - A publish operation partially fails (e.g. an epic and some tickets are created, then a later dependency call fails), leaving an internally-inconsistent dependency graph: report the partial state and stop rather than guessing whether to roll back or continue.
 
 ### Completion boundary
@@ -80,10 +71,8 @@ Demoted from a standalone stage (`30-publish`) at N1 adjudication A4: its only s
 
 - **Do not mark newly published tasks in_progress; that transition belongs to dispatch or the worker that later starts the work. New tickets remain open until execution actually begins.**
   (trigger: tickets/epics are being published to td; outcome: ticket status accurately reflects that planning, not execution, has occurred)
-  — `BU-P4-070`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Publish to td, L155)
 - **td dependencies are repository-local; for cross-repository blockers, record the counterpart repo/ticket id and exact merge order in both descriptions/logs rather than inventing a native dependency edge td cannot enforce across separate databases.**
   (trigger: a ticket is blocked by a ticket in a different repository's td database; outcome: cross-repo blocking is tracked honestly as a documented convention, not a fabricated native edge)
-  — `BU-P4-071`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Publish to td, L149-153); also `BU-1300`, `docs/icm/agents-invariant-dispositions.md` (line 200) — the same rule, cited for completeness of the corpus's own citation trail.
 
 ## Output
 

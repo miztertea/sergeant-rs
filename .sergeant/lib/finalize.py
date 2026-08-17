@@ -2,7 +2,7 @@
 """finalize.py — the shared D9 disposition finalize helper (R-MVP1-2).
 
 Layer 3 (`_config`-adjacent) deterministic machinery. R-MVP1-2
-(`docs/gauntlet/contracts/MVP-1.md`) ruled that promote/finalize EXECUTION
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`) ruled that promote/finalize EXECUTION
 is workflow content, not an engine concern: "the workflow's closing actor
 stage invokes a deterministic shared finalize helper; the engine learns no
 output vocabulary." This is that helper — generalized out of
@@ -88,7 +88,7 @@ output could not be resolved unambiguously, or if the evidence-preservation
 guard below refuses (nothing is modified in either case), 2 on a
 usage/environment error.
 
-EVIDENCE-PRESERVATION GUARD (GP-5b; docs/gauntlet/runs/n2-run2/
+EVIDENCE-PRESERVATION GUARD (GP-5b; sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/
 grammar-pressure-report.md GP-5b; issue #29)
 -----------------------------------------------------------------------------
 `docs/icm/convention.md` §1a's D9 disposition rule promises that

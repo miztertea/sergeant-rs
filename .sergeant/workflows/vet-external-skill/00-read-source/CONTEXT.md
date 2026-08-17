@@ -20,14 +20,13 @@ The external skill's complete SKILL.md and referenced scripts are read before ad
 
 - **Read the external skill's complete SKILL.md and referenced scripts before adopting it.**
   (trigger: vet-external-skill workflow entered; outcome: the skill's full instructions and scripts are read, not sampled)
-  — `BU-P1-120`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L126, vet step 1)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- What counts as a "referenced script" — following the skill's own reference graph to completion rather than reading only the top-level file (`BU-P1-120`).
+- What counts as a "referenced script" — following the skill's own reference graph to completion rather than reading only the top-level file.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

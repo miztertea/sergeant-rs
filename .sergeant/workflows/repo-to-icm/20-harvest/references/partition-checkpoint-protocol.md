@@ -4,7 +4,7 @@ Layer 3 (stable across runs), local to `20-harvest`. States how this stage
 crosses more than one actor turn/attempt when `10-inventory`'s partition set
 does not fit in one turn, without an engine change and without losing or
 duplicating coverage. Written against GP-1's adjudicated disposition
-(`docs/gauntlet/runs/n2-run2/grammar-pressure-report.md`) — see
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/grammar-pressure-report.md`) — see
 `../../CONTEXT.md`'s "v2: how `20-harvest` handles volume" for the choice
 this protocol implements and the alternative it rejects.
 
@@ -13,7 +13,7 @@ this protocol implements and the alternative it rejects.
 `output/` is Git-tracked on this run's Work branch and persists across a
 stage retry (`sgt retry` re-enters a stage as a fresh execution — fresh
 actor turn, fresh context window — against the artifacts already on disk;
-`docs/gauntlet/runs/n2-run2/grammar-pressure-report.md` GP-1 R1 measured
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/grammar-pressure-report.md` GP-1 R1 measured
 this working in run 2's own journal). So a stage that stops partway through
 its work, having durably recorded exactly how far it got, can be resumed by
 a **later, independent attempt of the same stage** picking up where the
@@ -31,8 +31,8 @@ recorded there:
 ```text
 | Partition | Status | Unit id range | Notes |
 |---|---|---|---|
-| root-level agent instructions | done | BU-0001–BU-0023 | |
-| bin: fleet dispatch & lifecycle (dispatch) | done | BU-0024–BU-0041 | |
+| root-level agent instructions | done | EX-0001–EX-0023 | |
+| bin: fleet dispatch & lifecycle (dispatch) | done | EX-0024–EX-0041 | |
 | bin: fleet dispatch & lifecycle (recovery) | pending | | not reached this attempt |
 ```
 
@@ -109,7 +109,7 @@ partition:
   someone (a human operator, or an orchestrating caller of this Work) needs
   to notice it and cause another attempt of this stage. `sgt retry` is
   **not** that mechanism (fixes #53; measured at N2 run 4, 2026-08-11,
-  `docs/gauntlet/notes/n2-fake-backend-semantics.md`): retry is only legal
+  `sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/n2-fake-backend-semantics.md`): retry is only legal
   against a failed/blocked/waiting stage, and this stage is neither —
   issuing it against a held or freshly-ended stage is refused (409 under
   the fake-held harness) or has no state left to act on (under a real

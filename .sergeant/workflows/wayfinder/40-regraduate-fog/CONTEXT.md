@@ -33,7 +33,7 @@ Apply `@@bounded-judgment`.
 - An effort's own Notes may explicitly override the plan-don't-do default to carry execution into the map; the stage honors this without reconfirming it.
 
 ### J5 — governing constraint
-- G7 (dynamic ticket graph, dynamically-discovered checkpoint graph) is closed — the loop back to `10-map-frontier` is represented as fresh re-invocation, not engine-level looping (`reference-corpus/synthesis.md` §5).
+- G7 (dynamic ticket graph, dynamically-discovered checkpoint graph) is closed — the loop back to `10-map-frontier` is represented as fresh re-invocation, not engine-level looping (`sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §5).
 
 ### J2 — delegated to this stage
 - None beyond the plan-don't-do default itself, which is J4/J5 as above.
@@ -52,7 +52,7 @@ The map's Not yet specified section is this stage's own durable record of what f
 
 ## Additional note
 
-The loop from this stage back to `10-map-frontier` is exactly the shape engine-gap **G7** (dynamically-discovered checkpoint graph) claimed as requiring new runtime machinery. G7 was **rejected** (`reference-corpus/synthesis.md` §5): the claim's own "why it fails" for the external-tracker rung was an ownership preference, not a representational failure — Wayfinder is faithfully represented today at the shared-context/helper rung with the issue tracker as the durable store, including the claim primitive. This draft represents the loop as re-invocation: completing this stage with fog remaining resubmits the workflow (a fresh Work) rather than the engine looping a pinned stage sequence.
+The loop from this stage back to `10-map-frontier` is exactly the shape engine-gap **G7** (dynamically-discovered checkpoint graph) claimed as requiring new runtime machinery. G7 was **rejected** (`sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §5): the claim's own "why it fails" for the external-tracker rung was an ownership preference, not a representational failure — Wayfinder is faithfully represented today at the shared-context/helper rung with the issue tracker as the durable store, including the claim primitive. This draft represents the loop as re-invocation: completing this stage with fog remaining resubmits the workflow (a fresh Work) rather than the engine looping a pinned stage sequence.
 
 ## Output
 

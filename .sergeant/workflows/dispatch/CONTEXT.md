@@ -1,11 +1,9 @@
 # Dispatch
 Draft workflow package — candidate **W8** `dispatch` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
-it is never delivered as a stage's instructions; each stage's own
-`CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
-§1a rule 5).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only — it is never delivered as a stage's
+instructions; each stage's own `CONTEXT.md` (Layer 2) is the actor's
+contract (`docs/icm/convention.md` §1a rule 5).
 
 ## Purpose
 
@@ -48,13 +46,13 @@ Material decisions are recorded per-stage in each stage's own output artifact.
 
 ## No `sgt dispatch` verb (skew-check-2026-08-17 finding 3)
 
-Every stage in this package phrases behavior as "sgt-dispatch does X" / "sgt-dispatch must Y," citing the upstream bash tool this package decomposes (`reference/sergeant-upstream/bin/sgt-dispatch`) being folded into behavior units. **`sgt` has no `dispatch` verb, hyphenated or otherwise** — confirmed by `sgt --help` (top-level verb list: `daemon`, `status`, `run`, `work`, `respond`, `retry`, `extend`, `cancel`, `watch`, `analytics`, `tui`, `doctor`, `init`, `repo`, `group`, `claude`, `codex`, `opencode`, `goose` — no `dispatch`, no `harness`) and by running `sgt dispatch --help` directly (`error: unrecognized subcommand 'dispatch'`). Wherever a stage says "sgt-dispatch," read it as upstream-tool provenance for the behavior unit, never as a present-tense `sgt` CLI invocation.
+Every stage in this package phrases behavior as "sgt-dispatch does X" / "sgt-dispatch must Y," naming the upstream bash tool this package decomposes. **`sgt` has no `dispatch` verb, hyphenated or otherwise** — confirmed by `sgt --help` (top-level verb list: `daemon`, `status`, `run`, `work`, `respond`, `retry`, `extend`, `cancel`, `watch`, `analytics`, `tui`, `doctor`, `init`, `repo`, `group`, `claude`, `codex`, `opencode`, `goose` — no `dispatch`, no `harness`) and by running `sgt dispatch --help` directly (`error: unrecognized subcommand 'dispatch'`). Wherever a stage says "sgt-dispatch," read it as upstream-tool provenance for the behavior unit, never as a present-tense `sgt` CLI invocation.
 
 The one thing `sgt-dispatch` names that this package genuinely needs a concrete mapping for — running this workflow at all — is `sgt run --workflow dispatch`. That mapping is mechanical and works today (see finding 3's own caveat about a fresh estate 422ing on any non-default workflow name, engine gap tracked separately as skew-check finding 6 / issue #165 — not this package's concern to fix).
 
 ## Relationships to other workflows
 
-**Corrected 2026-08-16, ICM-R3 (BU-DISP-15):** neither of the two packages named below exists in this repository — both are open, unbuilt engine gaps, not live delegations.
+**Corrected 2026-08-16, ICM-R3:** neither of the two packages named below exists in this repository — both are open, unbuilt engine gaps, not live delegations.
 
 - `15-check-admission` holds and releases the fleet-wide admission lock itself, across exactly one durable side effect — it does not delegate to a `drain-fleet` workflow (unbuilt, engine-gap G4).
 - `80-monitor` delivers escalation responses via the shipped `sgt respond` command / `POST /v1/work/{id}/input` — it does not delegate to a `respond-to-worker` workflow (unbuilt).
@@ -89,10 +87,10 @@ detail), which does not reduce under §6.3's test. Stage count dropped from
 A4" section and each surviving stage's "Helper invocations" section for the
 full disposition.
 
-**Obsolete-mechanism stress test (§8.2).** The `dispatch` skill's tmux/sentinel/worker-Bash machinery (pane identity, pane-as-notification-channel, pane-as-liveness-signal, the nudge loop) carried none of the stage boundaries above — see `reference-corpus/synthesis.md` §4 clusters M1–M4 for the mechanism-vs-policy separation. What survived: preflight-before-side-effect, all-or-nothing tracked-work creation, one canonical intent revision, durable brief delivery, intended→confirmed launch evidence, per-repo failure recorded rather than silent. Worker-contract content this workflow *authors* but does not itself execute (BU-P5-075/076/078/079/080/081/082/083/084/085/086/089, plus BU-P5-150/151/152/153 routed here at N1 verifier round 2 finding V3) is the input to `worker-mission` and `route-review-findings`.
+**Obsolete-mechanism stress test (§8.2).** The `dispatch` skill's tmux/sentinel/worker-Bash machinery (pane identity, pane-as-notification-channel, pane-as-liveness-signal, the nudge loop) carried none of the stage boundaries above — see `sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §4 clusters M1–M4 for the mechanism-vs-policy separation. What survived: preflight-before-side-effect, all-or-nothing tracked-work creation, one canonical intent revision, durable brief delivery, intended→confirmed launch evidence, per-repo failure recorded rather than silent. Worker-contract content this workflow *authors* but does not itself execute (routed here at N1 verifier round 2 finding V3) is the input to `worker-mission` and `route-review-findings`.
 
-Reviewers originally flagged this as the corpus's largest single cluster (63 units, 12 stages) — see `reference-corpus/synthesis.md` §8 note 1: either it is genuinely one procedure with twelve checkpoints, or it should split at `70-launch-and-record` into a plan-and-validate workflow and a launch-fleet workflow. A4's de-staging sweep (above) addresses the size concern from a different angle than a workflow split — the checkpoint count actually requiring independent judgment turns out to be five, not twelve. Whether `80-monitor`'s post-fold breadth still argues for a plan-and-validate / launch-fleet split remains an open question for the classification ledger; not resolved here.
+Reviewers originally flagged this as the corpus's largest single cluster (63 units, 12 stages) — see `sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §8 note 1: either it is genuinely one procedure with twelve checkpoints, or it should split at `70-launch-and-record` into a plan-and-validate workflow and a launch-fleet workflow. A4's de-staging sweep (above) addresses the size concern from a different angle than a workflow split — the checkpoint count actually requiring independent judgment turns out to be five, not twelve. Whether `80-monitor`'s post-fold breadth still argues for a plan-and-validate / launch-fleet split remains an open question for the classification ledger; not resolved here.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/dispatch.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 correction: the prior text pointed at a workflow-local `provenance.md` that does not exist under `.sergeant/workflows/dispatch/`.)
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/dispatch.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 correction: the prior text pointed at a workflow-local `provenance.md` that does not exist under `.sergeant/workflows/dispatch/`.)

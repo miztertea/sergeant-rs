@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test-finalize-disposition.py — R-MVP1-2's own pin test.
 
-`docs/gauntlet/contracts/MVP-1.md`, R-MVP1-2's pin: "A fake run of a
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`, R-MVP1-2's pin: "A fake run of a
 two-stage workflow with one `evidence` and one `promote` output leaves only
 the promoted file on the retained branch, the removal in branch history;
 reverting the closing-stage instruction leaves the evidence file (L7)."
