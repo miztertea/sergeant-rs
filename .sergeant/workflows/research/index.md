@@ -4,7 +4,8 @@ name: research
 status: published
 version: 2
 description: >-
-  Investigate a question against high-trust primary sources and capture the findings as a Markdown file in the repo.
+  Investigate a question against high-trust primary sources and capture
+the findings as a Markdown file in the repo.
 tags:
   - research
   - investigation
@@ -15,8 +16,8 @@ tags:
 
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/research.md` — this package's `BU-####`
-citations and `reference/sergeant-upstream/` paths were stripped from the
+`knowledge/evidence/provenance/research.md` — this package's provenance
+markers were stripped from the
 shipped template content below; the record of why each rule exists did not
 move with them.
 

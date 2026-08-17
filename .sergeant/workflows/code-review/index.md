@@ -4,7 +4,8 @@ name: code-review
 status: published
 version: 2
 description: >-
-  Review a diff on two parallel, non-contaminating axes — Standards and Spec — via isolated sub-reviews, reported side by side.
+  Review a diff on two parallel, non-contaminating axes — Standards and
+Spec — via isolated sub-reviews, reported side by side.
 tags:
   - review
   - quality
@@ -13,10 +14,9 @@ tags:
 
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/code-review.md` — this package's `BU-####`
-citations and `reference/sergeant-upstream/` paths were stripped from the
-shipped template content below; the record of why each rule exists did
-not move with them.
+`knowledge/evidence/provenance/code-review.md` — provenance markers were
+stripped from the shipped template content
+below; the record of why each rule exists did not move with them.
 
 # Code Review
 

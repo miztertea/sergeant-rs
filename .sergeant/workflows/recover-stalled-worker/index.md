@@ -4,7 +4,8 @@ name: recover-stalled-worker
 status: published
 version: 2
 description: >-
-  One bounded recovery attempt for a stalled worker: converge on a replacement or escalate — never guess.
+  One bounded recovery attempt for a stalled worker: converge on a
+replacement or escalate — never guess.
 tags:
   - worker
   - recovery
@@ -16,7 +17,7 @@ tags:
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
 `knowledge/evidence/provenance/recover-stalled-worker.md` — this package's
-`BU-####` citations and `reference/sergeant-upstream/` paths were stripped
+provenance markers were stripped
 from the shipped template content below; the record of why each rule
 exists did not move with them.
 

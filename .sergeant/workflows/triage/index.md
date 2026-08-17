@@ -4,7 +4,9 @@ name: triage
 status: published
 version: 3
 description: >-
-  Work through the attention queue: gather context, verify claims, recommend a disposition, and apply the terminal outcome with its required artifact.
+  Work through the attention queue: gather context, verify claims,
+recommend a disposition, and apply the terminal outcome with its required
+artifact.
 tags:
   - triage
   - queue-management
@@ -12,10 +14,9 @@ tags:
 
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/triage.md` — this package's `BU-####`
-citations and `reference/sergeant-upstream/` paths were stripped from the
-shipped template content below; the record of why each rule exists did
-not move with them.
+`knowledge/evidence/provenance/triage.md` — provenance markers were
+stripped from the shipped template content
+below; the record of why each rule exists did not move with them.
 
 # Triage
 

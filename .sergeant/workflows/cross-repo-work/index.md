@@ -4,7 +4,10 @@ name: cross-repo-work
 status: published
 version: 2
 description: >-
-  Decompose a requested outcome across repositories and define delivery order: produce a plan in which every required behavior has exactly one owning repository, an acyclic dependency position, a brief, and acceptance evidence — before any dispatch happens.
+  Decompose a requested outcome across repositories and define delivery
+order: produce a plan in which every required behavior has exactly one
+owning repository, an acyclic dependency position, a brief, and acceptance
+evidence — before any dispatch happens.
 tags:
   - multi-repository
   - planning
@@ -15,7 +18,7 @@ tags:
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
 `knowledge/evidence/provenance/cross-repo-work.md` — this package's
-`BU-####` citations and `reference/sergeant-upstream/` paths were stripped
+provenance markers were stripped
 from the shipped template content below; the record of why each rule
 exists did not move with them.
 

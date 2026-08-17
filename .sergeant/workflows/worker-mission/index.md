@@ -4,7 +4,8 @@ name: worker-mission
 status: published
 version: 2
 description: >-
-  From a rendered brief, produce a merged-ready change with evidence — the contract a dispatched worker delivers against.
+  From a rendered brief, produce a merged-ready change with evidence — the
+contract a dispatched worker delivers against.
 tags:
   - worker
   - software-change
@@ -16,7 +17,7 @@ tags:
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
 `knowledge/evidence/provenance/worker-mission.md` — this package's
-`BU-####` citations and `reference/sergeant-upstream/` paths were stripped
+provenance markers were stripped
 from the shipped template content below; the record of why each rule
 exists did not move with them.
 

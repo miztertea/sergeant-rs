@@ -4,7 +4,8 @@ name: implement
 status: published
 version: 2
 description: >-
-  Implement a piece of work from a spec or ticket set, explicit-invocation-only.
+  Implement a piece of work from a spec or ticket set,
+explicit-invocation-only.
 tags:
   - implementation
   - explicit-invocation
@@ -14,10 +15,9 @@ tags:
 
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/implement.md` — this package's `BU-####`
-citations and `reference/sergeant-upstream/` paths were stripped from the
-shipped template content below; the record of why each rule exists did
-not move with them.
+`knowledge/evidence/provenance/implement.md` — provenance markers were
+stripped from the shipped template content
+below; the record of why each rule exists did not move with them.
 
 Two-stage actor-only workflow (N1 reference corpus,
 `docs/gauntlet/contracts/N1.md`; `reference-corpus/synthesis.md` §1,

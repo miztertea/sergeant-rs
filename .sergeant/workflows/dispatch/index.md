@@ -4,7 +4,10 @@ name: dispatch
 status: published
 version: 2
 description: >-
-  Given a project, a brief or tracked task, and a repository set, produce one durable task with an isolated work surface, a rendered mission brief, and a running agent per repository — with every side effect validated and gated before the next repository's dispatch begins.
+  Given a project, a brief or tracked task, and a repository set, produce
+one durable task with an isolated work surface, a rendered mission brief,
+and a running agent per repository — with every side effect validated and
+gated before the next repository's dispatch begins.
 tags:
   - dispatch
   - fleet
@@ -15,12 +18,12 @@ tags:
 
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/dispatch.md` — this package's `BU-####`
-citations and `reference/sergeant-upstream/` paths were stripped from the
-shipped template content below; the record of why each rule exists did
-not move with them.
+`knowledge/evidence/provenance/dispatch.md` — provenance markers were
+stripped from the shipped template content
+below; the record of why each rule exists did not move with them.
 
-Six-stage admitted workflow (N1 reference corpus, `docs/gauntlet/contracts/N1.md`,
+Six-stage admitted workflow (N1 reference corpus,
+`docs/gauntlet/contracts/N1.md`,
 candidate **W8** `dispatch`) that, given a project, a brief or tracked
 task, and a repository set, produces one durable task with an isolated
 work surface, a rendered mission brief, and a running agent per

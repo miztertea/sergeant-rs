@@ -4,7 +4,8 @@ name: wayfinder
 status: published
 version: 2
 description: >-
-  Map an unfamiliar frontier of a codebase or problem space, ticket-izing decisions and resolving them one at a time.
+  Map an unfamiliar frontier of a codebase or problem space, ticket-izing
+decisions and resolving them one at a time.
 tags:
   - exploration
   - mapping
@@ -15,10 +16,9 @@ tags:
 
 Provenance for this template's rules (which behavior unit justifies each
 rule, and its upstream source) lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/wayfinder.md` — this package's `BU-####`
-citations and `reference/sergeant-upstream/` paths were stripped from the
-shipped template content below; the record of why each rule exists did
-not move with them.
+`knowledge/evidence/provenance/wayfinder.md` — provenance markers were
+stripped from the shipped template content
+below; the record of why each rule exists did not move with them.
 
 Four-stage actor-only workflow (N1 reference corpus, candidate **W33**
 `wayfinder`, `docs/gauntlet/contracts/N1.md`) that maps an unfamiliar
