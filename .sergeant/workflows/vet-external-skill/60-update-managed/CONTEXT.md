@@ -20,7 +20,6 @@ For skills.sh-managed skills: rerun the official installer and inspect the diff 
 
 - **For skills.sh-managed skills, rerun the official installer and inspect the diff and updated lock file before accepting changes.**
   (trigger: updating a skills.sh-managed skill; outcome: no update is accepted without inspecting its diff and lock-file change first)
-  — `BU-P1-126`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L138-139, skills.sh update path)
 
 ## Bounded judgment
 

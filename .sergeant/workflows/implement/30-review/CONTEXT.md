@@ -22,8 +22,8 @@ No behavior units are cited directly against this stage; its content is wholly d
 
 ## Delegates to
 
-`code-review` (`BU-P2-054`: "the code-review skill/workflow is used to
-review the work"). `code-review` is a separately-admitted PL-4 workflow —
+`code-review`: once implementation is done, the code-review skill/workflow
+is used to review the work. `code-review` is a separately-admitted PL-4 workflow —
 its own ICM-R2 adjudication (`docs/gauntlet/runs/icm-r2/code-review/
 adjudication-draft.md`) settled `STAND`, and it is live today as four real
 actor stages (`00-pin-fixed-point`, `10-identify-spec-source`,
@@ -57,7 +57,6 @@ would not).
 
 - **The final step of implement is to commit the work to the current branch.**
   (trigger: the work has been implemented, verified, and reviewed; outcome: the change is committed to the current branch)
-  — `BU-P2-055`, `reference/sergeant-upstream/.agents/skills/implement/SKILL.md` (body, lines 15-15)
 
 ## Bounded judgment
 

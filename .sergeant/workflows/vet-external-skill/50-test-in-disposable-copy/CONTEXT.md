@@ -20,7 +20,6 @@ The external skill's source is pinned or locked where the installer supports it;
 
 - **Test the external skill in a disposable repository or worktree before broad installation.**
   (trigger: source pinned; outcome: the skill is proven in an isolated environment before being broadly installed)
-  — `BU-P1-125`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L131, vet step 6)
 
 ## Helper invocation: pin source
 
@@ -30,7 +29,6 @@ Demoted from a standalone stage (`40-pin-source`) at N1 adjudication A4: its onl
 
 - **Pin or lock the external skill's source where the installer supports it.**
   (trigger: no conflict found; outcome: the installed skill version is pinned wherever the tooling allows)
-  — `BU-P1-124`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L130, vet step 5)
 
 ## Bounded judgment
 

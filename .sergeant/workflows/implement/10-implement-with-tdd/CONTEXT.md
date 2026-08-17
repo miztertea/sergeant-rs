@@ -39,7 +39,6 @@ intent to hand off to).
 
 - **During implementation, typechecking and single test files should be run regularly, with the full test suite run once at the end.**
   (trigger: implementation work is underway; outcome: fast, frequent local checks are interleaved with work, with one full-suite pass at the close)
-  — `BU-P2-053`, `reference/sergeant-upstream/.agents/skills/implement/SKILL.md` (body, lines 11-11)
 
 ## Bounded judgment
 
@@ -52,7 +51,7 @@ envelope` (`../CONTEXT.md`) unchanged except where narrowed below.
   shape to choose within one confirmed cycle, per `@@tdd`.
 - Which files or modules the typecheck/single-test-file helper checks
   during implementation, and when to run them, so long as the full suite
-  runs once at the close (`BU-P2-053`).
+  runs once at the close.
 
 ### J1 — local choices allowed
 - Ordering of otherwise-equivalent confirmed seams.
@@ -69,7 +68,7 @@ envelope` (`../CONTEXT.md`) unchanged except where narrowed below.
   confirmed it was previously invisible except by reading `tdd`'s own
   stage in full — a hidden contract-bearing dependency
   (`docs/icm/record-shapes.md` §1a rule 4 / `docs/icm/convention.md`
-  §1a rule 1; finding `BU-TDD-04`).
+  §1a rule 1).
 
 ### Completion boundary
 This stage may complete only when every confirmed seam for the current
