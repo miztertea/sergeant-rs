@@ -35,9 +35,9 @@ opened.
 | FLAG_MISSING | 4 |
 | VERB_MISSING | 1 |
 | ARG_SHAPE | 1 |
-| BEHAVIOR | 3 |
-| STALE | 0 |
-| **Total mismatches** | **9** |
+| BEHAVIOR | 4 |
+| STALE | 1 |
+| **Total mismatches** | **11** |
 
 Reverse-direction (binary has, doctrine doesn't mention): 6 items, listed
 at the end — not defects.
@@ -45,6 +45,11 @@ at the end — not defects.
 **Re-run note (same day, second pass):** findings 7–9 below were added on
 a second pass over the same scope; findings 1–6 and reverse items 1–4 are
 the original pass, left unchanged.
+
+**Re-run note (same day, third pass):** findings 10–11 below were added on
+a third, independent pass over the same scope (fresh authority build, fresh
+grep, fresh scratch estate); findings 1–9 and reverse items 1–6 are
+unchanged from the prior two passes.
 
 ---
 
@@ -370,6 +375,94 @@ doesn't exist) but specifically about the machinery this stage's own
 `reference/sergeant-upstream`, none ported. An actor following this
 CONTEXT.md verbatim would look for `td`/treehouse tooling that was never
 built in this project.
+
+---
+
+### 10. BEHAVIOR — NORTH-STAR.md's *current, today-revised* destination paragraph and ADR 0014's owner ruling both assert `sgt init` writes workflow templates to disk
+
+**Files:** `NORTH-STAR.md:22-23` (destination paragraph, marked "REVISED
+2026-08-17" — today) and
+`docs/adr/0014-product-workspace-split-owner-rulings.md:41-44` (the owner
+ruling that revision traces its authority to)
+
+**Claim (quoted):**
+> `NORTH-STAR.md:22-23`: "*Sergeant is an AgentOS distro — instructions, skills and workflow templates embedded in `sgt` and **written to your estate by `sgt init`** — that turns a general-purpose coding harness into an operator of your estate, carried by a durable intent-execution engine that runs those intents to completion in isolated worktrees.*"
+>
+> `docs/adr/0014...:41-44`: "**Distro delivery — embedded.** The distro (always-on doctrine, skills, workflow templates) ships embedded in the `sgt` binary and **is written to disk by `sgt init`**. It is not a cloned directory."
+
+This is the same underlying defect as finding 6 above (a fresh estate gets
+no `.sergeant/workflows/` from `sgt init`), but these two citations are
+worth recording separately from finding 6: they are not a routing table
+or a workflow-catalog listing that merely *implies* general availability
+— they are direct, present-tense assertions that `sgt init`'s write path
+includes workflow templates, made in the two most load-bearing doctrine
+documents in the repository (NORTH-STAR's own destination statement,
+revised the same day as this check, and the ADR it cites as its
+authority).
+
+**Command run:**
+```
+$ cd /tmp/skew-init-test-2 && sgt init && ls -la
+initialized estate at /tmp/skew-init-test-2
+  created sergeant.toml
+  created repos/
+  updated .gitignore
+
+-rw-r--r--  .gitignore
+-rw-r--r--  .sergeant.toml.lock
+drwxr-xr-x  repos
+-rw-r--r--  sergeant.toml
+$ ls .sergeant
+ls: cannot access '.sergeant': No such file or directory
+```
+`sgt init --help`'s own summary agrees with the observed behavior, not
+with NORTH-STAR/ADR 0014: "Scaffold an estate at the current directory
+(MVP-3): `[estate]` in `sergeant.toml`, `repos/`, `.gitignore` entries for
+`.sergeant/data` and `repos/`." No workflow content is named, and none is
+written.
+
+**Classification:** BEHAVIOR — same root cause as finding 6, recorded
+separately because the false claim sits in NORTH-STAR's own destination
+paragraph and in the ADR ruling on distro delivery, not just in a
+downstream catalog page.
+
+---
+
+### 11. STALE — README.md's `sgt doctor` check list omits the `filesystem` check, misstating the documented "in that order" sequence
+
+**File:** `README.md:174`
+
+**Claim (quoted):**
+> "Checks git, the `claude` CLI (presence and version gate), whether the toolchain directories `sgt claude` (and its siblings) would add to `PATH` are already on it, the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, and disk pressure inside the data directory — **in that order**, so a fault is reported under the right name..."
+
+**Command run:**
+```
+$ cd /tmp/skew-init-test-2 && sgt repo add demo --origin <local-path> && sgt doctor
+sergeant doctor — /tmp/skew-init-test-2/.sergeant/data
+  [ok  ] git          ...
+  [ok  ] claude        ...
+  [ok  ] environment   ...
+  [ok  ] data_dir      ...
+  [ok  ] filesystem    /tmp/skew-init-test-2/.sergeant/data supports reliable advisory locking
+  [ok  ] docker        ...
+  [ok  ] journal       ...
+  [ok  ] projection    ...
+  [ok  ] daemon        ...
+  [warn] permission_mode ...
+  [ok  ] estate        ...
+  [ok  ] disk_pressure ...
+```
+The actual emitted order is `git → claude → environment → data_dir →
+filesystem → docker → journal → projection → daemon → permission_mode →
+estate → disk_pressure`. README's enumerated list (`git → claude →
+environment → data_dir → docker → journal → projection → daemon →
+permission_mode → estate → disk_pressure`) skips the `filesystem`
+check (the advisory-locking probe) entirely; every other check name and
+relative position matches.
+
+**Classification:** STALE — a real, currently-running check
+(`filesystem`) is missing from a paragraph that explicitly claims to
+enumerate every check "in that order."
 
 ---
 
