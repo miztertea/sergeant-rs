@@ -10,9 +10,8 @@
 # Revised at ICM-R2 (docs/gauntlet/runs/icm-r2/code-review/
 # adjudication-draft.md): the prior revision's 20-parallel-review-standards
 # and 30-parallel-review-spec stages merge into 20-30-parallel-review, so
-# BU-P2-003/BU-P2-012's single-message, two-call concurrent dispatch can be
-# represented inside one stage rather than split across two sequential
-# engine stages.
+# the single-message, two-call concurrent dispatch can be represented
+# inside one stage rather than split across two sequential engine stages.
 #
 # Originally promoted per docs/icm/promotion-spec-2026-08-11.md; full
 # behavior-unit citation trail for the prior revision archived at

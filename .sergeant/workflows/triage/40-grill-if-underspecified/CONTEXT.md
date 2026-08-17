@@ -20,19 +20,17 @@ Underspecified items are escalated to an interview.
 
 - **If the item is underspecified after verification, the actor invokes the grilling procedure to sharpen it into shape.**
   (trigger: verification shows the request needs fleshing out; outcome: the item's specification and domain terms are sharpened, with decisions captured inline)
-  — `BU-P3-068`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 76). Upstream pairs this with a
-  separate `domain-modeling` procedure; no `domain-modeling` skill package
-  exists in this repo yet (only frozen upstream evidence — see
-  `docs/icm/agents-invariant-dispositions.md` BU-1064), so sharpening
-  domain terminology folds into the same `grilling` session below rather
-  than a second invocation.
+  Upstream pairs this with a separate `domain-modeling` procedure; no
+  `domain-modeling` skill package exists in this repo yet (only frozen
+  upstream evidence), so sharpening domain terminology folds into the same
+  `grilling` session below rather than a second invocation.
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Judging whether the item is underspecified after verification, and running the `grilling` skill to sharpen it (`BU-P3-068`).
+- Judging whether the item is underspecified after verification, and running the `grilling` skill to sharpen it.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

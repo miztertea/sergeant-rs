@@ -11,6 +11,13 @@ tags:
   - investigation
 ---
 
+Provenance for this template's rules (which behavior unit justifies each
+rule, and its upstream source) lives in `sergeant-rs-workspace`'s
+`knowledge/evidence/provenance/diagnose-bug.md` — this package's `BU-####`
+citations and `reference/sergeant-upstream/` paths were stripped from the
+shipped template content below; the record of why each rule exists did
+not move with them.
+
 # Diagnose Bug
 
 Six-stage actor-only workflow (N1 reference corpus,

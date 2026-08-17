@@ -20,10 +20,8 @@ The fixed point resolves and the diff is non-empty, or this fails here rather th
 
 - **The review's fixed comparison point is whatever the user specified (commit SHA, branch, tag, HEAD~N, etc); if the user did not specify one, the actor must ask for it before proceeding.**
   (trigger: user requests a review without naming a comparison point; outcome: the actor asks the user for the fixed point rather than guessing)
-  — `BU-P2-004`, `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (Step 1: Pin the fixed point, lines 19-19)
 - **Before spawning the two parallel review sub-agents, the actor must confirm the fixed point resolves (`git rev-parse`) and the diff is non-empty; a bad ref or empty diff must fail at this point, not inside the sub-agents.**
   (trigger: the fixed point and diff command are captured; outcome: invalid input is caught before expensive parallel work starts)
-  — `BU-P2-006`, `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md` (Step 1: Pin the fixed point, lines 23-23)
 
 ## Judgment required
 
