@@ -20,17 +20,16 @@ An undocumented/unrecognized stall class escalates rather than being guessed at.
 
 - **When documentation does not cover an observed failure, the operator should use the sergeant-help skill to search existing docs first, then create a td task containing the exact reproduction, expected behavior, preserved state, and acceptance criteria.**
   (trigger: a failure is not covered by any existing troubleshooting entry; outcome: an undocumented failure always becomes a well-formed, reproducible, trackable task rather than being handled ad hoc and lost)
-  — `BU-P8-109`, `reference/sergeant-upstream/docs/troubleshooting.md` (L242-244)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J5 — governing constraint
-- An undocumented/unrecognized stall class is never guessed at — it always escalates (`BU-P8-109`).
+- An undocumented/unrecognized stall class is never guessed at — it always escalates.
 
 ### J2 — delegated to this stage
-- How to conduct the `sergeant-help` documentation search and compose the `td` task's contents (reproduction, expected behavior, preserved state, acceptance criteria) (`BU-P8-109`).
+- How to conduct the `sergeant-help` documentation search and compose the `td` task's contents (reproduction, expected behavior, preserved state, acceptance criteria).
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

@@ -20,28 +20,26 @@ Non-main branches, uncommitted changes, ahead/behind state, active worktrees, an
 
 - **Every per-repository delivery gate must include: the owning td task (or its creation requirement), the fixed point and preserved source state, repository-specific test/lint/typecheck/build commands, Standards and Spec review sources, PR dependency and deployment order, and any already-approved or still-missing data/security/destructive decisions.**
   (trigger: delivery gates are being defined per repository; outcome: every repository's brief has a complete, checkable gate set before dispatch)
-  — `BU-P5-049`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 65-74)
 - **The cross-repo plan is complete only when every owning repository has one implementation brief, acceptance evidence, and an acyclic dependency position.**
   (trigger: delivery gates have been drafted for every repository; outcome: the plan's completion condition is explicit and checkable)
-  — `BU-P5-050`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 76-77)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J5 — governing constraint
-- Repository state inspection is strictly read-only: never stash, reset, switch, or clean (`BU-P5-048`).
-- The plan's completion condition — brief + acceptance evidence + acyclic position for every owner — is fixed, not a judgment call (`BU-P5-050`).
+- Repository state inspection is strictly read-only: never stash, reset, switch, or clean.
+- The plan's completion condition — brief + acceptance evidence + acyclic position for every owner — is fixed, not a judgment call.
 
 ### J2 — delegated to this stage
-- Defining each repository's concrete delivery-gate content from the inspected state and dependency graph (`BU-P5-049`).
+- Defining each repository's concrete delivery-gate content from the inspected state and dependency graph.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
 
 ### J0 — must become `needs_input`
-- Repository state conflicts with the requested outcome: stop for a decision rather than routing it into the worker brief (`BU-P5-048`).
-- A required data/security/destructive decision for a repository's gate is still missing or unresolved (`BU-P5-049`).
+- Repository state conflicts with the requested outcome: stop for a decision rather than routing it into the worker brief.
+- A required data/security/destructive decision for a repository's gate is still missing or unresolved.
 
 ### Completion boundary
 This stage may complete only once every owning repository has one implementation brief, acceptance evidence, and an acyclic dependency position — or the stage has stopped at one of the J0 cases above.
@@ -55,10 +53,8 @@ The per-repository delivery gate is this stage's own durable output, recorded pe
 
 - **cross-repo-work runs the status command and records non-main branches, uncommitted changes, ahead/behind state, active worktrees, and preserved workers for every owning repository before planning proceeds.**
   (trigger: ownership and dependencies are being established; outcome: the plan accounts for each owning repository's actual current state)
-  — `BU-P5-047`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 56-59)
 - **cross-repo-work never stashes, resets, switches, or cleans repository state during planning; it either routes an existing canonical branch/worktree into the worker brief or stops for a decision when state conflicts with the requested outcome.**
   (trigger: planning inspects a repository with pre-existing state; outcome: planning is strictly read-only with respect to repository state)
-  — `BU-P5-048`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 61-63)
 
 ## Output
 

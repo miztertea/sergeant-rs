@@ -20,31 +20,25 @@ A four-way classification determines whether a port is needed at all.
 
 - **When a deepening candidate's dependencies are pure in-process computation with no I/O, always merge the modules and test the result directly through the new interface; no adapter is needed.**
   (trigger: a deepening candidate's dependencies are classified as in-process; outcome: the modules are merged and tested at the new interface with no adapter layer)
-  — `BU-P4-014`, `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` (Dependency categories / In-process, L11)
 - **When a deepening candidate depends on something with a local test stand-in (e.g. an in-memory filesystem or an in-process database emulator), deepening is possible and the deepened module is tested against that stand-in inside the test suite, with the seam kept internal.**
   (trigger: a deepening candidate's dependencies are classified as local-substitutable; outcome: the deepened module is tested with the stand-in, without exposing a port at the external interface)
-  — `BU-P4-015`, `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` (Dependency categories / Local-substitutable, L15)
 - **When a deepening candidate depends on the team's own remote services, define a port (interface) at the seam owned by the deep module, inject an in-memory adapter for tests and an HTTP/gRPC/queue adapter for production.**
   (trigger: a deepening candidate's dependencies are classified as remote-but-owned; outcome: logic lives in one deep module; transport is swappable via an injected adapter)
-  — `BU-P4-016`, `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` (Dependency categories / Remote but owned, L19)
 - **When a deepening candidate depends on a true third-party external service the team doesn't control, inject that dependency as a port and give tests a mock adapter.**
   (trigger: a deepening candidate's dependencies are classified as true-external; outcome: the module is testable without calling the real third-party service)
-  — `BU-P4-017`, `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` (Dependency categories / True external, L25)
 
 - **Seam discipline: one adapter is a hypothetical seam, not yet worth exposing; two adapters (typically production plus test) justify making the seam real.**
   (trigger: deciding whether a classification result actually justifies exposing a port; outcome: a port is only exposed once at least two adapters genuinely need it, not on the mere possibility of a future second one)
-  — `BU-P4-018`, `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` ("Seam discipline", L29). **Added 2026-08-16, ICM-R3**: extracted at N1, classified workflow-local, never actually written into this stage's contract until now.
 - **Internal seams (private, test-only) are not exposed through the public interface merely because tests happen to use them.**
   (trigger: deciding what belongs on the deepened module's public interface; outcome: test-only access points stay internal rather than leaking into the public contract)
-  — `BU-P4-019`, `reference/sergeant-upstream/.agents/skills/codebase-design/DEEPENING.md` ("Seam discipline", L30). **Added 2026-08-16, ICM-R3**: same gap as `BU-P4-018`.
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Classifying a dependency into one of the four categories (in-process, local-substitutable, remote-but-owned, true-external) and applying the matching adapter strategy (`BU-P4-014`–`017`).
-- Whether a classification result actually justifies exposing a port (two-adapter threshold, `BU-P4-018`) and what belongs on the public interface versus staying internal (`BU-P4-019`).
+- Classifying a dependency into one of the four categories (in-process, local-substitutable, remote-but-owned, true-external) and applying the matching adapter strategy.
+- Whether a classification result actually justifies exposing a port (two-adapter threshold) and what belongs on the public interface versus staying internal.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
