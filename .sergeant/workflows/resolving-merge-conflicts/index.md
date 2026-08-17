@@ -12,6 +12,13 @@ tags:
 
 # Resolving Merge Conflicts
 
+Provenance for this template's rules (which behavior unit justifies each
+rule, and its upstream source) lives in `sergeant-rs-workspace`'s
+`knowledge/evidence/provenance/resolving-merge-conflicts.md` — this
+package's `BU-####` citations and `reference/sergeant-upstream/` paths were
+stripped from the shipped template content below; the record of why each
+rule exists did not move with them.
+
 Resolve an in-progress git merge/rebase conflict without inventing behavior
 or aborting. Admitted from the N1 reference-corpus decomposition
 (`docs/gauntlet/contracts/N1.md`), candidate **W26**.
