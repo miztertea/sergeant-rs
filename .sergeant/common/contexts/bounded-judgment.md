@@ -1,86 +1,38 @@
-# Bounded-Judgment Ladder
+# Bounded-Judgment Ladder — specialization contract
 
-Canonical source. Ratified by `docs/adr/0013-icm-r0-owner-rulings.md`
-decision 1, per `reference/proposal-icm-r-procedure-authority.md` §6.
-Referenced by `@@bounded-judgment` from any stage or skill's own
-`## Bounded judgment` section — no package copies this text; each adds
-only its local specialization (which J2 decision classes it delegates,
-which choices are J1, which land at J0).
+Ratified by `docs/adr/0013-icm-r0-owner-rulings.md` decision 1. Re-homed
+2026-08-17 (ADR 0014 decision 10, resolving the conflict between that
+decision and `docs/icm/convention.md` §3 rule 2's anti-duplication rule):
+the rung definitions themselves (J5–J0) are canonical in `AGENTS.md`'s
+AUTHORITY section, including PACE and succession of authority. This file
+no longer restates them. It carries what only this file needs: how a
+package narrows the ladder, the decision-evidence shape, the conflict
+rule, and a worked example. Referenced as `@@bounded-judgment` from any
+stage or skill's own `## Bounded judgment` section — no package copies
+this text; each adds only its local specialization.
+
+**Unresolved for the owner:** this re-homing is a material change to an
+artifact ADR 0013 decision 1 ratified. See the commit message that made
+this change for the explicit J0 flag; this file's content should be
+treated provisional until ruled on.
 
 ## Purpose
 
 > **What authority allows this actor to decide this material question
 > without returning to a human or higher authority?**
 
-Check J5 through J0 in order. Cite the first rung that actually resolves
-the decision. If two higher rungs conflict, the result is J0 — never a
-silently invented precedence between them.
+Rung definitions: `AGENTS.md`, AUTHORITY section. Check J5 through J0 in
+order there; cite the first rung that actually resolves the decision.
 
-Governs **material** decisions: choices that affect scope, acceptance,
-user-visible behavior, security, privacy, authority, destructive action,
-irreversible state, promoted artifacts, or a downstream stage's
-interpretation. Trivial tool mechanics do not require a citation unless
-the stage contract says otherwise.
+## Stage/skill specialization
 
-## J5 — Governing constraint
+A stage's `## Bounded judgment` section names its local narrowing: which
+J2 decision classes it delegates, which choices are J1, what must become
+`needs_input` at J0, its completion boundary, and where decisions are
+recorded — present even when it is only "inherits workflow envelope
+unchanged" (omission is never ambiguous).
 
-Binding law, safety policy, repository doctrine, an authority boundary, a
-workflow prohibition, or the stage's own contract requires or forbids the
-action. Apply it and cite the source; a lower rung cannot override it. If
-two governing constraints conflict, land at J0.
-
-## J4 — Explicit user or bound Work decision
-
-The user, the accepted Work intent, acceptance criteria, exclusions,
-repository selection, or explicit standing authorization already decides
-the question and is compatible with J5. Apply the recorded decision
-without asking the user to reconfirm it. Standing authorization is scoped
-— never generalized beyond what was actually granted, never overriding J5.
-
-## J3 — Settled authoritative record
-
-An accepted upstream artifact, ADR, prior stage output, pinned
-specification, authoritative system observation, or previously adjudicated
-decision settles the question. Reuse it and cite the artifact. A draft,
-self-authored output, stale observation, or unsupported inference does not
-qualify.
-
-## J2 — Delegated actor judgment
-
-The active skill or stage explicitly delegates this class of decision
-within named bounds. Inspect evidence, choose, and record the rationale
-and rung. "Use your best judgment" without a bounded decision class named
-is not a J2 grant — the package must name the delegation.
-
-## J1 — Local, reversible, non-contractual choice
-
-The choice is local to the current implementation, easily reversible, and
-cannot change scope, authority, security, data, public behavior,
-acceptance, or another actor's contract. Choose conservatively; record the
-choice only when it materially affects review or maintenance. A choice is
-not J1 merely because the actor believes the risk is low.
-
-## J0 — Not delegated, conflicting, or risk-changing
-
-No higher rung resolves the question, evidence conflicts, authority is
-missing, or the choice would change scope, policy, security/privacy
-posture, destructive effects, irreversible state, public behavior,
-acceptance, or promotion. Do not guess.
-
-For a workflow stage:
-
-1. record the unresolved decision;
-2. state which rungs were checked and why they did not settle it;
-3. preserve the evidence already gathered;
-4. state the actor's recommended answer when one can be responsibly
-   offered;
-5. end the turn with one direct question so the existing backend signal
-   places the Work in `needs_input`.
-
-For a Captain skill, ask the question live and wait for the user's answer
-before continuing.
-
-Canonical shape:
+Canonical shape for a J0 landing:
 
 ```markdown
 ## Decision required — J0
@@ -94,6 +46,13 @@ propose designs but may not alter public behavior; J1 does not apply.
 **Question:** Should this Work preserve backward compatibility, or may it
 make an intentional breaking API change?
 ```
+
+For a workflow stage: record the unresolved decision, state which rungs
+were checked and why they didn't settle it, preserve the evidence already
+gathered, state a recommendation when one can be responsibly offered, and
+end the turn with one direct question so the existing backend signal
+places the Work in `needs_input`. For a Captain skill: ask the question
+live and wait for the user's answer before continuing.
 
 ## Conflict rule
 
@@ -147,4 +106,4 @@ size and dispatch sequencing are local, reversible execution choices
 within already-granted authority, not a scope change. The session had
 initially asked the user anyway; the owner's correction ("those ladders
 are there to help you know when to come to me") is the concrete evidence
-that this was over-escalation, per §14.3's named risk.
+that this was over-escalation.
