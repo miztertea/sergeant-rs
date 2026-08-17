@@ -2099,6 +2099,104 @@ fn t3f_doctor_workflows_check_reports_zero_then_a_declared_package() {
     );
 }
 
+/// §6 Phase 3 (Ponytail R2 — reuse this check surface): `sgt doctor` reports
+/// how many `.sergeant/local/workflows/` packages shadow a same-named stock
+/// package, and flags any whose `edition` (ADR 0016) is older than the
+/// binary's own version.
+///
+/// guard-map: dropping the drift computation (or comparing against the wrong
+/// field) survives `t3f_doctor_workflows_check_reports_zero_then_a_declared_
+/// package` but fails this one.
+#[test]
+fn t3g_doctor_workflows_check_reports_local_shadow_and_edition_drift() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let workspace = TempDir::new().expect("tempdir");
+    std::fs::write(
+        workspace.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let stock = workspace.path().join(".sergeant/workflows/research");
+    std::fs::create_dir_all(&stock).expect("mkdir stock");
+    std::fs::write(
+        stock.join("workflow.toml"),
+        "[workflow]\nname = \"research\"\nversion = 1\nstages = []\n",
+    )
+    .expect("write workflow.toml");
+
+    // A local fork at the current binary edition: shadows stock, no drift.
+    let current_edition = env!("CARGO_PKG_VERSION");
+    let fresh_local = workspace.path().join(".sergeant/local/workflows/research");
+    std::fs::create_dir_all(&fresh_local).expect("mkdir local");
+    std::fs::write(
+        fresh_local.join("workflow.toml"),
+        "[workflow]\nname = \"research\"\nversion = 1\nstages = []\n",
+    )
+    .expect("write workflow.toml");
+    std::fs::write(
+        fresh_local.join("index.md"),
+        format!("---\nstatus: published\ndescription: d\nedition: {current_edition}\n---\n"),
+    )
+    .expect("write index.md");
+
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "workflows");
+    assert_eq!(check["status"], "ok", "{check}");
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("1 local package(s) shadow stock"),
+        "must report the shadow count: {detail}"
+    );
+    assert!(
+        detail.contains("research"),
+        "must name the shadowing package: {detail}"
+    );
+
+    // Now make the local fork stale: an edition older than the binary's own.
+    std::fs::write(
+        fresh_local.join("index.md"),
+        "---\nstatus: published\ndescription: d\nedition: 0.0.1\n---\n",
+    )
+    .expect("rewrite index.md with a stale edition");
+
+    let (_, json, _) = doctor_in(
+        workspace.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "workflows");
+    assert_eq!(
+        check["status"], "warn",
+        "a stale local edition must warn, not fail (it still runs): {check}"
+    );
+    let detail = check["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("1 older than the current edition"),
+        "must report the drift count: {detail}"
+    );
+    assert!(
+        detail.contains("research"),
+        "must name the drifted package: {detail}"
+    );
+    let remedy = check["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("sgt workflow fork"),
+        "the remedy must name the fork verb: {remedy}"
+    );
+}
+
 /// #67: an unwritable *parent* of the data dir used to produce two
 /// confusing, apparently-independent downstream symptoms — `docker` failing
 /// to open its blob store under the data dir (EPERM) and `disk_pressure`'s

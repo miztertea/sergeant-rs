@@ -537,6 +537,88 @@ fn group_remove_whole_group_vs_named_members() {
     assert_eq!(list.json()["groups"].as_array().unwrap().len(), 0);
 }
 
+// -------------------------------------------------------------- workflow
+
+/// §6 Phase 3 (Ponytail R7): `sgt workflow fork <name>` copies a stock
+/// workflow package into `.sergeant/local/workflows/<name>/`, where it then
+/// resolves ahead of stock (R4). guard-map: a fork that fails to copy every
+/// file, or that resolution fails to prefer, survives a narrower "the
+/// command exits 0" check but fails this one.
+#[test]
+fn workflow_fork_copies_stock_and_the_fork_then_resolves() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
+
+    let stock = estate.path().join(".sergeant/workflows/example");
+    std::fs::create_dir_all(stock.join("00-only")).expect("stage dir");
+    std::fs::write(
+        stock.join("workflow.toml"),
+        "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+    )
+    .expect("descriptor");
+    std::fs::write(stock.join("00-only").join("CONTEXT.md"), "stock body").expect("stage context");
+    std::fs::write(
+        stock.join("index.md"),
+        "---\nstatus: published\ndescription: an example\nedition: 0.1.0\n---\n",
+    )
+    .expect("index.md");
+
+    let forked = run(
+        estate.path(),
+        Some(&data_dir),
+        &[],
+        &["--json", "workflow", "fork", "example"],
+    );
+    forked.assert_ok("workflow fork");
+    let forked_json = forked.json();
+    assert_eq!(forked_json["forked"], "example");
+
+    let local = estate.path().join(".sergeant/local/workflows/example");
+    assert!(local.join("workflow.toml").is_file());
+    assert!(local.join("00-only/CONTEXT.md").is_file());
+    let index = std::fs::read_to_string(local.join("index.md")).expect("index.md");
+    assert!(
+        index.contains("edition: 0.1.0"),
+        "the edition marker must survive the copy verbatim: {index}"
+    );
+}
+
+/// §6 Phase 3 (Ponytail R7): `sgt workflow fork` refuses to overwrite an
+/// existing local package by the same name — it must never silently clobber
+/// a user's already-rewritten fork.
+#[test]
+fn workflow_fork_refuses_to_overwrite_an_existing_local_package() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
+
+    let stock = estate.path().join(".sergeant/workflows/example");
+    std::fs::create_dir_all(&stock).expect("mkdir stock");
+    std::fs::write(
+        stock.join("workflow.toml"),
+        "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = []\n",
+    )
+    .expect("descriptor");
+
+    let local = estate.path().join(".sergeant/local/workflows/example");
+    std::fs::create_dir_all(&local).expect("mkdir local");
+    std::fs::write(local.join("sentinel"), "user work, do not touch").expect("sentinel");
+
+    let refused = run(
+        estate.path(),
+        Some(&data_dir),
+        &[],
+        &["workflow", "fork", "example"],
+    );
+    refused.assert_fails("must refuse to overwrite an existing local package");
+    assert!(
+        local.join("sentinel").is_file(),
+        "the user's existing local package must be untouched"
+    );
+    assert!(!local.join("workflow.toml").is_file());
+}
+
 // --------------------------------------------------------- run --group
 
 /// guard-map: `sgt run --group <name>` expands client-side into the exact
