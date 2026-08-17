@@ -20,17 +20,15 @@ Either the plan is returned (planning-only) or control passes to dispatch; the c
 
 - **If the user requested planning only, cross-repo-work stops after returning the briefs, acceptance evidence, and dependency graph, without dispatching or editing any repository; if implementation was requested, it hands off to the dispatch workflow via its launch command, and the primary session itself never edits several repositories directly.**
   (trigger: planning is complete; outcome: either the plan is returned for review, or execution is handed to a distinct dispatch procedure -- the planning session never becomes a multi-repo editor itself)
-  — `BU-P5-051`, `reference/sergeant-upstream/skills/cross-repo-work/SKILL.md` (lines 79-85)
 - **sgt-dispatch must never itself carry out `git checkout -b`, `git push -u origin`, or `gh pr create` as its own inline behavior in the cross-repo-work skill's prose; these operations belong to the dispatched worker, not to the coordinating skill.**
   (trigger: the coordinator is planning cross-repo work; outcome: the coordinating skill stays a planning/decomposition procedure and never performs the worker's own git mutations itself)
-  — `BU-P7-017`, `reference/sergeant-upstream/tests/instruction-policy-test.sh` (lines 69-71)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J5 — governing constraint
-- The coordinator never edits several repositories itself, and never performs the dispatched worker's own git mutations (`git checkout -b`, `git push -u origin`, `gh pr create`) as inline behavior (`BU-P5-051`, `BU-P7-017`).
+- The coordinator never edits several repositories itself, and never performs the dispatched worker's own git mutations (`git checkout -b`, `git push -u origin`, `gh pr create`) as inline behavior.
 
 ### J2 — delegated to this stage
 - Determining whether the user requested planning-only or implementation.

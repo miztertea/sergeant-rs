@@ -12,6 +12,13 @@ tags:
 
 # Cross-Repo Work
 
+Provenance for this template's rules (which behavior unit justifies each
+rule, and its upstream source) lives in `sergeant-rs-workspace`'s
+`knowledge/evidence/provenance/cross-repo-work.md` — this package's
+`BU-####` citations and `reference/sergeant-upstream/` paths were stripped
+from the shipped template content below; the record of why each rule
+exists did not move with them.
+
 Five-stage actor-only workflow (N1 reference corpus, candidate **W7**
 `cross-repo-work`, `docs/gauntlet/contracts/N1.md`) that decomposes a
 requested outcome across the repositories that own it and defines
