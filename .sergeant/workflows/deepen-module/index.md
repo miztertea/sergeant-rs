@@ -3,6 +3,7 @@ kind: workflow
 name: deepen-module
 status: published
 version: 1
+edition: 0.1.0
 description: >-
   Turn a shallow module into a deep one at a deliberately chosen seam.
 tags:

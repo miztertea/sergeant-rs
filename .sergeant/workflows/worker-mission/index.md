@@ -3,6 +3,7 @@ kind: workflow
 name: worker-mission
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   From a rendered brief, produce a merged-ready change with evidence — the
 contract a dispatched worker delivers against.

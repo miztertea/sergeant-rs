@@ -1,6 +1,7 @@
 ---
 name: grill-with-docs
 description: A relentless interview to sharpen a plan or design, which also captures ADRs and a glossary as decisions land. Use when a plan or design needs interview-style stress-testing that should also produce durable domain artifacts.
+edition: 0.1.0
 ---
 
 Provenance for this skill's citation record lives in

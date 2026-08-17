@@ -3,6 +3,7 @@ kind: workflow
 name: dispatch
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Given a project, a brief or tracked task, and a repository set, produce
 one durable task with an isolated work surface, a rendered mission brief,

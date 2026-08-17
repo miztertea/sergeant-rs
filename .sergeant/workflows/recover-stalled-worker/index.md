@@ -3,6 +3,7 @@ kind: workflow
 name: recover-stalled-worker
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   One bounded recovery attempt for a stalled worker: converge on a
 replacement or escalate — never guess.

@@ -3,6 +3,7 @@ kind: workflow
 name: diagnose-bug
 status: published
 version: 1
+edition: 0.1.0
 description: >-
   Reproduce, isolate, prove, remediate and verify a defect.
 tags:

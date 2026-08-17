@@ -3,6 +3,7 @@ kind: workflow
 name: code-review
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Review a diff on two parallel, non-contaminating axes — Standards and
 Spec — via isolated sub-reviews, reported side by side.

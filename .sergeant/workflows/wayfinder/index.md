@@ -3,6 +3,7 @@ kind: workflow
 name: wayfinder
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Map an unfamiliar frontier of a codebase or problem space, ticket-izing
 decisions and resolving them one at a time.

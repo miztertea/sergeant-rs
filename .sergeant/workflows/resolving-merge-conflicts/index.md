@@ -3,6 +3,7 @@ kind: workflow
 name: resolving-merge-conflicts
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Resolve an in-progress git merge/rebase conflict without inventing
 behavior or aborting.

@@ -28,6 +28,7 @@ kind: workflow
 name: diagnose-bug
 status: published
 version: 3
+edition: 0.1.0
 description: >-
   Reproduce, isolate, prove, remediate and verify a defect.
 tags:
@@ -49,8 +50,16 @@ Fields:
 | `name` | yes | The workflow's identity. MUST equal the containing directory name under `.sergeant/workflows/` or `.sergeant/drafts/workflows/`. A mismatch is a violation — it is exactly the kind of ambiguity `@@name` resolution and catalog listing depend on not existing. |
 | `status` | yes | One of `draft`, `published`. MUST agree with filesystem location per `convention.md` §2.3: `published` is only legal under `.sergeant/workflows/`. `status` is authored metadata (§2 below) — it is never inferred from run history. |
 | `version` | yes | A monotonically increasing integer, bumped on any change to the workflow's stage sequence, context content that changes behavior, or `status`. Two admitted workflows sharing a `name` and `version` with different content is a violation — version is the freshness signal readers and generators rely on. |
+| `edition` | yes | The distro version (`Cargo.toml`'s package `version`, e.g. `0.1.0` — ADR 0014 decision 2's co-versioned `v0.x.y` identity) that wrote this file as stock content. Set once, by `sgt init`/update, when it writes the stock copy; a package a user has forked into `.sergeant/local/` keeps whatever `edition` it carried at fork time — the field records descent, not current drift (proposal §4.7, ADR 0014 decision 4). Comparing a fork's `edition` against the currently-shipped stock package's `edition` by plain string equality is how drift becomes checkable without a diff verb: unequal means the fork predates the current stock edition; equal means it doesn't. Editing the template body MUST NOT change `edition` — it is provenance, not a content hash. |
 | `description` | yes | One to a few sentences: what the workflow is for and its bounded outcome (§6.2's "recognizable trigger, bounded outcome, completion condition"). A description that only restates the name (e.g. `name: diagnose-bug`, `description: diagnoses bugs`) is a violation — it fails the greppability purpose of §7.3. |
 | `tags` | no | A flat list of free-text topical tags. Tags are authored, not derived; they MUST NOT be populated from observed telemetry (§2 below). |
+
+`skills/*/SKILL.md` front matter (`name`, `description`, and whatever else
+the harness's own skill format requires) is not a `kind: workflow` document
+and is not otherwise governed by this section, but it carries the same
+`edition` field with the same meaning and the same comparison rule — reusing
+the field name rather than inventing a second provenance shape for a second
+directory (CONSTRUCTION R2).
 
 Rules:
 
@@ -65,6 +74,12 @@ Rules:
    `status: published` workflow's `name` and MAY link to that workflow's own
    `index.md`. A published workflow missing from the root list is a
    violation (`convention.md` §1.1).
+3. `edition` is authored metadata (§2 below), not observed telemetry: it
+   changes only when `sgt init`/update overwrites the file with a new stock
+   copy, never as a side effect of a run, a lint pass, or a package author's
+   own edit to a package still under `.sergeant/workflows/`. A tool that
+   bumps `edition` for any reason other than writing a new stock copy is a
+   violation.
 
 ## 1a. Stage `CONTEXT.md` Inputs table (Layer 2 contract)
 

@@ -3,6 +3,7 @@ kind: workflow
 name: repo-to-icm
 status: published
 version: 3
+edition: 0.1.0
 description: >-
   Convert a repository's distributed procedural knowledge — skills, agent
   instructions, scripts, docs, tests — into draft ICM workflow packages

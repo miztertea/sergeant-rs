@@ -3,6 +3,7 @@ kind: workflow
 name: prototype
 status: published
 version: 1
+edition: 0.1.0
 description: >-
   Build a throwaway prototype to answer a design question, branching
 between logic and UI questions.

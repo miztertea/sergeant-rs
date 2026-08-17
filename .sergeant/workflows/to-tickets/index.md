@@ -3,6 +3,7 @@ kind: workflow
 name: to-tickets
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Break a plan, spec, investigation, findings register, PR, or
 conversation into dependency-aware tracer-bullet work.

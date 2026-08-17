@@ -3,6 +3,7 @@ kind: workflow
 name: implement
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Implement a piece of work from a spec or ticket set,
 explicit-invocation-only.

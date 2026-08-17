@@ -1,6 +1,7 @@
 ---
 name: to-spec
 description: Turn the current conversation's plan/design into a published spec ticket — no interview, just synthesis of what's already been discussed, plus repository exploration. Use when a design needs to become a spec-shaped ticket before implementation.
+edition: 0.1.0
 ---
 
 Provenance for this skill's citation record lives in

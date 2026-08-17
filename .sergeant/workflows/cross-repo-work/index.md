@@ -3,6 +3,7 @@ kind: workflow
 name: cross-repo-work
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Decompose a requested outcome across repositories and define delivery
 order: produce a plan in which every required behavior has exactly one

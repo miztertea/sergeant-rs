@@ -3,6 +3,7 @@ kind: workflow
 name: research
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Investigate a question against high-trust primary sources and capture
 the findings as a Markdown file in the repo.

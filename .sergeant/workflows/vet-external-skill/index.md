@@ -3,6 +3,7 @@ kind: workflow
 name: vet-external-skill
 status: published
 version: 2
+edition: 0.1.0
 description: >-
   Vet an external skill through a fixed sequence before adopting it, and
 keep already-adopted skills updated through the same discipline.
