@@ -20,19 +20,16 @@ For Sergeant-owned skills: update this repository through a reviewed PR and run 
 
 - **For Sergeant-owned skills, update this repository through a reviewed PR and run the repository's own instruction-policy test plus the full test suite.**
   (trigger: updating a Sergeant-owned skill; outcome: no Sergeant-owned skill changes ship without passing review and the full test suite, including the instruction-policy test)
-  — `BU-P1-127`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L142-144, Sergeant-owned update path)
 
   **Source-fidelity correction (ICM-R3, 2026-08-16):** the upstream text
   names a literal path, `tests/instruction-policy-test.sh`. This
   repository's own `tests/` does not contain that script (it contains
   `estate_routes.rs`, `m1_event_core.rs`, ... `t2_workflow_catalog.rs`);
-  the only file with that name lives at
-  `reference/sergeant-upstream/tests/instruction-policy-test.sh`, frozen
-  source-project evidence, not this repository's own live tooling. This
-  package is generic per-repository guidance: run whichever instruction-
-  policy check and full test suite the *target* repository (the one
-  whose Sergeant-owned skill is being updated) actually names, not this
-  literal upstream path.
+  that literal path is frozen source-project evidence, not this
+  repository's own live tooling. This package is generic per-repository
+  guidance: run whichever instruction-policy check and full test suite the
+  *target* repository (the one whose Sergeant-owned skill is being
+  updated) actually names, not this literal upstream path.
 
 ## Bounded judgment
 

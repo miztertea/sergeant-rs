@@ -20,14 +20,13 @@ The external skill does not conflict with repository AGENTS.md or safety policy.
 
 - **Verify the external skill does not conflict with repository AGENTS.md or safety policy.**
   (trigger: actions checked; outcome: no adopted skill contradicts the repository's own instruction or safety policy)
-  — `BU-P1-123`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L129, vet step 4)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J5 — governing constraint
-- No adopted skill may contradict repository instruction or safety policy (workflow-level constraint, `BU-P1-123` restates it as a check at this stage).
+- No adopted skill may contradict repository instruction or safety policy (workflow-level constraint, restated here as a check at this stage).
 
 ### J2 — delegated to this stage
 - Judging whether a given instruction or action in the skill is in fact a conflict.
