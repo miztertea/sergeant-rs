@@ -48,8 +48,10 @@ Five stages extracted as their own candidates (ladder §6.5, "deterministic-mach
 **1. reconcile fleet** (formerly `40-reconcile-before-launch`) — bulk fleet reconciliation runs before new work is created.
 
 - **Bulk fleet reconciliation syncs worktree status into fleet state, stops only identity-verified done or failed worker processes, and marks an interrupted dispatched record failed only once it has had neither a worktree nor an owned live process for a default 300-second grace period (configurable), while it always preserves needs_input, blocked, and orphaned records, and dispatch always runs this reconciliation automatically before creating new work.**
-  (trigger: sgt-watch --sync-all runs, or dispatch runs it automatically before new work; outcome: fleet state converges toward truth using identity-verified evidence and a bounded grace period, never a bare liveness guess, and never silently sweeps a needs_input/blocked/orphaned record)
+  (trigger: dispatch runs it automatically before new work — the automatic half of this is real, folded into helper invocation 1 below; outcome: fleet state converges toward truth using identity-verified evidence and a bounded grace period, never a bare liveness guess, and never silently sweeps a needs_input/blocked/orphaned record)
   — `BU-P8-070`, `reference/sergeant-upstream/docs/using-sergeant.md` (L137-155 (Monitor work))
+
+  **Engine gap (skew-check-2026-08-17 finding 2, [issue #167](https://github.com/miztertea/sergeant-rs/issues/167)):** the upstream trigger clause this behavior unit was ported from also named `sgt-watch --sync-all` as an on-demand way to force this same reconciliation. `sgt watch` has no `--sync-all` flag (`sgt watch --help`'s full option list is `--data-dir`, `--follow`, `--json`) and is documented (ADR 0009) and confirmed by its own `--help` text as read-only — it does not mutate fleet state. There is currently no CLI verb that triggers bulk fleet reconciliation on demand outside of the automatic pre-dispatch run described above; an operator who wants convergence without also submitting new work has no command for that today.
 
 **2. create tracked work** (formerly `30-create-tracked-work`) — all-or-nothing task creation across every target repo, rolled back on any failure.
 

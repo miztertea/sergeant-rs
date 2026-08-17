@@ -46,6 +46,12 @@ This workflow receives an already-admitted Work intent (a project, a brief or tr
 ### Decision record
 Material decisions are recorded per-stage in each stage's own output artifact.
 
+## No `sgt dispatch` verb (skew-check-2026-08-17 finding 3)
+
+Every stage in this package phrases behavior as "sgt-dispatch does X" / "sgt-dispatch must Y," citing the upstream bash tool this package decomposes (`reference/sergeant-upstream/bin/sgt-dispatch`) being folded into behavior units. **`sgt` has no `dispatch` verb, hyphenated or otherwise** — confirmed by `sgt --help` (top-level verb list: `daemon`, `status`, `run`, `work`, `respond`, `retry`, `extend`, `cancel`, `watch`, `analytics`, `tui`, `doctor`, `init`, `repo`, `group`, `claude`, `codex`, `opencode`, `goose` — no `dispatch`, no `harness`) and by running `sgt dispatch --help` directly (`error: unrecognized subcommand 'dispatch'`). Wherever a stage says "sgt-dispatch," read it as upstream-tool provenance for the behavior unit, never as a present-tense `sgt` CLI invocation.
+
+The one thing `sgt-dispatch` names that this package genuinely needs a concrete mapping for — running this workflow at all — is `sgt run --workflow dispatch`. That mapping is mechanical and works today (see finding 3's own caveat about a fresh estate 422ing on any non-default workflow name, engine gap tracked separately as skew-check finding 6 / issue #165 — not this package's concern to fix).
+
 ## Relationships to other workflows
 
 **Corrected 2026-08-16, ICM-R3 (BU-DISP-15):** neither of the two packages named below exists in this repository — both are open, unbuilt engine gaps, not live delegations.

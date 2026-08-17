@@ -28,6 +28,12 @@ responses via the shipped `sgt respond` command. Neither `drain-fleet`
 nor `respond-to-worker` is published in this library — both name open,
 unbuilt engine gaps, not live delegation targets.
 
+**No `sgt dispatch` verb (skew-check-2026-08-17 finding 3):** every stage's
+prose speaks of "sgt-dispatch" as provenance from the upstream bash tool
+this package decomposes — `sgt` has no `dispatch` subcommand. This
+workflow is invoked as `sgt run --workflow dispatch`; see `CONTEXT.md`'s
+"No `sgt dispatch` verb" section for the full disclaimer.
+
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Full behavior-unit citations and the N1 adjudication
 record (A4, folding twelve extracted stages into six) live in the archived
