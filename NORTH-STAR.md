@@ -24,6 +24,18 @@ that turns a general-purpose coding harness into an operator of your
 estate, carried by a durable intent-execution engine that runs those
 intents to completion in isolated worktrees.*
 
+**Not true yet, and marked as such (2026-08-17).** The embedding clause
+above is the destination, not the current behavior: `sgt init` today
+writes `sergeant.toml`, `repos/`, and a `.gitignore`, and no workflow
+templates at all (issue #165; measured in
+`docs/gauntlet/runs/skew-check-2026-08-17/findings.md` findings 6 and 10).
+The Phase 0 skew check flagged this paragraph — revised the same day it
+was written — as a present-tense assertion of behavior the binary does not
+have, which is exactly the instruction-fiction class this document's own
+amendments were correcting. A destination document is entitled to describe
+where it is going; it is not entitled to describe that as already working.
+This note stands until `sgt init` actually writes the distro.
+
 The finished loop: `curl … | sh` → `sgt init` → `sgt claude` → say *"let's
 work on the payment api"*, *"why is the ingress controller erroring?"*,
 *"research this PRD across the backend group"* → Captain shapes those into
