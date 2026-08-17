@@ -203,6 +203,37 @@ that dispatched work goes through, just without leaving the session. This
 routing judgment belongs to the harness; sergeant's core makes no claim
 about it.
 
+### OBSERVATION — what counts as knowing
+
+*Do I actually know this, or do I only know a process exists?*
+
+**A Work is not progressing merely because a process for it exists.**
+Liveness is not evidence. Trust the journal-backed state the inspection
+surfaces read; a running process, an open pane, or a recent file write are
+all compatible with a Work that is stuck, finished, or dead. `in_progress`,
+`needs_input`, `blocked`, and `waiting` are all nonterminal — none of them
+means "done," and none means "moving."
+
+**Attach the watcher before you reconcile, not after.** An estate-wide
+watch is edge-triggered from the moment it attaches. Start the watcher
+first, *then* run the fleet reconciliation — anything landing in between
+otherwise falls in a window nothing was watching. A one-shot estate watch
+invoked after reconciliation still carries that gap; this is stated rather
+than papered over. The same order applies before dispatching: attach, then
+submit.
+
+**A watch notice is a trigger, not the state.** Adjudicate from the
+snapshot and the ordinary inspection surfaces, never from a raw event
+payload. And `needs_input` is not automatically a summons — check the
+AUTHORITY ladder first, because existing intent, an established contract,
+or already-delegated authority may resolve it without a human.
+
+**Long waits belong in the background.** A foreground wait blocks the
+session and this harness caps such calls; a follow-mode watch under the
+harness's own background facility does not. Do not reconstruct either in
+shell — the watch verb is already the filter, and wrapping it in one
+discards events.
+
 ### Guardrails
 
 - Prefer `sgt` verbs over ad hoc shell or manual recovery; fall back only
