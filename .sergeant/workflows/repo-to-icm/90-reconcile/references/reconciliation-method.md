@@ -9,7 +9,7 @@ measurement package, and consolidate the grammar-pressure report.
 For every finding in `../80-adversarial-review/output/findings.ndjson`,
 record one disposition — `accept`, `reject`, or `park` — with a one-line
 reason, in `output/adjudication-log.md`. This mirrors the reference corpus's
-own adjudication method (`docs/gauntlet/contracts/N1.md`): evidence-only,
+own adjudication method (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`): evidence-only,
 rulings recorded, disagreements preserved rather than erased.
 
 - **accept**: the finding is correct; apply the repair directly to the
@@ -42,7 +42,7 @@ Proposal §9.9 names ten measurement dimensions. This file states all ten by
 name here (so recovering them never requires opening the proposal, which no
 stage's Inputs table can name — `docs/icm/convention.md` §1a rule 1 governs
 what this stage may depend on, and the proposal lives outside this
-workflow's own tree). Five require comparing against `reference-corpus/`
+workflow's own tree). Five require comparing against `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`
 and are **out of reach for this run's blindness rule**; five are
 **internally computable** from this run's own artifacts alone. Report both
 groups explicitly — a dimension silently missing from either group is a
@@ -76,9 +76,9 @@ draft validity             validator pass/fail per candidate, mechanical vs.
 review convergence         finding counts by axis/severity, accept/reject/
                            park counts (this stage's own adjudication-log.md)
 
-NOT COVERED HERE (require reference-corpus/ comparison — a separate, later
+NOT COVERED HERE (require sergeant-rs-workspace/knowledge/evidence/reference-corpus/ comparison — a separate, later
 process performed by independent comparers not bound by this run's
-blindness rule, docs/gauntlet/contracts/N2.md Outcome §3):
+blindness rule, sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md Outcome §3):
 
 behavioral recall, workflow-boundary agreement, stage-boundary agreement,
 representation agreement, engine-gap quality

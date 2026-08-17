@@ -12,7 +12,7 @@ correctly, and still let 11 reference behaviors carrying safety, identity,
 recovery, delivery, or human-decision consequence go silently absent —
 not because the files weren't read (all 16 were), but because nothing was
 specifically hunting for these five classes
-(`docs/gauntlet/runs/n2-run2/comparison-scorecard.md` §3, the §22.2 finding).
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-scorecard.md` §3, the §22.2 finding).
 Two of the sharpest misses were one-sentence `AGENTS.md` guardrails inside a
 file this run's actors extracted 23 other units from — proof that ordinary
 "read the file, extract what stands out" attention is not enough on its

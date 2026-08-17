@@ -21,7 +21,7 @@ stripped from the shipped template content
 below; the record of why each rule exists did not move with them.
 
 Two-stage actor-only workflow (N1 reference corpus,
-`docs/gauntlet/contracts/N1.md`; `reference-corpus/synthesis.md` §1,
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`; `sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §1,
 candidate **W23** `implement`) that implements a piece of work from a spec
 or ticket set. Explicit-invocation-only — this workflow must never be
 auto-loaded merely because the task looks like implementation.
@@ -31,4 +31,4 @@ auto-loaded).
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Curated for promotion per
 `docs/icm/promotion-spec-2026-08-11.md`; the full behavior-unit citations
-live in the archived `docs/gauntlet/promoted-provenance/implement.md`.
+live in the archived `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/implement.md`.

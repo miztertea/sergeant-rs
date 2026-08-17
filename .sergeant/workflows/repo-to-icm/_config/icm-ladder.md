@@ -19,21 +19,21 @@ repository instruction surface).
 
 ## 6.1a — Does this procedure decide what Work should exist, or execute one already admitted?
 
-*(Citation corrected ICM-R2, `docs/gauntlet/runs/icm-r2/repo-to-icm/
+*(Citation corrected ICM-R2, `sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/repo-to-icm/
 adjudication-draft.md`: the ICM-R1 landing that added this section
 (commit `dd3c0ef`) attributed it to `docs/adr/0013-icm-r0-owner-rulings.md`
 **decision 1**, which is "Names" — accepting "Placement Ladder (PL)" and
 "Bounded-Judgment Ladder (J)" as terms — and has no bearing on this
 discriminator. The actual grounding, confirmed against
-`reference/proposal-icm-r-procedure-authority.md` §3.3 and its own §19
+`sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §3.3 and its own §19
 decision list, is Finding **ICMR-F3** from the ICM-R0 gauntlet
-(`docs/gauntlet/runs/icm-r0/`), which motivated this section directly —
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r0/`), which motivated this section directly —
 not any of the twelve owner-ruled decisions in ADR 0013, none of which
 covers the driver/admission-boundary discriminator itself. This section's
 own *content* is unaffected; only the attribution below is corrected.)*
 
 Added following the ICM-R0 gauntlet's Finding ICMR-F3
-(`reference/proposal-icm-r-procedure-authority.md` §3.3): §6.2's own
+(`sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §3.3): §6.2's own
 question — "does it have a recognizable trigger, a bounded outcome, and a
 completion condition?" — is necessary for a workflow but not sufficient. A
 Captain skill can have all three too. This question must be asked and
@@ -48,7 +48,7 @@ already-existing Work merely to make that decision. It receives no
 admitted intent; it produces one.
 
 **Representation:** `captain-skill` (→ `skills/<name>/SKILL.md`, per the
-Placement Ladder's PL-2 — see `reference/proposal-icm-r-procedure-
+Placement Ladder's PL-2 — see `sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-
 authority.md` §5.4 for the full rung and its worked examples) if the
 answer is "decides what Work should exist." Continue to §6.2 only if the
 answer is "executes an already-admitted intent."
@@ -86,7 +86,7 @@ stage merely because it is executable.
 
 **The question must actually be answered, not skipped past.** N2
 adjudicated exactly this failure at scale
-(`docs/gauntlet/runs/n2-run2/comparison-c2-boundaries.md` §4.2): 73% of one
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-c2-boundaries.md` §4.2): 73% of one
 run's corpus was classified `helper`/`shared-helper` with a rationale that
 answered §6.5's question ("is this deterministic machinery subordinate to
 some checkpoint?") *without ever recording an answer to §6.3's own
@@ -101,8 +101,8 @@ the implementation would not remove a checkpoint anyone cared about" and
 continuing down the ladder. A rationale that jumps straight to §6.5's
 language without that sentence has not cleared §6.3 — it has skipped it.
 `40-classify/CONTEXT.md` states this as a required step, the same way this
-run's own reference (`reference-corpus/`) required it in its own A4
-adjudication (`docs/gauntlet/runs/n2-run2/comparison-c2-boundaries.md` §3):
+run's own reference (`sergeant-rs-workspace/knowledge/evidence/reference-corpus/`) required it in its own A4
+adjudication (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-c2-boundaries.md` §3):
 a checkpoint question is answered *before* a lower-rung classification is
 legal, not assumed by arriving there.
 
@@ -119,7 +119,7 @@ A behavior correctly classified `helper` because of what it *does* should
 cluster with other helpers doing the same thing regardless of which file
 happened to contain them; a corpus where helper clusters instead reproduce
 the inventory's own file list one-for-one is the tell that §6.3 was never
-actually asked (`docs/gauntlet/runs/n2-run2/comparison-c2-boundaries.md`
+actually asked (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-c2-boundaries.md`
 §4.2's own worked examples: `sgt-recover`, `sgt-respond`, `sgt-watch`,
 `sgt-drain*` each became its own single-file helper cluster this way).
 

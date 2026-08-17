@@ -30,7 +30,7 @@ Build-dir placement, not just contamination, is its own hazard: disposable workt
 
 ## What this is
 
-A local agent execution daemon (`sgt`): durable Work items run staged workflows in git-worktree surfaces, executed by native agent harnesses (Claude via headless `claude -p` turns; a deterministic fake backend for tests), with the entire trajectory event-sourced into an append-only journal. Specified by `reference/proposal-depot-rust-execution-surface.md` (which calls the product "Depot"); the N-series (ICM workflows, per-stage harnesses, Docker execute stages) is governed by its successor, `reference/proposal-next-iteration-icm-workflows.md`, kicked off by the N0 contract's rulings. Departures from either proposal live in GAUNTLET.md's deviation register and are settled — re-litigate one only by arguing its ruling is wrong, not by noticing the deviation exists. The product-level destination — what sergeant is *for*, past this repo's own build mechanics — is `NORTH-STAR.md`; this file stays scoped to how to work on the code.
+A local agent execution daemon (`sgt`): durable Work items run staged workflows in git-worktree surfaces, executed by native agent harnesses (Claude via headless `claude -p` turns; a deterministic fake backend for tests), with the entire trajectory event-sourced into an append-only journal. Specified by `sergeant-rs-workspace`'s `knowledge/evidence/reference/proposal-depot-rust-execution-surface.md` (which calls the product "Depot"); the N-series (ICM workflows, per-stage harnesses, Docker execute stages) is governed by its successor, `knowledge/evidence/reference/proposal-next-iteration-icm-workflows.md` in the same repo, kicked off by the N0 contract's rulings. Departures from either proposal live in GAUNTLET.md's deviation register and are settled — re-litigate one only by arguing its ruling is wrong, not by noticing the deviation exists. The product-level destination — what sergeant is *for*, past this repo's own build mechanics — is `NORTH-STAR.md`; this file stays scoped to how to work on the code.
 
 ## Architecture — the invariants that shape everything
 
@@ -94,11 +94,33 @@ in `AGENTS.md` instead.
 
 ## The development record (read before changing method or scope)
 
-- **GAUNTLET.md** — append-only ledger: the deviation register, backlog rows with named triggers, per-milestone scorecards and adjudication rulings (current numbering lives in the file itself, not here — refer, don't copy). Append; never rewrite history.
-- **LESSONS.md** — binding on development here. Highest-leverage: measure the claude CLI (L1), point fresh reviewers at the register first (L3), mutation probes only in disposable copies outside the tree (L5), keep fix commits separable from build commits (L10), re-read governing text at decision time — summaries are orientation, not authority (L12).
-- **docs/gauntlet/contracts/** — the milestone contracts the code was built and reviewed against; `reference/notes/gauntlet-pattern.md` defines the loop **and the binding model spread** (Sonnet executes contracts, Opus judges outcomes, Fable is the one orchestrator seat and never fans out — dated revision 2026-08-10, ruling R-S0-13); `resources/` holds every orchestration script as run, per-series.
-- Design decisions log their Ponytail rung (R1–R7 ladder in `reference/notes/ideaos-agent-contract.md`).
-- `reference/notes/` are **living method docs**, revised in place with dated entries (their own convention — see the economy revisions). Everything else under `reference/` — the proposals, `sergeant-upstream/` — is frozen evidence: don't edit it to change behavior.
+**The development record now lives in `sergeant-rs-workspace`, not this
+repo.** Phase 4 of `reference/proposal-product-workspace-split.md`
+(ADR 0014 decisions 9 and 17) moved it: `GAUNTLET.md` and `LESSONS.md`
+were decomposed into typed records before their bulk siblings —
+`docs/gauntlet/`, `reference/`, `reference-corpus/`, `resources/` — were
+migrated wholesale (Phase 4 step 4). This repo keeps ADRs (decisions that
+bind present-day behavior) and sheds the argument, evidence, and method
+corpus that produced them.
+
+- **`GAUNTLET.md` and `LESSONS.md`** are now short pointer files at their
+  old paths (kept so existing references don't 404) — the deviation
+  register, backlog, per-milestone ledger entries, and all 25 lessons are
+  typed records under `sergeant-rs-workspace`'s `knowledge/rulings/` and
+  `knowledge/evidence/`. Start at `knowledge/index.md` there.
+- **Milestone contracts, orchestration scripts, method notes, frozen
+  upstream material, and the nine proposals** — formerly
+  `docs/gauntlet/contracts/`, `resources/`, `reference/notes/`,
+  `reference/sergeant-upstream/`, `reference/proposal-*.md` — moved intact
+  to `sergeant-rs-workspace`'s `knowledge/evidence/{gauntlet,resources,
+  reference}/`, preserving their prior directory structure. Design
+  decisions still log their Ponytail rung (R1–R7 ladder, now at
+  `knowledge/evidence/reference/notes/ideaos-agent-contract.md`).
+- Anything in that corpus that binds present-day product behavior was
+  extracted to an ADR in this repo *before* the move (ADR 0014 decision
+  17) — see `sergeant-rs-workspace`'s
+  `knowledge/evidence/reference/EXTRACTION-2026-08-17.md` for the audit
+  trail of what was and wasn't extracted.
 
 ## Shipping gate
 

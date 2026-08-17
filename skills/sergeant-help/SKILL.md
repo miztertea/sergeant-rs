@@ -31,16 +31,16 @@ workflow loop) instead of continuing to answer questions about it.
 | What Sergeant is, the product/ownership model | `README.md`, `NORTH-STAR.md` |
 | Install and first estate | `README.md` ("Get it") |
 | How a harness should route, the standard workflow loop, guardrails | `AGENTS.md` |
-| Waiting for a Work's next attention/result without polling, avoiding a `sgt work show` loop, subscribing to Work transitions | `docs/gauntlet/contracts/WATCH.md` (the `sgt watch` command), `AGENTS.md` step 6 |
+| Waiting for a Work's next attention/result without polling, avoiding a `sgt work show` loop, subscribing to Work transitions | `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/WATCH.md` (the `sgt watch` command), `AGENTS.md` step 6 |
 | Workflow authoring rules, the `.sergeant/` filesystem convention | `docs/icm/convention.md` |
 | What workflows exist | `.sergeant/index.md` (the catalog) |
 | A specific workflow's stages/inputs/outputs | `.sergeant/workflows/<name>/index.md` and `CONTEXT.md` |
 | Per-host environment facts (uid, Docker, toolchain, proxy posture) | `docs/environments/<host>.md` |
 | Building/testing/gating sergeant-rs's own code | `docs/DEVELOPMENT.md` |
-| Estate manifest (`sergeant.toml`) shape and fields | `docs/gauntlet/contracts/MVP-1.md`, `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md` |
+| Estate manifest (`sergeant.toml`) shape and fields | `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`, `sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/estate-manifest-design-2026-08-11.md` |
 | Why a design decision was made, deviations from the proposals | `GAUNTLET.md` (deviation register, backlog) |
 | A binding lesson about how this project has been burned before | `LESSONS.md` |
-| What a milestone actually promised/delivered | `docs/gauntlet/contracts/<milestone>.md` |
+| What a milestone actually promised/delivered | `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/<milestone>.md` |
 
 There is no `docs/schema.md`/`docs/troubleshooting.md`/`docs/getting-started.md`
 in sergeant-rs — those upstream primary documents don't exist here; the rows
@@ -72,7 +72,7 @@ above are sergeant-rs's real equivalents, not a copy of upstream's map.
    - `AGENTS.md` for always-on execution/safety policy;
    - the trigger-loaded skill or workflow's own `index.md`/`CONTEXT.md` for
      its procedure;
-   - `docs/gauntlet/contracts/MVP-1.md` for estate-manifest fields;
+   - `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md` for estate-manifest fields;
    - `README.md`/`docs/DEVELOPMENT.md` for walkthroughs and dev commands.
 7. State when a behavior is undocumented, unmeasured, or contradictory. Do
    not invent a command, flag, state transition, or safety guarantee.

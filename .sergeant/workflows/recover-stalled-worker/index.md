@@ -23,8 +23,8 @@ from the shipped template content below; the record of why each rule
 exists did not move with them.
 
 Three-stage actor-only workflow (N1 reference corpus,
-`docs/gauntlet/contracts/N1.md`, candidate **W11** `recover-stalled-worker`,
-`reference-corpus/synthesis.md` §1) for one bounded recovery attempt on a
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`, candidate **W11** `recover-stalled-worker`,
+`sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §1) for one bounded recovery attempt on a
 stalled worker: converge on a replacement or escalate — never guess. Use
 when: A worker is `in_progress` with a stall classification recorded by the
 watcher.
@@ -32,4 +32,4 @@ watcher.
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Behavior-unit citations and the N1 adjudication record
 live in `docs/icm/promotion-spec-2026-08-11.md` and the archived
-`docs/gauntlet/promoted-provenance/recover-stalled-worker.md`.
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/recover-stalled-worker.md`.

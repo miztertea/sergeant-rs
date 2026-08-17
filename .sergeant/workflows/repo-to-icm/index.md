@@ -19,9 +19,9 @@ tags:
 
 # repo-to-icm
 
-Eleven-stage workflow (`docs/gauntlet/contracts/N2.md`; proposal §9) —
+Eleven-stage workflow (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md`; proposal §9) —
 ten actor stages plus one `kind = "execute"` stage, `65-self-check`
-(N4, `docs/gauntlet/contracts/N4.md`) — that decomposes a target
+(N4, `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N4.md`) — that decomposes a target
 repository's procedural knowledge into the ICM representation vocabulary
 (`docs/icm/record-shapes.md` §4) and
 materializes the result as **draft** workflow packages — never admitted
@@ -33,7 +33,7 @@ volume-handling decision), `workflow.toml` for the pinned stage order, and
 distilled — v2 adds the required-before-`helper` §6.3 answer and the
 over-promotion tell).
 
-**v2** (`docs/gauntlet/runs/n2-run2/comparison-scorecard.md`,
+**v2** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-scorecard.md`,
 `grammar-pressure-report.md`): `20-harvest` gained a per-partition
 checkpoint/retry protocol and a mandatory five-class (safety, identity,
 recovery, delivery, human-decision) consequence sweep with its own
@@ -47,7 +47,7 @@ that is not yet reachable in any committed tree (GP-5b / issue #29), proven
 by `scripts/test-finalize-evidence-guard.py` and wired into
 `scripts/validate-structure.py` as `[S15]`.
 
-**v3** (`docs/gauntlet/contracts/N4.md`, MVP-2 lane D3): adds
+**v3** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N4.md`, MVP-2 lane D3): adds
 `65-self-check`, a `kind = "execute"` stage between `60-draft` and
 `70-lint` that runs `scripts/validate-structure.py` against this
 workflow's own tree in a pinned, offline container — the mechanical
@@ -60,7 +60,7 @@ Use when: a repository's procedural knowledge needs to be surfaced as
 reviewable ICM candidates — either to seed a first admitted decomposition
 of a new repository, or to measure this workflow's own recall/precision
 against an already-adjudicated reference corpus (as in the N2 measurement
-run against `reference/sergeant-upstream`).
+run against `sergeant-rs-workspace/knowledge/evidence/reference/sergeant-upstream`).
 
 Output always lands under `.sergeant/drafts/workflows/<candidate>/` in the
 run's own worktree (`docs/icm/convention.md` §2) — promotion to

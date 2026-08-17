@@ -1,10 +1,10 @@
 # research — admitted workflow (N1 reference corpus,
-# docs/gauntlet/contracts/N1.md; candidate W27,
-# reference-corpus/synthesis.md §1). Investigates a question against
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md; candidate W27,
+# sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md §1). Investigates a question against
 # high-trust primary sources and writes the findings to a single cited
 # Markdown file. Promoted per docs/icm/promotion-spec-2026-08-11.md; the
 # full behavior-unit citation trail is archived at
-# docs/gauntlet/promoted-provenance/research.md.
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/research.md.
 #
 # One ordinary actor stage (00-investigate) — no engine change. Stage
 # order here is authoritative; the directory listing under this

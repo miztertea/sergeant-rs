@@ -18,11 +18,11 @@ run is closed.
 `adjudication-log.md` — every `80-adversarial-review` finding's disposition
 (accept/reject/park) and reason. `measurement-package.md` — the
 internally-computable `§9.9` dimensions (explicitly naming the five that
-require the separate, later blind comparison against `reference-corpus/`
+require the separate, later blind comparison against `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`
 and are not covered here), ending with `../scripts/finalize.py`'s recorded
 output. `grammar-pressure.ndjson` — every surviving engine-gap claim,
 behavior-level and meta-level, as full six-field records
-(`docs/gauntlet/contracts/N2.md` Outcome §4; exact wrapper shape in
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md` Outcome §4; exact wrapper shape in
 `references/reconciliation-method.md` §3).
 
 All three are `promote`: they are this run's final deliverable record — the

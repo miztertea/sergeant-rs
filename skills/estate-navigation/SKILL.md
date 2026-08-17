@@ -8,7 +8,7 @@ Provenance for this skill's citation record lives in
 `sergeant-rs-workspace`'s `knowledge/evidence/provenance/skills.md`.
 
 Content ported from the upstream core function map
-(`docs/gauntlet/notes/upstream-core-function-map-2026-08-11.md`): `sgt-context`
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/upstream-core-function-map-2026-08-11.md`): `sgt-context`
 ("emit a project's layered agent-instructions block... for session start")
 and `sgt-sync` ("clone missing / pull existing repos") were each ruled
 **SKILL** by owner pre-ruling — "pure config read, no worktree or Work state
@@ -18,9 +18,9 @@ project registry, `yq`-parsed, with `defaults → group → repo` instruction
 layering the harness composed itself) does not exist in sergeant-rs and is
 not re-created here; this skill teaches the equivalent judgment against
 sergeant-rs's actual estate model (`sergeant.toml`'s `[estate]`/`[[repo]]`/
-`[group.<name>]`, per `docs/gauntlet/contracts/MVP-1.md`).
+`[group.<name>]`, per `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`).
 
-**Extended at ICM-R2** (`docs/gauntlet/runs/icm-r2/sergeant-setup/
+**Extended at ICM-R2** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/sergeant-setup/
 adjudication-draft.md`) to absorb `sergeant-setup`'s two remaining live
 behaviors — interactive repo/group registration and capability-gap tracking
 — now that package retired. Both new sections below are live, Captain-
@@ -104,7 +104,7 @@ answer:
 **What this does not cover, on purpose.** The retired interview also asked
 for per-repo role, a free-text `agent_instructions` block (default and per-
 group), and a project-level GitHub identity. None of these have a
-`sergeant.toml` field today (`docs/gauntlet/contracts/MVP-1.md` — the schema
+`sergeant.toml` field today (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md` — the schema
 has `[[repo]] instructions = "local" | "suppress"`, not free text, and no
 GitHub-identity or Graphify-path field at the estate level). Don't invent
 values for fields that don't exist; if a user asks for one of these, say

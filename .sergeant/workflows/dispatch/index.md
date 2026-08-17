@@ -24,7 +24,7 @@ stripped from the shipped template content
 below; the record of why each rule exists did not move with them.
 
 Six-stage admitted workflow (N1 reference corpus,
-`docs/gauntlet/contracts/N1.md`,
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`,
 candidate **W8** `dispatch`) that, given a project, a brief or tracked
 task, and a repository set, produces one durable task with an isolated
 work surface, a rendered mission brief, and a running agent per
@@ -48,5 +48,5 @@ workflow is invoked as `sgt run --workflow dispatch`; see `CONTEXT.md`'s
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Full behavior-unit citations and the N1 adjudication
 record (A4, folding twelve extracted stages into six) live in the archived
-provenance copy, `docs/gauntlet/promoted-provenance/dispatch.md`, per
+provenance copy, `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/dispatch.md`, per
 `docs/icm/promotion-spec-2026-08-11.md`.

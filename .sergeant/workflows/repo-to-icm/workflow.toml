@@ -1,4 +1,4 @@
-# repo-to-icm — admitted workflow (N2, docs/gauntlet/contracts/N2.md;
+# repo-to-icm — admitted workflow (N2, sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md;
 # proposal §9). Converts a repository's distributed procedural knowledge
 # into DRAFT ICM workflow packages under .sergeant/drafts/workflows/, plus
 # an evidence-backed measurement report. It does not publish workflows and
@@ -11,7 +11,7 @@
 # scripts/validate-structure.py.
 #
 # v2: responds to the N2 run-2 comparison
-# (docs/gauntlet/runs/n2-run2/comparison-scorecard.md,
+# (sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-scorecard.md,
 # grammar-pressure-report.md) with content-only changes — still ten stages,
 # same order, same engine. `20-harvest` gains a per-partition
 # checkpoint-and-retry protocol and a mandatory consequence-class sweep
@@ -25,7 +25,7 @@
 #
 # v3 (this version, MVP-2 lane D3): adds `65-self-check`, a `kind =
 # "execute"` stage between `60-draft` and `70-lint` — this is N4's
-# adjudicated first real execute stage (docs/gauntlet/contracts/N4.md,
+# adjudicated first real execute stage (sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N4.md,
 # 2026-08-12 ADJUDICATION: "cheap, fast, and runnable constantly ...
 # repo-to-icm's validate-structure.py run"). It runs
 # `scripts/validate-structure.py` against this workflow's own tree in a

@@ -32,7 +32,7 @@ Apply `@@bounded-judgment`. The helper invocation below runs first, mechanically
 - None beyond ordinary tool mechanics — classification is the only material decision this stage makes, and it is J2.
 
 ### J0 — must become `needs_input`
-- **The work straddles more than one of the five categories and no single classification is clearly dominant** (e.g. a hard bug that also requires an uncertain design call before it can be fixed). The five categories are mutually exclusive by construction, each loading a materially different procedure with a different authority envelope — classifying a straddling case is not the same delegation as choosing among genuinely exclusive categories, and guessing silently picks the wrong downstream procedure. (Parallel finding to `deepen-module`'s own structurally identical five-vs-four-category branching point, `docs/gauntlet/runs/icm-r3/deepen-module/review.md`.)
+- **The work straddles more than one of the five categories and no single classification is clearly dominant** (e.g. a hard bug that also requires an uncertain design call before it can be fixed). The five categories are mutually exclusive by construction, each loading a materially different procedure with a different authority envelope — classifying a straddling case is not the same delegation as choosing among genuinely exclusive categories, and guessing silently picks the wrong downstream procedure. (Parallel finding to `deepen-module`'s own structurally identical five-vs-four-category branching point, `sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/deepen-module/review.md`.)
 
 ### Completion boundary
 This stage may complete only when scope is pinned and the work is classified into exactly one of the five categories (or raised as `needs_input` per the straddling case above).
@@ -42,7 +42,7 @@ The chosen category and its rationale are this stage's own durable output (`outp
 
 ## Additional note
 
-This is the branching point that raises engine-gap **G6** (child-procedure invocation with its own checkpoints) — see `reference-corpus/synthesis.md` §5. It survives partially: representable today only by inlining the chosen discipline's stages, losing independent parent/child checkpoint and recovery visibility.
+This is the branching point that raises engine-gap **G6** (child-procedure invocation with its own checkpoints) — see `sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §5. It survives partially: representable today only by inlining the chosen discipline's stages, losing independent parent/child checkpoint and recovery visibility.
 
 ## Helper invocations (folded stages, N1 adjudication A4)
 

@@ -1,12 +1,12 @@
 # TDD technique
 
 Shared actor-skill context (`docs/icm/convention.md` §6, Placement Ladder
-PL-3 — `reference/proposal-icm-r-procedure-authority.md` §5.5, whose own
+PL-3 — `sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §5.5, whose own
 worked example list names "a TDD technique" first). Resolved as `@@tdd`
 from `.sergeant/common/contexts/tdd.md` per `docs/icm/convention.md` §4.
 Rehomed at ICM-R3 from the two-stage `tdd` workflow
 (`.sergeant/workflows/tdd/`, N1 candidate **W22**); full behavior-unit
-citation trail archived at `docs/gauntlet/promoted-provenance/tdd.md`. This
+citation trail archived at `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/tdd.md`. This
 file does not re-derive those citations — it re-places the same cited
 content at the rung the current corpus actually earns.
 

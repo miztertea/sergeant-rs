@@ -1,4 +1,4 @@
-# to-tickets — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# to-tickets — admitted workflow (N1, sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md,
 # candidate W32). Breaks a plan, spec, investigation, findings register,
 # PR, or conversation into dependency-aware tracer-bullet work.
 #
@@ -10,7 +10,7 @@
 #
 # Curated for promotion per docs/icm/promotion-spec-2026-08-11.md; the full
 # stage-to-behavior-unit citation trail is archived at
-# docs/gauntlet/promoted-provenance/to-tickets.md.
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/to-tickets.md.
 
 [workflow]
 name = "to-tickets"

@@ -10,13 +10,13 @@ Provenance for this skill's citation record lives in
 Ported from `.sergeant/workflows/to-spec` (N1 candidate W31), which
 retires: this package's own defining behavior — synthesize from "the
 current conversation," never by interview — names a dependency on live
-dialogue that a dispatched Work cannot receive (`docs/gauntlet/runs/
+dialogue that a dispatched Work cannot receive (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/
 icm-r3/to-spec/adjudication-draft.md`'s "Driver and admission boundary").
 The Placement Ladder's PL-4 test requires a workflow to produce "a result
 that is meaningful independent of the original conversation continuing"
-(`reference/proposal-icm-r-procedure-authority.md` §5.6); this package's
+(`sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §5.6); this package's
 whole point is the opposite — the conversation supplies its content. That
-places it at PL-2, alongside `reference/proposal-icm-r-procedure-
+places it at PL-2, alongside `sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-
 authority.md` §5.4's own example of Captain-skill behavior: "turns user
 conversation into a bounded submission."
 

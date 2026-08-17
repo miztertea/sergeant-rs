@@ -1,3 +1,0 @@
-[2m2026-08-12T23:17:59.142043Z[0m [32m INFO[0m [2msergeant_rs::daemon[0m[2m:[0m daemon serving [3mendpoint[0m[2m=[0mhttp://127.0.0.1:40131 [3mdata_dir[0m[2m=[0m/tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/mvp4-soak-extended/data
-[2m2026-08-12T23:20:59.070119Z[0m [33m WARN[0m [2msergeant_rs::backend::claude[0m[2m:[0m the installed claude CLI completed a turn with no system/post_turn_summary line; withdrawing the `ask` capability [3mexecution_id[0m[2m=[0m01KZW4EB14RA0FV0Y6ZGZQ7NKH
-[2m2026-08-13T01:54:33.141693Z[0m [32m INFO[0m [2msergeant_rs::daemon[0m[2m:[0m shutdown signal received

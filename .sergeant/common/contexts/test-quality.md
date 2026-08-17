@@ -2,7 +2,7 @@
 
 Shared actor-skill context (Placement Ladder PL-3). Resolved as
 `@@test-quality` from `.sergeant/common/contexts/test-quality.md` per
-`docs/icm/convention.md` §4. Planned since `reference-corpus/
+`docs/icm/convention.md` §4. Planned since `sergeant-rs-workspace/knowledge/evidence/reference-corpus/
 shared-context-map.md`'s N1 synthesis pass but never materialized under
 `.sergeant/common/contexts/` before this ICM-R3 pass — see the `tdd`
 package adjudication's "Behavior-unit dispositions" table for the gap
@@ -75,6 +75,6 @@ your own classes, internal collaborators, or anything you control.
 ## Source
 
 Full behavior-unit citation trail for this content has not been separately
-archived under `docs/gauntlet/promoted-provenance/` — noted as a gap for
+archived under `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/` — noted as a gap for
 the independent reviewer, not fabricated here (see the `tdd`
 adjudication's Validation evidence section).

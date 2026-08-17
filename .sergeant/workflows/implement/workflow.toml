@@ -1,8 +1,8 @@
-# implement — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# implement — admitted workflow (N1, sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md,
 # candidate W23). Implements a piece of work from a spec or ticket set,
 # explicit-invocation-only. Promoted per
 # docs/icm/promotion-spec-2026-08-11.md; full behavior-unit citation trail
-# archived at docs/gauntlet/promoted-provenance/implement.md.
+# archived at sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/implement.md.
 #
 # Two ordinary actor stages (delegates to tdd at 10-implement-with-tdd and
 # to code-review at 30-review — both already promoted). Stage order here

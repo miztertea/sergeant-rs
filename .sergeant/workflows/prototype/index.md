@@ -22,7 +22,7 @@ stripped from the shipped template content
 below; the record of why each rule exists did not move with them.
 
 Six-stage actor-only workflow (N1 candidate **W21**,
-`docs/gauntlet/contracts/N1.md`) that builds a throwaway prototype to
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`) that builds a throwaway prototype to
 answer one design question, branching at `00-select-branch` between a
 logic/state investigation (`20L-build-logic`) and a UI-variants
 investigation (`20U-build-variants`) before handing off and capturing the
@@ -33,5 +33,5 @@ UI should look like.
 See `CONTEXT.md` for workflow orientation (including the reviewer note on
 the `20L`/`20U` branch shape) and `workflow.toml` for the pinned stage
 order. The full behavior-unit citation trail is archived at
-`docs/gauntlet/promoted-provenance/prototype.md`, per the promotion
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/prototype.md`, per the promotion
 procedure in `docs/icm/promotion-spec-2026-08-11.md`.

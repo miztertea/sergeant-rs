@@ -1,6 +1,6 @@
 # Recover Stalled Worker
 Draft workflow package — candidate **W11** `recover-stalled-worker` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
 This is Layer 1 orientation only — it is never delivered as a stage's
 instructions; each stage's own `CONTEXT.md` (Layer 2) is the actor's
 contract (`docs/icm/convention.md` §1a rule 5).
@@ -28,7 +28,7 @@ N1 adjudication A4 (BH-02) applied the generic de-staging sweep:
 no argument beyond the §6.5 "candidate execute-stage workload"
 boilerplate and folded into `40-escalate-on-second-attempt` as ordered
 helper invocations. Stage count dropped from 6 to 3; no behavior unit was
-deleted — see `docs/gauntlet/promoted-provenance/recover-stalled-worker.md`'s
+deleted — see `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/recover-stalled-worker.md`'s
 "Adjudication A4" section and
 `40-escalate-on-second-attempt/CONTEXT.md`'s "Helper invocations" section.
 
@@ -77,4 +77,4 @@ separate decision-log file.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/recover-stalled-worker.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/recover-stalled-worker.md` for the complete stage-to-behavior-unit mapping and workflow-level citations.

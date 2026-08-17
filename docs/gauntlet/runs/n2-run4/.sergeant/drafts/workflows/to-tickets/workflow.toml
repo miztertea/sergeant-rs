@@ -1,9 +1,0 @@
-# to-tickets — draft workflow candidate materialized by repo-to-icm's
-# 60-draft stage (N2 run, 21-partition corpus). status: draft in
-# index.md; this package has not been promoted to .sergeant/workflows/.
-# See provenance.md for the behavior_id evidence backing each stage.
-
-[workflow]
-name = "to-tickets"
-version = "1"
-stages = ["01-load-ticket-context", "02-draft-tickets", "03-review-breakdown", "04-publish-tickets", "05-validate-published-graph", "06-report-dispatch-frontier"]

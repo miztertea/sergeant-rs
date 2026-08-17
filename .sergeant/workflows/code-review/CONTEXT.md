@@ -1,9 +1,9 @@
 # Code Review
 Draft workflow package — candidate **W24** `code-review` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
 Revised at ICM-R2
-(`docs/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`) per
-`reference/proposal-icm-r-procedure-authority.md` §8. This is Layer 1
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`) per
+`sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §8. This is Layer 1
 orientation only — it is never delivered as a stage's instructions; each
 stage's own `CONTEXT.md` (Layer 2) is the actor's contract
 (`docs/icm/convention.md` §1a rule 5).
@@ -77,7 +77,7 @@ single-message, two-call concurrent dispatch.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/code-review.md` for the prior
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/code-review.md` for the prior
 revision's complete stage-to-behavior-unit mapping and workflow-level
-citations, and `docs/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`
+citations, and `sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`
 for this revision's full behavior-unit disposition table.

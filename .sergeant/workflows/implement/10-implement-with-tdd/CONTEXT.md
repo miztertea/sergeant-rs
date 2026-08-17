@@ -27,7 +27,7 @@ and `@@test-quality` (what makes a test worth keeping) throughout this
 stage. **Corrected 2026-08-16, ICM-R3**: `tdd` was previously a two-stage
 workflow this stage delegated to via undeclared context composition; it
 is now a shared technique context (`tdd`'s own ICM-R3 adjudication,
-`docs/gauntlet/runs/icm-r3/tdd/adjudication-draft.md`, REHOME — an
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/tdd/adjudication-draft.md`, REHOME — an
 independent reviewer's dispute over that disposition was resolved by
 owner ruling the same day: `tdd` is a technique an actor applies inside
 its own implementation turn, not a separate procedure with its own

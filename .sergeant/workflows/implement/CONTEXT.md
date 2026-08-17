@@ -1,9 +1,9 @@
 # Implement
 Draft workflow package — candidate **W23** `implement` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
 Revised at ICM-R3
-(`docs/gauntlet/runs/icm-r3/implement/adjudication-draft.md`) per
-`reference/proposal-icm-r-procedure-authority.md` §8. This is Layer 1
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/implement/adjudication-draft.md`) per
+`sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §8. This is Layer 1
 orientation only — it is never delivered as a stage's instructions; each
 stage's own `CONTEXT.md` (Layer 2) is the actor's contract
 (`docs/icm/convention.md` §1a rule 5).
@@ -63,7 +63,7 @@ evidence.
 | `10-implement-with-tdd` | actor-stage (§6.4, judgment) | Implementation proceeds seam by seam; folds the demoted `20-verify` checkpoint as a helper (N1 adjudication A4). |
 | `30-review` | actor-stage (§6.4, judgment) | The change is reviewed; folds the demoted `40-commit` checkpoint as a helper (N1 adjudication A4). |
 
-`20-verify` and `40-commit` were demoted per N1 adjudication A4 (finding N1-BH-02): both were classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate. Their behavior units survive, folded into the adjacent judgment-bearing stage as helper invocations — see each stage's own `CONTEXT.md` and `docs/gauntlet/promoted-provenance/implement.md`'s "Adjudication A4" section.
+`20-verify` and `40-commit` were demoted per N1 adjudication A4 (finding N1-BH-02): both were classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate. Their behavior units survive, folded into the adjacent judgment-bearing stage as helper invocations — see each stage's own `CONTEXT.md` and `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/implement.md`'s "Adjudication A4" section.
 
 ## Relationships to other workflows
 
@@ -78,7 +78,7 @@ evidence.
 
 Explicit-invocation-only — this workflow must never be auto-loaded merely because the task looks like implementation; this rule is mirrored cross-harness as well.
 
-ICM-R3 revision (`docs/gauntlet/runs/icm-r3/implement/adjudication-draft.md`):
+ICM-R3 revision (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/implement/adjudication-draft.md`):
 both stages gain this `## Authority envelope` companion and their own
 `## Bounded judgment` sections, replacing the prior generic
 `## Judgment required` boilerplate (`docs/icm/convention.md` §6.1,
@@ -88,16 +88,16 @@ as a separate Work" — `code-review` is a real four-stage, authority-
 enveloped workflow and cannot be faithfully represented by pulling its text
 into this workflow's own stage context. A full engine-gap claim for real
 nested/child workflow invocation is filed at
-`docs/gauntlet/runs/icm-r3/implement/draft/
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/implement/draft/
 engine-gap-nested-workflow-invocation.md`, evidenced by this package's own
 two delegations (both currently hedge "context composition today... does
 not exist yet" without the claim record §5 requires).
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/implement.md` for the complete
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/implement.md` for the complete
 stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3
 correction: the prior text pointed at a workflow-local `provenance.md`
 that does not exist under `.sergeant/workflows/implement/` — the archived
-file lives under `docs/gauntlet/promoted-provenance/`, matching every
+file lives under `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/`, matching every
 other promoted package's own layout.)

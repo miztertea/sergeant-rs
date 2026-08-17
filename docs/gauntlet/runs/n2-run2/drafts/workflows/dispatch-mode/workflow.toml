@@ -1,8 +1,0 @@
-# dispatch-mode — DRAFT candidate, materialized by repo-to-icm's 60-draft
-# stage. Not admitted; do not load into the runnable engine
-# (docs/icm/convention.md §2).
-
-[workflow]
-name = "dispatch-mode"
-version = "1"
-stages = ["10-dispatch-worker"]

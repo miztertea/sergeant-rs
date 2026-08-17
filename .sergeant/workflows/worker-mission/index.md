@@ -23,7 +23,7 @@ from the shipped template content below; the record of why each rule
 exists did not move with them.
 
 Four-stage admitted workflow (N1 reference corpus,
-`docs/gauntlet/contracts/N1.md`; `reference-corpus/synthesis.md` §1,
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`; `sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md` §1,
 candidate **W9** `worker-mission`) that, from a rendered brief, produces a
 merged-ready change with evidence — the contract a dispatched worker
 delivers against. Use when: A worker starts against a rendered brief.
@@ -37,5 +37,5 @@ library.
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Full behavior-unit citations and the N1 adjudication
 record (A4, folding six extracted stages into four) live in the archived
-provenance copy, `docs/gauntlet/promoted-provenance/worker-mission.md`,
+provenance copy, `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/worker-mission.md`,
 per `docs/icm/promotion-spec-2026-08-11.md`.

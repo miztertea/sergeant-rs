@@ -78,7 +78,7 @@ and this run alone:
      HEAD, not the subject's). Only here does "resolve `HEAD`" mean
      anything: `git -C <subject> rev-parse HEAD`.
    - **The subject is a vendored subtree** (no `.git` of its own — e.g.
-     `reference/sergeant-upstream`, tracked as ordinary files inside this
+     `sergeant-rs-workspace/knowledge/evidence/reference/sergeant-upstream`, tracked as ordinary files inside this
      outer repository). Its pinned revision is not something to (re)derive
      from `git rev-parse` inside it — there is no such object to resolve
      against. It is a recorded fact: look for that subject's own provenance
@@ -135,7 +135,7 @@ do not pick a plausible default. On the engine this workflow runs on today,
 an actor stage has no way to pause its own turn and wait for a human's
 answer mid-run — that is a `needs_input`/`waiting` transition the runtime
 drives from *outside* the actor's turn, never something the turn itself can
-request (`docs/gauntlet/notes/n2-fake-backend-semantics.md`). So the
+request (`sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/n2-fake-backend-semantics.md`). So the
 fail-closed action actually available to you is: still write
 `output/contract.md`, but make the ambiguity the document's own headline
 rather than a fabricated answer —

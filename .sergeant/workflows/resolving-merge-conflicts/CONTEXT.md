@@ -1,6 +1,6 @@
 # Resolving Merge Conflicts
 Draft workflow package — candidate **W26** `resolving-merge-conflicts` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
 This is Layer 1 orientation only —
 it is never delivered as a stage's instructions; each stage's own
 `CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`

@@ -23,9 +23,9 @@ rule exists did not move with them.
 
 Resolve an in-progress git merge/rebase conflict without inventing behavior
 or aborting. Admitted from the N1 reference-corpus decomposition
-(`docs/gauntlet/contracts/N1.md`), candidate **W26**.
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`), candidate **W26**.
 
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. The full behavior-unit citation trail is archived at
-`docs/gauntlet/promoted-provenance/resolving-merge-conflicts.md`, per
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/resolving-merge-conflicts.md`, per
 `docs/icm/promotion-spec-2026-08-11.md`.

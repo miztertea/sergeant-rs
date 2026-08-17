@@ -23,7 +23,7 @@ from the shipped template content below; the record of why each rule
 exists did not move with them.
 
 Seven-stage actor-only workflow (N1 reference corpus,
-`docs/gauntlet/contracts/N1.md`, candidate **W34**) that vets an external
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`, candidate **W34**) that vets an external
 skill through a fixed sequence before adopting it, and keeps
 already-adopted skills updated through the same discipline. Use when:
 before adopting an external skill, or when an adopted skill needs
@@ -33,4 +33,4 @@ See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Curated for promotion per
 `docs/icm/promotion-spec-2026-08-11.md`; the full behavior-unit citations
 live in the archived
-`docs/gauntlet/promoted-provenance/vet-external-skill.md`.
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/vet-external-skill.md`.

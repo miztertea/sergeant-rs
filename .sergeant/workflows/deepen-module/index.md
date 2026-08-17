@@ -21,7 +21,7 @@ provenance markers were stripped
 from the shipped template content below; the record of why each rule
 exists did not move with them.
 
-Three-stage actor-only workflow (`docs/gauntlet/contracts/N1.md`, candidate
+Three-stage actor-only workflow (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`, candidate
 **W25**) that turns a shallow module into a deep one at a deliberately
 chosen seam: classify a dependency cluster's coupling, generate and compare
 at least three independently designed interfaces, then replace the old
@@ -33,4 +33,4 @@ needs to be made deliberately rather than by default.
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Promoted per `docs/icm/promotion-spec-2026-08-11.md`;
 the full behavior-unit citation trail is archived at
-`docs/gauntlet/promoted-provenance/deepen-module.md`.
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/deepen-module.md`.
