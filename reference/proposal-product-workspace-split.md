@@ -1,6 +1,6 @@
 # Product / Workspace Split, Doctrine Rewrite, and Release Pipeline
 
-**Status:** Proposed
+**Status:** Proposed — revised 2026-08-17 after SPLIT-1 (sent back, scoped to §2)
 **Date:** 2026-08-17
 **Audit basis:** `main` @ 11aa8a1
 **Scope:** Repository topology, always-on doctrine, knowledge-layer design, distro
@@ -38,12 +38,29 @@ rulings, corpora). The record is 1,301 of 1,325 tracked markdown files and
 743,000 words. The product surface is `AGENTS.md` at 2,349 words.
 
 The consequence is not untidiness. It is a measurable retrieval failure, and it
-has already cost delivered work: a session hand-rolled seven stages of
-`validate-and-ship` because the real procedure "never reached the catalog"
-(LESSONS L20); a session quoted the `pgrep` bracket rule in a dispatch brief and
-then killed its own shell twice the same day; and the 2026-08-16 CI/CD proposal
-reconciled carefully against ADR 0001, ADR 0004, and the S-series while missing
-that NORTH-STAR holds its central deliverable behind a gate.
+has already cost delivered work:
+
+- A shipped workflow template mandates a CLI flag that does not exist,
+  in bold, as a non-negotiable step (§2.4). This is the strongest instance
+  and it is a live correctness defect, not merely an organizational one.
+- A session drove `no-mistakes` by hand for a full day, reimplementing
+  `validate-and-ship`'s gate-driving and custody-reconciliation stages
+  badly and inventing a workaround around a `--keep-local` flag it did not
+  know existed — because `docs/DEVELOPMENT.md` restated the procedure in
+  prose and never named the workflow, and "a reader who finds the prose
+  complete never reaches the catalog" (LESSONS L20).
+- A session quoted the `pgrep` bracket rule in a dispatch brief and then
+  killed its own shell twice the same day.
+- The 2026-08-16 CI/CD proposal reconciled carefully against ADR 0001,
+  ADR 0004, and the S-series while missing that NORTH-STAR holds its central
+  deliverable behind a gate.
+
+The second item carries its own small demonstration. An earlier draft of this
+proposal described it as "seven stages," taking the figure from
+`docs/DEVELOPMENT.md`, while LESSONS L20 names two specific stages. Both
+documents record the same incident at different magnitudes, and neither
+points at the other. That is routing fog, found while correcting a citation
+about routing fog.
 
 This proposal does five things:
 
@@ -73,16 +90,35 @@ plan states its degradations rather than claiming enforcement it does not have.*
 
 Applying the diagnostic (owner's knowledge base, 2026-07-11):
 
+**Revised 2026-08-17 after SPLIT-1.** The original scorecard claimed RED on
+all six. Two scores did not survive adversarial review and are corrected
+below; the revision is recorded rather than silently applied, per this
+repository's own convention. The corrected scorecard is weaker and remains
+sufficient — see §2.1.1.
+
 | Mode | Score | Evidence in this repository |
 |---|---|---|
-| Routing fog | RED | "Why did we choose X" has four homes: `docs/adr/`, `reference/proposal-*.md`, GAUNTLET rulings, `docs/icm/`. The bounded-judgment ladder declares itself canonical in three places at once. |
-| Dark corner | RED | No durable home for episodic session memory or for rejected approaches. Decisions reached in conversation have nowhere to land until someone writes a proposal. |
-| Arrival gap | RED | The ladder is unreachable in direct in-session mode. LESSONS L20, the `pkill` incident, and the CI proposal's missed gate are three recorded instances. |
+| Routing fog | AMBER | "Why did we choose X" has four candidate homes: `docs/adr/`, `reference/proposal-*.md`, GAUNTLET rulings, `docs/icm/`, with no stated rule for which owns a given question. **Corrected:** the original also claimed the bounded-judgment ladder "declares itself canonical in three places at once." That is false. One self-declaration exists (`.sergeant/common/contexts/bounded-judgment.md`), and `docs/icm/convention.md` explicitly *defers* to it — "canonical sources fixed elsewhere, referenced here rather than duplicated," which is the fix for routing fog, not an instance of it. |
+| Dark corner | AMBER | **Corrected:** the original claimed no durable home for episodic memory or rejected approaches. `LESSONS.md` and `GAUNTLET.md`'s deviation register provide partial homes for both. The narrowed claim that survives: decisions reached in conversation have no home until someone writes a proposal — evidenced by ADR 0014 existing only because this proposal's own session forced it. |
+| Arrival gap | RED | The ladder is unreachable in direct in-session mode. Two recorded instances stand: the `pkill` double-kill (a session quoted the bracket rule in a brief, then violated it twice the same day) and the CI proposal reconciling against ADRs while missing NORTH-STAR's gate. A third, `--intent-file`, is stronger than either — see §2.4. **Corrected:** the original also cited LESSONS L20; that citation overstated what the record documents and is withdrawn. |
 | Stale signal | RED | `gh pr edit` carries three dated superseding rows; the Claude CLI version carries three drift rows. Staleness is detected by human diligence, not by the system. |
 | Boundary blur | RED | `AGENTS.md` ↔ `docs/DEVELOPMENT.md` overlap. `AGENTS.md`'s own "the source that owns that topic wins" rule is an admission that boundaries blur. |
-| Instruction fiction | RED | `@@name` resolution documented as stage-only while skills use it; `.sergeant/index.md` narrates its own count; three `@@refs` resolve to nothing; NORTH-STAR describes a clone model we have now abandoned. |
+| Instruction fiction | RED | `.sergeant/index.md` narrates its own count; three `@@refs` resolve to nothing; NORTH-STAR described a clone model now abandoned; and a shipped workflow mandates a CLI flag that does not exist (§2.4). |
 
-Six for six, against a diagnostic that predates the failures it describes.
+### 2.1.1 Why the corrected scorecard still carries the argument
+
+Four RED and two AMBER is a weaker result than six RED, and the correction
+matters: the assumptions critic's characterisation of the original —
+*"motivated reasoning toward a RED verdict the section had already committed
+to"* — was accepted at adjudication.
+
+What the argument actually needs is not a perfect score. It needs that the
+failures are real, recorded, and have already cost delivered work. Four RED
+scores, two of them evidenced by incidents in this repository's own lessons
+and environment files, meet that bar. The two AMBER scores narrow to claims
+that still hold. A diagnostic that came back partly green would have been
+more credible than one that came back uniformly red, and the corrected
+version is the one to reason from.
 
 ### 2.2 Template contamination, measured 2026-08-17
 
@@ -92,35 +128,136 @@ which kind you are holding.
 
 ```
 template .md files under .sergeant/workflows + skills        216
-  carrying host/repo/tool-specific references (candidates)   162
-  hard references into reference/sergeant-upstream/           91
-  BU-#### citations into the behavior-unit corpus            611  (across 89 files)
+  hard references into reference/sergeant-upstream/           91  files
+  BU-#### citations into the behavior-unit corpus            611  across 89 files
 ```
 
-The 162 is an upper bound requiring triage — some matches are legitimate examples
-in a Rust context. The other two are unambiguous: **91 template files reference
-frozen evidence that is leaving for the workspace repo, and 611 citations point
-into a corpus that will never ship to a user.** Moving the record without
-decontaminating the templates dangles references inside the product's own shipped
-artifact.
+**Revised 2026-08-17 after SPLIT-1.** The original reported a third figure —
+162 "contamination candidates" — as the headline. It is withdrawn. It rested
+on a broad keyword grep with no stated methodology, and independent
+reconstruction lands near 117. The critic's finding was upheld: a number
+whose derivation cannot be repeated is not evidence.
+
+The two counts above hold exactly and were independently re-measured twice.
+They are also the ones that carry the argument on their own: **91 template
+files reference frozen evidence that is leaving for the workspace repo, and
+611 citations point into a corpus that will never ship to a user.** Moving
+the record without decontaminating the templates dangles references inside
+the product's own shipped artifact — and that follows from the unambiguous
+counts alone, without any judgment about how many files are "contaminated."
+
+The procedure/state test still needs applying file by file. That triage is
+Phase 2's work, not a number this proposal is entitled to assert in advance.
+Adversarial sampling suggested the real figure is closer to the 100 mark than
+to 162, and the test does not cleanly partition every file — some are neither
+purely procedure nor purely state. Phase 2 must therefore produce a
+three-way classification, not a binary one.
 
 ### 2.3 `@@ref` integrity, measured 2026-08-17
 
+Scope for every count below: **all 216 `.md` files** under
+`.sergeant/workflows/` and `skills/`. The original mixed two scopes without
+saying so and reported four numbers wrong; they are corrected here and were
+re-measured twice.
+
 ```
-stage CONTEXT.md files                80
-blocks titled "Bounded judgment"      82
-  citing @@bounded-judgment           77
-@@refs in use    bounded-judgment(107) tdd(10) test-quality(4) name(6)
-                 domain-modeling(1) ticket-shaping(1) triage-state-machine(1)
+template .md files                                216
+stage CONTEXT.md files (numbered stage dirs)       80
+blocks titled "Bounded judgment" (all 216 files)   82
+  files citing @@bounded-judgment                  79   (was reported 77)
+@@refs in use   bounded-judgment 109  (was 107)
+                tdd               14  (was 10)
+                name               8  (was  6)
+                test-quality       4
+                domain-modeling    1   ticket-shaping 1   triage-state-machine 1
 contexts that exist   bounded-judgment.md  tdd.md  test-quality.md
 ```
+
+Note that "80 stages" and "82 blocks" are drawn from different scopes — the
+82 includes workflow-root and skill files, not only numbered stage
+directories. The original presented them as one series.
 
 Three refs resolve to nothing. All three are narrated in
 `wayfinder/CONTEXT.md` as known gaps, which is the interesting part: **only prose
 distinguishes a live reference from an acknowledged gap.** That distinction must
 become machine-legible.
 
+### 2.4 A shipped template mandates a flag the binary does not have
+
+Found 2026-08-17, after SPLIT-1 closed, while checking how intents are
+passed to `sgt run`.
+
+`.sergeant/workflows/dispatch/05-classify-risk/CONTEXT.md` requires
+`--intent-file` three times, in bold, for any objective matching its
+safety-sensitive keyword set (auth, security, secrets, payments, databases,
+migrations, production, destructive, persistent state, state transitions),
+and states explicitly that this is **"not a delegated judgment call; the
+keyword match is fixed."**
+
+No such flag exists. Not on `sgt run`, not on `sgt dispatch`, not anywhere
+in `src/`. An actor following this published template on a
+security-or-payments objective is instructed to take a mandatory,
+non-negotiable step it cannot perform.
+
+This is the strongest instruction-fiction instance in the repository and the
+clearest argument in this document, because it is exactly what Phase 5's
+cross-repo skew check automates — and it was found by hand, by accident,
+while asking an unrelated question about shell quoting. It is also a live
+correctness defect in shipped content, not merely an organizational one.
+
+**Consequence for the plan:** the doctrine↔binary skew check moves out of
+Phase 5 and into Phase 0 in reduced form (see §6). It does not need both
+repositories mounted to compare doctrine's CLI claims against `--help`
+output; it needs one repo and a built binary. Phase 5 retains the full
+cross-repo version.
+
 ---
+
+## 2.5 Corrections to this proposal's own development
+
+Added 2026-08-17 after SPLIT-1's fidelity axis found that this document
+presented its conclusions with none of the history that produced them — that
+the corrections survived in ADR 0014 but "not in the document that is
+supposed to carry them forward." Its refuter called this the strongest
+finding in the file. The anti-duplication rule is satisfied by
+summary-plus-pointer; it was not satisfied by silence.
+
+Five positions in this document were reached by correcting Captain's first
+answer. Full records in ADR 0014.
+
+1. **Notion as the knowledge system of record.** Captain proposed migrating
+   the compiled knowledge layer to the owner's Notion workspace. Rejected —
+   it is a personal idea store, and making it the project's record would
+   make every contributor depend on it. The owner's own Notion decision page
+   and `reference/notes/ideaos-agent-contract.md` had already ruled the same
+   way; Captain had read the latter and proposed it anyway. §3.2's
+   three-substrate design is what replaced it.
+2. **Three repositories, and the wrong dependency direction.** Captain
+   proposed product / estate / record, with the distro extracted *out of*
+   the dev repo. The owner corrected both: two repositories, and the dev
+   estate consumes the *released* distro rather than a build-tree copy.
+   The corrected direction is load-bearing for §3.4's trap and for the
+   bootstrap hazard in ADR 0014's consequences.
+3. **`sgt workflow diff`.** Captain proposed the verb, then withdrew it on
+   R1 grounds once templates were reframed as examples — then had to
+   restore the underlying property when the research showed a fork has no
+   invalidation mechanism. §4.7's edition marker is the corrected form: the
+   property without the verb.
+4. **The inbox.** Told a proposal was "in the inbox," Captain searched
+   Gmail. The inbox is a documented host convention in
+   `docs/environments/cerberus.md`, a file Captain had already read for
+   other facts. This is the diagnosis in §2 happening to the author of §2.
+5. **PACE and succession-of-authority.** Captain added both rungs below J0
+   without a ruling, and SPLIT-1 flagged them as invented scope carried
+   into the decision register. The owner subsequently adopted them
+   (2026-08-17). The content stands; the defect was asserting doctrine and
+   then citing the assertion.
+
+A sixth, recorded for the same reason: Captain reported two SPLIT-1 findings
+to the owner as conclusions before the adversarial round ran. Both were
+refuted — the ADR 0008 storage-path collision, and the authority problem in
+§9. Relaying unrefuted critic output as findings defeats the purpose of
+having a refutation stage.
 
 ## 3. Target architecture
 
@@ -345,6 +482,12 @@ independent of the split and correct regardless of whether the rest lands.
   and initial triage, `cargo-deny` against the current graph, OSPS Baseline
   v2026.02.19 Level 1 control-by-control.
 - NORTH-STAR amendment (§1 table, three entries) drafted for owner ruling.
+- **Single-repo skew check** (moved here from Phase 5 by §2.4). Extract every
+  `sgt <verb> --<flag>` claim from `AGENTS.md`, `docs/DEVELOPMENT.md`,
+  `skills/`, and all 216 template files; diff against the built binary's
+  `--help` surface. Needs one repo and a build, not both repos mounted.
+  Fix `--intent-file` and whatever else it surfaces. The full cross-repo
+  version stays in Phase 5b.
 
 ### Phase 1 — Doctrine
 *No dependencies. Highest value per unit of effort.*
@@ -368,26 +511,66 @@ independent of the split and correct regardless of whether the rest lands.
 - Add edition markers (§4.7).
 
 ### Phase 3 — Override mechanism
-*Depends on: Phase 2. Only new engine work in the plan.*
+*Only new engine work in the plan. **Edition-marker format must be settled
+first** (see G3, corrected): Phase 2 writes markers into 216 files, so their
+format is a Phase-2 input, not a Phase-3 output.*
 
-- `.sergeant/local/workflows/` resolution — local shadows stock by name.
-- `sgt doctor` stock-drift and edition-drift detection.
-- `sgt workflow fork <name>` — copy stock to local with provenance.
+**Ponytail rung: R4/R6.** Recorded per `docs/DEVELOPMENT.md`'s requirement
+that every design decision log its rung — the original omitted this, found by
+SPLIT-1's invariants axis.
+
+- **R4 (native platform feature)** — local-shadows-stock resolution is
+  directory precedence, the same mechanism `/etc` vs `/usr/lib` and
+  `sites-available` already use. No new abstraction, no registry, no merge
+  semantics. Composition (local stages patching into a stock workflow) would
+  be R7 and is explicitly declined until real use demands it.
+- **R6 (one line)** — edition drift is a string comparison between a
+  frontmatter field and the binary's own version constant. No diffing, no
+  three-way merge, no `sgt workflow diff` verb.
+- **R2 (reuse)** — `sgt doctor` already owns "report a fixable fault with a
+  named remedy." Drift detection is one more check in an existing surface,
+  not a new verb.
+- `sgt workflow fork <name>` is the one genuinely new verb. R7 is claimed
+  only here, and only because R2–R6 fail: no existing verb copies stock to
+  local with provenance, and `cp` loses the edition stamp that makes drift
+  detectable at all.
 - Embedding: stock templates compiled into the binary, written by `sgt init`.
 
 ### Phase 4 — The split
-*Depends on: owner creating `sergeant-rs-workspace`. Blocking.*
+*Depends on: `sergeant-rs-workspace` (created by the owner 2026-08-17).*
+
+**This is not a `git mv`.** Owner ruling, 2026-08-17: *"We don't just want to
+move the mess."* Extraction precedes migration for every document, not only
+the obvious ones.
 
 - Workspace `sergeant.toml` mounting `sergeant-rs`; `repos/` working set.
-- Move evidence and corpora per §3.2. Clean start; history stays in `sergeant-rs`.
+- **Workspace `AGENTS.md`** (owner ruling) — purpose-built for developing
+  sergeant-rs, structurally modelled on the product's but Layer-3 in content:
+  how to compile the record, the two change disciplines, how to open PRs
+  against the mounted product. Short.
 - Workspace `DEVELOPMENT.md`; two-discipline change policy.
+- **Extract, then move.** For every document leaving the product repo:
+  anything that binds present-day behavior becomes an ADR in `sergeant-rs`
+  *first*; the argument that produced it goes to the workspace. Applies to
+  all nine `reference/proposal-*.md`, to `docs/icm/`, and to the corpora.
+  Moving a live ruling into a private repo would strand it.
+- **`GAUNTLET.md` and `LESSONS.md` are decomposed, not moved** (owner
+  ruling). 32,110 words become typed records in the workspace's OKF
+  structure — rulings to the decision register, lessons to the lesson
+  digest, deviation rows to their own type, run pointers to evidence. They
+  are the compile pass's first real customer, which is the right way to
+  prove it: if the compiler cannot handle this corpus, it cannot handle any.
+- **`docs/environments/` splits by kind** (owner ruling): the *capability*
+  stays with the product — `scripts/probe-env.sh` and the rule that a host
+  is measured before it is trusted, because `sgt` should understand its own
+  environment. The *measurements* — the dated per-host tables — become a
+  workspace host wing. Same procedure/state line the template test uses.
 - `sergeant-rs` sheds `docs/gauntlet/`, `reference/`, `reference-corpus/`,
-  `resources/`.
+  `resources/` once extraction is complete.
 
-### Phase 5 — Validator (Gate F)
-*Depends on: Phase 4 (needs both repos mounted in one estate).*
-
-Workspace-local workflow. Structural checks:
+### Phase 5a — Structural validator
+*Depends on: Phase 2. Runs against one repository — corrected from the
+original, which bundled these with the one check that needs both.*
 
 - Every template `index.md` parses and carries `type` + `status`.
 - `.sergeant/index.md` catalog matches the directory — computed, not narrated.
@@ -397,10 +580,15 @@ Workspace-local workflow. Structural checks:
 - `AGENTS.md` routing-table rows resolve to files that exist.
 - No shipped template references non-shipping content.
 
-Cross-repo check, which only the workspace can run:
+### Phase 5b — Cross-repo skew check
+*Depends on: Phase 4. The only check that genuinely needs both repositories
+mounted in one estate.*
 
-- Extract every `sgt <verb> --<flag>` claim from doctrine; diff against the built
-  binary's actual `--help` surface. **This is the co-version skew check.**
+- Full doctrine↔binary agreement across both repos, including the workspace's
+  own `AGENTS.md` and local workflows. **This is the co-version skew check
+  in its complete form.** Its reduced single-repo ancestor runs in Phase 0
+  (§2.4) and should already have caught `--intent-file`; 5b exists to keep
+  it green across the release boundary rather than to find it once.
 
 ### Phase 6 — Release pipeline
 *Depends on: Phases 3 and 5.*
@@ -421,16 +609,30 @@ Cross-repo check, which only the workspace can run:
 
 Each gate is a hard stop. A phase does not begin until its gate is green.
 
-| Gate | Before | Condition | Owner |
+**Corrected 2026-08-17 after SPLIT-1.** Two defects were confirmed: G3 placed
+the edition-marker decision *after* the phase that consumes it, and three
+gates listed Captain as both performer and gatekeeper.
+
+| Gate | Before | Condition | Green-lit by |
 |---|---|---|---|
 | **G0** | Phase 0 | Owner has ruled on the NORTH-STAR amendment (§1) | Owner |
 | **G1** | Phase 1 | Procedure/state test settled; CAN vs SHOULD boundary agreed | Owner |
-| **G2** | Phase 2 | Phase 1 merged; no BU citation resolves to content that will not ship | Captain |
-| **G3** | Phase 3 | Template triage complete; edition-marker format settled | Owner |
-| **G4** | Phase 4 | `sergeant-rs-workspace` exists and is reachable; override mechanism merged | Owner |
-| **G5** | Phase 5 | Split merged; both repos mounted in one estate | Captain |
-| **G6** | Phase 6 | Gate F green on a real commit; Slices 1–3 landed | Captain |
+| **G2a** | **Phase 2** | **Edition-marker format settled** — moved ahead of Phase 2, which writes markers into 216 files | Owner |
+| **G2b** | Phase 2 | Phase 1 merged; no BU citation resolves to content that will not ship | Captain (declared) |
+| **G3** | Phase 3 | Template triage complete | Owner |
+| **G4** | Phase 4 | `sergeant-rs-workspace` reachable; override mechanism merged | Owner |
+| **G5** | Phase 5a/5b | Phase 2 complete (5a); split merged (5b) | Captain (declared) |
+| **G6** | Phase 6 | Skew check green on a real commit; Slices 1–3 landed | Captain (declared) |
 | **G7** | First tag | Full release dry-run adjudicated; OSPS L1 assessed | Owner |
+
+**Declared degradation.** G2b, G5, and G6 are green-lit by the party that
+performs the work behind them. At one maintainer, identity-based separation
+is unavailable and pretending otherwise would be the ceremony §4.6 warns
+against. What is available and required instead: each of the three is a
+*mechanical* condition — a validator exit code, a merge state, a green
+check — not a judgment call, so "did it pass" is checkable by the owner
+after the fact without re-doing the work. A gate that required Captain's
+opinion of Captain's output would not be admissible here.
 
 ---
 
@@ -476,11 +678,32 @@ delegated authority is the recursion proof; one that stalls on `needs_input` at
 | **Not authorized** | Creating repositories or changing GitHub settings | J0 — owner-only |
 | **Not authorized** | Deleting or moving evidence | J0 |
 
-PACE for the overnight run: **Primary** — proceed under this section.
-**Alternate** — where a decision is J2-adjacent but unclear, take the
-conservative option and record it in the PR body. **Contingency** — where a
-decision is J0, stop that workstream, continue the others. **Emergency** — on
-any destructive-action question, stop entirely and leave the tree clean.
+**Corrected 2026-08-17 after SPLIT-1.** The original PACE ladder made
+"Alternate" a licence to decide — *"take the conservative option and record
+it"* — which authorises exactly the guess J0 forbids. PACE is a ladder of
+**routes to an authority**, never a ladder of decision latitude. Corrected:
+
+- **Primary** — the owner, live. Ask and wait.
+- **Alternate** — the owner, asynchronously: the question is written into
+  the PR body as a blocking open question and the workstream continues
+  *around* it. The decision is not taken; it is deferred in a place the
+  owner will see.
+- **Contingency** — no owner route available and the decision is J0: stop
+  that workstream, continue the others, leave the question recorded.
+- **Emergency** — destructive or irreversible action in question: stop
+  entirely, leave the tree clean, touch nothing further.
+
+At no rung does PACE convert a J0 into a decision. Degrading the *route*
+never degrades the *authority* — that is the whole distinction between this
+and the failure mode SPLIT-1 caught.
+
+**Every PR carries a decision log.** Per `bounded-judgment.md`'s Decision
+evidence section, one row per material choice — `| Decision | Rung |
+Evidence | Resolution |` — each tracing to ADR 0014, an earlier ADR, or
+marked **undelegated — parked**. Anything untraceable is not resolved in
+prose; it goes in the PR body as an open question with a recommendation.
+This is what makes "owner approves" a review of decisions rather than an
+audit of paragraphs.
 
 ---
 
@@ -551,6 +774,15 @@ verified.
 | ADR location | Product repo |
 | Workspace change policy | Two disciplines: behavior reviewed, knowledge appended |
 | Anti-capture posture | Four separations, contextual at N=1, stated not concealed |
+| Authority boundary | The merge, not the artifact — a PR is a request (ADR 0015) |
+| PACE / succession | Adopted; routes to an authority, never decision latitude (ADR 0014 d.14) |
+| OKF type vocabulary | Compiler proposes, owner ratifies; material divergence escalates (d.15) |
+| Workspace `AGENTS.md` | Yes, purpose-built, Layer-3 in content (d.16) |
+| Document migration | Extract binding rulings to ADRs first, then move evidence (d.17) |
+| `GAUNTLET.md` / `LESSONS.md` | Decomposed into typed records, never moved intact (d.9) |
+| `docs/environments/` | Capability ships with product; measurements go to workspace (d.18) |
+| Workspace visibility | Private; no secrets sweep gates migration (d.18) |
+| Skew check placement | Reduced single-repo form in Phase 0; full cross-repo in Phase 5b |
 | Nightly CI | Removed |
 | Release trigger | Manual `workflow_dispatch` only |
 | Release qualification | Gates A–E from the inbox proposal, plus Gate F |

@@ -178,6 +178,47 @@ home until this file.
 - This ADR is the fidelity authority for the SPLIT-1 grading panel. Without
   it the panel would grade a proposal against nothing.
 
+## Amendment, 2026-08-17 (same day, after SPLIT-1)
+
+SPLIT-1's fidelity axis found that `reference/proposal-product-workspace-
+split.md` §4.4 added two rungs below J0 — PACE and succession-of-authority —
+with no traceable source, and carried them into its decision register
+unqualified. The finding was correct: Captain drew both from the owner's
+Notion governance corpus during the same session and asserted them as
+doctrine.
+
+The owner ruled after the panel closed, adding decisions 14–18:
+
+14. **PACE and succession-of-authority are adopted.** Owner: *"Put them in.
+    That military doctrine is sound. I didn't push back because I agreed and
+    just didn't say so."* Recorded with the correction that silence is not
+    assent and should have been asked about. PACE is a ladder of **routes to
+    an authority**, never of decision latitude — degrading the route never
+    degrades the rung (see the proposal's §9, corrected).
+15. **The OKF type vocabulary is proposed by the first compile pass, not
+    pre-ratified.** Captain proceeds where it agrees with the compiler's
+    proposal; a materially different taxonomy escalates. A bounded J2 grant
+    with a named escalation trigger.
+16. **`sergeant-rs-workspace` gets its own `AGENTS.md`** — purpose-built for
+    developing sergeant-rs, structurally modelled on the product's, Layer-3
+    in content.
+17. **Extract before moving, for every document.** Proposals go to the
+    workspace, but anything binding present behavior is extracted to an ADR
+    in the product repo first. Owner: *"That goes for every document.
+    Learnings, potential adrs, etc. Consider what we have as evidence and
+    its target is a well formulated project knowledge base."* This
+    generalises decision 9's treatment of `GAUNTLET.md`/`LESSONS.md` to the
+    whole corpus.
+18. **`docs/environments/` splits by kind.** The capability stays with the
+    product — `scripts/probe-env.sh` and the rule that a host is measured
+    before it is trusted, because *"sgt should know to understand its
+    environment."* The dated measurements become a workspace host wing.
+    `sergeant-rs-workspace` stays private, so no secrets sweep gates the
+    migration.
+
+Decision 13's model policy is unchanged. ADR 0015 records the separate
+general ruling on pull requests as proposals.
+
 ## Open questions
 
 - Does `docs/environments/` stay with the product or move to the workspace?
