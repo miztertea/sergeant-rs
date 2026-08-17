@@ -3,6 +3,9 @@ name: to-spec
 description: Turn the current conversation's plan/design into a published spec ticket — no interview, just synthesis of what's already been discussed, plus repository exploration. Use when a design needs to become a spec-shaped ticket before implementation.
 ---
 
+Provenance for this skill's citation record lives in
+`sergeant-rs-workspace`'s `knowledge/evidence/provenance/skills.md`.
+
 Ported from `.sergeant/workflows/to-spec` (N1 candidate W31), which
 retires: this package's own defining behavior — synthesize from "the
 current conversation," never by interview — names a dependency on live
@@ -56,8 +59,8 @@ this skill does not pick between them on your behalf:
 - The `ready-for-agent` label name comes from this repository's own
   `triage` workflow, whose `50-apply-outcome` stage requires posting a
   *structured agent brief comment* to reach that outcome
-  (`.sergeant/workflows/triage/50-apply-outcome/CONTEXT.md`, `BU-P3-069`)
-  — not merely applying the label.
+  (`.sergeant/workflows/triage/50-apply-outcome/CONTEXT.md`) — not merely
+  applying the label.
 - This skill's own upstream source only says "apply the label... no need
   for additional triage," and separately assumes an issue-tracker/label
   vocabulary "provided to you" by a setup skill that does not exist in

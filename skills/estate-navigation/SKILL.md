@@ -3,7 +3,10 @@ name: estate-navigation
 description: Resolve an estate's declared repositories, groups, and health before acting in it, bring its working set up to date, register new repos/groups interactively, and file tracked work for gaps `sgt doctor` can't remedy — sergeant-rs's equivalent of upstream's sgt-context/sgt-sync/sergeant-setup.
 ---
 
-Content ported from `reference/sergeant-upstream`'s core function map
+Provenance for this skill's citation record lives in
+`sergeant-rs-workspace`'s `knowledge/evidence/provenance/skills.md`.
+
+Content ported from the upstream core function map
 (`docs/gauntlet/notes/upstream-core-function-map-2026-08-11.md`): `sgt-context`
 ("emit a project's layered agent-instructions block... for session start")
 and `sgt-sync` ("clone missing / pull existing repos") were each ruled
@@ -81,8 +84,8 @@ not a bug to work around.
 ## Registering repos and groups interactively
 
 When a user wants to set up or extend an estate rather than just navigate an
-existing one (former `sergeant-setup` `30-project-interview`,
-`BU-P5-024`'s transplantable fragment): ask, one at a time, waiting for each
+existing one (former `sergeant-setup` `30-project-interview`'s
+transplantable fragment): ask, one at a time, waiting for each
 answer:
 
 1. For each repository to add: its name, its clone origin URL (or confirm
@@ -111,7 +114,7 @@ than fabricating a place to put the answer.
 
 When `sgt doctor` reports a failing check it names no remedy for, or a
 required/optional prerequisite is otherwise confirmed unsupported (former
-`sergeant-setup` `05-file-capability-gaps`, `BU-P5-012`): draft a `td` issue
+`sergeant-setup` `05-file-capability-gaps`): draft a `td` issue
 — title, description, acceptance criteria — and show it in full for explicit
 `y`/`yes` approval before creating it. On decline, do not create it; report
 the gap plainly (in the session or in the estate-health summary you're
