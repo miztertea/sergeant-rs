@@ -305,6 +305,30 @@ Rules:
    elsewhere; reviewers SHOULD treat frequent `AGENTS.md` churn as a
    classification defect, not a documentation improvement.
 
+**Rule 2 is superseded for the two ladders, 2026-08-17
+(`docs/adr/0014-product-workspace-split-owner-rulings.md` decision 10).**
+Rule 2 forbids `AGENTS.md` restating a shared context. The owner ruled that
+the CONSTRUCTION (Ponytail R1–R7) and AUTHORITY (Bounded-Judgment J5–J0)
+ladders ship inline in `AGENTS.md`, because a Layer-0 always-on file that
+points elsewhere for its own decision procedure is not reachable in the mode
+that needs it most: `@@name` resolves only inside an active stage's context,
+so a direct in-session Captain — the mode most prone to over-escalation —
+had no ladder at all.
+
+This is not an exemption from rule 2's *purpose*. Duplication is still a
+violation. It is resolved by **moving canonicity, not by copying**:
+`AGENTS.md` now owns the rung definitions for both ladders, and
+`.sergeant/common/contexts/bounded-judgment.md` and `ponytail.md` are
+reduced to what only they need (stage-specialization contract,
+decision-evidence shape, conflict rule, authority inheritance, worked
+example) and reference `AGENTS.md` for the rungs. One canonical source per
+ladder, as rule 2 intends; `@@bounded-judgment` and `@@ponytail` still
+resolve per §4.
+
+Recorded here per `docs/adr/README.md`'s supersession convention — a later
+decision supersedes an earlier one and says so, rather than the two sitting
+in silent contradiction. §6 below is updated to match.
+
 ## 4. The `@@name` shared-context convention
 
 A stage context may include another file by reference rather than by
@@ -412,10 +436,17 @@ restated:
   own §6.1a/6.2 driver discriminator with the full PL rung set (Captain
   skill, actor skill, workflow, stage, deterministic mechanism, engine
   gap).
-- **Bounded-Judgment Ladder (J5..J0)** — `.sergeant/common/contexts/
-  bounded-judgment.md`, referenced as `@@bounded-judgment`. Answers "what
-  authority allows this actor to decide this material question without
-  returning to a human or higher authority?"
+- **Bounded-Judgment Ladder (J5..J0)** — canonical rung definitions in
+  `AGENTS.md` since 2026-08-17 (ADR 0014 decision 10; see the supersession
+  note in §3). `.sergeant/common/contexts/bounded-judgment.md`, referenced
+  as `@@bounded-judgment`, retains the stage-specialization contract, the
+  decision-evidence shape, the conflict rule, authority inheritance, and the
+  worked example. Answers "what authority allows this actor to decide this
+  material question without returning to a human or higher authority?"
+- **Ponytail Minimality Ladder (R1–R7)** — canonical rung definitions in
+  `AGENTS.md`; `.sergeant/common/contexts/ponytail.md` (`@@ponytail`)
+  retains the rung-logging convention. Answers "should this exist at all,
+  and at the lowest viable rung?"
 
 ### 6.1. Required sections
 
