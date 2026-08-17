@@ -1,3 +1,13 @@
+---
+known_gap_refs:
+  - ref: domain-modeling
+    reason: cross-package materialization gap in the @@name shared-context catalog; only frozen upstream evidence exists, no .sergeant/common/contexts/domain-modeling.md yet
+  - ref: ticket-shaping
+    reason: same materialization gap; this package is the shared-by owner but has not yet materialized the file
+  - ref: triage-state-machine
+    reason: same materialization gap; this package is the shared-by owner but has not yet materialized the file
+---
+
 # Wayfinder
 Draft workflow package — candidate **W33** `wayfinder` from the N1
 manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`).
