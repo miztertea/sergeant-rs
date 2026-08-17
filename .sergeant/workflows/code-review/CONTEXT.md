@@ -1,10 +1,9 @@
 # Code Review
 Draft workflow package — candidate **W24** `code-review` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. Revised at ICM-R2
-(`docs/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`) per
-`reference/proposal-icm-r-procedure-authority.md` §8. This is Layer 1
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
+Revised at ICM-R2
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`) per
+`sergeant-rs-workspace/knowledge/evidence/reference/proposal-icm-r-procedure-authority.md` §8. This is Layer 1
 orientation only — it is never delivered as a stage's instructions; each
 stage's own `CONTEXT.md` (Layer 2) is the actor's contract
 (`docs/icm/convention.md` §1a rule 5).
@@ -15,9 +14,9 @@ Review a diff on two parallel, non-contaminating axes, reported side by
 side:
 
 - **Standards** — does the code conform to this repo's documented coding
-  standards? (`BU-P2-001`)
+  standards?
 - **Spec** — does the code faithfully implement the originating issue,
-  PRD, or spec? (`BU-P2-002`)
+  PRD, or spec?
 
 ## Trigger
 
@@ -41,12 +40,11 @@ This workflow receives an already-admitted Work intent (a diff to review).
 
 ### Workflow may not decide
 - Whether to skip asking the user for the fixed point when none is given
-  — J0, `00-pin-fixed-point` (`BU-P2-004`).
+  — J0, `00-pin-fixed-point`.
 - Whether to merge or rerank the Standards and Spec axes — J5 governing
-  constraint, never merge (`BU-P2-016`).
+  constraint, never merge.
 - Whether to suppress a documented repo standard in favor of the smell
-  baseline — J5, the repo's own documented standard always overrides
-  (`BU-P2-009`).
+  baseline — J5, the repo's own documented standard always overrides.
 
 ### Human or Captain gates
 - Naming the fixed comparison point when the user did not supply one.
@@ -69,17 +67,17 @@ contexts/bounded-judgment.md` §Decision evidence.
 
 ## Notes for reviewers
 
-The two-axis separation is the durable design point (`BU-P2-018`), not the
+The two-axis separation is the durable design point, not the
 sub-agent mechanism that happens to isolate the two reviews from each
 other. `20-30-parallel-review` merges what were two sequential stages in
-the prior revision — the reference corpus's own classification record for
-`BU-P2-012` already named this stage `20-30-parallel-review`; splitting it
+the prior revision — the reference corpus's own classification record
+already named this stage `20-30-parallel-review`; splitting it
 into two engine stages could not represent the source's required
-single-message, two-call concurrent dispatch (`BU-P2-003`).
+single-message, two-call concurrent dispatch.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/code-review.md` for the prior
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/code-review.md` for the prior
 revision's complete stage-to-behavior-unit mapping and workflow-level
-citations, and `docs/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`
+citations, and `sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/code-review/adjudication-draft.md`
 for this revision's full behavior-unit disposition table.

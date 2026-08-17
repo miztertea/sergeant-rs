@@ -1,9 +1,0 @@
-# Workflow-level helpers — callback-protocol
-
-Layer 3 (`_config/`), stable across every future run of this candidate, used by more than one of its stages (`.sergeant/workflows/repo-to-icm/60-draft/references/draft-package-template.md`). Deterministic machinery `.sergeant/workflows/repo-to-icm/40-classify/output/classifications.ndjson` attached to `workflow=callback-protocol`, `stage=null` — referenced by the workflow as a whole, not one specific stage.
-
-- `BU-0761`: Task IDs, callback profile names, and correlation IDs must each match a strict identifier pattern before being used to build any filesystem path or event record; correlation IDs are additionally rejected if they contain a long (17-20 digit) numeric platform identifier.
-- `BU-0763`: A directory the callback-delivery step creates or reuses for its own callback state is forced to mode 0700 — created private from the start if new, or re-tightened to private if it already existed with looser permissions.
-- `BU-0765`: Every durable file the callback-delivery step writes (origin, sequence, event, state, seal) is published by writing to a temp file in the same directory, fsyncing the file, atomically renaming it into place, and then fsyncing the containing directory — so a crash can never leave a half-written file visible at its final path.
-- `BU-0768`: All mutating callback operations on one task (enqueue, drain, retry, seal, unseal) are serialized against each other by opening the task's lock file without following a symlink, verifying it is a regular user-owned file, forcing its mode to 0600, and then holding an exclusive flock for the whole critical section.
-- `BU-0815`: Every domain-specific failure in the callback-delivery step (any CallbackError raised anywhere — validation, locking, or I/O) is caught once at the top level, reported to stderr with a stable 'sgt-callback: ' prefix, and causes the process to exit 1.

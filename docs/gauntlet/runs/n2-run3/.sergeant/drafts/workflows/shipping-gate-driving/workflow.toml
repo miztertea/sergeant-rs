@@ -1,4 +1,0 @@
-[workflow]
-name = "shipping-gate-driving"
-version = "1"
-stages = ["01-group-remediation"]

@@ -20,14 +20,13 @@ A category/state proposal is made, then the run waits for direction.
 
 - **The actor proposes a category/state recommendation with reasoning and a relevant codebase summary, then waits for the maintainer's direction before proceeding.**
   (trigger: context has been gathered; outcome: the maintainer has a recommendation to react to before any state-changing action occurs)
-  — `BU-P3-066`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 72)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Proposing a category/state recommendation with reasoning and a relevant codebase summary (`BU-P3-066`).
+- Proposing a category/state recommendation with reasoning and a relevant codebase summary.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

@@ -1,4 +1,0 @@
-[workflow]
-name = "fleet-cleanup"
-version = "1"
-stages = ["01-cleanup-preconditions"]

@@ -1,8 +1,7 @@
 # Triage
 Draft workflow package — candidate **W30** `triage` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only —
 it is never delivered as a stage's instructions; each stage's own
 `CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
 §1a rule 5).
@@ -33,8 +32,8 @@ maintainer direction gated at `20-recommend`'s J0 clause. See each stage's own
 | `40-grill-if-underspecified` | actor-stage (§6.4, judgment) | Underspecified items are escalated to an interview. |
 | `50-apply-outcome` | actor-stage (§6.4, judgment) | The terminal disposition is applied with its required artifact. |
 
-**Revised at ICM-R3** (`docs/gauntlet/runs/icm-r3/triage/adjudication-draft.md`,
-`BU-TRI-04`): `recommend` and `verify` were renumbered `20`/`30` (previously
+**Revised at ICM-R3** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r3/triage/adjudication-draft.md`):
+`recommend` and `verify` were renumbered `20`/`30` (previously
 `30`/`20`) — verify's own trigger text ("a recommendation has been given and
 direction received") and the upstream source's own line order both place
 verification after recommendation, not before. No behavior unit's content or
@@ -46,11 +45,11 @@ placement rung changed.
 
 ## Notes for reviewers
 
-`resume` and `quick-override` (BU-P3-075, BU-P3-073) are documented re-entry variants of this same stage sequence, not separate stage directories. BU-P3-060's transition graph is explicitly non-linear (loops, maintainer override at any point) — the source extractor considered and rejected an engine-gap claim for it, and that rejection is upheld here: each transition is a fresh invocation of a stage, not a control-flow construct the runtime must own.
+`resume` and `quick-override` are documented re-entry variants of this same stage sequence, not separate stage directories. The state machine's transition graph is explicitly non-linear (loops, maintainer override at any point) — the source extractor considered and rejected an engine-gap claim for it, and that rejection is upheld here: each transition is a fresh invocation of a stage, not a control-flow construct the runtime must own.
 
-**N1 adjudication A4:** the former `00-show-attention` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-gather-context` as a helper invocation. Stage ordinals are unchanged (`10`-`50` are already correctly ordered without `00`) — see `docs/gauntlet/promoted-provenance/triage.md`'s "Adjudication A4" section.
+**N1 adjudication A4:** the former `00-show-attention` stage carried only the §6.5 deterministic-machinery boilerplate as its stage-level justification, with no additional checkpoint argument; it is demoted and folded into `10-gather-context` as a helper invocation. Stage ordinals are unchanged (`10`-`50` are already correctly ordered without `00`) — see `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/triage.md`'s "Adjudication A4" section.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/triage.md` for the complete
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/triage.md` for the complete
 stage-to-behavior-unit mapping and workflow-level citations.

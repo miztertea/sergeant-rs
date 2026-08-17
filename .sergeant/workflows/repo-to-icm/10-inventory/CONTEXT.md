@@ -93,7 +93,7 @@ named partition.
    recursive file listing, e.g. `find <subject> -type f`, restricted the
    same way).
    If this run's purpose is measurement (`../_config/run-discipline.md`
-   §1), this enumeration itself must not cross into `reference-corpus/` —
+   §1), this enumeration itself must not cross into `sergeant-rs-workspace/knowledge/evidence/reference-corpus/` —
    confirm it is excluded per `contract.md` before or while enumerating,
    not after.
 2. For each file, assign exactly one disposition from

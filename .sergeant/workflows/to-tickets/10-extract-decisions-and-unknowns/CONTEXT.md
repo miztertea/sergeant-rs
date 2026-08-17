@@ -20,14 +20,13 @@ An investigation ticket is created only for a genuinely blocking unknown, naming
 
 - **Create a short investigation ticket only when a genuinely blocking unknown cannot be answered from existing evidence, and that ticket must name the exact decision or artifact it is meant to produce.**
   (trigger: an unknown is identified while drafting a ticket breakdown; outcome: investigation tickets are created sparingly and each has a named deliverable)
-  — `BU-P4-065`, `reference/sergeant-upstream/.agents/skills/to-tickets/SKILL.md` (Extract Decisions and Unknowns, L60-62)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Judging whether an unknown is genuinely blocking versus answerable from existing evidence (`BU-P4-065`).
+- Judging whether an unknown is genuinely blocking versus answerable from existing evidence.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

@@ -537,6 +537,88 @@ fn group_remove_whole_group_vs_named_members() {
     assert_eq!(list.json()["groups"].as_array().unwrap().len(), 0);
 }
 
+// -------------------------------------------------------------- workflow
+
+/// §6 Phase 3 (Ponytail R7): `sgt workflow fork <name>` copies a stock
+/// workflow package into `.sergeant/local/workflows/<name>/`, where it then
+/// resolves ahead of stock (R4). guard-map: a fork that fails to copy every
+/// file, or that resolution fails to prefer, survives a narrower "the
+/// command exits 0" check but fails this one.
+#[test]
+fn workflow_fork_copies_stock_and_the_fork_then_resolves() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
+
+    let stock = estate.path().join(".sergeant/workflows/example");
+    std::fs::create_dir_all(stock.join("00-only")).expect("stage dir");
+    std::fs::write(
+        stock.join("workflow.toml"),
+        "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = [\"00-only\"]\n",
+    )
+    .expect("descriptor");
+    std::fs::write(stock.join("00-only").join("CONTEXT.md"), "stock body").expect("stage context");
+    std::fs::write(
+        stock.join("index.md"),
+        "---\nstatus: published\ndescription: an example\nedition: 0.1.0\n---\n",
+    )
+    .expect("index.md");
+
+    let forked = run(
+        estate.path(),
+        Some(&data_dir),
+        &[],
+        &["--json", "workflow", "fork", "example"],
+    );
+    forked.assert_ok("workflow fork");
+    let forked_json = forked.json();
+    assert_eq!(forked_json["forked"], "example");
+
+    let local = estate.path().join(".sergeant/local/workflows/example");
+    assert!(local.join("workflow.toml").is_file());
+    assert!(local.join("00-only/CONTEXT.md").is_file());
+    let index = std::fs::read_to_string(local.join("index.md")).expect("index.md");
+    assert!(
+        index.contains("edition: 0.1.0"),
+        "the edition marker must survive the copy verbatim: {index}"
+    );
+}
+
+/// §6 Phase 3 (Ponytail R7): `sgt workflow fork` refuses to overwrite an
+/// existing local package by the same name — it must never silently clobber
+/// a user's already-rewritten fork.
+#[test]
+fn workflow_fork_refuses_to_overwrite_an_existing_local_package() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
+
+    let stock = estate.path().join(".sergeant/workflows/example");
+    std::fs::create_dir_all(&stock).expect("mkdir stock");
+    std::fs::write(
+        stock.join("workflow.toml"),
+        "[workflow]\nname = \"example\"\nversion = \"1\"\nstages = []\n",
+    )
+    .expect("descriptor");
+
+    let local = estate.path().join(".sergeant/local/workflows/example");
+    std::fs::create_dir_all(&local).expect("mkdir local");
+    std::fs::write(local.join("sentinel"), "user work, do not touch").expect("sentinel");
+
+    let refused = run(
+        estate.path(),
+        Some(&data_dir),
+        &[],
+        &["workflow", "fork", "example"],
+    );
+    refused.assert_fails("must refuse to overwrite an existing local package");
+    assert!(
+        local.join("sentinel").is_file(),
+        "the user's existing local package must be untouched"
+    );
+    assert!(!local.join("workflow.toml").is_file());
+}
+
 // --------------------------------------------------------- run --group
 
 /// guard-map: `sgt run --group <name>` expands client-side into the exact
@@ -709,6 +791,67 @@ fn data_dir_defaults_to_estate_local_when_no_flag_or_env() {
             "cwd {cwd:?} must default to the estate-local data dir"
         );
     }
+}
+
+/// guard-map (#164): `sgt init` itself, with no `--data-dir`/`SGT_DATA_DIR`,
+/// must report and create the estate-local data dir it just made
+/// `sergeant.toml` discoverable at — not the pre-estate fallback. `dispatch`
+/// resolves `data_dir` once at the top, before the `Init` handler runs
+/// `init_estate`; on a brand-new estate that resolution predates
+/// `sergeant.toml` existing, so unless the `Init` handler re-resolves after
+/// creating it, `init`'s own embedded doctor report silently checks (and
+/// reports `[ok]` for) `$XDG_DATA_HOME`/`$HOME` instead of
+/// `<estate_root>/.sergeant/data` — exactly the failure this issue names:
+/// `sgt init` scaffolds a `.gitignore` rule for `.sergeant/data` but a
+/// fresh estate's journal silently lands outside the estate, with `doctor`
+/// reporting healthy the whole time. Mutation this kills: reverting the
+/// `Command::Init` handler to use the `data_dir` resolved before
+/// `init_estate` instead of re-resolving afterward.
+#[test]
+fn init_reports_and_creates_the_estate_local_data_dir_not_the_pre_estate_fallback() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let xdg = estate.path().join("xdg-home");
+    let home = estate.path().join("home");
+
+    let result = run(
+        estate.path(),
+        None,
+        &[
+            ("XDG_DATA_HOME", xdg.to_str().expect("utf8")),
+            ("HOME", home.to_str().expect("utf8")),
+        ],
+        &["--json", "init"],
+    );
+    assert_eq!(
+        result.code,
+        Some(0),
+        "init must succeed\nstdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+
+    let reported = PathBuf::from(
+        result.json()["doctor"]["data_dir"]
+            .as_str()
+            .expect("doctor.data_dir"),
+    );
+    let expected = std::fs::canonicalize(estate.path())
+        .expect("canonical estate root")
+        .join(".sergeant/data");
+    let reported = std::fs::canonicalize(&reported).unwrap_or(reported);
+    assert_eq!(
+        reported, expected,
+        "init's own report must resolve to the estate-local data dir, not the pre-estate fallback"
+    );
+    assert!(
+        expected.is_dir(),
+        "init must leave the estate-local data dir created on disk, matching the \
+         .gitignore rule it scaffolds for .sergeant/data"
+    );
+    assert!(
+        !xdg.exists(),
+        "init must not touch the pre-estate XDG fallback once an estate is being created"
+    );
 }
 
 /// guard-map: the estate-resolved default is a new *fallback rung*, not a

@@ -23,14 +23,14 @@
 
 ## The blindness rule still applies to you, and to what you produce
 
-Do not open `reference-corpus/`. The measurement package this stage emits
+Do not open `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`. The measurement package this stage emits
 reports only what this run can honestly compute **without** it — the five
 comparison-dependent dimensions (behavioral recall, workflow-boundary
 agreement, stage-boundary agreement, representation agreement, engine-gap
 quality) are explicitly named as *not covered here* per
 `references/reconciliation-method.md` §2, not estimated or guessed at. That
 comparison happens later, separately, performed by comparers this run's
-blindness rule does not bind (`docs/gauntlet/contracts/N2.md` Outcome §3).
+blindness rule does not bind (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md` Outcome §3).
 Reporting the boundary of what you can and cannot measure honestly is part
 of this stage's job, not a gap to paper over.
 
@@ -103,7 +103,7 @@ has been run and its result is recorded.
 
 Commands below are written **from the repository root** (the directory
 `.sergeant/` lives directly under) — this run's actual working directory,
-not `90-reconcile/` itself (`docs/gauntlet/notes/n2-fake-backend-semantics.md`).
+not `90-reconcile/` itself (`sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/n2-fake-backend-semantics.md`).
 
 ## How to do it
 

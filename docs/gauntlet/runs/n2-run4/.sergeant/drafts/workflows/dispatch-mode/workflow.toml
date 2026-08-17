@@ -1,9 +1,0 @@
-# dispatch-mode — draft workflow candidate materialized by repo-to-icm's
-# 60-draft stage (N2 run, 21-partition corpus). status: draft in
-# index.md; this package has not been promoted to .sergeant/workflows/.
-# See provenance.md for the behavior_id evidence backing each stage.
-
-[workflow]
-name = "dispatch-mode"
-version = "1"
-stages = ["01-plan-and-decompose", "02-dispatch-one-worker-per-repo", "03-monitor-and-reconcile", "04-validate-harness-selection", "05-resolve-and-record-model-pin", "06-bind-and-verify-coordinator-pane", "07-publish-canonical-intent", "08-validate-intent-file", "09-prepare-worker-brief", "10-reconcile-dispatch-results", "11-create-tasks-before-spawn", "12-rollback-coordinator-pane-on-abort", "13-check-drain-admission", "14-acquire-worktree", "15-handle-spawn-failure", "16-probe-harness-readiness", "17-capture-background-session-identity", "18-reattach-after-attach-exit", "19-detect-model-substitution"]

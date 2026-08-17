@@ -27,14 +27,14 @@ you have specifically checked for one.
   first pass, not the finding itself — **a correctly-executed `00-contract`
   is expected to produce exactly one such hit, in its own `contract.md`'s
   exclusion record** (`00-contract/CONTEXT.md`: "name it in `contract.md`"),
-  and that expected hit is not a finding. Do not open `reference-corpus/`
+  and that expected hit is not a finding. Do not open `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`
   itself to perform this check; you do need to read enough of *this run's
   own text* around every other hit to classify it, because the grep alone
   cannot tell a citation from a mention:
   - A hit inside a **citation field** — a behavior unit's `source.path`,
     `source.locator`, or a quoted span backing a `quote`/`quote_hash`; a
     `provenance.md` entry; a finding's own `target`/`evidence` naming a
-    location inside `reference-corpus/` — means this run's evidence is not
+    location inside `sergeant-rs-workspace/knowledge/evidence/reference-corpus/` — means this run's evidence is not
     actually independent of the answer key. That is a contamination
     finding, highest severity.
   - A hit that is **prose repeating the exclusion policy's own wording**
@@ -119,9 +119,9 @@ declared scope — one hash-truncation self-consistency defect in 14.8% of
 the corpus, a headline coverage count contradicted by the same document's
 own file list two sentences earlier, and a representation skew (`shared-
 helper` ~9x overrepresented) that a promotion-only over-staging check could
-never see (`docs/gauntlet/runs/n2-run2/comparison-c1-coverage-recall.md`
+never see (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-c1-coverage-recall.md`
 §4.1, `comparison-scorecard.md` D-1/D-6, `grammar-pressure-report.md` GP-6).
-None of the three checks below requires opening `reference-corpus/` or
+None of the three checks below requires opening `sergeant-rs-workspace/knowledge/evidence/reference-corpus/` or
 knowing the "right" answer — they check this run's own artifacts against
 each other and against internal arithmetic.
 

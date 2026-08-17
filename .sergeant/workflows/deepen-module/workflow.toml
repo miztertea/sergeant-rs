@@ -1,4 +1,4 @@
-# deepen-module — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# deepen-module — admitted workflow (N1, sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md,
 # candidate W25). Turns a shallow module into a deep one at a deliberately
 # chosen seam: classifies the dependency cluster, generates and compares
 # independently designed interfaces, and replaces shallow-module tests with
@@ -11,7 +11,7 @@
 #
 # Promoted per docs/icm/promotion-spec-2026-08-11.md; the full
 # behavior-unit citation trail is archived at
-# docs/gauntlet/promoted-provenance/deepen-module.md.
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/deepen-module.md.
 
 [workflow]
 name = "deepen-module"

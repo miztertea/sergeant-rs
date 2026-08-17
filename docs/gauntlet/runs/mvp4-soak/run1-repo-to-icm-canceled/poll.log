@@ -1,5 +1,0 @@
-2026-08-12T21:34:18Z state=active stage=00-contract(0/11) status=active turns=1 proc=LIVE: 1695942 grep -F /tmp/claude-1001/-home-miztertea-sergeant-rs/6c77471b-11a6-41b6-a88b-5d09cea538ff/scratchpad/mvp4-soak/data/surfaces/01KZVYA5RZYAZF5M7CTFPAH0ZW
-2026-08-12T21:35:10Z state=active stage=00-contract(0/11) status=active turns=1 proc=LIVE(session=a8289e80-95d1-4518-a7fd-d51eb339a720): 1695538 1695302 claude -p --verbose --output-format stream-json --setting-sources user --session-id a8289e80-95d1-4518-a7fd-d51eb339a720 --m
-2026-08-12T21:36:40Z state=active stage=00-contract(0/11) status=active turns=1 proc=LIVE(session=a8289e80-95d1-4518-a7fd-d51eb339a720): 1695538 1695302 claude -p --verbose --output-format stream-json --setting-sources user --session-id a8289e80-95d1-4518-a7fd-d51eb339a720 --m
-2026-08-12T21:38:10Z state=active stage=00-contract(0/11) status=active turns=1 proc=LIVE(session=a8289e80-95d1-4518-a7fd-d51eb339a720): 1695538 1695302 claude -p --verbose --output-format stream-json --setting-sources user --session-id a8289e80-95d1-4518-a7fd-d51eb339a720 --m
-2026-08-12T21:39:40Z state=active stage=00-contract(0/11) status=active turns=1 proc=none

@@ -20,7 +20,6 @@ Primary sources only, every claim traced; one Markdown file exists with every cl
 
 - **Research must be conducted against primary sources (official docs, source code, specs, first-party APIs) rather than secondary summaries, with every claim traced back to its owning source.**
   (trigger: the research workflow is investigating; outcome: every claim in the findings traces to a primary source)
-  — `BU-P3-042`, `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 1, line 10)
 
 ## Bounded judgment
 
@@ -28,16 +27,16 @@ Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
 - Choosing which primary sources are authoritative and tracing every claim
-  to its owning source, per `BU-P3-042` above.
+  to its owning source, per the behavior contract above.
 - Choosing where the findings file is placed and what "every claim carries
-  a citation" means mechanically, per `BU-P3-043`/`BU-P3-044` in the
-  Helper invocation section below (cited here by unit id, not restated —
-  ICM-R2 pilot review flagged the earlier draft's verbatim duplication of
-  this text in both sections as drift-prone).
+  a citation" means mechanically, per the Helper invocation section below
+  (cited here by reference, not restated — ICM-R2 pilot review flagged the
+  earlier draft's verbatim duplication of this text in both sections as
+  drift-prone).
 
 ### J1 — local choices allowed
 - Mechanical formatting of the findings file (heading structure, citation
-  style), as long as `BU-P3-043` holds.
+  style), as long as the Helper invocation section's rule holds.
 - The findings file's own filename, chosen inside the stage's assigned
   work surface.
 
@@ -59,9 +58,9 @@ Apply `@@bounded-judgment`.
 
 ### Completion boundary
 This stage may complete only when a single Markdown findings file exists,
-every claim in it carries a source citation, it has been placed per
-`BU-P3-044`, and no `J0` condition above was encountered without first
-being raised as `needs_input`.
+every claim in it carries a source citation, it has been placed per the
+Helper invocation section's placement rule, and no `J0` condition above
+was encountered without first being raised as `needs_input`.
 
 ### Decision evidence
 Record material J2 decisions (source-selection rationale, findings
@@ -78,10 +77,8 @@ Demoted from a standalone stage (`10-write-findings`) at N1 adjudication A4: its
 
 - **The investigation's output is a single Markdown file where every claim carries a source citation.**
   (trigger: investigation is complete; outcome: a single cited Markdown findings file exists)
-  — `BU-P3-043`, `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 2, line 11)
 - **The findings file is placed according to the repository's existing note-keeping convention, or in a sensible location (with the choice explicitly stated) if no convention exists.**
   (trigger: the findings file is being saved; outcome: the file lands in a discoverable, convention-consistent (or explicitly justified) location)
-  — `BU-P3-044`, `reference/sergeant-upstream/.agents/skills/research/SKILL.md` (item 3, line 12)
 
 ## Output
 

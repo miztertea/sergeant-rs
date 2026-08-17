@@ -1,9 +1,9 @@
-# wayfinder — admitted workflow (N1, docs/gauntlet/contracts/N1.md,
+# wayfinder — admitted workflow (N1, sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md,
 # candidate W33). Maps an unfamiliar frontier of a codebase or problem
 # space, ticket-izing decisions and resolving them one at a time.
 # Promoted per docs/icm/promotion-spec-2026-08-11.md; full behavior-unit
 # citation trail archived at
-# docs/gauntlet/promoted-provenance/wayfinder.md.
+# sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/wayfinder.md.
 #
 # Four ordinary actor stages (N1 adjudication A4 folded 20-create-tickets
 # into 10-map-frontier as a preceding helper invocation; see the archived

@@ -12,7 +12,7 @@ One JSON record per line, one record per behavior unit:
 
 ```json
 {
-  "behavior_id": "BU-0042",
+  "behavior_id": "EX-0042",
   "representation": "stage-context",
   "workflow": "cross-repo-work",
   "stage": "00-establish-scope",

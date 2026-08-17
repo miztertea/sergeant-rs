@@ -1,4 +1,0 @@
-[workflow]
-name = "task-intake-and-execution"
-version = "1"
-stages = ["01-resolve-context", "02-resolve-task", "03-reconcile-before-start", "04-execute", "05-direct-mode-implementation", "06-handle-decision-gate", "07-direct-mode-delivery", "08-reconcile-and-deliver"]

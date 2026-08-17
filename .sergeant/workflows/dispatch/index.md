@@ -3,8 +3,12 @@ kind: workflow
 name: dispatch
 status: published
 version: 2
+edition: 0.1.0
 description: >-
-  Given a project, a brief or tracked task, and a repository set, produce one durable task with an isolated work surface, a rendered mission brief, and a running agent per repository — with every side effect validated and gated before the next repository's dispatch begins.
+  Given a project, a brief or tracked task, and a repository set, produce
+one durable task with an isolated work surface, a rendered mission brief,
+and a running agent per repository — with every side effect validated and
+gated before the next repository's dispatch begins.
 tags:
   - dispatch
   - fleet
@@ -13,7 +17,14 @@ tags:
 
 # Dispatch
 
-Six-stage admitted workflow (N1 reference corpus, `docs/gauntlet/contracts/N1.md`,
+Provenance for this template's rules (which behavior unit justifies each
+rule, and its upstream source) lives in `sergeant-rs-workspace`'s
+`knowledge/evidence/provenance/dispatch.md` — provenance markers were
+stripped from the shipped template content
+below; the record of why each rule exists did not move with them.
+
+Six-stage admitted workflow (N1 reference corpus,
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`,
 candidate **W8** `dispatch`) that, given a project, a brief or tracked
 task, and a repository set, produces one durable task with an isolated
 work surface, a rendered mission brief, and a running agent per
@@ -37,5 +48,5 @@ workflow is invoked as `sgt run --workflow dispatch`; see `CONTEXT.md`'s
 See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
 pinned stage order. Full behavior-unit citations and the N1 adjudication
 record (A4, folding twelve extracted stages into six) live in the archived
-provenance copy, `docs/gauntlet/promoted-provenance/dispatch.md`, per
+provenance copy, `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/dispatch.md`, per
 `docs/icm/promotion-spec-2026-08-11.md`.

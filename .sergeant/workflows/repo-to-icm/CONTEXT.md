@@ -60,7 +60,7 @@ Captain skill or human admitted this Work.
   `AGENTS.md` — candidates are listed, never edited into `AGENTS.md` by
   this workflow (`references/synthesis-method.md` bucket 4).
 - Whether a surviving `engine-gap` claim triggers an engine change — it is
-  evidence for `docs/gauntlet/`'s engine-pressure record, never
+  evidence for `sergeant-rs-workspace/knowledge/evidence/gauntlet/`'s engine-pressure record, never
   self-authorizing (`docs/icm/record-shapes.md` §5 rule 6).
 - The subject repository's identity or revision when the Work's task and
   the worktree conflict or are both silent — `00-contract` fails closed
@@ -92,7 +92,7 @@ stage's decision record.
 ## The blindness rule (read before touching anything)
 
 This run's central safety constraint — for a **measurement** run, every
-stage's actor is blind to `reference-corpus/`, full stop — is stage
+stage's actor is blind to `sergeant-rs-workspace/knowledge/evidence/reference-corpus/`, full stop — is stage
 instruction, not orientation, so per §1a rule 5 (Layer 1 "MUST NOT contain
 stage instructions") its operative text lives in `_config/run-discipline.md`
 (Layer 3), which every stage's own Inputs table names, not here. What
@@ -199,7 +199,7 @@ runs, not this one.
   about to remove is already reachable in a committed tree, and refuses
   outright (fail-closed, nothing modified) rather than deleting a file that
   was never actually committed — see the module docstring and
-  `docs/gauntlet/runs/n2-run2/grammar-pressure-report.md` GP-5b.
+  `sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/grammar-pressure-report.md` GP-5b.
 - `scripts/test-finalize-evidence-guard.py` — a standalone sandbox test
   proving `finalize.py`'s evidence-preservation guard holds in both
   directions (refuses on an uncommitted file, proceeds on a committed one).
@@ -225,7 +225,7 @@ itself hand a stranger an executable command.
 ## v2: how `20-harvest` handles volume (read before assuming one turn is enough)
 
 N2 run 2 covered 16 of 136 `decompose`-dispositioned files in one `20-harvest`
-turn before its context window closed (`docs/gauntlet/runs/n2-run2/
+turn before its context window closed (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/
 grammar-pressure-report.md` GP-1). The adjudicated fix is authoring
 guidance, not an engine change — two shapes were weighed:
 

@@ -1,9 +1,0 @@
-# worker-lifecycle — draft workflow candidate materialized by repo-to-icm's
-# 60-draft stage (N2 run, 21-partition corpus). status: draft in
-# index.md; this package has not been promoted to .sergeant/workflows/.
-# See provenance.md for the behavior_id evidence backing each stage.
-
-[workflow]
-name = "worker-lifecycle"
-version = "1"
-stages = ["01-resume-model-pin-reverification", "02-drain-admission-lock", "03-deliver-mission", "04-bulk-reconcile-fleet-state", "05-stalled-worker-recovery", "06-recover-orphaned-worker", "07-enter-waiting-state", "08-evaluate-and-resume-wait", "09-drain-fleet-admission", "10-respond-to-worker", "11-acknowledge-response", "12-cleanup-fleet-task", "13-retire-response-handshake", "14-seal-before-deletion", "15-terminate-worker-process", "16-worker-exit-cleanup", "17-claim-action-lease", "18-migrate-legacy-response-state", "19-relaunch-superseded-worker", "20-force-stop-worker", "21-recycle-terminal-worker-pane", "22-classify-stalled-worker", "23-reconcile-incomplete-dispatch", "24-stop-validation-pane", "25-start-background-monitor", "26-stop-background-monitor"]

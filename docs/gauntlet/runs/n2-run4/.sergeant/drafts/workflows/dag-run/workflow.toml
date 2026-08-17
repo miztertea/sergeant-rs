@@ -1,9 +1,0 @@
-# dag-run — draft workflow candidate materialized by repo-to-icm's
-# 60-draft stage (N2 run, 21-partition corpus). status: draft in
-# index.md; this package has not been promoted to .sergeant/workflows/.
-# See provenance.md for the behavior_id evidence backing each stage.
-
-[workflow]
-name = "dag-run"
-version = "1"
-stages = ["01-resolve-stage-brief", "02-advance-on-dependency-completion", "03-verify-dag-prerequisites", "04-run-dispatch-hook"]

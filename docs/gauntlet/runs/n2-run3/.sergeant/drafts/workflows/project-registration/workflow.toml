@@ -1,4 +1,0 @@
-[workflow]
-name = "project-registration"
-version = "1"
-stages = ["01-confirm-context-loaded"]

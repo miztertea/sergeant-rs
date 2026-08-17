@@ -20,14 +20,13 @@ The claim is reproduced or the PR diff is tested, reported as confirmed/failed/i
 
 - **Before grilling, the actor verifies the claim empirically — reproducing a bug or checking out and testing a PR's diff — and reports one of confirmed, failed, or insufficient-detail, where confirmation strengthens the eventual agent brief.**
   (trigger: a recommendation has been given and direction received; outcome: the claim's validity is empirically established before further action)
-  — `BU-P3-067`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 74)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Reproducing a bug or checking out and testing a PR's diff, and reporting confirmed/failed/insufficient-detail (`BU-P3-067`).
+- Reproducing a bug or checking out and testing a PR's diff, and reporting confirmed/failed/insufficient-detail.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

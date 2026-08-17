@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """validate-structure.py — the §9.7 structural validator.
 
-Adapted from `reference-corpus/lint.py`'s package-structure check (its
+Adapted from `sergeant-rs-workspace/knowledge/evidence/reference-corpus/lint.py`'s package-structure check (its
 check 5) into a workflow-owned helper this workflow can run on itself and
-on what it generates (`docs/gauntlet/contracts/N2.md` Outcome §1: "It must
+on what it generates (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N2.md` Outcome §1: "It must
 itself pass reference-corpus-grade lint (the validator runs on its own
-tree)"). This script does not read anything under `reference-corpus/` —
+tree)"). This script does not read anything under `sergeant-rs-workspace/knowledge/evidence/reference-corpus/` —
 doing so from inside a workflow run would violate this workflow's own
 blindness rule (`../CONTEXT.md`) — it only re-derives the same *structural*
-checks reference-corpus/lint.py applies to draft-workflows/ packages, not
+checks sergeant-rs-workspace/knowledge/evidence/reference-corpus/lint.py applies to draft-workflows/ packages, not
 lint.py's deeper NDJSON quote/hash reproduction (record-shapes.md §3's
 citation discipline is `../_config/evidence-policy.md`'s job to state and
 `70-lint`'s actor's job to apply by hand or a future helper — reproducing

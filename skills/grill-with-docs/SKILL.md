@@ -1,7 +1,11 @@
 ---
 name: grill-with-docs
 description: A relentless interview to sharpen a plan or design, which also captures ADRs and a glossary as decisions land. Use when a plan or design needs interview-style stress-testing that should also produce durable domain artifacts.
+edition: 0.1.0
 ---
+
+Provenance for this skill's citation record lives in
+`sergeant-rs-workspace`'s `knowledge/evidence/provenance/skills.md`.
 
 Ported from `.sergeant/workflows/grill-with-docs` (N1 candidate W29), which
 retires for the same reason as `grilling`: North Star ruling R-NS-6
@@ -33,8 +37,6 @@ just a confirmed shared understanding in the transcript.
    - **A glossary entry**: any domain term the interview coined or
      sharpened, with its definition, added to (or creating) `docs/glossary.md`
      in the same repo the plan/design belongs to.
-   Method reference (frozen evidence, not runnable procedure in this repo):
-   `reference/sergeant-upstream/.agents/skills/domain-modeling/SKILL.md`.
 3. After the interview's confirmation gate is reached, review the captured
    ADRs/glossary entries with the user before treating them as final — the
    same explicit-confirmation discipline `grilling` applies to the plan

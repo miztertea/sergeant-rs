@@ -1,17 +1,14 @@
 # What GitHub's language bar is allowed to count.
 #
-# The repository is a single Rust crate carrying a large committed evidence
-# tree. `reference/` alone (the upstream fork, the spike notes, the workflow
-# archive) outweighs `src/` in bytes, and its shell and Python make the bar
-# report a majority-Shell project — a claim about the repo that is false in
-# every sense a reader means it. linguist-vendored says "committed, but not
-# ours": the files stay tracked and diffable, and stop being counted.
+# `.sergeant/**` carries a lot of shell and Python relative to `src/`, enough
+# to skew the bar toward a majority-Shell/Python read of what is a single
+# Rust crate. linguist-vendored says "committed, but not ours": the files
+# stay tracked and diffable, and stop being counted.
 #
-# `reference-corpus/` and `.sergeant/` are marked ahead of their arrival: they
-# exist on the N-series branch today, and marking them here means the language
-# bar survives that merge unchanged rather than needing a follow-up.
-reference/** linguist-vendored
-reference-corpus/** linguist-vendored
+# The evidence tree that used to make this worse (`reference/`,
+# `reference-corpus/`) moved to `sergeant-rs-workspace` (Phase 4 step 4,
+# ADR 0014 decision 17) — a `linguist-vendored` rule here can't reach into
+# another repository, so there is nothing to mark for those paths anymore.
 .sergeant/** linguist-vendored
 
 # Machine-written, reviewed only as a lockfile.

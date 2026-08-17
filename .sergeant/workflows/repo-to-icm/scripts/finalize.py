@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """finalize.py — repo-to-icm's own D9 disposition finalize step.
 
-R-MVP1-2 (`docs/gauntlet/contracts/MVP-1.md`): promote/finalize EXECUTION is
+R-MVP1-2 (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`): promote/finalize EXECUTION is
 workflow content invoking a *shared, deterministic* finalize helper — the
 engine learns no output vocabulary, and no workflow keeps a private fork of
 the disposition logic. That shared helper now lives at `.sergeant/lib/

@@ -1,4 +1,0 @@
-[workflow]
-name = "dispatch-worker"
-version = "1"
-stages = ["01-intent-file-gate", "02-create-td-tasks", "03-record-canonical-intent", "04-spawn-worker", "05-escalate-undecided-seam", "06-report-terminal-status"]

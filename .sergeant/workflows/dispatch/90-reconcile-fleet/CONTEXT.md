@@ -20,26 +20,23 @@ Per-repo verification of pinned scope, validation, review artifacts, zero blocki
 
 - **Reconciliation after all workers finish requires verifying, per repository: pinned-base scope, focused/full validation, separate standards/spec review artifacts, an accessibility review artifact for UI-facing work, zero blocking findings, required CI, and resolved non-outdated review threads; and checking dependency order so infra merges before API before app when there is a runtime dependency.**
   (trigger: all dispatched workers report done; outcome: completion is verified against a fixed, itemized gate list, not merely 'a PR exists')
-  — `BU-P5-070`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (lines 108-114)
 - **A fleet is never reconciled or cleaned up merely because every worker has opened a PR; all completion gates must be met.**
   (trigger: every dispatched worker has opened a PR; outcome: PR existence alone never triggers reconciliation/cleanup)
-  — `BU-P5-071`, `reference/sergeant-upstream/skills/dispatch/SKILL.md` (line 115)
 - **In dispatch mode, monitor progress and reconcile merge order, PRs, and cross-repository implications.**
   (trigger: workers dispatched; outcome: cross-repository delivery is reconciled)
-  — `BU-P1-006`, `reference/sergeant-upstream/AGENTS.md` (AGENTS.md L20, dispatch-mode step 3)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Verifying the itemized gate list per repository and reconciling dependency merge order (`BU-P5-070`, `BU-P1-006`).
+- Verifying the itemized gate list per repository and reconciling dependency merge order.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
 
 ### J5 — governing constraint
-- **A fleet is never reconciled merely because every worker opened a PR; all completion gates must be met** (`BU-P5-071`).
+- **A fleet is never reconciled merely because every worker opened a PR; all completion gates must be met.**
 
 ### J0 — must become `needs_input`
 - None specific to this stage beyond `@@bounded-judgment`'s general triggers.

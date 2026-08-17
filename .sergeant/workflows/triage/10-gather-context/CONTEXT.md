@@ -20,17 +20,15 @@ Three fixed attention buckets are shown, oldest first; the item and prior notes 
 
 - **Triaging a specific item begins by fully reading the item and prior triage notes, exploring the codebase via its domain glossary and ADRs, and running two checks: whether the behavior is already implemented (by domain concept, not literal wording) and whether the request resembles a prior recorded out-of-scope rejection.**
   (trigger: a specific issue or PR is being triaged; outcome: the actor has full context plus a redundancy verdict and a prior-rejection match (if any) before recommending)
-  — `BU-P3-065`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 70)
 - **Matching a new issue against the out-of-scope KB is done by concept similarity rather than literal keyword overlap.**
   (trigger: gather-context's prior-rejection check runs; outcome: a conceptually similar but differently-worded request is still recognized as a match)
-  — `BU-P3-089`, `reference/sergeant-upstream/.agents/skills/triage/OUT-OF-SCOPE.md` (line 75)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Judging whether the behavior is already implemented (by domain concept, not literal wording) and whether the request conceptually matches a prior out-of-scope rejection (`BU-P3-065`, `BU-P3-089`).
+- Judging whether the behavior is already implemented (by domain concept, not literal wording) and whether the request conceptually matches a prior out-of-scope rejection.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.
@@ -50,13 +48,10 @@ Demoted from a standalone stage (`00-show-attention`) at N1 adjudication A4: its
 
 - **When asked what needs attention, the workflow queries the tracker and presents three fixed buckets ordered oldest-first.**
   (trigger: the maintainer asks what needs attention; outcome: three ordered buckets of attention-worthy items are shown)
-  — `BU-P3-062`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 58)
 - **The third discovery bucket is needs-info items where the reporter has posted activity since the last triage notes, signaling they need re-evaluation.**
   (trigger: an item is in needs-info and the reporter has replied; outcome: the item surfaces in the attention list for re-evaluation)
-  — `BU-P3-063`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 62)
 - **The discovery bucket filter excludes non-external PRs, but this filter applies only to unprompted discovery — an explicitly named PR is triaged regardless of who authored it.**
   (trigger: PRs are included in the attention buckets; outcome: internal PRs never appear via discovery, but can always be triaged by explicit request)
-  — `BU-P3-064`, `reference/sergeant-upstream/.agents/skills/triage/SKILL.md` (line 64)
 
 ## Output
 

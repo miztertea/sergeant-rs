@@ -1,26 +1,22 @@
 # Standards axis: smell baseline
 
-Workflow-local context for `code-review`'s Standards axis
-(`BU-P2-008`, `BU-P2-009`, `BU-P2-010`, `BU-P2-011`; `reference/sergeant-
-upstream/.agents/skills/code-review/SKILL.md` Step 3). Single consumer
+Workflow-local context for `code-review`'s Standards axis. Single consumer
 (`20-30-parallel-review`) — authored here directly per
 `docs/icm/convention.md` §4 rule 1 rather than under `.sergeant/common/
 contexts/`, since no second workflow currently shares this contract.
 
 On top of whatever the repo documents, the Standards axis always carries
 the smell baseline below — a fixed set of Fowler code smells (_Refactoring_,
-ch. 3) that applies even when a repo documents nothing (`BU-P2-008`). Two
+ch. 3) that applies even when a repo documents nothing. Two
 rules bind it:
 
 - **The repo overrides.** A documented repo standard always wins; where it
-  endorses something the baseline would flag, suppress the smell
-  (`BU-P2-009`).
+  endorses something the baseline would flag, suppress the smell.
 - **Always a judgment call.** Each smell is a labelled heuristic ("possible
   Feature Envy"), never a hard violation — and, like any standard here,
-  skip anything tooling already enforces (`BU-P2-010`).
+  skip anything tooling already enforces.
 
-Each smell reads *what it is* → *how to fix*; match it against the diff
-(`BU-P2-011`):
+Each smell reads *what it is* → *how to fix*; match it against the diff:
 
 - **Mysterious Name** — a function, variable, or type whose name doesn't
   reveal what it does or holds. → rename it; if no honest name comes, the
@@ -50,6 +46,3 @@ Each smell reads *what it is* → *how to fix*; match it against the diff
   cut it, call the real target direct.
 - **Refused Bequest** — a subclass or implementer that ignores or overrides
   most of what it inherits. → drop the inheritance, use composition.
-
-Source: `reference/sergeant-upstream/.agents/skills/code-review/SKILL.md`,
-Step 3 ("Identify the standards sources"), lines 38-56.

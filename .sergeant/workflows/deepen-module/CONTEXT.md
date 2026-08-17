@@ -1,11 +1,9 @@
 # Deepen Module
 Draft workflow package — candidate **W25** `deepen-module` from the N1
-manual reference-corpus decomposition (`docs/gauntlet/contracts/N1.md`),
-decomposed from `reference/sergeant-upstream` per
-`reference-corpus/synthesis.md` §1. This is Layer 1 orientation only —
-it is never delivered as a stage's instructions; each stage's own
-`CONTEXT.md` (Layer 2) is the actor's contract (`docs/icm/convention.md`
-§1a rule 5).
+manual reference-corpus decomposition (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md`).
+This is Layer 1 orientation only — it is never delivered as a stage's
+instructions; each stage's own `CONTEXT.md` (Layer 2) is the actor's
+contract (`docs/icm/convention.md` §1a rule 5).
 
 ## Purpose
 
@@ -43,4 +41,4 @@ Material decisions are recorded per-stage in each stage's own output artifact.
 
 ## Provenance
 
-See `docs/gauntlet/promoted-provenance/deepen-module.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 note: the prior text pointed at a workflow-local `provenance.md` that does not exist — the same class of defect found in 19 of 23 packages' own `CONTEXT.md` files, systemic rather than specific to this package, corrected here incidentally while this file was already being amended for other reasons.)
+See `sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/deepen-module.md` for the complete stage-to-behavior-unit mapping and workflow-level citations. (ICM-R3 note: the prior text pointed at a workflow-local `provenance.md` that does not exist — the same class of defect found in 19 of 23 packages' own `CONTEXT.md` files, systemic rather than specific to this package, corrected here incidentally while this file was already being amended for other reasons.)

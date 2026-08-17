@@ -2,7 +2,7 @@
 # probe-env.sh — measure this host's environment facts and print them as a
 # markdown table in the docs/environments/ format.
 #
-# Retro deliverable (docs/gauntlet/notes/session-retro-n-series-2026-08-11.md,
+# Retro deliverable (sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/session-retro-n-series-2026-08-11.md,
 # item 1): nearly every hard stall in the N-series session was a collision
 # with an unmeasured container fact discovered the expensive way, mid-task.
 # Run this once at session start on ANY host and paste its table into that

@@ -20,14 +20,13 @@ The external skill's source and update mechanism are confirmed.
 
 - **Confirm the external skill's source and update mechanism.**
   (trigger: step 1 complete; outcome: provenance and update path are known before proceeding)
-  — `BU-P1-121`, `reference/sergeant-upstream/docs/skills.md` (docs/skills.md L127, vet step 2)
 
 ## Bounded judgment
 
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Judging whether a claimed source and update mechanism are actually confirmable from available evidence (`BU-P1-121`).
+- Judging whether a claimed source and update mechanism are actually confirmable from available evidence.
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics.

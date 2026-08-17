@@ -33,5 +33,5 @@ downstream (classification, synthesis, draft workflows) traces back to this
 file's records by `id`. The partition ledger and consequence-class sweep are
 the run's own honesty record about coverage and about the specific
 consequence-bearing behavior classes N2 run 2 silently missed
-(`docs/gauntlet/runs/n2-run2/comparison-scorecard.md` §3) — all three must
+(`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/n2-run2/comparison-scorecard.md` §3) — all three must
 survive the merge for any of that to be checkable after the run is over.

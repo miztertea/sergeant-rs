@@ -16,7 +16,7 @@
 Every command below is written **from the repository root** — the same
 directory `.sergeant/` lives directly under, which is this run's actual
 working directory (the materialized work surface's single bound worktree;
-`docs/gauntlet/notes/n2-fake-backend-semantics.md`'s cwd is a fresh actor
+`sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/n2-fake-backend-semantics.md`'s cwd is a fresh actor
 turn's cwd, not any one stage's own directory). Do not run these commands
 from inside `70-lint/` itself, and do not assume `../scripts/...` resolves
 — it only would from inside this stage's own directory, which is not where
