@@ -44,12 +44,21 @@ This workflow receives an already-admitted Work intent (either the coordinator-l
 
 ### Workflow may not decide
 - Whether to resolve an `ask-user` gate finding — it is relayed verbatim to the user, never resolved autonomously (`40-drive-gates`).
-- Whether a dispatched run of this workflow may autonomously push a branch, open a pull request, or trigger CI — **currently unclassified** (BU-VAS-15; see the stage-level `J0` note in `40-drive-gates/CONTEXT.md`). This is a live, unresolved owner decision, not a workflow authority this package grants itself.
 - To edit the pipeline-owned worktree, abort, or rerun mid-gate to escape a finding.
+
+### Resolved (was `BU-VAS-15`, issue #123): a dispatched run of this workflow pushing a branch, opening a PR, or triggering CI is not a gap
+Push, PR-open, and CI-run are this workflow's ordinary, correct, ungated
+behavior — they create the review artifact, they don't bypass review. The
+sensitive action is merge, and merge is held structurally by this
+repository's own GitHub configuration (`allow_auto_merge: false`, no
+branch protection rule on `main`), not by anything in this package's
+content. That is a repository setting outside this package's own
+visibility, not something a stage here can verify at runtime — worth
+re-checking directly if either setting ever changes, since this
+workflow's own content has no way to detect that.
 
 ### Human or Captain gates
 - Every `ask-user` gate finding.
-- The push/pr/ci authority gap (BU-VAS-15) until the owner rules on it.
 
 ### Decision record
 Material decisions are recorded per-stage in each stage's own `## Bounded judgment` section below and in the gate's own findings table (`40-drive-gates`).
