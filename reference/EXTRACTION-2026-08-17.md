@@ -16,9 +16,9 @@ re-minted. Candidates were then verified directly against the proposal
 text and, where the candidate claimed already-implemented code, against
 the actual source tree — not taken on the reader's word alone.
 
-One new ADR came out of this pass:
+One new ADR came out of this pass (minted as 0016, renumbered to 0017 on integration — the Phase 2b Work independently minted 0016 for the template edition marker from the same base):
 
-- **`docs/adr/0016-gate-work-branch-takeover.md`** — from
+- **`docs/adr/0017-gate-work-branch-takeover.md`** — from
   `reference/proposal-foundation-rationalization.md` §8.6, "How a gate Work
   binds to the branch it reviews." Verified as already implemented:
   `crate::runtime::engine::branch_takeover_precondition` and
@@ -197,7 +197,7 @@ context.
 
 ## Summary
 
-- New ADRs minted: **1** (`0016-gate-work-branch-takeover.md`).
+- New ADRs minted: **1** (`0017-gate-work-branch-takeover.md`).
 - Borderline items deliberately left as summary-only, not ADRs (see above):
   the two Cerberus-derived adapter invariants in
   `proposal-harness-adapter-research-v2.md`, and the CI trigger-dedup /
