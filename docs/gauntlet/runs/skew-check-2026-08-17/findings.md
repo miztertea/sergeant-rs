@@ -32,15 +32,19 @@ opened.
 
 | Classification | Count |
 |---|---|
-| FLAG_MISSING | 2 |
+| FLAG_MISSING | 4 |
 | VERB_MISSING | 1 |
 | ARG_SHAPE | 1 |
-| BEHAVIOR | 2 |
+| BEHAVIOR | 3 |
 | STALE | 0 |
-| **Total mismatches** | **6** |
+| **Total mismatches** | **9** |
 
-Reverse-direction (binary has, doctrine doesn't mention): 4 items, listed
+Reverse-direction (binary has, doctrine doesn't mention): 6 items, listed
 at the end — not defects.
+
+**Re-run note (same day, second pass):** findings 7–9 below were added on
+a second pass over the same scope; findings 1–6 and reverse items 1–4 are
+the original pass, left unchanged.
 
 ---
 
@@ -288,6 +292,87 @@ KNOWN 3.)
 
 ---
 
+### 7. FLAG_MISSING — `--adopt-branch` cited as the dispatch unpushed-work recovery path
+
+**File:** `.sergeant/workflows/dispatch/80-monitor/CONTEXT.md`, lines 71, 74, 77
+
+**Claim (quoted):**
+> L71: "Dispatch refuses to re-dispatch onto a branch that already carries committed work unreachable from any remote, unless the operator explicitly opts in with an adopt-branch flag, because a prior interrupted dispatch may have done real, unpreserved work that a fresh dispatch would silently discard or duplicate."
+>
+> L74: "**The `--adopt-branch` dispatch option is an explicit operator acknowledgement that a named branch already carries committed work and should be resumed as-is; it is non-destructive (it checks the branch out at a new worktree path, preserving the branch tip and every commit), and it exists so the unpushed-work guard cannot make preserved work permanently unresumable in a repository whose upstream denies push access.**"
+>
+> L77: "**The unpushed-work guard's refusal message must never instruct the operator to delete the branch (the data loss it exists to prevent) and must instead name `--adopt-branch` as the supported non-destructive reconcile path.**"
+
+**Command run:**
+```
+$ sgt run --help | grep -i adopt
+$ grep -rn "adopt.branch" src/
+```
+**Output:** both empty — no match on either.
+
+**Classification:** FLAG_MISSING, same family as findings 1 and 2: cited
+to `reference/sergeant-upstream/bin/sgt-dispatch` and
+`reference/sergeant-upstream/tests/sgt-dispatch-adopt-branch-test.sh`, but
+stated as this stage's own present-tense "Behavior contract." This repo's
+`sgt` has no unpushed-work guard and no `--adopt-branch` flag on any verb
+(`sgt run`'s full option set, confirmed above in finding 1, has no
+branch-adoption surface at all).
+
+---
+
+### 8. FLAG_MISSING — `--deps` ordering flag cited on dispatch's brief-rendering helper
+
+**File:** `.sergeant/workflows/dispatch/80-monitor/CONTEXT.md`, lines 81, 98
+
+**Claim (quoted):**
+> L81: "`BU-P5-074` records that `--deps` *ordering* is expressed here but its *enforcement* is left entirely to the dispatched workers reading their own brief..."
+>
+> L98: "**The --deps ordering string only expresses that one repository must finish before dependents can merge; enforcing it is left entirely to the dispatched workers reading it out of their own brief.**"
+
+**Command run:**
+```
+$ sgt run --help | grep -i deps
+$ grep -rn '"deps"' src/
+```
+**Output:** both empty.
+
+**Classification:** FLAG_MISSING. `sgt run`'s only multi-repo surface is
+`--repo` (repeatable) and `--group`; there is no dependency-ordering flag
+or field anywhere in `src/`.
+
+---
+
+### 9. BEHAVIOR — dispatch's `td` task tracker and `treehouse` worktree pooling have no counterpart in `src/`
+
+**File:** `.sergeant/workflows/dispatch/80-monitor/CONTEXT.md`, lines 56, 68, 92
+
+**Claim (quoted):**
+> L56: "Dispatching from a free-form brief creates exactly one td task per target repository before spawning any worker; if td is unavailable, task creation fails, generated metadata cannot be injected, or any selected repo fails to get a task, the whole dispatch aborts before spawning any worker and rolls back the generated tasks."
+>
+> L68: "Once repos have a treehouse pool initialized, dispatch automatically prefers a pre-warmed treehouse lease over a plain git worktree for those repos, without the operator having to select a worktree strategy per dispatch."
+>
+> L92: "**sgt-dispatch must resolve an OpenCode (`oc`) target session for routing coordinator notifications by consulting `td` for an existing routing task before creating one...**"
+
+**Command run:**
+```
+$ grep -rn "treehouse\|\btd\b" src/*.rs src/**/*.rs Cargo.toml
+```
+**Output:** no matches — no `td` invocation, no treehouse pooling logic,
+no OpenCode (`oc`) integration anywhere in `src/` or `Cargo.toml`'s
+dependency list. This repo's actual worktree acquisition (`src/runtime/
+surface.rs`) creates one plain git worktree per Work with no pooling and
+no external task tracker.
+
+**Classification:** BEHAVIOR, same family as finding 3 (`sgt dispatch`
+doesn't exist) but specifically about the machinery this stage's own
+"Behavior contract" section states as binding present-tense requirements
+(task-per-repo via `td`, treehouse-pool preference) — all cited to
+`reference/sergeant-upstream`, none ported. An actor following this
+CONTEXT.md verbatim would look for `td`/treehouse tooling that was never
+built in this project.
+
+---
+
 ## Reverse direction — binary capabilities not mentioned anywhere in doctrine
 
 Not defects; useful gaps to fold into doctrine later.
@@ -303,3 +388,11 @@ Not defects; useful gaps to fold into doctrine later.
 4. **`sgt daemon`** run with no subcommand (foreground daemon until
    SIGINT/SIGTERM) — doctrine only ever mentions `sgt daemon stop`; the
    foreground form is undocumented outside `sgt daemon --help` itself.
+5. **`SGT_TURN_CAP`** (`src/daemon.rs:830`, the daemon-wide default that
+   `--turns` overrides per-Work) — real and implemented, but
+   `README.md`'s "Using sgt day-to-day" section documents `--turns`/
+   `--ceiling-secs` without naming the env var they override.
+6. **`sgt repo add --instructions <local|suppress>`** as a CLI flag — only
+   the equivalent `[[repo]] instructions = "local" | "suppress"` TOML
+   field is documented (`skills/estate-navigation/SKILL.md:49`); the flag
+   itself (`sgt repo add --help`) is unmentioned.
