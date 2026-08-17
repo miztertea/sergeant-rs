@@ -28,20 +28,20 @@ The fixed point resolves and the diff is non-empty, or this fails here rather th
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- None of substance: confirming the fixed point resolves (`git rev-parse`) and the diff against it is non-empty are both deterministic checks, not judgment calls.
+- None identified: resolving the given ref (`git rev-parse`) and checking the diff is non-empty are deterministic checks, not judgment calls.
 
 ### J1 — local choices allowed
-- Exact wording of the request when asking the user for a fixed point.
+- Exact wording of the failure message when the ref doesn't resolve or the diff is empty.
 
 ### J0 — must become `needs_input`
-- The user did not specify a comparison point (commit SHA, branch, tag, `HEAD~N`, etc.): ask for it before proceeding, rather than guessing one.
-- The fixed point does not resolve (`git rev-parse` fails) or the diff against it is empty: stop here and report the failure, rather than letting a bad ref or empty diff surface inside a sub-review.
+- The user did not specify a fixed comparison point: ask for one before proceeding rather than guessing (e.g. defaulting to `HEAD~1` or `main`).
+- The given fixed point does not resolve, or the diff against it is empty: stop and report rather than passing a broken input into the parallel sub-reviews.
 
 ### Completion boundary
-This stage may complete only once the fixed point has been confirmed to resolve and the diff against it confirmed non-empty.
+This stage may complete only once the fixed point resolves and the diff is confirmed non-empty.
 
 ### Decision evidence
-Which fixed point was used (user-specified, or the resolved default) is recorded in this stage's own `output/README.md`-declared artifact.
+Record the resolved fixed point and diff command in `output/README.md`.
 
 ## Output
 

@@ -26,19 +26,19 @@ The spec source is identified via a fixed priority order ending in asking the us
 Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
-- Judging whether a candidate PRD/spec file under `docs/`, `specs/`, or `.scratch/` actually matches the branch or feature name closely enough to count as found, before falling through to the next step in the priority order.
+- Judging whether a candidate PRD/spec file under `docs/`, `specs/`, or `.scratch/` genuinely matches the branch or feature name — the priority order names the search locations, but recognizing a match among several plausible files is not mechanical.
 
 ### J1 — local choices allowed
-- Exact wording of the question when asking the user for a spec source.
+- None identified: the priority order (commit-message issue refs, then user-supplied path, then a matching PRD/spec file, then asking the user) is fully specified and admits no equivalent local variants.
 
 ### J0 — must become `needs_input`
-- The fixed priority order (issue references in commit messages, a user-passed path, a matching PRD/spec file) is exhausted with nothing found: ask the user rather than guessing or fabricating a spec source.
+- No spec source is found anywhere in the priority order: ask the user whether one exists. If the user says no, the Spec sub-agent is skipped and reports "no spec available" rather than the stage inventing a source.
 
 ### Completion boundary
-This stage may complete only once a spec source is identified, or the user has explicitly confirmed none exists (in which case the Spec sub-agent is skipped downstream in `20-30-parallel-review`).
+This stage may complete only once a spec source is identified, or the user's "no spec" answer is recorded and the Spec axis is marked skipped.
 
 ### Decision evidence
-The identified spec source (or the user's "no spec" answer) is recorded in this stage's own `output/README.md`-declared artifact.
+Record the identified spec source — or the skip and the user's reason — in `output/README.md`.
 
 ## Output
 

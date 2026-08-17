@@ -10,11 +10,11 @@ citation trail archived at `docs/gauntlet/promoted-provenance/tdd.md`. This
 file does not re-derive those citations — it re-places the same cited
 content at the rung the current corpus actually earns.
 
-Provenance for this file's rules (which behavior unit justifies each rule,
-and its upstream source) also lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/common-contexts.md` — provenance markers
-were stripped from the shipped content below; the record of why each rule
-exists did not move with them.
+Provenance for this file's `BU-####` citations (which behavior unit
+justifies each rule below, and its upstream source) lives in
+`sergeant-rs-workspace`'s `knowledge/evidence/provenance/common-contexts.md`
+— provenance markers were stripped from the shared context content below;
+the record of why each rule exists did not move with them.
 
 Test-driven development for one confirmed seam at a time: red, green, one
 minimal implementation. Consult this whenever implementation proceeds
@@ -69,8 +69,9 @@ contributes.
 
 ## Workflow-level notes carried from the retired `tdd` workflow
 
-- The workflow-level trigger and purpose statement are subsumed by this
-  file's own opening paragraph; they were never independent of the
-  technique content itself.
-- Refactoring was already explicitly out of scope for the loop before
-  this rehome — that boundary is unchanged, only its representation is.
+- The workflow-level trigger and purpose statement are subsumed by
+  this file's own opening paragraph; they were never independent of
+  the technique content itself.
+- Refactoring was already explicitly out of scope for the loop
+  before this rehome — that boundary is unchanged, only its
+  representation is.

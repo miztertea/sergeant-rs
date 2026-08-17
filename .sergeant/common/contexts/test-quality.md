@@ -3,22 +3,21 @@
 Shared actor-skill context (Placement Ladder PL-3). Resolved as
 `@@test-quality` from `.sergeant/common/contexts/test-quality.md` per
 `docs/icm/convention.md` §4. Planned since `reference-corpus/
-shared-context-map.md`'s N1 synthesis pass (16 units, anchored at the
-`tdd` skill's intro line 10, `tests.md`, and `mocking.md`) but never
-materialized under `.sergeant/common/contexts/` before this ICM-R3 pass —
-see the `tdd` package adjudication's "Behavior-unit dispositions" table
-for the gap finding this file closes. Named consumers per the
+shared-context-map.md`'s N1 synthesis pass but never materialized under
+`.sergeant/common/contexts/` before this ICM-R3 pass — see the `tdd`
+package adjudication's "Behavior-unit dispositions" table for the gap
+finding this file closes. Named consumers per the
 shared-context map: `diagnose-bug`, `prototype`, `tdd`, `implement`,
 `deepen-module`. This ICM-R3 pass reconciles only the `tdd` package;
 wiring the other four consumers' stage content to reference `@@test-quality`
 is out of this pass's scope and is left as a follow-on finding, not done
 silently here.
 
-Provenance for this file's rules (which behavior unit justifies each rule,
-and its upstream source) lives in `sergeant-rs-workspace`'s
-`knowledge/evidence/provenance/common-contexts.md` — provenance markers
-were stripped from the shipped content below; the record of why each rule
-exists did not move with them.
+Provenance for this file's source units (which behavior unit justifies
+each rule below, and its upstream source) lives in
+`sergeant-rs-workspace`'s `knowledge/evidence/provenance/common-contexts.md`
+— provenance markers were stripped from the shared context content below;
+the record of why each rule exists did not move with them.
 
 What a good test is, where tests go, and how to design for mockability —
 consulted before and during a red-green cycle (see `@@tdd`), not only at
@@ -75,9 +74,7 @@ your own classes, internal collaborators, or anything you control.
 
 ## Source
 
-The `tdd` skill's intro (line 10, "What a good test is" section),
-`tests.md` (Good Tests / Bad Tests), `mocking.md` (When to Mock, Designing
-for Mockability). Full behavior-unit citation trail for this content has
-not been separately archived under `docs/gauntlet/promoted-provenance/` —
-noted as a gap for the independent reviewer, not fabricated here (see the
-`tdd` adjudication's Validation evidence section).
+Full behavior-unit citation trail for this content has not been separately
+archived under `docs/gauntlet/promoted-provenance/` — noted as a gap for
+the independent reviewer, not fabricated here (see the `tdd`
+adjudication's Validation evidence section).
