@@ -959,6 +959,13 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         Command::Init { name } => {
             let cwd = std::env::current_dir()?;
             let outcome = crate::domain::manifest::init_estate(&cwd, name.as_deref())?;
+            // ADR 0014 decision 1: the distro (AGENTS.md, skills/,
+            // .sergeant/common/contexts/, .sergeant/workflows/) is embedded
+            // in the binary and written here, not cloned. Per-file
+            // idempotent (`domain::distro::write_distro`), so this never
+            // turns a second `sgt init` on an already-initialized estate
+            // into anything but a no-op, and it writes only within `cwd`.
+            let distro_outcome = crate::domain::distro::write_distro(&cwd)?;
             // Re-resolve now that `sergeant.toml` exists: the `data_dir`
             // computed above ran before `init_estate` created it, so on a
             // fresh estate estate discovery had nothing to find yet and
@@ -973,12 +980,14 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         "estate_section_added": outcome.estate_section_added,
                         "repos_dir_created": outcome.repos_dir_created,
                         "gitignore_updated": outcome.gitignore_updated,
-                        "changed": outcome.changed(),
+                        "distro_files_written": distro_outcome.written.len(),
+                        "distro_files_already_present": distro_outcome.skipped.len(),
+                        "changed": outcome.changed() || distro_outcome.changed(),
                     },
                     "doctor": report.to_json(),
                 }));
             } else {
-                if outcome.changed() {
+                if outcome.changed() || distro_outcome.changed() {
                     println!("initialized estate at {}", cwd.display());
                     if outcome.manifest_created {
                         println!("  created sergeant.toml");
@@ -991,6 +1000,13 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     }
                     if outcome.gitignore_updated {
                         println!("  updated .gitignore");
+                    }
+                    if distro_outcome.changed() {
+                        println!(
+                            "  wrote {} distro file(s) (AGENTS.md, skills/, \
+                             .sergeant/common/contexts/, .sergeant/workflows/)",
+                            distro_outcome.written.len()
+                        );
                     }
                 } else {
                     println!(
@@ -2338,7 +2354,9 @@ pub(crate) mod doctor {
                 ),
                 format!(
                     "write a package to {}/<name>/workflow.toml before dispatching `--workflow \
-                     <name>` (#165 — sgt init does not scaffold any yet)",
+                     <name>`, or re-run `sgt init` — it writes the embedded distro's stock \
+                     packages for any that are missing (#165), without touching one already \
+                     present",
                     workflows_dir.display()
                 ),
             )

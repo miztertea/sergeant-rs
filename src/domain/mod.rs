@@ -1,5 +1,6 @@
 //! Domain model: the core types describing work, execution, and workflow.
 
+pub mod distro;
 pub mod event;
 pub mod execution;
 pub mod manifest;

@@ -178,6 +178,205 @@ fn init_scaffolds_and_is_idempotent() {
     );
 }
 
+// --------------------------------------------------------------- distro
+
+/// guard-map (#165): a fresh estate has the embedded distro on disk after
+/// `sgt init` — `AGENTS.md`, at least one `skills/*/SKILL.md`, at least one
+/// `.sergeant/common/contexts/*.md`, and more than zero stock workflow
+/// packages under `.sergeant/workflows/`. Mutation this kills: `sgt init`
+/// going back to scaffolding only `sergeant.toml`/`repos/`/`.gitignore`
+/// (issue #165's original defect) would fail every assertion here.
+#[test]
+fn init_writes_the_embedded_distro() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
+
+    assert!(estate.path().join("AGENTS.md").is_file());
+
+    let skills: Vec<_> = std::fs::read_dir(estate.path().join("skills"))
+        .expect("skills dir")
+        .flatten()
+        .filter(|e| e.path().join("SKILL.md").is_file())
+        .collect();
+    assert!(!skills.is_empty(), "expected at least one skill package");
+
+    let contexts: Vec<_> = std::fs::read_dir(estate.path().join(".sergeant/common/contexts"))
+        .expect("contexts dir")
+        .flatten()
+        .collect();
+    assert!(!contexts.is_empty(), "expected at least one context file");
+
+    let workflows: Vec<_> = std::fs::read_dir(estate.path().join(".sergeant/workflows"))
+        .expect("workflows dir")
+        .flatten()
+        .filter(|e| e.path().join("workflow.toml").is_file())
+        .collect();
+    assert!(
+        !workflows.is_empty(),
+        "expected at least one stock workflow package"
+    );
+}
+
+/// guard-map (hard constraint 1): a second `sgt init` on an
+/// already-initialized estate is a true no-op for the distro too — it does
+/// not overwrite a file a user has since edited, and it never creates
+/// `.sergeant/local/` (that directory is the user's own; stock never writes
+/// there — hard constraint 3, Phase 3's local-shadows-stock resolution
+/// depends on the separation). Mutation this kills: `write_distro` losing
+/// its per-file existence check (a second init would then clobber the
+/// user's edit back to stock content) or accidentally writing under
+/// `.sergeant/local/` instead of `.sergeant/workflows/`.
+#[test]
+fn init_writing_the_distro_is_idempotent_and_never_touches_local() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
+    assert!(!estate.path().join(".sergeant/local").exists());
+
+    let sentinel = "the user edited this doctrine file\n";
+    std::fs::write(estate.path().join("AGENTS.md"), sentinel).expect("simulate a user edit");
+
+    let second = run(estate.path(), Some(&data_dir), &[], &["--json", "init"]);
+    second.assert_ok("second init");
+    assert!(
+        !second.json()["outcome"]["changed"].as_bool().unwrap(),
+        "a second init must change nothing, got {}",
+        second.stdout
+    );
+    assert_eq!(
+        std::fs::read_to_string(estate.path().join("AGENTS.md")).expect("AGENTS.md"),
+        sentinel,
+        "a second init must never clobber a user's edited AGENTS.md"
+    );
+    assert!(
+        !estate.path().join(".sergeant/local").exists(),
+        "sgt init must never create .sergeant/local/ — that tree is the user's own"
+    );
+}
+
+/// guard-map (ADR 0016 / hard constraint 4): every stock template `sgt
+/// init` writes carries `edition: <this binary's Cargo.toml version>` in
+/// its front matter — the co-versioning mechanism (ADR 0014 decision 2):
+/// the value is stamped by `sgt init` itself
+/// (`domain::distro::rewrite_edition`, keyed off `env!("CARGO_PKG_VERSION")`)
+/// rather than trusted verbatim from whatever was checked into the embedded
+/// content. Mutation this kills: reverting `write_file` to write embedded
+/// bytes unmodified would still pass today (checked-in `edition: 0.1.0`
+/// happens to match `Cargo.toml`'s current `0.1.0`) but silently drifts the
+/// moment either one changes without the other being re-synced by hand —
+/// this test pins the binary version as the source of truth, not the
+/// checked-in string.
+#[test]
+fn init_written_templates_carry_the_binary_edition() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
+
+    let edition_line = format!("edition: {}", env!("CARGO_PKG_VERSION"));
+
+    let mut checked = 0;
+    for entry in std::fs::read_dir(estate.path().join(".sergeant/workflows"))
+        .expect("workflows dir")
+        .flatten()
+    {
+        let index = entry.path().join("index.md");
+        if index.is_file() {
+            let text = std::fs::read_to_string(&index).expect("index.md");
+            assert!(
+                text.contains(&edition_line),
+                "{} must carry {edition_line:?}, got:\n{text}",
+                index.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "expected at least one stock index.md");
+
+    for entry in std::fs::read_dir(estate.path().join("skills"))
+        .expect("skills dir")
+        .flatten()
+    {
+        let skill_md = entry.path().join("SKILL.md");
+        if skill_md.is_file() {
+            let text = std::fs::read_to_string(&skill_md).expect("SKILL.md");
+            assert!(
+                text.contains(&edition_line),
+                "{} must carry {edition_line:?}, got:\n{text}",
+                skill_md.display()
+            );
+        }
+    }
+}
+
+/// guard-map (#165's own acceptance criterion): `sgt run --workflow <name>`
+/// resolves a stock package on a *freshly initialized* estate instead of
+/// 422ing — the exact failure issue #165 describes ("workflow \"research\"
+/// not found (looked in ...)"). This submits against `prototype`, a real
+/// shipped package, through the actual daemon (`support::DataDir`, a real
+/// spawn) rather than a hand-written fixture workflow, so the assertion is
+/// that resolution — not necessarily full execution — succeeds: any failure
+/// downstream of resolution (capability mismatch, etc.) is a different,
+/// acceptable outcome; a `workflow_error` naming "not found" is not.
+/// Mutation this kills: `sgt init` regressing back to writing no workflow
+/// packages (#165's original defect) would turn this submission's error
+/// code back into `workflow_error` with a "not found (looked in" message.
+#[test]
+fn run_workflow_resolves_against_a_freshly_initialized_estate() {
+    let data_dir = DataDir::new();
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(estate.path(), Some(data_dir.path()), &[], &["init"]).assert_ok("init");
+
+    init_repo(&estate.path().join("repos").join("target"));
+    run(
+        estate.path(),
+        Some(data_dir.path()),
+        &[],
+        &["repo", "add", "target"],
+    )
+    .assert_ok("repo add");
+
+    let submitted = run(
+        estate.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--workflow",
+            "prototype",
+            "--backend",
+            "fake",
+            "--repo",
+            "target",
+            "try the embedded distro",
+        ],
+    );
+
+    // A submit-time API error prints as `sgt: {status}: {message}` on
+    // stderr (`ClientError::Api`'s `Display`, `src/api.rs`), not JSON on
+    // stdout — so on failure the fingerprint of issue #165's 422
+    // (`WorkflowError::NotFound`'s message, `src/domain/workflow.rs`) is
+    // checked there. Any failure *without* that fingerprint is a different,
+    // unrelated outcome (e.g. a capability mismatch) and is not what this
+    // test is pinning.
+    assert!(
+        !submitted.stderr.contains("not found (looked in"),
+        "must not hit the #165 422, got stdout: {}\nstderr: {}",
+        submitted.stdout,
+        submitted.stderr
+    );
+    if submitted.code == Some(0) {
+        assert!(
+            submitted.json()["work"]["id"].is_string(),
+            "a successful submit must carry a work id, got: {}",
+            submitted.stdout
+        );
+    }
+
+    data_dir.reap();
+}
+
 /// guard-map: on a host with no `claude` CLI reachable, `sgt init` still
 /// exits 0 and still scaffolds the estate — the bug this pins (GH runner CI,
 /// all `m8_estate_cli` tests, run 31659419098): doctor's `claude` row FAILs
