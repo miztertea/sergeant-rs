@@ -26,10 +26,36 @@
 # this workflow's packaging step and release-body template both need a
 # follow-up change to actually embed and describe the distro.
 #
-# GATE F (distro structural validator): see the "gate-f" job below. It is a
-# documented no-op, not a passing check — the validator lives in
-# sergeant-rs-workspace, which this workflow cannot reach. Gap filed as
-# issue #176.
+# GATE F (distro structural validator): still does not run from this
+# workflow — sergeant-rs-workspace is private, and giving this release path
+# a token to read it is worse than not checking (see that repo's
+# knowledge/rulings/gate-f-ci-lives-here-2026-08-18.md). The property Gate F
+# names is proven continuously by sergeant-rs-workspace's own CI
+# (.github/workflows/validate.yml, PR ws#3, `validate-distro-live` job),
+# which checks out this repo read-only and runs `validate-distro` against it
+# on every PR and every push to this repo's main. A release therefore
+# inherits a continuously-proven property rather than re-proving it at
+# release time. Tracked as issue #176, now settled by that PR.
+#
+# DIST'S DEFAULT TOPOLOGY IS NOT ADOPTED (proposal §7/§10: "dist may own
+# packaging mechanics. Sergeant owns release authority."). `dist init`
+# generates its own CI recommendation triggered `on: push: tags: ...` — a
+# tag watcher, exactly what proposal §7 forbids as a release-initiating
+# event. This workflow never uses that generated workflow at all: `dist` is
+# invoked only as a plain `dist build` subcommand (see the `package` and
+# `package-installer` jobs below), called from jobs that already sit behind
+# `workflow_dispatch` and Gates A-F. The git tag this workflow eventually
+# creates is a side effect of `gh release create`/`gh release edit` in
+# `draft-release`/`publish`, run only after every gate and packaging step
+# has succeeded — dist's build mechanics never see or create that tag
+# themselves; they take it as an input (`--tag`) once we already know we
+# are publishing. Confirmed by measurement, not merely asserted:
+# docs/measure-dist-conditions-2026-08-18.md condition 4 directly exercised
+# `dist build --artifacts=local` from a branch push with no `v*` tag in the
+# repository at all, and found `dist`'s packaging mechanics indifferent to
+# how they are triggered. See also docs/measure-dist-2026-08-18.md
+# (condition 1 / bundled-DuckDB build feasibility) for the sibling
+# measurement this workflow's `package` job is based on.
 name: release
 
 on:
@@ -163,40 +189,52 @@ jobs:
         run: cargo deny check
 
   # ── Gate F — distro structural validator ───────────────────────────────
-  # NOT A REAL CHECK. See the top-of-file comment and issue #176. The
+  # Does not execute here — see the top-of-file comment for why (workspace
+  # repo is private; a read token for it is worse than not checking). The
   # validator this gate names lives in sergeant-rs-workspace's
   # .sergeant/local/workflows/validate-distro/ by deliberate placement (ADR
-  # 0014 decision 5), and this repo's CI cannot reach that repo. Every
-  # individual rule the validator applies takes only a sergeant-rs checkout
-  # as input (verified 2026-08-17 reading validate.py), so vendoring is
-  # possible, but doing so now would duplicate a check Phase 5a already
-  # assigns one home to, and would run before Phase 2's template
-  # decontamination has landed — guaranteed loud failures, not a real
-  # signal. This job exists so a reader of the Actions run sees an explicit,
-  # named skip rather than a gate that is simply absent.
+  # 0014 decision 5). The property is proven continuously, not skipped
+  # outright: sergeant-rs-workspace's own CI (.github/workflows/validate.yml,
+  # PR ws#3) runs validate-distro against a public checkout of this repo on
+  # every PR and push to that repo's main, so a release cutting from this
+  # repo's main inherits a property already proven at that commit rather
+  # than needing to re-prove it here. Tracked as issue #176, settled by that
+  # PR.
   gate-f-distro-validator:
     needs: gate-a-repo-state
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Gate F cannot run here — see issue #176
+      - name: Gate F does not run here — proven continuously in sergeant-rs-workspace (issue #176)
         run: |
-          echo "::warning::Gate F (distro structural validator) is a documented no-op. It lives in sergeant-rs-workspace and cannot run from this repo's CI. Tracked as issue #176. This release proceeds WITHOUT that check having run."
+          echo "::notice::Gate F (distro structural validator) does not run from this workflow. The property it names is proven continuously by sergeant-rs-workspace's own CI (.github/workflows/validate.yml, PR ws#3), which runs validate-distro against this repo on every PR and push to its main. This release inherits that continuously-proven property rather than re-proving it at release time. Tracked as issue #176."
           {
-            echo '## Gate F — distro structural validator: SKIPPED'
-            echo 'Not run. Validator lives in `sergeant-rs-workspace`, unreachable from this workflow. See issue #176.'
+            echo '## Gate F — distro structural validator: proven upstream, not re-run here'
+            echo 'Does not execute in this workflow. Proven continuously by `sergeant-rs-workspace`'"'"'s own CI (`.github/workflows/validate.yml`, PR ws#3, `validate-distro-live` job), which runs `validate-distro` against this repo on every PR and push to its `main`. See issue #176.'
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Package ─────────────────────────────────────────────────────────────
-  # Only after A-F. Measured 2026-08-17 (see PR description): `dist build`
-  # successfully builds sgt with bundled DuckDB and packages it, verified on
-  # a Linux x86_64 host in ~3m40s wall-clock for a cold build with a warm
-  # crates.io/git registry cache — GitHub's own cold-cache, 2-core runner
-  # numbers are UNVERIFIED from this environment (see the PR description's
-  # "could not verify" list). aarch64-apple-darwin is listed per ADR 0001's
-  # measured-target set but this workflow's macOS build step is UNVERIFIED
-  # end-to-end: no macOS runner was available to this session.
+  # Only after A-F. Measured on real GitHub-hosted runners, both targets,
+  # 2026-08-18 (docs/measure-dist-2026-08-18.md, proposal §10 condition 1):
+  # `dist build` successfully builds sgt with bundled DuckDB and packages it
+  # on both ubuntu-latest (897s cold build) and macos-latest (1002s cold
+  # build), with no disk or cache pressure on either. Binary behavioral
+  # equivalence and the generated installer's correctness (conditions 2-3)
+  # were additionally measured against a real archive on ubuntu-latest
+  # (docs/measure-dist-conditions-2026-08-18.md) and found identical to an
+  # ordinary `cargo build --release` binary, including the embedded distro.
+  #
+  # aarch64-apple-darwin per ADR 0001's measured-target set: the *build*
+  # succeeded on a real macos-latest runner (above), but binary equivalence
+  # and installer correctness were not re-measured on macOS — see docs/adr/
+  # 0018-measured-vocabulary-obligation-clean-build-not-full-validation.md,
+  # which clarifies ADR 0001 D8's "measured" vocabulary. Per that ruling,
+  # "unmeasured" on macOS means the code is written and should be right but
+  # is not fully validated there; it does not block. This job still builds
+  # and packages the macOS target, and this workflow does not claim macOS
+  # installer or binary behavior beyond a clean build/package having
+  # succeeded.
   package:
     needs:
       - gate-b-ci
@@ -236,6 +274,50 @@ jobs:
         with:
           name: dist-${{ matrix.target }}
           path: target/distrib/*
+          if-no-files-found: error
+
+  # ── Package: shell installer ────────────────────────────────────────────
+  # Proposal §12's remaining named artifact — the `curl ... | sh` installer.
+  # This is `dist`'s "global" artifact class (built once per app, not once
+  # per target), so it is its own job rather than another matrix leg of
+  # `package`. `dist build --artifacts=global` only needs the configured
+  # target list and a tag to render the installer's download URLs — it does
+  # not need that target's binary to already be built (verified locally
+  # against this exact `dist` version/config before landing this job: a
+  # global-artifacts build with no prior local build present still produces
+  # `sergeant-rs-installer.sh`). Runs after the same gates as `package`;
+  # this is packaging mechanics only, per the top-of-file note on dist's
+  # topology — it does not create or depend on the release tag existing in
+  # the repository, only on being told what tag string to embed.
+  package-installer:
+    needs:
+      - gate-b-ci
+      - gate-c-matrix
+      - gate-d-coverage
+      - gate-e-cargo-deny
+      - gate-f-distro-validator
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: install dist (pinned to workspace.metadata.dist's cargo-dist-version)
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+      - name: dist build --artifacts=global (shell installer only)
+        run: |
+          dist build --artifacts=global \
+            --target x86_64-unknown-linux-gnu \
+            --target aarch64-apple-darwin \
+            --tag "$RELEASE_TAG"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-installer
+          path: target/distrib/sergeant-rs-installer.sh
           if-no-files-found: error
 
   # ── Smoke test ──────────────────────────────────────────────────────────
@@ -322,6 +404,7 @@ jobs:
     needs:
       - smoke-test
       - sbom
+      - package-installer
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -330,6 +413,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # Pattern "dist-*" matches dist-x86_64-unknown-linux-gnu,
+      # dist-aarch64-apple-darwin, AND dist-installer — the shell installer
+      # lands in release-assets alongside the archives with no separate
+      # download step needed.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "dist-*"
@@ -351,7 +438,9 @@ jobs:
       - name: GitHub artifact attestations — build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          subject-path: "release-assets/*.tar.xz"
+          subject-path: |
+            release-assets/*.tar.xz
+            release-assets/sergeant-rs-installer.sh
 
       # One attest-sbom step per target: subject-path/sbom-path are 1:1 in
       # this action, so a single step spanning both tar.xz files would
@@ -381,6 +470,7 @@ jobs:
             sergeant-rs-aarch64-apple-darwin.tar.xz.sha256 \
             sgt_bin_x86_64-unknown-linux-gnu.cdx.json \
             sgt_bin_aarch64-apple-darwin.cdx.json \
+            sergeant-rs-installer.sh \
             SHA256SUMS.txt; do
             if [ ! -f "$f" ]; then
               echo "::error::release manifest missing expected asset $f" >&2
@@ -405,7 +495,10 @@ jobs:
             echo "not yet tracked by a dedicated open issue. See CHANGELOG.md and"
             echo "NORTH-STAR.md's \"Not true yet\" note."
             echo
-            echo "**Gate F (distro structural validator) did not run** — see issue #176."
+            echo "**Gate F (distro structural validator) did not run in this workflow.**"
+            echo "That property is proven continuously by sergeant-rs-workspace's own CI"
+            echo "(.github/workflows/validate.yml, PR ws#3) against this repo's main —"
+            echo "see issue #176."
           } > /tmp/release-notes.md
           gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
@@ -416,6 +509,7 @@ jobs:
             release-assets/*.tar.xz \
             release-assets/*.sha256 \
             release-assets/*.cdx.json \
+            release-assets/sergeant-rs-installer.sh \
             release-assets/SHA256SUMS.txt
 
   # ── Publish ─────────────────────────────────────────────────────────────
