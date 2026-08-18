@@ -88,3 +88,34 @@ jobs:
 
       - name: cargo check
         run: cargo check --all-targets
+
+  dependency-policy:
+    # proposal §5.2: routine PRs check bans/licenses/sources only. Advisories
+    # deliberately excluded here — a new RustSec advisory can land against an
+    # unchanged Cargo.lock and turn an unrelated documentation PR red
+    # overnight. Advisories are a release-time gate instead: release.yml's
+    # Gate E runs the full `cargo deny check`, including advisories.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check bans licenses sources
+
+  dependency-review:
+    # GitHub's own dependency-review action: diffs the PR's dependency
+    # manifests and can block a PR introducing a known-vulnerable
+    # dependency. It only understands pull_request events (it diffs base vs.
+    # head refs) — this workflow also runs on push to main and workflow_call,
+    # where there is no PR diff to review, so the job is scoped out there
+    # rather than running meaninglessly or failing for lack of a base ref.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
