@@ -1,0 +1,435 @@
+# The release workflow. Proposal §7-§13, re-scoped by ADR 0014 decision 2
+# (co-versioning) and decision 9 (this workflow composes ci.yml/matrix.yml/
+# coverage.yml rather than redefining their contracts).
+#
+# There is exactly one release authority: a human dispatching this workflow
+# from the Actions UI. No tag watcher, no push trigger, no cron — dry-run is
+# the default `mode` so an accidental "Run workflow" click cannot publish
+# anything.
+#
+# CO-VERSIONING CONSTRAINT (ADR 0014 decision 2, NORTH-STAR "Not true yet"
+# note): v0.x.y is supposed to name ONE artifact identity — the `sgt` binary
+# AND the embedded distro it writes via `sgt init`. That embedding does not
+# exist yet: `sgt init` today writes only `sergeant.toml`, `repos/`, and
+# `.gitignore`. This workflow therefore packages and ships the binary alone
+# and says so in the draft release body — it does NOT claim to ship an
+# embedded distro it cannot produce. NORTH-STAR's "Not true yet" note is the
+# standing record of this gap; nothing here weakens or removes it.
+#
+# Issue #165 (the originally-cited tracker for this) closed 2026-08-17 via
+# rung R2 — it made the gap visible (`sgt doctor` now reports a zero-package
+# estate) but explicitly rejected the full embedding fix as Phase 3's job
+# (reference/proposal-product-workspace-split.md). The embedding gap this
+# comment describes is therefore still real; #165 itself is just the wrong
+# citation for it now. There is no dedicated open issue for full distro
+# embedding yet — when Phase 3 lands (or a tracking issue is filed for it),
+# this workflow's packaging step and release-body template both need a
+# follow-up change to actually embed and describe the distro.
+#
+# GATE F (distro structural validator): see the "gate-f" job below. It is a
+# documented no-op, not a passing check — the validator lives in
+# sergeant-rs-workspace, which this workflow cannot reach. Gap filed as
+# issue #176.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >-
+          Version being released, e.g. 0.2.0. Must equal Cargo.toml's
+          package version at the released commit (Gate A) — this input is a
+          confirmation, not an instruction to bump anything.
+        required: true
+        type: string
+      mode:
+        description: Dry-run performs every gate and packaging step but never tags or publishes.
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - publish
+        default: dry-run
+
+# One release attempt in flight at a time — a second dispatch while one is
+# running is a mistake, not a legitimate concurrent release.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_TAG: v${{ inputs.version }}
+
+jobs:
+  # ── Gate A — repository state ──────────────────────────────────────────
+  # Proposal §9.1 / §8: confirm the exact revision and every version
+  # invariant before anything else runs. Failing here creates no tag and no
+  # release — this job does nothing but check facts.
+  gate-a-repo-state:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: running against main, HEAD is current main HEAD
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::release.yml must be dispatched against main, was dispatched against ${{ github.ref }}" >&2
+            exit 1
+          fi
+          remote_head=$(git rev-parse origin/main)
+          if [ "$GITHUB_SHA" != "$remote_head" ]; then
+            echo "::error::dispatched commit $GITHUB_SHA is not origin/main's HEAD ($remote_head) — main moved since dispatch" >&2
+            exit 1
+          fi
+
+      - name: requested version == Cargo.toml version
+        run: |
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$cargo_version" != "$RELEASE_VERSION" ]; then
+            echo "::error::input version $RELEASE_VERSION does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+      - name: v<version> tag does not already exist
+        run: |
+          if git rev-parse "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::error::tag $RELEASE_TAG already exists" >&2
+            exit 1
+          fi
+          if git ls-remote --tags origin "$RELEASE_TAG" | grep -q .; then
+            echo "::error::tag $RELEASE_TAG already exists on origin" >&2
+            exit 1
+          fi
+
+      - name: CHANGELOG contains the version
+        run: |
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::error::CHANGELOG.md does not exist" >&2
+            exit 1
+          fi
+          if ! grep -qF "$RELEASE_VERSION" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md does not mention $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+  # ── Gate B — reuse ci.yml's contract ───────────────────────────────────
+  # Proposal §9.2: release qualification never defines an alternate notion
+  # of "tests passed." This calls the exact same workflow every PR runs.
+  gate-b-ci:
+    needs: gate-a-repo-state
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  # ── Gate C — full measured-platform matrix ─────────────────────────────
+  # Proposal §9.3. matrix.yml already exposes workflow_call (Slice 3).
+  gate-c-matrix:
+    needs: gate-a-repo-state
+    uses: ./.github/workflows/matrix.yml
+    permissions:
+      contents: read
+
+  # ── Gate D — coverage ───────────────────────────────────────────────────
+  # Proposal §9.4. Same S-series convention and 90-line floor as every other
+  # coverage measurement — no second coverage number for releases.
+  gate-d-coverage:
+    needs: gate-a-repo-state
+    uses: ./.github/workflows/coverage.yml
+    permissions:
+      contents: read
+
+  # ── Gate E — strict dependency policy ──────────────────────────────────
+  # Proposal §5.2 / §9.5: routine PRs check bans/licenses/sources only;
+  # release qualification runs the FULL `cargo deny check`, advisories
+  # included, so a known RustSec advisory cannot silently enter a release.
+  gate-e-cargo-deny:
+    needs: gate-a-repo-state
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check (full — advisories, bans, licenses, sources)
+        run: cargo deny check
+
+  # ── Gate F — distro structural validator ───────────────────────────────
+  # NOT A REAL CHECK. See the top-of-file comment and issue #176. The
+  # validator this gate names lives in sergeant-rs-workspace's
+  # .sergeant/local/workflows/validate-distro/ by deliberate placement (ADR
+  # 0014 decision 5), and this repo's CI cannot reach that repo. Every
+  # individual rule the validator applies takes only a sergeant-rs checkout
+  # as input (verified 2026-08-17 reading validate.py), so vendoring is
+  # possible, but doing so now would duplicate a check Phase 5a already
+  # assigns one home to, and would run before Phase 2's template
+  # decontamination has landed — guaranteed loud failures, not a real
+  # signal. This job exists so a reader of the Actions run sees an explicit,
+  # named skip rather than a gate that is simply absent.
+  gate-f-distro-validator:
+    needs: gate-a-repo-state
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Gate F cannot run here — see issue #176
+        run: |
+          echo "::warning::Gate F (distro structural validator) is a documented no-op. It lives in sergeant-rs-workspace and cannot run from this repo's CI. Tracked as issue #176. This release proceeds WITHOUT that check having run."
+          {
+            echo '## Gate F — distro structural validator: SKIPPED'
+            echo 'Not run. Validator lives in `sergeant-rs-workspace`, unreachable from this workflow. See issue #176.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Package ─────────────────────────────────────────────────────────────
+  # Only after A-F. Measured 2026-08-17 (see PR description): `dist build`
+  # successfully builds sgt with bundled DuckDB and packages it, verified on
+  # a Linux x86_64 host in ~3m40s wall-clock for a cold build with a warm
+  # crates.io/git registry cache — GitHub's own cold-cache, 2-core runner
+  # numbers are UNVERIFIED from this environment (see the PR description's
+  # "could not verify" list). aarch64-apple-darwin is listed per ADR 0001's
+  # measured-target set but this workflow's macOS build step is UNVERIFIED
+  # end-to-end: no macOS runner was available to this session.
+  package:
+    needs:
+      - gate-b-ci
+      - gate-c-matrix
+      - gate-d-coverage
+      - gate-e-cargo-deny
+      - gate-f-distro-validator
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: install dist (pinned to workspace.metadata.dist's cargo-dist-version)
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+
+      - name: dist build (packages the binary + LICENSE/README + checksum)
+        run: dist build --artifacts=local --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: target/distrib/*
+          if-no-files-found: error
+
+  # ── Smoke test ──────────────────────────────────────────────────────────
+  # Proposal §13: extract into a clean environment (a fresh job, not the
+  # build tree) and verify the binary actually runs before trusting it.
+  smoke-test:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist-artifact
+
+      - name: extract into a clean directory and run sgt --version
+        run: |
+          set -eu
+          mkdir -p smoke
+          tar xf dist-artifact/sergeant-rs-${{ matrix.target }}.tar.xz -C smoke
+          bin=$(find smoke -name sgt -type f)
+          "$bin" --version
+          got=$("$bin" --version | awk '{print $2}')
+          if [ "$got" != "$RELEASE_VERSION" ]; then
+            echo "::error::smoke-tested binary reports version $got, expected $RELEASE_VERSION" >&2
+            exit 1
+          fi
+
+  # ── SBOM ────────────────────────────────────────────────────────────────
+  # One generator, target-scoped (proposal §22 unknown 5: "verify the
+  # emitted CycloneDX document correctly describes Sergeant's target-specific
+  # release before admitting it instead of layering a second generator").
+  # cargo-dist 0.32.0 has no built-in SBOM output (checked via `dist plan`);
+  # cargo-cyclonedx's `--describe binaries --target <triple>` produces a
+  # per-binary, per-target document — verified 2026-08-17: its
+  # metadata.component names the `sgt` binary specifically, not the whole
+  # workspace, for the built target.
+  sbom:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-cyclonedx
+      - name: generate target-scoped CycloneDX SBOM for the sgt binary
+        run: |
+          cargo cyclonedx --format json --describe binaries \
+            --target ${{ matrix.target }} --target-in-filename
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-${{ matrix.target }}
+          path: sgt_bin_${{ matrix.target }}.cdx.json
+          if-no-files-found: error
+
+  # ── Assemble draft, attest, verify manifest ────────────────────────────
+  # Section 6.2: this job gets contents: write only because it must create
+  # a draft release; it does not get any other job's authority. Attestation
+  # sub-steps get id-token/attestations write on top, nothing else.
+  draft-release:
+    needs:
+      - smoke-test
+      - sbom
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "dist-*"
+          path: release-assets
+          merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "sbom-*"
+          path: release-assets
+          merge-multiple: true
+
+      - name: SHA-256 manifest (reuses dist's per-archive .sha256 files — no second generator)
+        run: |
+          cd release-assets
+          cat *.sha256 > SHA256SUMS.txt
+          echo "manifest:" && cat SHA256SUMS.txt
+
+      - name: GitHub artifact attestations — build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: "release-assets/*.tar.xz"
+
+      # One attest-sbom step per target: subject-path/sbom-path are 1:1 in
+      # this action, so a single step spanning both tar.xz files would
+      # attest the aarch64 archive against the x86_64 SBOM — wrong evidence
+      # for that platform, and a direct contradiction of the SBOM job's own
+      # point (target-scoped documents, not one generator for everything).
+      - name: GitHub artifact attestations — SBOM (x86_64-unknown-linux-gnu)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: "release-assets/sergeant-rs-x86_64-unknown-linux-gnu.tar.xz"
+          sbom-path: "release-assets/sgt_bin_x86_64-unknown-linux-gnu.cdx.json"
+
+      - name: GitHub artifact attestations — SBOM (aarch64-apple-darwin)
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: "release-assets/sergeant-rs-aarch64-apple-darwin.tar.xz"
+          sbom-path: "release-assets/sgt_bin_aarch64-apple-darwin.cdx.json"
+
+      - name: verify release manifest — every promised asset is present
+        run: |
+          set -eu
+          cd release-assets
+          for f in \
+            sergeant-rs-x86_64-unknown-linux-gnu.tar.xz \
+            sergeant-rs-x86_64-unknown-linux-gnu.tar.xz.sha256 \
+            sergeant-rs-aarch64-apple-darwin.tar.xz \
+            sergeant-rs-aarch64-apple-darwin.tar.xz.sha256 \
+            sgt_bin_x86_64-unknown-linux-gnu.cdx.json \
+            sgt_bin_aarch64-apple-darwin.cdx.json \
+            SHA256SUMS.txt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::release manifest missing expected asset $f" >&2
+              exit 1
+            fi
+          done
+
+      - name: assemble DRAFT release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          notes_section=$(awk '/^## /{if (found) exit; if ($0 ~ /'"$RELEASE_VERSION"'/) found=1; next} found' CHANGELOG.md)
+          {
+            echo "$notes_section"
+            echo
+            echo "---"
+            echo
+            echo "**Co-versioning note:** this release ships the \`sgt\` binary only."
+            echo "v${RELEASE_VERSION} does NOT yet ship an embedded distro — that"
+            echo "is Phase 3 scope (reference/proposal-product-workspace-split.md),"
+            echo "not yet tracked by a dedicated open issue. See CHANGELOG.md and"
+            echo "NORTH-STAR.md's \"Not true yet\" note."
+            echo
+            echo "**Gate F (distro structural validator) did not run** — see issue #176."
+          } > /tmp/release-notes.md
+          gh release create "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "v${RELEASE_VERSION}" \
+            --notes-file /tmp/release-notes.md \
+            --draft \
+            release-assets/*.tar.xz \
+            release-assets/*.sha256 \
+            release-assets/*.cdx.json \
+            release-assets/SHA256SUMS.txt
+
+  # ── Publish ─────────────────────────────────────────────────────────────
+  # Only reached in `mode: publish`. dry-run stops at the draft above —
+  # a draft release is inspectable and deletable, never a durable public
+  # fact (proposal §13).
+  publish:
+    needs: draft-release
+    if: ${{ inputs.mode == 'publish' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: publish the draft (this is what makes the tag/assets durable)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false

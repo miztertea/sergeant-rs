@@ -66,3 +66,29 @@ debug = false
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
 tempfile = "3"
+
+# Packaging mechanics for release.yml (proposal §10: "`dist` may own packaging
+# mechanics. Sergeant owns release authority."). `ci = "github"` still selects
+# dist's GitHub-shaped artifact naming/manifest conventions, but this repo
+# does NOT run `dist generate` and does NOT adopt dist's own generated
+# workflow — that workflow triggers on `push: tags`, which conflicts with the
+# workflow_dispatch-only release authority this repo requires (ADR 0014
+# decision 9 / proposal §7). `allow-dirty = ["ci"]` is what lets `dist build`
+# run without a generated `.github/workflows/release.yml` present or in sync;
+# release.yml instead shells out to `dist build`/`dist host` as a build step,
+# nothing more. Targets are exactly ADR 0001 D1's measured set minus the
+# WSL2-under-Windows case dist has no native concept of (release ships a
+# Linux binary there, same as ADR 0001) — see release.yml's own comment for
+# the aarch64-apple-darwin verification gap this repo could not close from a
+# Linux-only CI environment.
+[workspace.metadata.dist]
+cargo-dist-version = "0.32.0"
+ci = "github"
+allow-dirty = ["ci"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+# dist's expected release-build profile name. Inherits release rather than
+# adding new optimization flags of its own (R1: no new tuning surface until
+# a measured need shows up).
+[profile.dist]
+inherits = "release"
