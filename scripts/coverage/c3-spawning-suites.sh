@@ -30,3 +30,19 @@ cov_stage_begin c3-m6_surfaces
 cov_run cargo llvm-cov --no-report --test m6_surfaces || cov_fail "m6_surfaces failed under instrumentation"
 cov_stage_end 2 "m6 spawns daemons (TUI, doctor) and runs scripts/demo.sh; more than the test \
 binary's own profile must arrive, or no subprocess flushed"
+
+# Added 2026-08-19 alongside C2's five, closing the same accounting gap: this
+# suite existed but no stage script invoked it, so backend/docker.rs's real
+# coverage never reached the report.
+#
+# Floor is 1, not 2, and deliberately so. m7 drives a real Docker Engine and
+# self-skips with SKIPPED-ENV where Docker is unreachable (docs/DEVELOPMENT.md's
+# two-environments rule). On such a host the suite legitimately spawns no
+# container and flushes only its own test-binary profile — a floor of 2 would
+# read that correct, documented skip as a broken instrument and fail the stage.
+# The trade is stated rather than hidden: on a Docker-capable host this stage
+# will not catch a subprocess that silently failed to flush.
+cov_stage_begin c3-m7_docker_executor
+cov_run cargo llvm-cov --no-report --test m7_docker_executor || cov_fail "m7_docker_executor failed under instrumentation"
+cov_stage_end 1 "the m7 test binary must write its own profile; container subprocesses are not \
+required because the suite self-skips where Docker is unreachable"
