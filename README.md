@@ -52,6 +52,55 @@ intent, and drives `sgt run` on your behalf — see [`AGENTS.md`](AGENTS.md)
 for exactly how it routes and the loop it follows, and the [workflow
 catalog](#workflows) below for what a workflow actually is.
 
+### Installing a released binary instead of building from source
+
+`dist` (cargo-dist) publishes a prebuilt `sgt` for each [release](https://github.com/miztertea/sergeant-rs/releases), plus a `curl | sh` convenience installer:
+
+```sh
+curl -fsSL https://github.com/miztertea/sergeant-rs/releases/download/v0.1.0/sergeant-rs-installer.sh | sh
+```
+
+**This one-liner does not verify anything.** It downloads the archive for
+your platform and installs it — it does not check a checksum, a signature,
+or an attestation. If you watch its output you'll see it say so plainly:
+`no checksums to verify`. That line isn't a warning about a missing file;
+`dist`'s generated installer declares the local variables it would use to
+verify a checksum but nothing in the script ever assigns them, so the
+verification branch is structurally unreachable — the installer always
+takes the "nothing to verify" path, for every release. Convenient, but it
+gives you no evidence the artifact you're running is the one this project
+published.
+
+If you want that evidence, verify by hand — it's a few extra commands, run
+once per release:
+
+```sh
+# 1. Download the archive for your platform, its checksum file, and the installer.
+mkdir -p /tmp/sgt-install && cd /tmp/sgt-install
+gh release download v0.1.0 --repo miztertea/sergeant-rs \
+  -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz' \
+  -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz.sha256'
+
+# 2. Check the archive's contents match what was published.
+sha256sum -c sergeant-rs-x86_64-unknown-linux-gnu.tar.xz.sha256
+
+# 3. Check the archive was actually built by this repo's release workflow,
+#    not just that some file with a matching hash was uploaded somewhere.
+gh attestation verify sergeant-rs-x86_64-unknown-linux-gnu.tar.xz --owner miztertea
+
+# 4. Only after both checks pass, extract and install by hand.
+tar xf sergeant-rs-x86_64-unknown-linux-gnu.tar.xz
+install -m 755 sergeant-rs-x86_64-unknown-linux-gnu/sgt ~/.local/bin/sgt
+sgt --version
+```
+
+Step 2 confirms the bytes weren't corrupted or swapped in transit; step 3
+confirms they came from a GitHub Actions run of *this* repository's
+`release.yml`, via Sigstore/GitHub's build-provenance attestation — the
+thing the convenience one-liner skips entirely. Swap the target triple
+(`aarch64-apple-darwin`) and `~/.local/bin` for your platform and preferred
+install location as needed.
+
 Want to see the whole loop first, with no tokens spent and no estate to
 set up? `scripts/demo.sh` builds the debug binary itself and drives it end
 to end in a throwaway repo — submit → worktree → stage runs and *stops to

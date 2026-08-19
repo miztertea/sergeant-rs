@@ -10,6 +10,25 @@ released before a release can proceed.
 
 ## [Unreleased]
 
+### Documentation
+
+- **Corrected: the shell installer does not verify downloads.** `dist`'s
+  generated `sergeant-rs-installer.sh` (published from v0.1.0 onward)
+  declares the local variables it would use to check a downloaded
+  archive's checksum but never assigns them anywhere in the script, so its
+  verification branch is structurally unreachable — every install via the
+  `curl | sh` convenience one-liner prints "no checksums to verify" and
+  installs unverified, confirmed by running the published v0.1.0 installer.
+  This was previously undocumented; README.md's "Installing a released
+  binary instead of building from source" section now states this plainly
+  and gives a manual, deliberate verification path instead: download the
+  archive and its `.sha256`, `sha256sum -c` it, then `gh attestation
+  verify` it against this repo's build-provenance attestation, then
+  extract and install by hand. `.github/workflows/release.yml`'s
+  `package-installer` job comment is corrected to match — it previously
+  read as though the shipped installer consumed the checksums `dist` also
+  generates; it does not.
+
 ## [0.1.0] - 2026-08-19
 
 First release. `sgt` is an AgentOS distro: instructions, skills, and

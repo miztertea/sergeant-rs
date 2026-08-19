@@ -304,6 +304,26 @@ jobs:
   # this is packaging mechanics only, per the top-of-file note on dist's
   # topology — it does not create or depend on the release tag existing in
   # the repository, only on being told what tag string to embed.
+  #
+  # This job produces the installer script and, separately, the per-archive
+  # `.sha256` files (via `dist build --artifacts=local` in `package`,
+  # above). Nothing wires the two together: the generated
+  # `sergeant-rs-installer.sh` declares the local variables it would use to
+  # verify a downloaded archive's checksum but never assigns them, so its
+  # verification branch is unreachable and every install via this script
+  # prints "no checksums to verify" and installs unverified — confirmed by
+  # running the installer against a published release
+  # (`docs/measure-dist-conditions-2026-08-18.md`'s own "no checksums to
+  # verify" observation, condition 3, generalizes past the ad hoc local-server
+  # setup that first surfaced it — see that file's 2026-08-19 amendment).
+  # The documented, deliberate verification path is manual: README.md's
+  # "Installing a released binary instead of building from source" section
+  # walks `sha256sum -c` against the `.sha256` this job's sibling produces,
+  # plus `gh attestation verify` against the build-provenance attestation
+  # `draft-release` (below) creates. This job does not attempt to fix that
+  # gap — patching or post-processing `dist`'s generated installer to wire
+  # in checksum verification is a larger change with its own supply-chain
+  # risk surface, and is the owner's call, not a packaging-job comment's.
   package-installer:
     needs:
       - gate-b-ci
