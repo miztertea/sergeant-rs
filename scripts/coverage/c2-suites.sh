@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# C2 — the four integration suites that spawn no daemon of their own.
+# C2 — the integration suites that spawn no daemon of their own.
 #
 #   scripts/coverage/c2-suites.sh
 #
@@ -32,3 +32,32 @@ cov_stage_end 1 "the m3 test binary must write its own profile"
 cov_stage_begin c2-m5_projections
 cov_run cargo llvm-cov --no-report --test m5_projections || cov_fail "m5_projections failed under instrumentation"
 cov_stage_end 1 "the m5 test binary must write its own profile"
+
+# Added 2026-08-19. These four suites existed in tests/ but were invoked by no
+# stage script, so their profiles never reached the report: the convention was
+# measuring 87.97% where a plain `cargo llvm-cov` (which runs every suite)
+# measured 91.09% on identical code. The gap was not missing tests — it was
+# missing accounting, concentrated on exactly the files these suites cover
+# (the estate CLI verbs, watch.rs, the harness passthrough, the T2/T3 routes).
+# m8 and m9 spawn a daemon in a minority of their cases and m10 execs rather
+# than spawning, so all four sit here rather than in C3, whose floor rule is
+# written for suites dominated by real `sgt` subprocesses.
+cov_stage_begin c2-m8_estate_cli
+cov_run cargo llvm-cov --no-report --test m8_estate_cli || cov_fail "m8_estate_cli failed under instrumentation"
+cov_stage_end 1 "the m8 test binary must write its own profile"
+
+cov_stage_begin c2-m9_watch
+cov_run cargo llvm-cov --no-report --test m9_watch || cov_fail "m9_watch failed under instrumentation"
+cov_stage_end 1 "the m9 test binary must write its own profile"
+
+cov_stage_begin c2-m10_harness
+cov_run cargo llvm-cov --no-report --test m10_harness || cov_fail "m10_harness failed under instrumentation"
+cov_stage_end 1 "the m10 test binary must write its own profile"
+
+cov_stage_begin c2-estate_routes
+cov_run cargo llvm-cov --no-report --test estate_routes || cov_fail "estate_routes failed under instrumentation"
+cov_stage_end 1 "the estate_routes test binary must write its own profile"
+
+cov_stage_begin c2-t2_workflow_catalog
+cov_run cargo llvm-cov --no-report --test t2_workflow_catalog || cov_fail "t2_workflow_catalog failed under instrumentation"
+cov_stage_end 1 "the t2_workflow_catalog test binary must write its own profile"
