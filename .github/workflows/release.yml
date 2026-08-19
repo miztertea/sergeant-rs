@@ -69,7 +69,13 @@ on:
         required: true
         type: string
       mode:
-        description: Dry-run performs every gate and packaging step but never tags or publishes.
+        description: >-
+          Dry-run performs every gate and packaging step, including
+          assembling a real draft GitHub Release with uploaded assets (this
+          is what proves packaging and the release manifest actually work)
+          — but deletes that draft before the job ends, on every path
+          including failure and cancellation. It never creates a git tag
+          and never publishes anything durable.
         required: true
         type: choice
         options:
@@ -409,6 +415,17 @@ jobs:
   # Section 6.2: this job gets contents: write only because it must create
   # a draft release; it does not get any other job's authority. Attestation
   # sub-steps get id-token/attestations write on top, nothing else.
+  #
+  # This job runs identically in both modes — proposal §13 lists "assemble
+  # draft release" and "verify the release manifest" as steps a dry run is
+  # supposed to prove, so dry-run does not skip them. What differs is the
+  # very last step: in dry-run it deletes the draft this job just created,
+  # with `if: always()` so the deletion runs whether the job succeeded,
+  # failed partway through, or was cancelled. The one gap that step cannot
+  # close: if the runner itself is killed before GitHub Actions gets a
+  # chance to execute an always() step (e.g. the whole runner disappears),
+  # nothing local can run cleanup — the draft would need removing by hand.
+  # That is a platform-level limit, not a gap in this design.
   draft-release:
     needs:
       - smoke-test
@@ -419,6 +436,8 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+    outputs:
+      release-id: ${{ steps.capture-release-id.outputs.release_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -521,10 +540,73 @@ jobs:
             release-assets/sergeant-rs-installer.sh \
             release-assets/SHA256SUMS.txt
 
+      # A tag is not a unique key for a draft — GitHub lets multiple drafts
+      # share one tag_name, which is exactly what let a stale dry-run draft
+      # get published instead of this run's draft (see git history on this
+      # step). From here on, every operation on the release this job just
+      # created — cleanup below, and the publish job in a later job —
+      # addresses it by database ID, captured once, right here, immediately
+      # after the create above returns. The draft-release job never runs
+      # concurrently with another release attempt (top-of-file `concurrency`
+      # group), so at this exact moment "the release with this tag_name" is
+      # unambiguous — this is the one and only place in the workflow where
+      # a tag-based lookup is still safe.
+      - name: capture release ID (by tag, for the last time in this workflow)
+        id: capture-release-id
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          release_id=$(gh api "repos/${{ github.repository }}/releases?per_page=100" \
+            --jq '[.[] | select(.tag_name == "'"$RELEASE_TAG"'")][0].id')
+          if [ -z "$release_id" ] || [ "$release_id" = "null" ]; then
+            echo "::error::could not find the release just created for tag $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_ID=$release_id" >> "$GITHUB_ENV"
+
+      # Dry-run only. Runs on every path — success, a failed step above, or
+      # the job being cancelled mid-run — because `if: always()` steps still
+      # execute after a cancellation signal (GitHub Actions runs them like a
+      # `finally` block, within the runner's cancellation grace period).
+      # Primary lookup is $RELEASE_ID from the capture step above; the
+      # fallback re-derives it by tag_name for the one case that step can't
+      # cover — the job was cancelled (or `gh release create` itself failed
+      # partway through an asset upload) before the capture step ever ran,
+      # leaving a partially-uploaded draft with no captured ID. The list
+      # endpoint (unlike `releases/tags/{tag}`) includes drafts, so this
+      # fallback finds it. If the runner is killed outright before any
+      # always() step can execute at all, no step here can run — that is a
+      # platform-level limit, not a gap in this cleanup.
+      - name: dry-run cleanup — delete the draft this run created
+        if: always() && inputs.mode == 'dry-run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          release_id="${RELEASE_ID:-}"
+          if [ -z "$release_id" ]; then
+            release_id=$(gh api "repos/${{ github.repository }}/releases?per_page=100" \
+              --jq '[.[] | select(.tag_name == "'"$RELEASE_TAG"'")][0].id // empty')
+          fi
+          if [ -n "$release_id" ] && [ "$release_id" != "null" ]; then
+            echo "::notice::dry-run cleanup: deleting draft release id $release_id (tag $RELEASE_TAG)"
+            gh api -X DELETE "repos/${{ github.repository }}/releases/$release_id"
+          else
+            echo "::notice::dry-run cleanup: no draft found for tag $RELEASE_TAG — nothing to remove"
+          fi
+
   # ── Publish ─────────────────────────────────────────────────────────────
-  # Only reached in `mode: publish`. dry-run stops at the draft above —
-  # a draft release is inspectable and deletable, never a durable public
-  # fact (proposal §13).
+  # Only reached in `mode: publish`. Publishes by release ID, not by tag —
+  # `draft-release` emits the ID of the exact draft it created as a job
+  # output, and this job edits that ID directly. A tag can name more than
+  # one draft (see the capture-release-id step in `draft-release`), so
+  # resolving by tag here would risk publishing whichever draft GitHub
+  # happens to return for that tag, not necessarily this run's — which is
+  # precisely how a stale dry-run draft got published instead of the
+  # qualified one. dry-run never reaches this job at all (the `if` below);
+  # its draft is created and deleted entirely inside `draft-release`.
   publish:
     needs: draft-release
     if: ${{ inputs.mode == 'publish' }}
@@ -532,7 +614,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: publish the draft (this is what makes the tag/assets durable)
+      - name: publish the release this run created, by ID (this is what makes the tag/assets durable)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --draft=false
+          RELEASE_ID: ${{ needs.draft-release.outputs.release-id }}
+        run: |
+          set -eu
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::draft-release did not emit a release-id output — refusing to guess which draft to publish" >&2
+            exit 1
+          fi
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -f draft=false
