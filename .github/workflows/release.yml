@@ -151,8 +151,17 @@ jobs:
   gate-b-ci:
     needs: gate-a-repo-state
     uses: ./.github/workflows/ci.yml
+    # ci.yml's dependency-review job declares `pull-requests: read`. A called
+    # workflow's GITHUB_TOKEN permissions can only stay the same or become
+    # MORE restrictive — a callee that tries to elevate past its caller is
+    # rejected at startup, before any job exists. Granting only
+    # `contents: read` here made the entire release run fail with
+    # `startup_failure` and zero jobs. A caller must grant the UNION of what
+    # every job in the called workflow declares, not what the gate itself
+    # appears to need.
     permissions:
       contents: read
+      pull-requests: read
 
   # ── Gate C — full measured-platform matrix ─────────────────────────────
   # Proposal §9.3. matrix.yml already exposes workflow_call (Slice 3).
