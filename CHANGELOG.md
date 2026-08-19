@@ -54,11 +54,12 @@ engine that runs those intents to completion in isolated worktrees.
   across `ci.yml`, `matrix.yml`, `coverage.yml`, and `release.yml` is
   pinned to a commit SHA, not a mutable tag; `cargo-deny` enforces
   bans/licenses/sources on every PR and the full advisory-inclusive check
-  at release time (Gate E); GitHub's `dependency-review-action` diffs
-  dependency manifests on every pull request; Dependabot runs weekly,
-  grouped updates for both Cargo and GitHub Actions dependencies; and
-  release artifacts ship with a CycloneDX SBOM per target plus GitHub
-  build-provenance and SBOM attestations.
+  at release time (Gate E); CodeQL default setup scans Rust and Actions
+  weekly; GitHub's `dependency-review-action` diffs dependency manifests
+  on every pull request; Dependabot runs weekly, grouped updates for both
+  Cargo and GitHub Actions dependencies; and release artifacts ship with a
+  CycloneDX SBOM per target plus GitHub build-provenance and SBOM
+  attestations.
 - **Packaging configuration** (`[workspace.metadata.dist]` and
   `[profile.dist]` in `Cargo.toml`): `dist` (cargo-dist 0.32.0) covers the
   two target triples ADR 0001 names as release targets,
