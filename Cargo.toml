@@ -87,6 +87,11 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 allow-dirty = ["ci"]
 targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+# proposal §12's "shell installer" artifact (`curl ... | sh`). Adopted here,
+# not merely built by hand, because condition 3 (measure-dist-conditions,
+# 2026-08-18) measured this exact generated installer's mechanics against a
+# real archive and found them correct.
+installers = ["shell"]
 
 # dist's expected release-build profile name. Inherits release rather than
 # adding new optimization flags of its own (R1: no new tuning surface until
