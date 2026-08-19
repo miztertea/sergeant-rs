@@ -24,7 +24,14 @@ that turns a general-purpose coding harness into an operator of your
 estate, carried by a durable intent-execution engine that runs those
 intents to completion in isolated worktrees.*
 
-**Not true yet, and marked as such (2026-08-17).** The embedding clause
+**Now true (2026-08-18), closing the note below.** `sgt init` embeds and
+writes the distro — `AGENTS.md`, `skills/`, `.sergeant/common/contexts/`,
+and `.sergeant/workflows/` (241 files, measured) — into a fresh estate,
+per-file idempotent so re-running `sgt init` stays a no-op (issue #165).
+The historical note this replaces is kept legible rather than deleted, per
+this document's own rule:
+
+*Not true yet, and marked as such (2026-08-17). The embedding clause
 above is the destination, not the current behavior: `sgt init` today
 writes `sergeant.toml`, `repos/`, and a `.gitignore`, and no workflow
 templates at all (issue #165; measured in
@@ -34,7 +41,12 @@ was written — as a present-tense assertion of behavior the binary does not
 have, which is exactly the instruction-fiction class this document's own
 amendments were correcting. A destination document is entitled to describe
 where it is going; it is not entitled to describe that as already working.
-This note stands until `sgt init` actually writes the distro.
+This note stands until `sgt init` actually writes the distro.*
+
+What is still not true: the `curl … | sh` installer step named in the
+finished-loop paragraph below is a separate, pre-existing release-pipeline
+concern (`release.yml`, Phase 6) this change does not touch or claim to
+close — only the embedding clause above is what this note is about.
 
 The finished loop: `curl … | sh` → `sgt init` → `sgt claude` → say *"let's
 work on the payment api"*, *"why is the ingress controller erroring?"*,
