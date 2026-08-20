@@ -59,18 +59,41 @@ PROBE_HOME_DIR="$(mktemp -d "${HOME%/}/.probe-env.XXXXXX" 2>/dev/null || true)"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Run a command with a wall-clock bound if `timeout` exists; otherwise print
-# an unmeasurable result rather than risk hanging. Callers that touch a
-# daemon or the network MUST go through this — never invoke unbounded.
+# Set when bounded() had to fall back to running a command with no wall
+# clock at all (neither timeout(1) nor gtimeout(1) on PATH). Read once,
+# after all probes have run, to add a single measured "Probe bounds" fact
+# row — never left as silent behavior a reader has to infer.
+#
+# bounded() is invoked from inside $(...) command substitutions throughout
+# this script, each of which forks a subshell — a plain variable assignment
+# there would not survive back to this scope. The flag is recorded as a
+# marker file under the (already trap-cleaned) scratch dir instead, and
+# folded into this variable once, after all probes have run.
+BOUNDED_UNENFORCED=0
+BOUNDED_UNENFORCED_MARKER="${PROBE_TMP_DIR:+$PROBE_TMP_DIR/.bounded_unenforced}"
+
+# Run a command with a wall-clock bound: prefer `timeout`, then `gtimeout`
+# (macOS/BSD hosts with coreutils installed via Homebrew), then fall back to
+# running the command unbounded rather than fabricate a result. The wrapped
+# command's real stdout and exit code always pass through — this must never
+# substitute a sentinel string for either, since callers parse stdout as the
+# probe's actual output. Callers that touch a daemon or the network MUST go
+# through this — never invoke unbounded directly.
 bounded() {
   local secs="$1"
   shift
   if have timeout; then
     timeout "$secs" "$@"
     return $?
+  elif have gtimeout; then
+    gtimeout "$secs" "$@"
+    return $?
   fi
-  echo "unmeasurable: no timeout(1) available to bound this probe"
-  return 111
+  if [ -n "$BOUNDED_UNENFORCED_MARKER" ]; then
+    : > "$BOUNDED_UNENFORCED_MARKER" 2>/dev/null || true
+  fi
+  "$@"
+  return $?
 }
 
 # Collapse embedded newlines to spaces. Safe to apply repeatedly (idempotent)
@@ -487,10 +510,15 @@ add_fact "rustc" "$(oneline "$(path_tool_fact rustc)")" "command -v rustc; rustc
 
 if have nproc; then
   cores="$(nproc 2>/dev/null)"
+  cores_evidence="nproc"
+elif have sysctl; then
+  cores="$(sysctl -n hw.ncpu 2>/dev/null)"
+  cores_evidence="sysctl -n hw.ncpu"
 else
-  cores="unmeasurable: nproc not present"
+  cores="unmeasurable: neither nproc nor sysctl present"
+  cores_evidence="nproc, sysctl -n hw.ncpu (both absent)"
 fi
-add_fact "Cores" "$cores" "nproc"
+add_fact "Cores" "$cores" "$cores_evidence"
 
 kernel="$(uname -r 2>/dev/null || echo unmeasurable)"
 add_fact "Kernel" "$kernel" "uname -r"
@@ -538,6 +566,15 @@ if [ "$uid_num" = "0" ]; then
   else
     add_note "uid 0 (root), claude CLI absent from PATH: cannot check the documented root skip-flag refusal on this host at all (imported claim from src/backend/claude.rs, unverifiable here without the CLI)."
   fi
+fi
+
+if [ -n "$BOUNDED_UNENFORCED_MARKER" ] && [ -e "$BOUNDED_UNENFORCED_MARKER" ]; then
+  BOUNDED_UNENFORCED=1
+fi
+if [ "$BOUNDED_UNENFORCED" -eq 1 ]; then
+  add_fact "Probe bounds" \
+    "unenforced: no timeout(1)/gtimeout(1) on PATH; bounded probes ran without a wall clock" \
+    "bounded()"
 fi
 
 # ---------------------------------------------------------------------------

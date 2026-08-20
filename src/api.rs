@@ -3179,8 +3179,14 @@ fn doctor_root(state: &ApiState) -> PathBuf {
 
 /// `GET /v1/doctor` (§16.3) — the same `doctor::Report::to_json()`
 /// `sgt doctor --json` already prints, computed exactly once here.
+///
+/// `xdg_outranked` is `false` here, not omitted: #80's provenance is a fact
+/// about *this process's* `cli::resolve_data_dir` call, computed by whatever
+/// CLI invocation resolved `state.data_dir` before spawning or attaching to
+/// this daemon — that resolution, and its winning rung, do not survive
+/// across the process boundary to this handler.
 async fn doctor_report(State(state): State<ApiState>) -> Response {
-    let report = doctor::run(&state.data_dir, &doctor_root(&state)).await;
+    let report = doctor::run(&state.data_dir, &doctor_root(&state), false).await;
     Json(report.to_json()).into_response()
 }
 
