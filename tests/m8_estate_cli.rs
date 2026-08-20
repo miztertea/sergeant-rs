@@ -1294,14 +1294,16 @@ fn manifest_data_dir_overrides_the_estate_local_default() {
     );
 }
 
-/// guard-map (ADR 0008(b), §8.7's open precedence question, resolved here):
-/// `SGT_DATA_DIR` still outranks a manifest-declared `data_dir` — the
-/// recommendation this Work is making, not an owner ruling (see the
-/// commit/PR summary for the argument and its counterargument). Pinned so a
-/// future change cannot silently flip which one wins without this test
-/// naming the flip. Mutation this kills: reordering `resolve_data_dir` so
-/// the estate walk (and the manifest `data_dir` it may carry) is consulted
-/// before `SGT_DATA_DIR`.
+/// guard-map (ADR 0008(b); precedence settled by owner ruling 2026-08-20 —
+/// backlog close-out kickoff, `docs/proposals/backlog-closeout-2026-08-20.md`
+/// rulings §8): `SGT_DATA_DIR` outranks a manifest-declared `data_dir`. The
+/// full ratified order is `--data-dir` > `SGT_DATA_DIR` > manifest
+/// `data_dir` — invocation-explicit beats declared, an owner ruling now, not
+/// the recommendation this test used to pin. Pinned so a future change
+/// cannot silently flip which one wins without this test naming the flip.
+/// Mutation this kills: reordering `resolve_data_dir` so the estate walk
+/// (and the manifest `data_dir` it may carry) is consulted before
+/// `SGT_DATA_DIR`.
 #[test]
 fn sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir() {
     let estate = tempfile::TempDir::new().expect("tempdir");
@@ -1326,6 +1328,114 @@ fn sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir() {
         std::fs::canonicalize(&reported).unwrap_or(reported),
         std::fs::canonicalize(&explicit_env).unwrap_or(explicit_env),
         "SGT_DATA_DIR must still win over a manifest-declared data_dir"
+    );
+}
+
+/// guard-map (ADR 0008(b); owner ruling 2026-08-20 rulings §8): `--data-dir`
+/// outranks a manifest-declared `data_dir` too — the flag rung above
+/// `SGT_DATA_DIR` in the ratified order, `--data-dir` > `SGT_DATA_DIR` >
+/// manifest `data_dir`. Sibling of
+/// `sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir` above,
+/// same `declare_manifest_data_dir` + canonicalize pattern. Mutation this
+/// kills: reordering `resolve_data_dir` so the estate walk (and the
+/// manifest `data_dir` it may carry) is consulted before the `--data-dir`
+/// flag.
+#[test]
+fn data_dir_flag_still_outranks_a_manifest_declared_data_dir() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+    declare_manifest_data_dir(estate.path(), "manifest-declared-data-dir");
+
+    let explicit_flag = estate.path().join("explicit-flag-dir");
+    let result = run(
+        estate.path(),
+        Some(&explicit_flag),
+        &[],
+        &["--json", "doctor"],
+    );
+    let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
+    assert_eq!(
+        std::fs::canonicalize(&reported).unwrap_or(reported),
+        std::fs::canonicalize(&explicit_flag).unwrap_or(explicit_flag),
+        "--data-dir must still win over a manifest-declared data_dir"
+    );
+}
+
+/// #80/ADR 0008: when `$XDG_DATA_HOME` is set but the estate rung already
+/// won (no `--data-dir`/`SGT_DATA_DIR`, no manifest `data_dir` — the
+/// estate-local default wins outright), `sgt --json doctor`'s `data_dir`
+/// row discloses it as a detail line on the still-`ok` check, never a warn
+/// and never a new row. With `$XDG_DATA_HOME` unset, the same row carries
+/// no such note. Built on raw `Command` rather than the shared `run()`
+/// helper so both cases control `$XDG_DATA_HOME` explicitly — `env_remove`
+/// for the unset case — instead of depending on whatever the host process
+/// happens to have set.
+#[test]
+fn doctor_data_dir_detail_discloses_an_outranked_xdg_data_home() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+
+    let xdg = estate.path().join("xdg-home");
+    std::fs::create_dir_all(&xdg).expect("xdg dir");
+
+    let data_dir_detail = |output: std::process::Output| -> String {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let report: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        let data_dir_row = report["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "data_dir")
+            .unwrap_or_else(|| panic!("doctor must carry a data_dir row: {report}"))
+            .clone();
+        assert_eq!(
+            data_dir_row["status"], "ok",
+            "the data_dir row must stay ok: {data_dir_row}"
+        );
+        data_dir_row["detail"].as_str().expect("detail").to_string()
+    };
+
+    let with_xdg = Command::new(SGT)
+        .current_dir(estate.path())
+        // An ambient SGT_DATA_DIR would win the Env rung and mask the
+        // Manifest/EstateDefault outcome this test pins.
+        .env_remove("SGT_DATA_DIR")
+        .env("XDG_DATA_HOME", &xdg)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("run sgt");
+    let with_xdg_detail = data_dir_detail(with_xdg);
+    assert!(
+        with_xdg_detail.contains(
+            "$XDG_DATA_HOME is set but outranked here — estate-first resolution, ADR 0008"
+        ),
+        "data_dir detail must disclose the outranked $XDG_DATA_HOME: {with_xdg_detail}"
+    );
+
+    let without_xdg = Command::new(SGT)
+        .current_dir(estate.path())
+        .env_remove("SGT_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
+        .args(["--json", "doctor"])
+        .output()
+        .expect("run sgt");
+    let without_xdg_detail = data_dir_detail(without_xdg);
+    assert!(
+        !without_xdg_detail.contains("outranked"),
+        "unset $XDG_DATA_HOME must not trigger the outranked disclosure: {without_xdg_detail}"
     );
 }
 

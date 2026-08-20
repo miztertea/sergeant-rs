@@ -433,3 +433,36 @@ fn the_proposals_canonical_manifest_example_parses_under_the_current_schema() {
     assert!(estate.groups.contains_key("payments"));
     assert_eq!(estate.profiles.len(), 1);
 }
+
+// --------------------------------------- 4. close-out completion boundary
+
+/// The `60-close-out` stage's Completion boundary section (#124) states the
+/// same terminality applies to any external pipeline run the stage drove:
+/// completion requires that run to reach a terminal disposition, or the
+/// handover log to explicitly record it was deliberately left open and why.
+/// Quoted verbatim so this test tracks the doctrine text, not a paraphrase
+/// of it.
+#[test]
+fn close_out_completion_boundary_covers_external_pipeline_runs() {
+    let context_md = std::fs::read_to_string(
+        repo_root().join(".sergeant/workflows/validate-and-ship/60-close-out/CONTEXT.md"),
+    )
+    .expect("read 60-close-out/CONTEXT.md");
+
+    let anchor = context_md
+        .find("### Completion boundary")
+        .expect("60-close-out/CONTEXT.md must still have a '### Completion boundary' section");
+    let section = &context_md[anchor..];
+
+    assert!(
+        section.contains(
+            "The same terminality binds any external pipeline run this stage drove: \
+             completion requires that run to have reached a terminal disposition, or \
+             the handover log to explicitly record that it was deliberately left open \
+             and why — an untracked open run is silence by another name."
+        ),
+        "60-close-out/CONTEXT.md's Completion boundary section no longer states the \
+         external-pipeline-run terminality clause (#124) — update this test and the \
+         doctrine text together"
+    );
+}
