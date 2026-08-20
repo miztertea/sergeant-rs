@@ -84,6 +84,75 @@ released before a release can proceed.
 
 ### Changed
 
+- **Every Work is now admitted against a complete Git preflight before it
+  exists (estate-root proposal §8).** Submitting used to read each mount's
+  HEAD with no judgment at all: a dirty mount, a detached HEAD, an
+  unresolvable commit, an existing `sergeant/<work-id>` ref, an occupied or
+  still-registered surface path, or a repository whose lock could not be
+  taken all became a durable Work record first and a problem afterwards.
+  Core now checks all eleven §8.1 facts for **every** selected repository
+  before `work.submitted` is journaled and before any Git mutation, and
+  refuses with a structured 422 when any of them is unresolved — so there
+  is nothing to clean up, in the journal or in your checkouts.
+
+  Each check has its own stable error code, the evidence observed, and a
+  named remedy: `git_preflight_mount_missing`, `_mount_aliased`,
+  `_top_level_mismatch`, `_linked_worktree_source`,
+  `_common_dir_unlockable`, `_detached_head`, `_unresolvable_head`,
+  `_dirty_mount`, `_work_branch_collision`, `_worktree_path_collision`,
+  `_incomplete_plan`. A refusal reports every unresolved finding across the
+  whole scope, so a multi-repository submission is fixed in one pass rather
+  than one submission per repository; when part of a scope cannot be
+  planned, the refusal says so explicitly and **no** repository is
+  materialized, including the ones that were fine.
+
+  The base a Work runs on is now an *admitted* fact: `base_branch` and
+  `base_sha` are what preflight judged, not what the mount happens to say
+  by the time `git worktree add` runs. Sergeant still performs no automatic
+  network or branch-changing Git command on any admission path — no fetch,
+  pull, push, rebase, switch, checkout or remote-default inference — which
+  is now asserted against a recording Git binary across a whole real
+  admission rather than only stated.
+
+  **Upgrade note:** a mount with uncommitted changes, or on a detached
+  HEAD, is refused where it previously ran. Commit or stash, check the
+  mount out onto the branch the Work should be based on, or use the new
+  bounded override below.
+
+- **`sgt run --override-git-preflight`** waives exactly two of those
+  cautions, and only because an exact commit can still be pinned in both
+  (§8.3):
+
+  - a **dirty** mount — the Work is based on the committed `HEAD`, the full
+    `git status --porcelain` output is journaled as evidence, and the
+    record states explicitly that the uncommitted changes are excluded from
+    the Work base (they stay in your mount, untouched);
+  - a **detached** mount — the exact `HEAD` is pinned and **no** named base
+    branch is recorded.
+
+  It never waives anything else: not an invalid estate, unresolved or
+  unknown scope, an unknown or aliased repository, an unresolvable top
+  level / common directory / commit, a lock conflict, an existing Work ref
+  or surface path, a failed surface construction, or a
+  backend/workflow/profile failure. An unresolvable `HEAD` says so
+  explicitly — the override is unavailable there because no exact base can
+  be pinned. Override may waive policy caution; it may not replace a
+  missing fact or overcome mechanical impossibility.
+
+  It is available **only** as a flag on `sgt run` (and the matching
+  `override_git_preflight` request field). There is no configuration key,
+  no `[estate]` key, no profile field and no run template that can set it:
+  the operator types it for that submission or it is not set. The
+  authorization and every waived finding are journaled with the Work.
+
+- **A repository binding records no base branch when there is none.**
+  `base_branch` on a `RepositoryBinding` (and on the `BindingSummary`
+  backends receive) is now nullable, and a detached admission records an
+  explicit `null` rather than the old `"(detached)"` sentinel — a value
+  that read like a branch name in the field every consumer branches on. A
+  binding journaled before this change replays exactly what it recorded,
+  sentinel included.
+
 - **An estate is now exactly the current directory (estate-root proposal
   §4).** Every estate-scoped command — `run`, `status`, `work *`,
   `respond`/`retry`/`extend`/`cancel`, `watch`, `analytics`, `tui`,
