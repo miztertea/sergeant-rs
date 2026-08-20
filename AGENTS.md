@@ -20,10 +20,14 @@
 
 Sergeant is an AgentOS distro: always-on doctrine, skills, and workflow
 templates embedded in the `sgt` binary and written to disk by `sgt init`.
-It is carried by `sgt`, a durable intent-execution engine that runs
-submitted intents to completion in isolated git worktrees. The full
-destination and the rulings behind it are `NORTH-STAR.md` — read it before
-changing anything here.
+It is carried by `sgt`, a durable intent-execution engine that gives
+every Work its own git worktree and a declared mutation surface —
+authorization, not a seal — and runs submitted intents to completion
+against it, journaling what it can prove happened outside that surface
+as dirty evidence at retirement rather than silently absorbing it
+(NORTH-STAR.md's amended destination text, #180). The full destination
+and the rulings behind it are `NORTH-STAR.md` — read it before changing
+anything here.
 
 Sergeant is designed for one developer per installation: adoption by a
 larger organization means each developer clones and installs
@@ -255,6 +259,13 @@ Before dispatching meaningful repository Work, Captain:
 
 Core repeats and enforces every mechanical Git check named above; this
 list is Captain's own discipline on top of it, not a substitute for it.
+
+A shared mount is accepted risk, not a gap: every Work targeting a given
+repository is cut from that repository's one mount, so a mount whose
+committed HEAD moves between one Work's admission and its retirement —
+Captain's own edit, another Work, or an unrelated process — is observed
+and reported (`EstateDriftObservation`), never fenced; nothing here
+prevents two Works from touching the same mount concurrently.
 
 A worker is told its exact selected paths, base, and assigned branch. It
 does not:

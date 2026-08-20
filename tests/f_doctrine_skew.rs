@@ -549,3 +549,61 @@ fn monitor_states_the_real_reconciliation_mechanism() {
         "80-monitor/CONTEXT.md still carries an 'Engine gap' note #167's closure removed"
     );
 }
+
+// --------------------------------------------------------- 6. #180 wording
+
+/// NORTH-STAR.md's live destination text states the ratified #180 contract
+/// — a declared mutation surface, observed and journaled, never an
+/// enforced one — and AGENTS.md's mirror sentence says the same thing.
+/// Quoted verbatim, same house pattern as above.
+#[test]
+fn north_star_states_the_ratified_mutation_surface_contract() {
+    let north_star =
+        std::fs::read_to_string(repo_root().join("NORTH-STAR.md")).expect("read NORTH-STAR.md");
+    let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
+    // Both files soft-wrap; collapse whitespace so a sentence spanning a
+    // line break still matches a `contains` check on its logical text
+    // rather than its accidental line layout (same trick
+    // `agents_md_session_start_matches_the_real_root_gate` uses above).
+    let north_star_flat = north_star.split_whitespace().collect::<Vec<_>>().join(" ");
+    let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        north_star_flat.contains(
+            "carried by a durable intent-execution engine that gives every Work its own \
+             worktree and a declared mutation surface — authorization, not a seal — runs \
+             intents to completion against it, and journals what core can prove happened \
+             outside that surface as dirty evidence at retirement rather than silently \
+             absorbing it."
+        ),
+        "NORTH-STAR.md's destination text no longer states the ratified #180 mutation-surface \
+         contract — update this test and the doctrine text together"
+    );
+
+    assert!(
+        agents_md_flat.contains(
+            "It is carried by `sgt`, a durable intent-execution engine that gives every Work \
+             its own git worktree and a declared mutation surface — authorization, not a \
+             seal — and runs submitted intents to completion against it, journaling what it \
+             can prove happened outside that surface as dirty evidence at retirement rather \
+             than silently absorbing it"
+        ),
+        "AGENTS.md's mirror sentence no longer states the same #180 contract — update this \
+         test and the doctrine text together"
+    );
+
+    // Factual-not-exhortative framing (MUTATION_SURFACE_HEADER's own rule,
+    // src/backend/claude.rs): the destination text must never claim the
+    // mutation surface itself is enforced.
+    for (name, text) in [
+        ("NORTH-STAR.md", &north_star_flat),
+        ("AGENTS.md", &agents_md_flat),
+    ] {
+        assert!(
+            !text.contains("enforces the mutation surface")
+                && !text.contains("enforced mutation surface")
+                && !text.contains("mutation surface is enforced"),
+            "{name} must state the mutation surface as declared and observed, never enforced"
+        );
+    }
+}

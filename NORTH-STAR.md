@@ -21,8 +21,11 @@ ruled false by decisions this repository has now taken.
 *Sergeant is an AgentOS distro — instructions, skills and workflow
 templates embedded in `sgt` and written to your estate by `sgt init` —
 that turns a general-purpose coding harness into an operator of your
-estate, carried by a durable intent-execution engine that runs those
-intents to completion in isolated worktrees.*
+estate, carried by a durable intent-execution engine that gives every
+Work its own worktree and a declared mutation surface — authorization,
+not a seal — runs intents to completion against it, and journals what
+core can prove happened outside that surface as dirty evidence at
+retirement rather than silently absorbing it.*
 
 **Now true (2026-08-18), closing the note below.** `sgt init` embeds and
 writes the distro — `AGENTS.md`, `skills/`, `.sergeant/common/contexts/`,
@@ -60,7 +63,7 @@ and you write your own locals.
 Acceptance: the stranger gets from `curl` to that finished change without
 reading this repository.
 
-Three amendments are folded into the text above:
+Four amendments are folded into the text above:
 
 1. **"A cloned directory of instructions, skills and conventions" is
    struck.** It is now false twice: the distro is embedded in the binary
@@ -77,6 +80,22 @@ Three amendments are folded into the text above:
 3. **Stranger-first framing.** The destination is stated from the
    Redditor's install line inward, rather than from this repository's
    structure outward.
+4. **"Isolated worktrees" is stated honestly (amended 2026-08-20, owner
+   ruling on issue #180 — `docs/proposals/backlog-closeout-2026-08-20.md`
+   kickoff ruling 5).** Each Work's worktree is a declared mutation
+   surface, not an enforced boundary: nothing here runs an OS sandbox or
+   blocks a write outside it. What core actually does is observe — at
+   retirement, per-binding integrity findings
+   (`runtime::integrity::IntegrityFinding`: an assigned worktree left
+   uncommitted, missing, on the wrong branch, detached, or answering from
+   the wrong common dir) and, for every bound mount, whether its
+   committed HEAD moved during the Work's window
+   (`EstateDriftObservation`, always unattributed — core cannot prove who
+   moved it) — and charge what it can prove as dirty evidence, never
+   silently absorbing it. A shared mount two Works touch at once is
+   accepted risk under this contract, named rather than implied away by
+   "isolated" alone; prevention or OS-level sandboxing remains a
+   non-goal.
 
 Original text, historical (adjudicated 2026-08-11):
 
