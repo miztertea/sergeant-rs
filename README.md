@@ -32,9 +32,12 @@ cargo install --path . --bin sgt   # first build compiles bundled DuckDB from sc
 
 That puts `sgt` on `$CARGO_HOME/bin` (usually `~/.cargo/bin`, already on
 `PATH` for most Rust installs). Sergeant is clone-is-distro: this checkout
-*is* the estate. `AGENTS.md`, `skills/`, and `.sergeant/workflows/` only
-exist here — stay in it rather than starting a bare directory elsewhere,
-which would leave a harness with nothing to read:
+*is* the estate — the exact directory `sergeant.toml` lives in once you
+`sgt init` it below. `AGENTS.md`, `skills/`, and `.sergeant/workflows/`
+only exist here — stay in it. Sergeant does not search parent directories
+for an estate and does not fall back to a plain Git checkout, so every
+estate-scoped command run from a bare directory elsewhere refuses outright
+rather than quietly finding nothing to read:
 
 ```sh
 sgt init                              # scaffold the estate: sergeant.toml [estate], repos/, .gitignore
@@ -136,16 +139,16 @@ flattened to plain text, not mockups; regenerate with `cargo test --lib --
 
 ## Using sgt day-to-day
 
-Every command below is copy-pasteable; every command takes `--json` for scripting and `--data-dir <dir>` to point at a non-default data directory. Default precedence: `--data-dir` → `$SGT_DATA_DIR` → this estate's own `.sergeant/data` (found by walking up from the current directory — this is the path `sgt init`'s `.gitignore` entry covers, and what keeps sergeant's state out of `~`) → `$XDG_DATA_HOME/sergeant` → `~/.local/share/sergeant`. One wrinkle: the very first `sgt init` in a fresh directory reports its health check against the pre-estate fallback (`$XDG_DATA_HOME`/`~/.local/share/sergeant`), since the estate doesn't exist yet at the instant that check runs — every command after that first one resolves to `<estate>/.sergeant/data` as expected.
+Every command below is copy-pasteable, run from the estate root; every command takes `--json` for scripting, `--data-dir <dir>` to point at a non-default data directory, and `-C <estate-root>` to name the estate explicitly instead of `cd`-ing there first. Default precedence: `--data-dir` → `$SGT_DATA_DIR` → this estate's own `.sergeant/data` (only when the current directory — or `-C`'s target — *is* the estate root exactly; sergeant never searches parent directories for one, this is the path `sgt init`'s `.gitignore` entry covers, and what keeps sergeant's state out of `~`) → `$XDG_DATA_HOME/sergeant` → `~/.local/share/sergeant`. One wrinkle: the very first `sgt init` in a fresh directory reports its health check against the pre-estate fallback (`$XDG_DATA_HOME`/`~/.local/share/sergeant`), since the estate doesn't exist yet at the instant that check runs — every command after that first one resolves to `<estate>/.sergeant/data` as expected.
 
-**Submit work**, from inside any git repository:
+**Submit work**, from the exact estate root — a multi-repository estate must name a scope explicitly (`--repo`/`--group`/`--all`); a one-repository estate infers its only repository:
 
 ```sh
 sgt run "add retry handling to the settlement worker"
 sgt run "add retry handling" --backend claude --workflow software-change --repo billing-service
 ```
 
-`run` takes an intent plus optional `--workflow <name>`, `--backend <claude|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), `--group <name>` (a declared estate group, expanded into the same repo selection), `--workspace <name>`, and `--turns <n>`/`--ceiling-secs <n>` (override this one work item's turn envelope instead of the daemon-wide default).
+`run` takes an intent plus optional `--workflow <name>`, `--backend <claude|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), `--group <name>` (a declared estate group, expanded into the same repo selection), `--all` (every declared repository, explicit and journaled), `--turns <n>`/`--ceiling-secs <n>` (override this one work item's turn envelope instead of the daemon-wide default), and `--override-git-preflight` (waives a dirty-or-detached mount for this one submission, never anything else — `sgt run --help` is the authority on the full current list).
 
 **Watch it** — CLI or TUI, same daemon state through the same API, pick whichever fits:
 
@@ -221,7 +224,7 @@ sgt analytics blocked_time_per_work  # answer one of them
 sgt doctor
 ```
 
-Checks git, the `claude` CLI (presence and version gate), whether the toolchain directories `sgt claude` (and its siblings) would add to `PATH` are already on it, the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, and disk pressure inside the data directory — in that order, so a fault is reported under the right name; an unwritable data directory makes Docker and disk pressure decline with a pointer back to the `data_dir` row instead of re-diagnosing the same fault under their own name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon, because it's diagnosing the installation, not priming it — it joins `status`, `work`, `analytics`, `watch`, `tui`, and `daemon stop` in never materializing a daemon just to observe it (only `run`/`respond`/`retry`/`extend`/`cancel` do that).
+Checks git, the `claude` CLI (presence and version gate), whether the toolchain directories `sgt claude` (and its siblings) would add to `PATH` are already on it, the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, whether the current directory is an exact estate root, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, the declared workflow catalog, a cheap Git-surface summary (active/retained worktrees and patches, retained bytes, journaled Work branches, terminal-dirty Works — from the journal and retained-artifact filesystem metadata only, never a per-branch `git` walk), and disk pressure inside the data directory — in that order, so a fault is reported under the right name; an unwritable data directory makes Docker and disk pressure decline with a pointer back to the `data_dir` row instead of re-diagnosing the same fault under their own name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon, because it's diagnosing the installation, not priming it — it joins `status`, `work`, `analytics`, `watch`, `tui`, and `daemon stop` in never materializing a daemon just to observe it (only `run`/`respond`/`retry`/`extend`/`cancel` do that).
 
 **Launch a harness bound to this estate:**
 
@@ -265,7 +268,7 @@ A workflow is a directory, not code: a `workflow.toml` naming ordered stages, an
 └── ...
 ```
 
-Route to it explicitly (`sgt run "..." --workflow <name>`), or leave `--workflow` off and `sgt` uses the workspace's own `software-change` workflow if the repo has one, falling back to the built-in default otherwise. Backends are selected per work item (`--backend claude|fake`) or by named routing profiles in `sergeant.toml`. A profile can also pin the permission mode Claude turns launch with (`permission_mode = "acceptEdits"` in the profile's `options` table, using the CLI's own `--permission-mode` vocabulary); with no mode set, `sgt` passes no permission flag at all — never a silent bypass — and `sgt doctor` reports each profile's effective mode.
+Route to it explicitly (`sgt run "..." --workflow <name>`), or leave `--workflow` off and `sgt` uses the estate's own `software-change` workflow if it has declared one under `.sergeant/workflows/`, falling back to the built-in default otherwise. Backends are selected per work item (`--backend claude|fake`) or by named routing profiles in `sergeant.toml`. A profile can also pin the permission mode Claude turns launch with (`permission_mode = "acceptEdits"` in the profile's `options` table, using the CLI's own `--permission-mode` vocabulary); with no mode set, `sgt` passes no permission flag at all — never a silent bypass — and `sgt doctor` reports each profile's effective mode.
 
 This repository dogfoods its own convention under `.sergeant/`: `.sergeant/index.md` catalogs every published workflow (23 at last count — code review, TDD, diagnosing a bug, resolving a merge conflict, breaking a plan into tickets, and more), and [`repo-to-icm`](.sergeant/workflows/repo-to-icm/) — a ten-stage workflow that converts a repository's scattered procedural knowledge (skills, agent instructions, scripts, docs) into reviewable draft workflow packages — is the worked example. Read its [`index.md`](.sergeant/workflows/repo-to-icm/index.md) and [`CONTEXT.md`](.sergeant/workflows/repo-to-icm/CONTEXT.md) for how a real multi-stage workflow is laid out, and see [`AGENTS.md`](AGENTS.md) for how an agent operating in this repo is expected to discover and route to one. Alongside it, `skills/<name>/SKILL.md` is the operator-skills layer — instructions the harness loads directly for judgment/dialogue work that never needs a dispatched Work item (`sergeant-help`, `grilling`, `grill-with-docs`, `estate-navigation`).
 

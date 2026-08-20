@@ -40,13 +40,27 @@ group", "set up this estate", "file a ticket for a missing prerequisite").
 
 ## Resolving estate context (the `sgt-context` equivalent)
 
-1. `sgt doctor` — install/estate health with named remedies for anything
+1. Confirm the exact estate root first: the one directory holding
+   `./sergeant.toml` with an `[estate]` table. Check that directory itself —
+   `ls ./sergeant.toml` — and never walk upward looking for one, because
+   `sgt` doesn't either: an estate-scoped command run anywhere else (a
+   parent, a `repos/<name>` mount, a Work surface) refuses before it
+   contacts the daemon, naming `cd <estate-root>`, `sgt -C <estate-root>
+   <command>`, or `sgt init`. `sgt -C <estate-root>` addresses an estate
+   without moving the session's working directory; it names an exact root
+   too, with no search of its own.
+2. `sgt doctor` — install/estate health with named remedies for anything
    fixable (git, the `claude` CLI and its version gate, Docker, the data
-   directory, the journal, the analytics projection, the daemon, each
-   profile's effective permission mode, and — inside an estate — the
-   manifest's own health and disk pressure).
-2. `sgt repo list` — every declared `[[repo]]`: name, origin, local path.
-3. `sgt group list` — every declared `[group.<name>]` and its members, if the
+   directory, the journal, the analytics projection, the daemon, whether the
+   current directory is an exact estate root, each profile's effective
+   permission mode, and — inside an estate — the manifest's own health, the
+   declared workflow catalog, a cheap Git-surface summary of active and
+   retained worktrees/patches and terminal-dirty Works, and disk pressure).
+   It is one of the four surfaces that work outside an estate at all
+   (`sgt --help`, `--version`, `sgt init`, `sgt doctor`), so it can also
+   answer "am I anywhere near an estate?" before anything else is tried.
+3. `sgt repo list` — every declared `[[repo]]`: name, origin, local path.
+4. `sgt group list` — every declared `[group.<name>]` and its members, if the
    task spans more than one repo.
 
 There is no harness-side instruction-layering step to perform yourself:

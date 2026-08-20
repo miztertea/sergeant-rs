@@ -144,3 +144,73 @@ set), `analytics`, and the TUI. Auto-spawn survives only on verbs that
 mutate durable state: `run`, `respond`, `retry`, `extend`, `cancel`, and
 `work reap --yes`. The principle behind the set, stated first in
 R-WATCH-3: "observation must not materialize the thing observed."
+
+Terms fixed by the estate-root Git work-surface contract
+(`docs/proposals/estate-root-git.md`, owner interview 2026-08-19, amended
+by the 2026-08-20 gauntlet evaluation recorded in
+`docs/proposals/estate-root-git-implementation-plan.md`; the manifest-
+authority half of the change is `docs/adr/0008-manifest-authority-over-
+storage-paths.md`'s "Amended by the estate-root integration" section).
+§14.7's seven terms — read the proposal for the full decision, this file
+for the vocabulary it fixed.
+
+**Estate.** Exactly the current directory containing `./sergeant.toml` —
+never an ancestor, never a plain Git checkout with no manifest
+(`domain::estate::Estate::admit`/`EstateRoot`). Every estate-scoped command
+resolves this once, before daemon contact, and refuses outright anywhere
+else (AGENTS.md's "Session start"); a daemon binds to exactly one estate
+root for its whole lifetime and a runtime descriptor from a different root
+cannot be reused. Supersedes the pre-estate-root Workspace vocabulary
+(§13.2): the domain rename is complete, but `Work::workspace` (never
+written since) still deserializes a pre-rename journal event under its
+original field name — see that field's own doc comment.
+
+**Repository Mount.** A declared repository's one estate-owned base
+checkout, always at `repos/<name>` and never anywhere else — no
+`[[repo]].path`, no symlink, no linked worktree, no other estate's clone
+accepted as a mount (`domain::estate::REPOS_DIR`, `Estate::declared_repos`).
+Workers never write here; it is the clean base every Work's surface is cut
+from, and it may advance on its own while Work runs against a surface
+still pinned to its admission SHA.
+
+**Work Scope.** The repositories one Work targets, as two facts kept
+distinct: the request (`domain::work::ScopeRequest` — `--repo`/`--group`/
+`--all`, exactly as the client asked) and its resolution against the bound
+estate's declared repositories and groups (`Work::repositories`), computed
+once at submit and never retroactively changed by a later manifest edit.
+Omission never means "every repository" — a multi-repository estate
+refuses an unscoped submission by name; a one-repository estate infers its
+only repository.
+
+**Repository Binding.** The per-repository record a materialized Work
+surface carries: source mount, base branch/SHA, worktree path, assigned
+branch, canonical top level and common directory, and the preflight
+evidence (waived findings included) that admitted it
+(`runtime::surface::RepositoryBinding`). This is the exact-fact layer
+`sgt work show`'s `surface`/`teardown` keys and the adapter's `StartRequest`
+are built from — never a live re-read of the mount.
+
+**Work Surface.** One Work's whole mutation boundary: one linked worktree
+per bound repository, all sharing one assigned branch, materialized once
+for the Work's entire lifetime and reused across every stage retry
+(`runtime::surface::WorkSurface`). Distinct from a Repository Mount
+(estate-owned, shared, never written by a worker) and from `repos/<name>`
+itself — a worker's own writes land only here, under the estate's
+configured surfaces directory (AGENTS.md's estate/Git model table).
+
+**Integrity Disposition.** The two-valued axis riding beside a terminal
+Work's state, orthogonal to it exactly the way ADR 0007(b)'s
+`reported_state` already is: `clean` when every binding retired with
+nothing core cannot account for, `dirty` when at least one §11.3 finding
+or unretirable binding exists (`runtime::integrity::IntegrityDisposition`).
+Never a state-machine value and never blocks a transition — a dirty
+`completed` still reads `completed_dirty` in `sgt work list`/`show` rather
+than as a plain success (C5's mandatory-rendering acceptance criterion).
+
+**Estate Drift.** A declared mount's committed HEAD observed to have moved
+between a Work's admission and its retirement — reported, never
+attributed to the Work, because a mount moving during the Work's window is
+not evidence the Work moved it (`runtime::integrity::EstateDriftObservation`,
+gauntlet finding C6). Bounded on purpose: declared mounts only, one
+`git rev-parse` each, observed at admission and retirement alone — no
+worktree walking, no unselected-repo status calls, no continuous polling.
