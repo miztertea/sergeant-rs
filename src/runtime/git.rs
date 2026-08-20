@@ -232,6 +232,45 @@ pub fn git_submodule_update(dir: &Path) -> Result<String, GitError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The remote name a declared `[[repo]] upstream` is written to (#112).
+///
+/// Forge-neutral by construction: the URL is opaque here and everywhere
+/// below, and nothing in this codebase asks a host what it thinks of it. The
+/// name is what makes `gh`, `glab`, `git push -u upstream`, and a human's
+/// muscle memory all resolve the same way inside a mount.
+pub const UPSTREAM_REMOTE: &str = "upstream";
+
+/// `git remote get-url <name>`, or `None` when the remote is not configured.
+///
+/// A read, so it is safe anywhere config reading is — which is *not* the Work
+/// admission path: `tests/e_admission_uses_no_network_git.rs` forbids the
+/// `remote` verb there outright, read or write (§6.4: sergeant never infers a
+/// remote default for a Work). Callers are `sgt repo add` and `sgt doctor`,
+/// both operator-invoked and neither on that path.
+pub fn git_remote_url(dir: &Path, name: &str) -> Option<String> {
+    git(dir, &["remote", "get-url", name])
+        .ok()
+        .filter(|url| !url.is_empty())
+}
+
+/// `git remote add <name> <url>` — a repository-local config write, no
+/// network contact of any kind.
+///
+/// `--` for the same reason [`git_clone`] uses it: the URL is human-supplied
+/// (`sgt repo add --upstream <url>`) and one starting with `-` would
+/// otherwise be read as a flag. Nothing validates the URL's *shape* — #112 is
+/// forge-neutral, so an ssh alias, a `file:` path and a hosted HTTPS URL are
+/// all equally legitimate here.
+pub fn git_remote_add(dir: &Path, name: &str, url: &str) -> Result<String, GitError> {
+    git(dir, &["remote", "add", "--", name, url])
+}
+
+/// `git remote set-url <name> <url>` — [`git_remote_add`] for a remote that
+/// already exists, with the identical `--` guard.
+pub fn git_remote_set_url(dir: &Path, name: &str, url: &str) -> Result<String, GitError> {
+    git(dir, &["remote", "set-url", "--", name, url])
+}
+
 /// One hermetic Git invocation: no pager, no prompts, no editor, stdin closed.
 fn command(dir: &Path, args: &[&str]) -> Command {
     let git_bin = std::env::var(GIT_BIN_ENV).unwrap_or_else(|_| "git".to_string());

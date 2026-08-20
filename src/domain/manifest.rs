@@ -51,7 +51,9 @@ use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use crate::domain::estate::{Estate, EstateError, InstructionPolicy, MANIFEST_FILE, mount_path};
 use crate::domain::is_plain_name;
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic};
-use crate::runtime::git::{git_clone, git_succeeds};
+use crate::runtime::git::{
+    UPSTREAM_REMOTE, git_clone, git_remote_add, git_remote_set_url, git_remote_url, git_succeeds,
+};
 
 /// The `.gitignore` entries `sgt init` maintains (task's own naming): the
 /// estate-local data dir, the populated repository mounts, the manifest
@@ -206,6 +208,21 @@ pub enum ManifestError {
     #[error("cloning {origin:?} into {path} failed: {detail}")]
     CloneFailed {
         origin: String,
+        path: String,
+        detail: String,
+    },
+    /// `sgt repo add --upstream <url>` recorded the declaration but git
+    /// refused to configure the remote (#112). The manifest edit is refused
+    /// with it rather than committed half-done: the declaration and the
+    /// remote it materializes are one operator action.
+    #[error(
+        "recording {upstream:?} as {name}'s upstream remote failed in {path}: {detail}; fix the \
+         checkout (or set it by hand — `git -C {path} remote add upstream {upstream}`), then \
+         retry"
+    )]
+    UpstreamRemoteFailed {
+        name: String,
+        upstream: String,
         path: String,
         detail: String,
     },
@@ -462,20 +479,29 @@ fn ensure_gitignore(root: &Path) -> Result<bool, ManifestError> {
     Ok(true)
 }
 
-/// `sgt repo add <name> [--origin <url>] [--instructions local|suppress]`:
-/// populate-or-verify (design capture: "canonical clone locations are not
-/// sergeant's business; an existing entry need only be a git repo"), then
-/// declare `[[repo]]`.
+/// `sgt repo add <name> [--origin <url>] [--upstream <url>]
+/// [--instructions local|suppress]`: populate-or-verify (design capture:
+/// "canonical clone locations are not sergeant's business; an existing entry
+/// need only be a git repo"), then declare `[[repo]]`.
 ///
 /// - `origin` given, `repos/<name>` absent: `git clone <origin> repos/<name>`.
 /// - `origin` given, `repos/<name>` present: verified as a git repo (its
 ///   remote is *not* checked against `origin` — that check belongs to git,
 ///   not to sgt, per the design capture).
 /// - `origin` absent: `repos/<name>` must already exist and be a git repo.
+///
+/// `upstream` (#112) is declared in the manifest and ensured as the mount's
+/// `upstream` remote either way — a `git remote add|set-url`, run here
+/// because *this* is the moment an operator explicitly asked sergeant to
+/// configure a mount. The Work admission path never does (§6.4, pinned by
+/// `tests/e_admission_uses_no_network_git.rs`, which forbids the `remote`
+/// verb there outright); drift on a mount nothing asked about is `sgt
+/// doctor`'s to name, not this module's to silently correct.
 pub fn add_repo(
     estate_root: &Path,
     name: &str,
     origin: Option<&str>,
+    upstream: Option<&str>,
     instructions: Option<InstructionPolicy>,
 ) -> Result<(), ManifestError> {
     if !is_plain_name(name) {
@@ -498,7 +524,7 @@ pub fn add_repo(
     // one function, `estate::mount_path`, so the writer and the reader
     // can never disagree about where a repository lives.
     let repo_path = mount_path(estate_root, name);
-    populate_or_verify(name, &repo_path, origin)?;
+    populate_or_verify(name, &repo_path, origin, upstream)?;
 
     // §6.1: no `path` key. The entry declares a name; the mount follows from
     // it.
@@ -510,17 +536,22 @@ pub fn add_repo(
     if let Some(origin) = origin {
         table.insert("origin", value(origin));
     }
+    if let Some(upstream) = upstream {
+        table.insert("upstream", value(upstream));
+    }
     repo_array_mut(&mut doc, &manifest_path)?.push(table);
 
     validate(estate_root, &doc)?;
     commit(estate_root, &doc)
 }
 
-/// Clone or verify `repo_path` per [`add_repo`]'s own rule.
+/// Clone or verify `repo_path` per [`add_repo`]'s own rule, then ensure the
+/// declared `upstream` remote on whichever checkout that left behind.
 fn populate_or_verify(
     name: &str,
     repo_path: &Path,
     origin: Option<&str>,
+    upstream: Option<&str>,
 ) -> Result<(), ManifestError> {
     if repo_path.exists() {
         if !git_succeeds(repo_path, &["rev-parse", "--show-toplevel"]) {
@@ -529,7 +560,7 @@ fn populate_or_verify(
                 path: repo_path.display().to_string(),
             });
         }
-        return Ok(());
+        return ensure_upstream_remote(name, repo_path, upstream);
     }
     let Some(origin) = origin else {
         return Err(ManifestError::NoPathAndNoOrigin {
@@ -551,13 +582,47 @@ fn populate_or_verify(
             detail: "destination path is not valid UTF-8".to_string(),
         })?;
     match git_clone(repo_path.parent().unwrap_or(repo_path), origin, dest_path) {
-        Ok(_) => Ok(()),
+        Ok(_) => ensure_upstream_remote(name, repo_path, upstream),
         Err(e) => Err(ManifestError::CloneFailed {
             origin: origin.to_string(),
             path: repo_path.display().to_string(),
             detail: e.to_string(),
         }),
     }
+}
+
+/// Make the mount's `upstream` remote say exactly what the manifest declares
+/// (#112) — `remote add` when there is none, `remote set-url` when there is.
+///
+/// A no-op when nothing is declared: this never *removes* a remote an
+/// operator configured themselves, and it never touches `origin`. The URL is
+/// opaque — no forge, host or CLI is inferred from it, here or anywhere else
+/// — and no network contact happens: `git remote add`/`set-url` are
+/// repository-local config writes.
+fn ensure_upstream_remote(
+    name: &str,
+    repo_path: &Path,
+    upstream: Option<&str>,
+) -> Result<(), ManifestError> {
+    let Some(upstream) = upstream else {
+        return Ok(());
+    };
+    let existing = git_remote_url(repo_path, UPSTREAM_REMOTE);
+    if existing.as_deref() == Some(upstream) {
+        return Ok(());
+    }
+    let outcome = match existing {
+        Some(_) => git_remote_set_url(repo_path, UPSTREAM_REMOTE, upstream),
+        None => git_remote_add(repo_path, UPSTREAM_REMOTE, upstream),
+    };
+    outcome
+        .map(|_| ())
+        .map_err(|e| ManifestError::UpstreamRemoteFailed {
+            name: name.to_string(),
+            upstream: upstream.to_string(),
+            path: repo_path.display().to_string(),
+            detail: e.to_string(),
+        })
 }
 
 /// `sgt repo remove <name>`: refuses (naming the group and the remedy) while
@@ -964,7 +1029,7 @@ mod tests {
         let root = dir.path();
         init_estate(root, Some("e")).expect("init");
 
-        let err = add_repo(root, "ghost", None, None).expect_err("no dir, no origin");
+        let err = add_repo(root, "ghost", None, None, None).expect_err("no dir, no origin");
         assert!(
             matches!(err, ManifestError::NoPathAndNoOrigin { .. }),
             "got {err}"
@@ -972,9 +1037,10 @@ mod tests {
 
         let existing = root.join("repos").join("api");
         init_repo(&existing);
-        add_repo(root, "api", None, None).expect("verify an existing git repo, no origin needed");
+        add_repo(root, "api", None, None, None)
+            .expect("verify an existing git repo, no origin needed");
 
-        let err = add_repo(root, "api", None, None).expect_err("already declared");
+        let err = add_repo(root, "api", None, None, None).expect_err("already declared");
         assert!(
             matches!(err, ManifestError::RepoAlreadyDeclared { .. }),
             "got {err}"
@@ -1001,6 +1067,7 @@ mod tests {
             &root,
             "api",
             Some(upstream.to_str().expect("utf8")),
+            None,
             Some(InstructionPolicy::Local),
         )
         .expect("clone from origin");
@@ -1014,6 +1081,92 @@ mod tests {
             Some(upstream.to_str().expect("utf8"))
         );
         assert_eq!(estate.instruction_policy("api"), InstructionPolicy::Local);
+    }
+
+    /// #112: `--upstream` is recorded on the `[[repo]]` entry *and*
+    /// materialized as the fresh clone's `upstream` remote — the clone is
+    /// sergeant-created, so configuring it here is a config write on
+    /// sergeant's own artifact, not on the operator's checkout.
+    ///
+    /// guard-map: dropping either half fails. Mutation this kills: writing
+    /// the manifest key without the remote (an operator whose `gh`/`git push
+    /// -u upstream` still does not resolve, with the manifest claiming
+    /// otherwise), or setting the remote without recording the declaration
+    /// (nothing left for `sgt doctor` to check drift against).
+    #[test]
+    fn add_repo_records_upstream_and_configures_the_remote_on_a_fresh_clone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("estate");
+        std::fs::create_dir_all(&root).expect("estate dir");
+        init_estate(&root, Some("e")).expect("init");
+
+        let source = dir.path().join("source");
+        init_repo(&source);
+        // Opaque and forge-neutral: nothing parses this, and it is
+        // deliberately not the origin.
+        let declared = "ssh://git@example.invalid:2222/team/api.git";
+
+        add_repo(
+            &root,
+            "api",
+            Some(source.to_str().expect("utf8")),
+            Some(declared),
+            None,
+        )
+        .expect("clone with an upstream");
+
+        let estate = Estate::from_config(&root.join(MANIFEST_FILE)).expect("parses");
+        assert_eq!(estate.repository_upstream("api"), Some(declared));
+        assert_eq!(
+            git_remote_url(&root.join("repos").join("api"), UPSTREAM_REMOTE).as_deref(),
+            Some(declared),
+            "the declaration must be materialized as the mount's own remote"
+        );
+    }
+
+    /// #112 on the populate-or-verify *verify* arm: an existing mount is an
+    /// explicit operator-invoked config mutation too, and a re-declaration
+    /// with a different URL moves the remote rather than leaving the manifest
+    /// and the checkout disagreeing.
+    ///
+    /// guard-map: an implementation that only ever `remote add`s fails on the
+    /// second call (git refuses a remote that already exists), and one that
+    /// skips the verify arm entirely fails on the first.
+    #[test]
+    fn add_repo_ensures_the_upstream_remote_on_an_existing_mount() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("estate");
+        std::fs::create_dir_all(&root).expect("estate dir");
+        init_estate(&root, Some("e")).expect("init");
+        let mount = root.join("repos").join("api");
+        init_repo(&mount);
+
+        let first = "ssh://git@example.invalid/team/api.git";
+        add_repo(&root, "api", None, Some(first), None).expect("declare with an upstream");
+        assert_eq!(
+            git_remote_url(&mount, UPSTREAM_REMOTE).as_deref(),
+            Some(first)
+        );
+
+        // Re-declaring with a different URL: the remote follows the
+        // manifest, which is the authority.
+        remove_repo(&root, "api").expect("undeclare");
+        let moved = "https://example.invalid/team/api.git";
+        add_repo(&root, "api", None, Some(moved), None).expect("re-declare, moved upstream");
+        assert_eq!(
+            git_remote_url(&mount, UPSTREAM_REMOTE).as_deref(),
+            Some(moved),
+            "a declared upstream that changed must move the remote, not be silently ignored"
+        );
+
+        // A declaration with no upstream never removes what is there: this
+        // verb only ever moves a remote toward what the manifest declares.
+        remove_repo(&root, "api").expect("undeclare again");
+        add_repo(&root, "api", None, None, None).expect("re-declare with no upstream");
+        assert_eq!(
+            git_remote_url(&mount, UPSTREAM_REMOTE).as_deref(),
+            Some(moved)
+        );
     }
 
     /// `sgt repo add --origin <url>` passes a human-supplied string straight
@@ -1038,7 +1191,8 @@ mod tests {
         let sentinel = dir.path().join("pwned");
         let origin = format!("ext::sh -c \"touch {}\"", sentinel.display());
 
-        let err = add_repo(&root, "api", Some(&origin), None).expect_err("ext:: must not clone");
+        let err =
+            add_repo(&root, "api", Some(&origin), None, None).expect_err("ext:: must not clone");
         assert!(
             matches!(err, ManifestError::CloneFailed { .. }),
             "expected a CloneFailed refusal, got: {err:?}"
@@ -1067,7 +1221,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("estate dir");
         init_estate(&root, Some("e")).expect("init");
 
-        let err = add_repo(&root, "api", Some("--upload-pack=x"), None)
+        let err = add_repo(&root, "api", Some("--upload-pack=x"), None, None)
             .expect_err("a dash-prefixed origin must not clone");
         let ManifestError::CloneFailed { detail, .. } = err else {
             panic!("expected a CloneFailed refusal, got: {err:?}");
@@ -1092,8 +1246,8 @@ mod tests {
         let b = root.join("repos").join("b");
         init_repo(&a);
         init_repo(&b);
-        add_repo(root, "a", None, None).expect("add a");
-        add_repo(root, "b", None, None).expect("add b");
+        add_repo(root, "a", None, None, None).expect("add a");
+        add_repo(root, "b", None, None, None).expect("add b");
         add_group(root, "pair", &["a".to_string(), "b".to_string()], None).expect("add group");
 
         let err = remove_repo(root, "a").expect_err("still a group member");
@@ -1132,7 +1286,7 @@ mod tests {
         init_estate(root, Some("e")).expect("init");
         let a = root.join("repos").join("a");
         init_repo(&a);
-        add_repo(root, "a", None, None).expect("add a");
+        add_repo(root, "a", None, None, None).expect("add a");
 
         let err = add_group(root, "pair", &["a".to_string(), "ghost".to_string()], None)
             .expect_err("ghost is not declared");
@@ -1162,7 +1316,7 @@ mod tests {
         init_estate(root, Some("e")).expect("init");
         for name in ["a", "b", "c"] {
             init_repo(&root.join("repos").join(name));
-            add_repo(root, name, None, None).expect("add");
+            add_repo(root, name, None, None, None).expect("add");
         }
 
         add_group(root, "trio", &["a".to_string()], Some("first")).expect("create group");
@@ -1194,7 +1348,7 @@ mod tests {
         init_estate(root, Some("e")).expect("init");
         for name in ["a", "b"] {
             init_repo(&root.join("repos").join(name));
-            add_repo(root, name, None, None).expect("add");
+            add_repo(root, name, None, None, None).expect("add");
         }
         add_group(root, "pair", &["a".to_string(), "b".to_string()], None).expect("add group");
 
@@ -1253,7 +1407,7 @@ mod tests {
         init_repo(&root.join("repos").join("a"));
         std::fs::write(&manifest_path, "[estate]\nname = \"e\"\n\n[repo]\nx = 1\n")
             .expect("hand-write malformed repo section");
-        let err = add_repo(root, "a", None, None).expect_err("malformed [repo]");
+        let err = add_repo(root, "a", None, None, None).expect_err("malformed [repo]");
         assert!(
             matches!(err, ManifestError::MalformedSection { .. }),
             "got {err}"
@@ -1293,8 +1447,8 @@ mod tests {
         }
 
         let root_a = root.clone();
-        let handle = std::thread::spawn(move || add_repo(&root_a, "a", None, None));
-        let result_b = add_repo(&root, "b", None, None);
+        let handle = std::thread::spawn(move || add_repo(&root_a, "a", None, None, None));
+        let result_b = add_repo(&root, "b", None, None, None);
         let result_a = handle.join().expect("thread");
 
         result_a.expect("a added");
@@ -1330,8 +1484,8 @@ mod tests {
         for name in ["a", "b"] {
             init_repo(&root.join("repos").join(name));
         }
-        add_repo(root, "a", None, None).expect("declare a");
-        add_repo(root, "b", None, None).expect("declare b");
+        add_repo(root, "a", None, None, None).expect("declare a");
+        add_repo(root, "b", None, None, None).expect("declare b");
 
         // Simulate the clone-is-distro shape: `a`'s working copy is gone,
         // but it is still declared.
@@ -1339,7 +1493,7 @@ mod tests {
 
         // `add_repo` for an unrelated new repo `c` must still succeed.
         init_repo(&root.join("repos").join("c"));
-        add_repo(root, "c", None, None)
+        add_repo(root, "c", None, None, None)
             .expect("add_repo must not require every OTHER declared repo to resolve on disk");
 
         // `add_group`/`remove_group` naming only `b`/`c` must still succeed.

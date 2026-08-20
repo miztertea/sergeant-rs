@@ -336,6 +336,14 @@ enum RepoCommand {
         /// Clone source. Required unless `repos/<name>` already exists.
         #[arg(long)]
         origin: Option<String>,
+        /// Forge-neutral upstream URL (#112): recorded on the `[[repo]]`
+        /// entry and configured as the mount's `upstream` remote, so `gh`,
+        /// `glab` and `git` all resolve it inside any surface cut from this
+        /// repository. The URL is opaque — no host or forge is inferred
+        /// from it. `sgt doctor` names the drift if a mount's remote later
+        /// stops matching what the manifest declares.
+        #[arg(long)]
+        upstream: Option<String>,
         /// R-MVP1-4 instruction policy: `local` or `suppress` (default:
         /// unset, which resolves to `suppress`).
         #[arg(long)]
@@ -1303,6 +1311,7 @@ async fn repo_command(
         RepoCommand::Add {
             name,
             origin,
+            upstream,
             instructions,
         } => {
             let policy = match instructions.as_deref() {
@@ -1315,7 +1324,13 @@ async fn repo_command(
                     )));
                 }
             };
-            crate::domain::manifest::add_repo(estate_root, &name, origin.as_deref(), policy)?;
+            crate::domain::manifest::add_repo(
+                estate_root,
+                &name,
+                origin.as_deref(),
+                upstream.as_deref(),
+                policy,
+            )?;
             if json {
                 print_json(&json!({"added": name}));
             } else {
@@ -1346,6 +1361,7 @@ async fn repo_command(
                         "path": r.path,
                         "instructions": estate.instruction_policy(&r.name).as_str(),
                         "origin": estate.repository_origin(&r.name),
+                        "upstream": estate.repository_upstream(&r.name),
                     })).collect::<Vec<_>>(),
                 }));
             } else if estate.repositories.is_empty() {
@@ -1353,11 +1369,12 @@ async fn repo_command(
             } else {
                 for r in &estate.repositories {
                     println!(
-                        "{}  {}  instructions={}  origin={}",
+                        "{}  {}  instructions={}  origin={}  upstream={}",
                         r.name,
                         r.path.display(),
                         estate.instruction_policy(&r.name),
                         estate.repository_origin(&r.name).unwrap_or("-"),
+                        estate.repository_upstream(&r.name).unwrap_or("-"),
                     );
                 }
             }
@@ -2656,6 +2673,7 @@ pub(crate) mod doctor {
         for repo in &declared {
             declared_names.insert(repo.name.clone());
             if repo.path.exists() {
+                upstream_drift(repo, &mut details, &mut remedies);
                 continue;
             }
             details.push(format!(
@@ -2710,6 +2728,57 @@ pub(crate) mod doctor {
         } else {
             Check::warn("estate", details.join("; "), remedies.join("; "))
         }
+    }
+
+    /// #112: does this present mount's `upstream` remote say what the
+    /// manifest declares?
+    ///
+    /// The manifest is the authority and doctor is a diagnostic, so this
+    /// **names** the drift and hands over the exact `git` command that would
+    /// fix it — it never rewrites an existing mount's config. Configuring the
+    /// remote is `sgt repo add --upstream`'s job, where the operator
+    /// explicitly asked for it; a mount that drifted afterward (a hand edit, a
+    /// re-clone, a moved forge) is theirs to reconcile knowingly.
+    ///
+    /// A read-only `git remote get-url`, and legitimate here for the same
+    /// reason it is not on the admission path: `sgt doctor` is an operator
+    /// asking about their own checkout, not a Work being admitted (§6.4, and
+    /// `tests/e_admission_uses_no_network_git.rs`'s forbidden-verb list).
+    /// Nothing here parses the URL — a forge, host or CLI is never inferred
+    /// from it.
+    fn upstream_drift(
+        repo: &crate::domain::estate::DeclaredRepo,
+        details: &mut Vec<String>,
+        remedies: &mut Vec<String>,
+    ) {
+        use crate::runtime::git::{UPSTREAM_REMOTE, git_remote_url};
+
+        let Some(declared) = repo.upstream.as_deref() else {
+            return;
+        };
+        let actual = git_remote_url(&repo.path, UPSTREAM_REMOTE);
+        if actual.as_deref() == Some(declared) {
+            return;
+        }
+        let (what, verb) = match &actual {
+            Some(actual) => (
+                format!("has {UPSTREAM_REMOTE} = {actual}"),
+                "set-url".to_string(),
+            ),
+            None => (
+                format!("has no {UPSTREAM_REMOTE} remote"),
+                "add".to_string(),
+            ),
+        };
+        details.push(format!(
+            "{} declares upstream {declared} but the mount {what}",
+            repo.name
+        ));
+        remedies.push(format!(
+            "{}: `git -C {} remote {verb} {UPSTREAM_REMOTE} {declared}`",
+            repo.name,
+            repo.path.display()
+        ));
     }
 
     /// #165 (Ponytail R2 — visibility, not the fix): how many workflow
@@ -3706,6 +3775,98 @@ pub(crate) mod doctor {
             let check = check_from_reliability(Path::new("/some/data/dir"), Reliability::Reliable);
             assert_eq!(check.status, Status::Ok);
             assert!(check.remedy.is_none());
+        }
+
+        /// #112: the estate row names a declared `upstream` the mount's own
+        /// remote does not carry, with the exact `git` command that would
+        /// reconcile it — and goes quiet again once the remote agrees.
+        /// Doctor names drift; it never rewrites an existing mount.
+        ///
+        /// guard-map: dropping `upstream_drift`'s call site, comparing the
+        /// wrong remote, or "helpfully" configuring the remote from here
+        /// (the row would then never warn at all) each fail this.
+        #[test]
+        fn the_estate_row_names_upstream_drift_and_its_exact_remedy() {
+            fn git(dir: &Path, args: &[&str]) {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("GIT_AUTHOR_NAME", "sergeant tests")
+                    .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+                    .env("GIT_COMMITTER_NAME", "sergeant tests")
+                    .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .output()
+                    .expect("run git");
+                assert!(
+                    output.status.success(),
+                    "git {args:?} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let root = dir.path();
+            let mount = root.join("repos").join("api");
+            std::fs::create_dir_all(&mount).expect("mount dir");
+            git(&mount, &["init", "-b", "main"]);
+            std::fs::write(mount.join("README.md"), "# fixture\n").expect("write");
+            git(&mount, &["add", "."]);
+            git(&mount, &["commit", "-m", "initial"]);
+
+            let declared = "ssh://git@example.invalid/team/api.git";
+            std::fs::write(
+                root.join(MANIFEST_FILE),
+                format!(
+                    "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\
+                     upstream = \"{declared}\"\n"
+                ),
+            )
+            .expect("sergeant.toml");
+
+            let drifted = estate_check(Some(root));
+            assert_eq!(drifted.status, Status::Warn, "{drifted:?}");
+            assert!(
+                drifted.detail.contains(declared) && drifted.detail.contains("no upstream remote"),
+                "the row must name the declaration and what the mount actually has: {}",
+                drifted.detail
+            );
+            let remedy = drifted.remedy.expect("a warning must name its remedy");
+            assert!(
+                remedy.contains("remote add upstream") && remedy.contains(declared),
+                "the remedy must be the exact command: {remedy}"
+            );
+
+            // Reconciled by hand, exactly as the remedy says: the row goes
+            // quiet. Doctor never did this itself.
+            git(&mount, &["remote", "add", "upstream", declared]);
+            assert_eq!(estate_check(Some(root)).status, Status::Ok);
+
+            // Drifted the other way — a remote that exists and disagrees —
+            // reads as `set-url`, not `add`.
+            git(
+                &mount,
+                &[
+                    "remote",
+                    "set-url",
+                    "upstream",
+                    "https://elsewhere.invalid/x.git",
+                ],
+            );
+            let moved = estate_check(Some(root));
+            assert_eq!(moved.status, Status::Warn);
+            assert!(
+                moved.detail.contains("https://elsewhere.invalid/x.git"),
+                "{}",
+                moved.detail
+            );
+            assert!(
+                moved
+                    .remedy
+                    .expect("a warning must name its remedy")
+                    .contains("remote set-url upstream")
+            );
         }
 
         /// §12.2/§18: a scratch data dir, no estate — the row must not even

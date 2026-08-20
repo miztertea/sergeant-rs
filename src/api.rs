@@ -3078,6 +3078,7 @@ fn manifest_error_code(e: &ManifestError) -> &'static str {
         ManifestError::ExistingPathNotAGitRepository { .. } => "existing_path_not_a_git_repository",
         ManifestError::NoPathAndNoOrigin { .. } => "no_path_and_no_origin",
         ManifestError::CloneFailed { .. } => "clone_failed",
+        ManifestError::UpstreamRemoteFailed { .. } => "upstream_remote_failed",
         ManifestError::MalformedSection { .. } => "malformed_section",
     }
 }
@@ -3105,6 +3106,9 @@ fn manifest_error_status(e: &ManifestError) -> StatusCode {
         }
         ManifestError::RepoInUseByGroups { .. } => StatusCode::CONFLICT,
         ManifestError::CloneFailed { .. } => StatusCode::BAD_GATEWAY,
+        // Not 502: `remote add`/`set-url` are local config writes, so a
+        // failure here is about this checkout, never about a network.
+        ManifestError::UpstreamRemoteFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
@@ -3162,6 +3166,11 @@ struct AddRepoRequest {
     name: String,
     #[serde(default)]
     origin: Option<String>,
+    /// #112's forge-neutral upstream declaration, forwarded verbatim — this
+    /// route stays the thin wrapper §16.2 asks for, so what `sgt repo add
+    /// --upstream` can declare, a direct API caller can declare too.
+    #[serde(default)]
+    upstream: Option<String>,
     #[serde(default)]
     instructions: Option<String>,
 }
@@ -3198,8 +3207,16 @@ async fn estate_add_repo(
     };
     let name = req.name.clone();
     let origin = req.origin.clone();
-    let result =
-        blocking_sync(|| manifest::add_repo(&estate_root, &name, origin.as_deref(), instructions));
+    let upstream = req.upstream.clone();
+    let result = blocking_sync(|| {
+        manifest::add_repo(
+            &estate_root,
+            &name,
+            origin.as_deref(),
+            upstream.as_deref(),
+            instructions,
+        )
+    });
     match result {
         Ok(()) => (
             StatusCode::CREATED,
@@ -3207,6 +3224,7 @@ async fn estate_add_repo(
                 "name": req.name,
                 "path": format!("repos/{}", req.name),
                 "origin": req.origin,
+                "upstream": req.upstream,
                 "instructions": req.instructions,
             })),
         )
@@ -4089,11 +4107,17 @@ impl ApiClient {
         &self,
         name: &str,
         origin: Option<&str>,
+        upstream: Option<&str>,
         instructions: Option<&str>,
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/estate/repos",
-            &json!({"name": name, "origin": origin, "instructions": instructions}),
+            &json!({
+                "name": name,
+                "origin": origin,
+                "upstream": upstream,
+                "instructions": instructions,
+            }),
         )
         .await
     }
