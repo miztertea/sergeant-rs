@@ -92,7 +92,8 @@ use sergeant_rs::domain::execution::{
 use sergeant_rs::domain::profile::Profile;
 use sergeant_rs::domain::work::{
     KIND_WORK_BLOCKED, KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED,
-    KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, WorkState,
+    KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, Work,
+    WorkState,
 };
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED,
@@ -324,6 +325,22 @@ fn core(data_dir: &Path) -> Core {
         .expect("catch up");
     let (events_tx, _rx) = tokio::sync::broadcast::channel(16);
     Core::new(journal, registry, events_tx)
+}
+
+/// #4: a Work whose run has settled may already have moved out of `works`
+/// into the bounded `terminal_works` cache by the time a test reads it back
+/// — mirrors the first two tiers of `api.rs`'s `resolve_work` (`works` then
+/// `terminal_works`). None of this file's fixtures churn anywhere near
+/// `terminal_works`'s own capacity, so the third tier (journal
+/// re-derivation) is never needed here.
+fn work_of(core: &Core, work_id: &str) -> Work {
+    let registry = core.registry.state();
+    registry
+        .works
+        .get(work_id)
+        .or_else(|| registry.terminal_works.get(work_id))
+        .unwrap_or_else(|| panic!("no Work found for {work_id}, live or cached"))
+        .clone()
 }
 
 fn commit(core: &mut Core, work_id: &str, kind: &str, payload: Value) {
@@ -3511,10 +3528,7 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
         vec![work_id.to_string()],
         "definite evidence"
     );
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
     assert_eq!(blocked.len(), 1);
     assert!(
@@ -3626,7 +3640,7 @@ fn a4_reconcile_reattaches_a_resumable_execution_before_it_classifies() {
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.resumed, vec![work_id.to_string()]);
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Completed,
         "an unambiguously resumable execution is resumed, not parked"
     );
@@ -3674,10 +3688,7 @@ fn a4_reconcile_that_cannot_reattach_stays_fail_closed() {
 
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let reconciled = events_of(&core, work_id, KIND_EXECUTION_RECONCILED);
     assert_eq!(reconciled[0]["disposition"], "ambiguous");
     assert_eq!(reconciled[0]["reattached"], false);
@@ -3741,10 +3752,7 @@ fn a4_reconcile_does_not_ask_a_backend_that_cannot_resume() {
     );
     let reconciled = events_of(&core, work_id, KIND_EXECUTION_RECONCILED);
     assert_eq!(reconciled[0]["reattached"], false);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Completed
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Completed);
 }
 
 /// Acceptance 4b: a session that no longer exists → the execution is
@@ -3768,10 +3776,7 @@ fn a4_restart_with_vanished_session_retires_the_execution_and_blocks() {
 
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
 
     let reconciled = events_of(&core, work_id, KIND_EXECUTION_RECONCILED);
     assert_eq!(reconciled.len(), 1);
@@ -3856,10 +3861,7 @@ fn a4_a_crash_inside_the_reconcile_append_window_rederives_on_restart() {
 
     let report = recovery::reconcile(&engine, &mut core).expect("re-run reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let stopped = events_of(&core, work_id, KIND_EXECUTION_STOPPED);
     assert_eq!(
         stopped.len(),
@@ -3963,7 +3965,7 @@ fn a4_a_crash_between_completion_and_teardown_is_swept_on_restart() {
             "{work_id}: the record must not pretend it landed with the completion"
         );
         assert_eq!(
-            core.registry.state().works[work_id].state,
+            work_of(&core, work_id).state,
             WorkState::Completed,
             "{work_id}: sweeping scaffolding never rewrites the outcome"
         );
@@ -4128,7 +4130,7 @@ fn a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept(
         surface.root.display()
     );
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Canceled,
         "sweeping scaffolding never rewrites the outcome"
     );
@@ -4419,10 +4421,7 @@ fn a4_a_crash_between_spawn_and_execution_started_blocks_the_work() {
 
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let reconciled = events_of(&core, work_id, KIND_EXECUTION_RECONCILED);
     assert_eq!(reconciled[0]["disposition"], "ambiguous");
     assert!(
@@ -4585,10 +4584,7 @@ fn r1_worker_reports_done_but_native_session_stays_alive() {
     );
 
     engine.resume(&mut core, work_id).expect("drive");
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Completed
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Completed);
     assert!(
         fake.is_live("exec-01M4CATALOG1"),
         "the native session outlived completion — and that must not matter"
@@ -4646,10 +4642,7 @@ fn r2_daemon_dies_during_delivery_fails_closed_with_the_input_preserved() {
 
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let inputs = events_of(&core, work_id, KIND_STAGE_INPUT_RECEIVED);
     assert_eq!(inputs.len(), 1, "the delivered answer is journal-preserved");
     assert_eq!(inputs[0]["input"], "blue");
@@ -4693,7 +4686,7 @@ fn r3_native_dies_after_work_preserved_is_not_a_failure() {
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.resumed, vec![work_id.to_string()]);
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Completed,
         "dead process + completed signal = completed work, never failed"
     );
@@ -4900,10 +4893,7 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
         let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
         assert!(report.resumed.is_empty() && report.blocked.is_empty());
     }
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::NeedsInput
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::NeedsInput);
     assert!(
         events_of(&core, work_id, KIND_WORK_BLOCKED).is_empty(),
         "no timeout reclassified the wait"
@@ -4952,7 +4942,7 @@ fn n19_materializing_a_surface_is_an_effect_the_caller_performs() {
     let mut core = core(data.path());
     let work_id = "01N3SURFACE1";
     submit_work(&mut core, work_id, "materialize me");
-    let work = core.registry.state().works[work_id].clone();
+    let work = work_of(&core, work_id);
     let plan = plan_for(&engine);
 
     let step = engine
@@ -4976,7 +4966,7 @@ fn n19_materializing_a_surface_is_an_effect_the_caller_performs() {
         "no worktree may exist while the guard is still held"
     );
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Pending,
         "the work does not become active until the surface really exists"
     );
@@ -5018,7 +5008,7 @@ fn n20_tearing_a_surface_down_is_an_effect_the_caller_performs() {
     let mut core = core(data.path());
     let work_id = "01N3SURFACE2";
     submit_work(&mut core, work_id, "cancel me");
-    let work = core.registry.state().works[work_id].clone();
+    let work = work_of(&core, work_id);
     let plan = plan_for(&engine);
     engine.start(&mut core, &work, &plan).expect("start");
     let worktree = core.registry.state().runs[work_id]
@@ -5075,7 +5065,7 @@ fn n21_a_cancel_during_materialization_records_the_surface_and_tears_it_down() {
     let mut core = core(data.path());
     let work_id = "01N3SURFACE3";
     submit_work(&mut core, work_id, "cancel me mid-git");
-    let work = core.registry.state().works[work_id].clone();
+    let work = work_of(&core, work_id);
     let plan = plan_for(&engine);
 
     let step = engine
@@ -5096,7 +5086,7 @@ fn n21_a_cancel_during_materialization_records_the_surface_and_tears_it_down() {
     drain(&engine, &mut core, step);
 
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Canceled,
         "a late surface must not revive a work that moved on"
     );
@@ -5825,10 +5815,7 @@ fn n2_a_failed_launch_abandons_its_reservation_and_blocks_the_work() {
         events_of(&core, work_id, KIND_EXECUTION_STARTED).is_empty(),
         "nothing started"
     );
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     assert!(
         core.registry.state().runs[work_id]
             .unsettled_reservation()
@@ -5882,7 +5869,7 @@ fn n3_a_late_launch_cannot_revive_work_that_moved_on() {
     step.deferred.wait();
 
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Canceled,
         "a late launch must not revive terminal work"
     );
@@ -5971,10 +5958,7 @@ fn n4_a_reservation_whose_launch_never_reported_fails_closed_at_restart() {
 
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
     let evidence = blocked
         .last()
@@ -6102,7 +6086,7 @@ fn n6_an_actor_authored_ask_parks_the_stage_and_respond_resumes_the_same_executi
 
     engine.retry(&mut core, work_id).expect("retry");
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::NeedsInput,
         "the actor's question parks the work"
     );
@@ -6138,10 +6122,7 @@ fn n6_an_actor_authored_ask_parks_the_stage_and_respond_resumes_the_same_executi
         1,
         "answering an ask continues the conversation; it does not start a second one"
     );
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Completed
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Completed);
 }
 
 /// The same park, authored by the *adapter* rather than the actor, is
@@ -6185,7 +6166,7 @@ fn n8_a_live_execution_can_raise_a_question_between_engine_calls() {
 
     engine.retry(&mut core, work_id).expect("retry");
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Active,
         "the execution is still working"
     );
@@ -6200,10 +6181,7 @@ fn n8_a_live_execution_can_raise_a_question_between_engine_calls() {
     assert!(fake.actor_asks(&execution_id, "which environment?"));
     engine.resume(&mut core, work_id).expect("resume");
 
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::NeedsInput
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::NeedsInput);
     let parked = events_of(&core, work_id, KIND_STAGE_NEEDS_INPUT);
     assert_eq!(parked[0]["detail"], "which environment?");
     assert_eq!(parked[0]["asked_by"], "actor");
@@ -6294,7 +6272,7 @@ fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
 
     engine.retry(&mut core, work_id).expect("retry");
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::NeedsInput,
         "the actor's question parks the work"
     );
@@ -6317,10 +6295,7 @@ fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
         report.resumed.is_empty() && report.blocked.is_empty(),
         "a parked work is a decision; recovery must not re-decide it: {report:?}"
     );
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::NeedsInput
-    );
+    assert_eq!(work_of(core, work_id).state, WorkState::NeedsInput);
 
     // The human answers the restarted daemon.
     engine
@@ -6333,7 +6308,7 @@ fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
         "the answer reached the execution that asked it"
     );
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(core, work_id).state,
         WorkState::Completed,
         "and the run continued from it"
     );
@@ -6404,7 +6379,7 @@ fn n18_a_refused_reattach_still_fails_the_answer_closed() {
         .expect("respond is accepted, then fails closed");
 
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(core, work_id).state,
         WorkState::Blocked,
         "an unprovable context blocks rather than guessing"
     );
@@ -6872,10 +6847,7 @@ fn n10_window1_before_the_reservation_append() {
 
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Blocked
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     assert_eq!(
         events_of(&core, work_id, KIND_WORK_BLOCKED)[0]["reason"],
         "no execution to reconcile"
@@ -7023,10 +6995,7 @@ fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
             "{label}: the adapter's answer about the reserved identity is recorded"
         );
         let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
-        outcomes.push((
-            core.registry.state().works[work_id].state,
-            abandoned["reason"].clone(),
-        ));
+        outcomes.push((work_of(&core, work_id).state, abandoned["reason"].clone()));
         evidence.push(blocked.last().expect("a block").clone());
     }
     assert_eq!(
@@ -7239,7 +7208,7 @@ fn n15_window7_terminal_before_the_cleanup_request() {
     let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
     assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Completed,
         "terminal work is never revived or reclassified"
     );
@@ -7287,10 +7256,7 @@ fn n16_window8_cleanup_done_before_the_cleanup_append() {
         torn[0]["report"]["bindings"][0]["disposition"], "missing",
         "evidence from the disk, not an assumption about which side of the window the crash fell on"
     );
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Completed
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Completed);
 }
 
 /// §22.5's **cancel-during-launch** window, which had no treatment at all.
@@ -7372,7 +7338,7 @@ fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
 
     // §22.5's convergence rules, unchanged by the closure.
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Canceled,
         "no terminal work revived"
     );
@@ -7573,7 +7539,7 @@ fn park_with_a_live_turn(
         .expect("settle launch");
     step.deferred.wait();
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(core, work_id).state,
         WorkState::Active,
         "the run must be active with a turn in flight, or these tests are \
          asserting nothing"
@@ -7800,7 +7766,7 @@ fn n30_two_observations_of_one_finished_turn_complete_the_stage_once() {
         .expect("first settle");
     drain(&engine, &mut core, step);
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Completed,
         "the first observation is the one that lands"
     );
@@ -7870,7 +7836,7 @@ fn r_mvp1_8_a_k2_settle_reports_running_twice_then_completes_via_the_completion_
         .expect("settle launch");
     step.deferred.wait();
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Active,
         "settle tick 1 of 2: launch-settle's own observation must still \
          report Running, or this test is measuring the pre-R-MVP1-8 fake"
@@ -7896,7 +7862,7 @@ fn r_mvp1_8_a_k2_settle_reports_running_twice_then_completes_via_the_completion_
         .expect("settle observe");
     step.deferred.wait();
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Active,
         "settle tick 2 of 2 must still report Running"
     );
@@ -7957,10 +7923,7 @@ fn r_mvp1_8_k0_is_the_unchanged_default_scripted_signal_visible_at_launch_settle
         "k=0 must complete on launch-settle's own observation, unchanged: {:?}",
         kinds_of(&core, work_id)
     );
-    assert_eq!(
-        core.registry.state().works[work_id].state,
-        WorkState::Completed
-    );
+    assert_eq!(work_of(&core, work_id).state, WorkState::Completed);
 }
 
 /// The completion driver asks only about runs that could still be answered.
@@ -8554,7 +8517,7 @@ fn r_mvp1_7_a_scripted_run_exceeding_the_cap_blocks_at_exactly_n_spawned_turns()
 
     let work_id = "01MVP17CAP";
     submit_work(&mut core, work_id, "spend more turns than the cap allows");
-    let work = core.registry.state().works[work_id].clone();
+    let work = work_of(&core, work_id);
     let step = engine
         .begin_start(&mut core, &work, &plan)
         .expect("begin start");
@@ -8572,7 +8535,7 @@ fn r_mvp1_7_a_scripted_run_exceeding_the_cap_blocks_at_exactly_n_spawned_turns()
         "the durable counter must agree with the journal count above"
     );
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::Blocked,
         "the (N+1)th turn is refused, not silently skipped"
     );
@@ -8621,7 +8584,7 @@ fn r_mvp1_7_a_send_that_internally_retries_through_resume_counts_one_turn() {
 
     engine.retry(&mut core, work_id).expect("retry");
     assert_eq!(
-        core.registry.state().works[work_id].state,
+        work_of(&core, work_id).state,
         WorkState::NeedsInput,
         "the actor's question parks the work"
     );
@@ -9053,7 +9016,7 @@ fn r_mvp1_7_a_consumed_crossing_whose_turn_ended_is_journaled_stale_not_delivere
         work_id,
         "hang, then go stale in the delivery window",
     );
-    let work = core.registry.state().works[work_id].clone();
+    let work = work_of(&core, work_id);
     let step = engine
         .begin_start(&mut core, &work, &plan)
         .expect("begin start");

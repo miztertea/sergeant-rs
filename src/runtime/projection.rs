@@ -321,6 +321,29 @@ pub struct WorkRegistry {
     /// [`TERMINAL_RUN_CACHE_CAPACITY`].
     #[serde(default)]
     pub terminal_run_order: std::collections::VecDeque<String>,
+    /// #4's Work cache (Rule A pattern, mirroring `terminal_runs`/
+    /// `terminal_run_order` exactly): the full [`Work`] struct for the most
+    /// recent [`TERMINAL_WORK_CACHE_CAPACITY`] Works `maybe_evict` has
+    /// reclaimed from `works`, keyed by work id. Same eviction trigger as
+    /// the run cache — a Work moves here the instant `run_is_settled` says
+    /// its run is safe to reclaim — and the same reason: `work_view`/
+    /// `fleet_body` read here before ever paying for a journal replay.
+    #[serde(default)]
+    pub terminal_works: std::collections::BTreeMap<String, Work>,
+    /// Insertion order for `terminal_works`, oldest first — mirrors
+    /// `terminal_run_order`.
+    #[serde(default)]
+    pub terminal_work_order: std::collections::VecDeque<String>,
+    /// The always-retained slim index: one [`WorkIndexRow`] per Work ever
+    /// journaled, created at `work.submitted` and updated in place — never
+    /// evicted. This is what makes eviction from `works`/`terminal_works`
+    /// bounded-*cost* rather than bounded-*history*: a Work that has aged
+    /// out of `terminal_works` still has a row here, so `sgt work list`
+    /// keeps listing it (narrowed) and existence checks still answer
+    /// correctly for it, at tens of bytes per work instead of the tens of
+    /// kB a full [`Work`] can reach.
+    #[serde(default)]
+    pub work_index: std::collections::BTreeMap<String, WorkIndexRow>,
     /// MVP-3's admission drain flag (`sgt daemon stop`, scoped exactly to
     /// that use): whether `POST /v1/work` currently refuses new
     /// submissions. Folded from `admission.paused`/`admission.resumed`
@@ -342,6 +365,18 @@ pub struct WorkRegistry {
 /// to here.
 const TERMINAL_RUN_CACHE_CAPACITY: usize = 512;
 
+/// Bound on how many terminal Works [`WorkRegistry::terminal_works`] holds
+/// at once — the Rule A pattern applied to `works` itself (#4), not only to
+/// `runs`.
+///
+/// **Proposal, for owner ratification at the PR:** 2x
+/// [`TERMINAL_RUN_CACHE_CAPACITY`]. A [`Work`] struct is smaller than a
+/// compacted [`WorkRun`] (no stage history, no surface/teardown/reservation
+/// detail), so twice as many entries costs a comparable order of memory to
+/// the run cache alone — worst case low tens of MB, argued for a modest 8GB
+/// host in general, not sized to whatever machine this was written on.
+const TERMINAL_WORK_CACHE_CAPACITY: usize = 1024;
+
 impl WorkRegistry {
     /// The run for `work_id`, live or evicted-but-cached — the one lookup
     /// every API view should use instead of reading `runs` directly, so a
@@ -352,6 +387,34 @@ impl WorkRegistry {
             .get(work_id)
             .or_else(|| self.terminal_runs.get(work_id))
     }
+}
+
+/// #4's bounded-cost replacement for an unbounded `works` map: exactly what
+/// a `sgt work list` row renders for a Work whose full [`Work`] struct has
+/// aged out of [`WorkRegistry::terminal_works`] — never evicted itself, so
+/// every Work this daemon has ever journaled has one, from creation to now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkIndexRow {
+    /// Same value as the Work's own `id` — carried here too so a row is
+    /// self-describing without a caller threading the key back in.
+    pub id: String,
+    /// The human intent, as journaled at submission. Immutable thereafter,
+    /// like [`Work::intent`].
+    pub intent: String,
+    /// Current state, updated in place on every state transition — the
+    /// same mapping [`apply_registry_event`] applies to the live `Work`.
+    pub state: WorkState,
+    /// §11.5's integrity axis, updated in place from the same
+    /// `surface.torn_down` that sets [`WorkRun::integrity`]. `None` is not
+    /// assessed, same reading as the run's own field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<IntegrityDisposition>,
+    /// RFC3339 UTC creation time, copied from the Work at submission.
+    pub created_at: String,
+    /// RFC3339 UTC timestamp of the last event that changed `state` or
+    /// `integrity` — the journal event's own `timestamp`, not a wall clock
+    /// read at fold time, so replay reproduces it identically.
+    pub updated_at: String,
 }
 
 /// Everything the journal says about one work's run: the workflow it pinned,
@@ -591,11 +654,27 @@ fn run_is_settled(work: &Work, run: &WorkRun) -> bool {
         && run.unsettled_reservation().is_none()
 }
 
-/// Evict `work_id`'s run if [`run_is_settled`] says it is safe to. A no-op
-/// for a work with no run recorded at all, or one not yet settled — called
-/// unconditionally after every event, so it fires the instant the *last*
-/// settling event lands, whichever of teardown/reservation-closure/state
-/// transition that turns out to be for a given run.
+/// Evict `work_id`'s run if [`run_is_settled`] says it is safe to, then (#4)
+/// its full [`Work`] struct on the same trigger. A no-op for a work with no
+/// run recorded at all, or one not yet settled — called unconditionally
+/// after every event, so it fires the instant the *last* settling event
+/// lands, whichever of teardown/reservation-closure/state transition that
+/// turns out to be for a given run.
+///
+/// The Work eviction is gated on the identical condition as the run's,
+/// deliberately: a Work has no surface/teardown/reservation of its own for
+/// recovery to read mid-settling, so nothing about *it* needs the wait —
+/// but tying it to the same trigger, rather than firing independently the
+/// instant `is_absorbing(work.state)` goes true, keeps one settling moment
+/// for the pair rather than two. The one gap this leaves: a Work canceled
+/// before it ever gets a `runs` entry (no workflow bound, no surface, no
+/// reservation — e.g. `pending` -> `canceled`) never reaches this function
+/// at all, since the early return above requires one; it stays in `works`
+/// indefinitely. Rare in practice (most submissions bind a workflow and
+/// materialize before they can reach an absorbing state) and not a
+/// correctness problem — `works` unbounded for that narrow slice is exactly
+/// today's behavior, not a regression — so it is accepted rather than
+/// chased with a second, independent trigger.
 fn maybe_evict(state: &mut WorkRegistry, work_id: Option<&str>) {
     let Some(work_id) = work_id else { return };
     let Some(work) = state.works.get(work_id) else {
@@ -624,6 +703,19 @@ fn maybe_evict(state: &mut WorkRegistry, work_id: Option<&str>) {
     while state.terminal_run_order.len() > TERMINAL_RUN_CACHE_CAPACITY {
         if let Some(oldest) = state.terminal_run_order.pop_front() {
             state.terminal_runs.remove(&oldest);
+        }
+    }
+    // #4: the same settling moment moves the full `Work` out of the
+    // unbounded `works` map and into the bounded `terminal_works` cache.
+    // `work_index`'s row for `work_id` already exists and is untouched —
+    // it is what an entry overflowing `terminal_works` below drops back to.
+    if let Some(work) = state.works.remove(work_id) {
+        state.terminal_works.insert(work_id.to_string(), work);
+        state.terminal_work_order.push_back(work_id.to_string());
+        while state.terminal_work_order.len() > TERMINAL_WORK_CACHE_CAPACITY {
+            if let Some(oldest) = state.terminal_work_order.pop_front() {
+                state.terminal_works.remove(&oldest);
+            }
         }
     }
 }
@@ -656,12 +748,19 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
     // (`WorkState::for_event_kind`), so a kind cannot mean one state when
     // appended and another when replayed.
     if let Some(new_state) = WorkState::for_event_kind(&event.kind) {
-        if let Some(work) = event
-            .work_id
-            .as_ref()
-            .and_then(|id| state.works.get_mut(id))
-        {
-            work.state = new_state;
+        if let Some(work_id) = event.work_id.as_ref() {
+            if let Some(work) = state.works.get_mut(work_id) {
+                work.state = new_state;
+            }
+            // The slim index mirrors `state` for exactly this reason: it
+            // must answer `sgt work list`/existence checks correctly for a
+            // Work whose full struct has already been evicted, which a
+            // terminal transition's own `maybe_evict` call below is about
+            // to do for an absorbing `new_state`.
+            if let Some(row) = state.work_index.get_mut(work_id) {
+                row.state = new_state;
+                row.updated_at = event.timestamp.clone();
+            }
         }
         if evict {
             maybe_evict(state, event.work_id.as_deref());
@@ -676,6 +775,17 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                         .command_works
                         .insert(command_id.clone(), work.id.clone());
                 }
+                state.work_index.insert(
+                    work.id.clone(),
+                    WorkIndexRow {
+                        id: work.id.clone(),
+                        intent: work.intent.clone(),
+                        state: work.state,
+                        integrity: None,
+                        created_at: work.created_at.clone(),
+                        updated_at: work.created_at.clone(),
+                    },
+                );
                 state.works.insert(work.id.clone(), work);
             }
         }
@@ -726,6 +836,14 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 // carrying the previous retirement's verdict forward would
                 // report a fact about a teardown this run has replaced.
                 run.integrity = None;
+                // Mirrored onto the slim index for the same reason: a
+                // rematerialization must not leave a stale verdict behind
+                // for a Work whose full run has already aged out of
+                // `terminal_works`.
+                if let Some(row) = state.work_index.get_mut(work_id) {
+                    row.integrity = None;
+                    row.updated_at = event.timestamp.clone();
+                }
             }
         }
         KIND_SURFACE_TORN_DOWN => {
@@ -741,6 +859,10 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 // and `from_value(Null)` is an error, so both read back as
                 // "not assessed" rather than being defaulted to clean.
                 run.integrity = serde_json::from_value(event.payload["integrity"].clone()).ok();
+                if let Some(row) = state.work_index.get_mut(work_id) {
+                    row.integrity = run.integrity;
+                    row.updated_at = event.timestamp.clone();
+                }
             }
         }
         KIND_STAGE_ENTERED => {
@@ -952,6 +1074,18 @@ pub fn work_registry_projection() -> Projection<WorkRegistry> {
 /// (never started, or genuinely unknown) — the same answer a live,
 /// non-evicted registry would give for that work.
 pub fn rederive_run(journal: &Journal, work_id: &str) -> Result<Option<WorkRun>, JournalError> {
+    Ok(rederive_registry_for(journal, work_id)?
+        .runs
+        .remove(work_id))
+}
+
+/// The fold shared by [`rederive_run`] and [`rederive_work`]: filters the
+/// journal down to `work_id`'s own events and folds them through
+/// [`apply_registry_event`] with `evict: false`, exactly as `rederive_run`'s
+/// own doc explains. One fold, read out two ways, so the two rederivations
+/// can never drift into different ideas of what `work_id`'s events replay
+/// to.
+fn rederive_registry_for(journal: &Journal, work_id: &str) -> Result<WorkRegistry, JournalError> {
     let mut scratch = WorkRegistry::default();
     for event in journal.replay()? {
         let event = event?;
@@ -959,7 +1093,23 @@ pub fn rederive_run(journal: &Journal, work_id: &str) -> Result<Option<WorkRun>,
             apply_registry_event(&mut scratch, &event, false);
         }
     }
-    Ok(scratch.runs.remove(work_id))
+    Ok(scratch)
+}
+
+/// #4's read side for the Work cache, mirroring [`rederive_run`] exactly
+/// (down to sharing its fold, [`rederive_registry_for`]): rebuild one
+/// Work's full struct straight from the journal, for a caller that finds
+/// `WorkRegistry::works` and `WorkRegistry::terminal_works` no longer have
+/// it — aged out of the bounded cache, or evicted in an earlier process
+/// lifetime a fresh rebuild-on-start re-folded from scratch.
+///
+/// Returns `Ok(None)` only for a work id the journal never mentions at all;
+/// every id `WorkRegistry::work_index` has ever held a row for rederives
+/// something.
+pub fn rederive_work(journal: &Journal, work_id: &str) -> Result<Option<Work>, JournalError> {
+    Ok(rederive_registry_for(journal, work_id)?
+        .works
+        .remove(work_id))
 }
 
 #[cfg(test)]
@@ -1334,15 +1484,28 @@ mod rule_a_eviction_tests {
         }
         assert_eq!(
             core.registry.state().works.len(),
-            N,
-            "the light Work record is never evicted — the fleet listing still \
-             sees every work"
+            0,
+            "every one of the {N} Works settled with nothing outstanding and \
+             must have been evicted from the live map too (#4) — a non-flat \
+             count here is the same leak back, just moved from `runs` to `works`"
         );
         assert_eq!(
             core.registry.state().runs.len(),
             0,
             "every one of the {N} runs settled with nothing outstanding and \
              must have been evicted — a non-flat count here is #4's leak back"
+        );
+        assert_eq!(
+            core.registry.state().terminal_works.len(),
+            N,
+            "well within TERMINAL_WORK_CACHE_CAPACITY: every evicted Work \
+             must still be answerable from the bounded cache, not lost"
+        );
+        assert_eq!(
+            core.registry.state().work_index.len(),
+            N,
+            "the slim index is never evicted — the fleet listing still sees \
+             every work, narrowed or not"
         );
     }
 
@@ -1397,6 +1560,132 @@ mod rule_a_eviction_tests {
         assert!(state.terminal_runs.contains_key(&still_cached));
     }
 
+    /// #4's own version of the test above: `terminal_works` must stay
+    /// bounded under sustained churn beyond *its* capacity too — the exact
+    /// leak this whole cache exists to close, just for the full `Work`
+    /// struct instead of the compacted run. `work_index` is the control:
+    /// unlike `terminal_works`, it must keep growing 1:1 with every work
+    /// submitted, never dropping an entry.
+    #[test]
+    fn the_terminal_work_cache_itself_stays_bounded_under_churn_beyond_its_capacity() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let total = TERMINAL_WORK_CACHE_CAPACITY + 200;
+        for i in 0..total {
+            let work_id = format!("01WORKCHURN{i:06}");
+            testing::submit(&mut core, &work_id, "cache churn");
+            testing::commit(
+                &mut core,
+                &work_id,
+                KIND_SURFACE_MATERIALIZED,
+                a_surface(&work_id),
+            );
+            testing::commit(&mut core, &work_id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &work_id,
+                KIND_SURFACE_TORN_DOWN,
+                a_teardown(&work_id),
+            );
+        }
+        let state = core.registry.state();
+        assert_eq!(
+            state.works.len(),
+            0,
+            "still fully evicted from the live map"
+        );
+        assert_eq!(
+            state.terminal_works.len(),
+            TERMINAL_WORK_CACHE_CAPACITY,
+            "the terminal-work cache must never exceed its own capacity, \
+             however many works settle — a growing count here is #4's leak, \
+             just moved to a new field"
+        );
+        assert_eq!(
+            state.terminal_work_order.len(),
+            TERMINAL_WORK_CACHE_CAPACITY,
+            "the order queue and the cache map must shrink together"
+        );
+        assert_eq!(
+            state.work_index.len(),
+            total,
+            "the slim index is the one structure here that must never shrink \
+             — it is the bounded-*cost*, not bounded-*history*, half of #4"
+        );
+        let aged_out = "01WORKCHURN000000";
+        let still_cached = format!("01WORKCHURN{:06}", total - 1);
+        assert!(!state.terminal_works.contains_key(aged_out));
+        assert!(state.terminal_works.contains_key(&still_cached));
+        assert!(
+            state.work_index.contains_key(aged_out),
+            "aged out of the full-struct cache, but the slim row must remain"
+        );
+    }
+
+    /// The pin, stated directly for #4 the way
+    /// `rederive_run_is_byte_identical_to_a_run_that_was_never_evicted`
+    /// states it for R-MVP1-9: `rederive_work` reconstructs a Work that is
+    /// byte-identical to the one a non-evicting fold of the identical
+    /// events would produce. Same events, same reducer logic
+    /// (`apply_registry_event` with `evict: false` either way), same order —
+    /// the only variable this test isolates is *whether eviction ran in
+    /// between*.
+    #[test]
+    fn rederive_work_is_byte_identical_to_a_work_that_was_never_evicted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let journal_dir = dir.path().join("journal");
+        let work_id = "01REDERIVEWORK";
+
+        // Build the journal once, through the *evicting* live registry —
+        // exactly the daemon's own path.
+        let mut core = testing::core(&journal_dir);
+        testing::submit(&mut core, work_id, "rederive me too");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            a_surface(work_id),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_TORN_DOWN,
+            a_teardown(work_id),
+        );
+        assert!(
+            !core.registry.state().works.contains_key(work_id),
+            "precondition: this Work must actually have been evicted, or the \
+             comparison below proves nothing"
+        );
+
+        // The independent answer: fold the *same* journal from scratch with
+        // eviction switched off.
+        fn non_evicting(state: &mut WorkRegistry, event: &Event) {
+            apply_registry_event(state, event, false);
+        }
+        let mut never_evicted = Projection::new(WorkRegistry::default(), non_evicting);
+        never_evicted
+            .catch_up(core.journal.replay().expect("replay"))
+            .expect("catch up");
+        let expected = never_evicted
+            .state()
+            .works
+            .get(work_id)
+            .cloned()
+            .expect("the never-evicted fold must have a Work for this id");
+
+        let rederived = rederive_work(&core.journal, work_id)
+            .expect("replay")
+            .expect("a Work to rederive");
+        assert_eq!(
+            rederived, expected,
+            "the evicted Work's re-derived struct must be byte-identical to \
+             the Work a non-evicting fold of the same events would have \
+             produced"
+        );
+    }
+
     /// Restart indifference: rebuild-on-start is a full replay through the
     /// same evicting reducer, so a work that was evicted before a restart is
     /// evicted again afterwards — never resurrected into memory just because
@@ -1435,7 +1724,17 @@ mod rule_a_eviction_tests {
             !rebuilt.state().runs.contains_key(work_id),
             "rebuild-on-start must not resurrect an evicted run into memory"
         );
-        assert_eq!(rebuilt.state().works[work_id].state, WorkState::Completed);
+        assert!(
+            !rebuilt.state().works.contains_key(work_id),
+            "rebuild-on-start must not resurrect an evicted Work into the \
+             live map either (#4) — same indifference, both maps"
+        );
+        assert_eq!(
+            rebuilt.state().terminal_works[work_id].state,
+            WorkState::Completed,
+            "the evicted Work must still be answerable from the bounded cache \
+             after a rebuild, same as before it"
+        );
     }
 }
 

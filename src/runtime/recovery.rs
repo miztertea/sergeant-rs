@@ -642,8 +642,11 @@ mod tests {
             Some(IntegrityDisposition::Dirty),
             "and the projection folds it the same way the live path's does"
         );
+        // #4: the recovered teardown just settled this run, so the same
+        // commit evicted the Work into `terminal_works` — it is no longer
+        // in `works` at all.
         assert_eq!(
-            core.registry.state().works[work_id].state,
+            core.registry.state().terminal_works[work_id].state,
             WorkState::Completed,
             "integrity never moves Work state (§11.5)"
         );
