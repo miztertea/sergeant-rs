@@ -822,7 +822,15 @@ fn check_removed_repo_path(text: &str, file: &str) -> Result<(), EstateError> {
 ///
 /// Returns the canonical mount on success, so callers record the resolved
 /// path rather than the declared one.
-fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, EstateError> {
+///
+/// **Public because §8.4 makes the daemon repeat this, not because two
+/// implementations of it exist.** `Estate::resolve` calls it while parsing the
+/// manifest; [`crate::runtime::preflight`] calls this same function again per
+/// *selected* repository at admission — "the API/daemon repeats and
+/// authoritatively enforces the mechanical contract" — and maps the three
+/// error variants it can return onto §8.1's checks 1–4 rather than re-deriving
+/// the same three questions from git a second way.
+pub fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, EstateError> {
     // Check 2, first half, and the one case a canonical comparison alone
     // cannot see: the mount *itself* being a symlink. `canonicalize` would
     // happily follow it and then agree with git that the target is the top

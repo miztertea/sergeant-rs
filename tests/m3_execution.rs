@@ -280,6 +280,22 @@ fn events_of(data_dir: &Path, work_id: &str, kind: &str) -> Vec<Event> {
         .collect()
 }
 
+/// Make each of `paths` writable or not, for tests that need a git write to
+/// fail while every git *read* still succeeds.
+fn set_writable(paths: &[PathBuf], writable: bool) {
+    for path in paths {
+        let mut permissions = std::fs::metadata(path).expect("stat").permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(if writable { 0o755 } else { 0o555 });
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(!writable);
+        std::fs::set_permissions(path, permissions).expect("chmod");
+    }
+}
+
 /// Whether a branch exists in a repository.
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     !git(repo, &["branch", "--list", branch]).is_empty()
@@ -3069,12 +3085,30 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     let estate = repos.path().join("payments");
     let api = estate.join("repos").join("api");
     init_repo(&api);
-    // A mount with no commits at all: a real repository at the derived path
-    // (so §6.2's mount validation admits it) with no HEAD to cut a surface
-    // from.
+    // A mount §8.1 admits and materialization then cannot write to: a real
+    // repository at the derived path, on a clean attached HEAD with a full
+    // SHA and no colliding ref or path — every question preflight asks is
+    // answered — whose `.git` is read-only, so the `git worktree add` that
+    // comes *after* admission is the thing that fails.
+    //
+    // Before Phase E this was a repository with no commits at all, which
+    // materialization discovered by failing `rev-parse HEAD` mid-way. §8.1
+    // check 7 now refuses that submission before a Work record exists (see
+    // `git_preflight_refuses_an_unresolvable_head_and_says_no_override_applies`),
+    // so it can no longer reach the rollback path this test is about.
     let web = estate.join("repos").join("web");
-    std::fs::create_dir_all(&web).expect("repo dir");
-    git(&web, &["init", "-b", "main"]);
+    init_repo(&web);
+    // `.git` *and* its ref storage: git creates the branch before it creates
+    // the worktree registry entry, so leaving `refs/heads` writable would
+    // strand a real `sergeant/<work-id>` branch in `web` — which is not the
+    // failure this test is about (the last assertion below pins that `web`
+    // got nothing at all).
+    let web_readonly = [
+        web.join(".git"),
+        web.join(".git/refs"),
+        web.join(".git/refs/heads"),
+    ];
+    set_writable(&web_readonly, false);
     std::fs::write(
         estate.join("sergeant.toml"),
         "[estate]\nname = \"payments\"\n\n\
@@ -3104,6 +3138,10 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
         json!({"scope": {"all": true}}),
     )
     .await;
+    // Restored the moment materialization is over, so the rig's own cleanup
+    // can still remove the directory.
+    set_writable(&web_readonly, true);
+
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(
@@ -3195,6 +3233,14 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
         ),
         &["solo"],
     );
+    // A data dir *inside* the mount is an untracked directory in it, which
+    // §8.1 check 8 correctly reads as a dirty mount. That is a property of
+    // this scenario's unusual layout, not of the split under test, so it is
+    // excluded the ordinary way an operator would exclude it — in the
+    // repository's own `.git/info/exclude`, which needs no commit and adds
+    // nothing to the checkout's tracked content.
+    std::fs::write(repo.join(".git/info/exclude"), ".sergeant-data*\n")
+        .expect("write .git/info/exclude");
 
     let (registry, _fake) = one_fake([FakeStep::hang()]);
     let handle = start_with(
