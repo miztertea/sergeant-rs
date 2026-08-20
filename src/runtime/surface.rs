@@ -1486,6 +1486,74 @@ mod tests {
         }
     }
 
+    /// §2.7/Phase B (C4): `repository_lock` keys on the canonical *checkout
+    /// path* handed to it, not the git common directory the checkout
+    /// actually shares with others. A primary checkout and a `git worktree
+    /// add` of it are two different, canonicalize-stable paths pointing at
+    /// one shared `.git` (a linked worktree's `commondir` file points back
+    /// to it) — the same "two workspaces can reach one repository by
+    /// different routes" hazard `repository_lock`'s own doc comment already
+    /// names for symlinks, just reached through a worktree instead. Today
+    /// that means concurrent mutations against a checkout and its own
+    /// linked worktree are not serialized against each other at all,
+    /// defeating the guard this module's header describes (measured
+    /// burst-50 fatal: `.git/worktrees/<other-work>/commondir`). Phase B's
+    /// blocking interprocess lock keys on canonical `git rev-parse
+    /// --path-format=absolute --git-common-dir` instead, closing this.
+    // CONTRACT PIN (estate-root Phase B): repository_lock keys on the git common directory, so a checkout and its own linked worktree share one lock.
+    #[test]
+    fn contract_pin_repository_lock_aliases_a_checkout_and_its_own_linked_worktree() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let primary = repo(&dir.path().join("primary"));
+        let linked = dir.path().join("linked-worktree");
+        let output = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                linked.to_str().expect("utf8 path"),
+                "-b",
+                "linked-branch",
+            ])
+            .current_dir(&primary.path)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git worktree add");
+        assert!(output.status.success(), "worktree add: {output:?}");
+
+        // Both paths do genuinely share one git common directory — the fact
+        // Phase B's fix will key on.
+        let common_from_primary = git(
+            &primary.path,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .expect("common dir from the primary checkout");
+        let common_from_linked = git(
+            &linked,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .expect("common dir from the linked worktree");
+        assert_eq!(
+            common_from_primary, common_from_linked,
+            "the fixture must actually share one git common directory"
+        );
+
+        let primary_lock = repository_lock(&primary.path);
+        let linked_lock = repository_lock(&linked);
+
+        assert!(
+            !Arc::ptr_eq(&primary_lock, &linked_lock),
+            "today, repository_lock is keyed on the canonical checkout path rather than the \
+             shared git common directory, so a primary checkout and its own linked worktree \
+             yield two distinct lock Arcs — nothing serializes worktree-registry mutations \
+             against each other between them"
+        );
+    }
+
     /// Run one git command in `dir` with a fixture identity, same shape as
     /// [`repo`]'s own commits — for tests that need to commit *inside* an
     /// already-materialized worktree, where the crate's `git()` wrapper alone
@@ -1892,6 +1960,88 @@ mod tests {
         assert!(
             missing_report.bindings[0].final_sha.is_some(),
             "a vanished worktree still has a branch tip to report"
+        );
+    }
+
+    /// #173: today, teardown is blind to a worktree that switched off its
+    /// own `work_branch` before it was torn down. `final_sha` is read from
+    /// `refs/heads/<work_branch>` — deliberately, so it resolves even for a
+    /// `Missing` binding (see
+    /// `teardown_captures_the_retained_branchs_tip_as_the_finalize_commit`
+    /// above) — and `git status --porcelain` only asks "is the worktree
+    /// dirty", not "is it still on the branch this binding claims". A
+    /// worktree that checks out a different branch and commits there is
+    /// clean by that check (nothing uncommitted) and leaves `work_branch`
+    /// itself exactly where it started, so teardown reports the base SHA
+    /// and a clean `Removed` disposition — indistinguishable from a surface
+    /// nothing ever touched — while `git worktree remove` deletes the
+    /// worktree that was the only record of which branch it had actually
+    /// ended up on. Phase A adds actual-vs-expected branch/HEAD/status
+    /// reconciliation at teardown and a closed integrity-finding enum so
+    /// this divergence is reported instead of silently absorbed.
+    // CONTRACT PIN (estate-root Phase A): teardown reports actual-vs-expected branch/HEAD divergence instead of a clean disposition at the base SHA.
+    #[test]
+    fn contract_pin_teardown_is_blind_to_a_worktree_switched_off_its_work_branch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01SWITCH", std::slice::from_ref(&spec)).expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+        let work_branch_name = surface.bindings[0].work_branch.clone();
+        let base_sha = surface.bindings[0].base_sha.clone();
+
+        // Inside the linked worktree, switch to a different branch entirely
+        // and commit there — never touching `work_branch`.
+        git_as_test_identity(&worktree, &["checkout", "-b", "renegade"]);
+        std::fs::write(worktree.join("elsewhere.txt"), "not on work_branch\n")
+            .expect("write elsewhere");
+        git_as_test_identity(&worktree, &["add", "."]);
+        git_as_test_identity(
+            &worktree,
+            &["commit", "-m", "work happened on the wrong branch"],
+        );
+        let renegade_commit = git(&worktree, &["rev-parse", "HEAD"]).expect("renegade commit");
+        assert_ne!(
+            renegade_commit, base_sha,
+            "the fixture must actually produce a divergent commit"
+        );
+
+        let report = teardown(&surface);
+
+        // The defect, pinned: a clean `Removed` disposition and the base
+        // SHA, as if nothing had ever happened in this worktree.
+        assert_eq!(
+            report.bindings[0].disposition,
+            BindingDisposition::Removed,
+            "today, switching branches inside the worktree does not stop teardown from \
+             reporting a clean removal"
+        );
+        assert_eq!(
+            report.bindings[0].final_sha.as_deref(),
+            Some(base_sha.as_str()),
+            "today, final_sha is the untouched work_branch ref — still at the base SHA — \
+             not the divergent commit the worktree actually ended up on"
+        );
+        assert!(
+            !worktree.exists(),
+            "today, the worktree (the only record of the renegade branch's checkout) is removed"
+        );
+        // The renegade branch itself survives in the source repository's
+        // refs (worktrees share one ref store) — the commit is not
+        // destroyed — but nothing in the teardown report names it, and the
+        // work_branch this binding is journaled against never pointed at
+        // it, so no reconciliation done today can connect the two.
+        assert!(
+            git_succeeds(
+                &spec.path,
+                &["rev-parse", "--verify", "refs/heads/renegade"]
+            ),
+            "the renegade commit itself survives, orphaned from anything teardown reported"
+        );
+        assert_ne!(
+            work_branch_name, "renegade",
+            "sanity: the binding's own work_branch was never the one switched to"
         );
     }
 

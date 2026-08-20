@@ -1392,6 +1392,48 @@ mod tests {
         assert!(err.contains("api, web"), "got {err}");
     }
 
+    /// `select` with an empty name list returns every declared repository —
+    /// the caller-convenience reading of "no selection". Phase C replaces
+    /// this with structured scope requests (`--repo`/`--group`/`--all`) and
+    /// an explicit empty-scope refusal with the §7.1 remedy text (C7b); an
+    /// empty list will then no longer mean "all".
+    // CONTRACT PIN (estate-root Phase C): empty selection refuses instead of meaning "all".
+    #[test]
+    fn contract_pin_empty_selection_currently_means_every_repository() {
+        let workspace = Workspace {
+            name: "payments".to_string(),
+            root: PathBuf::from("/nowhere"),
+            repositories: vec![
+                RepositorySpec {
+                    name: "api".to_string(),
+                    path: PathBuf::from("/nowhere/api"),
+                },
+                RepositorySpec {
+                    name: "web".to_string(),
+                    path: PathBuf::from("/nowhere/web"),
+                },
+            ],
+            default_backend: None,
+            default_workflow: None,
+            profiles: Vec::new(),
+            config_path: None,
+            surfaces_dir: None,
+            data_dir: None,
+            repository_policy: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            repository_origin: BTreeMap::new(),
+        };
+
+        let selected = workspace
+            .select(&[])
+            .expect("an empty selection succeeds today");
+        assert_eq!(
+            selected.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["api", "web"],
+            "today, an empty selection silently expands to every declared repository"
+        );
+    }
+
     /// `sergeant.toml` declaring no `[[repo]]` entries at all is
     /// refused rather than accepted as a workspace with nothing to act on.
     #[test]
@@ -1951,6 +1993,68 @@ mod tests {
         assert!(
             matches!(err, WorkspaceError::NotARepository { .. }),
             "got {err}"
+        );
+    }
+
+    /// C7a/Phase D: today, an estate whose `sergeant.toml` sits in an
+    /// ancestor directory is discovered from a descendant cwd via the
+    /// upward walk this pin exists to flip away from — Phase D moves to
+    /// exact-root resolution only (no ancestor walk, no git fallback;
+    /// `estate_root` comes from the daemon config / runtime descriptor
+    /// instead). This is the same shape as
+    /// `estate_discovery_walks_upward_past_an_inner_git_boundary` above,
+    /// marked separately because that test's *purpose* is "the walk works
+    /// correctly" (a fact worth keeping while ancestor-walk discovery still
+    /// exists) whereas this pin's purpose is "the walk exists at all" (a
+    /// fact Phase D removes outright, at which point this specific test
+    /// must be flipped rather than merely edited around).
+    // CONTRACT PIN (estate-root Phase D): ancestor-walk discovery is removed; a descendant cwd no longer finds an estate above it.
+    #[test]
+    fn contract_pin_ancestor_walk_discovers_estate_from_descendant_cwd() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        std::fs::create_dir_all(&estate_root).expect("estate dir");
+        write_estate(&estate_root, "ancestor-estate");
+
+        let member = estate_root.join("repos").join("payments-api");
+        init_repo(&member);
+
+        let workspace = Workspace::discover(&member)
+            .expect("today, discovery from a descendant cwd walks up and finds the estate");
+        assert_eq!(workspace.name, "ancestor-estate");
+        assert_eq!(
+            std::fs::canonicalize(&workspace.root).ok(),
+            std::fs::canonicalize(&estate_root).ok(),
+            "the discovered root is the ancestor directory, not the descendant cwd"
+        );
+    }
+
+    /// C7a/Phase D: today, a plain git repository with no `sergeant.toml`
+    /// anywhere above it falls back to `git rev-parse --show-toplevel` and
+    /// yields a single-repository workspace with no config file at all —
+    /// R-MVP1-12's "single-repository use requires zero configuration".
+    /// Phase D removes this fallback along with the ancestor walk: exact-root
+    /// resolution has nothing to fall back *to* once there is no upward
+    /// search.
+    // CONTRACT PIN (estate-root Phase D): zero-config git fallback is removed; a repo with no sergeant.toml anywhere above no longer resolves to a workspace.
+    #[test]
+    fn contract_pin_zero_config_git_fallback_yields_a_single_repo_workspace() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("plain-repo");
+        init_repo(&root);
+        // No `sergeant.toml` anywhere in this fixture, at `root` or above it.
+
+        let workspace = Workspace::discover(&root)
+            .expect("today, a plain git repo with no sergeant.toml falls back to git toplevel");
+        assert_eq!(workspace.repositories.len(), 1);
+        assert!(
+            workspace.config_path.is_none(),
+            "the zero-config fallback has no sergeant.toml to point at"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&workspace.repositories[0].path).ok(),
+            std::fs::canonicalize(&root).ok(),
+            "the single repository is the git toplevel itself"
         );
     }
 
