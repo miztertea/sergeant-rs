@@ -387,6 +387,19 @@ impl WorkRegistry {
             .get(work_id)
             .or_else(|| self.terminal_runs.get(work_id))
     }
+
+    /// The current [`WorkState`] for `work_id`, live or evicted — #4's other
+    /// lookup every caller that only needs the state (not the full [`Work`])
+    /// should use instead of reading `works` directly. `works` only holds
+    /// active Works now; the always-retained `work_index` slim row carries
+    /// `state` too and is never evicted, so this answers correctly for an
+    /// already-terminal (possibly evicted) `work_id` with no journal replay.
+    pub fn state_view(&self, work_id: &str) -> Option<WorkState> {
+        self.works
+            .get(work_id)
+            .map(|w| w.state)
+            .or_else(|| self.work_index.get(work_id).map(|row| row.state))
+    }
 }
 
 /// #4's bounded-cost replacement for an unbounded `works` map: exactly what
@@ -405,7 +418,17 @@ pub struct WorkIndexRow {
     /// same mapping [`apply_registry_event`] applies to the live `Work`.
     pub state: WorkState,
     /// §11.5's integrity axis, updated in place from the same
-    /// `surface.torn_down` that sets [`WorkRun::integrity`]. `None` is not
+    /// `surface.torn_down` that sets [`WorkRun::integrity`] — but not a
+    /// verbatim mirror of it. This is the *effective* disposition: the
+    /// explicit `Dirty` retirement, OR ADR 0007(b)'s structural
+    /// stranded-completion check (`TeardownReport::stranded_completion`),
+    /// computed at `torn_down` time while `run.surface`/`run.teardown` are
+    /// both still in hand. The slim row never retains either of those, so
+    /// this is the only place it *can* be computed once a Work ages out of
+    /// `terminal_works` — without it, an evicted stranded completion would
+    /// silently read back as plain `completed` (#4's eviction gap) instead of
+    /// `completed_dirty`. Rederive paths replay through the same reducer, so
+    /// journal-truth consistency holds automatically. `None` is not
     /// assessed, same reading as the run's own field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrity: Option<IntegrityDisposition>,
@@ -860,7 +883,37 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 // "not assessed" rather than being defaulted to clean.
                 run.integrity = serde_json::from_value(event.payload["integrity"].clone()).ok();
                 if let Some(row) = state.work_index.get_mut(work_id) {
-                    row.integrity = run.integrity;
+                    // #4's slim-row eviction gap: `row.integrity` used to
+                    // mirror only the explicit disposition above, which is
+                    // all a stranded completion (ADR 0007(b)) has once its
+                    // Work ages out of `terminal_works` — the structural
+                    // `stranded_completion` check `reported_state` runs for
+                    // the live row needs `run.teardown`/`run.surface`, which
+                    // this slim row never keeps. Folding that structural
+                    // check in here, while both are still in hand, lets the
+                    // slim row carry the *effective* disposition instead: an
+                    // eviction can no longer make a stranded completion read
+                    // back as plain `completed`. `work.completed` is always
+                    // journaled before its trailing `surface.torn_down`
+                    // (engine.rs's R2 rung note), so `state.works[work_id]`
+                    // already reflects the terminal state this checks.
+                    let explicit_dirty = run.integrity == Some(IntegrityDisposition::Dirty);
+                    let completed = state
+                        .works
+                        .get(work_id)
+                        .is_some_and(|w| w.state == WorkState::Completed);
+                    let structural_stranded = completed
+                        && match (run.surface.as_ref(), run.teardown.as_ref()) {
+                            (Some(surface), Some(teardown)) => {
+                                teardown.stranded_completion(surface)
+                            }
+                            _ => false,
+                        };
+                    row.integrity = if explicit_dirty || structural_stranded {
+                        Some(IntegrityDisposition::Dirty)
+                    } else {
+                        run.integrity
+                    };
                     row.updated_at = event.timestamp.clone();
                 }
             }

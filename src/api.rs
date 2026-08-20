@@ -1691,18 +1691,14 @@ fn stranded_completion(work: &Work, run: &WorkRun) -> bool {
     let Some(surface) = run.surface.as_ref() else {
         return false;
     };
-    teardown.bindings.iter().any(|binding| {
-        let never_advanced = surface
-            .bindings
-            .iter()
-            .find(|b| b.repository == binding.repository)
-            .is_some_and(|b| binding.final_sha.as_deref() == Some(b.base_sha.as_str()));
-        never_advanced
-            && matches!(
-                binding.disposition,
-                BindingDisposition::RetainedDirty { .. }
-            )
-    })
+    // The structural predicate itself lives on `TeardownReport` (surface.rs,
+    // beside `integrity()`) so the projection reducer can compute the same
+    // thing at `surface.torn_down` time, with no live `Work` at hand, for
+    // `WorkIndexRow`'s effective disposition (#4's slim-row eviction gap).
+    // Only the `work.state == Completed` gate stays here — that is the one
+    // fact the reducer already knows a different way (it runs after
+    // `work.completed` has already updated `work.state`/`row.state`).
+    teardown.stranded_completion(surface)
 }
 
 /// The `state` `work list`/`work show` report: verbatim for every ordinary
@@ -1931,12 +1927,13 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
 /// narrowing explicitly rather than leaving a client to infer it from
 /// absent keys.
 ///
-/// One known gap versus the full row's `reported_state`: [`stranded_completion`]
-/// reads the teardown's finalize commit against the surface's base SHA,
-/// neither of which the slim row retains, so an evicted stranded completion
-/// whose retained `integrity` disposition was never marked `Dirty` reads
-/// plain `completed` here instead of `completed_dirty`. Disclosed, not
-/// silently narrowed — same spirit as the rest of this row.
+/// No gap versus the full row's `reported_state` for the `completed_dirty`
+/// question, despite the slim row never retaining `run.teardown`/
+/// `run.surface`: `WorkIndexRow::integrity` (projection.rs) is the *effective*
+/// disposition — explicit `Dirty` OR [`stranded_completion`]'s structural
+/// check — already folded in at `surface.torn_down` time, while both were
+/// still in hand. So the plain `== Some(Dirty)` check below is enough; it
+/// does not need to re-derive stranded-ness from fields this row never kept.
 fn evicted_fleet_row(row: &WorkIndexRow) -> Value {
     let state = if row.state == WorkState::Completed
         && row.integrity == Some(IntegrityDisposition::Dirty)
@@ -5534,6 +5531,278 @@ mod tests {
                 .work_index
                 .contains_key("01NOSUCHWORKATALL"),
             "an id nothing ever journaled must not be found"
+        );
+    }
+
+    /// Panel finding (the explicit-Dirty half): `evicted_fleet_row` reads
+    /// `WorkIndexRow::integrity` directly, and an explicit `Dirty`
+    /// disposition was always mirrored into it verbatim — so this half
+    /// already passed before the fix. It is kept here as a regression guard
+    /// alongside its stranded-completion sibling just below, which the fix
+    /// was actually for.
+    ///
+    /// Same churn shape as
+    /// `a_work_view_survives_terminal_work_cache_eviction_and_unknown_ids_still_404`
+    /// just above: submit the target first (so it is oldest and ages out
+    /// first), then churn ordinary completions past
+    /// `TERMINAL_WORK_CACHE_CAPACITY` (1024) so `evicted_fleet_row` is the
+    /// branch `fleet_body` actually takes for it, not the full-row branch.
+    #[test]
+    fn evicted_fleet_row_reports_completed_dirty_for_an_explicit_dirty_disposition() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn ordinary_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": true,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "removed",
+                }],
+            }})
+        }
+
+        fn explicit_dirty_teardown(work_id: &str) -> Value {
+            // A clean removal in every way `TeardownReport::integrity()`
+            // itself would score, but retired with an explicit `Dirty`
+            // disposition anyway — the two ways to `completed_dirty` §11.5's
+            // own doc calls out as a union rather than a competition.
+            let mut payload = ordinary_teardown(work_id);
+            payload["integrity"] = json!("dirty");
+            payload
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        let target_id = "01EXPLICITDIRTY0000001";
+        testing::submit(&mut core, target_id, "retired dirty on purpose");
+        testing::commit(
+            &mut core,
+            target_id,
+            KIND_SURFACE_MATERIALIZED,
+            surface(target_id),
+        );
+        testing::commit(&mut core, target_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            target_id,
+            KIND_SURFACE_TORN_DOWN,
+            explicit_dirty_teardown(target_id),
+        );
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        // Churn ordinary completions past `TERMINAL_WORK_CACHE_CAPACITY`
+        // (1024, private to `projection.rs`) so `target_id` — submitted
+        // first, so it is the oldest — actually ages out of `terminal_works`
+        // and `evicted_fleet_row` is the branch `fleet_body` actually takes.
+        for i in 0..1224 {
+            let id = format!("01EXPLICITDIRTYCHURN{i:06}");
+            testing::submit(&mut core, &id, "cache churn");
+            testing::commit(&mut core, &id, KIND_SURFACE_MATERIALIZED, surface(&id));
+            testing::commit(&mut core, &id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &id,
+                KIND_SURFACE_TORN_DOWN,
+                ordinary_teardown(&id),
+            );
+        }
+        assert!(
+            !core.registry.state().terminal_works.contains_key(target_id),
+            "the target must actually have aged out of the bounded cache for \
+             this test to prove anything"
+        );
+
+        let fleet = fleet_body(&core, &engine);
+        let row = fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .find(|w| w["id"] == target_id)
+            .expect("the evicted-past-cache work is still listed, narrowed");
+        assert_eq!(row["evicted"], true, "{row}");
+        assert_eq!(
+            row["state"], "completed_dirty",
+            "an explicit Dirty disposition must still read completed_dirty \
+             once the Work has aged past TERMINAL_WORK_CACHE_CAPACITY: {row}"
+        );
+    }
+
+    /// Panel finding (the core fix, stranded-completion half): before this
+    /// fix, `WorkIndexRow::integrity` only ever mirrored the *explicit*
+    /// disposition a `surface.torn_down` carried — never ADR 0007(b)'s
+    /// structural inference (`stranded_completion`: a closing stage's
+    /// finalize commit that never moved past the surface's base SHA, with a
+    /// `RetainedDirty` binding). A stranded completion with no explicit
+    /// `Dirty` disposition therefore read `completed_dirty` in `sgt work
+    /// show`/`sgt work list` right up until its Work aged past
+    /// `TERMINAL_WORK_CACHE_CAPACITY` — at which point `evicted_fleet_row`,
+    /// reading `WorkIndexRow` alone, would find `row.integrity` still `None`
+    /// and silently revert it to plain `completed`. The fix folds the
+    /// structural check into `WorkIndexRow::integrity` itself, at
+    /// `surface.torn_down` time in the reducer (`projection.rs`), while
+    /// `run.surface`/`run.teardown` are still in hand.
+    ///
+    /// **Why this fails without the fix.** This fixture's teardown payload
+    /// carries no `integrity` key at all (mirroring
+    /// `a_stranded_completion_survives_terminal_run_cache_eviction`'s
+    /// `stranded_teardown` shape exactly: `clean: false`, a `retained_dirty`
+    /// binding whose `final_sha` equals the surface binding's own
+    /// `base_sha`, i.e. never advanced) — so on the pre-fix reducer,
+    /// `row.integrity` is set from `run.integrity`, which
+    /// `serde_json::from_value` on an absent key resolves to `None`.
+    /// `evicted_fleet_row` only special-cases `row.integrity ==
+    /// Some(Dirty)`; with `row.integrity == None` it falls straight to
+    /// `row.state.as_str()`, i.e. `"completed"`. Only after the Work ages
+    /// past `TERMINAL_WORK_CACHE_CAPACITY` does that gap become visible —
+    /// while cached, `fleet_body`/`work_view` both still resolve the full
+    /// run and re-run `stranded_completion` directly, which is exactly why
+    /// this test churns past the cache rather than asserting immediately.
+    #[test]
+    fn evicted_fleet_row_reports_completed_dirty_for_a_stranded_completion() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn stranded_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": false,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "retained_dirty",
+                    "changes": " M half-done.rs",
+                    // Never advanced past the base SHA `surface` recorded —
+                    // no explicit `integrity` key anywhere in this payload.
+                    "final_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn ordinary_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": true,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "removed",
+                }],
+            }})
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        let stranded_id = "01STRANDEDEVICTED0001";
+        testing::submit(&mut core, stranded_id, "declares a commit, never makes one");
+        testing::commit(
+            &mut core,
+            stranded_id,
+            KIND_SURFACE_MATERIALIZED,
+            surface(stranded_id),
+        );
+        testing::commit(&mut core, stranded_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            stranded_id,
+            KIND_SURFACE_TORN_DOWN,
+            stranded_teardown(stranded_id),
+        );
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        // Churn ordinary completions past `TERMINAL_WORK_CACHE_CAPACITY`
+        // (1024) so `stranded_id` — submitted first, so it is the oldest —
+        // actually ages out of `terminal_works` and `evicted_fleet_row` is
+        // the branch `fleet_body` actually takes for it.
+        for i in 0..1224 {
+            let id = format!("01STRANDEDEVICTEDCHURN{i:06}");
+            testing::submit(&mut core, &id, "cache churn");
+            testing::commit(&mut core, &id, KIND_SURFACE_MATERIALIZED, surface(&id));
+            testing::commit(&mut core, &id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &id,
+                KIND_SURFACE_TORN_DOWN,
+                ordinary_teardown(&id),
+            );
+        }
+        assert!(
+            !core
+                .registry
+                .state()
+                .terminal_works
+                .contains_key(stranded_id),
+            "the stranded work must actually have aged out of the bounded \
+             cache for this test to prove anything"
+        );
+
+        let fleet = fleet_body(&core, &engine);
+        let row = fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .find(|w| w["id"] == stranded_id)
+            .expect("the evicted-past-cache work is still listed, narrowed");
+        assert_eq!(row["evicted"], true, "{row}");
+        assert_eq!(
+            row["state"], "completed_dirty",
+            "an evicted stranded completion (ADR 0007(b)'s structural \
+             inference, no explicit Dirty disposition) must not silently \
+             revert to plain completed just because its Work aged past \
+             TERMINAL_WORK_CACHE_CAPACITY: {row}"
         );
     }
 

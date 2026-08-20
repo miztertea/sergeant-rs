@@ -247,16 +247,15 @@ pub fn branch_takeover_precondition(
     // just below refuses anything else), which is exactly the case #4
     // evicts the full `Work` struct for — `works` alone would 404 a
     // perfectly good takeover target the instant its run settled. Only
-    // `.state` is needed here, and the slim index carries it, never
-    // evicted, so this never has to fall back to a journal replay.
-    let state = registry
-        .works
-        .get(target_work_id)
-        .map(|w| w.state)
-        .or_else(|| registry.work_index.get(target_work_id).map(|row| row.state))
-        .ok_or_else(|| BranchTakeoverError::TargetNotFound {
-            work_id: target_work_id.to_string(),
-        })?;
+    // `.state` is needed here, and `state_view` answers it from the slim
+    // index, never evicted, so this never has to fall back to a journal
+    // replay.
+    let state =
+        registry
+            .state_view(target_work_id)
+            .ok_or_else(|| BranchTakeoverError::TargetNotFound {
+                work_id: target_work_id.to_string(),
+            })?;
     if !is_absorbing(state) {
         return Err(BranchTakeoverError::TargetNotTerminal {
             work_id: target_work_id.to_string(),
@@ -4360,18 +4359,16 @@ impl Engine {
     }
 
     fn work_state(&self, core: &Core, work_id: &str) -> Result<WorkState, EngineError> {
-        let registry = core.registry.state();
         // #4: `works` only holds active Works now. Most callers here only
         // ever ask about one (scheduling loops touch non-absorbing works by
         // construction), but this is a shared lookup, not scoped to those
-        // callers — the slim index carries `state` for exactly this case
-        // and is never evicted, so it answers correctly for an already-
-        // terminal (possibly evicted) `work_id` too, with no journal replay.
-        registry
-            .works
-            .get(work_id)
-            .map(|w| w.state)
-            .or_else(|| registry.work_index.get(work_id).map(|row| row.state))
+        // callers — `state_view` answers from the slim index for exactly
+        // this case, and it is never evicted, so it answers correctly for
+        // an already-terminal (possibly evicted) `work_id` too, with no
+        // journal replay.
+        core.registry
+            .state()
+            .state_view(work_id)
             .ok_or_else(|| EngineError::NoRun {
                 work_id: work_id.to_string(),
             })
