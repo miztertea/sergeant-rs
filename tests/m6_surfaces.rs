@@ -1498,6 +1498,12 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // here because the fixture estate declares one; an estate with
             // none reads `warn`, which is `t3f`'s subject.
             "workflows",
+            // estate-root §12.2: the cheap Git-surface summary — journal
+            // plus retained-artifact filesystem metadata only, never a
+            // per-branch git walk. Green here because the fixture estate
+            // has no journal at all yet ("no journal yet" reads `ok`, the
+            // same as a fresh install with nothing run in it).
+            "git_surfaces",
             "disk_pressure",
         ],
         "the --json check list and its order are the stable part of this contract"

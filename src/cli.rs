@@ -2120,16 +2120,27 @@ pub(crate) mod doctor {
         }
 
         /// The human report: one line per check, remedy indented under any
-        /// check that is not `Ok`.
+        /// check that is not `Ok`. A `detail` that itself spans several
+        /// lines (§12.2's `git_surfaces` block is the one row that does)
+        /// gets the same continuation treatment remedy already has below,
+        /// indented to the column its own first line starts at
+        /// (`"  [{marker}] {name:<12} "`'s fixed width) rather than back to
+        /// column zero — so the block reads as one row's own detail, not as
+        /// stray output between checks.
         pub fn print(&self) {
+            const DETAIL_COLUMN: usize = 22;
             println!("sergeant doctor — {}", self.data_dir.display());
             for check in &self.checks {
+                let mut lines = check.detail.lines();
                 println!(
                     "  [{}] {:<12} {}",
                     check.status.marker(),
                     check.name,
-                    check.detail
+                    lines.next().unwrap_or("")
                 );
+                for line in lines {
+                    println!("{:DETAIL_COLUMN$}{line}", "");
+                }
                 if let Some(remedy) = &check.remedy {
                     // A remedy may be several lines — §4.4's estate-root
                     // diagnostic is a whole block. Continuation lines are
@@ -2200,6 +2211,10 @@ pub(crate) mod doctor {
         checks.push(permission_mode_check(admitted.as_deref()));
         checks.push(estate_check(admitted.as_deref()));
         checks.push(workflows_check(admitted.as_deref()));
+        // §12.2: cheap, bounded — journal plus retained-artifact filesystem
+        // metadata, never a per-branch git walk. Same estate-root threading
+        // as the two rows above.
+        checks.push(git_surfaces_check(data_dir, admitted.as_deref()));
         // N4/#23 (retention Rule B): disk pressure inside the data dir. Runs
         // after everything above regardless of their outcome — knowing "is
         // this installation about to run out of disk" does not depend on the
@@ -2572,6 +2587,179 @@ pub(crate) mod doctor {
                     names.len(),
                     names.join(", ")
                 ),
+            )
+        }
+    }
+
+    /// estate-root proposal §12.2: a cheap, bounded Git-surface summary
+    /// derived from the journal and retained-artifact filesystem metadata
+    /// only — never a per-branch `git` ancestry walk (§12.3's expensive
+    /// reconciliation, unbuilt on purpose, owns that). Same discovery as
+    /// [`estate_check`]/[`workflows_check`]; silent (`ok`) outside any
+    /// estate.
+    ///
+    /// "Active" here is the git-surface sense — a Work's surface has a
+    /// `surface.materialized` event with no later `surface.torn_down` for
+    /// the same work id — not [`crate::domain::work::WorkState::Active`];
+    /// a Work sitting in `waiting`/`needs_input`/`blocked` still holds an
+    /// open surface and counts here. A rematerialization (crash-recovery
+    /// replay reissuing `surface.materialized` for a work id already torn
+    /// down) clears the earlier teardown and its integrity verdict for that
+    /// work id, mirroring `work_registry_reducer`'s own `run.teardown =
+    /// None`/`run.integrity = None` on the same event.
+    ///
+    /// "journaled Work branches" counts every binding any Work's surface
+    /// was ever materialized with, active or long since torn down — §12.1's
+    /// branches are durable and never deleted here, so this is the
+    /// journal's own count of what was created, not a walk of what a
+    /// mounted repository still has a ref for.
+    ///
+    /// "retained worktrees"/"retained patches"/"retained artifact size"
+    /// reuse [`crate::runtime::surface::retained_bindings`] — the same live
+    /// filesystem read `sgt work retained` answers from — over every
+    /// journaled teardown, classifying each entry by whether its retained
+    /// path is the captured patch file or the whole worktree directory
+    /// fallback. "terminal dirty Works" counts work ids whose most recent
+    /// teardown recorded [`crate::runtime::integrity::IntegrityDisposition::Dirty`].
+    fn git_surfaces_check(data_dir: &Path, estate_root: Option<&Path>) -> Check {
+        use crate::runtime::integrity::IntegrityDisposition;
+        use crate::runtime::surface::{
+            KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN, TeardownReport, WorkSurface,
+            retained_bindings,
+        };
+
+        if estate_root.is_none() {
+            return Check::ok("git_surfaces", "not an estate root — nothing to check");
+        }
+        if !journal_dir(data_dir).exists() {
+            return Check::ok(
+                "git_surfaces",
+                "no journal yet — nothing has run in this data dir",
+            );
+        }
+        let replay = match Journal::replay_data_dir(data_dir) {
+            Ok(replay) => replay,
+            Err(e) => {
+                return Check::warn(
+                    "git_surfaces",
+                    format!("cannot open the journal: {e}"),
+                    "see the journal check above",
+                );
+            }
+        };
+
+        // work id -> binding count of its most recent `surface.materialized`.
+        let mut materialized: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        // work id -> its most recent `surface.torn_down` report.
+        let mut torn_down: std::collections::BTreeMap<String, TeardownReport> =
+            std::collections::BTreeMap::new();
+        // work id -> the integrity verdict that same teardown recorded.
+        let mut integrity: std::collections::BTreeMap<String, IntegrityDisposition> =
+            std::collections::BTreeMap::new();
+
+        for event in replay {
+            let event = match event {
+                Ok(event) => event,
+                Err(e) => {
+                    return Check::warn(
+                        "git_surfaces",
+                        format!("journal replay failed: {e}"),
+                        "see the journal check above",
+                    );
+                }
+            };
+            let Some(work_id) = event.work_id.clone() else {
+                continue;
+            };
+            match event.kind.as_str() {
+                KIND_SURFACE_MATERIALIZED => {
+                    if let Ok(surface) =
+                        serde_json::from_value::<WorkSurface>(event.payload["surface"].clone())
+                    {
+                        materialized.insert(work_id.clone(), surface.bindings.len());
+                        torn_down.remove(&work_id);
+                        integrity.remove(&work_id);
+                    }
+                }
+                KIND_SURFACE_TORN_DOWN => {
+                    if let Ok(report) =
+                        serde_json::from_value::<TeardownReport>(event.payload["report"].clone())
+                    {
+                        match serde_json::from_value::<IntegrityDisposition>(
+                            event.payload["integrity"].clone(),
+                        ) {
+                            Ok(disposition) => {
+                                integrity.insert(work_id.clone(), disposition);
+                            }
+                            Err(_) => {
+                                integrity.remove(&work_id);
+                            }
+                        }
+                        torn_down.insert(work_id, report);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let journaled_branches: usize = materialized.values().sum();
+        let active_work_ids: Vec<&str> = materialized
+            .keys()
+            .filter(|id| !torn_down.contains_key(id.as_str()))
+            .map(String::as_str)
+            .collect();
+        let active_works = active_work_ids.len();
+        let active_worktrees: usize = active_work_ids.iter().map(|id| materialized[*id]).sum();
+
+        let mut retained_worktrees = 0u64;
+        let mut retained_patches = 0u64;
+        let mut retained_bytes = 0u64;
+        let mut terminal_dirty_works = 0u64;
+
+        for (work_id, report) in &torn_down {
+            for binding in retained_bindings(report) {
+                retained_bytes += binding.bytes;
+                if binding.reason == "retained_dirty" && binding.path.is_file() {
+                    retained_patches += 1;
+                } else {
+                    retained_worktrees += 1;
+                }
+            }
+            if integrity.get(work_id) == Some(&IntegrityDisposition::Dirty) {
+                terminal_dirty_works += 1;
+            }
+        }
+
+        let detail = [
+            "git surfaces".to_string(),
+            format!("  active works:              {active_works}"),
+            format!("  active linked worktrees:   {active_worktrees}"),
+            format!("  retained worktrees:        {retained_worktrees}"),
+            format!("  retained patches:          {retained_patches}"),
+            format!(
+                "  retained artifact size:    {}",
+                human_bytes(retained_bytes)
+            ),
+            format!("  journaled Work branches:   {journaled_branches}"),
+            format!("  terminal dirty Works:      {terminal_dirty_works}"),
+        ]
+        .join("\n");
+
+        if retained_worktrees == 0 && retained_patches == 0 && terminal_dirty_works == 0 {
+            Check::ok("git_surfaces", detail)
+        } else {
+            // §12.3 stays future work: this names the separate inspection/
+            // cleanup remedy rather than classifying anything as merged,
+            // redundant, or safe to delete, and deletes nothing itself.
+            Check::warn(
+                "git_surfaces",
+                detail,
+                "inspect with `sgt work retained` (bytes, path, and why, for everything \
+                 retained); `sgt work show <id>` explains a specific terminal-dirty Work's \
+                 integrity findings; `sgt work reap --yes <id>` explicitly discards one \
+                 reviewed retained binding — this row classifies nothing as merged or \
+                 redundant and deletes nothing on its own",
             )
         }
     }
@@ -3233,6 +3421,257 @@ pub(crate) mod doctor {
             let check = check_from_reliability(Path::new("/some/data/dir"), Reliability::Reliable);
             assert_eq!(check.status, Status::Ok);
             assert!(check.remedy.is_none());
+        }
+
+        /// §12.2/§18: a scratch data dir, no estate — the row must not even
+        /// attempt to open a journal that was never asked for.
+        #[test]
+        fn git_surfaces_is_silent_outside_an_estate() {
+            let check = git_surfaces_check(Path::new("/nonexistent/data/dir"), None);
+            assert_eq!(check.status, Status::Ok);
+            assert_eq!(check.detail, "not an estate root — nothing to check");
+        }
+
+        /// §12.2/§18: a fresh estate with a journal but nothing ever run in
+        /// it — every count is zero and the row stays `Ok`, same as every
+        /// other doctor row on a fresh install.
+        #[test]
+        fn git_surfaces_on_an_empty_journal_is_all_zero_and_ok() {
+            let data_dir = std::env::temp_dir()
+                .join(format!("sgt-git-surfaces-test-{}", ulid::Ulid::generate()));
+            Journal::open(&data_dir).expect("journal opens");
+            let check = git_surfaces_check(&data_dir, Some(Path::new("/some/estate")));
+            let _ = std::fs::remove_dir_all(&data_dir);
+            assert_eq!(check.status, Status::Ok);
+            assert!(check.remedy.is_none());
+            for row in [
+                "active works:              0",
+                "active linked worktrees:   0",
+                "retained worktrees:        0",
+                "retained patches:          0",
+                "retained artifact size:    0 B",
+                "journaled Work branches:   0",
+                "terminal dirty Works:      0",
+            ] {
+                assert!(
+                    check.detail.contains(row),
+                    "missing {row:?} in {:?}",
+                    check.detail
+                );
+            }
+        }
+
+        /// §12.2/§18: the full row set, seeded straight into the journal —
+        /// no daemon, no real git worktree, exactly the "journal + manifest
+        /// + retained-artifact filesystem metadata" the row promises.
+        ///
+        /// Four works, four different git-surface fates:
+        /// - `work-a`: materialized, two bindings, never torn down — an
+        ///   *active* work with two active linked worktrees.
+        /// - `work-b`: materialized (one binding), torn down clean — a
+        ///   durable branch that leaves no residue.
+        /// - `work-c`: torn down with a captured, still-on-disk dirty patch
+        ///   and a `dirty` integrity verdict — one retained patch, one
+        ///   terminal dirty work.
+        /// - `work-d`: torn down `retained_error` with the worktree
+        ///   directory itself still on disk and a `dirty` verdict — one
+        ///   retained worktree, a second terminal dirty work.
+        ///
+        /// Expected tally: 1 active work, 2 active linked worktrees, 1
+        /// retained worktree, 1 retained patch, 2 terminal dirty works, and
+        /// 5 journaled Work branches (2 + 1 + 1 + 1 across the four works) —
+        /// none of it requiring a single `git` invocation.
+        #[test]
+        fn git_surfaces_tallies_a_seeded_journal_across_four_works() {
+            use crate::domain::event::{EventDraft, EventSource};
+            use crate::runtime::surface::{KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN};
+
+            let data_dir = std::env::temp_dir()
+                .join(format!("sgt-git-surfaces-test-{}", ulid::Ulid::generate()));
+            std::fs::create_dir_all(&data_dir).expect("scratch data dir");
+
+            // On-disk evidence `retained_bindings` reads live, per its own
+            // "report what is actually on disk right now" rule.
+            let patch_path = data_dir.join("work-c-patch.diff");
+            std::fs::write(&patch_path, b"diff --git a/x b/x\n").expect("write patch fixture");
+            let worktree_path = data_dir.join("work-d-worktree");
+            std::fs::create_dir_all(&worktree_path).expect("worktree fixture dir");
+            std::fs::write(worktree_path.join("dirty.txt"), b"uncommit")
+                .expect("worktree fixture file");
+
+            let source = EventSource::new("test", "git_surfaces");
+            let mut journal = Journal::open(&data_dir).expect("journal opens");
+
+            let materialized = |repos: &[&str]| {
+                json!({
+                    "surface": {
+                        "work_id": "placeholder",
+                        "root": data_dir.join("surfaces/placeholder"),
+                        "bindings": repos.iter().map(|r| json!({
+                            "repository": r,
+                            "source_path": data_dir.join("repos").join(r),
+                            "base_sha": "0".repeat(40),
+                            "worktree_path": data_dir.join("surfaces/placeholder").join(r),
+                            "work_branch": format!("sergeant/{r}"),
+                            "head_sha": "0".repeat(40),
+                        })).collect::<Vec<_>>(),
+                    }
+                })
+            };
+
+            // work-a: two bindings, active (no teardown).
+            journal
+                .append(
+                    EventDraft::new(
+                        source.clone(),
+                        KIND_SURFACE_MATERIALIZED,
+                        materialized(&["one", "two"]),
+                    )
+                    .with_work_id("work-a"),
+                )
+                .expect("append work-a materialized");
+
+            // work-b: one binding, torn down clean.
+            journal
+                .append(
+                    EventDraft::new(
+                        source.clone(),
+                        KIND_SURFACE_MATERIALIZED,
+                        materialized(&["solo"]),
+                    )
+                    .with_work_id("work-b"),
+                )
+                .expect("append work-b materialized");
+            journal
+                .append(
+                    EventDraft::new(
+                        source.clone(),
+                        KIND_SURFACE_TORN_DOWN,
+                        json!({
+                            "report": {
+                                "work_id": "work-b",
+                                "clean": true,
+                                "bindings": [{
+                                    "repository": "solo",
+                                    "worktree_path": data_dir.join("surfaces/work-b/solo"),
+                                    "work_branch": "sergeant/work-b",
+                                    "disposition": "removed",
+                                }],
+                            },
+                            "integrity": "clean",
+                        }),
+                    )
+                    .with_work_id("work-b"),
+                )
+                .expect("append work-b torn down");
+
+            // work-c: torn down with a retained, on-disk patch; dirty.
+            journal
+                .append(
+                    EventDraft::new(
+                        source.clone(),
+                        KIND_SURFACE_MATERIALIZED,
+                        materialized(&["patched"]),
+                    )
+                    .with_work_id("work-c"),
+                )
+                .expect("append work-c materialized");
+            journal
+                .append(
+                    EventDraft::new(
+                        source.clone(),
+                        KIND_SURFACE_TORN_DOWN,
+                        json!({
+                            "report": {
+                                "work_id": "work-c",
+                                "clean": false,
+                                "bindings": [{
+                                    "repository": "patched",
+                                    "worktree_path": data_dir.join("surfaces/work-c/patched"),
+                                    "work_branch": "sergeant/work-c",
+                                    "disposition": "retained_dirty",
+                                    "changes": " M dirty.rs",
+                                    "patch": {"path": patch_path, "bytes": 19},
+                                }],
+                            },
+                            "integrity": "dirty",
+                        }),
+                    )
+                    .with_work_id("work-c"),
+                )
+                .expect("append work-c torn down");
+
+            // work-d: torn down `retained_error`, worktree dir still on
+            // disk; dirty.
+            journal
+                .append(
+                    EventDraft::new(
+                        source.clone(),
+                        KIND_SURFACE_MATERIALIZED,
+                        materialized(&["stuck"]),
+                    )
+                    .with_work_id("work-d"),
+                )
+                .expect("append work-d materialized");
+            journal
+                .append(
+                    EventDraft::new(
+                        source.clone(),
+                        KIND_SURFACE_TORN_DOWN,
+                        json!({
+                            "report": {
+                                "work_id": "work-d",
+                                "clean": false,
+                                "bindings": [{
+                                    "repository": "stuck",
+                                    "worktree_path": worktree_path,
+                                    "work_branch": "sergeant/work-d",
+                                    "disposition": "retained_error",
+                                    "detail": "worktree remove refused: bare repository",
+                                }],
+                            },
+                            "integrity": "dirty",
+                        }),
+                    )
+                    .with_work_id("work-d"),
+                )
+                .expect("append work-d torn down");
+            drop(journal);
+
+            let check = git_surfaces_check(&data_dir, Some(Path::new("/some/estate")));
+            let _ = std::fs::remove_dir_all(&data_dir);
+
+            assert_eq!(
+                check.status,
+                Status::Warn,
+                "residue must not read as Ok: {check:?}"
+            );
+            let remedy = check.remedy.expect("nonzero residue must name a remedy");
+            assert!(remedy.contains("sgt work retained"), "remedy: {remedy}");
+            assert!(remedy.contains("sgt work reap"), "remedy: {remedy}");
+
+            for row in [
+                "active works:              1",
+                "active linked worktrees:   2",
+                "retained worktrees:        1",
+                "retained patches:          1",
+                "journaled Work branches:   5",
+                "terminal dirty Works:      2",
+            ] {
+                assert!(
+                    check.detail.contains(row),
+                    "missing {row:?} in {:?}",
+                    check.detail
+                );
+            }
+            // 19 (the patch's recorded size) + 8 ("uncommit"'s live directory
+            // size) = 27 bytes total, well under a KiB — `human_bytes` still
+            // renders it in bytes.
+            assert!(
+                check.detail.contains("retained artifact size:    27 B"),
+                "{:?}",
+                check.detail
+            );
         }
     }
 }
