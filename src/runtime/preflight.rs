@@ -682,7 +682,13 @@ fn check_one(
 
     Ok(AdmittedRepository {
         repository: name.to_string(),
-        mount_path: canonical_top_level.clone(),
+        // §3.5 lists "mount path" and "canonical Git top level" separately,
+        // and they are separate here too: the first is §6.1's derived mount
+        // as the estate declares it, the second is what git resolved that
+        // path to. Checks 2 and 3 are exactly the requirement that they
+        // agree — recording only one of them would erase the fact that they
+        // were compared.
+        mount_path: mount.to_path_buf(),
         canonical_top_level,
         canonical_common_dir,
         base_branch,
