@@ -21,7 +21,7 @@ cheap `sgt doctor` surface summary. Vocabulary moves from Workspace to Estate.
 
 | # | Finding | Disposition here |
 |---|---------|------------------|
-| C1 | §14.5 "Captain captains" claims an owner ruling that exists nowhere (not in ADRs, rulings, or the proposal's own §20 register) and reverses live ROUTING doctrine (BU-0004/BU-0009, J5) | **Struck.** Not implemented. If wanted, it is a new owner decision with the overrides named — flagged as an open question below. |
+| C1 | §14.5 "Captain captains" claims an owner ruling that exists nowhere (not in ADRs, rulings, or the proposal's own §20 register) and reverses live ROUTING doctrine (BU-0004/BU-0009, J5) | **Resolved by owner (2026-08-20):** the intent was emphasis, not prohibition — Captain focuses on dispatching Work and shaping intent rather than writing code. Phase F encodes it as doctrine emphasis; the existing ROUTING allowances (BU-0004/BU-0009) are not revoked. |
 | C2 | `adapter_observed_outside_surface_git_command` / `backend_reported_outside_surface_write` have no detection mechanism in the current claude adapter (session-fixed cwd, raw `input` blobs) | Both variants **stay in the closed enum but are emission-gated on structured evidence**. No heuristic shell parsing. The claude adapter emits no such evidence today, so these findings do not fire yet; the contract test asserts an adapter without the evidence still runs and core reports only what it can prove (§18). |
 | C3 | Widening `surface.materializing/materialized/torn_down` rewrites crash-window recovery (engine.rs re-attachment sites) | Journal changes are **additive**: new fields tolerated as optional on replay, new event kinds where widening would be ambiguous. "Re-derive crash-window recovery against the new event shape" is an explicit work item of Phases B and E with its own tests. |
 | C4 | `fsutil::take_exclusive_lock` is try-once/fail-fast/process-lifetime; §9.4 needs blocking, re-acquirable, contending locks | **New primitive**: a blocking interprocess file lock keyed by canonical `git rev-parse --path-format=absolute --git-common-dir`, built and tested in its own slice item before the rekey. §8.1 step 5 reuses `platform/fs_locking::detect_for_path` on the mount's filesystem (same gate the daemon applies to the data dir). |
@@ -31,7 +31,7 @@ cheap `sgt doctor` surface summary. Vocabulary moves from Workspace to Estate.
 | C7b | The run-template companion proposal does not exist | `--template`/`sgt template` **struck** from scope resolution and command classification until that document exists. Scope forms are `--repo`, `--group`, `--all` only. |
 | C8 | The dogfood estate has two repos and no `[group]`; the scope gate would flip with no shorthand | The dogfood manifest is seeded with a group **in the same change** that enforces explicit scope (machine-local `sergeant.toml`; noted in CHANGELOG upgrade notes). |
 | C9 | #124/#144 (teardown vs parked external no-mistakes runs) sit inside the teardown machinery and were unaddressed | Disposition: **explicitly out of scope** for this integration; the retention taxonomy (§12) is built so #144's suggested retention category can be added without schema change. Noted in the head PR. |
-| C10 | No non-chdir path to name an estate (`-C`-style flag) | **Not implemented** — product-surface decision reserved for the owner. Open question below. |
+| C10 | No non-chdir path to name an estate (`-C`-style flag) | **Approved by owner (2026-08-20).** `sgt -C <estate-root>` lands in Phase D: names an exact root explicitly (no search, no inference; env remains evidence-only per §5.3), following the existing global-flag pattern. The CLI is agent-first; an agent should not need to mutate its own cwd to address an estate. |
 | C11 | Slice 1 under-sized; §18's "scripted Git binary" has no infrastructure (`runtime/git.rs` bare `Command::new("git")`) | Phase 0 makes the git binary **injectable** (mirroring `docker_bin`), enabling the no-network/no-branch-switch admission tests. |
 | C12 | `--workspace` quoted as live flag text in shipped estate content | Swept in Phase F; `validate-skew` run against the pattern. |
 
@@ -68,11 +68,8 @@ are already proven.
 
 ## 5. Open questions for the owner (do not block integration)
 
-1. **`sgt -C <estate-root>`** — an explicit, non-searching flag naming an
-   exact root for scripts/hooks. Gauntlet recommends; product-surface call is
-   yours. (C10)
-2. **§14.5 "Captain captains"** — if you want it, it becomes decision #22
-   with the BU-0004/BU-0009 override named explicitly. Struck from this
-   integration. (C1)
+1. ~~`sgt -C <estate-root>`~~ — approved 2026-08-20; implemented in Phase D. (C10)
+2. ~~§14.5 "Captain captains"~~ — resolved 2026-08-20 as doctrine emphasis,
+   encoded in Phase F. (C1)
 3. **#124/#144 retention category** for parked external runs — taxonomy is
    left compatible; scheduling that work is yours. (C9)
