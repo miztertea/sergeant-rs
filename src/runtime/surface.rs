@@ -2457,6 +2457,63 @@ mod tests {
         }
     }
 
+    /// Amendment C3: every journal change is additive. A `surface.materialized`
+    /// payload written before Phase E has no `preflight` key and a plain
+    /// string `base_branch`, and both must replay as exactly the facts they
+    /// recorded — nothing invented, and "no preflight ran" distinguishable
+    /// from "preflight waived nothing".
+    #[test]
+    fn a_pre_phase_e_binding_replays_with_no_preflight_evidence() {
+        let payload = serde_json::json!({
+            "repository": "api",
+            "source_path": "/estate/repos/api",
+            "base_branch": "main",
+            "base_sha": "a".repeat(40),
+            "worktree_path": "/data/surfaces/01OLD/api",
+            "work_branch": "sergeant/01OLD",
+            "head_sha": "a".repeat(40),
+        });
+        let binding: RepositoryBinding =
+            serde_json::from_value(payload).expect("a pre-Phase-E binding still deserializes");
+        assert_eq!(binding.base_branch.as_deref(), Some("main"));
+        assert_eq!(
+            binding.preflight, None,
+            "absent means no preflight ran — never an empty evidence record, which would \
+             claim preflight ran and waived nothing"
+        );
+        assert_eq!(binding.origin, BindingOrigin::Cut);
+        assert_eq!(binding.canonical_top_level, None);
+
+        // And the detached sentinel that field used to carry replays as the
+        // string it was, rather than being silently reinterpreted as absence.
+        let detached = serde_json::json!({
+            "repository": "api",
+            "source_path": "/estate/repos/api",
+            "base_branch": "(detached)",
+            "base_sha": "b".repeat(40),
+            "worktree_path": "/data/surfaces/01OLD/api",
+            "work_branch": "sergeant/01OLD",
+            "head_sha": "b".repeat(40),
+        });
+        let binding: RepositoryBinding = serde_json::from_value(detached).expect("replays");
+        assert_eq!(binding.base_branch.as_deref(), Some("(detached)"));
+    }
+
+    /// The same rule for the plan: a `surface.materializing` from before
+    /// Phase E carries no admission at all, and materializing from it falls
+    /// back to reading the mount — the only thing it could ever do.
+    #[test]
+    fn a_pre_phase_e_surface_plan_replays_with_no_admission() {
+        let payload = serde_json::json!({
+            "root": "/data/surfaces/01OLD",
+            "work_branch": "sergeant/01OLD",
+            "repositories": [{"name": "api", "path": "/estate/repos/api"}],
+        });
+        let plan: SurfacePlan = serde_json::from_value(payload).expect("replays");
+        assert!(plan.admitted.is_empty());
+        assert!(!plan.override_git_preflight);
+    }
+
     /// §11: "runtime work surfaces live outside the source checkout". A data
     /// dir configured *inside* a repository would put a worktree in the
     /// checkout whose files are supposed to stay declarative — refused, not
