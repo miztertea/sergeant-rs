@@ -59,7 +59,8 @@ group", "set up this estate", "file a ticket for a missing prerequisite").
    It is one of the four surfaces that work outside an estate at all
    (`sgt --help`, `--version`, `sgt init`, `sgt doctor`), so it can also
    answer "am I anywhere near an estate?" before anything else is tried.
-3. `sgt repo list` — every declared `[[repo]]`: name, origin, local path.
+3. `sgt repo list` — every declared `[[repo]]`: name, local path, instruction
+   policy, origin, and upstream.
 4. `sgt group list` — every declared `[group.<name>]` and its members, if the
    task spans more than one repo.
 
@@ -80,6 +81,14 @@ not a bug to work around.
   `repos/<name>` if the directory doesn't exist yet, or verifies it's
   already a git repository if it does, then declares `[[repo]]`. This is
   the entire "clone missing" half of `sgt-sync`, natively.
+- **A repo whose upstream should resolve inside every surface:**
+  `sgt repo add <name> --upstream <url>` — records `[[repo]] upstream` and
+  configures the mount's `upstream` remote, so `gh`, `glab` and plain `git`
+  all resolve it from a Work's worktree. The URL is opaque and forge-neutral:
+  sergeant infers no host, forge or CLI from it. The manifest is the
+  authority — if a mount's remote later stops matching what it declares,
+  `sgt doctor`'s estate row names the drift and the exact `git remote
+  add|set-url` command that fixes it, and never rewrites the mount itself.
 - **An already-declared repo whose local clone is behind its remote:**
   **no `sgt` verb covers this today** (the "pull existing" half of
   `sgt-sync` has no engine-side equivalent — a genuine, named gap, not
@@ -120,10 +129,13 @@ for per-repo role, a free-text `agent_instructions` block (default and per-
 group), and a project-level GitHub identity. None of these have a
 `sergeant.toml` field today (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md` — the schema
 has `[[repo]] instructions = "local" | "suppress"`, not free text, and no
-GitHub-identity or Graphify-path field at the estate level). Don't invent
-values for fields that don't exist; if a user asks for one of these, say
-plainly that sergeant-rs's estate model doesn't have that field yet rather
-than fabricating a place to put the answer.
+Graphify-path field at the estate level). The nearest thing to the third is
+`[[repo]] upstream`, and it is deliberately narrower than what was asked
+for: one opaque URL per repository, no identity, credential, account or
+forge attached — record a URL there and nothing else. Don't invent values
+for fields that don't exist; if a user asks for one of these, say plainly
+that sergeant-rs's estate model doesn't have that field yet rather than
+fabricating a place to put the answer.
 
 ## Filing tracked work for a gap `sgt doctor` can't remedy
 

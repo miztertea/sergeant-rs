@@ -4507,6 +4507,7 @@ mod tests {
                 })
                 .collect(),
             repository_origin: BTreeMap::new(),
+            repository_upstream: BTreeMap::new(),
         }
     }
 
@@ -4911,6 +4912,7 @@ mod tests {
                 repository_policy: std::collections::BTreeMap::new(),
                 groups: std::collections::BTreeMap::new(),
                 repository_origin: std::collections::BTreeMap::new(),
+                repository_upstream: std::collections::BTreeMap::new(),
             },
             repositories: Vec::new(),
             surfaces_root: dir.path().join("surfaces"),

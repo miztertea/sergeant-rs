@@ -1770,6 +1770,256 @@ fn work_retained_and_reap_are_reachable_from_the_real_cli() {
     data_dir.reap();
 }
 
+/// guard-map: `sgt work sweep` (#159), reachable end to end through the real
+/// CLI/daemon. The bare verb classifies and mutates nothing;
+/// `--delete-redundant` alone prints exactly what `--yes` would destroy and
+/// still mutates nothing; `--yes` deletes the redundant branch and leaves the
+/// orphan — the one this estate's journal has no Work for — standing.
+/// Mutation this kills: the preview path deleting anything, the confirmed
+/// path widening past `redundant`, or either path failing to reach the
+/// daemon at all.
+#[test]
+fn work_sweep_classifies_previews_then_deletes_from_the_real_cli() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+    write_two_stage_workflow(repo.path());
+    let mount = repo.path().join("repos").join("solo");
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--workflow",
+            "tiny",
+            "leave a branch behind",
+        ],
+    );
+    submitted.assert_ok("run");
+    let work_id = submitted.json()["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    wait_for_state(repo.path(), data_dir.path(), &work_id, "completed");
+    let work_branch = format!("sergeant/{work_id}");
+
+    // A `sergeant/*` ref this estate's journal knows nothing about (#172).
+    let orphan = "sergeant/01BOGUSBOGUSBOGUSBOGUSBOGUS";
+    git(&mount, &["branch", orphan, "main"]);
+
+    let report = run(repo.path(), Some(data_dir.path()), &[], &["work", "sweep"]);
+    report.assert_ok("work sweep");
+    for expected in ["default branch: main", "redundant", "orphan", &work_branch] {
+        assert!(
+            report.stdout.contains(expected),
+            "the report must name {expected:?}: {}",
+            report.stdout
+        );
+    }
+
+    let refs_before = git(&mount, &["for-each-ref", "--format=%(refname:short)"]);
+    let preview = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "sweep", "--delete-redundant"],
+    );
+    preview.assert_ok("work sweep --delete-redundant (preview)");
+    assert!(
+        preview.stdout.contains("--yes would permanently delete:")
+            && preview.stdout.contains(&work_branch),
+        "the preview must name exactly what --yes would destroy: {}",
+        preview.stdout
+    );
+    assert!(
+        !preview.stdout.contains(orphan),
+        "an orphan is never deletable, so it must not appear in the deletion preview: {}",
+        preview.stdout
+    );
+    assert_eq!(
+        refs_before,
+        git(&mount, &["for-each-ref", "--format=%(refname:short)"]),
+        "a preview must not touch a single ref"
+    );
+
+    let deleted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "sweep", "--delete-redundant", "--yes"],
+    );
+    deleted.assert_ok("work sweep --delete-redundant --yes");
+    assert!(
+        deleted.stdout.contains("deleted at"),
+        "got: {}",
+        deleted.stdout
+    );
+    let refs_after = git(&mount, &["for-each-ref", "--format=%(refname:short)"]);
+    assert!(!refs_after.contains(&work_branch), "{refs_after}");
+    assert!(refs_after.contains(orphan), "{refs_after}");
+    assert!(refs_after.contains("main"), "{refs_after}");
+
+    data_dir.reap();
+}
+
+// ------------------------------------------------------------ intent file
+
+/// guard-map: `sgt run --intent-file <PATH>` (#166) submits the file's
+/// contents as the intent, byte for byte apart from the single trailing
+/// newline an editor appends — including the multi-line, quote-bearing shape
+/// that is the whole reason the flag exists. Mutation this kills: any
+/// parsing, templating, trimming or re-wrapping of the file between reading
+/// it and the request body.
+#[test]
+fn run_intent_file_submits_the_files_contents_verbatim() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+
+    // Interior blank lines, quotes, a backslash, leading whitespace and a
+    // trailing space — everything shell quoting would mangle and everything
+    // a well-meaning normalizer would "fix".
+    let intent = "Fix the \"widget\" parser.\n\nIt must handle a\\b and   \n  indented lines.";
+    let path = repo.path().join("brief.md");
+    std::fs::write(&path, format!("{intent}\n")).expect("write brief");
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--intent-file",
+            path.to_str().expect("utf8 path"),
+        ],
+    );
+    submitted.assert_ok("run --intent-file");
+    assert_eq!(
+        submitted.json()["work"]["intent"].as_str(),
+        Some(intent),
+        "the submitted intent must be the file, verbatim"
+    );
+
+    data_dir.reap();
+}
+
+/// guard-map: exactly one of the positional intent and `--intent-file` may
+/// be given, and neither is an error — clap's own pairing, checked here
+/// rather than trusted, since a dropped `conflicts_with` would silently make
+/// one of the two win. Neither case may reach a daemon.
+#[test]
+fn run_requires_exactly_one_of_intent_and_intent_file() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+    let path = repo.path().join("brief.md");
+    std::fs::write(&path, "from the file\n").expect("write brief");
+
+    let both = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "run",
+            "on the command line",
+            "--intent-file",
+            path.to_str().expect("utf8 path"),
+        ],
+    );
+    both.assert_fails("both an intent and --intent-file");
+    assert!(
+        both.stderr.contains("--intent-file"),
+        "the refusal must name the conflict: {}",
+        both.stderr
+    );
+
+    let neither = run(repo.path(), Some(data_dir.path()), &[], &["run"]);
+    neither.assert_fails("neither an intent nor --intent-file");
+
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "a refused submission must never have spawned a daemon"
+    );
+    data_dir.reap();
+}
+
+/// guard-map: `--intent-file`'s mechanical guards, each refusing before any
+/// daemon contact and each naming what it refused. Mutation this kills:
+/// dropping the symlink check (`fs::read` would happily follow it), the
+/// regular-file check, the size ceiling, or the UTF-8 requirement.
+#[test]
+fn run_intent_file_refuses_a_symlink_a_directory_an_oversized_file_and_non_utf8() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+
+    let submit = |path: &Path| {
+        run(
+            repo.path(),
+            Some(data_dir.path()),
+            &[],
+            &["run", "--intent-file", path.to_str().expect("utf8 path")],
+        )
+    };
+
+    let real = repo.path().join("real.md");
+    std::fs::write(&real, "a perfectly good intent\n").expect("write");
+    let link = repo.path().join("link.md");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    #[cfg(unix)]
+    {
+        let refused = submit(&link);
+        refused.assert_fails("a symlinked --intent-file");
+        assert!(
+            refused.stderr.contains("symlink"),
+            "got: {}",
+            refused.stderr
+        );
+    }
+
+    let refused = submit(repo.path());
+    refused.assert_fails("a directory as --intent-file");
+    assert!(
+        refused.stderr.contains("not a regular file"),
+        "got: {}",
+        refused.stderr
+    );
+
+    let oversized = repo.path().join("huge.md");
+    std::fs::write(&oversized, vec![b'x'; 1024 * 1024 + 1]).expect("write");
+    let refused = submit(&oversized);
+    refused.assert_fails("an oversized --intent-file");
+    assert!(
+        refused.stderr.contains("1.0 MiB") && refused.stderr.contains("limit"),
+        "the refusal must name the limit and the actual size: {}",
+        refused.stderr
+    );
+
+    let binary = repo.path().join("binary.md");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00]).expect("write");
+    let refused = submit(&binary);
+    refused.assert_fails("a non-UTF-8 --intent-file");
+    assert!(
+        refused.stderr.contains("not valid UTF-8"),
+        "got: {}",
+        refused.stderr
+    );
+
+    let missing = repo.path().join("nope.md");
+    submit(&missing).assert_fails("a missing --intent-file");
+
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "every guard must refuse before any daemon contact"
+    );
+    data_dir.reap();
+}
+
 // -------------------------------------------------- envelope / daemon stop
 
 /// guard-map: `sgt run --turns N --ceiling-secs S` (checkpoint-friction

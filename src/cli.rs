@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiClient, ClientError};
 use crate::daemon::{self, RuntimeDescriptor};
 use crate::domain::estate::{Estate, EstateRoot, RootSource};
+use crate::runtime::sweep::SweepTarget;
 
 /// How long the client waits for a spawned daemon to publish a healthy
 /// descriptor before giving up.
@@ -91,8 +92,23 @@ enum Command {
     Status,
     /// Submit new work.
     Run {
-        /// The intent to submit.
-        intent: String,
+        /// The intent to submit. Give this or `--intent-file`, never both.
+        #[arg(required_unless_present = "intent_file")]
+        intent: Option<String>,
+        /// Read the intent from a file instead of the command line (#166).
+        ///
+        /// The file's contents become the intent verbatim — only a trailing
+        /// newline is trimmed. Nothing is parsed, templated or interpreted,
+        /// and the daemon receives exactly the same string a positional
+        /// intent would have sent. For a multi-paragraph brief that shell
+        /// quoting mangles, or one an editor or another tool produced.
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "intent",
+            required_unless_present = "intent"
+        )]
+        intent_file: Option<PathBuf>,
         /// Workflow to run (default: the estate's, else `software-change`).
         #[arg(long)]
         workflow: Option<String>,
@@ -335,6 +351,14 @@ enum RepoCommand {
         /// Clone source. Required unless `repos/<name>` already exists.
         #[arg(long)]
         origin: Option<String>,
+        /// Forge-neutral upstream URL (#112): recorded on the `[[repo]]`
+        /// entry and configured as the mount's `upstream` remote, so `gh`,
+        /// `glab` and `git` all resolve it inside any surface cut from this
+        /// repository. The URL is opaque — no host or forge is inferred
+        /// from it. `sgt doctor` names the drift if a mount's remote later
+        /// stops matching what the manifest declares.
+        #[arg(long)]
+        upstream: Option<String>,
         /// R-MVP1-4 instruction policy: `local` or `suppress` (default:
         /// unset, which resolves to `suppress`).
         #[arg(long)]
@@ -436,6 +460,29 @@ enum WorkCommand {
         /// Actually perform the deletion. Without it, this only previews
         /// what would be destroyed.
         #[arg(long)]
+        yes: bool,
+    },
+    /// §12.3's deliberate sweep (#159): classify every `sergeant/*` branch
+    /// in every mount of this estate — `active` (a Work is still on it),
+    /// `redundant` (its tip is already contained in the mount's default
+    /// branch, so it holds no unique commits), `retained` (a terminal Work's
+    /// unique work), `orphan` (a `sergeant/*` ref sergeant never journaled)
+    /// — and report each mount's prunable worktree registrations.
+    ///
+    /// Deliberately not part of `sgt doctor`: this walks every mount's ref
+    /// store and asks git about ancestry per branch, where doctor's
+    /// git-surfaces row is a cheap count off the journal.
+    ///
+    /// Reports only, unless `--delete-redundant --yes` is given. Nothing but
+    /// a `redundant` branch is ever deletable, and the daemon re-proves that
+    /// per branch at deletion time.
+    Sweep {
+        /// Delete the branches classified `redundant`. Without `--yes` this
+        /// only prints exactly what would be deleted.
+        #[arg(long)]
+        delete_redundant: bool,
+        /// Actually perform the deletion (requires `--delete-redundant`).
+        #[arg(long, requires = "delete_redundant")]
         yes: bool,
     },
 }
@@ -766,6 +813,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         }
         Command::Run {
             intent,
+            intent_file,
             workflow,
             backend,
             profile,
@@ -786,6 +834,22 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // expansion (MVP-3 finding MVP3-C2, R-MVP1-5(b)); §7.2's own
             // rule — "a client surface adds usability, never functionality"
             // — is exactly what retires that.
+            //
+            // #166: the file is read before any daemon contact, so a refused
+            // read costs no spawn and no journal entry.
+            let intent = match (intent, intent_file) {
+                (Some(intent), _) => intent,
+                (None, Some(path)) => read_intent_file(&path)?,
+                // clap's `required_unless_present` pairing already refused
+                // this; kept as a refusal rather than an `expect` because a
+                // parser change should degrade to a diagnostic, not a panic.
+                (None, None) => {
+                    return Err(CliError::new(
+                        "no intent given: pass one as an argument, or name a file with \
+                         --intent-file <PATH>",
+                    ));
+                }
+            };
             let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
@@ -908,6 +972,66 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Work {
+            command:
+                WorkCommand::Sweep {
+                    delete_redundant,
+                    yes,
+                },
+        } => {
+            // Classification mutates nothing, so it connects like `retained`
+            // (ADR 0009: observation must not materialize the thing
+            // observed). Only the confirmed deletion joins `reap`'s bucket
+            // and may spawn a daemon.
+            let client = if delete_redundant && yes {
+                ensure_daemon(&data_dir, &estate_root(&estate)).await?
+            } else {
+                observe_connect(&data_dir, &estate_root(&estate)).await?
+            };
+            let report = client.sweep().await?;
+            if !delete_redundant {
+                if sgt.json {
+                    print_json(&report);
+                } else {
+                    print_sweep(&report);
+                }
+                return Ok(());
+            }
+            let redundant = redundant_branches(&report);
+            if !yes {
+                if sgt.json {
+                    let targets: Vec<&SweepTarget> = redundant.iter().map(|(t, _)| t).collect();
+                    print_json(&json!({"would_delete": targets}));
+                } else if redundant.is_empty() {
+                    println!("nothing is classified redundant — nothing to delete");
+                } else {
+                    println!("--yes would permanently delete:");
+                    for (target, tip) in &redundant {
+                        println!("  {}  {}  {tip}", target.repository, target.branch);
+                    }
+                    println!("re-run with --yes to actually delete these");
+                }
+                return Ok(());
+            }
+            if redundant.is_empty() {
+                if sgt.json {
+                    print_json(&json!({"deleted": []}));
+                } else {
+                    println!("nothing is classified redundant — nothing to delete");
+                }
+                return Ok(());
+            }
+            // The daemon re-classifies every one of these before deleting
+            // any of it; this list is a request, not a grant.
+            let targets: Vec<SweepTarget> = redundant.into_iter().map(|(t, _)| t).collect();
+            let result = client.sweep_delete(&targets, true).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_sweep_deletion(&result);
+            }
+            Ok(())
+        }
         Command::Work { command } => {
             let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             match command {
@@ -1011,9 +1135,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     }
                     Ok(())
                 }
-                // Handled by the dedicated `ensure_daemon` arm above, since
-                // reap mutates durable state — never reachable here.
+                // Both are handled by their own dedicated arms above —
+                // never reachable here.
                 WorkCommand::Reap { .. } => unreachable!("reap is matched before this arm"),
+                WorkCommand::Sweep { .. } => unreachable!("sweep is matched before this arm"),
             }
         }
         Command::Analytics { name } => {
@@ -1206,6 +1331,86 @@ fn estate_root(estate: &Option<EstateRoot>) -> PathBuf {
         .clone()
 }
 
+/// The most an `--intent-file` may hold (#166).
+///
+/// An intent is prose — a brief, a task description, a pasted issue body.
+/// One mebibyte is orders of magnitude past anything a human or a tool
+/// writes for that, and comfortably inside what a loopback request body
+/// carries on every target platform, so the limit is here to catch a
+/// *mistake* (a binary, a log, the wrong path) rather than to ration
+/// anything. A refusal names both the limit and the actual size, so the
+/// operator can see which of the two they hit.
+const INTENT_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read `--intent-file` as the intent, verbatim (#166).
+///
+/// Pure transport: the contents become the same `intent` string a positional
+/// argument would have produced, and nothing downstream — the request body,
+/// the engine, the journal — can tell the two apart. Nothing here parses,
+/// templates or interprets the file.
+///
+/// The guards are mechanical and ordered, each refusing before the next is
+/// asked, and all of them before any daemon contact — a refused read costs
+/// no daemon spawn and no journal entry:
+///
+/// 1. **the leaf is a symlink** — the same `symlink_metadata` check
+///    `estate::validate_mount` makes for a mount, for the same reason: what
+///    a path *is* must be decided before anything follows it somewhere else;
+/// 2. **not a regular file** — a directory, a fifo or a device is a mistake,
+///    and reading a fifo would hang a CLI that has no timeout of its own;
+/// 3. **larger than [`INTENT_FILE_MAX_BYTES`]**;
+/// 4. **not valid UTF-8** — an intent is text, and the wire contract is a
+///    JSON string.
+fn read_intent_file(path: &Path) -> Result<String, CliError> {
+    let display = path.display();
+    let metadata = path.symlink_metadata().map_err(|e| {
+        CliError::new(format!(
+            "cannot read --intent-file {display}: {e}; check the path"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::new(format!(
+            "--intent-file {display} is a symlink; name the file it points at directly"
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(CliError::new(format!(
+            "--intent-file {display} is not a regular file; name a text file holding the intent"
+        )));
+    }
+    let too_large = |actual: u64| {
+        CliError::new(format!(
+            "--intent-file {display} is {} — larger than the {} limit; name the file holding \
+             the intent, or shorten it",
+            doctor::human_bytes(actual),
+            doctor::human_bytes(INTENT_FILE_MAX_BYTES),
+        ))
+    };
+    if metadata.len() > INTENT_FILE_MAX_BYTES {
+        return Err(too_large(metadata.len()));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| CliError::new(format!("cannot read --intent-file {display}: {e}")))?;
+    // Re-checked against what was actually read: the file may have grown
+    // between the `symlink_metadata` above and this read.
+    if bytes.len() as u64 > INTENT_FILE_MAX_BYTES {
+        return Err(too_large(bytes.len() as u64));
+    }
+    let text = String::from_utf8(bytes).map_err(|e| {
+        CliError::new(format!(
+            "--intent-file {display} is not valid UTF-8 ({e}); an intent is text"
+        ))
+    })?;
+    // The one edit made to the contents: the single line terminator an
+    // editor appends. Everything else — interior blank lines, trailing
+    // spaces, a second trailing newline someone meant — is the intent.
+    Ok(text
+        .strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .unwrap_or(&text)
+        .to_string())
+}
+
 /// `sgt repo add/remove/list` (MVP-3): a pure manifest edit/read, no daemon
 /// involved — repository declarations are estate topology (§9), not runtime
 /// state.
@@ -1218,6 +1423,7 @@ async fn repo_command(
         RepoCommand::Add {
             name,
             origin,
+            upstream,
             instructions,
         } => {
             let policy = match instructions.as_deref() {
@@ -1230,7 +1436,13 @@ async fn repo_command(
                     )));
                 }
             };
-            crate::domain::manifest::add_repo(estate_root, &name, origin.as_deref(), policy)?;
+            crate::domain::manifest::add_repo(
+                estate_root,
+                &name,
+                origin.as_deref(),
+                upstream.as_deref(),
+                policy,
+            )?;
             if json {
                 print_json(&json!({"added": name}));
             } else {
@@ -1261,6 +1473,7 @@ async fn repo_command(
                         "path": r.path,
                         "instructions": estate.instruction_policy(&r.name).as_str(),
                         "origin": estate.repository_origin(&r.name),
+                        "upstream": estate.repository_upstream(&r.name),
                     })).collect::<Vec<_>>(),
                 }));
             } else if estate.repositories.is_empty() {
@@ -1268,11 +1481,12 @@ async fn repo_command(
             } else {
                 for r in &estate.repositories {
                     println!(
-                        "{}  {}  instructions={}  origin={}",
+                        "{}  {}  instructions={}  origin={}  upstream={}",
                         r.name,
                         r.path.display(),
                         estate.instruction_policy(&r.name),
                         estate.repository_origin(&r.name).unwrap_or("-"),
+                        estate.repository_upstream(&r.name).unwrap_or("-"),
                     );
                 }
             }
@@ -1522,6 +1736,135 @@ fn print_reap_report(result: &Value) {
             _ => println!("{repository}: {outcome}"),
         }
     }
+}
+
+/// §12.3's sweep report (`GET /v1/sweep`, `sgt work sweep`): every mount's
+/// `sergeant/*` refs with what each one is, the default branch every
+/// `redundant` verdict is relative to, and the mount's prunable worktree
+/// registrations with git's own remedy.
+fn print_sweep(report: &Value) {
+    let empty = Vec::new();
+    let repositories = report["repositories"].as_array().unwrap_or(&empty);
+    if repositories.is_empty() {
+        println!("no repositories declared — nothing to sweep");
+        return;
+    }
+    let mut redundant = 0usize;
+    for repository in repositories {
+        let name = repository["repository"].as_str().unwrap_or("?");
+        match repository["default_branch"].as_str() {
+            Some(default) => println!("{name} (default branch: {default})"),
+            None => println!("{name} (HEAD is detached — redundancy cannot be proven here)"),
+        }
+        if let Some(unreadable) = repository["unreadable"].as_str() {
+            println!("  cannot read this mount: {unreadable}");
+            continue;
+        }
+        let branches = repository["branches"].as_array().unwrap_or(&empty);
+        if branches.is_empty() {
+            println!("  no sergeant/* branches");
+        }
+        for branch in branches {
+            let classification = branch["classification"].as_str().unwrap_or("?");
+            if classification == "redundant" {
+                redundant += 1;
+            }
+            println!(
+                "  {:<9} {}  {}  {}",
+                classification,
+                branch["branch"].as_str().unwrap_or("?"),
+                short_sha(branch["tip"].as_str().unwrap_or("?")),
+                branch["detail"].as_str().unwrap_or(""),
+            );
+        }
+        let prunable = repository["prunable_worktrees"].as_u64().unwrap_or(0);
+        if prunable > 0 {
+            println!(
+                "  {prunable} prunable worktree registration(s) — remedy: `git -C {} worktree \
+                 prune`",
+                repository["path"].as_str().unwrap_or("?"),
+            );
+        }
+    }
+    if let Some(note) = report["note"].as_str() {
+        println!("note: {note}");
+    }
+    if redundant > 0 {
+        println!(
+            "{redundant} branch(es) classified redundant; preview the deletion with `sgt work \
+             sweep --delete-redundant`"
+        );
+    }
+}
+
+/// The sweep's deletion result (`POST /v1/sweep`, `sgt work sweep
+/// --delete-redundant --yes`): what actually happened to each requested
+/// branch, including every one the daemon's own re-classification refused.
+fn print_sweep_deletion(result: &Value) {
+    let empty = Vec::new();
+    let deleted = result["deleted"].as_array().unwrap_or(&empty);
+    if deleted.is_empty() {
+        println!("nothing was deleted");
+        return;
+    }
+    for entry in deleted {
+        let where_ = format!(
+            "{}  {}",
+            entry["repository"].as_str().unwrap_or("?"),
+            entry["branch"].as_str().unwrap_or("?"),
+        );
+        match entry["outcome"].as_str() {
+            Some("deleted") => println!(
+                "{where_}: deleted at {}",
+                short_sha(entry["tip"].as_str().unwrap_or("?")),
+            ),
+            Some("refused") => println!(
+                "{where_}: refused — {}",
+                entry["reason"].as_str().unwrap_or("?"),
+            ),
+            Some("failed") => println!(
+                "{where_}: failed — {}",
+                entry["detail"].as_str().unwrap_or("?"),
+            ),
+            _ => println!("{where_}: {}", entry["outcome"]),
+        }
+    }
+}
+
+/// Every branch the daemon's classification pass called `redundant`, paired
+/// with the tip it currently points at — what the unconfirmed preview prints
+/// and what `--yes` submits.
+fn redundant_branches(report: &Value) -> Vec<(SweepTarget, String)> {
+    let empty = Vec::new();
+    report["repositories"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .flat_map(|repository| {
+            let name = repository["repository"].as_str().unwrap_or("?").to_string();
+            repository["branches"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .filter(|branch| branch["classification"].as_str() == Some("redundant"))
+                .map(|branch| {
+                    (
+                        SweepTarget {
+                            repository: name.clone(),
+                            branch: branch["branch"].as_str().unwrap_or("?").to_string(),
+                        },
+                        branch["tip"].as_str().unwrap_or("?").to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A commit for a report column: git's own abbreviation length, with a
+/// short-or-missing value passed through as-is rather than sliced blindly.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 /// A canned query's answer as a plain aligned table (M6 owns presentation).
@@ -2442,6 +2785,7 @@ pub(crate) mod doctor {
         for repo in &declared {
             declared_names.insert(repo.name.clone());
             if repo.path.exists() {
+                upstream_drift(repo, &mut details, &mut remedies);
                 continue;
             }
             details.push(format!(
@@ -2496,6 +2840,57 @@ pub(crate) mod doctor {
         } else {
             Check::warn("estate", details.join("; "), remedies.join("; "))
         }
+    }
+
+    /// #112: does this present mount's `upstream` remote say what the
+    /// manifest declares?
+    ///
+    /// The manifest is the authority and doctor is a diagnostic, so this
+    /// **names** the drift and hands over the exact `git` command that would
+    /// fix it — it never rewrites an existing mount's config. Configuring the
+    /// remote is `sgt repo add --upstream`'s job, where the operator
+    /// explicitly asked for it; a mount that drifted afterward (a hand edit, a
+    /// re-clone, a moved forge) is theirs to reconcile knowingly.
+    ///
+    /// A read-only `git remote get-url`, and legitimate here for the same
+    /// reason it is not on the admission path: `sgt doctor` is an operator
+    /// asking about their own checkout, not a Work being admitted (§6.4, and
+    /// `tests/e_admission_uses_no_network_git.rs`'s forbidden-verb list).
+    /// Nothing here parses the URL — a forge, host or CLI is never inferred
+    /// from it.
+    fn upstream_drift(
+        repo: &crate::domain::estate::DeclaredRepo,
+        details: &mut Vec<String>,
+        remedies: &mut Vec<String>,
+    ) {
+        use crate::runtime::git::{UPSTREAM_REMOTE, git_remote_url};
+
+        let Some(declared) = repo.upstream.as_deref() else {
+            return;
+        };
+        let actual = git_remote_url(&repo.path, UPSTREAM_REMOTE);
+        if actual.as_deref() == Some(declared) {
+            return;
+        }
+        let (what, verb) = match &actual {
+            Some(actual) => (
+                format!("has {UPSTREAM_REMOTE} = {actual}"),
+                "set-url".to_string(),
+            ),
+            None => (
+                format!("has no {UPSTREAM_REMOTE} remote"),
+                "add".to_string(),
+            ),
+        };
+        details.push(format!(
+            "{} declares upstream {declared} but the mount {what}",
+            repo.name
+        ));
+        remedies.push(format!(
+            "{}: `git -C {} remote {verb} {UPSTREAM_REMOTE} {declared}`",
+            repo.name,
+            repo.path.display()
+        ));
     }
 
     /// #165 (Ponytail R2 — visibility, not the fix): how many workflow
@@ -3492,6 +3887,98 @@ pub(crate) mod doctor {
             let check = check_from_reliability(Path::new("/some/data/dir"), Reliability::Reliable);
             assert_eq!(check.status, Status::Ok);
             assert!(check.remedy.is_none());
+        }
+
+        /// #112: the estate row names a declared `upstream` the mount's own
+        /// remote does not carry, with the exact `git` command that would
+        /// reconcile it — and goes quiet again once the remote agrees.
+        /// Doctor names drift; it never rewrites an existing mount.
+        ///
+        /// guard-map: dropping `upstream_drift`'s call site, comparing the
+        /// wrong remote, or "helpfully" configuring the remote from here
+        /// (the row would then never warn at all) each fail this.
+        #[test]
+        fn the_estate_row_names_upstream_drift_and_its_exact_remedy() {
+            fn git(dir: &Path, args: &[&str]) {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("GIT_AUTHOR_NAME", "sergeant tests")
+                    .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+                    .env("GIT_COMMITTER_NAME", "sergeant tests")
+                    .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .output()
+                    .expect("run git");
+                assert!(
+                    output.status.success(),
+                    "git {args:?} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let root = dir.path();
+            let mount = root.join("repos").join("api");
+            std::fs::create_dir_all(&mount).expect("mount dir");
+            git(&mount, &["init", "-b", "main"]);
+            std::fs::write(mount.join("README.md"), "# fixture\n").expect("write");
+            git(&mount, &["add", "."]);
+            git(&mount, &["commit", "-m", "initial"]);
+
+            let declared = "ssh://git@example.invalid/team/api.git";
+            std::fs::write(
+                root.join(MANIFEST_FILE),
+                format!(
+                    "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\
+                     upstream = \"{declared}\"\n"
+                ),
+            )
+            .expect("sergeant.toml");
+
+            let drifted = estate_check(Some(root));
+            assert_eq!(drifted.status, Status::Warn, "{drifted:?}");
+            assert!(
+                drifted.detail.contains(declared) && drifted.detail.contains("no upstream remote"),
+                "the row must name the declaration and what the mount actually has: {}",
+                drifted.detail
+            );
+            let remedy = drifted.remedy.expect("a warning must name its remedy");
+            assert!(
+                remedy.contains("remote add upstream") && remedy.contains(declared),
+                "the remedy must be the exact command: {remedy}"
+            );
+
+            // Reconciled by hand, exactly as the remedy says: the row goes
+            // quiet. Doctor never did this itself.
+            git(&mount, &["remote", "add", "upstream", declared]);
+            assert_eq!(estate_check(Some(root)).status, Status::Ok);
+
+            // Drifted the other way — a remote that exists and disagrees —
+            // reads as `set-url`, not `add`.
+            git(
+                &mount,
+                &[
+                    "remote",
+                    "set-url",
+                    "upstream",
+                    "https://elsewhere.invalid/x.git",
+                ],
+            );
+            let moved = estate_check(Some(root));
+            assert_eq!(moved.status, Status::Warn);
+            assert!(
+                moved.detail.contains("https://elsewhere.invalid/x.git"),
+                "{}",
+                moved.detail
+            );
+            assert!(
+                moved
+                    .remedy
+                    .expect("a warning must name its remedy")
+                    .contains("remote set-url upstream")
+            );
         }
 
         /// §12.2/§18: a scratch data dir, no estate — the row must not even

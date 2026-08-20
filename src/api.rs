@@ -71,6 +71,7 @@ use crate::runtime::surface::{
     BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
     KIND_SURFACE_TORN_DOWN, reap, retained_bindings,
 };
+use crate::runtime::sweep::{self, SweepTarget};
 
 /// API revision served by this build (`GET /v1/system`, runtime descriptor).
 pub const API_REVISION: &str = "v1";
@@ -402,6 +403,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/work/{id}/extend", post(work_extend))
         .route("/work/{id}/reap", post(reap_work))
         .route("/retained", get(list_retained))
+        .route("/sweep", get(sweep_estate).post(sweep_delete))
         .route(
             "/estate/repos",
             get(estate_list_repos).post(estate_add_repo),
@@ -2856,6 +2858,164 @@ async fn list_retained(State(state): State<ApiState>) -> Response {
     Json(json!({"retained": entries})).into_response()
 }
 
+// ------------------------------------------------------------------- sweep
+
+/// The mount-validated topology a sweep reads and (only ever) deletes in.
+///
+/// `Estate::resolve`, not `declared_repos`: a verb that may run `git branch
+/// -D` inside a directory must first have proof that directory is this
+/// estate's own ordinary checkout — §6.1's derived mount, no symlink, no
+/// linked worktree, no other estate's clone. A declared-but-unresolvable
+/// repository fails the whole pass by name rather than being swept past.
+fn sweep_topology(state: &ApiState) -> Result<Estate, (StatusCode, Value)> {
+    let root = estate_root_or_error(state)?;
+    Estate::resolve(&root).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error_body("invalid_estate", e.to_string()),
+        )
+    })
+}
+
+/// The journaled Work identity a sweep cross-references `sergeant/*` refs
+/// against: every Work this daemon has ever journaled, with its current
+/// state.
+///
+/// `work_index` is exactly that set by construction (#4: a slim row per
+/// `work.submitted`, updated in place, never evicted), so this reads it
+/// directly instead of replaying the journal for a fact the registry already
+/// holds — which also means an *absent* id is real evidence of an
+/// unjournaled ref (#172's orphan), not an eviction artifact.
+fn journaled_work_states(core: &Core) -> std::collections::BTreeMap<String, WorkState> {
+    core.registry
+        .state()
+        .work_index
+        .iter()
+        .map(|(id, row)| (id.clone(), row.state))
+        .collect()
+}
+
+/// `GET /v1/sweep` — §12.3's deliberate sweep, classification half (#159):
+/// every `sergeant/*` ref in every mount, classified `active`/`redundant`/
+/// `retained`/`orphan`, plus each mount's prunable worktree registrations.
+///
+/// Read-only in the strongest sense — it mutates neither the estate nor the
+/// journal — which is why it is a plain `GET` with no `command_id`, exactly
+/// like `GET /v1/retained`, and why `sgt work sweep` connects to an existing
+/// daemon rather than spawning one.
+///
+/// The registry read and the git walk are deliberately not held under one
+/// lock: the Work states are snapshotted under the guard, the guard is
+/// dropped, and the per-mount `for-each-ref`/`merge-base` walk — the
+/// expensive half, and the whole reason §12.3 keeps this out of `doctor` —
+/// runs with every other request free to proceed. A Work that changes state
+/// mid-walk is therefore classified against the snapshot; that is safe
+/// because nothing here acts on the answer, and the deletion half re-derives
+/// its own classification from scratch anyway.
+async fn sweep_estate(State(state): State<ApiState>) -> Response {
+    let estate = match sweep_topology(&state) {
+        Ok(estate) => estate,
+        Err((status, body)) => return (status, Json(body)).into_response(),
+    };
+    let works = {
+        let core = CoreGuard::acquire(&state.core).await;
+        journaled_work_states(&core)
+    };
+    let report = blocking(move || sweep::classify(&estate, &works)).await;
+    Json(report).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SweepRequest {
+    command_id: String,
+    /// Must be `true`, or the request is refused — sweep deletes branches
+    /// and git's reflog is the only undo.
+    #[serde(default)]
+    confirm: bool,
+    /// The branches the client believes are redundant. A request, never an
+    /// authorization: the server re-classifies every one of them.
+    #[serde(default)]
+    branches: Vec<SweepTarget>,
+}
+
+/// `POST /v1/sweep` — §12.3's deliberate sweep, deletion half (#159).
+///
+/// Refuses without `{"confirm": true}` for the same reason `reap` does:
+/// there is no journaled state a resubmission could undo, so a bare body is
+/// ambiguity, not an implicit yes (`AGENTS.md`'s fail-closed rule). The
+/// operator reviews `GET /v1/sweep` first — that is the read half of this
+/// same pair — then re-sends with the branches and confirmation.
+///
+/// **The client's `branches` list is a request, not a grant.** Classification
+/// is re-derived here, at deletion time, and only a branch this daemon still
+/// calls `redundant` — tip already contained in its mount's default branch —
+/// is deleted. An `active`, `retained` or `orphan` branch, a ref outside
+/// `sergeant/*`, and a branch that no longer exists are all refused with the
+/// reason named, having mutated nothing.
+///
+/// §22.6 tradeoff, the same one `reap` discloses: the git calls run while the
+/// core guard is held, queueing every other guarded request for their
+/// duration. A sweep is rare, explicit and never on a hot path, and holding
+/// the guard is what keeps the mutation and its `command.accepted` record —
+/// which carries the deleted branches and their tip SHAs, so the journal
+/// records what was destroyed and where it can be restored from — one
+/// indivisible step.
+async fn sweep_delete(
+    State(state): State<ApiState>,
+    body: Result<Json<SweepRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let mut core = CoreGuard::acquire(&state.core).await;
+    if let Some(resp) = replay_command(&core, &req.command_id) {
+        return resp;
+    }
+    if !req.confirm {
+        let result = error_body(
+            "confirmation_required",
+            "sweep deletes branches; review GET /v1/sweep, then resend with \"confirm\": true",
+        );
+        return record_and_respond(
+            &mut core,
+            &req.command_id,
+            "work.sweep",
+            None,
+            StatusCode::BAD_REQUEST,
+            result,
+        );
+    }
+    let estate = match sweep_topology(&state) {
+        Ok(estate) => estate,
+        Err((status, body)) => {
+            return record_and_respond(
+                &mut core,
+                &req.command_id,
+                "work.sweep",
+                None,
+                status,
+                body,
+            );
+        }
+    };
+    let works = journaled_work_states(&core);
+    let deleted =
+        blocking_sync(|| sweep::delete_redundant(&state.data_dir, &estate, &works, &req.branches));
+    let result = json!({"deleted": deleted});
+    record_and_respond(
+        &mut core,
+        &req.command_id,
+        "work.sweep",
+        None,
+        StatusCode::OK,
+        result,
+    )
+}
+
 // ------------------------------------------------------------------ estate
 //
 // §16.2/§16.3: thin daemon-side wrappers over `crate::domain::manifest`'s
@@ -2878,14 +3038,25 @@ async fn list_retained(State(state): State<ApiState>) -> Response {
 /// silently resolve to the wrong manifest rather than failing closed — the
 /// one outcome R-NS-4's discipline exists to prevent.
 fn resolve_estate_root(state: &ApiState) -> Result<PathBuf, Box<Response>> {
+    estate_root_or_error(state)
+        .map_err(|(status, body)| Box::new((status, Json(body)).into_response()))
+}
+
+/// [`resolve_estate_root`]'s answer as a `(status, body)` pair rather than a
+/// finished response — the shape a *command* handler needs, because its
+/// refusal has to be journaled under a `command_id` before it is answered
+/// with, and `record_and_respond` takes the body.
+fn estate_root_or_error(state: &ApiState) -> Result<PathBuf, (StatusCode, Value)> {
     match state.engine.estate_root.clone() {
         Some(root) => Ok(root),
-        None => Err(Box::new(error_response(
+        None => Err((
             StatusCode::NOT_FOUND,
-            "no_estate",
-            "this daemon is bound to no estate — start it from an estate root (`sgt daemon` \
-             from the root, or `sgt -C <estate-root> daemon`)",
-        ))),
+            error_body(
+                "no_estate",
+                "this daemon is bound to no estate — start it from an estate root (`sgt daemon` \
+                 from the root, or `sgt -C <estate-root> daemon`)",
+            ),
+        )),
     }
 }
 
@@ -2907,6 +3078,7 @@ fn manifest_error_code(e: &ManifestError) -> &'static str {
         ManifestError::ExistingPathNotAGitRepository { .. } => "existing_path_not_a_git_repository",
         ManifestError::NoPathAndNoOrigin { .. } => "no_path_and_no_origin",
         ManifestError::CloneFailed { .. } => "clone_failed",
+        ManifestError::UpstreamRemoteFailed { .. } => "upstream_remote_failed",
         ManifestError::MalformedSection { .. } => "malformed_section",
     }
 }
@@ -2934,6 +3106,9 @@ fn manifest_error_status(e: &ManifestError) -> StatusCode {
         }
         ManifestError::RepoInUseByGroups { .. } => StatusCode::CONFLICT,
         ManifestError::CloneFailed { .. } => StatusCode::BAD_GATEWAY,
+        // Not 502: `remote add`/`set-url` are local config writes, so a
+        // failure here is about this checkout, never about a network.
+        ManifestError::UpstreamRemoteFailed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
 
@@ -2991,6 +3166,11 @@ struct AddRepoRequest {
     name: String,
     #[serde(default)]
     origin: Option<String>,
+    /// #112's forge-neutral upstream declaration, forwarded verbatim — this
+    /// route stays the thin wrapper §16.2 asks for, so what `sgt repo add
+    /// --upstream` can declare, a direct API caller can declare too.
+    #[serde(default)]
+    upstream: Option<String>,
     #[serde(default)]
     instructions: Option<String>,
 }
@@ -3027,8 +3207,16 @@ async fn estate_add_repo(
     };
     let name = req.name.clone();
     let origin = req.origin.clone();
-    let result =
-        blocking_sync(|| manifest::add_repo(&estate_root, &name, origin.as_deref(), instructions));
+    let upstream = req.upstream.clone();
+    let result = blocking_sync(|| {
+        manifest::add_repo(
+            &estate_root,
+            &name,
+            origin.as_deref(),
+            upstream.as_deref(),
+            instructions,
+        )
+    });
     match result {
         Ok(()) => (
             StatusCode::CREATED,
@@ -3036,6 +3224,7 @@ async fn estate_add_repo(
                 "name": req.name,
                 "path": format!("repos/{}", req.name),
                 "origin": req.origin,
+                "upstream": req.upstream,
                 "instructions": req.instructions,
             })),
         )
@@ -3883,6 +4072,31 @@ impl ApiClient {
         .await
     }
 
+    /// `GET /v1/sweep` — §12.3's deliberate sweep, classification half
+    /// (#159). Mutates nothing.
+    pub async fn sweep(&self) -> Result<Value, ClientError> {
+        self.get("/v1/sweep").await
+    }
+
+    /// `POST /v1/sweep` with a fresh command id (§26) — the deletion half.
+    /// `confirm` must be `true` or the daemon refuses, and the daemon
+    /// re-classifies every branch before deleting any of it.
+    pub async fn sweep_delete(
+        &self,
+        branches: &[SweepTarget],
+        confirm: bool,
+    ) -> Result<Value, ClientError> {
+        self.post(
+            "/v1/sweep",
+            &json!({
+                "command_id": ulid::Ulid::generate().to_string(),
+                "confirm": confirm,
+                "branches": branches,
+            }),
+        )
+        .await
+    }
+
     /// `GET /v1/estate/repos` (§16.2/§20.4) — declared repositories.
     pub async fn repos(&self) -> Result<Value, ClientError> {
         self.get("/v1/estate/repos").await
@@ -3893,11 +4107,17 @@ impl ApiClient {
         &self,
         name: &str,
         origin: Option<&str>,
+        upstream: Option<&str>,
         instructions: Option<&str>,
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/estate/repos",
-            &json!({"name": name, "origin": origin, "instructions": instructions}),
+            &json!({
+                "name": name,
+                "origin": origin,
+                "upstream": upstream,
+                "instructions": instructions,
+            }),
         )
         .await
     }

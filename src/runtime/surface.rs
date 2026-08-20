@@ -61,8 +61,12 @@ pub const SURFACES_DIR: &str = "surfaces";
 /// than no key at all, and whose one weakness (aliasing a checkout against its
 /// own linked worktree) can only bite where git was already unable to tell us
 /// they were the same repository.
+///
+/// `pub(crate)` for `runtime::sweep`'s deletion pass (#159), which mutates
+/// the same ref store under the same two layers rather than inventing a
+/// second locking discipline for `branch -D`.
 #[derive(Debug, Clone)]
-struct RepositoryGate {
+pub(crate) struct RepositoryGate {
     /// Data dir whose `locks/repo/` holds the interprocess lock file.
     data_dir: PathBuf,
     /// Canonical git common directory: one identity, both layers.
@@ -72,7 +76,7 @@ struct RepositoryGate {
 impl RepositoryGate {
     /// Derive the gate for `source` by asking git for its common directory.
     /// One spawn; call once per repository per operation.
-    fn derive(data_dir: &Path, source: &Path) -> Self {
+    pub(crate) fn derive(data_dir: &Path, source: &Path) -> Self {
         Self::from_common_dir(data_dir, canonical_git_common_dir(source).ok(), source)
     }
 
@@ -168,7 +172,10 @@ fn repository_lock(identity: &Path) -> Arc<Mutex<()>> {
 /// is returned: it means another process may be mutating this registry right
 /// now, which is precisely the condition this function exists to prevent
 /// running under.
-fn with_repository<T>(gate: &RepositoryGate, f: impl FnOnce() -> T) -> Result<T, SurfaceError> {
+pub(crate) fn with_repository<T>(
+    gate: &RepositoryGate,
+    f: impl FnOnce() -> T,
+) -> Result<T, SurfaceError> {
     let local = repository_lock(&gate.identity);
     let _local_guard = local.lock().unwrap_or_else(|e| e.into_inner());
     let _file_guard = repolock::acquire(&gate.data_dir, &gate.identity)?;
