@@ -2469,6 +2469,43 @@ mod tests {
         assert!(surface.contains("and nothing else"), "{surface}");
     }
 
+    /// §8.3's bounded override admits a detached mount, which records an exact
+    /// `base_sha` and no named base branch. The actor is told that in words —
+    /// not a `None`-shaped placeholder it would have to interpret — and the
+    /// pin itself is still carried in full, because the SHA is the only base
+    /// fact such a binding has.
+    #[test]
+    fn a_detached_admission_says_it_has_no_named_base_branch_and_still_names_the_sha() {
+        let api_sha = "c".repeat(40);
+        let web_sha = "d".repeat(40);
+        let mut detached = binding("web", &web_sha);
+        detached.base_branch = None;
+        let request = prompt_request(vec![binding("api", &api_sha), detached]);
+        let prompt = compose_launch_prompt(&request);
+
+        let sections: Vec<&str> = prompt.split("\n\n").collect();
+        let surface = sections[2];
+        assert!(
+            surface.contains(&format!(
+                "- web: /data/surfaces/01PROMPT/web (branch sergeant/01PROMPT, \
+                 cut from no named base branch (detached admission) at {web_sha})"
+            )),
+            "{surface}"
+        );
+        // The named-base arm is unaffected by the detached one beside it.
+        assert!(
+            surface.contains(&format!(
+                "- api: /data/surfaces/01PROMPT/api (branch sergeant/01PROMPT, \
+                 cut from main at {api_sha})"
+            )),
+            "{surface}"
+        );
+        assert!(
+            !surface.contains("None"),
+            "no Rust-shaped placeholder reaches the actor: {surface}"
+        );
+    }
+
     /// C2/C3: a request with no binding summary — a `StartRequest` replayed
     /// from before §10.1, or any caller that does not supply one — still
     /// launches, and says nothing about a mutation surface rather than
