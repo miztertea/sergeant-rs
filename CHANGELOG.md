@@ -10,6 +10,10 @@ released before a release can proceed.
 
 ## [Unreleased]
 
+(nothing yet)
+
+## [0.1.1] - 2026-08-20
+
 ### Added
 
 - **Terminal Works now report an integrity disposition (#173).** At
