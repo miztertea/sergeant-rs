@@ -58,8 +58,12 @@ released before a release can proceed.
   one-repository estate is unaffected: it still infers its sole repository
   on an empty scope. Group expansion is no longer CLI-side: the daemon
   resolves `--group`/`--repo`/`--all` against its own bound manifest, so
-  every client (CLI, TUI, or a direct API caller) reaches the identical
-  resolution. `sgt run --all` is new — an explicit, journaled selection of
+  every client submitting the same scope — CLI, TUI, or a direct API caller
+  — reaches the identical resolution. The TUI's New Work form submits that
+  same structured scope: its dead `workspace` field is replaced by a
+  `group` field, and both it and `repositories` are forwarded unexpanded,
+  so naming a group in the TUI resolves exactly as `sgt run --group` does.
+  `sgt run --all` is new — an explicit, journaled selection of
   the whole estate. A submitted Work now records both the request form
   (`scope_request`: repos/group/all as submitted) and the resolved
   repository list, so a later manifest edit cannot rewrite what an
