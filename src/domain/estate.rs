@@ -103,6 +103,10 @@ pub struct DeclaredRepo {
     pub path: PathBuf,
     /// `origin` from `[[repo]]`, when declared.
     pub origin: Option<String>,
+    /// `upstream` from `[[repo]]`, when declared (#112) — the URL a mount's
+    /// `upstream` remote is expected to carry. Opaque and forge-neutral: no
+    /// host, forge or CLI is inferred from it anywhere.
+    pub upstream: Option<String>,
 }
 
 /// Per-repository instruction-suppression policy (R-MVP1-4, `[[repo]]
@@ -253,6 +257,16 @@ pub struct Estate {
     /// `origin` — has no known origin.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repository_origin: BTreeMap<String, String>,
+    /// Per-repository `upstream` (#112), keyed by repository name — the URL
+    /// the mount's `upstream` remote is declared to carry.
+    ///
+    /// The manifest is the authority; the remote is a *materialization* of
+    /// this declaration, ensured by `sgt repo add` where config mutation is
+    /// already legitimate and reported as drift by `sgt doctor` everywhere
+    /// else. Nothing in execution consults it (R-NS-4), and nothing anywhere
+    /// derives a forge, host or CLI from it — the URL is opaque.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repository_upstream: BTreeMap<String, String>,
 }
 
 /// An admitted estate root (§4.1): the canonical directory that *is* the
@@ -741,6 +755,12 @@ struct RepositoryEntry {
     /// on by this module beyond bookkeeping (see [`Estate::repository_origin`]).
     #[serde(default)]
     origin: Option<String>,
+    /// #112's forge-neutral upstream declaration: the URL the mount's
+    /// `upstream` remote should carry. Recorded here and acted on only where
+    /// config mutation is already legitimate (`src/domain/manifest.rs`'s
+    /// clone-or-verify); this module never touches a remote.
+    #[serde(default)]
+    upstream: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1059,6 +1079,7 @@ impl Estate {
                 name: entry.name,
                 path,
                 origin: entry.origin,
+                upstream: entry.upstream,
             });
         }
         Ok(declared)
@@ -1139,6 +1160,7 @@ impl Estate {
         let mut repositories = Vec::with_capacity(parsed.repo.len());
         let mut repository_policy = BTreeMap::new();
         let mut repository_origin = BTreeMap::new();
+        let mut repository_upstream = BTreeMap::new();
         for entry in parsed.repo {
             if !is_plain_name(&entry.name) {
                 return Err(EstateError::InvalidRepositoryName {
@@ -1167,6 +1189,9 @@ impl Estate {
             repository_policy.insert(entry.name.clone(), entry.instructions);
             if let Some(origin) = entry.origin {
                 repository_origin.insert(entry.name.clone(), origin);
+            }
+            if let Some(upstream) = entry.upstream {
+                repository_upstream.insert(entry.name.clone(), upstream);
             }
             repositories.push(RepositorySpec {
                 name: entry.name,
@@ -1245,6 +1270,7 @@ impl Estate {
             repository_policy,
             groups,
             repository_origin,
+            repository_upstream,
         })
     }
 
@@ -1277,6 +1303,7 @@ impl Estate {
         let mut repositories = Vec::with_capacity(parsed.repo.len());
         let mut repository_policy = BTreeMap::new();
         let mut repository_origin = BTreeMap::new();
+        let mut repository_upstream = BTreeMap::new();
         for entry in parsed.repo {
             if !is_plain_name(&entry.name) {
                 return Err(EstateError::InvalidRepositoryName {
@@ -1296,6 +1323,9 @@ impl Estate {
             repository_policy.insert(entry.name.clone(), entry.instructions);
             if let Some(origin) = &entry.origin {
                 repository_origin.insert(entry.name.clone(), origin.clone());
+            }
+            if let Some(upstream) = &entry.upstream {
+                repository_upstream.insert(entry.name.clone(), upstream.clone());
             }
             repositories.push(RepositorySpec {
                 name: entry.name,
@@ -1371,6 +1401,7 @@ impl Estate {
             repository_policy,
             groups,
             repository_origin,
+            repository_upstream,
         })
     }
 
@@ -1394,6 +1425,13 @@ impl Estate {
     /// for a declared repository that never gave an `origin`.
     pub fn repository_origin(&self, repository: &str) -> Option<&str> {
         self.repository_origin.get(repository).map(String::as_str)
+    }
+
+    /// This repository's declared `upstream` (#112), if the manifest records
+    /// one. The URL is returned exactly as declared — opaque, forge-neutral,
+    /// never parsed for a host.
+    pub fn repository_upstream(&self, repository: &str) -> Option<&str> {
+        self.repository_upstream.get(repository).map(String::as_str)
     }
 
     /// Whether `dir` is *itself* an estate root, tolerantly: `Ok(true)` iff
@@ -1786,6 +1824,44 @@ mod tests {
         ));
     }
 
+    /// #112: `[[repo]] upstream` parses, stays opaque, and reaches every
+    /// reader — the strict loader's `repository_upstream` map and the
+    /// diagnostic loader's [`DeclaredRepo`] alike. An entry that declares
+    /// none has none: absence is never guessed at from `origin` or anything
+    /// else.
+    ///
+    /// guard-map: dropping the field from either loader, or defaulting it to
+    /// the origin, fails here. Mutation this kills: a reader that
+    /// "helpfully" infers an upstream, which would make `sgt doctor` report
+    /// drift against a URL nobody declared.
+    #[test]
+    fn a_declared_upstream_is_carried_opaquely_by_every_reader() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        // Deliberately not a forge URL: nothing anywhere parses this.
+        let declared = "ssh://git@example.invalid:2222/team/api.git";
+        let estate = parse(
+            root,
+            &format!(
+                "[estate]\nname = \"w\"\n\n\
+                 [[repo]]\nname = \"api\"\norigin = \"/somewhere/api\"\n\
+                 upstream = \"{declared}\"\n\n\
+                 [[repo]]\nname = \"web\"\n"
+            ),
+        )
+        .expect("upstream parses");
+        assert_eq!(estate.repository_upstream("api"), Some(declared));
+        assert_eq!(estate.repository_upstream("web"), None);
+        assert_eq!(estate.repository_upstream("nonexistent"), None);
+
+        let declared_repos =
+            Estate::declared_repos(&root.join(MANIFEST_FILE)).expect("declared_repos");
+        assert_eq!(declared_repos[0].upstream.as_deref(), Some(declared));
+        assert_eq!(declared_repos[1].upstream, None);
+    }
+
     /// Two entries with the same *name* collapse two worktrees into one
     /// surface path, which is the same hazard read from the other side.
     #[test]
@@ -1836,6 +1912,7 @@ mod tests {
             repository_policy: BTreeMap::new(),
             groups: BTreeMap::new(),
             repository_origin: BTreeMap::new(),
+            repository_upstream: BTreeMap::new(),
         };
 
         let selected = estate
@@ -1888,6 +1965,7 @@ mod tests {
             repository_policy: BTreeMap::new(),
             groups: BTreeMap::new(),
             repository_origin: BTreeMap::new(),
+            repository_upstream: BTreeMap::new(),
         };
 
         let err = estate

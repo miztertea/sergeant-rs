@@ -22,8 +22,13 @@ INTERVAL="${PERF_IDLE_INTERVAL:-1}"
 perf_environment "$PERF_OUT/environment.txt" > /dev/null
 
 DD="$PERF_SCRATCH/idle/data"
+ESTATE="$PERF_SCRATCH/idle/estate"
 rm -rf "$PERF_SCRATCH/idle"
 mkdir -p "$DD"
+# `sgt daemon` refuses to start outside an exact estate root (§4.1) even when
+# nothing is ever submitted, so this baseline scaffolds one too — idle
+# behavior on a fresh data dir, not idle behavior with no estate at all.
+perf_estate_scaffold "$ESTATE"
 perf_daemon_start "$DD"
 perf_say "daemon pid $PERF_DAEMON_PID · sampling ${SECS}s at ${INTERVAL}s"
 perf_kv settle_s "$SECS"

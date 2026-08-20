@@ -9,9 +9,14 @@ scripts/perf/run-all.sh /path/outdir  # environment + idle baseline + S1..S7, in
 scripts/perf/s3-deep.sh /path/outdir  # any scenario, alone
 ```
 
-`<outdir>` must live **outside the repo tree**. Each scenario creates its own
-data dir and seed repo under `<outdir>/scratch/`, writes raw CSV/JSON next to
-it, prints a distilled summary block, and ends with the hygiene sweep.
+`<outdir>` must live **outside the repo tree**. Each scenario scaffolds its
+own scratch **estate** under `<outdir>/scratch/` (`perf_estate_scaffold` in
+`common.sh`: a `sergeant.toml` plus `repos/<name>`, per the estate-root
+contract) rather than a bare data dir — post-#w2b behavior, so nobody should
+run these scripts expecting the old ad hoc data-dir shape or from this
+repository's own root. Every `sgt` call the harness makes runs with its cwd
+inside that scaffolded root; it writes raw CSV/JSON next to the scratch
+tree, prints a distilled summary block, and ends with the hygiene sweep.
 
 | script | scenario |
 | --- | --- |

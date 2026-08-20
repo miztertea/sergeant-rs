@@ -644,4 +644,37 @@ jobs:
             echo "::error::draft-release did not emit a release-id output — refusing to guess which draft to publish" >&2
             exit 1
           fi
-          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -f draft=false
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -f draft=false -f make_latest=true
+
+  # ── Verify latest ──────────────────────────────────────────────────────
+  # `make_latest=true` above is a request, not a guarantee — GitHub's
+  # "latest" resolution is eventually consistent. Confirm this run's own
+  # tag is what /releases/latest actually reports before we call the
+  # publish durable, retrying to ride out the lag rather than racing it.
+  verify-latest:
+    needs: [draft-release, publish]
+    if: ${{ inputs.mode == 'publish' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: assert the published release is reported as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.draft-release.outputs.release-id }}
+        run: |
+          set -eu
+          published_tag=$(gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" -q .tag_name)
+          attempt=1
+          latest_tag=""
+          while [ "$attempt" -le 5 ]; do
+            latest_tag=$(gh api "repos/${{ github.repository }}/releases/latest" -q .tag_name)
+            if [ "$latest_tag" = "$published_tag" ]; then
+              echo "::notice::releases/latest reports $latest_tag, matching published tag $published_tag"
+              exit 0
+            fi
+            attempt=$((attempt + 1))
+            sleep 5
+          done
+          echo "::error::releases/latest reports '$latest_tag', expected published tag '$published_tag'" >&2
+          exit 1

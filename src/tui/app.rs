@@ -1092,6 +1092,10 @@ impl App {
                         .add_repo(
                             &spawn_name,
                             spawn_origin.as_deref(),
+                            // The overlay's form has no upstream field
+                            // (#112 is a CLI/manifest concern); a repo
+                            // declared here declares no upstream.
+                            None,
                             spawn_instructions.as_deref(),
                         )
                         .await;

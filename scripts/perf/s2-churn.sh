@@ -26,10 +26,11 @@ SETTLE="${PERF_S2_SETTLE:-120}"
 INTERVAL="${PERF_S2_SAMPLE_INTERVAL:-1}"
 
 DD="$PERF_SCRATCH/s2/data"
-REPO="$PERF_SCRATCH/s2/repo"
+ESTATE="$PERF_SCRATCH/s2/estate"
 rm -rf "$PERF_SCRATCH/s2"
 mkdir -p "$DD"
-perf_seed_repo "$REPO"
+perf_estate_scaffold "$ESTATE"
+REPO="$PERF_REPO"
 perf_daemon_start "$DD"
 perf_say "daemon pid $PERF_DAEMON_PID · $TOTAL works in waves of $WAVE · settle ${SETTLE}s"
 

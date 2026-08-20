@@ -1294,14 +1294,16 @@ fn manifest_data_dir_overrides_the_estate_local_default() {
     );
 }
 
-/// guard-map (ADR 0008(b), §8.7's open precedence question, resolved here):
-/// `SGT_DATA_DIR` still outranks a manifest-declared `data_dir` — the
-/// recommendation this Work is making, not an owner ruling (see the
-/// commit/PR summary for the argument and its counterargument). Pinned so a
-/// future change cannot silently flip which one wins without this test
-/// naming the flip. Mutation this kills: reordering `resolve_data_dir` so
-/// the estate walk (and the manifest `data_dir` it may carry) is consulted
-/// before `SGT_DATA_DIR`.
+/// guard-map (ADR 0008(b); precedence settled by owner ruling 2026-08-20 —
+/// backlog close-out kickoff, `docs/proposals/backlog-closeout-2026-08-20.md`
+/// rulings §8): `SGT_DATA_DIR` outranks a manifest-declared `data_dir`. The
+/// full ratified order is `--data-dir` > `SGT_DATA_DIR` > manifest
+/// `data_dir` — invocation-explicit beats declared, an owner ruling now, not
+/// the recommendation this test used to pin. Pinned so a future change
+/// cannot silently flip which one wins without this test naming the flip.
+/// Mutation this kills: reordering `resolve_data_dir` so the estate walk
+/// (and the manifest `data_dir` it may carry) is consulted before
+/// `SGT_DATA_DIR`.
 #[test]
 fn sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir() {
     let estate = tempfile::TempDir::new().expect("tempdir");
@@ -1326,6 +1328,114 @@ fn sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir() {
         std::fs::canonicalize(&reported).unwrap_or(reported),
         std::fs::canonicalize(&explicit_env).unwrap_or(explicit_env),
         "SGT_DATA_DIR must still win over a manifest-declared data_dir"
+    );
+}
+
+/// guard-map (ADR 0008(b); owner ruling 2026-08-20 rulings §8): `--data-dir`
+/// outranks a manifest-declared `data_dir` too — the flag rung above
+/// `SGT_DATA_DIR` in the ratified order, `--data-dir` > `SGT_DATA_DIR` >
+/// manifest `data_dir`. Sibling of
+/// `sgt_data_dir_env_var_still_outranks_a_manifest_declared_data_dir` above,
+/// same `declare_manifest_data_dir` + canonicalize pattern. Mutation this
+/// kills: reordering `resolve_data_dir` so the estate walk (and the
+/// manifest `data_dir` it may carry) is consulted before the `--data-dir`
+/// flag.
+#[test]
+fn data_dir_flag_still_outranks_a_manifest_declared_data_dir() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+    declare_manifest_data_dir(estate.path(), "manifest-declared-data-dir");
+
+    let explicit_flag = estate.path().join("explicit-flag-dir");
+    let result = run(
+        estate.path(),
+        Some(&explicit_flag),
+        &[],
+        &["--json", "doctor"],
+    );
+    let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
+    assert_eq!(
+        std::fs::canonicalize(&reported).unwrap_or(reported),
+        std::fs::canonicalize(&explicit_flag).unwrap_or(explicit_flag),
+        "--data-dir must still win over a manifest-declared data_dir"
+    );
+}
+
+/// #80/ADR 0008: when `$XDG_DATA_HOME` is set but the estate rung already
+/// won (no `--data-dir`/`SGT_DATA_DIR`, no manifest `data_dir` — the
+/// estate-local default wins outright), `sgt --json doctor`'s `data_dir`
+/// row discloses it as a detail line on the still-`ok` check, never a warn
+/// and never a new row. With `$XDG_DATA_HOME` unset, the same row carries
+/// no such note. Built on raw `Command` rather than the shared `run()`
+/// helper so both cases control `$XDG_DATA_HOME` explicitly — `env_remove`
+/// for the unset case — instead of depending on whatever the host process
+/// happens to have set.
+#[test]
+fn doctor_data_dir_detail_discloses_an_outranked_xdg_data_home() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+
+    let xdg = estate.path().join("xdg-home");
+    std::fs::create_dir_all(&xdg).expect("xdg dir");
+
+    let data_dir_detail = |output: std::process::Output| -> String {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let report: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+        let data_dir_row = report["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .find(|c| c["name"] == "data_dir")
+            .unwrap_or_else(|| panic!("doctor must carry a data_dir row: {report}"))
+            .clone();
+        assert_eq!(
+            data_dir_row["status"], "ok",
+            "the data_dir row must stay ok: {data_dir_row}"
+        );
+        data_dir_row["detail"].as_str().expect("detail").to_string()
+    };
+
+    let with_xdg = Command::new(SGT)
+        .current_dir(estate.path())
+        // An ambient SGT_DATA_DIR would win the Env rung and mask the
+        // Manifest/EstateDefault outcome this test pins.
+        .env_remove("SGT_DATA_DIR")
+        .env("XDG_DATA_HOME", &xdg)
+        .args(["--json", "doctor"])
+        .output()
+        .expect("run sgt");
+    let with_xdg_detail = data_dir_detail(with_xdg);
+    assert!(
+        with_xdg_detail.contains(
+            "$XDG_DATA_HOME is set but outranked here — estate-first resolution, ADR 0008"
+        ),
+        "data_dir detail must disclose the outranked $XDG_DATA_HOME: {with_xdg_detail}"
+    );
+
+    let without_xdg = Command::new(SGT)
+        .current_dir(estate.path())
+        .env_remove("SGT_DATA_DIR")
+        .env_remove("XDG_DATA_HOME")
+        .args(["--json", "doctor"])
+        .output()
+        .expect("run sgt");
+    let without_xdg_detail = data_dir_detail(without_xdg);
+    assert!(
+        !without_xdg_detail.contains("outranked"),
+        "unset $XDG_DATA_HOME must not trigger the outranked disclosure: {without_xdg_detail}"
     );
 }
 
@@ -1657,6 +1767,256 @@ fn work_retained_and_reap_are_reachable_from_the_real_cli() {
         retained_after.json()
     );
 
+    data_dir.reap();
+}
+
+/// guard-map: `sgt work sweep` (#159), reachable end to end through the real
+/// CLI/daemon. The bare verb classifies and mutates nothing;
+/// `--delete-redundant` alone prints exactly what `--yes` would destroy and
+/// still mutates nothing; `--yes` deletes the redundant branch and leaves the
+/// orphan — the one this estate's journal has no Work for — standing.
+/// Mutation this kills: the preview path deleting anything, the confirmed
+/// path widening past `redundant`, or either path failing to reach the
+/// daemon at all.
+#[test]
+fn work_sweep_classifies_previews_then_deletes_from_the_real_cli() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+    write_two_stage_workflow(repo.path());
+    let mount = repo.path().join("repos").join("solo");
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--workflow",
+            "tiny",
+            "leave a branch behind",
+        ],
+    );
+    submitted.assert_ok("run");
+    let work_id = submitted.json()["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    wait_for_state(repo.path(), data_dir.path(), &work_id, "completed");
+    let work_branch = format!("sergeant/{work_id}");
+
+    // A `sergeant/*` ref this estate's journal knows nothing about (#172).
+    let orphan = "sergeant/01BOGUSBOGUSBOGUSBOGUSBOGUS";
+    git(&mount, &["branch", orphan, "main"]);
+
+    let report = run(repo.path(), Some(data_dir.path()), &[], &["work", "sweep"]);
+    report.assert_ok("work sweep");
+    for expected in ["default branch: main", "redundant", "orphan", &work_branch] {
+        assert!(
+            report.stdout.contains(expected),
+            "the report must name {expected:?}: {}",
+            report.stdout
+        );
+    }
+
+    let refs_before = git(&mount, &["for-each-ref", "--format=%(refname:short)"]);
+    let preview = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "sweep", "--delete-redundant"],
+    );
+    preview.assert_ok("work sweep --delete-redundant (preview)");
+    assert!(
+        preview.stdout.contains("--yes would permanently delete:")
+            && preview.stdout.contains(&work_branch),
+        "the preview must name exactly what --yes would destroy: {}",
+        preview.stdout
+    );
+    assert!(
+        !preview.stdout.contains(orphan),
+        "an orphan is never deletable, so it must not appear in the deletion preview: {}",
+        preview.stdout
+    );
+    assert_eq!(
+        refs_before,
+        git(&mount, &["for-each-ref", "--format=%(refname:short)"]),
+        "a preview must not touch a single ref"
+    );
+
+    let deleted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "sweep", "--delete-redundant", "--yes"],
+    );
+    deleted.assert_ok("work sweep --delete-redundant --yes");
+    assert!(
+        deleted.stdout.contains("deleted at"),
+        "got: {}",
+        deleted.stdout
+    );
+    let refs_after = git(&mount, &["for-each-ref", "--format=%(refname:short)"]);
+    assert!(!refs_after.contains(&work_branch), "{refs_after}");
+    assert!(refs_after.contains(orphan), "{refs_after}");
+    assert!(refs_after.contains("main"), "{refs_after}");
+
+    data_dir.reap();
+}
+
+// ------------------------------------------------------------ intent file
+
+/// guard-map: `sgt run --intent-file <PATH>` (#166) submits the file's
+/// contents as the intent, byte for byte apart from the single trailing
+/// newline an editor appends — including the multi-line, quote-bearing shape
+/// that is the whole reason the flag exists. Mutation this kills: any
+/// parsing, templating, trimming or re-wrapping of the file between reading
+/// it and the request body.
+#[test]
+fn run_intent_file_submits_the_files_contents_verbatim() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+
+    // Interior blank lines, quotes, a backslash, leading whitespace and a
+    // trailing space — everything shell quoting would mangle and everything
+    // a well-meaning normalizer would "fix".
+    let intent = "Fix the \"widget\" parser.\n\nIt must handle a\\b and   \n  indented lines.";
+    let path = repo.path().join("brief.md");
+    std::fs::write(&path, format!("{intent}\n")).expect("write brief");
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--intent-file",
+            path.to_str().expect("utf8 path"),
+        ],
+    );
+    submitted.assert_ok("run --intent-file");
+    assert_eq!(
+        submitted.json()["work"]["intent"].as_str(),
+        Some(intent),
+        "the submitted intent must be the file, verbatim"
+    );
+
+    data_dir.reap();
+}
+
+/// guard-map: exactly one of the positional intent and `--intent-file` may
+/// be given, and neither is an error — clap's own pairing, checked here
+/// rather than trusted, since a dropped `conflicts_with` would silently make
+/// one of the two win. Neither case may reach a daemon.
+#[test]
+fn run_requires_exactly_one_of_intent_and_intent_file() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+    let path = repo.path().join("brief.md");
+    std::fs::write(&path, "from the file\n").expect("write brief");
+
+    let both = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "run",
+            "on the command line",
+            "--intent-file",
+            path.to_str().expect("utf8 path"),
+        ],
+    );
+    both.assert_fails("both an intent and --intent-file");
+    assert!(
+        both.stderr.contains("--intent-file"),
+        "the refusal must name the conflict: {}",
+        both.stderr
+    );
+
+    let neither = run(repo.path(), Some(data_dir.path()), &[], &["run"]);
+    neither.assert_fails("neither an intent nor --intent-file");
+
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "a refused submission must never have spawned a daemon"
+    );
+    data_dir.reap();
+}
+
+/// guard-map: `--intent-file`'s mechanical guards, each refusing before any
+/// daemon contact and each naming what it refused. Mutation this kills:
+/// dropping the symlink check (`fs::read` would happily follow it), the
+/// regular-file check, the size ceiling, or the UTF-8 requirement.
+#[test]
+fn run_intent_file_refuses_a_symlink_a_directory_an_oversized_file_and_non_utf8() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+
+    let submit = |path: &Path| {
+        run(
+            repo.path(),
+            Some(data_dir.path()),
+            &[],
+            &["run", "--intent-file", path.to_str().expect("utf8 path")],
+        )
+    };
+
+    let real = repo.path().join("real.md");
+    std::fs::write(&real, "a perfectly good intent\n").expect("write");
+    let link = repo.path().join("link.md");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    #[cfg(unix)]
+    {
+        let refused = submit(&link);
+        refused.assert_fails("a symlinked --intent-file");
+        assert!(
+            refused.stderr.contains("symlink"),
+            "got: {}",
+            refused.stderr
+        );
+    }
+
+    let refused = submit(repo.path());
+    refused.assert_fails("a directory as --intent-file");
+    assert!(
+        refused.stderr.contains("not a regular file"),
+        "got: {}",
+        refused.stderr
+    );
+
+    let oversized = repo.path().join("huge.md");
+    std::fs::write(&oversized, vec![b'x'; 1024 * 1024 + 1]).expect("write");
+    let refused = submit(&oversized);
+    refused.assert_fails("an oversized --intent-file");
+    assert!(
+        refused.stderr.contains("1.0 MiB") && refused.stderr.contains("limit"),
+        "the refusal must name the limit and the actual size: {}",
+        refused.stderr
+    );
+
+    let binary = repo.path().join("binary.md");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00]).expect("write");
+    let refused = submit(&binary);
+    refused.assert_fails("a non-UTF-8 --intent-file");
+    assert!(
+        refused.stderr.contains("not valid UTF-8"),
+        "got: {}",
+        refused.stderr
+    );
+
+    let missing = repo.path().join("nope.md");
+    submit(&missing).assert_fails("a missing --intent-file");
+
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "every guard must refuse before any daemon contact"
+    );
     data_dir.reap();
 }
 

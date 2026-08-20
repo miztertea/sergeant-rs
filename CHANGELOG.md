@@ -12,6 +12,86 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.1.2] - 2026-08-20
+
+Maintenance release: one day of backlog close-out rationalizing the base
+feature set the estate-root contract (0.1.1) implied. Nothing here is a new
+direction — these are the verbs, declarations, and honest reports that
+should have always been there, plus the accumulated perf and hygiene debts
+paid down.
+
+### Fixed
+
+- `release.yml` passes `make_latest=true` at publish and asserts
+  `/releases/latest` resolves to the released tag, retrying eventual
+  consistency — a stale Latest badge now fails the run loudly (#200).
+- `scripts/probe-env.sh` no longer substitutes a sentinel string as a
+  wrapped command's own output when `timeout(1)` is missing: it falls back
+  to `gtimeout`, then runs unbounded and reports the unenforced bound as
+  its own measured row; Cores falls back to `sysctl -n hw.ncpu` (#143).
+- `sgt doctor` replays the journal once instead of three times; its cost no
+  longer triples the journal-size term (#12).
+- The `events` table gained an index on `(kind, work_id)`, roughly halving
+  `blocked_time_per_work`'s cold-call cost at every measured mark (#10).
+- A torn final journal line observed while the daemon is mid-append is now
+  classified as a tolerable transient (`is_possible_torn_tail`), distinct
+  from mid-file corruption which still fails closed; the test harness
+  retries only the former (#169).
+- Doctor's `data_dir` check names the winning resolution rung when an
+  explicitly-set `$XDG_DATA_HOME` is outranked inside an estate, and
+  ADR 0008's dangling precedence pointer was replaced with the adjudicated
+  order: `--data-dir` > `SGT_DATA_DIR` > manifest `data_dir` (#80).
+
+### Changed
+
+- Terminal Work structs now live in a bounded cache (capacity 1024, Rule A
+  pattern): `work list` keeps full history via an always-retained slim
+  index, `work show` on an evicted Work re-derives from the journal, and an
+  evicted list row carries `"evicted": true` with the effective integrity
+  disposition — a stranded `completed_dirty` never reads as plain
+  `completed` (#4).
+- The perf harness scaffolds its own scratch estate and submits with
+  explicit scope, so it runs under the estate contract (#8, #10, #12
+  measurement support).
+- `validate-and-ship`'s close-out stage may complete only once any external
+  pipeline run it drove reached a terminal disposition, or the handover log
+  records why one was deliberately left open (#124).
+- Dispatch doctrine now matches the shipped engine: risk routing points at
+  AGENTS.md's Captain intent discipline (the eight-dimension brief's one
+  home), and the monitor stage describes the engine's own startup
+  reconciliation instead of a shell-tool-era sync verb (#166, #167 —
+  closed, no verb needed: reconciliation is engine-owned).
+- NORTH-STAR and AGENTS.md state the ratified mutation-surface contract:
+  per-Work worktrees with declared surfaces, violations journaled and
+  charged as dirty evidence — observation with honest consequences, not
+  prevention; shared-mount collision named as accepted risk (#180).
+
+### Added
+
+- `sgt work sweep` (#159): classifies every `sergeant/*` ref per mount —
+  active / redundant (provably ancestor of the mount's default branch) /
+  retained (unique content, commit count) / orphan (no journaled Work, the
+  #172 fold-in) — plus prunable worktree registrations. Read-only by
+  default; `--delete-redundant --yes` deletes only server-re-verified
+  redundant refs under the repository gate, journaling each deleted tip
+  SHA. Failed Works classify active and are never deletable.
+- Forge-neutral `upstream = "<url>"` on `[[repo]]` (#112): recorded by
+  `sgt repo add --upstream`, ensured as the mount's `upstream` remote at
+  clone/repo-add (admission stays remote-agnostic), drift reported by
+  doctor with the exact remedy. Any forge, or none — git is the
+  assumption, not a CLI.
+- `sgt run --intent-file <path>` (#166): the file's contents become the
+  intent verbatim; mechanical guards only (symlink refusal, regular file,
+  1 MiB cap, UTF-8) — ends the scratchpad-and-`cat` workaround for
+  multi-paragraph intents.
+- Two workflow packages: `validate-intent` (#201, optional pre-dispatch
+  review of an intent across the eight dimensions — reports gaps, never
+  fills them) and `record-decisions` (#88, transcribes already-made
+  decisions with fidelity-first review; gaps are logged, never invented).
+- `docs/proposals/journal-archival-rule-c.md` (#17): the gauntlet-evaluated
+  Rule C archival design — ten open questions await a follow-up discussion;
+  no behavior change in this release.
+
 ## [0.1.1] - 2026-08-20
 
 ### Added

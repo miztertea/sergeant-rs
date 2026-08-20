@@ -332,6 +332,42 @@ perf_seed_repo() {
   PERF_REPO="$repo"
 }
 
+# --- scratch estate (estate-root contract) ---------------------------------
+
+# perf_estate_scaffold <estate-dir> [repo-name]
+#
+# Builds a self-contained scratch estate at <estate-dir>: a `sergeant.toml`
+# declaring one `[[repo]]` (§6.1 — there is no `path` key, the mount is
+# always the derived `<estate-root>/repos/<name>`), whose mount is seeded
+# with `perf_seed_repo`'s own recipe — a real git repository, attached branch,
+# one commit, clean tree, and the `.sergeant/workflows/software-change`
+# layout — so it clears every §8.1 admission check the fake backend's submit
+# path exercises (1 MountPresent, 3 MountTopLevel, 4 MountPrimaryCheckout,
+# 6 HeadAttached, 7 HeadFullSha, 8 WorktreeClean) and daemon startup's own
+# `Estate::admit` (§4.1) resolves cleanly.
+#
+# Every `sgt daemon` spawn and every direct estate-scoped `sgt` CLI call this
+# harness makes must run with its cwd inside the returned root — sergeant does
+# not search parent directories for an estate, and refuses outside the exact
+# one (§4.1's "no search happens from it"). `perf_daemon_start` and
+# `perf_sgt` both read `PERF_ESTATE_ROOT` below for that; call this before
+# either.
+#
+# Sets and exports PERF_ESTATE_ROOT (canonical) and PERF_ESTATE_REPO_NAME,
+# and (through perf_seed_repo) PERF_REPO/PERF_REPOS as before — a scaffolded
+# estate's one repository is still a repo scenarios can pass to perf_hygiene
+# and friends exactly as they always have.
+perf_estate_scaffold() {
+  local estate_dir="$1" name="${2:-perf-repo}"
+  mkdir -p "$estate_dir"
+  PERF_ESTATE_ROOT="$(cd "$estate_dir" && pwd)"
+  printf '[estate]\nname = "perf-harness"\n\n[[repo]]\nname = "%s"\n' "$name" \
+    > "$PERF_ESTATE_ROOT/sergeant.toml"
+  perf_seed_repo "$PERF_ESTATE_ROOT/repos/$name"
+  PERF_ESTATE_REPO_NAME="$name"
+  export PERF_ESTATE_ROOT PERF_ESTATE_REPO_NAME
+}
+
 # --- daemon control --------------------------------------------------------
 
 perf_descriptor_field() {
@@ -355,16 +391,22 @@ perf_descriptor_field() {
 # listener bind.
 perf_daemon_start() {
   local dd="$1" script="${2:-}" timeout="${3:-300}"
+  [ -n "${PERF_ESTATE_ROOT:-}" ] || perf_die "perf_daemon_start: no scratch estate scaffolded — call perf_estate_scaffold first; the estate-root contract refuses \`sgt daemon\` outside an exact estate root (§4.1)"
   mkdir -p "$dd"
   PERF_DATA_DIR="$dd"
   rm -f "$dd/runtime.json"
   local log="$dd/daemon.stdio.log"
   local t0 t1
   perf_mark t0
+  # §4.1: "no search happens from it" — the daemon must be spawned with cwd
+  # inside the estate root it is bound to, never wherever the caller's shell
+  # happened to be (the repo root, when this script is invoked directly).
+  # `$dd` is always an absolute path out of perf_init's scratch tree, so the
+  # cd below moves nothing but the daemon's own root discovery.
   if [ -n "$script" ]; then
-    SGT_FAKE_SCRIPT="$script" setsid "$SGT_BIN" daemon --data-dir "$dd" >>"$log" 2>&1 &
+    ( cd "$PERF_ESTATE_ROOT" && SGT_FAKE_SCRIPT="$script" exec setsid "$SGT_BIN" daemon --data-dir "$dd" ) >>"$log" 2>&1 &
   else
-    env -u SGT_FAKE_SCRIPT setsid "$SGT_BIN" daemon --data-dir "$dd" >>"$log" 2>&1 &
+    ( cd "$PERF_ESTATE_ROOT" && exec env -u SGT_FAKE_SCRIPT setsid "$SGT_BIN" daemon --data-dir "$dd" ) >>"$log" 2>&1 &
   fi
   # `setsid` forks when the caller is already a process-group leader, so the
   # job's pid is not necessarily the daemon's. The descriptor is authoritative:
@@ -467,6 +509,20 @@ perf_daemon_kill9() {
   done
   [ "$pid" = "${PERF_DAEMON_PID:-}" ] && PERF_DAEMON_PID=""
   return 0
+}
+
+# perf_sgt <args...> — the CLI, with cwd inside the scaffolded estate root.
+#
+# Every estate-scoped verb (`work`, `status`, `analytics`, `tui`, `daemon`,
+# ... — `src/cli.rs`'s `is_estate_scoped`; `doctor` is the one CLI verb this
+# harness calls that is *not* estate-scoped and needs no wrapping, though
+# routing it through here too would be harmless) refuses outside an exact
+# estate root (§4.1). Every direct `"$SGT_BIN" ...` call a scenario makes for
+# one of those verbs goes through here instead of running from whatever cwd
+# the scenario script happened to have.
+perf_sgt() {
+  [ -n "${PERF_ESTATE_ROOT:-}" ] || perf_die "perf_sgt: no scratch estate scaffolded — call perf_estate_scaffold first"
+  ( cd "$PERF_ESTATE_ROOT" && "$SGT_BIN" "$@" )
 }
 
 # --- /proc sampling --------------------------------------------------------
@@ -609,12 +665,19 @@ perf_timed_get() {
   printf '%s %s\n' "$((t1 - t0))" "$line"
 }
 
-# perf_submit <intent> [cwd] [backend] — one synchronous submit; prints the
-# work id (empty on failure). Body is built before the clock starts.
+# perf_submit <intent> [cwd] [backend] [repo] — one synchronous submit;
+# prints the work id (empty on failure). Body is built before the clock
+# starts. `repo` (default: the scaffolded estate's own PERF_ESTATE_REPO_NAME)
+# becomes explicit `scope.repos` — work submission now requires a declared
+# scope (§7.1); an empty `repo` submits no scope field at all, relying on the
+# daemon's single-repository inference (§7.1's rule 3), which is exactly what
+# a scaffolded one-repository estate qualifies for.
 perf_submit() {
-  local intent="$1" cwd="${2:-${PERF_REPO:-}}" backend="${3:-fake}" body resp
-  body="$(jq -nc --arg cid "$(perf_ulid)" --arg intent "$intent" --arg cwd "$cwd" --arg b "$backend" \
-    '{command_id:$cid, intent:$intent, backend:$b, origin:{client:"cli", cwd:$cwd}}')"
+  local intent="$1" cwd="${2:-${PERF_REPO:-}}" backend="${3:-fake}" \
+    repo="${4:-${PERF_ESTATE_REPO_NAME:-}}" body resp
+  body="$(jq -nc --arg cid "$(perf_ulid)" --arg intent "$intent" --arg cwd "$cwd" --arg b "$backend" --arg r "$repo" \
+    '{command_id:$cid, intent:$intent, backend:$b, origin:{client:"cli", cwd:$cwd}}
+     + (if $r == "" then {} else {scope:{repos:[$r]}} end)')"
   resp="$(perf_api POST /v1/work "$body")"
   jq -r '.work.id // empty' <<< "$resp"
 }
@@ -648,17 +711,20 @@ perf_journal_events() { # events on disk, independent of the daemon
   cat "$dd"/journal/*.ndjson 2>/dev/null | wc -l | tr -d ' '
 }
 
-# perf_burst <n> <parallel> <calls-dir> [intent-prefix]
+# perf_burst <n> <parallel> <calls-dir> [intent-prefix] [repo]
 #
 # n concurrent submits through the HTTP API (one curl per call, xargs -P for
 # fan-out) writing one CSV line per call into <calls-dir>. The submit path
 # runs the whole workflow inside the request with the fake backend, so a call's
-# latency is a work's end-to-end latency.
+# latency is a work's end-to-end latency. `repo` (default: the scaffolded
+# estate's PERF_ESTATE_REPO_NAME) is forwarded to _submit-one.sh as explicit
+# `scope.repos` — see perf_submit's own comment on why an empty value is
+# still a legal submission for a one-repository estate.
 perf_burst() {
-  local n="$1" par="$2" dir="$3" prefix="${4:-perf}"
+  local n="$1" par="$2" dir="$3" prefix="${4:-perf}" repo="${5:-${PERF_ESTATE_REPO_NAME:-}}"
   mkdir -p "$dir"
   seq 1 "$n" | xargs -P "$par" -I@ \
-    "$PERF_DIR/_submit-one.sh" "$PERF_ENDPOINT" "$PERF_TOKEN" "${PERF_REPO:-}" "$prefix-@" "$dir/@.csv"
+    "$PERF_DIR/_submit-one.sh" "$PERF_ENDPOINT" "$PERF_TOKEN" "${PERF_REPO:-}" "$prefix-@" "$dir/@.csv" "$repo"
 }
 
 # perf_collect_calls <calls-dir> <out-csv> — concatenate per-call CSVs.

@@ -240,6 +240,7 @@ Composes an environment (enriches `PATH` with `~/.cargo/bin` and `~/.local/bin` 
 ```sh
 sgt init                              # scaffold [estate] in sergeant.toml, repos/, .gitignore entries
 sgt repo add <name> --origin <url>    # clone repos/<name> and declare it (origin optional if it's already there)
+sgt repo add <name> --upstream <url>  # also declare an upstream and set it as the mount's `upstream` remote (forge-neutral)
 sgt repo remove <name>                # undeclare it (refuses while a group still lists it; never deletes repos/<name>)
 sgt repo list                         # declared repositories
 sgt group add <name> <repo>...        # declare or extend a group (mkdir-p semantics)

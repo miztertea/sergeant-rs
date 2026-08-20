@@ -61,8 +61,12 @@ pub const SURFACES_DIR: &str = "surfaces";
 /// than no key at all, and whose one weakness (aliasing a checkout against its
 /// own linked worktree) can only bite where git was already unable to tell us
 /// they were the same repository.
+///
+/// `pub(crate)` for `runtime::sweep`'s deletion pass (#159), which mutates
+/// the same ref store under the same two layers rather than inventing a
+/// second locking discipline for `branch -D`.
 #[derive(Debug, Clone)]
-struct RepositoryGate {
+pub(crate) struct RepositoryGate {
     /// Data dir whose `locks/repo/` holds the interprocess lock file.
     data_dir: PathBuf,
     /// Canonical git common directory: one identity, both layers.
@@ -72,7 +76,7 @@ struct RepositoryGate {
 impl RepositoryGate {
     /// Derive the gate for `source` by asking git for its common directory.
     /// One spawn; call once per repository per operation.
-    fn derive(data_dir: &Path, source: &Path) -> Self {
+    pub(crate) fn derive(data_dir: &Path, source: &Path) -> Self {
         Self::from_common_dir(data_dir, canonical_git_common_dir(source).ok(), source)
     }
 
@@ -168,7 +172,10 @@ fn repository_lock(identity: &Path) -> Arc<Mutex<()>> {
 /// is returned: it means another process may be mutating this registry right
 /// now, which is precisely the condition this function exists to prevent
 /// running under.
-fn with_repository<T>(gate: &RepositoryGate, f: impl FnOnce() -> T) -> Result<T, SurfaceError> {
+pub(crate) fn with_repository<T>(
+    gate: &RepositoryGate,
+    f: impl FnOnce() -> T,
+) -> Result<T, SurfaceError> {
     let local = repository_lock(&gate.identity);
     let _local_guard = local.lock().unwrap_or_else(|e| e.into_inner());
     let _file_guard = repolock::acquire(&gate.data_dir, &gate.identity)?;
@@ -571,6 +578,41 @@ impl TeardownReport {
     /// repository".
     pub fn findings(&self) -> impl Iterator<Item = &IntegrityFinding> {
         self.bindings.iter().flat_map(|b| b.findings.iter())
+    }
+
+    /// ADR 0007(b): whether this teardown, against the surface it tore down,
+    /// shows a closing stage that declared a commit as its durable outcome
+    /// but never actually advanced the branch and left the worktree dirty —
+    /// the safety net for when an actor guesses wrong about its own runtime
+    /// model (`docs/adr/0007-actor-runtime-contract.md`).
+    ///
+    /// The engine still learns nothing about what a commit *is* (NORTH-STAR:
+    /// "the engine learns no output vocabulary; only the pointer is core"):
+    /// this reads two facts the pointer already computes — a binding's
+    /// teardown disposition, and whether its finalize commit ever moved past
+    /// the surface's own base SHA — rather than asking any workflow what it
+    /// meant to do.
+    ///
+    /// Structural, not state-aware: this alone does not know whether the
+    /// Work this teardown belongs to actually reached `Completed` — callers
+    /// that need `reported_state`'s full `stranded_completion` semantics
+    /// (api.rs) gate this on `work.state` themselves. It exists standalone
+    /// here specifically so a caller with no live `Work` at hand — the
+    /// projection reducer, computing the slim index's effective disposition
+    /// at `surface.torn_down` time — can still ask it.
+    pub fn stranded_completion(&self, surface: &WorkSurface) -> bool {
+        self.bindings.iter().any(|binding| {
+            let never_advanced = surface
+                .bindings
+                .iter()
+                .find(|b| b.repository == binding.repository)
+                .is_some_and(|b| binding.final_sha.as_deref() == Some(b.base_sha.as_str()));
+            never_advanced
+                && matches!(
+                    binding.disposition,
+                    BindingDisposition::RetainedDirty { .. }
+                )
+        })
     }
 }
 

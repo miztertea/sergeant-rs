@@ -34,7 +34,6 @@
 //!   test proves the mount saw none of it.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,7 +46,7 @@ use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::runtime::git::GIT_BIN_ENV;
 
 mod support;
-use support::{DataDir, scaffold_estate};
+use support::{DataDir, Invocation, parse_log, real_git, scaffold_estate, write_recording_shim};
 
 /// Verbs that must never appear on an admission path, in any directory.
 const FORBIDDEN_ANYWHERE: &[&str] = &[
@@ -67,100 +66,6 @@ const FORBIDDEN_ANYWHERE: &[&str] = &[
 /// Verbs that must never be run *against the mounted checkout*. See the
 /// module doc for why `reset` is on this list rather than the one above.
 const FORBIDDEN_IN_THE_MOUNT: &[&str] = &["reset"];
-
-/// One recorded invocation: where it ran and what it was asked to do.
-#[derive(Debug)]
-struct Invocation {
-    cwd: PathBuf,
-    args: Vec<String>,
-}
-
-impl Invocation {
-    /// The subcommand: the first argument that is not a global option.
-    /// `runtime::git::command` always prefixes `--no-pager`, and several
-    /// call sites pass `-c key=value`, so the verb is not simply `args[0]`.
-    fn verb(&self) -> Option<&str> {
-        let mut args = self.args.iter();
-        while let Some(arg) = args.next() {
-            if arg == "-c" || arg == "-C" {
-                let _ = args.next();
-                continue;
-            }
-            if arg.starts_with('-') {
-                continue;
-            }
-            return Some(arg.as_str());
-        }
-        None
-    }
-}
-
-fn parse_log(text: &str) -> Vec<Invocation> {
-    text.lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let (cwd, args) = line
-                .split_once('\t')
-                .unwrap_or_else(|| panic!("malformed recording line: {line:?}"));
-            Invocation {
-                cwd: PathBuf::from(cwd),
-                args: args
-                    .split('\u{1}')
-                    .filter(|arg| !arg.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            }
-        })
-        .collect()
-}
-
-/// A shim that records every invocation and then becomes the real git.
-///
-/// `$PWD` and the argument vector are written as one tab-separated record
-/// with `\1`-separated arguments — a separator no git argument this codebase
-/// produces can contain, so an argument with a space in it survives intact.
-/// Appended with `>>` under a single `printf`, which is atomic enough for
-/// concurrent children writing short records to the same file.
-fn write_recording_shim(path: &Path, log: &Path, real_git: &Path) {
-    // The separator is written into the script as a literal U+0001 byte
-    // rather than as the escape `\001`: `sh` does not interpret escapes
-    // inside double quotes, so the escape would end up in the log as four
-    // characters and every record would be one unsplittable field.
-    let unit = '\u{1}';
-    std::fs::write(
-        path,
-        format!(
-            "#!/bin/sh\n\
-             record=\"$PWD\t\"\n\
-             for arg in \"$@\"; do record=\"$record$arg{unit}\"; done\n\
-             printf '%s\\n' \"$record\" >> {log:?}\n\
-             exec {real_git:?} \"$@\"\n",
-            log = log.display().to_string(),
-            real_git = real_git.display().to_string(),
-        ),
-    )
-    .expect("write shim");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod");
-    }
-    // Runs the shim once (`--version`), which records a line of its own.
-    // Truncate afterwards so the log holds only what the admission did.
-    support::wait_until_executable(path);
-    std::fs::write(log, "").expect("truncate the shim's own warm-up record");
-}
-
-fn real_git() -> PathBuf {
-    let out = std::process::Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .expect("locate git");
-    assert!(out.status.success(), "git must be on PATH for this test");
-    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-}
 
 #[tokio::test]
 async fn a_whole_admission_never_runs_a_network_or_branch_changing_git_command() {

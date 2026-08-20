@@ -433,3 +433,175 @@ fn the_proposals_canonical_manifest_example_parses_under_the_current_schema() {
     assert!(estate.groups.contains_key("payments"));
     assert_eq!(estate.profiles.len(), 1);
 }
+
+// --------------------------------------- 4. close-out completion boundary
+
+/// The `60-close-out` stage's Completion boundary section (#124) states the
+/// same terminality applies to any external pipeline run the stage drove:
+/// completion requires that run to reach a terminal disposition, or the
+/// handover log to explicitly record it was deliberately left open and why.
+/// Quoted verbatim so this test tracks the doctrine text, not a paraphrase
+/// of it.
+#[test]
+fn close_out_completion_boundary_covers_external_pipeline_runs() {
+    let context_md = std::fs::read_to_string(
+        repo_root().join(".sergeant/workflows/validate-and-ship/60-close-out/CONTEXT.md"),
+    )
+    .expect("read 60-close-out/CONTEXT.md");
+
+    let anchor = context_md
+        .find("### Completion boundary")
+        .expect("60-close-out/CONTEXT.md must still have a '### Completion boundary' section");
+    let section = &context_md[anchor..];
+
+    assert!(
+        section.contains(
+            "The same terminality binds any external pipeline run this stage drove: \
+             completion requires that run to have reached a terminal disposition, or \
+             the handover log to explicitly record that it was deliberately left open \
+             and why — an untracked open run is silence by another name."
+        ),
+        "60-close-out/CONTEXT.md's Completion boundary section no longer states the \
+         external-pipeline-run terminality clause (#124) — update this test and the \
+         doctrine text together"
+    );
+}
+
+// ------------------------------------------------- 5. dispatch doctrine (#166/#167)
+
+/// `05-classify-risk/CONTEXT.md` states `--intent-file`'s real mechanics —
+/// pure-content transport, mechanical guards only, pointing at AGENTS.md's
+/// Captain intent discipline rather than restating it — now that #166 has
+/// shipped the flag. Quoted verbatim so this test tracks the doctrine text,
+/// not a paraphrase of it (the house pattern this suite already uses for
+/// `60-close-out`, above).
+#[test]
+fn classify_risk_states_the_real_intent_file_mechanics() {
+    let context_md = std::fs::read_to_string(
+        repo_root().join(".sergeant/workflows/dispatch/05-classify-risk/CONTEXT.md"),
+    )
+    .expect("read 05-classify-risk/CONTEXT.md");
+
+    assert!(
+        context_md.contains(
+            "It is pure-content transport: `sgt` validates only mechanics — the leaf must \
+             not be a symlink, must be a regular file, is capped at 1 MiB, and must be valid \
+             UTF-8 (`src/cli.rs`'s `read_intent_file`) — and neither parses the contents nor \
+             requires any particular section structure."
+        ),
+        "05-classify-risk/CONTEXT.md no longer states --intent-file's real mechanics — \
+         update this test and the doctrine text together"
+    );
+    assert!(
+        context_md.contains(
+            "The eight-dimension risk brief named in AGENTS.md's `### INTENT — Captain's \
+             intent discipline` — the authoritative list — is Captain's own discipline, \
+             stated once there; this stage points at it rather than restating it."
+        ),
+        "05-classify-risk/CONTEXT.md no longer points at AGENTS.md's INTENT section as the \
+         one home for the eight dimensions — update this test and the doctrine text together"
+    );
+
+    // The claim must actually be true: AGENTS.md must carry that section.
+    let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
+    assert!(
+        agents_md.contains("### INTENT — Captain's intent discipline"),
+        "AGENTS.md no longer carries the INTENT section 05-classify-risk points at"
+    );
+}
+
+/// `80-monitor/CONTEXT.md` states the real reconciliation mechanism —
+/// automatic, once, at daemon startup via `runtime::recovery`, with no
+/// on-demand sync verb — now that #167 has closed with no such verb.
+/// Quoted verbatim, same house pattern as above.
+#[test]
+fn monitor_states_the_real_reconciliation_mechanism() {
+    let context_md = std::fs::read_to_string(
+        repo_root().join(".sergeant/workflows/dispatch/80-monitor/CONTEXT.md"),
+    )
+    .expect("read 80-monitor/CONTEXT.md");
+
+    assert!(
+        context_md.contains(
+            "Reconciliation runs automatically once, at daemon startup, before the daemon \
+             serves its first request: journal replay is followed by \
+             `runtime::recovery::reconcile`, which reattaches, resumes, or classifies every \
+             work believed `active` and appends `execution.reconciled` for each."
+        ),
+        "80-monitor/CONTEXT.md no longer states the real startup-reconciliation mechanism — \
+         update this test and the doctrine text together"
+    );
+    assert!(
+        context_md.contains(
+            "There is deliberately no on-demand sync verb: the upstream `--sync-all` was \
+             file-drift repair for a daemon-less shell tool with no continuous supervisor of \
+             its own; this daemon has one."
+        ),
+        "80-monitor/CONTEXT.md no longer states why there is no on-demand sync verb (#167) — \
+         update this test and the doctrine text together"
+    );
+
+    // No engine-gap ghost text should survive the rewrite.
+    assert!(
+        !context_md.contains("Engine gap"),
+        "80-monitor/CONTEXT.md still carries an 'Engine gap' note #167's closure removed"
+    );
+}
+
+// --------------------------------------------------------- 6. #180 wording
+
+/// NORTH-STAR.md's live destination text states the ratified #180 contract
+/// — a declared mutation surface, observed and journaled, never an
+/// enforced one — and AGENTS.md's mirror sentence says the same thing.
+/// Quoted verbatim, same house pattern as above.
+#[test]
+fn north_star_states_the_ratified_mutation_surface_contract() {
+    let north_star =
+        std::fs::read_to_string(repo_root().join("NORTH-STAR.md")).expect("read NORTH-STAR.md");
+    let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
+    // Both files soft-wrap; collapse whitespace so a sentence spanning a
+    // line break still matches a `contains` check on its logical text
+    // rather than its accidental line layout (same trick
+    // `agents_md_session_start_matches_the_real_root_gate` uses above).
+    let north_star_flat = north_star.split_whitespace().collect::<Vec<_>>().join(" ");
+    let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        north_star_flat.contains(
+            "carried by a durable intent-execution engine that gives every Work its own \
+             worktree and a declared mutation surface — authorization, not a seal — runs \
+             intents to completion against it, and journals what core can prove happened \
+             outside that surface as dirty evidence at retirement rather than silently \
+             absorbing it."
+        ),
+        "NORTH-STAR.md's destination text no longer states the ratified #180 mutation-surface \
+         contract — update this test and the doctrine text together"
+    );
+
+    assert!(
+        agents_md_flat.contains(
+            "It is carried by `sgt`, a durable intent-execution engine that gives every Work \
+             its own git worktree and a declared mutation surface — authorization, not a \
+             seal — and runs submitted intents to completion against it, journaling what it \
+             can prove happened outside that surface as dirty evidence at retirement rather \
+             than silently absorbing it"
+        ),
+        "AGENTS.md's mirror sentence no longer states the same #180 contract — update this \
+         test and the doctrine text together"
+    );
+
+    // Factual-not-exhortative framing (MUTATION_SURFACE_HEADER's own rule,
+    // src/backend/claude.rs): the destination text must never claim the
+    // mutation surface itself is enforced.
+    for (name, text) in [
+        ("NORTH-STAR.md", &north_star_flat),
+        ("AGENTS.md", &agents_md_flat),
+    ] {
+        assert!(
+            !text.contains("enforces the mutation surface")
+                && !text.contains("enforced mutation surface")
+                && !text.contains("mutation surface is enforced"),
+            "{name} must state the mutation surface as declared and observed, never enforced"
+        );
+    }
+}

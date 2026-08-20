@@ -101,7 +101,7 @@ async fn get_estate_repos_reflects_the_manifest_empty_then_populated() {
     init_repo(source.path());
     let origin = source.path().to_str().expect("utf8 path");
     client
-        .add_repo("svc-a", Some(origin), None)
+        .add_repo("svc-a", Some(origin), None, None)
         .await
         .expect("add repo");
 
@@ -128,7 +128,7 @@ async fn post_estate_repos_honors_the_instructions_choice() {
     init_repo(source.path());
     let origin = source.path().to_str().expect("utf8 path");
     let result = client
-        .add_repo("svc-b", Some(origin), Some("local"))
+        .add_repo("svc-b", Some(origin), None, Some("local"))
         .await
         .expect("add repo");
     assert_eq!(result["instructions"], "local");
@@ -150,12 +150,12 @@ async fn post_estate_repos_refuses_a_duplicate_name_with_the_manifest_refusal() 
     init_repo(source.path());
     let origin = source.path().to_str().expect("utf8 path");
     client
-        .add_repo("svc-a", Some(origin), None)
+        .add_repo("svc-a", Some(origin), None, None)
         .await
         .expect("first add");
 
     let err = client
-        .add_repo("svc-a", Some(origin), None)
+        .add_repo("svc-a", Some(origin), None, None)
         .await
         .expect_err("a second add of the same name must be refused");
     let text = err.to_string();
@@ -178,7 +178,7 @@ async fn delete_estate_repos_removes_the_declaration_but_not_the_clone() {
     init_repo(source.path());
     let origin = source.path().to_str().expect("utf8 path");
     client
-        .add_repo("svc-a", Some(origin), None)
+        .add_repo("svc-a", Some(origin), None, None)
         .await
         .expect("add repo");
 
@@ -204,7 +204,7 @@ async fn delete_estate_repos_refuses_while_a_group_still_references_it() {
     init_repo(source.path());
     let origin = source.path().to_str().expect("utf8 path");
     client
-        .add_repo("svc-a", Some(origin), None)
+        .add_repo("svc-a", Some(origin), None, None)
         .await
         .expect("add repo");
     client
@@ -239,7 +239,7 @@ async fn post_estate_groups_creates_then_extends_by_union() {
     let origin = source.path().to_str().expect("utf8 path");
     for name in ["svc-a", "svc-b"] {
         client
-            .add_repo(name, Some(origin), None)
+            .add_repo(name, Some(origin), None, None)
             .await
             .expect("add repo");
     }
@@ -296,7 +296,7 @@ async fn get_estate_groups_reflects_the_manifest() {
     init_repo(source.path());
     let origin = source.path().to_str().expect("utf8 path");
     client
-        .add_repo("svc-a", Some(origin), None)
+        .add_repo("svc-a", Some(origin), None, None)
         .await
         .expect("add repo");
     client
@@ -324,7 +324,7 @@ async fn delete_estate_groups_with_named_repos_removes_only_those_members() {
     let origin = source.path().to_str().expect("utf8 path");
     for name in ["svc-a", "svc-b"] {
         client
-            .add_repo(name, Some(origin), None)
+            .add_repo(name, Some(origin), None, None)
             .await
             .expect("add repo");
     }
@@ -360,7 +360,7 @@ async fn delete_estate_groups_with_no_repos_removes_the_whole_group() {
     init_repo(source.path());
     let origin = source.path().to_str().expect("utf8 path");
     client
-        .add_repo("svc-a", Some(origin), None)
+        .add_repo("svc-a", Some(origin), None, None)
         .await
         .expect("add repo");
     client
@@ -390,7 +390,7 @@ async fn delete_estate_groups_refuses_a_nonmember() {
     let origin = source.path().to_str().expect("utf8 path");
     for name in ["svc-a", "svc-b"] {
         client
-            .add_repo(name, Some(origin), None)
+            .add_repo(name, Some(origin), None, None)
             .await
             .expect("add repo");
     }

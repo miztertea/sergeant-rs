@@ -8,7 +8,9 @@ Root catalog (`docs/icm/convention.md` §1 rule 1; `docs/icm/record-shapes.md`
 workflow's own `index.md` is the source for those (`docs/icm/convention.md`
 §3 rule 2, the same anti-duplication rule that governs `AGENTS.md`).
 
-17 packages (down from 35 at the MVP-5 F2 execution-surface re-triage,
+19 packages (up from 17 at the 2026-08-20 wave-4 backlog close-out, which
+authored and published `validate-intent` (#201) and `record-decisions`
+(#88); down from 35 at the MVP-5 F2 execution-surface re-triage,
 2026-08-12; down from 23 at ICM-R2, 2026-08-16; down from 20 at ICM-R3,
 2026-08-16). Prior retirements: 12 — 9 CLI-SURFACE, 1 OPERATOR-SKILL, and
 the 2 R-NS-6-dissolved `grilling`/`grill-with-docs` — to `skills/`
@@ -46,6 +48,7 @@ is preserved in git history.
 | `dispatch` | published | [`workflows/dispatch/index.md`](workflows/dispatch/index.md) |
 | `implement` | published | [`workflows/implement/index.md`](workflows/implement/index.md) |
 | `prototype` | published | [`workflows/prototype/index.md`](workflows/prototype/index.md) |
+| `record-decisions` | published | [`workflows/record-decisions/index.md`](workflows/record-decisions/index.md) |
 | `recover-stalled-worker` | published | [`workflows/recover-stalled-worker/index.md`](workflows/recover-stalled-worker/index.md) |
 | `repo-to-icm` | published | [`workflows/repo-to-icm/index.md`](workflows/repo-to-icm/index.md) |
 | `research` | published | [`workflows/research/index.md`](workflows/research/index.md) |
@@ -53,6 +56,7 @@ is preserved in git history.
 | `to-tickets` | published | [`workflows/to-tickets/index.md`](workflows/to-tickets/index.md) |
 | `triage` | published | [`workflows/triage/index.md`](workflows/triage/index.md) |
 | `validate-and-ship` | published | [`workflows/validate-and-ship/index.md`](workflows/validate-and-ship/index.md) |
+| `validate-intent` | published | [`workflows/validate-intent/index.md`](workflows/validate-intent/index.md) |
 | `vet-external-skill` | published | [`workflows/vet-external-skill/index.md`](workflows/vet-external-skill/index.md) |
 | `wayfinder` | published | [`workflows/wayfinder/index.md`](workflows/wayfinder/index.md) |
 | `worker-mission` | published | [`workflows/worker-mission/index.md`](workflows/worker-mission/index.md) |

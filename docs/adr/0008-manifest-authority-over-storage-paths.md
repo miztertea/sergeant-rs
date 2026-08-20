@@ -97,9 +97,10 @@ ADR 0006 establishes, not more.
 ## Consequences
 
 The manifest gains a new `[estate] data_dir` field, mirroring
-`surfaces_dir`'s shape. Implemented; see GAUNTLET.md's "ADR 0008" ledger
-entry for the shipped shape, the precedence rung it chose, and
-verification.
+`surfaces_dir`'s shape. Implemented; the precedence rung it slots into is
+settled by owner ruling 2026-08-20 (backlog close-out kickoff,
+`docs/proposals/backlog-closeout-2026-08-20.md` rulings §8): `--data-dir` >
+`SGT_DATA_DIR` > manifest `data_dir` — invocation-explicit beats declared.
 
 #64 closes on this ruling rather than on the implementation it originally
 proposed; the self-hosting contradiction it named stays real and is now an
@@ -158,10 +159,10 @@ accepted contradiction rather than a pending fix, was not specified in the
 interview.
 
 The precedence and override behavior of a manifest-declared `data_dir`
-relative to `--data-dir` and `SGT_DATA_DIR` — whether it slots in at the
-same rung as estate discovery currently does, or somewhere else in the
-existing five-rung order — is not specified beyond "the manifest should be
-authority for both or neither." The implementation picked a rung
-(`SGT_DATA_DIR`/`--data-dir` still outrank a manifest `data_dir`) as a
-recommendation, not an owner ruling — argued and left open for
-adjudication in GAUNTLET.md's "ADR 0008" ledger entry.
+relative to `--data-dir` and `SGT_DATA_DIR` is resolved, not open: owner
+ruling 2026-08-20 (backlog close-out kickoff,
+`docs/proposals/backlog-closeout-2026-08-20.md` rulings §8) ratifies
+`--data-dir` > `SGT_DATA_DIR` > manifest `data_dir` — invocation-explicit
+beats declared. The implementation's rung order already matched this
+ruling; what had stood as an unadjudicated recommendation is now the owner
+ruling itself, pinned by test (`tests/m8_estate_cli.rs`).

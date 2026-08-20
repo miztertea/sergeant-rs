@@ -188,11 +188,30 @@ async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, extra: Value) -
     value
 }
 
+/// Every event currently committed to `data_dir`'s journal.
+///
+/// A short bounded retry absorbs #169's one legitimate transient —
+/// `replay_data_dir` racing a live `append_event` mid-write and observing a
+/// torn tail, which `JournalError::is_possible_torn_tail` names precisely.
+/// `wait_for_kinds` and `wait_for_a_quiet_journal` both poll this against a
+/// running daemon, so this is the one spot in the harness that can actually
+/// hit the race; every other `Malformed` still panics immediately on first
+/// sight, exactly as before — real corruption is never something a retry
+/// fixes, and pretending otherwise would only hide it.
 fn journal_events(data_dir: &Path) -> Vec<Event> {
-    Journal::replay_data_dir(data_dir)
-        .expect("replay")
-        .map(|e| e.expect("event"))
-        .collect()
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match Journal::replay_data_dir(data_dir)
+            .expect("replay")
+            .collect::<Result<Vec<Event>, _>>()
+        {
+            Ok(events) => return events,
+            Err(e) if e.is_possible_torn_tail() && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("journal replay failed: {e}"),
+        }
+    }
 }
 
 /// Every canned query plus the table counts, as one comparable blob. This is

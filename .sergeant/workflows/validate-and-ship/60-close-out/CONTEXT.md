@@ -60,7 +60,7 @@ Apply `@@bounded-judgment`.
 - This stage's own `checks-passed`/`passed` outcomes presuppose a PR already exists and CI already ran — this stage does not itself open that PR or trigger that CI, but that is expected, ordinary behavior, not an unresolved authority gap (resolved — see the workflow-level `CONTEXT.md`'s "Resolved" note). If this stage is ever reached at `checks-passed`/`passed` without a PR/CI having actually happened, that is itself a `J0` condition, not something to paper over by describing the expected happy path as if it occurred.
 
 ### Completion boundary
-This stage may complete only at a terminal or near-terminal pipeline outcome, with the user given an honest, itemized summary — never left at a failed outcome in silence.
+This stage may complete only at a terminal or near-terminal pipeline outcome, with the user given an honest, itemized summary — never left at a failed outcome in silence. The same terminality binds any external pipeline run this stage drove: completion requires that run to have reached a terminal disposition, or the handover log to explicitly record that it was deliberately left open and why — an untracked open run is silence by another name.
 
 ### Decision evidence
 The outcome acted on and the summary given are this stage's own decision record; ownership-transfer logging (below) is separate and mechanical.
