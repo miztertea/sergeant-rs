@@ -29,18 +29,84 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::backend::BindingSummary;
 use crate::domain::workspace::RepositorySpec;
 use crate::runtime::fsutil::create_dir_all_durable;
-use crate::runtime::git::{GitError, git, git_submodule_update, git_succeeds};
+use crate::runtime::git::{
+    GitError, canonical_git_common_dir, canonical_git_top_level, git, git_submodule_update,
+    git_succeeds,
+};
 use crate::runtime::integrity::{
     DriftAttribution, EstateDriftObservation, IntegrityDisposition, IntegrityFinding, ObservedHead,
 };
+use crate::runtime::repolock::{self, RepoLockError};
 
 /// Directory under the data dir holding all work surfaces.
 pub const SURFACES_DIR: &str = "surfaces";
 
-/// One lock per source repository, held across every worktree mutation this
-/// module makes against that repository.
+/// The lock identity for one repository, derived **once per operation** and
+/// carried to every guarded span that operation opens.
+///
+/// Deriving is a `git rev-parse` — a process spawn — so it happens at the
+/// entry to `materialize`/`attach`/`rematerialize`/`teardown`/`reap`, per
+/// repository, and never inside a span. A binding that already records its
+/// canonical common directory (§3.5, journaled from Phase B onward) skips the
+/// spawn entirely; only a pre-enrichment binding pays for one.
+///
+/// `identity` is the canonical git common directory (§2.7/§9.4), which is what
+/// **both** locking layers key on. Fallback when git cannot answer — a source
+/// path that is not a repository, or a git that will not run — is the
+/// canonicalized source path: the pre-Phase-B key, which is strictly better
+/// than no key at all, and whose one weakness (aliasing a checkout against its
+/// own linked worktree) can only bite where git was already unable to tell us
+/// they were the same repository.
+#[derive(Debug, Clone)]
+struct RepositoryGate {
+    /// Data dir whose `locks/repo/` holds the interprocess lock file.
+    data_dir: PathBuf,
+    /// Canonical git common directory: one identity, both layers.
+    identity: PathBuf,
+}
+
+impl RepositoryGate {
+    /// Derive the gate for `source` by asking git for its common directory.
+    /// One spawn; call once per repository per operation.
+    fn derive(data_dir: &Path, source: &Path) -> Self {
+        Self::from_common_dir(data_dir, canonical_git_common_dir(source).ok(), source)
+    }
+
+    /// The gate for a common directory already in hand — the shape
+    /// `materialize_one` and `attach_one` use, because they need that same
+    /// reading for the binding they are about to journal (§3.5) and must not
+    /// spawn `git rev-parse` twice to get it.
+    fn from_common_dir(data_dir: &Path, common_dir: Option<PathBuf>, source: &Path) -> Self {
+        let identity = common_dir.unwrap_or_else(|| {
+            std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf())
+        });
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            identity,
+        }
+    }
+
+    /// The gate for a journaled binding, preferring the identity recorded at
+    /// admission (§3.5) over re-asking the checkout. Beyond saving a spawn,
+    /// this is the more honest answer: the lock a teardown takes is the one
+    /// the materialization that created these worktrees took, even if the
+    /// source path has since been moved or replaced underneath us.
+    fn for_binding(data_dir: &Path, binding: &RepositoryBinding) -> Self {
+        match &binding.canonical_common_dir {
+            Some(identity) => Self {
+                data_dir: data_dir.to_path_buf(),
+                identity: identity.clone(),
+            },
+            None => Self::derive(data_dir, &binding.source_path),
+        }
+    }
+}
+
+/// One in-process lock per repository identity, held across every worktree
+/// mutation this module makes against that repository.
 ///
 /// **Not the core lock, and that is the point.** N3 moved git out from under
 /// the daemon's single writer (§22.6), which is what the budget asks for — and
@@ -52,30 +118,60 @@ pub const SURFACES_DIR: &str = "surfaces";
 /// *retained*, journaled and left on disk, which is honest and still wrong.
 ///
 /// So concurrency against one repository is serialized here, at the narrowest
-/// scope that fixes it: per source path, for the duration of the git calls
-/// that touch its registry. Two works in different repositories still proceed
-/// in parallel, and no request anywhere queues behind the core lock for it.
-fn repository_lock(source: &Path) -> Arc<Mutex<()>> {
+/// scope that fixes it: per repository identity, for the duration of the git
+/// calls that touch its registry. Two works in different repositories still
+/// proceed in parallel, and no request anywhere queues behind the core lock
+/// for it.
+///
+/// **Keyed on the git common directory since Phase B**, not the source
+/// checkout path. §2.7: different linked worktree paths may share one common
+/// directory — and therefore one ref and worktree registry — while receiving
+/// different locks, and a lock two mutators do not share is not a lock. This
+/// stays as §9.4's permitted "fast local layer"; the file lock
+/// [`with_repository`] takes inside it is the correctness boundary.
+fn repository_lock(identity: &Path) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     let table = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    // Keyed on the canonical path: two workspaces can reach one repository by
-    // different routes, and a lock they do not share is not a lock.
-    let key = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let mut table = table.lock().unwrap_or_else(|e| e.into_inner());
-    Arc::clone(table.entry(key).or_default())
+    Arc::clone(table.entry(identity.to_path_buf()).or_default())
 }
 
-/// Run `f` with this repository's worktree registry to itself.
+/// Run `f` with this repository's worktree registry to itself — against every
+/// thread in this process, and against every other process on the machine.
 ///
-/// Poisoning is deliberately ignored: the guard protects git's on-disk
+/// Two layers, in this order (§9.4: "the implementation may retain an
+/// in-process mutex for efficiency, but the filesystem lock is the correctness
+/// boundary"):
+///
+/// 1. [`repository_lock`], the in-process mutex. Cheap, and it means the
+///    common case — a burst of submissions inside one daemon — never reaches
+///    the filesystem to discover it must wait.
+/// 2. [`repolock::acquire`], the interprocess file lock. Taken *inside* the
+///    mutex, so exactly one thread of this process ever contends for it, which
+///    is also what makes the bounded wait a wait for a genuinely foreign
+///    holder rather than for ourselves.
+///
+/// Both are released in reverse order when this function returns.
+///
+/// **The span is not widened by any of this.** The asymmetric hold pattern
+/// this module measured (reads, status and worktree population *outside*;
+/// registry mutation inside a narrow span) is unchanged — the file lock is
+/// taken and dropped in exactly the eight places the mutex already was, and no
+/// read acquired a guard before this change or acquires one after it.
+///
+/// Mutex poisoning is deliberately ignored: the guard protects git's on-disk
 /// registry, not an in-memory invariant, so a panic in one caller leaves
 /// nothing for the next one to be confused by — and refusing every later
 /// worktree operation for the daemon's lifetime would be a far worse failure
-/// than the one being guarded against.
-fn with_repository<T>(source: &Path, f: impl FnOnce() -> T) -> T {
-    let lock = repository_lock(source);
-    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    f()
+/// than the one being guarded against. A *file* lock failure is different and
+/// is returned: it means another process may be mutating this registry right
+/// now, which is precisely the condition this function exists to prevent
+/// running under.
+fn with_repository<T>(gate: &RepositoryGate, f: impl FnOnce() -> T) -> Result<T, SurfaceError> {
+    let local = repository_lock(&gate.identity);
+    let _local_guard = local.lock().unwrap_or_else(|e| e.into_inner());
+    let _file_guard = repolock::acquire(&gate.data_dir, &gate.identity)?;
+    Ok(f())
 }
 
 /// Event kind: a work surface is about to be materialized. Appended *before*
@@ -149,6 +245,29 @@ pub struct RepositoryBinding {
     /// shape that could exist then — deserializes as exactly that.
     #[serde(default)]
     pub origin: BindingOrigin,
+    /// §3.5's "canonical Git top level": what `source_path` actually resolved
+    /// to as a working tree at admission (`git rev-parse --show-toplevel`,
+    /// canonicalized).
+    ///
+    /// `Option` + `#[serde(default)]` (amendment C3: journal changes are
+    /// additive): a binding journaled before Phase B replays as `None`, which
+    /// is the truthful reading — nothing observed this at the time — and
+    /// every consumer treats it as "re-derive or do without", never as a
+    /// value to invent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_top_level: Option<PathBuf>,
+    /// §3.5's "canonical Git common directory", and §2.7's lock identity:
+    /// `git rev-parse --path-format=absolute --git-common-dir`, canonicalized,
+    /// pinned at admission.
+    ///
+    /// Recording it is what lets a later teardown lock the *same* repository
+    /// the materialization did without re-asking a checkout that may since
+    /// have moved — and what lets `common_dir_finding` compare the worktree's
+    /// answer against what was admitted rather than against a second live
+    /// reading of the source. `None` for a pre-Phase-B binding, exactly like
+    /// [`Self::canonical_top_level`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_common_dir: Option<PathBuf>,
 }
 
 /// What materialization is about to create, recorded before it creates any of
@@ -207,6 +326,27 @@ impl WorkSurface {
             [only] => only.worktree_path.clone(),
             _ => self.root.clone(),
         }
+    }
+
+    /// §10.1's binding summary: the exact worktrees this Work may modify,
+    /// with the branch and base commit each was bound to, in scope order.
+    ///
+    /// [`Self::execution_cwd`] answers "where does the process start", which
+    /// for a multi-repo Work is the surface root — a directory the Work may
+    /// *not* write to. This answers the different and more important question
+    /// a backend's launch grammar needs: which directories are the mutation
+    /// surface, and what is each one supposed to be.
+    pub fn binding_summary(&self) -> Vec<BindingSummary> {
+        self.bindings
+            .iter()
+            .map(|b| BindingSummary {
+                repository: b.repository.clone(),
+                worktree_path: b.worktree_path.clone(),
+                work_branch: b.work_branch.clone(),
+                base_branch: b.base_branch.clone(),
+                base_sha: b.base_sha.clone(),
+            })
+            .collect()
     }
 }
 
@@ -380,6 +520,13 @@ pub enum SurfaceError {
     /// Git refused.
     #[error(transparent)]
     Git(#[from] GitError),
+    /// The repository's interprocess lock (§9.4) could not be taken, so the
+    /// registry mutation it guards was never attempted. Carried transparently:
+    /// [`RepoLockError`] already names the lock file, the git common directory
+    /// it stands for, and how long acquisition waited — everything an operator
+    /// needs, and nothing this layer can add to it.
+    #[error(transparent)]
+    RepositoryLock(#[from] RepoLockError),
     /// Filesystem failure preparing the surface directory.
     #[error("surface io error at {path}: {source}")]
     Io {
@@ -457,7 +604,15 @@ pub fn surface_root(surfaces_root: &Path, work_id: &str) -> PathBuf {
 /// exactly the same recorded teardown a later repository's failure always
 /// got, instead of silently stranding the worktree `materialize_one` had
 /// already created for it.
+///
+/// `data_dir` is the daemon's own storage, and is *not* assumed to be the
+/// parent of `surfaces_root` (R-MVP1-1 unbound the two). It is here for one
+/// reason: it locates the interprocess repository locks §9.4 requires
+/// (`<data_dir>/locks/repo/`; see [`crate::runtime::repolock`] for why that
+/// key is complete under §6.2). Every entry point in this module takes it for
+/// the same reason and uses it for nothing else.
 pub fn materialize(
+    data_dir: &Path,
     surfaces_root: &Path,
     work_id: &str,
     repositories: &[RepositorySpec],
@@ -478,7 +633,7 @@ pub fn materialize(
 
     let mut bindings: Vec<RepositoryBinding> = Vec::with_capacity(repositories.len());
     for repository in repositories {
-        let outcome = match materialize_one(&root, &canonical_root, &branch, repository) {
+        let outcome = match materialize_one(data_dir, &root, &canonical_root, &branch, repository) {
             Ok(binding) => init_submodules_if_present(&binding.worktree_path)
                 .map(|()| binding.clone())
                 .map_err(|err| (Some(binding), err)),
@@ -502,7 +657,7 @@ pub fn materialize(
                     root,
                     bindings,
                 };
-                let report = teardown(&partial);
+                let report = teardown(data_dir, &partial);
                 return Err(SurfaceError::PartialFailure {
                     source: Box::new(err),
                     teardown: report,
@@ -518,6 +673,7 @@ pub fn materialize(
 }
 
 fn materialize_one(
+    data_dir: &Path,
     root: &Path,
     canonical_root: &Path,
     branch: &str,
@@ -558,6 +714,17 @@ fn materialize_one(
     )
     .unwrap_or_else(|_| "(detached)".to_string());
 
+    // §3.5's two canonical identities, read here — once, outside the lock,
+    // alongside the other admission facts — and then used for both purposes
+    // they exist for: the lock key below, and the binding's own record of what
+    // this repository *was* at admission.  Deriving them here rather than
+    // inside the span is the whole point: `with_repository` must never spawn
+    // a `git rev-parse` while holding a registry lock.
+    let canonical_top_level = canonical_git_top_level(&repository.path).ok();
+    let canonical_common_dir = canonical_git_common_dir(&repository.path).ok();
+    let gate =
+        RepositoryGate::from_common_dir(data_dir, canonical_common_dir.clone(), &repository.path);
+
     // Only `git worktree add` touches `.git/worktrees/` — the operation the
     // per-repository lock exists to serialize.  Hold it for exactly that span
     // and nothing more.
@@ -574,9 +741,9 @@ fn materialize_one(
     // below populates exactly the same content as a full add would have.  The
     // checkout completes before `materialize_one` returns, so no caller ever
     // sees a worktree with its branch set but its files absent.
-    with_repository(&repository.path, || {
+    with_repository(&gate, || {
         add_worktree_no_checkout(&repository.path, &worktree_path, branch, &base_sha)
-    })?;
+    })??;
     // Outside the per-repository lock: populate the working tree.
     //
     // `git reset --hard HEAD` is used rather than `git checkout HEAD` for two
@@ -610,7 +777,7 @@ fn materialize_one(
     if let Err(checkout_err) = checkout_worktree(&worktree_path) {
         let path = worktree_path.display().to_string();
         // Remove registry entry first so the branch is unreferenced.
-        let _ = with_repository(&repository.path, || {
+        let _ = with_repository(&gate, || {
             git(&repository.path, &["worktree", "remove", "--force", &path]).map(|_| ())
         });
         // Delete the branch so a retry can re-create it with `-b`.
@@ -634,6 +801,12 @@ fn materialize_one(
         work_branch: branch.to_string(),
         head_sha,
         origin: BindingOrigin::Cut,
+        canonical_top_level,
+        // The `Option` is carried, not the gate's `identity`: the gate falls
+        // back to the canonicalized source path when git cannot answer, and
+        // that path is not a common directory — journaling it as one would
+        // record a value that only usually means what the field says.
+        canonical_common_dir,
     })
 }
 
@@ -658,15 +831,31 @@ fn materialize_one(
 /// this change opens. Left alone rather than folded into this pass: the fix
 /// belongs to `settle_rematerialize`'s error handling in general, not to
 /// submodules specifically.
-pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError> {
+///
+/// §3.5/C3: both canonical identities are **re-derived** here rather than
+/// carried forward. A retry can land days after admission, and this is the
+/// one path that re-establishes the worktree from the branch — if the mount
+/// has been re-cloned or moved in between, the identity that matters is the
+/// one the re-attachment actually used. A pre-Phase-B binding that replayed
+/// with `None` therefore gains its identities on first retry, rather than
+/// staying blank forever.
+pub fn rematerialize(data_dir: &Path, surface: &WorkSurface) -> Result<WorkSurface, SurfaceError> {
     create_dir_all_durable(&surface.root).map_err(|source| SurfaceError::Io {
         path: surface.root.display().to_string(),
         source,
     })?;
     let mut bindings = Vec::with_capacity(surface.bindings.len());
     for binding in &surface.bindings {
+        // One derivation per binding per operation, before any span opens.
+        let canonical_common_dir = canonical_git_common_dir(&binding.source_path).ok();
+        let canonical_top_level = canonical_git_top_level(&binding.source_path).ok();
+        let gate = RepositoryGate::from_common_dir(
+            data_dir,
+            canonical_common_dir.clone(),
+            &binding.source_path,
+        );
         if !binding.worktree_path.exists() {
-            with_repository(&binding.source_path, || {
+            with_repository(&gate, || {
                 // Whatever removed the directory may not have unregistered it
                 // — teardown only prunes on the paths it walks, and a worktree
                 // can vanish long after that (a retained-dirty one deleted by
@@ -697,11 +886,15 @@ pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError>
                     !branch_exists,
                 )?;
                 init_submodules_if_present(&binding.worktree_path)
-            })?;
+            })??;
         }
         let head_sha = git(&binding.worktree_path, &["rev-parse", "HEAD"])?;
         bindings.push(RepositoryBinding {
             head_sha,
+            canonical_top_level: canonical_top_level
+                .or_else(|| binding.canonical_top_level.clone()),
+            canonical_common_dir: canonical_common_dir
+                .or_else(|| binding.canonical_common_dir.clone()),
             ..binding.clone()
         });
     }
@@ -740,7 +933,11 @@ pub fn rematerialize(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError>
 /// gate-surface attach never leaves an orphaned worktree in the caller's
 /// repositories — same as an ordinary `materialize` failure, and using the
 /// identical [`SurfaceError::PartialFailure`] shape.
+///
+/// `data_dir` locates the interprocess repository locks, exactly as in
+/// [`materialize`].
 pub fn attach(
+    data_dir: &Path,
     surfaces_root: &Path,
     work_id: &str,
     target_work_id: &str,
@@ -761,7 +958,7 @@ pub fn attach(
 
     let mut bindings: Vec<RepositoryBinding> = Vec::with_capacity(target_bindings.len());
     for target in target_bindings {
-        let outcome = match attach_one(&root, &canonical_root, target_work_id, target) {
+        let outcome = match attach_one(data_dir, &root, &canonical_root, target_work_id, target) {
             Ok(binding) => init_submodules_if_present(&binding.worktree_path)
                 .map(|()| binding.clone())
                 .map_err(|err| (Some(binding), err)),
@@ -787,7 +984,7 @@ pub fn attach(
                     root,
                     bindings,
                 };
-                let report = teardown(&partial);
+                let report = teardown(data_dir, &partial);
                 return Err(SurfaceError::PartialFailure {
                     source: Box::new(err),
                     teardown: report,
@@ -803,6 +1000,7 @@ pub fn attach(
 }
 
 fn attach_one(
+    data_dir: &Path,
     root: &Path,
     canonical_root: &Path,
     target_work_id: &str,
@@ -820,7 +1018,19 @@ fn attach_one(
             source_repo: target.source_path.display().to_string(),
         });
     }
-    let head_sha = with_repository(&target.source_path, || -> Result<String, SurfaceError> {
+    // §3.5, derived once and outside the span, exactly as `materialize_one`
+    // does. An attached binding shares the target's *branch*, but its own
+    // identities are read fresh here: this Work is admitting this repository
+    // now, and "what the mount was when the target was admitted" is a
+    // different fact, already recorded on the target's own binding.
+    let canonical_top_level = canonical_git_top_level(&target.source_path).ok();
+    let canonical_common_dir = canonical_git_common_dir(&target.source_path).ok();
+    let gate = RepositoryGate::from_common_dir(
+        data_dir,
+        canonical_common_dir.clone(),
+        &target.source_path,
+    );
+    let head_sha = with_repository(&gate, || -> Result<String, SurfaceError> {
         // `create_branch: false`: the git-level operation `rematerialize`
         // already performs in a different context (re-attaching a surface's
         // own retained branch), invoked here from a new caller with a
@@ -843,7 +1053,7 @@ fn attach_one(
             false,
         )?;
         Ok(git(&worktree_path, &["rev-parse", "HEAD"])?)
-    })?;
+    })??;
 
     Ok(RepositoryBinding {
         repository: target.repository.clone(),
@@ -856,6 +1066,8 @@ fn attach_one(
         origin: BindingOrigin::Attached {
             target_work_id: target_work_id.to_string(),
         },
+        canonical_top_level,
+        canonical_common_dir,
     })
 }
 
@@ -865,7 +1077,13 @@ fn attach_one(
 /// This never returns an error. Teardown runs on the way to a terminal state,
 /// and a Work does not stop being canceled because a worktree was dirty — the
 /// honest outcome is a recorded report, which is what the caller journals.
-pub fn teardown(surface: &WorkSurface) -> TeardownReport {
+/// That includes a repository lock this daemon could not take: it becomes a
+/// `RetainedError` disposition with the timeout as its detail, which is the
+/// same fail-closed shape a git refusal already produces.
+///
+/// `data_dir` locates the interprocess repository locks, exactly as in
+/// [`materialize`].
+pub fn teardown(data_dir: &Path, surface: &WorkSurface) -> TeardownReport {
     let mut bindings = Vec::with_capacity(surface.bindings.len());
     let mut drift = Vec::new();
     for binding in &surface.bindings {
@@ -873,7 +1091,7 @@ pub fn teardown(surface: &WorkSurface) -> TeardownReport {
         // touches anything, so `observed` is the estate as the Work left it
         // rather than as teardown left it.
         drift.extend(observe_estate_drift(binding));
-        let outcome = teardown_binding(binding);
+        let outcome = teardown_binding(data_dir, binding);
         bindings.push(BindingTeardown {
             repository: binding.repository.clone(),
             worktree_path: binding.worktree_path.clone(),
@@ -1068,13 +1286,16 @@ pub struct ReapReport {
 /// Scoped to `RetainedDirty` only, matching [`ReapOutcome::Skipped`]'s
 /// reasoning: a `RetainedError` binding has no evidence backing a forced
 /// removal, so it is reported, not touched.
-pub fn reap(surface: &WorkSurface, teardown: &TeardownReport) -> ReapReport {
+///
+/// `data_dir` locates the interprocess repository locks, exactly as in
+/// [`materialize`].
+pub fn reap(data_dir: &Path, surface: &WorkSurface, teardown: &TeardownReport) -> ReapReport {
     let bindings = teardown
         .bindings
         .iter()
         .map(|b| BindingReap {
             repository: b.repository.clone(),
-            outcome: reap_binding(surface, b),
+            outcome: reap_binding(data_dir, surface, b),
         })
         .collect();
     remove_surface_root(&surface.root);
@@ -1084,7 +1305,7 @@ pub fn reap(surface: &WorkSurface, teardown: &TeardownReport) -> ReapReport {
     }
 }
 
-fn reap_binding(surface: &WorkSurface, binding: &BindingTeardown) -> ReapOutcome {
+fn reap_binding(data_dir: &Path, surface: &WorkSurface, binding: &BindingTeardown) -> ReapOutcome {
     match &binding.disposition {
         BindingDisposition::RetainedDirty {
             patch: Some(info), ..
@@ -1104,11 +1325,10 @@ fn reap_binding(surface: &WorkSurface, binding: &BindingTeardown) -> ReapOutcome
             // through git rather than a raw recursive delete keeps the
             // source repository's own worktree registry consistent, the
             // same as every other removal this module ever does.
-            let Some(source) = surface
+            let Some(surface_binding) = surface
                 .bindings
                 .iter()
                 .find(|b| b.repository == binding.repository)
-                .map(|b| b.source_path.clone())
             else {
                 return ReapOutcome::Failed {
                     detail: "no surface binding recorded for this repository; cannot resolve \
@@ -1116,12 +1336,22 @@ fn reap_binding(surface: &WorkSurface, binding: &BindingTeardown) -> ReapOutcome
                         .to_string(),
                 };
             };
+            let source = surface_binding.source_path.clone();
+            // Derived once, outside the span, from the binding's own record —
+            // the same rule every other guarded span in this module follows.
+            let gate = RepositoryGate::for_binding(data_dir, surface_binding);
             let bytes = directory_size(&binding.worktree_path);
             let path = binding.worktree_path.display().to_string();
-            match with_repository(&source, || {
+            // Two failure layers flattened into one `Failed`: a lock we could
+            // not take and a removal git refused are both "this was not
+            // reaped, here is why", and reap's report has one place to say so.
+            match with_repository(&gate, || {
                 git(&source, &["worktree", "remove", "--force", &path])
             }) {
-                Ok(_) => ReapOutcome::Reaped { bytes },
+                Ok(Ok(_)) => ReapOutcome::Reaped { bytes },
+                Ok(Err(e)) => ReapOutcome::Failed {
+                    detail: e.to_string(),
+                },
                 Err(e) => ReapOutcome::Failed {
                     detail: e.to_string(),
                 },
@@ -1371,39 +1601,29 @@ fn reachable_from_a_named_ref(binding: &RepositoryBinding, sha: &str) -> bool {
     )
 }
 
-/// `git rev-parse --path-format=absolute --git-common-dir`, canonicalized.
-///
-/// Canonicalized because the comparison this feeds is about *identity*, not
-/// spelling: a source path reached through a symlink (`/tmp` → `/private/tmp`
-/// on macOS, an estate mount behind a symlinked parent) would otherwise
-/// answer differently from the worktree that shares its object store, and
-/// report a mismatch where there is none.
-fn common_dir(dir: &Path) -> Option<PathBuf> {
-    let raw = git(
-        dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .ok()?;
-    let path = PathBuf::from(raw);
-    Some(std::fs::canonicalize(&path).unwrap_or(path))
-}
-
 /// §11.3's `assigned_common_dir_mismatch`: the worktree and the checkout it
 /// is journaled against must agree on the Git common directory — the identity
 /// §2.7 locks on and the one that says these two paths really do share an
 /// object store.
 ///
-/// Phase A asks the question at teardown, from both sides, which needs no
+/// Phase A asked the question at teardown, from both sides, which needed no
 /// binding schema change. Phase B pins the canonical common dir at admission,
-/// at which point the expected side comes from the binding rather than from
-/// re-asking the source checkout.
+/// so the *expected* side now comes from the binding — a genuinely stronger
+/// check, because it compares the worktree against what was admitted rather
+/// than against a second live reading that would move with the mount. A
+/// pre-enrichment binding (`None`, C3) falls back to Phase A's behaviour and
+/// re-asks the source checkout, which is exactly as good an answer as it ever
+/// was for those bindings.
 ///
 /// A read that fails on either side yields no finding: this is the *identity*
 /// check, and an unanswerable git is a different failure, already handled
 /// fail-closed by the status/removal path below.
 fn common_dir_finding(binding: &RepositoryBinding) -> Option<IntegrityFinding> {
-    let expected = common_dir(&binding.source_path)?;
-    let observed = common_dir(&binding.worktree_path)?;
+    let expected = match &binding.canonical_common_dir {
+        Some(admitted) => admitted.clone(),
+        None => canonical_git_common_dir(&binding.source_path).ok()?,
+    };
+    let observed = canonical_git_common_dir(&binding.worktree_path).ok()?;
     if expected == observed {
         return None;
     }
@@ -1450,7 +1670,11 @@ fn observe_estate_drift(binding: &RepositoryBinding) -> Option<EstateDriftObserv
     })
 }
 
-fn teardown_binding(binding: &RepositoryBinding) -> BindingOutcome {
+fn teardown_binding(data_dir: &Path, binding: &RepositoryBinding) -> BindingOutcome {
+    // One lock identity for this whole teardown, resolved before any span
+    // opens — from the binding's own admission record when it has one, so the
+    // lock released here is the lock materialization took.
+    let gate = RepositoryGate::for_binding(data_dir, binding);
     // Read the retained branch's tip **before** taking the per-repository lock.
     // This call reads from ref storage only — it does not access the worktree
     // registry (`.git/worktrees/`) that `with_repository` protects, so running
@@ -1473,7 +1697,13 @@ fn teardown_binding(binding: &RepositoryBinding) -> BindingOutcome {
         // The directory is gone, but the source repository still lists it;
         // unregister it now so a later rematerialize at the same path is
         // possible.  `git worktree prune` modifies the registry → lock.
-        with_repository(&binding.source_path, || {
+        //
+        // Best-effort, and already was: `prune_stale_worktrees` discards its
+        // own git failures. A lock we cannot take is one more way this prune
+        // does not happen, and it changes nothing about the disposition below
+        // — the worktree is `Missing` either way, and the next teardown or
+        // rematerialize against this repository prunes what this one skipped.
+        let _ = with_repository(&gate, || {
             prune_stale_worktrees(&binding.source_path);
         });
         findings.push(IntegrityFinding::AssignedWorktreeMissing {
@@ -1589,8 +1819,15 @@ fn teardown_binding(binding: &RepositoryBinding) -> BindingOutcome {
                 worktree_path: binding.worktree_path.clone(),
                 evidence: changes.clone(),
             });
-            let disposition =
-                with_repository(&binding.source_path, || retain_dirty(binding, changes));
+            // A lock we cannot take means the `--force` removal `retain_dirty`
+            // ends with must not be attempted at all: another process may be
+            // rewriting this registry right now. Fail closed exactly as an
+            // unanswerable `git status` does below — retained, with the
+            // refusal itself as the recorded evidence.
+            let disposition = with_repository(&gate, || retain_dirty(binding, changes))
+                .unwrap_or_else(|e| BindingDisposition::RetainedError {
+                    detail: e.to_string(),
+                });
             return BindingOutcome {
                 disposition,
                 final_sha,
@@ -1618,7 +1855,7 @@ fn teardown_binding(binding: &RepositoryBinding) -> BindingOutcome {
 
     // Clean path: only `git worktree remove` touches the registry.
     let path = binding.worktree_path.display().to_string();
-    let disposition = with_repository(&binding.source_path, || {
+    let disposition = with_repository(&gate, || {
         match git(&binding.source_path, &["worktree", "remove", &path]) {
             Ok(_) => BindingDisposition::Removed,
             // #22: git unconditionally refuses to remove a worktree that
@@ -1651,6 +1888,11 @@ fn teardown_binding(binding: &RepositoryBinding) -> BindingOutcome {
                 detail: e.to_string(),
             },
         }
+    })
+    // Same fail-closed rule as every other arm here: a removal that was never
+    // attempted retains the worktree and records why.
+    .unwrap_or_else(|e| BindingDisposition::RetainedError {
+        detail: e.to_string(),
     });
     BindingOutcome {
         disposition,
@@ -1775,6 +2017,40 @@ mod tests {
     use super::*;
     use std::process::Command;
 
+    /// The data dir a fixture surface belongs to.
+    ///
+    /// Every fixture in this module hands `materialize` one tempdir as *both*
+    /// the data dir and the surfaces root — the daemon's own default
+    /// relationship (`<data_dir>/surfaces`) collapsed by one level, which
+    /// keeps a fixture to a single directory. A surface root is
+    /// `<surfaces_root>/<work-id>`, so its parent is that directory.
+    ///
+    /// The two being genuinely independent (R-MVP1-1: an estate may put its
+    /// surfaces anywhere, and §9.4's locks still live in the daemon's own
+    /// storage) is pinned separately, by
+    /// [`the_repository_lock_lives_under_the_data_dir_not_the_surfaces_root`].
+    fn fixture_data_dir(surface: &WorkSurface) -> &Path {
+        surface
+            .root
+            .parent()
+            .expect("a fixture surface root always has a parent")
+    }
+
+    /// [`teardown`] against the data dir this fixture surface belongs to.
+    fn teardown_of(surface: &WorkSurface) -> TeardownReport {
+        teardown(fixture_data_dir(surface), surface)
+    }
+
+    /// [`rematerialize`] against the data dir this fixture surface belongs to.
+    fn rematerialize_of(surface: &WorkSurface) -> Result<WorkSurface, SurfaceError> {
+        rematerialize(fixture_data_dir(surface), surface)
+    }
+
+    /// [`reap`] against the data dir this fixture surface belongs to.
+    fn reap_of(surface: &WorkSurface, report: &TeardownReport) -> ReapReport {
+        reap(fixture_data_dir(surface), surface, report)
+    }
+
     /// Concurrent surfaces against **one** repository all materialize and all
     /// tear down cleanly.
     ///
@@ -1803,7 +2079,13 @@ mod tests {
     #[test]
     fn concurrent_surfaces_on_one_repository_all_materialize_and_retire_cleanly() {
         let dir = tempfile::TempDir::new().expect("tempdir");
+        // Unlike the rest of this module's fixtures, the data dir and the
+        // surfaces root are kept apart here: the emptiness assertion below is
+        // about the *surfaces* root, and §9.4's `locks/repo/` lives in the
+        // daemon's storage. This is also the production relationship, one
+        // level flattened (`<data_dir>/surfaces`).
         let data = dir.path().join("data");
+        let surfaces = dir.path().join("surfaces");
         let spec = repo(&dir.path().join("solo"));
         // Enough overlap that adds and removes interleave inside git's own
         // `.git/worktrees` registry, which is where the measured failure was.
@@ -1817,12 +2099,18 @@ mod tests {
                 let handles: Vec<_> = (0..WORKS)
                     .map(|i| {
                         let data = data.clone();
+                        let surfaces = surfaces.clone();
                         let spec = spec.clone();
                         scope.spawn(move || {
                             let work_id = format!("01CONCURRENT{round}{i:03}");
-                            let surface = materialize(&data, &work_id, std::slice::from_ref(&spec))
-                                .unwrap_or_else(|e| panic!("materialize {work_id}: {e}"));
-                            teardown(&surface)
+                            let surface = materialize(
+                                &data,
+                                &surfaces,
+                                &work_id,
+                                std::slice::from_ref(&spec),
+                            )
+                            .unwrap_or_else(|e| panic!("materialize {work_id}: {e}"));
+                            teardown(&data, &surface)
                         })
                     })
                     .collect();
@@ -1839,13 +2127,13 @@ mod tests {
                      removed (round {round} of {ROUNDS}): {report:?}"
                 );
             }
-            // `data` is handed to `materialize` directly as the surfaces
+            // `surfaces` is handed to `materialize` directly as the surfaces
             // root (R-MVP1-1: no implicit `SURFACES_DIR` nesting inside this
             // module any more — that join happens once, at `Engine`'s
             // default computation, not here).
             assert!(
-                !data.exists()
-                    || std::fs::read_dir(&data)
+                !surfaces.exists()
+                    || std::fs::read_dir(&surfaces)
                         .expect("surfaces root")
                         .next()
                         .is_none(),
@@ -1854,24 +2142,28 @@ mod tests {
         }
     }
 
-    /// §2.7/Phase B (C4): `repository_lock` keys on the canonical *checkout
-    /// path* handed to it, not the git common directory the checkout
-    /// actually shares with others. A primary checkout and a `git worktree
-    /// add` of it are two different, canonicalize-stable paths pointing at
-    /// one shared `.git` (a linked worktree's `commondir` file points back
-    /// to it) — the same "two workspaces can reach one repository by
-    /// different routes" hazard `repository_lock`'s own doc comment already
-    /// names for symlinks, just reached through a worktree instead. Today
-    /// that means concurrent mutations against a checkout and its own
-    /// linked worktree are not serialized against each other at all,
-    /// defeating the guard this module's header describes (measured
-    /// burst-50 fatal: `.git/worktrees/<other-work>/commondir`). Phase B's
-    /// blocking interprocess lock keys on canonical `git rev-parse
-    /// --path-format=absolute --git-common-dir` instead, closing this.
-    // CONTRACT PIN (estate-root Phase B): repository_lock keys on the git common directory, so a checkout and its own linked worktree share one lock.
+    /// §2.7 (Phase 0 pin #5, flipped by Phase B): a checkout and its own
+    /// linked worktree are **one** lock identity, at both layers.
+    ///
+    /// A primary checkout and a `git worktree add` of it are two different,
+    /// canonicalize-stable paths pointing at one shared `.git` — a linked
+    /// worktree's `commondir` file points back to it — so a lock keyed on the
+    /// checkout *path* handed the module gave them one lock each, which is the
+    /// same "two workspaces can reach one repository by different routes"
+    /// hazard `repository_lock`'s own doc comment already named for symlinks,
+    /// just reached through a worktree instead. Nothing serialized concurrent
+    /// registry mutations between them, defeating the guard this module's
+    /// header describes (measured burst-50 fatal: `.git/worktrees/<other-
+    /// work>/commondir`).
+    ///
+    /// Both halves are asserted, because the fix has two halves: the
+    /// in-process mutex is now keyed on the common directory (one `Arc`), and
+    /// the interprocess lock file derived from that identity is one file. A
+    /// regression in either would let the two paths past each other.
     #[test]
-    fn contract_pin_repository_lock_aliases_a_checkout_and_its_own_linked_worktree() {
+    fn a_checkout_and_its_own_linked_worktree_are_one_repository_lock() {
         let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = dir.path().join("data");
         let primary = repo(&dir.path().join("primary"));
         let linked = dir.path().join("linked-worktree");
         let output = Command::new("git")
@@ -1893,33 +2185,98 @@ mod tests {
             .expect("git worktree add");
         assert!(output.status.success(), "worktree add: {output:?}");
 
-        // Both paths do genuinely share one git common directory — the fact
-        // Phase B's fix will key on.
-        let common_from_primary = git(
-            &primary.path,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .expect("common dir from the primary checkout");
-        let common_from_linked = git(
-            &linked,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .expect("common dir from the linked worktree");
+        // The fixture premise: these two paths really do share one git common
+        // directory. Without this the rest of the test would pass vacuously.
         assert_eq!(
-            common_from_primary, common_from_linked,
+            canonical_git_common_dir(&primary.path).expect("common dir from the primary checkout"),
+            canonical_git_common_dir(&linked).expect("common dir from the linked worktree"),
             "the fixture must actually share one git common directory"
         );
 
-        let primary_lock = repository_lock(&primary.path);
-        let linked_lock = repository_lock(&linked);
+        let primary_gate = RepositoryGate::derive(&data, &primary.path);
+        let linked_gate = RepositoryGate::derive(&data, &linked);
 
+        // Layer 1: the in-process fast layer resolves to the same mutex.
         assert!(
-            !Arc::ptr_eq(&primary_lock, &linked_lock),
-            "today, repository_lock is keyed on the canonical checkout path rather than the \
-             shared git common directory, so a primary checkout and its own linked worktree \
-             yield two distinct lock Arcs — nothing serializes worktree-registry mutations \
-             against each other between them"
+            Arc::ptr_eq(
+                &repository_lock(&primary_gate.identity),
+                &repository_lock(&linked_gate.identity),
+            ),
+            "a primary checkout and its own linked worktree share one worktree registry, so \
+             they must share one in-process lock: keyed on the canonical git common directory, \
+             not on the checkout path each caller happened to name"
         );
+
+        // Layer 2: and the correctness boundary — one lock file, so the same
+        // holds against another process, not merely another thread.
+        assert_eq!(
+            repolock::lock_path(&data, &primary_gate.identity),
+            repolock::lock_path(&data, &linked_gate.identity),
+            "and one interprocess lock file, which is what makes this hold across processes"
+        );
+
+        // A genuinely different repository still gets its own lock: the point
+        // is one identity per registry, not one gate for all of git.
+        let other = repo(&dir.path().join("other"));
+        let other_gate = RepositoryGate::derive(&data, &other.path);
+        assert!(
+            !Arc::ptr_eq(
+                &repository_lock(&primary_gate.identity),
+                &repository_lock(&other_gate.identity),
+            ),
+            "unrelated repositories must still proceed in parallel"
+        );
+        assert_ne!(
+            repolock::lock_path(&data, &primary_gate.identity),
+            repolock::lock_path(&data, &other_gate.identity),
+        );
+    }
+
+    /// R-MVP1-1 left the surfaces root free to live anywhere; §9.4's locks
+    /// still belong to the daemon's own storage. The two are separate
+    /// parameters and this is the test that keeps them separate — every other
+    /// fixture in this module collapses them into one tempdir.
+    #[test]
+    fn the_repository_lock_lives_under_the_data_dir_not_the_surfaces_root() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = dir.path().join("data");
+        let surfaces = dir.path().join("somewhere-else/surfaces");
+        let spec = repo(&dir.path().join("solo"));
+
+        let surface = materialize(
+            &data,
+            &surfaces,
+            "01SPLITROOTS",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        assert!(
+            surface.root.starts_with(&surfaces),
+            "the surface goes where the surfaces root says: {}",
+            surface.root.display()
+        );
+
+        let common = surface.bindings[0]
+            .canonical_common_dir
+            .clone()
+            .expect("a freshly materialized binding records its common directory");
+        let lock = repolock::lock_path(&data, &common);
+        assert!(
+            lock.is_file(),
+            "materializing takes the repository lock, so its file exists under the data dir: {}",
+            lock.display()
+        );
+        assert!(
+            !lock.starts_with(&surfaces),
+            "and not under the surfaces root"
+        );
+        assert!(
+            !lock.starts_with(&spec.path),
+            "and never inside the user's checkout (§6.2 / surface doctrine)"
+        );
+
+        let report = teardown(&data, &surface);
+        assert!(report.clean, "teardown across split roots: {report:?}");
     }
 
     /// Run one git command in `dir` with a fixture identity, same shape as
@@ -1980,8 +2337,13 @@ mod tests {
         let spec = repo(&source);
         let data_dir_inside = source.join(".sergeant-data");
 
-        let err = materialize(&data_dir_inside, "01WORKID", std::slice::from_ref(&spec))
-            .expect_err("must refuse");
+        let err = materialize(
+            &data_dir_inside,
+            &data_dir_inside,
+            "01WORKID",
+            std::slice::from_ref(&spec),
+        )
+        .expect_err("must refuse");
         assert!(
             matches!(err, SurfaceError::InsideSourceCheckout { .. }),
             "expected a refusal, got {err}"
@@ -1994,8 +2356,13 @@ mod tests {
 
         // The same repository outside the checkout materializes fine.
         let data = tempfile::TempDir::new().expect("tempdir");
-        let surface = materialize(data.path(), "01WORKID", std::slice::from_ref(&spec))
-            .expect("materialize outside the checkout");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01WORKID",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize outside the checkout");
         assert_eq!(surface.bindings.len(), 1);
         // Single-repo work executes in the worktree itself, not the root.
         assert_eq!(surface.execution_cwd(), surface.bindings[0].worktree_path);
@@ -2011,8 +2378,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01GONE", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01GONE",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
 
         let worktree = surface.bindings[0].worktree_path.display().to_string();
         std::fs::remove_dir_all(&surface.bindings[0].worktree_path).expect("remove worktree");
@@ -2023,7 +2395,7 @@ mod tests {
             "git still lists the vanished worktree until something unregisters it"
         );
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         assert!(!report.clean, "a missing worktree is not a clean teardown");
         assert_eq!(report.bindings[0].disposition, BindingDisposition::Missing);
         assert_eq!(report.bindings[0].work_branch, work_branch("01GONE"));
@@ -2037,7 +2409,7 @@ mod tests {
                 .contains(&worktree),
             "teardown must unregister the worktree it recorded as missing"
         );
-        let rebuilt = rematerialize(&surface)
+        let rebuilt = rematerialize_of(&surface)
             .expect("a recorded-missing worktree must not wedge the path forever");
         assert!(rebuilt.bindings[0].worktree_path.is_dir());
     }
@@ -2065,14 +2437,19 @@ mod tests {
         let outer = repo(&dir.path().join("outer"));
         declare_submodule(&outer.path, &inner.path, "vendored");
 
-        let surface = materialize(data.path(), "01STALE", std::slice::from_ref(&outer))
-            .expect("materialize a repository with a submodule");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01STALE",
+            std::slice::from_ref(&outer),
+        )
+        .expect("materialize a repository with a submodule");
         let worktree = surface.bindings[0].worktree_path.clone();
 
         // Uncommitted work: teardown retains it whole, and therefore never
         // prunes.
         std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty");
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         assert!(matches!(
             report.bindings[0].disposition,
             BindingDisposition::RetainedDirty { patch: None, .. }
@@ -2085,7 +2462,7 @@ mod tests {
         // ...and then it is deleted by something that is not sergeant.
         std::fs::remove_dir_all(&worktree).expect("delete out of band");
 
-        let rebuilt = rematerialize(&surface).expect("retry must still be able to rebuild");
+        let rebuilt = rematerialize_of(&surface).expect("retry must still be able to rebuild");
         assert!(rebuilt.bindings[0].worktree_path.is_dir());
         assert_eq!(
             git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).expect("head"),
@@ -2095,7 +2472,7 @@ mod tests {
         // And it is repeatable: a second rebuild after a second deletion
         // works too, so nothing accumulates that eventually wedges it.
         std::fs::remove_dir_all(&worktree).expect("delete again");
-        rematerialize(&surface).expect("still rebuildable");
+        rematerialize_of(&surface).expect("still rebuildable");
     }
 
     /// A later repository failing must not leave the earlier ones' branches
@@ -2115,8 +2492,13 @@ mod tests {
         let branch = work_branch("01PARTIAL");
         git(&second.path, &["branch", &branch]).expect("pre-create the colliding branch");
 
-        let err = materialize(data.path(), "01PARTIAL", &[first.clone(), second])
-            .expect_err("the second repository must fail");
+        let err = materialize(
+            data.path(),
+            data.path(),
+            "01PARTIAL",
+            &[first.clone(), second],
+        )
+        .expect_err("the second repository must fail");
         let SurfaceError::PartialFailure { source, teardown } = err else {
             panic!("expected a partial failure, got {err}");
         };
@@ -2171,8 +2553,13 @@ mod tests {
         std::os::unix::fs::symlink(&source, &link).expect("symlink");
         let data_dir_via_link = link.join(".sergeant-data");
 
-        let err = materialize(&data_dir_via_link, "01LINK", std::slice::from_ref(&spec))
-            .expect_err("the symlinked route is still inside the checkout");
+        let err = materialize(
+            &data_dir_via_link,
+            &data_dir_via_link,
+            "01LINK",
+            std::slice::from_ref(&spec),
+        )
+        .expect_err("the symlinked route is still inside the checkout");
         assert!(
             matches!(err, SurfaceError::InsideSourceCheckout { .. }),
             "expected a refusal, got {err}"
@@ -2204,11 +2591,16 @@ mod tests {
         second.name = "second".to_string();
 
         // One repository: the root is empty after the worktree goes.
-        let solo = materialize(data.path(), "01ROOT", std::slice::from_ref(&first))
-            .expect("materialize solo");
+        let solo = materialize(
+            data.path(),
+            data.path(),
+            "01ROOT",
+            std::slice::from_ref(&first),
+        )
+        .expect("materialize solo");
         let root = solo.root.clone();
         assert!(root.is_dir(), "materialize created the root");
-        let report = teardown(&solo);
+        let report = teardown_of(&solo);
         assert!(report.clean);
         assert!(
             !root.exists(),
@@ -2225,26 +2617,27 @@ mod tests {
         // …and tearing the same surface down again is a no-op, not an error:
         // the crash window between the removal and the `surface.torn_down`
         // append is re-run, not repaired (L6).
-        let again = teardown(&solo);
+        let again = teardown_of(&solo);
         assert_eq!(again.bindings[0].disposition, BindingDisposition::Missing);
         assert!(!root.exists());
 
         // Two repositories: the root survives until the last worktree is
         // gone. Tearing down a surface that names only the first binding
         // leaves the second worktree — and therefore the root — untouched.
-        let pair = materialize(data.path(), "01PAIR", &[first, second]).expect("materialize pair");
+        let pair = materialize(data.path(), data.path(), "01PAIR", &[first, second])
+            .expect("materialize pair");
         let pair_root = pair.root.clone();
         let partial = WorkSurface {
             bindings: pair.bindings[..1].to_vec(),
             ..pair.clone()
         };
-        teardown(&partial);
+        teardown_of(&partial);
         assert!(
             pair_root.is_dir(),
             "a root still holding another repository's worktree must be kept"
         );
         assert!(pair.bindings[1].worktree_path.is_dir(), "untouched");
-        teardown(&pair);
+        teardown_of(&pair);
         assert!(
             !pair_root.exists(),
             "the last binding's removal takes the root with it"
@@ -2255,10 +2648,15 @@ mod tests {
         // directory — that gets reclaimed once its dirty state is captured
         // as a patch, which is exactly what keeps the root non-empty.
         let dirty_spec = repo(&dir.path().join("dirty"));
-        let dirty = materialize(data.path(), "01DIRTY", std::slice::from_ref(&dirty_spec))
-            .expect("materialize dirty");
+        let dirty = materialize(
+            data.path(),
+            data.path(),
+            "01DIRTY",
+            std::slice::from_ref(&dirty_spec),
+        )
+        .expect("materialize dirty");
         std::fs::write(dirty.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
-        let report = teardown(&dirty);
+        let report = teardown_of(&dirty);
         let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
         else {
             panic!(
@@ -2291,8 +2689,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface = materialize(data.path(), "01FINALIZE", std::slice::from_ref(&spec))
-            .expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01FINALIZE",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let worktree = &surface.bindings[0].worktree_path;
         let base_sha = surface.bindings[0].base_sha.clone();
 
@@ -2306,7 +2709,7 @@ mod tests {
             "the fixture must actually advance the branch"
         );
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         assert_eq!(report.bindings[0].disposition, BindingDisposition::Removed);
         assert_eq!(
             report.bindings[0].final_sha.as_deref(),
@@ -2317,10 +2720,15 @@ mod tests {
 
         // A worktree the repository never had (Missing) still resolves the
         // branch tip: it lives on the branch, not the worktree.
-        let again = materialize(data.path(), "01FINALIZE2", std::slice::from_ref(&spec))
-            .expect("materialize again");
+        let again = materialize(
+            data.path(),
+            data.path(),
+            "01FINALIZE2",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize again");
         std::fs::remove_dir_all(&again.bindings[0].worktree_path).expect("simulate vanished");
-        let missing_report = teardown(&again);
+        let missing_report = teardown_of(&again);
         assert_eq!(
             missing_report.bindings[0].disposition,
             BindingDisposition::Missing
@@ -2359,8 +2767,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01SWITCH", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01SWITCH",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let worktree = surface.bindings[0].worktree_path.clone();
         let work_branch_name = surface.bindings[0].work_branch.clone();
         let base_sha = surface.bindings[0].base_sha.clone();
@@ -2381,7 +2794,7 @@ mod tests {
             "the fixture must actually produce a divergent commit"
         );
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let binding = &report.bindings[0];
 
         // A clean worktree on the wrong branch is still removed (§11.7): the
@@ -2460,11 +2873,16 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01CLEAN", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01CLEAN",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let base_sha = surface.bindings[0].base_sha.clone();
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let binding = &report.bindings[0];
 
         assert_eq!(binding.disposition, BindingDisposition::Removed);
@@ -2499,8 +2917,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface = materialize(data.path(), "01DETACHED", std::slice::from_ref(&spec))
-            .expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01DETACHED",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let worktree = surface.bindings[0].worktree_path.clone();
 
         // Detach, then commit: the commit belongs to no branch at all.
@@ -2516,7 +2939,7 @@ mod tests {
             "the fixture must actually produce a commit no branch contains"
         );
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let binding = &report.bindings[0];
 
         assert!(
@@ -2554,7 +2977,7 @@ mod tests {
         let retained = retained_bindings(&report);
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].reason, "retained_unreferenced");
-        let reaped = reap(&surface, &report);
+        let reaped = reap_of(&surface, &report);
         assert!(
             matches!(
                 &reaped.bindings[0].outcome,
@@ -2578,14 +3001,19 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface = materialize(data.path(), "01REACHABLE", std::slice::from_ref(&spec))
-            .expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01REACHABLE",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let worktree = surface.bindings[0].worktree_path.clone();
 
         // Detached, but at the work branch's own tip: nothing is at risk.
         git_as_test_identity(&worktree, &["checkout", "--detach"]);
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let binding = &report.bindings[0];
 
         assert_eq!(binding.disposition, BindingDisposition::Removed);
@@ -2612,11 +3040,16 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface = materialize(data.path(), "01VANISHED", std::slice::from_ref(&spec))
-            .expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01VANISHED",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         std::fs::remove_dir_all(&surface.bindings[0].worktree_path).expect("simulate vanished");
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let binding = &report.bindings[0];
 
         assert_eq!(binding.disposition, BindingDisposition::Missing);
@@ -2640,11 +3073,16 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01DIRTY", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01DIRTY",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         std::fs::write(surface.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let binding = &report.bindings[0];
 
         assert!(
@@ -2672,22 +3110,37 @@ mod tests {
     /// journaled against is not the worktree the binding thinks it is — the
     /// same identity §2.7/§9.4 needs the interprocess lock keyed on.
     ///
-    /// Reproduced by handing teardown a binding whose `source_path` names a
-    /// *different* repository than the worktree actually belongs to, which is
-    /// exactly the shape a mis-journaled or aliased mount would have.
+    /// Reproduced by handing teardown a binding that names a *different*
+    /// repository than the worktree actually belongs to, which is exactly the
+    /// shape a mis-journaled or aliased mount would have.
+    ///
+    /// Since Phase B the expected side is the identity the binding *recorded
+    /// at admission* (§3.5), not a second live reading of `source_path` — a
+    /// stronger check, because it compares the worktree against what was
+    /// admitted rather than against a mount that may have moved since. The
+    /// mis-binding here therefore rewrites both halves of the binding's
+    /// repository identity, which is what a mis-journaled binding really
+    /// looks like.
     #[test]
     fn a_worktree_whose_common_dir_disagrees_with_its_source_checkout_is_a_finding() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let mine = repo(&dir.path().join("mine"));
         let stranger = repo(&dir.path().join("stranger"));
-        let surface = materialize(data.path(), "01COMMONDIR", std::slice::from_ref(&mine))
-            .expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01COMMONDIR",
+            std::slice::from_ref(&mine),
+        )
+        .expect("materialize");
 
         let mut misbound = surface.clone();
         misbound.bindings[0].source_path = stranger.path.clone();
+        misbound.bindings[0].canonical_common_dir =
+            Some(canonical_git_common_dir(&stranger.path).expect("stranger common dir"));
 
-        let report = teardown(&misbound);
+        let report = teardown_of(&misbound);
         let binding = &report.bindings[0];
 
         assert!(
@@ -2704,6 +3157,162 @@ mod tests {
         assert!(surface.bindings[0].worktree_path.exists());
     }
 
+    /// The same finding, from a binding journaled before Phase B existed
+    /// (C3: `canonical_common_dir` replays as `None`).
+    ///
+    /// With nothing admitted to compare against, the check falls back to
+    /// Phase A's behaviour — re-ask the journaled `source_path` — which is
+    /// exactly as good an answer as it ever was for those bindings, and is
+    /// the guarantee that widening the binding did not quietly switch off a
+    /// finding for every Work that predates the widening.
+    #[test]
+    fn a_pre_enrichment_binding_still_gets_the_common_dir_finding_from_its_source_path() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mine = repo(&dir.path().join("mine"));
+        let stranger = repo(&dir.path().join("stranger"));
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01OLDCOMMONDIR",
+            std::slice::from_ref(&mine),
+        )
+        .expect("materialize");
+
+        let mut misbound = surface.clone();
+        misbound.bindings[0].source_path = stranger.path.clone();
+        // The shape an old journal replays as: no admitted identity at all.
+        misbound.bindings[0].canonical_common_dir = None;
+        misbound.bindings[0].canonical_top_level = None;
+
+        let report = teardown_of(&misbound);
+        assert!(
+            report.bindings[0]
+                .findings
+                .iter()
+                .any(|f| matches!(f, IntegrityFinding::AssignedCommonDirMismatch { .. })),
+            "expected a common-dir mismatch from the source-path fallback: {:?}",
+            report.bindings[0].findings
+        );
+        assert_eq!(report.integrity(), IntegrityDisposition::Dirty);
+    }
+
+    /// §3.5 + C3: what a fresh binding records, and what an old one replays
+    /// as.
+    ///
+    /// The two canonical identities are additive `Option` fields, so a
+    /// `surface.materialized` payload written before Phase B — the exact JSON
+    /// shape this test embeds — must still deserialize, and must come back
+    /// saying *nothing observed this*, never a fabricated path.
+    #[test]
+    fn a_binding_records_its_canonical_identities_and_an_old_payload_replays_without_them() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01IDENTITY",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let binding = &surface.bindings[0];
+
+        assert_eq!(
+            binding.canonical_top_level.as_deref(),
+            Some(
+                canonical_git_top_level(&spec.path)
+                    .expect("top level")
+                    .as_path()
+            ),
+            "a fresh binding records §3.5's canonical top level"
+        );
+        assert_eq!(
+            binding.canonical_common_dir.as_deref(),
+            Some(
+                canonical_git_common_dir(&spec.path)
+                    .expect("common dir")
+                    .as_path()
+            ),
+            "and the canonical common directory §2.7 locks on"
+        );
+
+        // A `surface.materialized` payload from before Phase B: every field
+        // the old shape had, and neither of the new ones.
+        let old = serde_json::json!({
+            "repository": "solo",
+            "source_path": "/repos/solo",
+            "base_branch": "main",
+            "base_sha": "0".repeat(40),
+            "worktree_path": "/data/surfaces/01OLD/solo",
+            "work_branch": "sergeant/01OLD",
+            "head_sha": "1".repeat(40),
+        });
+        let replayed: RepositoryBinding =
+            serde_json::from_value(old).expect("an old binding must still replay");
+        assert_eq!(replayed.repository, "solo");
+        assert_eq!(replayed.origin, BindingOrigin::Cut);
+        assert_eq!(
+            replayed.canonical_top_level, None,
+            "nothing observed this at the time; it must not be invented"
+        );
+        assert_eq!(replayed.canonical_common_dir, None);
+
+        // And the enriched shape round-trips as itself.
+        let round_tripped: RepositoryBinding =
+            serde_json::from_value(serde_json::to_value(binding).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(&round_tripped, binding);
+
+        let report = teardown_of(&surface);
+        assert!(report.clean, "{report:?}");
+    }
+
+    /// C3, the other half: a whole `surface.materialized` payload in the
+    /// pre-enrichment shape replays into a `WorkSurface` that teardown can
+    /// still act on — and a teardown driven from it locks the right
+    /// repository, because [`RepositoryGate::for_binding`] falls back to
+    /// deriving from `source_path` when the binding admitted nothing.
+    #[test]
+    fn an_old_shape_materialized_payload_replays_and_tears_down() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01OLDREPLAY",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+
+        // Journal it, then strip the fields Phase B added — byte-for-byte the
+        // payload a pre-Phase-B daemon would have written.
+        let mut payload = serde_json::to_value(&surface).expect("serialize surface");
+        for binding in payload["bindings"]
+            .as_array_mut()
+            .expect("bindings array")
+            .iter_mut()
+        {
+            let binding = binding.as_object_mut().expect("binding object");
+            binding.remove("canonical_top_level");
+            binding.remove("canonical_common_dir");
+            binding.remove("origin");
+        }
+
+        let replayed: WorkSurface =
+            serde_json::from_value(payload).expect("an old surface payload must still replay");
+        assert_eq!(replayed.bindings[0].canonical_common_dir, None);
+        assert_eq!(replayed.bindings[0].origin, BindingOrigin::Cut);
+
+        let report = teardown(data.path(), &replayed);
+        assert!(
+            report.clean,
+            "a surface replayed from an old payload still tears down cleanly: {report:?}"
+        );
+        assert!(!surface.bindings[0].worktree_path.exists());
+    }
+
     /// §11.4, bounded by amendment C6: a mount whose committed HEAD moved
     /// during the Work window is *observed* — one `rev-parse` per bound
     /// repository, at retirement — and attributed to nobody.
@@ -2718,8 +3327,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01DRIFT", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01DRIFT",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let base_sha = surface.bindings[0].base_sha.clone();
 
         // Somebody else advances the mount while the Work runs.
@@ -2728,7 +3342,7 @@ mod tests {
         git_as_test_identity(&spec.path, &["commit", "-m", "somebody else's commit"]);
         let moved = git(&spec.path, &["rev-parse", "HEAD"]).expect("moved head");
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
 
         assert_eq!(
             report.drift,
@@ -2752,7 +3366,7 @@ mod tests {
     fn a_surface_needs_at_least_one_repository() {
         let data = tempfile::TempDir::new().expect("tempdir");
         assert!(matches!(
-            materialize(data.path(), "01EMPTY", &[]),
+            materialize(data.path(), data.path(), "01EMPTY", &[]),
             Err(SurfaceError::NoRepositories)
         ));
     }
@@ -2813,8 +3427,13 @@ mod tests {
         let outer = repo(&dir.path().join("outer"));
         declare_submodule(&outer.path, &inner.path, "vendored");
 
-        let surface = materialize(data.path(), "01SUBMODULE", std::slice::from_ref(&outer))
-            .expect("materialize a repository with a submodule");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01SUBMODULE",
+            std::slice::from_ref(&outer),
+        )
+        .expect("materialize a repository with a submodule");
         let worktree = &surface.bindings[0].worktree_path;
         assert_eq!(
             std::fs::read_to_string(worktree.join("vendored").join("payload.txt"))
@@ -2829,7 +3448,7 @@ mod tests {
             "the submodule must report initialized: {status:?}"
         );
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         assert!(
             report.clean,
             "an untouched submodule worktree is clean: {report:?}"
@@ -2890,8 +3509,13 @@ mod tests {
         );
         git_as_test_identity(&outer.path, &["commit", "-m", "an unreachable submodule"]);
 
-        let err = materialize(data.path(), "01BADSUBMODULE", std::slice::from_ref(&outer))
-            .expect_err("a disallowed submodule transport must refuse materialization");
+        let err = materialize(
+            data.path(),
+            data.path(),
+            "01BADSUBMODULE",
+            std::slice::from_ref(&outer),
+        )
+        .expect_err("a disallowed submodule transport must refuse materialization");
         let SurfaceError::PartialFailure { source, teardown } = err else {
             panic!(
                 "expected the same rolled-back-and-reported shape a later repository's \
@@ -3009,8 +3633,13 @@ mod tests {
         // First attempt: add_worktree_no_checkout succeeds (no checkout →
         // smudge filter not triggered), checkout_worktree fails (smudge
         // filter exits 1), cleanup runs.
-        let err = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec))
-            .expect_err("checkout_worktree failure must propagate as an error");
+        let err = materialize(
+            data.path(),
+            data.path(),
+            "01CHECKFAIL",
+            std::slice::from_ref(&spec),
+        )
+        .expect_err("checkout_worktree failure must propagate as an error");
         assert!(
             matches!(err, SurfaceError::Git { .. }),
             "expected a git error from the reset --hard, got: {err}"
@@ -3047,12 +3676,18 @@ mod tests {
         }
 
         // Retry: must succeed because the branch slot was freed.
-        let surface = materialize(data.path(), "01CHECKFAIL", std::slice::from_ref(&spec)).expect(
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01CHECKFAIL",
+            std::slice::from_ref(&spec),
+        )
+        .expect(
             "retry must succeed — branch was deleted so it can be recreated with -b; \
                  if this fails with 'branch already exists', the cleanup is missing",
         );
         assert!(surface.bindings[0].worktree_path.is_dir());
-        teardown(&surface);
+        teardown_of(&surface);
     }
 
     /// The force-retry `teardown_binding` uses for git's blanket "containing
@@ -3075,6 +3710,7 @@ mod tests {
 
         let surface = materialize(
             data.path(),
+            data.path(),
             "01DIRTYSUBMODULE",
             std::slice::from_ref(&outer),
         )
@@ -3088,7 +3724,7 @@ mod tests {
         )
         .expect("simulate uncommitted submodule content");
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         assert!(
             !report.clean,
             "uncommitted content inside a submodule must block teardown: {report:?}"
@@ -3142,8 +3778,13 @@ mod tests {
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
 
-        let target = materialize(data.path(), "01TARGET", std::slice::from_ref(&spec))
-            .expect("materialize target");
+        let target = materialize(
+            data.path(),
+            data.path(),
+            "01TARGET",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize target");
         let target_branch = target.bindings[0].work_branch.clone();
         assert_eq!(target_branch, work_branch("01TARGET"));
 
@@ -3161,14 +3802,20 @@ mod tests {
         let pre_gate_tip =
             git(&target.bindings[0].worktree_path, &["rev-parse", "HEAD"]).expect("target head");
 
-        let target_report = teardown(&target);
+        let target_report = teardown_of(&target);
         assert!(
             target_report.clean,
             "the fixture must reach the clean-teardown precondition: {target_report:?}"
         );
 
-        let gate = attach(data.path(), "01GATE", "01TARGET", &target.bindings)
-            .expect("attach must succeed once the target has torn down clean");
+        let gate = attach(
+            data.path(),
+            data.path(),
+            "01GATE",
+            "01TARGET",
+            &target.bindings,
+        )
+        .expect("attach must succeed once the target has torn down clean");
         assert_eq!(gate.bindings.len(), 1);
         assert_eq!(gate.bindings[0].work_branch, target_branch);
         assert_eq!(
@@ -3207,7 +3854,7 @@ mod tests {
             "a commit made in the attached worktree must land on the target's real branch"
         );
 
-        let gate_report = teardown(&gate);
+        let gate_report = teardown_of(&gate);
         assert!(gate_report.clean, "gate teardown: {gate_report:?}");
         // Teardown always retains the branch — including one it only ever
         // attached to, never minted.
@@ -3237,12 +3884,23 @@ mod tests {
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
 
-        let target = materialize(data.path(), "01LIVE", std::slice::from_ref(&spec))
-            .expect("materialize target");
+        let target = materialize(
+            data.path(),
+            data.path(),
+            "01LIVE",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize target");
         // No teardown: the target's worktree is still live on its branch.
 
-        let err = attach(data.path(), "01GATE", "01LIVE", &target.bindings)
-            .expect_err("attach must refuse while the target's worktree still holds the branch");
+        let err = attach(
+            data.path(),
+            data.path(),
+            "01GATE",
+            "01LIVE",
+            &target.bindings,
+        )
+        .expect_err("attach must refuse while the target's worktree still holds the branch");
         assert!(
             matches!(err, SurfaceError::Git(_)),
             "expected git's own exclusivity refusal, got {err}"
@@ -3256,10 +3914,16 @@ mod tests {
         // exactly the race Mechanism A's precondition exists to prevent —
         // pin it the other way too: once the target *does* tear down clean,
         // the identical call succeeds.
-        let report = teardown(&target);
+        let report = teardown_of(&target);
         assert!(report.clean);
-        attach(data.path(), "01GATE2", "01LIVE", &target.bindings)
-            .expect("attach must succeed once the target's worktree is actually gone");
+        attach(
+            data.path(),
+            data.path(),
+            "01GATE2",
+            "01LIVE",
+            &target.bindings,
+        )
+        .expect("attach must succeed once the target's worktree is actually gone");
     }
 
     /// A branch that no longer exists — deleted out of band after a clean
@@ -3272,16 +3936,27 @@ mod tests {
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
 
-        let target = materialize(data.path(), "01GONEBRANCH", std::slice::from_ref(&spec))
-            .expect("materialize target");
-        let report = teardown(&target);
+        let target = materialize(
+            data.path(),
+            data.path(),
+            "01GONEBRANCH",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize target");
+        let report = teardown_of(&target);
         assert!(report.clean);
 
         let branch = target.bindings[0].work_branch.clone();
         git(&spec.path, &["branch", "-D", &branch]).expect("delete the branch out of band");
 
-        let err = attach(data.path(), "01GATE", "01GONEBRANCH", &target.bindings)
-            .expect_err("attach must refuse when the branch no longer exists");
+        let err = attach(
+            data.path(),
+            data.path(),
+            "01GATE",
+            "01GONEBRANCH",
+            &target.bindings,
+        )
+        .expect_err("attach must refuse when the branch no longer exists");
         assert!(
             matches!(err, SurfaceError::Git(_)),
             "expected a git refusal naming the missing branch, got {err}"
@@ -3299,9 +3974,14 @@ mod tests {
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
 
-        let target = materialize(data.path(), "01COLLIDE", std::slice::from_ref(&spec))
-            .expect("materialize target");
-        let report = teardown(&target);
+        let target = materialize(
+            data.path(),
+            data.path(),
+            "01COLLIDE",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize target");
+        let report = teardown_of(&target);
         assert!(report.clean);
 
         let colliding_path = data.path().join("01GATE").join("solo");
@@ -3309,8 +3989,14 @@ mod tests {
         std::fs::write(colliding_path.join("occupied.txt"), "already here\n")
             .expect("occupy the path");
 
-        let err = attach(data.path(), "01GATE", "01COLLIDE", &target.bindings)
-            .expect_err("attach must refuse a worktree path collision");
+        let err = attach(
+            data.path(),
+            data.path(),
+            "01GATE",
+            "01COLLIDE",
+            &target.bindings,
+        )
+        .expect_err("attach must refuse a worktree path collision");
         assert!(
             matches!(err, SurfaceError::Git(_)),
             "expected git's own refusal to add a worktree onto a non-empty path, got {err}"
@@ -3337,11 +4023,12 @@ mod tests {
 
         let target = materialize(
             data.path(),
+            data.path(),
             "01PARTIALATTACH",
             &[first.clone(), second.clone()],
         )
         .expect("materialize target");
-        let report = teardown(&target);
+        let report = teardown_of(&target);
         assert!(report.clean);
 
         // The second repository's branch is gone by the time the gate
@@ -3350,8 +4037,14 @@ mod tests {
         let branch = work_branch("01PARTIALATTACH");
         git(&second.path, &["branch", "-D", &branch]).expect("delete second's branch");
 
-        let err = attach(data.path(), "01GATE", "01PARTIALATTACH", &target.bindings)
-            .expect_err("the second repository's attach must fail");
+        let err = attach(
+            data.path(),
+            data.path(),
+            "01GATE",
+            "01PARTIALATTACH",
+            &target.bindings,
+        )
+        .expect_err("the second repository's attach must fail");
         let SurfaceError::PartialFailure {
             teardown: rollback, ..
         } = err
@@ -3398,8 +4091,13 @@ mod tests {
         let inner = repo(&dir.path().join("inner"));
         let spec = repo(&dir.path().join("solo"));
 
-        let target = materialize(data.path(), "01SUBTARGET", std::slice::from_ref(&spec))
-            .expect("materialize target");
+        let target = materialize(
+            data.path(),
+            data.path(),
+            "01SUBTARGET",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize target");
         let worktree = target.bindings[0].worktree_path.clone();
 
         // Declare a submodule over a transport `init_submodules_if_present`'s
@@ -3427,14 +4125,20 @@ mod tests {
         );
         git_as_test_identity(&worktree, &["commit", "-m", "an unreachable submodule"]);
 
-        let target_report = teardown(&target);
+        let target_report = teardown_of(&target);
         assert!(
             target_report.clean,
             "the fixture must reach the clean-teardown precondition: {target_report:?}"
         );
 
-        let err = attach(data.path(), "01GATE", "01SUBTARGET", &target.bindings)
-            .expect_err("a disallowed submodule transport must refuse the takeover");
+        let err = attach(
+            data.path(),
+            data.path(),
+            "01GATE",
+            "01SUBTARGET",
+            &target.bindings,
+        )
+        .expect_err("a disallowed submodule transport must refuse the takeover");
         let SurfaceError::PartialFailure {
             source,
             teardown: rollback,
@@ -3472,7 +4176,7 @@ mod tests {
     fn attach_needs_at_least_one_target_binding() {
         let data = tempfile::TempDir::new().expect("tempdir");
         assert!(matches!(
-            attach(data.path(), "01EMPTY", "01TARGET", &[]),
+            attach(data.path(), data.path(), "01EMPTY", "01TARGET", &[]),
             Err(SurfaceError::NoRepositories)
         ));
     }
@@ -3492,8 +4196,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01SCOPE", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01SCOPE",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let worktree = surface.bindings[0].worktree_path.clone();
 
         std::fs::write(worktree.join(".gitignore"), "target/\n").expect(".gitignore");
@@ -3509,7 +4218,7 @@ mod tests {
         std::fs::write(worktree.join("target").join("big.bin"), "compiled output")
             .expect("build artifact");
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
         else {
             panic!(
@@ -3552,8 +4261,13 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01LOCKED", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01LOCKED",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let worktree = surface.bindings[0].worktree_path.clone();
 
         std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty");
@@ -3567,7 +4281,7 @@ mod tests {
         )
         .expect("lock the worktree");
 
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
         let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
         else {
             panic!(
@@ -3617,10 +4331,15 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface = materialize(data.path(), "01INSPECT", std::slice::from_ref(&spec))
-            .expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01INSPECT",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         std::fs::write(surface.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
-        let report = teardown(&surface);
+        let report = teardown_of(&surface);
 
         let error_binding = BindingTeardown {
             repository: "other".to_string(),
@@ -3687,10 +4406,15 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), "01REAP", std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01REAP",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         std::fs::write(surface.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
-        let mut report = teardown(&surface);
+        let mut report = teardown_of(&surface);
         let BindingDisposition::RetainedDirty {
             patch: Some(before),
             ..
@@ -3717,7 +4441,7 @@ mod tests {
             },
         });
 
-        let reaped = reap(&surface, &report);
+        let reaped = reap_of(&surface, &report);
         assert_eq!(reaped.work_id, "01REAP");
 
         let solo = reaped

@@ -124,9 +124,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde_json::{Value, json};
 
 use super::{
-    Backend, BackendError, BackendSignal, Capabilities, Completion, EventSink, ExecutionHandle,
-    NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport, ResumeRequest,
-    RuntimeScope, StartRequest,
+    Backend, BackendError, BackendSignal, BindingSummary, Capabilities, Completion, EventSink,
+    ExecutionHandle, NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport,
+    ResumeRequest, RuntimeScope, StartRequest,
 };
 use crate::domain::event::{Event, EventDraft, EventSource};
 use crate::domain::profile::Profile;
@@ -208,6 +208,94 @@ does not hold for a daemon reached any other way: a terminal that never went thr
 <harness>` inherits whatever environment it happened to have. If a tool you expect is missing, \
 that is more likely an unenriched PATH than a permissions fault — run `sgt doctor` to check what \
 this installation's environment actually guarantees before assuming otherwise.";
+
+/// Opening line of §10.1's mutation-surface section, composed after
+/// [`ENVIRONMENT_CONTRACT`] by [`compose_launch_prompt`] whenever the request
+/// carries a binding summary.
+///
+/// §10.1 names exactly what is outside the Work's mutation authority — the
+/// estate root, the `repos/` mounts, unselected repositories, other Work
+/// surfaces, sergeant's runtime state, unrelated checkouts — and the shortest
+/// true statement of all of it is "the listed worktrees, and nothing else".
+/// The mounts get their own clause because they are the one exclusion an actor
+/// is actively likely to get wrong: `repos/<name>` is where the repository
+/// *looks* like it lives, and a linked worktree of it is easy to mistake for a
+/// view rather than the thing itself.
+///
+/// **Factual, not exhortative.** This states where the Work's authority
+/// begins and ends and what each worktree was bound to; it does not
+/// editorialize about consequences or add rules of its own. §12's "procedure
+/// is data" belongs to the stage's CONTEXT.md, which is composed after this
+/// and stays verbatim.
+const MUTATION_SURFACE_HEADER: &str = "\
+Mutation surface: this Work may modify exactly the worktree(s) listed below, and nothing else. \
+The estate root, the `repos/` mounts those worktrees were cut from, unselected repositories, \
+other Works' surfaces, and any other path on this machine are outside what this Work is \
+authorized to change. Each worktree is already checked out on its own branch at its own base \
+commit:";
+
+/// The full first-turn prompt for a LAUNCH, in fixed section order.
+///
+/// ```text
+/// 1  EXECUTION_MODEL_CONTRACT      ADR 0007(a), sergeant's own statement
+/// 2  ENVIRONMENT_CONTRACT          ADR 0007(a), sergeant's own statement
+/// 3  mutation surface (§10.1)      sergeant's own statement, from the bindings
+/// 4  intent                        §12: data, verbatim
+/// 5  CONTEXT.md                    §12: data, verbatim
+/// ```
+///
+/// ADR 0007(a)'s two statements precede everything: they are sergeant's own
+/// execution-model and environment guarantees, not stage content, so neither
+/// is subject to §12's "verbatim, uninterpreted" rule the way intent and
+/// CONTEXT.md are. §10.1's mutation surface joins them for the same reason —
+/// it is a fact about the Work sergeant admitted, not procedure — and sits
+/// third, after the guarantees the actor needs to read everything else
+/// correctly and before the work it is being asked to do.
+///
+/// Section 3 is omitted entirely when the request carries no bindings, rather
+/// than emitted empty: a `StartRequest` replayed from before §10.1 existed has
+/// nothing to say here, and "you may modify nothing" is a claim its silence
+/// does not make.
+///
+/// A free function, not a method, and the reason is testability: composition
+/// used to happen inline in `launch`, where the only way to observe it was to
+/// spawn a real `claude` process. This is the seam
+/// `the_launch_prompt_states_the_mutation_surface_after_the_two_contracts`
+/// pins.
+fn compose_launch_prompt(request: &StartRequest) -> String {
+    let mut sections = vec![
+        EXECUTION_MODEL_CONTRACT.to_string(),
+        ENVIRONMENT_CONTRACT.to_string(),
+    ];
+    if !request.bindings.is_empty() {
+        sections.push(mutation_surface_section(&request.bindings));
+    }
+    sections.push(request.intent.clone());
+    sections.push(request.context.clone());
+    sections.join("\n\n")
+}
+
+/// §10.1's section body: the header, then one line per bound repository.
+///
+/// One line each, in the Work's own scope order, naming the four facts §10.1
+/// asks for — path, expected branch, base branch, base SHA. The SHA is
+/// carried in full rather than abbreviated: it is the Work's pin, and a
+/// short form is a value an actor would have to resolve before it could use
+/// it for anything.
+fn mutation_surface_section(bindings: &[BindingSummary]) -> String {
+    let mut section = String::from(MUTATION_SURFACE_HEADER);
+    for binding in bindings {
+        section.push_str(&format!(
+            "\n- {}: {} (branch {}, cut from {} at {})",
+            binding.repository,
+            binding.worktree_path.display(),
+            binding.work_branch,
+            binding.base_branch,
+            binding.base_sha,
+        ));
+    }
+    section
+}
 
 /// The actor's question from one `post_turn_summary` line, when it asked one.
 ///
@@ -1632,18 +1720,7 @@ impl Backend for ClaudeBackend {
                 },
             );
         }
-        // ADR 0007(a) precedes both: sergeant's own execution-model and
-        // environment-guarantee statements, not stage content, so neither is
-        // ever subject to §12's "verbatim, uninterpreted" rule the way
-        // intent and CONTEXT.md are. §12 itself: procedure is data — intent
-        // plus the stage's CONTEXT.md, verbatim, uninterpreted. The two
-        // contracts are composed together, in this fixed order, so a test
-        // can pin that adding one never overwrites the other.
-        let prompt = format!(
-            "{EXECUTION_MODEL_CONTRACT}\n\n{ENVIRONMENT_CONTRACT}\n\n{}\n\n{}",
-            request.intent, request.context
-        );
-        if let Err(e) = self.spawn_turn(&request.execution_id, prompt) {
+        if let Err(e) = self.spawn_turn(&request.execution_id, compose_launch_prompt(request)) {
             // A failed launch must not leave a phantom execution that
             // OBSERVE would misread as an interrupted-but-resumable turn.
             self.lock().executions.remove(&request.execution_id);
@@ -2299,6 +2376,111 @@ fn new_session_uuid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `StartRequest` carrying `bindings`, for the prompt-composition
+    /// tests. Everything else is the minimum a request needs.
+    fn prompt_request(bindings: Vec<BindingSummary>) -> StartRequest {
+        StartRequest {
+            work_id: "01PROMPT".to_string(),
+            execution_id: "e-prompt".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: PathBuf::from("/data/surfaces/01PROMPT"),
+            intent: "the human intent".to_string(),
+            context: "the stage's CONTEXT.md".to_string(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
+            bindings,
+        }
+    }
+
+    fn binding(repository: &str, sha: &str) -> BindingSummary {
+        BindingSummary {
+            repository: repository.to_string(),
+            worktree_path: PathBuf::from(format!("/data/surfaces/01PROMPT/{repository}")),
+            work_branch: "sergeant/01PROMPT".to_string(),
+            base_branch: "main".to_string(),
+            base_sha: sha.to_string(),
+        }
+    }
+
+    /// §10.1: the launched turn is told the exact worktrees the Work may
+    /// modify, the branch each is expected to be on, and the commit each was
+    /// cut from — and that everything else, the `repos/` mounts included, is
+    /// outside its authority.
+    ///
+    /// The order is the contract as much as the content is (ADR 0007(a)'s two
+    /// statements, then this, then §12's verbatim data), so it is asserted
+    /// positionally rather than by "contains".
+    #[test]
+    fn the_launch_prompt_states_the_mutation_surface_after_the_two_contracts() {
+        let api_sha = "a".repeat(40);
+        let web_sha = "b".repeat(40);
+        let request = prompt_request(vec![binding("api", &api_sha), binding("web", &web_sha)]);
+        let prompt = compose_launch_prompt(&request);
+
+        let sections: Vec<&str> = prompt.split("\n\n").collect();
+        assert_eq!(
+            sections.len(),
+            5,
+            "five sections in fixed order: {sections:#?}"
+        );
+        assert_eq!(sections[0], EXECUTION_MODEL_CONTRACT);
+        assert_eq!(sections[1], ENVIRONMENT_CONTRACT);
+        assert_eq!(
+            sections[3], "the human intent",
+            "§12's data is carried verbatim and is not disturbed by the new section"
+        );
+        assert_eq!(sections[4], "the stage's CONTEXT.md");
+
+        let surface = sections[2];
+        assert!(
+            surface.starts_with(MUTATION_SURFACE_HEADER),
+            "the mutation surface is the third section: {surface}"
+        );
+        // Every fact §10.1 names, per repository, exactly as journaled.
+        assert!(
+            surface.contains(
+                "- api: /data/surfaces/01PROMPT/api (branch sergeant/01PROMPT, cut from main at "
+            ),
+            "{surface}"
+        );
+        assert!(
+            surface.contains(&api_sha),
+            "the full base SHA, not a prefix"
+        );
+        assert!(
+            surface.contains("- web: /data/surfaces/01PROMPT/web (branch sergeant/01PROMPT"),
+            "{surface}"
+        );
+        assert!(surface.contains(&web_sha));
+        // Scope order, not alphabetical-by-accident: api was bound first.
+        assert!(surface.find("- api:") < surface.find("- web:"));
+        // And the exclusions §10.1 lists, with the mounts named explicitly.
+        assert!(surface.contains("`repos/`"), "{surface}");
+        assert!(surface.contains("and nothing else"), "{surface}");
+    }
+
+    /// C2/C3: a request with no binding summary — a `StartRequest` replayed
+    /// from before §10.1, or any caller that does not supply one — still
+    /// launches, and says nothing about a mutation surface rather than
+    /// claiming an empty one.
+    #[test]
+    fn a_start_request_without_bindings_composes_the_prompt_it_always_did() {
+        let prompt = compose_launch_prompt(&prompt_request(Vec::new()));
+        let sections: Vec<&str> = prompt.split("\n\n").collect();
+        assert_eq!(sections.len(), 4, "the pre-§10.1 shape: {sections:#?}");
+        assert_eq!(sections[0], EXECUTION_MODEL_CONTRACT);
+        assert_eq!(sections[1], ENVIRONMENT_CONTRACT);
+        assert_eq!(sections[2], "the human intent");
+        assert_eq!(sections[3], "the stage's CONTEXT.md");
+        assert!(
+            !prompt.contains("Mutation surface:"),
+            "silence, not a claim that the Work may modify nothing: {prompt}"
+        );
+    }
 
     /// The measured 2.1.226 result envelope for an honored haiku pin
     /// (verbatim fields that matter, recorded 2026-08-08 in this container).

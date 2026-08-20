@@ -801,6 +801,7 @@ fn start_request(
         profile: None,
         execute: None,
         instruction_policy: InstructionPolicy::default(),
+        bindings: Vec::new(),
     }
 }
 
@@ -2619,6 +2620,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
                         .collect(),
                 }),
                 instruction_policy: Some(InstructionPolicy::default()),
+                bindings: Vec::new(),
             },
         )
         .expect("re-adopt");
@@ -3219,6 +3221,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 model: Some("anthropic/claude-haiku-4-5".to_string()),
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
+                bindings: Vec::new(),
             },
         )
         .expect_err("a provider-qualified pin is refused pre-flight at RESUME too");
@@ -3239,6 +3242,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 model: Some("haiku".to_string()),
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
+                bindings: Vec::new(),
             },
         )
         .expect("re-adopt");
@@ -3501,6 +3505,7 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
                 model: Some("haiku".to_string()),
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
+                bindings: Vec::new(),
             },
         )
         .expect("re-adopt is idempotent");
@@ -3832,8 +3837,13 @@ fn a4_a_crash_between_completion_and_teardown_is_swept_on_restart() {
             path: repo.clone(),
         };
         // A real surface, materialized exactly as the engine materializes it.
-        let surface =
-            materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            work_id,
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         submit_work(&mut core, work_id, "completed just before the crash");
         commit(
             &mut core,
@@ -3976,7 +3986,13 @@ fn a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept(
         name: "dirty".to_string(),
         path: repo.clone(),
     };
-    let surface = materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("surface");
+    let surface = materialize(
+        data.path(),
+        data.path(),
+        work_id,
+        std::slice::from_ref(&spec),
+    )
+    .expect("surface");
     submit_work(&mut core, work_id, "canceled with work still in the tree");
     commit(
         &mut core,
@@ -5288,6 +5304,7 @@ fn a1_real_claude_session_identity_survives_turns_and_restart() {
                 model: Some("haiku".to_string()),
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
+                bindings: Vec::new(),
             },
         )
         .expect("re-adopt from session evidence");
@@ -6145,6 +6162,7 @@ fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
         profile: None,
         execute: None,
         instruction_policy: InstructionPolicy::default(),
+        bindings: Vec::new(),
     };
     let handle = fake.start(&request).expect("start");
     assert_eq!(
@@ -6258,6 +6276,19 @@ fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
     assert_eq!(resumes.len(), 1, "exactly one re-adoption: {resumes:?}");
     assert_eq!(resumes[0].0, execution_id);
     assert_eq!(resumes[0].1.work_id, work_id);
+    // §10.1's binding summary is re-supplied too, from the journaled surface
+    // — and note the surface `journal_surface` wrote is deliberately in the
+    // *pre-enrichment* shape (no `canonical_*` fields), so this also proves
+    // C3: an old `surface.materialized` payload replays and still yields a
+    // complete summary, because every field the summary needs predates the
+    // widening.
+    let summary = &resumes[0].1.bindings;
+    assert_eq!(summary.len(), 1, "one bound repository: {summary:?}");
+    assert_eq!(summary[0].repository, "solo");
+    assert_eq!(summary[0].work_branch, format!("sergeant/{work_id}"));
+    assert_eq!(summary[0].base_branch, "main");
+    assert_eq!(summary[0].base_sha, "0".repeat(40));
+    assert_eq!(summary[0].worktree_path, data.path());
     let reconciled = events_of(core, work_id, KIND_EXECUTION_RECONCILED);
     assert_eq!(
         reconciled.len(),
@@ -6450,6 +6481,7 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
         profile: None,
         execute: None,
         instruction_policy: InstructionPolicy::default(),
+        bindings: Vec::new(),
     };
     let handle = backend.start(&request).expect("start");
 
@@ -6590,6 +6622,7 @@ fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mo
         profile: None,
         execute: None,
         instruction_policy: InstructionPolicy::default(),
+        bindings: Vec::new(),
     };
     let handle = backend.start(&request).expect("start");
     let observation = wait_settled(&backend, &handle, Duration::from_secs(180));
@@ -6883,6 +6916,7 @@ fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
                 profile: None,
                 execute: None,
                 instruction_policy: InstructionPolicy::default(),
+                bindings: Vec::new(),
             })
             .expect("prepare");
         fake.launch(&prepared).expect("launch");
@@ -6980,6 +7014,7 @@ fn n13_window5_result_observed_before_the_result_append() {
             profile: None,
             execute: None,
             instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");
@@ -7065,6 +7100,7 @@ fn n14_window6_result_appended_before_the_transition() {
             profile: None,
             execute: None,
             instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");

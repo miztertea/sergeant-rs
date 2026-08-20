@@ -582,8 +582,13 @@ mod tests {
 
         let work_id = "01RECOVEREDTEARDOWN00";
         let spec = repo(&dir.path().join("solo"));
-        let surface =
-            materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            work_id,
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         let worktree = surface.bindings[0].worktree_path.clone();
 
         testing::submit(&mut core, work_id, "crashed before its teardown landed");

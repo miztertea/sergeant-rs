@@ -1355,6 +1355,7 @@ mod tests {
                 env: BTreeMap::new(),
             }),
             instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
         };
         let prepared = backend
             .prepare(&request)
@@ -1468,6 +1469,7 @@ mod tests {
                 profile: None,
                 execute: None,
                 instruction_policy: InstructionPolicy::default(),
+                bindings: Vec::new(),
             };
             let spec = ExecuteSpec {
                 image: "alpine:3".into(),
@@ -1504,6 +1506,7 @@ mod tests {
             profile: None,
             execute: None,
             instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
         };
         let err = backend.prepare(&request).expect_err("must refuse");
         assert!(matches!(err, BackendError::Failed { .. }));

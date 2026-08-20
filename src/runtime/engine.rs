@@ -548,6 +548,12 @@ pub struct InterruptOutcome {
 /// included, queueing behind someone else's checkout.
 pub struct PendingSurface {
     work_id: String,
+    /// The daemon's data dir, carried so [`Self::perform`] can locate the
+    /// interprocess repository locks (§9.4). Deliberately separate from
+    /// `SurfaceEffect::Materialize`'s `surfaces_root`, which R-MVP1-1 unbound
+    /// from the data dir: an estate may put its surfaces anywhere, and the
+    /// locks still live in the daemon's own storage.
+    data_dir: PathBuf,
     effect: SurfaceEffect,
 }
 
@@ -610,6 +616,7 @@ impl PendingSurface {
                 surfaces_root,
                 plan,
             } => SurfaceOutcome::Materialized(materialize(
+                &self.data_dir,
                 surfaces_root,
                 &self.work_id,
                 &plan.repositories,
@@ -621,9 +628,11 @@ impl PendingSurface {
                 if surface.bindings.iter().all(|b| b.worktree_path.exists()) {
                     return SurfaceOutcome::Rematerialized(Ok(None));
                 }
-                SurfaceOutcome::Rematerialized(rematerialize(surface).map(Some))
+                SurfaceOutcome::Rematerialized(rematerialize(&self.data_dir, surface).map(Some))
             }
-            SurfaceEffect::Teardown { surface, .. } => SurfaceOutcome::TornDown(teardown(surface)),
+            SurfaceEffect::Teardown { surface, .. } => {
+                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface))
+            }
         }
     }
 }
@@ -1520,6 +1529,7 @@ impl Engine {
         Ok(Step {
             next: Next::Surface(Box::new(PendingSurface {
                 work_id: work.id.clone(),
+                data_dir: self.data_dir.clone(),
                 effect: SurfaceEffect::Materialize {
                     surfaces_root: plan.surfaces_root.clone(),
                     plan: Box::new(plan.clone()),
@@ -1936,6 +1946,7 @@ impl Engine {
             return Ok(Step {
                 next: Next::Surface(Box::new(PendingSurface {
                     work_id: work_id.to_string(),
+                    data_dir: self.data_dir.clone(),
                     effect: SurfaceEffect::Rematerialize {
                         surface,
                         index: current.index,
@@ -2744,6 +2755,11 @@ impl Engine {
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile,
             instruction_policy: Some(Self::run_instruction_policy(run)),
+            // §10.1, re-supplied from the journaled surface for the same
+            // reason the pin and the profile are: a restarted adapter has
+            // lost whatever it derived from it, and the Work's mutation
+            // surface is not something it may re-invent from a bare cwd.
+            bindings: surface.binding_summary(),
         })
     }
 
@@ -2979,6 +2995,11 @@ impl Engine {
             // MVP-2 D2 item 1: the policy `workflow.bound` pinned, not
             // re-derived from the live manifest.
             instruction_policy: Self::run_instruction_policy(&run),
+            // §10.1: the complete binding summary, not only a cwd. Taken from
+            // the surface this stage is actually about to run in, so the paths
+            // and refs an adapter states are the ones sergeant journaled —
+            // never re-derived from the manifest or from the filesystem.
+            bindings: surface.binding_summary(),
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -3896,6 +3917,7 @@ impl Engine {
         }
         Next::Surface(Box::new(PendingSurface {
             work_id: work_id.to_string(),
+            data_dir: self.data_dir.clone(),
             effect: SurfaceEffect::Teardown { surface, recovered },
         }))
     }
@@ -4863,6 +4885,7 @@ mod tests {
             profile: None,
             execute: None,
             instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
         };
         let handle = fake.start(&start_request).expect("fake backend start");
         testing::commit(
@@ -4987,6 +5010,8 @@ mod tests {
                 work_branch: format!("sergeant/{work_id}"),
                 head_sha: "1".repeat(40),
                 origin: BindingOrigin::Cut,
+                canonical_top_level: Some(PathBuf::from("/repos/solo")),
+                canonical_common_dir: Some(PathBuf::from("/repos/solo/.git")),
             }
         }
 

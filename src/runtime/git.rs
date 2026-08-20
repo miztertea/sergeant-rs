@@ -65,6 +65,53 @@ pub enum GitError {
     },
 }
 
+/// `git rev-parse --path-format=absolute --git-common-dir` in `dir`,
+/// canonicalized: the identity §2.7/§9.4 locks on.
+///
+/// The *common* directory, not the git dir: a linked worktree's own
+/// `.git/worktrees/<name>` is private to it, while the common dir is the
+/// shared object store, the ref storage, and the linked-worktree registry —
+/// the state two concurrent mutators actually collide in. A primary checkout
+/// and every `git worktree add` of it answer with one and the same path,
+/// which is precisely what a lock keyed on the checkout *path* could never
+/// see (proposal §2.7: "different linked worktree paths may share one Git
+/// common directory and therefore one ref/worktree registry while receiving
+/// different locks").
+///
+/// Canonicalized because this is about identity, not spelling: a repository
+/// reached through a symlink (`/tmp` → `/private/tmp` on macOS, an estate
+/// mount behind a symlinked parent) would otherwise answer differently from
+/// the same repository reached directly, and hand two names to one thing.
+/// When canonicalization fails — a path that raced away underneath us — the
+/// absolute answer Git gave is kept as-is rather than discarded: a slightly
+/// less normalized identity still serializes correctly against every other
+/// caller that resolves it the same way, and refusing outright would fail an
+/// operation over a spelling.
+pub fn canonical_git_common_dir(dir: &Path) -> Result<std::path::PathBuf, GitError> {
+    let raw = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let path = std::path::PathBuf::from(raw);
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// `git rev-parse --path-format=absolute --show-toplevel` in `dir`,
+/// canonicalized the same way [`canonical_git_common_dir`] is.
+///
+/// §3.5's "canonical Git top level" half of a repository binding: what the
+/// declared mount path actually resolves to as a working tree, recorded at
+/// admission so later readers compare against what was admitted rather than
+/// re-asking a checkout that may have moved.
+pub fn canonical_git_top_level(dir: &Path) -> Result<std::path::PathBuf, GitError> {
+    let raw = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )?;
+    let path = std::path::PathBuf::from(raw);
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 /// Run `git <args>` in `dir` and return trimmed stdout, or a [`GitError`].
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
     let output = command(dir, args)
