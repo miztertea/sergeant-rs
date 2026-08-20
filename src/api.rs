@@ -64,7 +64,8 @@ use crate::runtime::graph::{
 use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{
-    Projection, ProjectionError, WorkRegistry, WorkRun, is_absorbing, rederive_run,
+    Projection, ProjectionError, WorkIndexRow, WorkRegistry, WorkRun, is_absorbing, rederive_run,
+    rederive_work,
 };
 use crate::runtime::surface::{
     BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
@@ -1495,6 +1496,43 @@ async fn submit_work(
     )
 }
 
+/// #4's Work cache read side, the full-[`Work`] analog of [`resolve_run`]
+/// just below: `works` (active) -> `terminal_works` (cache) -> journal
+/// re-derivation, in that order. Every site that used to read
+/// `registry.works.get`/`.contains_key` directly for a Work it needed the
+/// full struct from — `work_view`, `cancel`/`extend`/`reap`-shaped
+/// handlers — routes through this instead, so a Work aged out of the
+/// bounded cache is still found, exactly the way `resolve_run` already
+/// keeps working for its run.
+///
+/// `None` only for a work id `WorkRegistry::work_index` has no row for —
+/// genuinely unknown, never journaled. The index is checked before ever
+/// paying for a replay: every Work this daemon has journaled has a row
+/// there for as long as the journal exists, evicted from the full-struct
+/// cache or not, so a miss there is conclusive without reading a single
+/// event.
+fn resolve_work(core: &Core, work_id: &str) -> Option<Work> {
+    let registry = core.registry.state();
+    if let Some(work) = registry.works.get(work_id) {
+        return Some(work.clone());
+    }
+    if let Some(work) = registry.terminal_works.get(work_id) {
+        return Some(work.clone());
+    }
+    registry.work_index.get(work_id)?;
+    match blocking_sync(|| rederive_work(&core.journal, work_id)) {
+        Ok(work) => work,
+        Err(e) => {
+            tracing::error!(
+                work_id = %work_id,
+                error = %e,
+                "could not re-derive an evicted work from the journal"
+            );
+            None
+        }
+    }
+}
+
 /// The [`WorkRun`] to render for a work: the live or R-MVP1-9-evicted-but-
 /// cached registry entry (`cached`, which callers pass as `WorkRegistry::
 /// run_view`'s answer — checking both `runs` and `terminal_runs`), or —
@@ -1653,18 +1691,14 @@ fn stranded_completion(work: &Work, run: &WorkRun) -> bool {
     let Some(surface) = run.surface.as_ref() else {
         return false;
     };
-    teardown.bindings.iter().any(|binding| {
-        let never_advanced = surface
-            .bindings
-            .iter()
-            .find(|b| b.repository == binding.repository)
-            .is_some_and(|b| binding.final_sha.as_deref() == Some(b.base_sha.as_str()));
-        never_advanced
-            && matches!(
-                binding.disposition,
-                BindingDisposition::RetainedDirty { .. }
-            )
-    })
+    // The structural predicate itself lives on `TeardownReport` (surface.rs,
+    // beside `integrity()`) so the projection reducer can compute the same
+    // thing at `surface.torn_down` time, with no live `Work` at hand, for
+    // `WorkIndexRow`'s effective disposition (#4's slim-row eviction gap).
+    // Only the `work.state == Completed` gate stays here — that is the one
+    // fact the reducer already knows a different way (it runs after
+    // `work.completed` has already updated `work.state`/`row.state`).
+    teardown.stranded_completion(surface)
 }
 
 /// The `state` `work list`/`work show` report: verbatim for every ordinary
@@ -1705,14 +1739,17 @@ fn reported_state(work: &Work, run: Option<&WorkRun>) -> &'static str {
 /// into one record is how "in review" becomes a state-machine value.
 fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
     let registry = core.registry.state();
-    let work = registry.works.get(work_id);
+    // #4: `works` may have already evicted this id into `terminal_works` or
+    // beyond — `resolve_work` is the same works -> cache -> journal chain
+    // `resolve_run` below already uses for the run.
+    let work = resolve_work(core, work_id);
     let cached_run = registry.run_view(work_id);
-    let run = work.and_then(|w| resolve_run(core, w, cached_run));
+    let run = work.as_ref().and_then(|w| resolve_run(core, w, cached_run));
     // ADR 0007(b): the persisted `Work` serializes with its true `state`
     // (`Completed`) intact; only this view's own `state` key is overridden,
     // so a work still in flight and every non-stranded completion look
     // exactly as before.
-    let work_json = work.map(|w| {
+    let work_json = work.as_ref().map(|w| {
         let mut value = serde_json::to_value(w).unwrap_or(Value::Null);
         if let Some(object) = value.as_object_mut() {
             object.insert("state".to_string(), json!(reported_state(w, run.as_ref())));
@@ -1743,7 +1780,7 @@ fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
         "integrity": run.as_ref().and_then(integrity_view),
         // R-MVP1-2's sibling: named per repository once there is something to
         // point at.
-        "output": work.and_then(|w| run.as_ref().and_then(|r| output_pointer(w, r))),
+        "output": work.as_ref().and_then(|w| run.as_ref().and_then(|r| output_pointer(w, r))),
         // MVP-3's envelope-visibility item: how much of R-MVP1-7's turn
         // budget this Work has spent and how much it has, without decoding
         // the journal for `execution.started`/`stage.resumed` counts or the
@@ -1754,7 +1791,7 @@ fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
         // run yet — e.g. a `pending` Work with no repository context) still
         // reports a real, honest cap/ceiling: zero turns spent against
         // whatever this Work would be checked against once it starts.
-        "envelope": work.map(|w| {
+        "envelope": work.as_ref().map(|w| {
             let default_run = WorkRun::default();
             let run_ref = run.as_ref().unwrap_or(&default_run);
             json!({
@@ -1793,22 +1830,37 @@ fn run_stage_view(run: &WorkRun) -> Option<Value> {
 /// them is exactly how "in review" becomes a state-machine value — but a fleet
 /// view that cannot say which stage a running work is on is not a fleet view,
 /// so `stage` is a sibling key of `work` here as it is in `work_view`.
+///
+/// #4: iterates `registry.work_index` — the always-retained key set — not
+/// `registry.works`, which only holds active Works now. For each id this
+/// renders the same full row as before when the Work is still active or
+/// still in the bounded `terminal_works` cache; a Work aged out of that
+/// cache renders a narrowed row built from its [`WorkIndexRow`] alone,
+/// with `"evicted": true` naming the shape — see
+/// [`evicted_fleet_row`]'s own doc for exactly what that narrows.
 fn fleet_body(core: &Core, engine: &Engine) -> Value {
     let registry = core.registry.state();
     let works: Vec<Value> = registry
-        .works
-        .values()
-        .map(|work| {
-                // `registry.run_view` alone only reaches the bounded
-                // in-memory cache (`TERMINAL_RUN_CACHE_CAPACITY`); once a
-                // terminal run ages out of it, `resolve_run`'s journal-
-                // replay fallback is what `work_view` already relies on to
-                // keep `sgt work show` correct for the identical work. This
-                // row must use the same fallback, or an evicted work's
-                // `state` here would silently fall back to plain
-                // `completed` (ADR 0007(b)) while `work show` still says
-                // `completed_dirty` for it.
-            let run = resolve_run(core, work, registry.run_view(&work.id));
+        .work_index
+        .keys()
+        .map(|id| {
+            let Some(work) = registry
+                .works
+                .get(id)
+                .or_else(|| registry.terminal_works.get(id))
+            else {
+                return evicted_fleet_row(&registry.work_index[id]);
+            };
+            // `registry.run_view` alone only reaches the bounded
+            // in-memory cache (`TERMINAL_RUN_CACHE_CAPACITY`); once a
+            // terminal run ages out of it, `resolve_run`'s journal-
+            // replay fallback is what `work_view` already relies on to
+            // keep `sgt work show` correct for the identical work. This
+            // row must use the same fallback, or an evicted work's
+            // `state` here would silently fall back to plain
+            // `completed` (ADR 0007(b)) while `work show` still says
+            // `completed_dirty` for it.
+            let run = resolve_run(core, work, registry.run_view(id));
             let mut row = serde_json::to_value(work).unwrap_or(Value::Null);
             if let Some(object) = row.as_object_mut() {
                 // ADR 0007(b): `sgt work list` is where an operator looks
@@ -1859,6 +1911,46 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
         })
         .collect();
     json!({"works": works})
+}
+
+/// The `sgt work list` row for a Work that has aged out of `terminal_works`
+/// entirely — #4's bounded-cost tradeoff made visible. Built from
+/// [`WorkIndexRow`] alone, so it carries only what that row keeps: `id`,
+/// `intent`, `state` (with the same `completed_dirty` compaction
+/// `reported_state` applies, when the retained disposition alone is enough
+/// to tell), `integrity` (disposition only — the findings and drift
+/// `integrity_view` composes from a live [`TeardownReport`] are not part of
+/// the slim row), and the two timestamps. No `stage`/`resolved_backend`/
+/// `envelope`/`output` — those need the run, which a Work this old no
+/// longer has cached, and re-deriving it here would be the very per-row
+/// journal replay this cache exists to avoid. `"evicted": true` names the
+/// narrowing explicitly rather than leaving a client to infer it from
+/// absent keys.
+///
+/// No gap versus the full row's `reported_state` for the `completed_dirty`
+/// question, despite the slim row never retaining `run.teardown`/
+/// `run.surface`: `WorkIndexRow::integrity` (projection.rs) is the *effective*
+/// disposition — explicit `Dirty` OR [`stranded_completion`]'s structural
+/// check — already folded in at `surface.torn_down` time, while both were
+/// still in hand. So the plain `== Some(Dirty)` check below is enough; it
+/// does not need to re-derive stranded-ness from fields this row never kept.
+fn evicted_fleet_row(row: &WorkIndexRow) -> Value {
+    let state = if row.state == WorkState::Completed
+        && row.integrity == Some(IntegrityDisposition::Dirty)
+    {
+        "completed_dirty"
+    } else {
+        row.state.as_str()
+    };
+    json!({
+        "id": row.id,
+        "intent": row.intent,
+        "state": state,
+        "integrity": row.integrity.map(|d| json!({"disposition": d})),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "evicted": true,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2043,13 +2135,17 @@ async fn list_workflows(
 /// execution state (the M3 contract's `work show` surface).
 async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
-    match core.registry.state().works.get(&id) {
-        Some(_) => Json(work_view(&core, &state.engine, &id)).into_response(),
-        None => error_response(
+    // #4: existence is answered from the always-retained slim index, not
+    // the (now bounded) `works` map — an evicted-beyond-cache Work still
+    // has a row there, and `work_view`'s own `resolve_work` re-derives it.
+    if core.registry.state().work_index.contains_key(&id) {
+        Json(work_view(&core, &state.engine, &id)).into_response()
+    } else {
+        error_response(
             StatusCode::NOT_FOUND,
             "work_not_found",
             format!("no work with id {id}"),
-        ),
+        )
     }
 }
 
@@ -2090,7 +2186,7 @@ async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Res
 /// `resolve_run` already defers, not this build's.
 async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
-    if !core.registry.state().works.contains_key(&id) {
+    if !core.registry.state().work_index.contains_key(&id) {
         return error_response(
             StatusCode::NOT_FOUND,
             "work_not_found",
@@ -2287,7 +2383,12 @@ async fn cancel_work(
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
-    let Some(work) = core.registry.state().works.get(&id).cloned() else {
+    // #4: a duplicate cancel (fresh `command_id`, same target) against a
+    // Work canceled earlier — possibly already evicted, since `Canceled` is
+    // absorbing — must still find it to answer the idempotent-success arm
+    // below, not 404. `resolve_work` is the same works -> cache -> journal
+    // chain `work_view` uses.
+    let Some(work) = resolve_work(&core, &id) else {
         let result = error_body("work_not_found", format!("no work with id {id}"));
         return record_and_respond(
             &mut core,
@@ -2394,7 +2495,7 @@ async fn work_input(
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
-    if !core.registry.state().works.contains_key(&id) {
+    if !core.registry.state().work_index.contains_key(&id) {
         let result = error_body("work_not_found", format!("no work with id {id}"));
         return record_and_respond(
             &mut core,
@@ -2465,7 +2566,7 @@ async fn work_retry(
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
-    if !core.registry.state().works.contains_key(&id) {
+    if !core.registry.state().work_index.contains_key(&id) {
         let result = error_body("work_not_found", format!("no work with id {id}"));
         return record_and_respond(
             &mut core,
@@ -2541,7 +2642,7 @@ async fn work_extend(
     if let Some(resp) = replay_command(&core, &req.command_id) {
         return resp;
     }
-    if !core.registry.state().works.contains_key(&id) {
+    if !core.registry.state().work_index.contains_key(&id) {
         let result = error_body("work_not_found", format!("no work with id {id}"));
         return record_and_respond(
             &mut core,
@@ -2649,7 +2750,9 @@ async fn reap_work(
             result,
         );
     }
-    let Some(work) = core.registry.state().works.get(&id).cloned() else {
+    // #4: reap targets a terminal Work's teardown, so this id is exactly
+    // the shape likely to have aged out of the live map already.
+    let Some(work) = resolve_work(&core, &id) else {
         let result = error_body("work_not_found", format!("no work with id {id}"));
         return record_and_respond(
             &mut core,
@@ -2713,14 +2816,27 @@ async fn reap_work(
 /// tradeoff `work_transcript` discloses: a terminal work not already in the
 /// bounded cache costs a full journal replay under the guard. Inspecting
 /// retained state is an occasional, operator-driven action, not a hot path.
+///
+/// #4 doubles that accepted tradeoff rather than closing it: this walks
+/// every id in `registry.work_index` (every Work ever journaled, active or
+/// not — `registry.works` alone would silently stop finding any *terminal*
+/// Work the instant it aged out of the live map, and terminal is exactly
+/// what a teardown requires) and now resolves the Work itself through
+/// `resolve_work`'s cache-then-journal chain, on top of `resolve_run`'s own.
+/// Worst case — an estate with many more historical Works than either
+/// bounded cache holds — pays up to two replays per id instead of one.
+/// Still bounded by the same "occasional, operator-driven, not a hot path"
+/// argument above, not a new category of cost; called out here rather than
+/// left implicit for whoever tunes the cache capacities next.
 async fn list_retained(State(state): State<ApiState>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
     let registry = core.registry.state();
     let entries: Vec<Value> = registry
-        .works
-        .values()
-        .filter_map(|work| {
-            let run = resolve_run(&core, work, registry.run_view(&work.id))?;
+        .work_index
+        .keys()
+        .filter_map(|id| {
+            let work = resolve_work(&core, id)?;
+            let run = resolve_run(&core, &work, registry.run_view(id))?;
             let teardown = run.teardown?;
             Some((work.id.clone(), retained_bindings(&teardown)))
         })
@@ -3152,7 +3268,7 @@ fn projection_unavailable(e: impl std::fmt::Display) -> Response {
 async fn work_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     {
         let core = CoreGuard::acquire(&state.core).await;
-        if !core.registry.state().works.contains_key(&id) {
+        if !core.registry.state().work_index.contains_key(&id) {
             return error_response(
                 StatusCode::NOT_FOUND,
                 "work_not_found",
@@ -5281,6 +5397,412 @@ mod tests {
             "an evicted stranded completion must not silently revert to plain \
              completed in `sgt work list` just because its run cache entry \
              aged out: {row}"
+        );
+    }
+
+    /// #4's own version of the test above, one layer further out: not just
+    /// the *run* cache but the *Work* cache too. Once `target_id` ages past
+    /// `TERMINAL_WORK_CACHE_CAPACITY`, `work_view` must route through
+    /// `resolve_work`'s journal fallback and answer byte-identically to
+    /// what it answered while the Work was still cached — R-MVP1-9's own
+    /// pin ("an evicted view is byte-identical to a non-evicted one"),
+    /// restated for #4. `fleet_body`'s row for the same id must also still
+    /// be there (narrowed, `"evicted": true`), and an id that was never
+    /// journaled at all must still 404 through the slim-index existence
+    /// check, exactly as it did before any of this churn.
+    #[test]
+    fn a_work_view_survives_terminal_work_cache_eviction_and_unknown_ids_still_404() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn ordinary_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": true,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "removed",
+                }],
+            }})
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        let target_id = "01TARGETWORK00000001";
+        testing::submit(&mut core, target_id, "declares a commit, never makes one");
+        testing::commit(
+            &mut core,
+            target_id,
+            KIND_SURFACE_MATERIALIZED,
+            surface(target_id),
+        );
+        testing::commit(&mut core, target_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            target_id,
+            KIND_SURFACE_TORN_DOWN,
+            ordinary_teardown(target_id),
+        );
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        assert!(
+            core.registry.state().terminal_works.contains_key(target_id),
+            "precondition: still cached, or the before/after comparison below \
+             proves nothing about eviction specifically"
+        );
+        let before = work_view(&core, &engine, target_id);
+
+        // Churn ordinary completions past `projection.rs`'s own
+        // `TERMINAL_WORK_CACHE_CAPACITY` (1024, private to that module) so
+        // `target_id` — submitted first, so it is the oldest — actually
+        // ages out of it.
+        for i in 0..1224 {
+            let id = format!("01WORKCACHECHURN{i:06}");
+            testing::submit(&mut core, &id, "cache churn");
+            testing::commit(&mut core, &id, KIND_SURFACE_MATERIALIZED, surface(&id));
+            testing::commit(&mut core, &id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &id,
+                KIND_SURFACE_TORN_DOWN,
+                ordinary_teardown(&id),
+            );
+        }
+        assert!(
+            !core.registry.state().terminal_works.contains_key(target_id),
+            "the target must actually have aged out of the bounded cache for \
+             this test to prove anything"
+        );
+        assert!(
+            core.registry.state().work_index.contains_key(target_id),
+            "the slim index must still know this id exists"
+        );
+
+        let after = work_view(&core, &engine, target_id);
+        assert_eq!(
+            before, after,
+            "an evicted Work's view must be byte-identical to what it answered \
+             while still cached: before={before}, after={after}"
+        );
+
+        let fleet = fleet_body(&core, &engine);
+        let row = fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .find(|w| w["id"] == target_id)
+            .expect("the evicted-past-cache work is still listed, narrowed");
+        assert_eq!(row["evicted"], true, "{row}");
+        assert_eq!(row["state"], after["work"]["state"], "{row}");
+        assert_eq!(row["intent"], after["work"]["intent"], "{row}");
+
+        // Existence checks must still 404 correctly for a truly unknown id
+        // — unaffected by any of the churn above.
+        assert!(
+            !core
+                .registry
+                .state()
+                .work_index
+                .contains_key("01NOSUCHWORKATALL"),
+            "an id nothing ever journaled must not be found"
+        );
+    }
+
+    /// Panel finding (the explicit-Dirty half): `evicted_fleet_row` reads
+    /// `WorkIndexRow::integrity` directly, and an explicit `Dirty`
+    /// disposition was always mirrored into it verbatim — so this half
+    /// already passed before the fix. It is kept here as a regression guard
+    /// alongside its stranded-completion sibling just below, which the fix
+    /// was actually for.
+    ///
+    /// Same churn shape as
+    /// `a_work_view_survives_terminal_work_cache_eviction_and_unknown_ids_still_404`
+    /// just above: submit the target first (so it is oldest and ages out
+    /// first), then churn ordinary completions past
+    /// `TERMINAL_WORK_CACHE_CAPACITY` (1024) so `evicted_fleet_row` is the
+    /// branch `fleet_body` actually takes for it, not the full-row branch.
+    #[test]
+    fn evicted_fleet_row_reports_completed_dirty_for_an_explicit_dirty_disposition() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn ordinary_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": true,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "removed",
+                }],
+            }})
+        }
+
+        fn explicit_dirty_teardown(work_id: &str) -> Value {
+            // A clean removal in every way `TeardownReport::integrity()`
+            // itself would score, but retired with an explicit `Dirty`
+            // disposition anyway — the two ways to `completed_dirty` §11.5's
+            // own doc calls out as a union rather than a competition.
+            let mut payload = ordinary_teardown(work_id);
+            payload["integrity"] = json!("dirty");
+            payload
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        let target_id = "01EXPLICITDIRTY0000001";
+        testing::submit(&mut core, target_id, "retired dirty on purpose");
+        testing::commit(
+            &mut core,
+            target_id,
+            KIND_SURFACE_MATERIALIZED,
+            surface(target_id),
+        );
+        testing::commit(&mut core, target_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            target_id,
+            KIND_SURFACE_TORN_DOWN,
+            explicit_dirty_teardown(target_id),
+        );
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        // Churn ordinary completions past `TERMINAL_WORK_CACHE_CAPACITY`
+        // (1024, private to `projection.rs`) so `target_id` — submitted
+        // first, so it is the oldest — actually ages out of `terminal_works`
+        // and `evicted_fleet_row` is the branch `fleet_body` actually takes.
+        for i in 0..1224 {
+            let id = format!("01EXPLICITDIRTYCHURN{i:06}");
+            testing::submit(&mut core, &id, "cache churn");
+            testing::commit(&mut core, &id, KIND_SURFACE_MATERIALIZED, surface(&id));
+            testing::commit(&mut core, &id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &id,
+                KIND_SURFACE_TORN_DOWN,
+                ordinary_teardown(&id),
+            );
+        }
+        assert!(
+            !core.registry.state().terminal_works.contains_key(target_id),
+            "the target must actually have aged out of the bounded cache for \
+             this test to prove anything"
+        );
+
+        let fleet = fleet_body(&core, &engine);
+        let row = fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .find(|w| w["id"] == target_id)
+            .expect("the evicted-past-cache work is still listed, narrowed");
+        assert_eq!(row["evicted"], true, "{row}");
+        assert_eq!(
+            row["state"], "completed_dirty",
+            "an explicit Dirty disposition must still read completed_dirty \
+             once the Work has aged past TERMINAL_WORK_CACHE_CAPACITY: {row}"
+        );
+    }
+
+    /// Panel finding (the core fix, stranded-completion half): before this
+    /// fix, `WorkIndexRow::integrity` only ever mirrored the *explicit*
+    /// disposition a `surface.torn_down` carried — never ADR 0007(b)'s
+    /// structural inference (`stranded_completion`: a closing stage's
+    /// finalize commit that never moved past the surface's base SHA, with a
+    /// `RetainedDirty` binding). A stranded completion with no explicit
+    /// `Dirty` disposition therefore read `completed_dirty` in `sgt work
+    /// show`/`sgt work list` right up until its Work aged past
+    /// `TERMINAL_WORK_CACHE_CAPACITY` — at which point `evicted_fleet_row`,
+    /// reading `WorkIndexRow` alone, would find `row.integrity` still `None`
+    /// and silently revert it to plain `completed`. The fix folds the
+    /// structural check into `WorkIndexRow::integrity` itself, at
+    /// `surface.torn_down` time in the reducer (`projection.rs`), while
+    /// `run.surface`/`run.teardown` are still in hand.
+    ///
+    /// **Why this fails without the fix.** This fixture's teardown payload
+    /// carries no `integrity` key at all (mirroring
+    /// `a_stranded_completion_survives_terminal_run_cache_eviction`'s
+    /// `stranded_teardown` shape exactly: `clean: false`, a `retained_dirty`
+    /// binding whose `final_sha` equals the surface binding's own
+    /// `base_sha`, i.e. never advanced) — so on the pre-fix reducer,
+    /// `row.integrity` is set from `run.integrity`, which
+    /// `serde_json::from_value` on an absent key resolves to `None`.
+    /// `evicted_fleet_row` only special-cases `row.integrity ==
+    /// Some(Dirty)`; with `row.integrity == None` it falls straight to
+    /// `row.state.as_str()`, i.e. `"completed"`. Only after the Work ages
+    /// past `TERMINAL_WORK_CACHE_CAPACITY` does that gap become visible —
+    /// while cached, `fleet_body`/`work_view` both still resolve the full
+    /// run and re-run `stranded_completion` directly, which is exactly why
+    /// this test churns past the cache rather than asserting immediately.
+    #[test]
+    fn evicted_fleet_row_reports_completed_dirty_for_a_stranded_completion() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn stranded_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": false,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "retained_dirty",
+                    "changes": " M half-done.rs",
+                    // Never advanced past the base SHA `surface` recorded —
+                    // no explicit `integrity` key anywhere in this payload.
+                    "final_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        fn ordinary_teardown(work_id: &str) -> Value {
+            json!({"report": {
+                "work_id": work_id,
+                "clean": true,
+                "bindings": [{
+                    "repository": "solo",
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "disposition": "removed",
+                }],
+            }})
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        let stranded_id = "01STRANDEDEVICTED0001";
+        testing::submit(&mut core, stranded_id, "declares a commit, never makes one");
+        testing::commit(
+            &mut core,
+            stranded_id,
+            KIND_SURFACE_MATERIALIZED,
+            surface(stranded_id),
+        );
+        testing::commit(&mut core, stranded_id, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            stranded_id,
+            KIND_SURFACE_TORN_DOWN,
+            stranded_teardown(stranded_id),
+        );
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        // Churn ordinary completions past `TERMINAL_WORK_CACHE_CAPACITY`
+        // (1024) so `stranded_id` — submitted first, so it is the oldest —
+        // actually ages out of `terminal_works` and `evicted_fleet_row` is
+        // the branch `fleet_body` actually takes for it.
+        for i in 0..1224 {
+            let id = format!("01STRANDEDEVICTEDCHURN{i:06}");
+            testing::submit(&mut core, &id, "cache churn");
+            testing::commit(&mut core, &id, KIND_SURFACE_MATERIALIZED, surface(&id));
+            testing::commit(&mut core, &id, KIND_WORK_COMPLETED, json!({}));
+            testing::commit(
+                &mut core,
+                &id,
+                KIND_SURFACE_TORN_DOWN,
+                ordinary_teardown(&id),
+            );
+        }
+        assert!(
+            !core
+                .registry
+                .state()
+                .terminal_works
+                .contains_key(stranded_id),
+            "the stranded work must actually have aged out of the bounded \
+             cache for this test to prove anything"
+        );
+
+        let fleet = fleet_body(&core, &engine);
+        let row = fleet["works"]
+            .as_array()
+            .expect("works")
+            .iter()
+            .find(|w| w["id"] == stranded_id)
+            .expect("the evicted-past-cache work is still listed, narrowed");
+        assert_eq!(row["evicted"], true, "{row}");
+        assert_eq!(
+            row["state"], "completed_dirty",
+            "an evicted stranded completion (ADR 0007(b)'s structural \
+             inference, no explicit Dirty disposition) must not silently \
+             revert to plain completed just because its Work aged past \
+             TERMINAL_WORK_CACHE_CAPACITY: {row}"
         );
     }
 

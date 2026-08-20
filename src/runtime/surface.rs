@@ -572,6 +572,41 @@ impl TeardownReport {
     pub fn findings(&self) -> impl Iterator<Item = &IntegrityFinding> {
         self.bindings.iter().flat_map(|b| b.findings.iter())
     }
+
+    /// ADR 0007(b): whether this teardown, against the surface it tore down,
+    /// shows a closing stage that declared a commit as its durable outcome
+    /// but never actually advanced the branch and left the worktree dirty —
+    /// the safety net for when an actor guesses wrong about its own runtime
+    /// model (`docs/adr/0007-actor-runtime-contract.md`).
+    ///
+    /// The engine still learns nothing about what a commit *is* (NORTH-STAR:
+    /// "the engine learns no output vocabulary; only the pointer is core"):
+    /// this reads two facts the pointer already computes — a binding's
+    /// teardown disposition, and whether its finalize commit ever moved past
+    /// the surface's own base SHA — rather than asking any workflow what it
+    /// meant to do.
+    ///
+    /// Structural, not state-aware: this alone does not know whether the
+    /// Work this teardown belongs to actually reached `Completed` — callers
+    /// that need `reported_state`'s full `stranded_completion` semantics
+    /// (api.rs) gate this on `work.state` themselves. It exists standalone
+    /// here specifically so a caller with no live `Work` at hand — the
+    /// projection reducer, computing the slim index's effective disposition
+    /// at `surface.torn_down` time — can still ask it.
+    pub fn stranded_completion(&self, surface: &WorkSurface) -> bool {
+        self.bindings.iter().any(|binding| {
+            let never_advanced = surface
+                .bindings
+                .iter()
+                .find(|b| b.repository == binding.repository)
+                .is_some_and(|b| binding.final_sha.as_deref() == Some(b.base_sha.as_str()));
+            never_advanced
+                && matches!(
+                    binding.disposition,
+                    BindingDisposition::RetainedDirty { .. }
+                )
+        })
+    }
 }
 
 /// Failure materializing a surface.

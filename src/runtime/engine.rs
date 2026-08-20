@@ -243,17 +243,23 @@ pub fn branch_takeover_precondition(
     registry: &WorkRegistry,
     target_work_id: &str,
 ) -> Result<Vec<RepositoryBinding>, BranchTakeoverError> {
-    let work =
+    // #4: the target of a takeover is by definition terminal (the check
+    // just below refuses anything else), which is exactly the case #4
+    // evicts the full `Work` struct for — `works` alone would 404 a
+    // perfectly good takeover target the instant its run settled. Only
+    // `.state` is needed here, and `state_view` answers it from the slim
+    // index, never evicted, so this never has to fall back to a journal
+    // replay.
+    let state =
         registry
-            .works
-            .get(target_work_id)
+            .state_view(target_work_id)
             .ok_or_else(|| BranchTakeoverError::TargetNotFound {
                 work_id: target_work_id.to_string(),
             })?;
-    if !is_absorbing(work.state) {
+    if !is_absorbing(state) {
         return Err(BranchTakeoverError::TargetNotTerminal {
             work_id: target_work_id.to_string(),
-            state: work.state,
+            state,
         });
     }
     let run = registry
@@ -4353,11 +4359,16 @@ impl Engine {
     }
 
     fn work_state(&self, core: &Core, work_id: &str) -> Result<WorkState, EngineError> {
+        // #4: `works` only holds active Works now. Most callers here only
+        // ever ask about one (scheduling loops touch non-absorbing works by
+        // construction), but this is a shared lookup, not scoped to those
+        // callers — `state_view` answers from the slim index for exactly
+        // this case, and it is never evicted, so it answers correctly for
+        // an already-terminal (possibly evicted) `work_id` too, with no
+        // journal replay.
         core.registry
             .state()
-            .works
-            .get(work_id)
-            .map(|w| w.state)
+            .state_view(work_id)
             .ok_or_else(|| EngineError::NoRun {
                 work_id: work_id.to_string(),
             })
@@ -5505,6 +5516,7 @@ mod tests {
 
     mod branch_takeover {
         use super::*;
+        use crate::runtime::projection::WorkIndexRow;
         use crate::runtime::surface::{BindingDisposition, BindingOrigin, BindingTeardown};
 
         fn work(id: &str, state: WorkState) -> Work {
@@ -5758,6 +5770,44 @@ mod tests {
             let bindings = branch_takeover_precondition(&registry, "01EVICTED")
                 .expect("an evicted-but-cached terminal run must still be readable");
             assert_eq!(bindings, vec![binding("01EVICTED")]);
+        }
+
+        /// #4's own version of the test above: the *Work* itself, not only
+        /// its run, can be evicted from the live map now — aged out of
+        /// `terminal_works` entirely, answerable only from `work_index`.
+        /// `branch_takeover_precondition` must consult that slim index for
+        /// `.state` rather than reading `registry.works` bare, or a
+        /// perfectly good ADR 0017 takeover target would refuse as
+        /// `TargetNotFound` the instant its Work aged out of the cache.
+        #[test]
+        fn permits_a_target_whose_work_was_evicted_from_the_live_map_too() {
+            let mut registry = WorkRegistry::default();
+            // Not in `works`, not even in `terminal_works` — only the slim
+            // index remembers this id exists and what state it is in.
+            registry.work_index.insert(
+                "01WORKEVICTED".to_string(),
+                WorkIndexRow {
+                    id: "01WORKEVICTED".to_string(),
+                    intent: "review this".to_string(),
+                    state: WorkState::Completed,
+                    integrity: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+            );
+            registry.terminal_runs.insert(
+                "01WORKEVICTED".to_string(),
+                WorkRun {
+                    surface: Some(surface("01WORKEVICTED")),
+                    teardown: Some(teardown_report("01WORKEVICTED", true)),
+                    ..Default::default()
+                },
+            );
+            let bindings = branch_takeover_precondition(&registry, "01WORKEVICTED").expect(
+                "a Work evicted past `terminal_works`, with only a slim index row left, \
+                 must still be readable for its state",
+            );
+            assert_eq!(bindings, vec![binding("01WORKEVICTED")]);
         }
     }
 }
