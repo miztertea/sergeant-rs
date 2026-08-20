@@ -3392,6 +3392,10 @@ async fn doctor_report(State(state): State<ApiState>) -> Response {
 /// A catch-up failure is answered as a 503 against the projection, never as a
 /// failure of the work it describes: the journal is untouched and a restart
 /// rebuilds.
+// `Response` is the error currency of every handler on this router; boxing it
+// here (clippy 1.98's `result_large_err`) would cost an unbox at each `?` site
+// for a helper called on read paths only.
+#[allow(clippy::result_large_err)]
 async fn with_analytics<T>(
     state: &ApiState,
     f: impl FnOnce(&mut Analytics) -> Result<T, AnalyticsError>,
