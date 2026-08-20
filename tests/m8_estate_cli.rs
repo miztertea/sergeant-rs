@@ -1410,6 +1410,9 @@ fn doctor_data_dir_detail_discloses_an_outranked_xdg_data_home() {
 
     let with_xdg = Command::new(SGT)
         .current_dir(estate.path())
+        // An ambient SGT_DATA_DIR would win the Env rung and mask the
+        // Manifest/EstateDefault outcome this test pins.
+        .env_remove("SGT_DATA_DIR")
         .env("XDG_DATA_HOME", &xdg)
         .args(["--json", "doctor"])
         .output()
@@ -1424,6 +1427,7 @@ fn doctor_data_dir_detail_discloses_an_outranked_xdg_data_home() {
 
     let without_xdg = Command::new(SGT)
         .current_dir(estate.path())
+        .env_remove("SGT_DATA_DIR")
         .env_remove("XDG_DATA_HOME")
         .args(["--json", "doctor"])
         .output()
