@@ -255,6 +255,77 @@ else
   pass "cleanup: no leaked scratch dirs under \$TMPDIR"
 fi
 
+# ---------------------------------------------------------------------------
+# Test 10 (#143 bounded-fallback regression): PATH lacking both timeout and
+# gtimeout must not leak the old sentinel string into a probe's measured
+# value, and must surface the condition as a measured "Probe bounds" row.
+# ---------------------------------------------------------------------------
+d="$WORK/b1"
+mk_stub_path "$d" "${ALL_TOOLS[@]}"
+rm -f "$d/timeout" "$d/gtimeout"
+out="$(PATH="$d" bash "$TARGET" 2>/dev/null)"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "#143 (no timeout/gtimeout): expected exit 0, got $rc"
+elif grep -qF 'no timeout(1) available' <<<"$out"; then
+  fail "#143 (no timeout/gtimeout): stale sentinel string leaked into a fact value"
+elif ! grep -qE '^\| Probe bounds \| unenforced:' <<<"$out"; then
+  fail "#143 (no timeout/gtimeout): Probe bounds row missing or not reporting unenforced"
+else
+  pass "#143 (no timeout/gtimeout): unenforced state measured, no sentinel leak"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 11 (#143 gtimeout-fallback regression): PATH lacking timeout but with
+# a working gtimeout must use it — no Probe bounds row, since bounding is
+# still enforced via the fallback.
+# ---------------------------------------------------------------------------
+d="$WORK/b2"
+mk_stub_path "$d" "${ALL_TOOLS[@]}"
+rm -f "$d/timeout"
+cat >"$d/gtimeout" <<'EOF'
+#!/bin/sh
+shift
+exec "$@"
+EOF
+chmod +x "$d/gtimeout"
+out="$(PATH="$d" bash "$TARGET" 2>/dev/null)"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "#143 (gtimeout fallback): expected exit 0, got $rc"
+elif grep -qE '^\| Probe bounds \|' <<<"$out"; then
+  fail "#143 (gtimeout fallback): Probe bounds row present even though gtimeout was on PATH"
+else
+  pass "#143 (gtimeout fallback): gtimeout used, no unenforced row"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 12 (#143 cores-sysctl-fallback regression): PATH lacking nproc but
+# with a stub sysctl reporting hw.ncpu must use it for the Cores row, with
+# evidence naming sysctl, not nproc.
+# ---------------------------------------------------------------------------
+d="$WORK/b3"
+mk_stub_path "$d" "${ALL_TOOLS[@]}"
+rm -f "$d/nproc"
+cat >"$d/sysctl" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-n" ] && [ "$2" = "hw.ncpu" ]; then
+  echo 12
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$d/sysctl"
+out="$(PATH="$d" bash "$TARGET" 2>/dev/null)"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  fail "#143 (sysctl cores fallback): expected exit 0, got $rc"
+elif ! grep -qE '^\| Cores \| 12 \| sysctl -n hw.ncpu' <<<"$out"; then
+  fail "#143 (sysctl cores fallback): Cores row did not report 12 via sysctl -n hw.ncpu"
+else
+  pass "#143 (sysctl cores fallback): Cores measured via sysctl fallback"
+fi
+
 echo
 if [ "$FAIL" -ne 0 ]; then
   echo "probe-env-selftest: FAILURES ABOVE"
