@@ -44,10 +44,11 @@ ROUNDS="${PERF_S3_ROUNDS:-5}"
 REPS="${PERF_S3_REPS:-1}"
 
 DD="$PERF_SCRATCH/s3/data"
-REPO="$PERF_SCRATCH/s3/repo"
+ESTATE="$PERF_SCRATCH/s3/estate"
 rm -rf "$PERF_SCRATCH/s3"
 mkdir -p "$DD"
-perf_seed_repo "$REPO"
+perf_estate_scaffold "$ESTATE"
+REPO="$PERF_REPO"
 
 # A script of MAXC needs_input steps: the loop below stops responding as soon
 # as the depth target is met, so the tail of the script is simply unused.
@@ -197,11 +198,11 @@ perf_kv events_all_http "$code"
 
 perf_step "the same reads through the CLI (process-per-call cost)"
 perf_mark cli0
-"$SGT_BIN" --data-dir "$DD" --json work show "$WORK" > "$PERF_SCRATCH/s3/cli-show.json" 2>/dev/null || true
+perf_sgt --data-dir "$DD" --json work show "$WORK" > "$PERF_SCRATCH/s3/cli-show.json" 2>/dev/null || true
 perf_mark cli1
 perf_kv cli_work_show_ms "$(perf_ms $((cli1 - cli0)))"
 perf_mark cli2
-"$SGT_BIN" --data-dir "$DD" --json work show "$WORK" --graph > "$PERF_SCRATCH/s3/cli-graph.json" 2>/dev/null || true
+perf_sgt --data-dir "$DD" --json work show "$WORK" --graph > "$PERF_SCRATCH/s3/cli-graph.json" 2>/dev/null || true
 perf_mark cli3
 perf_kv cli_work_graph_ms "$(perf_ms $((cli3 - cli2)))"
 

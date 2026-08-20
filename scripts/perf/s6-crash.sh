@@ -31,10 +31,11 @@ INFLIGHT="${PERF_S6_INFLIGHT:-10}"
 KILL_DELAY="${PERF_S6_KILL_DELAY:-auto}"
 
 DD="$PERF_SCRATCH/s6/data"
-REPO="$PERF_SCRATCH/s6/repo"
+ESTATE="$PERF_SCRATCH/s6/estate"
 rm -rf "$PERF_SCRATCH/s6"
 mkdir -p "$DD"
-perf_seed_repo "$REPO"
+perf_estate_scaffold "$ESTATE"
+REPO="$PERF_REPO"
 
 perf_kv cycles "$CYCLES"
 perf_kv inflight "$INFLIGHT"
