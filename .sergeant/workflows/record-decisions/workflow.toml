@@ -1,0 +1,15 @@
+# record-decisions — #88's `to-adr` candidate. Transcribes decisions
+# already made in an in-session grilling into ADR/glossary material, with
+# a missing rationale logged rather than invented, and fidelity to the
+# brief as the top-weighted review axis (reusing
+# worker-mission/30-independent-review's brief-authoritative axis
+# mechanism).
+#
+# Two ordinary actor stages — no engine change. Stage order here is
+# authoritative; the directory listing under this workflow's own tree
+# MUST agree with it lexically (docs/icm/convention.md §1 rule 4).
+
+[workflow]
+name = "record-decisions"
+version = "1"
+stages = ["10-transcribe-decisions", "20-fidelity-review"]

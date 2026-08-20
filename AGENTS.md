@@ -20,10 +20,14 @@
 
 Sergeant is an AgentOS distro: always-on doctrine, skills, and workflow
 templates embedded in the `sgt` binary and written to disk by `sgt init`.
-It is carried by `sgt`, a durable intent-execution engine that runs
-submitted intents to completion in isolated git worktrees. The full
-destination and the rulings behind it are `NORTH-STAR.md` — read it before
-changing anything here.
+It is carried by `sgt`, a durable intent-execution engine that gives
+every Work its own git worktree and a declared mutation surface —
+authorization, not a seal — and runs submitted intents to completion
+against it, journaling what it can prove happened outside that surface
+as dirty evidence at retirement rather than silently absorbing it
+(NORTH-STAR.md's amended destination text, #180). The full destination
+and the rulings behind it are `NORTH-STAR.md` — read it before changing
+anything here.
 
 Sergeant is designed for one developer per installation: adoption by a
 larger organization means each developer clones and installs
@@ -256,6 +260,13 @@ Before dispatching meaningful repository Work, Captain:
 Core repeats and enforces every mechanical Git check named above; this
 list is Captain's own discipline on top of it, not a substitute for it.
 
+A shared mount is accepted risk, not a gap: every Work targeting a given
+repository is cut from that repository's one mount, so a mount whose
+committed HEAD moves between one Work's admission and its retirement —
+Captain's own edit, another Work, or an unrelated process — is observed
+and reported (`EstateDriftObservation`), never fenced; nothing here
+prevents two Works from touching the same mount concurrently.
+
 A worker is told its exact selected paths, base, and assigned branch. It
 does not:
 
@@ -270,6 +281,46 @@ does not:
 A violation is reported dirty (the integrity disposition riding beside
 `sgt work show`'s terminal state), never silently treated as ordinary
 output.
+
+### INTENT — Captain's intent discipline
+
+*What must the intent itself say before Work touches sensitive territory?*
+
+Before dispatching Work whose objective names auth, security, secrets,
+payments, databases, migrations, production, destructive, persistent-state,
+or state-transition territory (the same fixed keyword set `dispatch`'s
+`05-classify-risk` stage routes on), Captain composes the intent — via
+`sgt run --intent-file <path>` — covering eight dimensions:
+
+- **Objective** — what the Work is actually for.
+- **Required Invariants** — what must remain true throughout.
+- **Approved Tradeoffs** — what is knowingly given up, and why.
+- **Out Of Scope** — what this Work must not touch or attempt.
+- **State Transitions** — what durable state moves, and between which
+  states.
+- **Failure Windows** — where a partial failure could leave things, and how
+  that would be noticed.
+- **Negative Test Matrix** — what must be proven not to happen.
+- **Validation Evidence** — what will be checked, and how, before the Work
+  is trusted done.
+
+This is Captain discipline, not engine validation. `sgt run --intent-file`
+transports the file's contents as the intent verbatim (`sgt run --help`'s
+own text for the flag) and validates only mechanics — the leaf must not be
+a symlink, must be a regular file, is capped at 1 MiB, and must be valid
+UTF-8 (`src/cli.rs`'s `read_intent_file`) — never a section, a schema, or
+any other content shape. The
+discipline of actually writing the eight dimensions lives here, applied by
+whoever composes the file; `sgt` itself cannot tell a covered dimension
+from an absent one.
+
+A routine objective — one that names none of the keywords above — uses a
+plain intent; the eight-dimension brief is reserved for the territory that
+earns it.
+
+This is the one home for these eight dimensions. Any other doctrine that
+needs them — a workflow stage's routing rule, a package's own review
+checklist — points here rather than restating the list.
 
 ### OBSERVATION — what counts as knowing
 
