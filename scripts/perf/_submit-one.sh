@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One submit, timed, as a standalone process so `xargs -P` can fan it out.
 #
-#   _submit-one.sh <endpoint> <token> <cwd> <intent> <out-csv>
+#   _submit-one.sh <endpoint> <token> <cwd> <intent> <out-csv> [repo]
 #
 # Writes exactly one CSV line:
 #   t_start_ns,wall_ns,curl_total_s,http_code,work_id,state
@@ -11,9 +11,14 @@
 # own %{time_total} is recorded alongside the shell's wall delta: the gap
 # between them is this harness's per-call process cost, which is what tells a
 # reader whether the client or the daemon saturated first.
+#
+# `repo`, when given, becomes explicit `scope.repos` (work submission now
+# requires a declared scope — estate-root proposal §7.1); an empty `repo`
+# submits no scope field, relying on the daemon's single-repository inference
+# for a one-repository estate.
 set -uo pipefail
 
-endpoint="$1"; token="$2"; cwd="$3"; intent="$4"; out="$5"
+endpoint="$1"; token="$2"; cwd="$3"; intent="$4"; out="$5"; repo="${6:-}"
 
 alphabet=0123456789ABCDEFGHJKMNPQRSTVWXYZ
 ulid() {
@@ -35,11 +40,13 @@ now_ns() {
 }
 
 if [ -n "$cwd" ]; then
-  body="$(jq -nc --arg cid "$(ulid)" --arg intent "$intent" --arg cwd "$cwd" \
-    '{command_id:$cid, intent:$intent, backend:"fake", origin:{client:"cli", cwd:$cwd}}')"
+  body="$(jq -nc --arg cid "$(ulid)" --arg intent "$intent" --arg cwd "$cwd" --arg r "$repo" \
+    '{command_id:$cid, intent:$intent, backend:"fake", origin:{client:"cli", cwd:$cwd}}
+     + (if $r == "" then {} else {scope:{repos:[$r]}} end)')"
 else
-  body="$(jq -nc --arg cid "$(ulid)" --arg intent "$intent" \
-    '{command_id:$cid, intent:$intent, backend:"fake"}')"
+  body="$(jq -nc --arg cid "$(ulid)" --arg intent "$intent" --arg r "$repo" \
+    '{command_id:$cid, intent:$intent, backend:"fake"}
+     + (if $r == "" then {} else {scope:{repos:[$r]}} end)')"
 fi
 
 t0="$(now_ns)"

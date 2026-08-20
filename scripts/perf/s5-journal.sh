@@ -30,10 +30,11 @@ WAVE="${PERF_S5_WAVE:-25}"
 READY_TIMEOUT="${PERF_S5_READY_TIMEOUT:-600}"
 
 DD="$PERF_SCRATCH/s5/data"
-REPO="$PERF_SCRATCH/s5/repo"
+ESTATE="$PERF_SCRATCH/s5/estate"
 rm -rf "$PERF_SCRATCH/s5"
 mkdir -p "$DD"
-perf_seed_repo "$REPO"
+perf_estate_scaffold "$ESTATE"
+REPO="$PERF_REPO"
 perf_daemon_start "$DD" "" "$READY_TIMEOUT"
 perf_kv marks "$MARKS"
 perf_kv wave_size "$WAVE"
@@ -126,7 +127,7 @@ for mark in $MARKS; do
   # `sgt analytics <q>` through the CLI once, so the process-per-call cost of
   # the shipped client is on the record next to the endpoint's.
   perf_mark ca0
-  "$SGT_BIN" --data-dir "$DD" --json analytics "${QUERIES%% *}" > /dev/null 2>&1 || true
+  perf_sgt --data-dir "$DD" --json analytics "${QUERIES%% *}" > /dev/null 2>&1 || true
   perf_mark ca1
   perf_kv "m${mark}_analytics_cli_ms" "$(perf_ms $((ca1 - ca0)))"
 done
