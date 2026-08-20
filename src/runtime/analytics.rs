@@ -123,6 +123,7 @@ CREATE TABLE events (
     kind           VARCHAR NOT NULL,
     payload        VARCHAR NOT NULL
 );
+CREATE INDEX idx_events_kind_work ON events(kind, work_id);
 CREATE TABLE work (
     work_id       VARCHAR PRIMARY KEY,
     intent        VARCHAR,
