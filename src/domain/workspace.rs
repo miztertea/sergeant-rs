@@ -1115,14 +1115,31 @@ impl Workspace {
     }
 
     /// Restrict the workspace to the named repositories (the submit request's
-    /// `repositories` selection). An unknown name is an error rather than a
-    /// silently empty surface, and a name repeated in the selection is an
-    /// error too — two identical bindings would send `materialize` at the
-    /// same worktree path and branch twice, the second `git worktree add`
-    /// failing after the first has already touched the user's repository.
+    /// resolved scope — see `runtime::engine::Engine::resolve_scope`, the
+    /// caller that turns `--repo`/`--group`/`--all` into this exact name
+    /// list). An unknown name is an error rather than a silently empty
+    /// surface, and a name repeated in the selection is an error too — two
+    /// identical bindings would send `materialize` at the same worktree path
+    /// and branch twice, the second `git worktree add` failing after the
+    /// first has already touched the user's repository.
+    ///
+    /// **An empty `names` is refused, not "every repository" (estate-root
+    /// Phase C, §7.1).** Before Phase C this returned every declared
+    /// repository — the "zero-config" reading of no selection. §7.1 replaces
+    /// that with an explicit refusal: a one-repository estate's sole-repo
+    /// inference and a multi-repository estate's structured remedy both
+    /// belong to the *resolution* layer above this one
+    /// (`Engine::resolve_scope`), which decides what an empty scope request
+    /// means before ever reaching here — this domain-level call now only
+    /// ever sees a nonempty, already-decided name list.
     pub fn select(&self, names: &[String]) -> Result<Vec<RepositorySpec>, String> {
         if names.is_empty() {
-            return Ok(self.repositories.clone());
+            return Err(format!(
+                "no repositories selected for workspace {:?}; an empty selection is refused, \
+                 not expanded to every declared repository (estate-root Phase C, §7.1) — \
+                 select explicitly with --repo, --group, or --all",
+                self.name
+            ));
         }
         let mut seen = BTreeSet::new();
         let mut selected = Vec::with_capacity(names.len());
@@ -1392,14 +1409,14 @@ mod tests {
         assert!(err.contains("api, web"), "got {err}");
     }
 
-    /// `select` with an empty name list returns every declared repository —
-    /// the caller-convenience reading of "no selection". Phase C replaces
-    /// this with structured scope requests (`--repo`/`--group`/`--all`) and
-    /// an explicit empty-scope refusal with the §7.1 remedy text (C7b); an
-    /// empty list will then no longer mean "all".
-    // CONTRACT PIN (estate-root Phase C): empty selection refuses instead of meaning "all".
+    /// `select` with an empty name list is refused, not "every declared
+    /// repository" — the Phase 0 pin's flip (estate-root Phase C, §7.1).
+    /// Single-repo inference and the multi-repo structured remedy are
+    /// `Engine::resolve_scope`'s job, decided before this is ever called
+    /// with an empty list; this domain-layer regression test only pins that
+    /// `select` itself no longer papers over an undecided scope.
     #[test]
-    fn contract_pin_empty_selection_currently_means_every_repository() {
+    fn empty_selection_is_refused_at_the_domain_layer() {
         let workspace = Workspace {
             name: "payments".to_string(),
             root: PathBuf::from("/nowhere"),
@@ -1424,13 +1441,12 @@ mod tests {
             repository_origin: BTreeMap::new(),
         };
 
-        let selected = workspace
+        let err = workspace
             .select(&[])
-            .expect("an empty selection succeeds today");
-        assert_eq!(
-            selected.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
-            ["api", "web"],
-            "today, an empty selection silently expands to every declared repository"
+            .expect_err("an empty selection must now be refused, not expanded to \"all\"");
+        assert!(
+            err.contains("payments") && err.contains("--all"),
+            "the refusal should name the workspace and the remedy vocabulary, got: {err}"
         );
     }
 
