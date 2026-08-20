@@ -55,7 +55,7 @@ The one thing `sgt-dispatch` names that this package genuinely needs a concrete 
 **Corrected 2026-08-16, ICM-R3:** neither of the two packages named below exists in this repository — both are open, unbuilt engine gaps, not live delegations.
 
 - `15-check-admission` holds and releases the fleet-wide admission lock itself, across exactly one durable side effect — it does not delegate to a `drain-fleet` workflow (unbuilt, engine-gap G4).
-- `80-monitor` delivers escalation responses via the shipped `sgt respond` command / `POST /v1/work/{id}/input` — it does not delegate to a `respond-to-worker` workflow (unbuilt).
+- `80-monitor` delivers escalation responses via the shipped `sgt respond` command / `POST /v1/work/{id}/input` — it does not delegate to a `respond-to-worker` workflow (unbuilt). Under the estate-root contract, that delivery is Captain's own action from the estate root, not something `80-monitor`'s worker can execute from inside `dispatch`'s own Work surface — see that stage's `CONTEXT.md` for the engine-gap note.
 
 ## Adjudication notes (A3, A4)
 

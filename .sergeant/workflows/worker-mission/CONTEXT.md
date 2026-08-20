@@ -44,7 +44,7 @@ Material decisions are recorded per-stage in each stage's own output artifact.
 
 ## Relationships to other workflows
 
-- `20-implement` delegates to **diagnose-bug, prototype, implement, or deepen-module** (whichever `10-triage-and-route` selected), each dispatched as its own separately-admitted Work — or, when the TDD discipline is selected directly, applies **`@@tdd`**/**`@@test-quality`** in place (`tdd`'s own ICM-R3 REHOME, confirmed).
+- `20-implement` delegates to **diagnose-bug, prototype, implement, or deepen-module** (whichever `10-triage-and-route` selected), each dispatched as its own separately-admitted Work — or, when the TDD discipline is selected directly, applies **`@@tdd`**/**`@@test-quality`** in place (`tdd`'s own ICM-R3 REHOME, confirmed). Under the estate-root contract that dispatch is Captain's own submission from the estate root; `20-implement`'s own worker cannot invoke `sgt run` from inside its Work surface (see that stage's `CONTEXT.md` for the engine-gap note).
 
 ## Adjudication note (A4)
 
