@@ -67,7 +67,11 @@ released before a release can proceed.
   the whole estate. A submitted Work now records both the request form
   (`scope_request`: repos/group/all as submitted) and the resolved
   repository list, so a later manifest edit cannot rewrite what an
-  already-journaled Work meant.
+  already-journaled Work meant. Owner ruling (2026-08-20): `--all` combined
+  with `--repo` and/or `--group` is refused (`conflicting_scope`, 422)
+  instead of `--all` silently winning — clap rejects the combination
+  locally, and the daemon's own `Engine::resolve_scope` is the authoritative
+  check for a direct API caller.
 
 - **`sgt -C <estate-root>`** names an estate explicitly instead of requiring
   a `cd` (gauntlet finding C10, approved by the owner 2026-08-20). It is a

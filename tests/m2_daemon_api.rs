@@ -4020,6 +4020,58 @@ async fn r_mvp1_6_a_disagreeing_repos_refuses_naming_both_sources() {
     handle.shutdown().await;
 }
 
+/// Owner ruling (2026-08-20): `scope.all` combined with a nonempty
+/// `scope.repos` is refused with a structured 422 (`conflicting_scope`)
+/// rather than `all` silently winning — pinned end to end through a real
+/// daemon, since a direct API caller (unlike the CLI, which now refuses
+/// this combination locally via clap) reaches the daemon's own
+/// `Engine::resolve_scope` as the authoritative check.
+#[tokio::test]
+async fn scope_all_combined_with_repos_refuses_with_conflicting_scope() {
+    let dir = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
+    let fake = FakeBackend::new(FAKE_BACKEND_NAME);
+    let handle = start_with_fake_bound(dir.path(), &fake, Some(estate.path())).await;
+    let http = client();
+
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid(),
+            "intent": "everything and also just this one",
+            "scope": {"repos": ["solo"], "all": true},
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(resp.status(), 422);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "conflicting_scope");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("solo") && message.contains("all"),
+        "the refusal must name what was combined: {message}"
+    );
+
+    // Nothing was created: the refusal happens before any Work record.
+    let list: Value = http
+        .get(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("list json");
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "a refused submission must create no Work: {list}"
+    );
+    handle.shutdown().await;
+}
+
 /// TH-12: `intent_detail.repos` is deliberately inert when the
 /// `repositories` flag is absent (`domain::work`'s own doc: "Purely
 /// descriptive data here" — R-MVP1-6 ruled `intent_detail` a progressive-

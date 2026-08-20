@@ -117,8 +117,12 @@ enum Command {
         group: Option<String>,
         /// Explicit whole-estate selection (§7.1's third scope form,
         /// forwarded as `scope.all`) — required to target every repository
-        /// in a multi-repository estate; the daemon never infers it.
-        #[arg(long)]
+        /// in a multi-repository estate; the daemon never infers it. Owner
+        /// ruling (2026-08-20): mutually exclusive with `--repo`/`--group` —
+        /// combining them is refused here by clap, and again (the
+        /// authoritative check, for a direct API caller) by the daemon's own
+        /// `Engine::resolve_scope`.
+        #[arg(long, conflicts_with_all = ["repositories", "group"])]
         all: bool,
         /// R-MVP1-7's turn envelope, overridden for this one Work
         /// (checkpoint-friction item — the daemon-wide `Engine::turn_cap`/

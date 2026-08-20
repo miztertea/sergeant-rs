@@ -86,9 +86,11 @@ pub struct SubmitContext<'a> {
     /// against *this* daemon's own bound manifest (§7.2), not by the caller.
     pub group: Option<&'a str>,
     /// `scope.all` — an explicit whole-estate selection (§7.1's third scope
-    /// form). Wins over `repos`/`group` when set: [`Engine::resolve_scope`]
-    /// resolves to every declared repository and does not also require
-    /// `repos`/`group` to be empty.
+    /// form). Owner ruling (2026-08-20): combined with a nonempty `repos`
+    /// and/or a set `group`, this is refused
+    /// ([`EngineError::ConflictingScope`]) rather than silently winning over
+    /// them — [`Engine::resolve_scope`] only resolves to every declared
+    /// repository when `repos`/`group` are both empty/unset.
     pub all: bool,
     /// The id the Work *would* be given, for §8.1's checks 9 and 10 — both
     /// of which are questions about `sergeant/<work-id>` and
@@ -812,6 +814,28 @@ pub enum EngineError {
         /// Every group name the estate does declare.
         available: Vec<String>,
     },
+    /// Owner ruling (2026-08-20): `scope.all`/`--all` combined with
+    /// `scope.repos`/`--repo` and/or `scope.group`/`--group` is refused
+    /// rather than `all` silently winning over the other two. §7.1's three
+    /// scope forms are mutually exclusive at the top level — naming both
+    /// "every declared repository" and a specific subset is not a union,
+    /// it is two different answers to "what is this Work about" in one
+    /// request, and Sergeant does not guess which one the caller meant.
+    /// Refused here, in [`Engine::resolve_scope`], before any Work record —
+    /// the same "reject before Work or worktree side effects" timing
+    /// [`EngineError::MissingScope`] already uses.
+    #[error(
+        "scope.all was combined with scope.repos={repos:?} and/or scope.group={group:?}; --all \
+         selects the whole estate and must not be combined with a repository subset — submit \
+         --all alone to select every declared repository, or --repo/--group without --all to \
+         select a subset"
+    )]
+    ConflictingScope {
+        /// `scope.repos`, exactly as submitted alongside `scope.all`.
+        repos: Vec<String>,
+        /// `scope.group`, exactly as submitted alongside `scope.all`, if any.
+        group: Option<String>,
+    },
     /// R-MVP1-4: the selected repositories disagree on `instructions`
     /// policy. One process, one `--setting-sources` — there is nowhere for
     /// two policies to both take effect, so the submission is refused
@@ -975,6 +999,7 @@ impl EngineError {
             EngineError::RepositorySelection(_) => "unknown_repository",
             EngineError::MissingScope { .. } => "missing_scope",
             EngineError::UnknownGroup { .. } => "unknown_group",
+            EngineError::ConflictingScope { .. } => "conflicting_scope",
             EngineError::InstructionPolicyConflict { .. } => "instruction_policy_conflict",
             EngineError::ProfileNotFound { .. } => "profile_not_found",
             EngineError::ProfileBackendMismatch { .. } => "profile_backend_mismatch",
@@ -1337,10 +1362,14 @@ impl Engine {
     /// this one function and get the identical answer; no client surface
     /// reimplements group-membership or empty-scope semantics.
     ///
-    /// Order of decisions, per §7.1:
+    /// Order of decisions, per §7.1 (as amended by the owner's 2026-08-20
+    /// ruling):
     ///
-    /// 1. `all` wins outright: every declared repository, regardless of
-    ///    whatever `repos`/`group` also said (§7.3 still journals the
+    /// 0. `all` combined with a nonempty `repos` and/or a set `group` is
+    ///    refused outright ([`EngineError::ConflictingScope`]) — naming both
+    ///    "every declared repository" and a specific subset is two answers
+    ///    to one question, and `all` no longer silently wins.
+    /// 1. `all` alone: every declared repository (§7.3 still journals the
     ///    request form separately, so *why* it resolved to everything is
     ///    never lost even though the resolved list alone couldn't say).
     /// 2. Otherwise, the union of `repos` and — when `group` names a
@@ -1375,6 +1404,12 @@ impl Engine {
         estate: &Estate,
         context: &SubmitContext<'_>,
     ) -> Result<Vec<RepositorySpec>, EngineError> {
+        if context.all && (!context.repos.is_empty() || context.group.is_some()) {
+            return Err(EngineError::ConflictingScope {
+                repos: context.repos.to_vec(),
+                group: context.group.map(str::to_string),
+            });
+        }
         if context.all {
             return Ok(estate.repositories.clone());
         }
@@ -4464,12 +4499,13 @@ mod tests {
         }
     }
 
-    /// §7.1: `--all` wins outright, regardless of whatever `repos`/`group`
-    /// also said.
+    /// Owner ruling (2026-08-20): `--all` combined with `--repo` and/or
+    /// `--group` is refused, naming what was combined — `all` no longer
+    /// silently wins over an explicit repos/group selection.
     #[test]
-    fn resolve_scope_all_selects_every_declared_repository_regardless_of_repos_or_group() {
+    fn resolve_scope_all_combined_with_repos_or_group_is_refused() {
         let estate = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
-        let resolved = Engine::resolve_scope(
+        let err = Engine::resolve_scope(
             &estate,
             &SubmitContext {
                 repos: &["api".to_string()],
@@ -4478,7 +4514,53 @@ mod tests {
                 ..SubmitContext::default()
             },
         )
-        .expect("all must resolve");
+        .expect_err("--all combined with --repo/--group must be refused");
+        match err {
+            EngineError::ConflictingScope { repos, group } => {
+                assert_eq!(repos, vec!["api".to_string()]);
+                assert_eq!(group, Some("pair".to_string()));
+            }
+            other => panic!("expected ConflictingScope, got {other}"),
+        }
+
+        // The refusal fires on `--repo` alone, too, not only in combination
+        // with `--group`.
+        let err = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                repos: &["api".to_string()],
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("--all combined with --repo alone must be refused");
+        assert!(matches!(err, EngineError::ConflictingScope { .. }));
+
+        // And on `--group` alone, with no explicit `--repo`.
+        let err = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                group: Some("pair"),
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("--all combined with --group alone must be refused");
+        assert!(matches!(err, EngineError::ConflictingScope { .. }));
+    }
+
+    /// §7.1: `--all` alone still resolves to every declared repository.
+    #[test]
+    fn resolve_scope_all_alone_still_selects_every_declared_repository() {
+        let estate = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let resolved = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect("all alone must resolve");
         let mut names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
         names.sort();
         assert_eq!(names, ["api", "web"]);
@@ -4741,6 +4823,13 @@ mod tests {
                     available: vec!["payments".to_string()],
                 },
                 "unknown_group",
+            ),
+            (
+                EngineError::ConflictingScope {
+                    repos: vec!["api".to_string()],
+                    group: Some("pair".to_string()),
+                },
+                "conflicting_scope",
             ),
         ];
         let mut seen = std::collections::BTreeSet::new();
