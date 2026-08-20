@@ -103,16 +103,22 @@ jobs:
     # policy belongs to the pinned dev compiler (rust-toolchain.toml), not
     # to this deliberately-older floor.
     runs-on: ubuntu-latest
+    env:
+      # Single source of truth for this job's two 1.89.0 uses below. Keep in
+      # sync with Cargo.toml's rust-version (see the comment there) — YAML
+      # and TOML can't share a literal without added machinery, so this only
+      # collapses the duplication within this job, from two sites to one.
+      MSRV: 1.89.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: rustup toolchain install (MSRV floor — deliberately older than rust-toolchain.toml's pin)
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: rustup toolchain install ${{ env.MSRV }} --profile minimal
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: cargo check --locked --all-targets (MSRV floor — check only, no clippy on an old compiler)
-        run: cargo +1.89.0 check --locked --all-targets
+        run: cargo +${{ env.MSRV }} check --locked --all-targets
 
   dependency-policy:
     # proposal §5.2: routine PRs check bans/licenses/sources only. Advisories

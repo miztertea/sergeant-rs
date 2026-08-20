@@ -2,6 +2,9 @@
 name = "sergeant-rs"
 version = "0.1.2"
 edition = "2024"
+# Keep in sync with the `msrv` job's `env.MSRV` in .github/workflows/ci.yml
+# (W1 spec §E) — cargo has no way to read this field back into that job's
+# `run:` steps without added machinery, so the two are hand-synced.
 rust-version = "1.89.0"
 license = "MIT"
 repository = "https://github.com/miztertea/sergeant-rs"
