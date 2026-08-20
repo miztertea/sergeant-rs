@@ -102,7 +102,10 @@ released before a release can proceed.
   inside its own Work surface without a disclaiming note nearby; the
   estate-root proposal's own canonical manifest example (§13.1) still
   parses under the current schema; no shipped workflow/skill content
-  quotes the removed `--workspace` flag (C12 regression pin).
+  quotes the removed `--workspace` flag (C12 regression pin); and the
+  embedded `skills/` root/preflight remedies match the refusal text, the
+  `--help` surface, and the preflight remedy strings the binary really
+  emits.
 
 ### Changed
 
@@ -324,6 +327,21 @@ released before a release can proceed.
   explicit note that the worker's own Work surface is not an estate root
   and the command would refuse from there today; the actual submission is
   Captain's, from the estate root.
+
+- **Embedded skills rewritten for the exact-root front door (§14.6).**
+  `skills/sergeant-help` gains the loud root and preflight remedies it was
+  silent on: documentation-map rows for "which directory must this command
+  run from" and "why was my submission refused for a dirty or detached
+  mount", failure-behavior rows repeating the refusals' own remedies
+  verbatim (`cd <estate-root>`, `sgt -C <estate-root> <command>`, `sgt
+  init`; `git -C <mount> status`/`switch <branch>`, with
+  `--override-git-preflight` described as the per-submission waiver of a
+  dirty or detached mount and nothing else), and a must-not bullet against
+  routing around either refusal. `skills/estate-navigation` now teaches the
+  exact-root check itself — look for this directory's own `./sergeant.toml`,
+  never walk upward, `-C` to name a root without moving — and its `sgt
+  doctor` description is brought current with the `estate_root`,
+  `workflows`, and `git_surfaces` rows.
 
 - **ADR 0008's estate-root amendment verified, not redone.** Phase D
   already amended it ("Amended by the estate-root integration (C7a,

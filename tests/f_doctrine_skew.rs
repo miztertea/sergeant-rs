@@ -161,6 +161,94 @@ fn agents_md_dash_c_flag_actually_names_the_estate() {
     );
 }
 
+/// The embedded operator skills the harness loads directly (`skills/`)
+/// carry the same root-gate and Git-preflight remedies the binary actually
+/// prints (§14.6's "loud root/preflight remedies"), and `estate-navigation`
+/// teaches the exact-root check rather than an upward search — each claim
+/// cross-checked against the real refusal, the real `--help`, or the real
+/// remedy string, never against a paraphrase of it.
+#[test]
+fn embedded_skills_carry_the_real_root_and_preflight_remedies() {
+    let help_skill = std::fs::read_to_string(repo_root().join("skills/sergeant-help/SKILL.md"))
+        .expect("read skills/sergeant-help/SKILL.md");
+    let navigation_skill =
+        std::fs::read_to_string(repo_root().join("skills/estate-navigation/SKILL.md"))
+            .expect("read skills/estate-navigation/SKILL.md");
+
+    // 1. The root-gate refusal a real estate-scoped command gives outside an
+    //    estate — every remedy it names must be one `sergeant-help` names too.
+    let refused = bare_dir();
+    let refusal = stderr(&run(refused.path(), &["status"]));
+    for quoted in [
+        "no estate found in",
+        "does not search parent directories",
+        "cd <estate-root>",
+        "sgt init",
+    ] {
+        assert!(
+            refusal.contains(quoted),
+            "the real root-gate refusal no longer contains {quoted:?} — update the skill and \
+             this test together: {refusal}"
+        );
+        assert!(
+            help_skill.contains(quoted),
+            "sergeant-help must repeat the real root-gate remedy {quoted:?}"
+        );
+    }
+    // The descendant half of the same gate, and `-C`: both live in the
+    // binary rather than in that one refusal's text.
+    assert!(
+        help_skill.contains("this command must be run from the estate root"),
+        "sergeant-help must quote the descendant refusal's own wording"
+    );
+    assert!(
+        stdout(&run(refused.path(), &["--help"])).contains("-C <ESTATE_ROOT>"),
+        "`sgt --help` no longer documents the global -C flag the skills route to"
+    );
+    for skill in [&help_skill, &navigation_skill] {
+        assert!(
+            skill.contains("sgt -C <estate-root>"),
+            "both skills must name `-C` as the remedy that needs no `cd`"
+        );
+    }
+
+    // 2. The Git preflight: the flag exists on `sgt run`, and the mount
+    //    remedies the skill quotes are the ones preflight actually emits.
+    assert!(
+        stdout(&run(refused.path(), &["run", "--help"])).contains("--override-git-preflight"),
+        "`sgt run --help` no longer carries the override flag the skills describe"
+    );
+    // Rust string literals in that file are line-continued mid-sentence, so
+    // drop the `\` continuations and collapse whitespace: match the remedy's
+    // logical text rather than its accidental line layout.
+    let preflight_src = std::fs::read_to_string(repo_root().join("src/runtime/preflight.rs"))
+        .expect("read src/runtime/preflight.rs")
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for remedy in ["git -C <mount> status", "git -C <mount> switch <branch>"] {
+        assert!(
+            preflight_src.contains(remedy),
+            "preflight no longer emits the remedy {remedy:?} sergeant-help quotes"
+        );
+        assert!(
+            help_skill.contains(remedy),
+            "sergeant-help must quote preflight's own remedy {remedy:?}"
+        );
+    }
+
+    // 3. `estate-navigation` teaches the exact-root check, not an upward one.
+    assert!(
+        navigation_skill.contains("./sergeant.toml"),
+        "estate-navigation must teach checking this directory's own ./sergeant.toml"
+    );
+    assert!(
+        navigation_skill.contains("never walk upward"),
+        "estate-navigation must forbid an upward search outright"
+    );
+}
+
 // -------------------------------------------------- 2. embedded distro skew
 
 /// No `CONTEXT.md` under the embedded `.sergeant/workflows/` distro source
