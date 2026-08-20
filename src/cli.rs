@@ -2001,6 +2001,7 @@ pub(crate) mod doctor {
     use crate::backend::docker::{self, DockerBackend, DockerConfig};
     use crate::daemon;
     use crate::domain::estate::MANIFEST_FILE;
+    use crate::domain::event::Event;
     use crate::runtime::analytics::Analytics;
     use crate::runtime::journal::Journal;
 
@@ -2199,9 +2200,9 @@ pub(crate) mod doctor {
         // checked before anything derived from it; a projection rebuild over
         // an unreadable journal would report the journal's fault under the
         // projection's name.
-        let (journal_check, journal_ok) = journal_check(data_dir);
+        let (journal_check, journal_ok, journal_events) = journal_check(data_dir);
         checks.push(journal_check);
-        checks.push(projection_check(data_dir, journal_ok));
+        checks.push(projection_check(journal_ok, journal_events.as_deref()));
         checks.push(daemon_check(data_dir).await);
         // §4.2: `sgt doctor` is usable outside an estate and never searches
         // upward. The estate-root row is the one that says out loud whether
@@ -2218,7 +2219,11 @@ pub(crate) mod doctor {
         // §12.2: cheap, bounded — journal plus retained-artifact filesystem
         // metadata, never a per-branch git walk. Same estate-root threading
         // as the two rows above.
-        checks.push(git_surfaces_check(data_dir, admitted.as_deref()));
+        checks.push(git_surfaces_check(
+            data_dir,
+            admitted.as_deref(),
+            journal_events.as_deref(),
+        ));
         // N4/#23 (retention Rule B): disk pressure inside the data dir. Runs
         // after everything above regardless of their outcome — knowing "is
         // this installation about to run out of disk" does not depend on the
@@ -2625,7 +2630,11 @@ pub(crate) mod doctor {
     /// path is the captured patch file or the whole worktree directory
     /// fallback. "terminal dirty Works" counts work ids whose most recent
     /// teardown recorded [`crate::runtime::integrity::IntegrityDisposition::Dirty`].
-    fn git_surfaces_check(data_dir: &Path, estate_root: Option<&Path>) -> Check {
+    fn git_surfaces_check(
+        data_dir: &Path,
+        estate_root: Option<&Path>,
+        events: Option<&[Event]>,
+    ) -> Check {
         use crate::runtime::integrity::IntegrityDisposition;
         use crate::runtime::surface::{
             KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN, TeardownReport, WorkSurface,
@@ -2641,15 +2650,15 @@ pub(crate) mod doctor {
                 "no journal yet — nothing has run in this data dir",
             );
         }
-        let replay = match Journal::replay_data_dir(data_dir) {
-            Ok(replay) => replay,
-            Err(e) => {
-                return Check::warn(
-                    "git_surfaces",
-                    format!("cannot open the journal: {e}"),
-                    "see the journal check above",
-                );
-            }
+        // The journal dir exists, so `journal_check` above attempted a
+        // replay; `None` here means that replay failed — its Check already
+        // names the fault, this one just declines by pointing at it.
+        let Some(events) = events else {
+            return Check::warn(
+                "git_surfaces",
+                "not attempted: the journal did not replay",
+                "see the journal check above",
+            );
         };
 
         // work id -> binding count of its most recent `surface.materialized`.
@@ -2662,17 +2671,7 @@ pub(crate) mod doctor {
         let mut integrity: std::collections::BTreeMap<String, IntegrityDisposition> =
             std::collections::BTreeMap::new();
 
-        for event in replay {
-            let event = match event {
-                Ok(event) => event,
-                Err(e) => {
-                    return Check::warn(
-                        "git_surfaces",
-                        format!("journal replay failed: {e}"),
-                        "see the journal check above",
-                    );
-                }
-            };
+        for event in events {
             let Some(work_id) = event.work_id.clone() else {
                 continue;
             };
@@ -3199,9 +3198,16 @@ pub(crate) mod doctor {
     /// "the daemon will start". It never takes the journal's writer lock, so
     /// running this against a live daemon is safe.
     ///
-    /// Returns the check and whether the replay succeeded, so the projection
-    /// check below can say "not attempted" instead of blaming itself.
-    fn journal_check(data_dir: &Path) -> (Check, bool) {
+    /// Returns the check, whether the replay succeeded, and — on success —
+    /// the events it replayed, so every check derived from the journal
+    /// (`projection_check`, `git_surfaces_check`) can fold that same
+    /// `Vec<Event>` instead of each re-opening and re-replaying the journal
+    /// for itself (#12: one replay shared across doctor's checks). `None`
+    /// on both the no-journal and the replay-failure paths — callers that
+    /// need to tell those two apart still have the bool for that; this
+    /// function keeps sole ownership of the structured `Malformed` detail
+    /// either way.
+    fn journal_check(data_dir: &Path) -> (Check, bool, Option<Vec<Event>>) {
         let remedy = "the journal is the durable record — do not delete it. Inspect the \
                       reported segment by hand; a torn tail from a crash is quarantined \
                       automatically the next time the daemon opens it";
@@ -3216,6 +3222,7 @@ pub(crate) mod doctor {
                     "no journal yet — nothing has run in this data dir",
                 ),
                 true,
+                None,
             );
         }
         let replay = match Journal::replay_data_dir(data_dir) {
@@ -3224,25 +3231,27 @@ pub(crate) mod doctor {
                 return (
                     Check::fail("journal", format!("cannot open the journal: {e}"), remedy),
                     false,
+                    None,
                 );
             }
         };
-        let mut count = 0u64;
+        let mut events = Vec::new();
         let mut last_seq = 0u64;
         for event in replay {
             match event {
                 Ok(event) => {
-                    count += 1;
                     last_seq = event.seq;
+                    events.push(event);
                 }
                 Err(e) => {
                     return (
                         Check::fail(
                             "journal",
-                            format!("replay failed after {count} events: {e}"),
+                            format!("replay failed after {} events: {e}", events.len()),
                             remedy,
                         ),
                         false,
+                        None,
                     );
                 }
             }
@@ -3250,9 +3259,13 @@ pub(crate) mod doctor {
         (
             Check::ok(
                 "journal",
-                format!("{count} events replay cleanly (head seq {last_seq})"),
+                format!(
+                    "{} events replay cleanly (head seq {last_seq})",
+                    events.len()
+                ),
             ),
             true,
+            Some(events),
         )
     }
 
@@ -3263,7 +3276,7 @@ pub(crate) mod doctor {
     /// not own. What this proves is the property that matters — the fold from
     /// journal to projection completes — which is exactly what the daemon
     /// does on every start (§40: projections are disposable).
-    fn projection_check(data_dir: &Path, journal_ok: bool) -> Check {
+    fn projection_check(journal_ok: bool, events: Option<&[Event]>) -> Check {
         if !journal_ok {
             return Check::warn(
                 "projection",
@@ -3272,22 +3285,14 @@ pub(crate) mod doctor {
             );
         }
         let scratch = std::env::temp_dir().join(format!("sgt-doctor-{}", ulid::Ulid::generate()));
-        let outcome = if journal_dir(data_dir).exists() {
-            Journal::replay_data_dir(data_dir)
-                .map_err(|e| e.to_string())
-                .and_then(|replay| {
-                    Analytics::rebuild(&scratch, replay)
-                        .map(|analytics| analytics.last_seq())
-                        .map_err(|e| e.to_string())
-                })
-        } else {
-            // No journal yet: the fold has nothing to read, but the store
-            // itself must still open — which is the half of this check that
-            // a fresh install can actually be wrong about.
-            Analytics::rebuild(&scratch, std::iter::empty())
-                .map(|analytics| analytics.last_seq())
-                .map_err(|e| e.to_string())
-        };
+        // `events` is `None` on a fresh install with no journal at all, same
+        // as `Some(&[])` for a journal that exists but has nothing in it —
+        // either way the fold has nothing to read, but the store itself
+        // must still open, which is the half of this check that a fresh
+        // install can actually be wrong about.
+        let outcome = Analytics::rebuild(&scratch, events.unwrap_or(&[]).iter().cloned().map(Ok))
+            .map(|analytics| analytics.last_seq())
+            .map_err(|e| e.to_string());
         let _ = std::fs::remove_dir_all(&scratch);
         match outcome {
             Ok(last_seq) => Check::ok(
@@ -3431,7 +3436,7 @@ pub(crate) mod doctor {
         /// attempt to open a journal that was never asked for.
         #[test]
         fn git_surfaces_is_silent_outside_an_estate() {
-            let check = git_surfaces_check(Path::new("/nonexistent/data/dir"), None);
+            let check = git_surfaces_check(Path::new("/nonexistent/data/dir"), None, None);
             assert_eq!(check.status, Status::Ok);
             assert_eq!(check.detail, "not an estate root — nothing to check");
         }
@@ -3444,7 +3449,12 @@ pub(crate) mod doctor {
             let data_dir = std::env::temp_dir()
                 .join(format!("sgt-git-surfaces-test-{}", ulid::Ulid::generate()));
             Journal::open(&data_dir).expect("journal opens");
-            let check = git_surfaces_check(&data_dir, Some(Path::new("/some/estate")));
+            let events: Vec<Event> = Journal::replay_data_dir(&data_dir)
+                .expect("journal replays")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("events parse");
+            let check =
+                git_surfaces_check(&data_dir, Some(Path::new("/some/estate")), Some(&events));
             let _ = std::fs::remove_dir_all(&data_dir);
             assert_eq!(check.status, Status::Ok);
             assert!(check.remedy.is_none());
@@ -3642,7 +3652,12 @@ pub(crate) mod doctor {
                 .expect("append work-d torn down");
             drop(journal);
 
-            let check = git_surfaces_check(&data_dir, Some(Path::new("/some/estate")));
+            let events: Vec<Event> = Journal::replay_data_dir(&data_dir)
+                .expect("journal replays")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("events parse");
+            let check =
+                git_surfaces_check(&data_dir, Some(Path::new("/some/estate")), Some(&events));
             let _ = std::fs::remove_dir_all(&data_dir);
 
             assert_eq!(
