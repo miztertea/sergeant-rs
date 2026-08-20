@@ -92,8 +92,23 @@ enum Command {
     Status,
     /// Submit new work.
     Run {
-        /// The intent to submit.
-        intent: String,
+        /// The intent to submit. Give this or `--intent-file`, never both.
+        #[arg(required_unless_present = "intent_file")]
+        intent: Option<String>,
+        /// Read the intent from a file instead of the command line (#166).
+        ///
+        /// The file's contents become the intent verbatim — only a trailing
+        /// newline is trimmed. Nothing is parsed, templated or interpreted,
+        /// and the daemon receives exactly the same string a positional
+        /// intent would have sent. For a multi-paragraph brief that shell
+        /// quoting mangles, or one an editor or another tool produced.
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with = "intent",
+            required_unless_present = "intent"
+        )]
+        intent_file: Option<PathBuf>,
         /// Workflow to run (default: the estate's, else `software-change`).
         #[arg(long)]
         workflow: Option<String>,
@@ -798,6 +813,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         }
         Command::Run {
             intent,
+            intent_file,
             workflow,
             backend,
             profile,
@@ -818,6 +834,22 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // expansion (MVP-3 finding MVP3-C2, R-MVP1-5(b)); §7.2's own
             // rule — "a client surface adds usability, never functionality"
             // — is exactly what retires that.
+            //
+            // #166: the file is read before any daemon contact, so a refused
+            // read costs no spawn and no journal entry.
+            let intent = match (intent, intent_file) {
+                (Some(intent), _) => intent,
+                (None, Some(path)) => read_intent_file(&path)?,
+                // clap's `required_unless_present` pairing already refused
+                // this; kept as a refusal rather than an `expect` because a
+                // parser change should degrade to a diagnostic, not a panic.
+                (None, None) => {
+                    return Err(CliError::new(
+                        "no intent given: pass one as an argument, or name a file with \
+                         --intent-file <PATH>",
+                    ));
+                }
+            };
             let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
@@ -1297,6 +1329,86 @@ fn estate_root(estate: &Option<EstateRoot>) -> PathBuf {
         .expect("dispatch admits the root for every estate-scoped command")
         .path
         .clone()
+}
+
+/// The most an `--intent-file` may hold (#166).
+///
+/// An intent is prose — a brief, a task description, a pasted issue body.
+/// One mebibyte is orders of magnitude past anything a human or a tool
+/// writes for that, and comfortably inside what a loopback request body
+/// carries on every target platform, so the limit is here to catch a
+/// *mistake* (a binary, a log, the wrong path) rather than to ration
+/// anything. A refusal names both the limit and the actual size, so the
+/// operator can see which of the two they hit.
+const INTENT_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read `--intent-file` as the intent, verbatim (#166).
+///
+/// Pure transport: the contents become the same `intent` string a positional
+/// argument would have produced, and nothing downstream — the request body,
+/// the engine, the journal — can tell the two apart. Nothing here parses,
+/// templates or interprets the file.
+///
+/// The guards are mechanical and ordered, each refusing before the next is
+/// asked, and all of them before any daemon contact — a refused read costs
+/// no daemon spawn and no journal entry:
+///
+/// 1. **the leaf is a symlink** — the same `symlink_metadata` check
+///    `estate::validate_mount` makes for a mount, for the same reason: what
+///    a path *is* must be decided before anything follows it somewhere else;
+/// 2. **not a regular file** — a directory, a fifo or a device is a mistake,
+///    and reading a fifo would hang a CLI that has no timeout of its own;
+/// 3. **larger than [`INTENT_FILE_MAX_BYTES`]**;
+/// 4. **not valid UTF-8** — an intent is text, and the wire contract is a
+///    JSON string.
+fn read_intent_file(path: &Path) -> Result<String, CliError> {
+    let display = path.display();
+    let metadata = path.symlink_metadata().map_err(|e| {
+        CliError::new(format!(
+            "cannot read --intent-file {display}: {e}; check the path"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::new(format!(
+            "--intent-file {display} is a symlink; name the file it points at directly"
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(CliError::new(format!(
+            "--intent-file {display} is not a regular file; name a text file holding the intent"
+        )));
+    }
+    let too_large = |actual: u64| {
+        CliError::new(format!(
+            "--intent-file {display} is {} — larger than the {} limit; name the file holding \
+             the intent, or shorten it",
+            doctor::human_bytes(actual),
+            doctor::human_bytes(INTENT_FILE_MAX_BYTES),
+        ))
+    };
+    if metadata.len() > INTENT_FILE_MAX_BYTES {
+        return Err(too_large(metadata.len()));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| CliError::new(format!("cannot read --intent-file {display}: {e}")))?;
+    // Re-checked against what was actually read: the file may have grown
+    // between the `symlink_metadata` above and this read.
+    if bytes.len() as u64 > INTENT_FILE_MAX_BYTES {
+        return Err(too_large(bytes.len() as u64));
+    }
+    let text = String::from_utf8(bytes).map_err(|e| {
+        CliError::new(format!(
+            "--intent-file {display} is not valid UTF-8 ({e}); an intent is text"
+        ))
+    })?;
+    // The one edit made to the contents: the single line terminator an
+    // editor appends. Everything else — interior blank lines, trailing
+    // spaces, a second trailing newline someone meant — is the intent.
+    Ok(text
+        .strip_suffix('\n')
+        .map(|t| t.strip_suffix('\r').unwrap_or(t))
+        .unwrap_or(&text)
+        .to_string())
 }
 
 /// `sgt repo add/remove/list` (MVP-3): a pure manifest edit/read, no daemon

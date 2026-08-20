@@ -1865,6 +1865,161 @@ fn work_sweep_classifies_previews_then_deletes_from_the_real_cli() {
     data_dir.reap();
 }
 
+// ------------------------------------------------------------ intent file
+
+/// guard-map: `sgt run --intent-file <PATH>` (#166) submits the file's
+/// contents as the intent, byte for byte apart from the single trailing
+/// newline an editor appends — including the multi-line, quote-bearing shape
+/// that is the whole reason the flag exists. Mutation this kills: any
+/// parsing, templating, trimming or re-wrapping of the file between reading
+/// it and the request body.
+#[test]
+fn run_intent_file_submits_the_files_contents_verbatim() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+
+    // Interior blank lines, quotes, a backslash, leading whitespace and a
+    // trailing space — everything shell quoting would mangle and everything
+    // a well-meaning normalizer would "fix".
+    let intent = "Fix the \"widget\" parser.\n\nIt must handle a\\b and   \n  indented lines.";
+    let path = repo.path().join("brief.md");
+    std::fs::write(&path, format!("{intent}\n")).expect("write brief");
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--intent-file",
+            path.to_str().expect("utf8 path"),
+        ],
+    );
+    submitted.assert_ok("run --intent-file");
+    assert_eq!(
+        submitted.json()["work"]["intent"].as_str(),
+        Some(intent),
+        "the submitted intent must be the file, verbatim"
+    );
+
+    data_dir.reap();
+}
+
+/// guard-map: exactly one of the positional intent and `--intent-file` may
+/// be given, and neither is an error — clap's own pairing, checked here
+/// rather than trusted, since a dropped `conflicts_with` would silently make
+/// one of the two win. Neither case may reach a daemon.
+#[test]
+fn run_requires_exactly_one_of_intent_and_intent_file() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+    let path = repo.path().join("brief.md");
+    std::fs::write(&path, "from the file\n").expect("write brief");
+
+    let both = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "run",
+            "on the command line",
+            "--intent-file",
+            path.to_str().expect("utf8 path"),
+        ],
+    );
+    both.assert_fails("both an intent and --intent-file");
+    assert!(
+        both.stderr.contains("--intent-file"),
+        "the refusal must name the conflict: {}",
+        both.stderr
+    );
+
+    let neither = run(repo.path(), Some(data_dir.path()), &[], &["run"]);
+    neither.assert_fails("neither an intent nor --intent-file");
+
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "a refused submission must never have spawned a daemon"
+    );
+    data_dir.reap();
+}
+
+/// guard-map: `--intent-file`'s mechanical guards, each refusing before any
+/// daemon contact and each naming what it refused. Mutation this kills:
+/// dropping the symlink check (`fs::read` would happily follow it), the
+/// regular-file check, the size ceiling, or the UTF-8 requirement.
+#[test]
+fn run_intent_file_refuses_a_symlink_a_directory_an_oversized_file_and_non_utf8() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+
+    let submit = |path: &Path| {
+        run(
+            repo.path(),
+            Some(data_dir.path()),
+            &[],
+            &["run", "--intent-file", path.to_str().expect("utf8 path")],
+        )
+    };
+
+    let real = repo.path().join("real.md");
+    std::fs::write(&real, "a perfectly good intent\n").expect("write");
+    let link = repo.path().join("link.md");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    #[cfg(unix)]
+    {
+        let refused = submit(&link);
+        refused.assert_fails("a symlinked --intent-file");
+        assert!(
+            refused.stderr.contains("symlink"),
+            "got: {}",
+            refused.stderr
+        );
+    }
+
+    let refused = submit(repo.path());
+    refused.assert_fails("a directory as --intent-file");
+    assert!(
+        refused.stderr.contains("not a regular file"),
+        "got: {}",
+        refused.stderr
+    );
+
+    let oversized = repo.path().join("huge.md");
+    std::fs::write(&oversized, vec![b'x'; 1024 * 1024 + 1]).expect("write");
+    let refused = submit(&oversized);
+    refused.assert_fails("an oversized --intent-file");
+    assert!(
+        refused.stderr.contains("1.0 MiB") && refused.stderr.contains("limit"),
+        "the refusal must name the limit and the actual size: {}",
+        refused.stderr
+    );
+
+    let binary = repo.path().join("binary.md");
+    std::fs::write(&binary, [0xff, 0xfe, 0x00]).expect("write");
+    let refused = submit(&binary);
+    refused.assert_fails("a non-UTF-8 --intent-file");
+    assert!(
+        refused.stderr.contains("not valid UTF-8"),
+        "got: {}",
+        refused.stderr
+    );
+
+    let missing = repo.path().join("nope.md");
+    submit(&missing).assert_fails("a missing --intent-file");
+
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "every guard must refuse before any daemon contact"
+    );
+    data_dir.reap();
+}
+
 // -------------------------------------------------- envelope / daemon stop
 
 /// guard-map: `sgt run --turns N --ceiling-secs S` (checkpoint-friction
