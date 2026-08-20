@@ -612,8 +612,8 @@ async fn t2_multi_repo_workspace_binds_one_worktree_per_repository() {
             journaled["work_branch"].as_str().unwrap()
         );
         assert_eq!(
-            entry.base_branch,
-            journaled["base_branch"].as_str().unwrap()
+            entry.base_branch.as_deref(),
+            journaled["base_branch"].as_str()
         );
         assert_eq!(
             entry.base_sha,

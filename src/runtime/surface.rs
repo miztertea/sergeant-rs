@@ -229,8 +229,23 @@ pub struct RepositoryBinding {
     pub repository: String,
     /// Source repository top level (never written to by execution).
     pub source_path: PathBuf,
-    /// Branch the surface was cut from (`(detached)` if HEAD was detached).
-    pub base_branch: String,
+    /// Branch the surface was cut from — §3.5's "observed base branch, **if
+    /// attached**".
+    ///
+    /// `None` is the honest record for a detached mount admitted under §8.3's
+    /// bounded override: that admission pins an exact `base_sha` and, in the
+    /// proposal's own words, records "no named base branch". Before Phase E
+    /// this was a `String` carrying the sentinel `"(detached)"` — a value that
+    /// *looks* like a branch name (git's ref grammar permits parentheses)
+    /// sitting in the field every reader branches on.
+    ///
+    /// `#[serde(default)]` so a binding journaled before this change replays
+    /// exactly what it recorded, the old sentinel included (as
+    /// `Some("(detached)")`). Serialized even when `None`: an explicit `null`
+    /// *is* the record that this Work has no named base branch, and a missing
+    /// key would be indistinguishable from a payload predating the field.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     /// Commit the surface was cut from.
     pub base_sha: String,
     /// Worktree path under the data dir.
@@ -706,13 +721,13 @@ fn materialize_one(
     // is the same fact it was before (the submit captured a snapshot of HEAD
     // at request time, and that snapshot is what the run executes on).
     let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
-    // A detached HEAD has no branch name; record the fact rather than
-    // inventing one.
+    // A detached HEAD has no branch name; record the *absence* rather than
+    // inventing a sentinel that reads like one.
     let base_branch = git(
         &repository.path,
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
     )
-    .unwrap_or_else(|_| "(detached)".to_string());
+    .ok();
 
     // §3.5's two canonical identities, read here — once, outside the lock,
     // alongside the other admission facts — and then used for both purposes

@@ -290,7 +290,13 @@ fn mutation_surface_section(bindings: &[BindingSummary]) -> String {
             binding.repository,
             binding.worktree_path.display(),
             binding.work_branch,
-            binding.base_branch,
+            // A detached admission (§8.3's bounded override) has no named
+            // base branch; say so rather than print a `None`-shaped
+            // placeholder the actor would have to interpret.
+            binding
+                .base_branch
+                .as_deref()
+                .unwrap_or("no named base branch (detached admission)"),
             binding.base_sha,
         ));
     }
@@ -2401,7 +2407,7 @@ mod tests {
             repository: repository.to_string(),
             worktree_path: PathBuf::from(format!("/data/surfaces/01PROMPT/{repository}")),
             work_branch: "sergeant/01PROMPT".to_string(),
-            base_branch: "main".to_string(),
+            base_branch: Some("main".to_string()),
             base_sha: sha.to_string(),
         }
     }

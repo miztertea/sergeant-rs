@@ -5344,7 +5344,7 @@ mod tests {
             RepositoryBinding {
                 repository: "solo".to_string(),
                 source_path: PathBuf::from("/repos/solo"),
-                base_branch: "main".to_string(),
+                base_branch: Some("main".to_string()),
                 base_sha: "0".repeat(40),
                 worktree_path: PathBuf::from(format!("/data/surfaces/{work_id}/solo")),
                 work_branch: format!("sergeant/{work_id}"),

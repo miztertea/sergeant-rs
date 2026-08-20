@@ -201,8 +201,12 @@ pub struct BindingSummary {
     pub worktree_path: PathBuf,
     /// Branch the Work executes on in that worktree.
     pub work_branch: String,
-    /// Branch the work branch was cut from (`(detached)` if HEAD was).
-    pub base_branch: String,
+    /// Branch the work branch was cut from — `None` when the mount was
+    /// admitted detached under §8.3's bounded override, which pins an exact
+    /// `base_sha` and records no named base branch. `#[serde(default)]` so a
+    /// summary journaled before the field became optional still replays.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     /// Exact commit it was cut from.
     pub base_sha: String,
 }
