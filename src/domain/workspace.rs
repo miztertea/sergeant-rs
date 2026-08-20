@@ -36,10 +36,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::is_plain_name;
 use crate::domain::profile::Profile;
-use crate::runtime::git::{GitError, git};
+use crate::runtime::git::{GitError, canonical_git_common_dir, canonical_git_top_level};
 
 /// Checked-in workspace configuration file name (D1: `depot.toml` upstream).
 pub const WORKSPACE_FILE: &str = "sergeant.toml";
+
+/// The one directory every repository mount lives under, relative to the
+/// estate root (§6.1: `<estate-root>/repos/<name>`). Derived, never
+/// configured — the estate owns its checkouts, and a path field would let a
+/// manifest alias one in from somewhere else (§6.2).
+pub const REPOS_DIR: &str = "repos";
+
+/// §6.1's derived mount for one declared repository. The *only* place a
+/// repository path is ever computed.
+pub fn mount_path(estate_root: &Path, name: &str) -> PathBuf {
+    estate_root.join(REPOS_DIR).join(name)
+}
 
 /// The per-repository instruction file `instructions = "local"` would have
 /// the actor read natively (R-MVP1-4). Named here because it is the one
@@ -72,15 +84,17 @@ pub const INSTRUCTION_FILE: &str = "AGENTS.md";
 pub struct RepositorySpec {
     /// Name used in surfaces, bindings and `--repo` selection.
     pub name: String,
-    /// Absolute path to the repository's top level.
+    /// Absolute, canonical path to the repository's top level — §6.1's
+    /// derived mount `<estate-root>/repos/<name>`, validated as this
+    /// estate's own ordinary checkout (see `validate_mount`).
     pub path: PathBuf,
 }
 
 /// One `[[repo]]` entry read straight off `sergeant.toml`, before any
 /// on-disk existence check — see [`Workspace::declared_repos`]. Unlike
-/// [`RepositorySpec::path`] (git-resolved, guaranteed to exist), `path` here
-/// is only the declared path joined onto the manifest's directory and may
-/// point at nothing.
+/// [`RepositorySpec::path`] (mount-validated, guaranteed to be this estate's
+/// own ordinary checkout), `path` here is only §6.1's derived mount
+/// (`<root>/repos/<name>`) and may point at nothing.
 #[derive(Debug, Clone)]
 pub struct DeclaredRepo {
     /// Repository name.
@@ -181,10 +195,10 @@ pub struct InstructionIdentity {
 /// A resolved workspace: topology and defaults, never transient state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
-    /// Workspace name (from `sergeant.toml`, else the repo directory name).
+    /// Estate name, from `[estate] name`.
     pub name: String,
-    /// Directory the workspace was discovered from (the single repo's top
-    /// level, or the directory holding `sergeant.toml`).
+    /// The estate root: the canonical directory holding `sergeant.toml`, and
+    /// the directory every mount is derived beneath (§6.1).
     pub root: PathBuf,
     /// Repositories in the workspace, in declaration order.
     pub repositories: Vec<RepositorySpec>,
@@ -197,7 +211,9 @@ pub struct Workspace {
     /// Profiles declared for this workspace (§14).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<Profile>,
-    /// Path of the `sergeant.toml` that produced this workspace, if any.
+    /// Path of the `sergeant.toml` that produced this estate. `Option` only
+    /// because the type predates exact-root admission; every workspace this
+    /// build can construct has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<PathBuf>,
     /// `[estate] surfaces_dir` (R-MVP1-1): resolved to an absolute path
@@ -217,9 +233,9 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_dir: Option<PathBuf>,
     /// Per-repository instruction policy (R-MVP1-4), keyed by repository
-    /// name. A name absent from this map (including every repository in the
-    /// zero-config single-repo fallback) resolves to
-    /// [`InstructionPolicy::Suppress`] via [`Workspace::instruction_policy`].
+    /// name. A name absent from this map — a `[[repo]]` entry that declared
+    /// no `instructions` — resolves to [`InstructionPolicy::Suppress`] via
+    /// [`Workspace::instruction_policy`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repository_policy: BTreeMap<String, InstructionPolicy>,
     /// `[group.<name>]` declarations, validated (every member is a declared
@@ -233,9 +249,8 @@ pub struct Workspace {
     /// functionality) — recorded so `sgt repo list` can show where a
     /// repository was cloned from and a repeated `sgt repo add` can tell "the
     /// dir already exists" from "and here is what it should verify against".
-    /// A name absent from this map (including the zero-config fallback and
-    /// any `[[repo]]` entry that never declared `origin`) has no known
-    /// origin.
+    /// A name absent from this map — a `[[repo]]` entry that never declared
+    /// `origin` — has no known origin.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repository_origin: BTreeMap<String, String>,
 }
@@ -500,15 +515,77 @@ pub enum WorkspaceError {
         /// Parse failure, with line and column.
         source: toml::de::Error,
     },
-    /// A declared repository does not exist or is not a Git repository.
-    #[error("{file} declares repository {name:?} at {path}, which is not a git repository")]
+    /// §6.1: the derived mount `<estate-root>/repos/<name>` is missing, or
+    /// is not a Git repository at all. §15: name the expected derived path.
+    #[error(
+        "{file} declares repository {name:?}, whose mount {path} is missing or is not a git \
+         repository. Every repository is mounted at <estate-root>/repos/<name> (§6.1); clone or \
+         place one there, or `sgt repo add {name} --origin <url>`"
+    )]
     RepositoryNotFound {
         /// Config file that declared it.
         file: String,
         /// Declared repository name.
         name: String,
-        /// Resolved path that failed.
+        /// The derived mount path that failed.
         path: String,
+    },
+    /// §6.2: the mount is a symlink, an alias, or otherwise resolves to a
+    /// checkout that is not the estate-owned one. §15: name the expected
+    /// derived path **and** the actual Git top level.
+    #[error(
+        "{file} declares repository {name:?} at {expected}, but that path resolves to a different \
+         checkout: git reports its top level as {actual}. A repository mount must be the \
+         estate's own checkout at <estate-root>/repos/<name> — symlinks, ../ aliases and \
+         another estate's clone are refused (§6.2). Separate estates use separate clones, even \
+         for the same upstream repository."
+    )]
+    RepositoryMountAliased {
+        /// Config file that declared it.
+        file: String,
+        /// Declared repository name.
+        name: String,
+        /// The derived, canonical mount path.
+        expected: String,
+        /// What `git rev-parse --show-toplevel` actually answered.
+        actual: String,
+    },
+    /// §6.2/§8.1 check 4: the mount is a **linked worktree**, not an
+    /// ordinary primary checkout — its Git common directory lives in some
+    /// other repository. Declaring a Work's own linked worktree as a
+    /// repository source is exactly the recursion this refuses.
+    #[error(
+        "{file} declares repository {name:?} at {path}, which is a linked worktree, not an \
+         ordinary checkout: its git common dir is {common_dir}, outside the mount. A repository \
+         mount owns its own branches, common directory, worktree registry and sergeant/* refs \
+         (§6.2); a linked worktree owns none of them. Clone the repository into \
+         <estate-root>/repos/{name} instead."
+    )]
+    RepositoryMountIsLinkedWorktree {
+        /// Config file that declared it.
+        file: String,
+        /// Declared repository name.
+        name: String,
+        /// The derived mount path.
+        path: String,
+        /// The common dir that gave it away.
+        common_dir: String,
+    },
+    /// §6.1: `[[repo]] path` is removed. Named explicitly rather than left
+    /// to `deny_unknown_fields`, for the same reason R-MVP1-3's legacy
+    /// vocabulary is: a key that used to be *required* deserves a migration
+    /// notice, not "unknown field `path`".
+    #[error(
+        "{file} declares repository {name:?} with a `path` key, which no longer exists. \
+         Repository mounts are derived, not configured: every repository lives at \
+         <estate-root>/repos/<name> (§6.1). Delete the `path` line; if the checkout is \
+         somewhere else, move or re-clone it to repos/{name}."
+    )]
+    RepositoryPathDeclared {
+        /// Config file that declared it.
+        file: String,
+        /// The repository whose entry still carries `path`.
+        name: String,
     },
     /// Two repositories share a name; surfaces are keyed by name, so this
     /// would silently collapse two worktrees into one.
@@ -646,11 +723,17 @@ struct EstateSection {
     data_dir: Option<PathBuf>,
 }
 
+/// One `[[repo]]` entry.
+///
+/// **§6.1: there is no `path`.** A repository's mount is derived, not
+/// configured — `<estate-root>/repos/<name>`, always. A manifest that still
+/// declares one gets [`WorkspaceError::RepositoryPathDeclared`], a named
+/// removal notice, rather than `deny_unknown_fields`' generic "unknown
+/// field" pointing at a key that used to be required.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RepositoryEntry {
     name: String,
-    path: PathBuf,
     /// R-MVP1-4. Unset means [`InstructionPolicy::Suppress`].
     #[serde(default)]
     instructions: InstructionPolicy,
@@ -682,6 +765,122 @@ const LEGACY_TABLES: &[(&str, &str, &str)] = &[
         "rename each [[repository]] entry to [[repo]] (same fields, plus optional instructions)",
     ),
 ];
+
+/// `dir` with every ancestor canonicalized but the final component left
+/// exactly as named — see [`validate_mount`]'s own comment for why the leaf
+/// must not be resolved.
+fn canonical_leaf(dir: &Path) -> PathBuf {
+    match (dir.parent(), dir.file_name()) {
+        (Some(parent), Some(leaf)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(leaf))
+            .unwrap_or_else(|_| dir.to_path_buf()),
+        _ => dir.to_path_buf(),
+    }
+}
+
+/// Probe raw TOML for a removed `[[repo]] path` key **before** the real
+/// parse, for exactly the reason [`check_legacy_vocabulary`] probes for the
+/// legacy tables: `deny_unknown_fields` would answer "unknown field `path`"
+/// about a key that was *required* until this release, which names nothing
+/// an operator can act on. §6.1's removal deserves the migration notice.
+fn check_removed_repo_path(text: &str, file: &str) -> Result<(), WorkspaceError> {
+    let value: toml::Value = toml::from_str(text).map_err(|source| WorkspaceError::Malformed {
+        path: file.to_string(),
+        source,
+    })?;
+    let Some(repos) = value.get("repo").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    for entry in repos {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        if table.contains_key("path") {
+            return Err(WorkspaceError::RepositoryPathDeclared {
+                file: file.to_string(),
+                name: table
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("<unnamed>")
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// §6.1/§6.2/§8.1 checks 1–4: is `mount` really this estate's own checkout
+/// for `name`?
+///
+/// 1. The derived mount exists and is a Git repository at all.
+/// 2. Its canonical Git top level is *exactly* the canonical mount — which
+///    is what catches a symlinked mount, a `../` alias, and another estate's
+///    clone reached through either.
+/// 3. Its canonical Git common directory lives inside that top level — which
+///    is what catches a linked worktree admitted as a source, including a
+///    Work's own surface.
+///
+/// Returns the canonical mount on success, so callers record the resolved
+/// path rather than the declared one.
+fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, WorkspaceError> {
+    // Check 2, first half, and the one case a canonical comparison alone
+    // cannot see: the mount *itself* being a symlink. `canonicalize` would
+    // happily follow it and then agree with git that the target is the top
+    // level — which is exactly the shared-mount aliasing §6.2 refuses, so it
+    // is caught before any canonicalization happens.
+    if mount
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        let actual = std::fs::canonicalize(mount)
+            .unwrap_or_else(|_| std::fs::read_link(mount).unwrap_or_else(|_| mount.to_path_buf()));
+        return Err(WorkspaceError::RepositoryMountAliased {
+            file: file.to_string(),
+            name: name.to_string(),
+            expected: canonical_leaf(mount).display().to_string(),
+            actual: actual.display().to_string(),
+        });
+    }
+    let top_level =
+        canonical_git_top_level(mount).map_err(|_| WorkspaceError::RepositoryNotFound {
+            file: file.to_string(),
+            name: name.to_string(),
+            path: mount.display().to_string(),
+        })?;
+    // Canonicalized on both sides: `canonical_git_top_level` already
+    // resolves symlinks, so comparing it against a raw `mount` would report
+    // every macOS `/var` -> `/private/var` host as aliased (#127). The final
+    // component is deliberately *not* resolved (it cannot be a symlink — the
+    // check above already refused that), so an estate reached through a
+    // symlinked ancestor still compares equal while a mount that is itself an
+    // alias does not.
+    let canonical_mount = canonical_leaf(mount);
+    if top_level != canonical_mount {
+        return Err(WorkspaceError::RepositoryMountAliased {
+            file: file.to_string(),
+            name: name.to_string(),
+            expected: canonical_mount.display().to_string(),
+            actual: top_level.display().to_string(),
+        });
+    }
+    // A primary checkout's common dir is `<top level>/.git`; a linked
+    // worktree's points back into the repository it was cut from.
+    let common_dir =
+        canonical_git_common_dir(mount).map_err(|_| WorkspaceError::RepositoryNotFound {
+            file: file.to_string(),
+            name: name.to_string(),
+            path: mount.display().to_string(),
+        })?;
+    if !common_dir.starts_with(&canonical_mount) {
+        return Err(WorkspaceError::RepositoryMountIsLinkedWorktree {
+            file: file.to_string(),
+            name: name.to_string(),
+            path: canonical_mount.display().to_string(),
+            common_dir: common_dir.display().to_string(),
+        });
+    }
+    Ok(canonical_mount)
+}
 
 /// Probe raw TOML for the pre-estate vocabulary **before** the real parse
 /// (R-MVP1-3: "one probe before parse, not a second parser" — this reads the
@@ -822,6 +1021,7 @@ impl Workspace {
             source,
         })?;
         check_legacy_vocabulary(&text, &file)?;
+        check_removed_repo_path(&text, &file)?;
         let parsed: WorkspaceFile =
             toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
                 path: file.clone(),
@@ -846,9 +1046,10 @@ impl Workspace {
                     name: entry.name,
                 });
             }
+            let path = mount_path(&root, &entry.name);
             declared.push(DeclaredRepo {
                 name: entry.name,
-                path: root.join(&entry.path),
+                path,
                 origin: entry.origin,
             });
         }
@@ -913,6 +1114,7 @@ impl Workspace {
         // `deny_unknown_fields` would reject anyway, just early enough to
         // name the rename instead of a generic unknown-field error.
         check_legacy_vocabulary(&text, &file)?;
+        check_removed_repo_path(&text, &file)?;
         let parsed: WorkspaceFile =
             toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
                 path: file.clone(),
@@ -947,17 +1149,9 @@ impl Workspace {
                     name: entry.name,
                 });
             }
-            // Declared paths are relative to the config file, per §9's
-            // `../payments-api` example.
-            let joined = root.join(&entry.path);
-            let resolved = git(&joined, &["rev-parse", "--show-toplevel"]).map_err(|_| {
-                WorkspaceError::RepositoryNotFound {
-                    file: file.clone(),
-                    name: entry.name.clone(),
-                    path: joined.display().to_string(),
-                }
-            })?;
-            let resolved = PathBuf::from(resolved);
+            // §6.1: the mount is derived, never declared, and validated as
+            // this estate's own ordinary checkout before anything binds it.
+            let resolved = validate_mount(&file, &entry.name, &mount_path(&root, &entry.name))?;
             if let Some(first) = seen_paths.get(&resolved) {
                 return Err(WorkspaceError::DuplicateRepositoryPath {
                     file,
@@ -1065,6 +1259,7 @@ impl Workspace {
             source,
         })?;
         check_legacy_vocabulary(&text, &file)?;
+        check_removed_repo_path(&text, &file)?;
         let parsed: WorkspaceFile =
             toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
                 path: file.clone(),
@@ -1092,9 +1287,9 @@ impl Workspace {
                     name: entry.name,
                 });
             }
-            // Declared, joined, **not** git-resolved (see this fn's own doc:
-            // that is the one thing a structural parse cannot check).
-            let joined = root.join(&entry.path);
+            // §6.1's derived mount, **not** git-validated (see this fn's own
+            // doc: that is the one thing a structural parse cannot check).
+            let joined = mount_path(&root, &entry.name);
             repository_policy.insert(entry.name.clone(), entry.instructions);
             if let Some(origin) = &entry.origin {
                 repository_origin.insert(entry.name.clone(), origin.clone());
@@ -1318,13 +1513,13 @@ fn estate_table_check(config_path: &Path) -> Result<bool, WorkspaceError> {
 /// on, absolute passes through — but reached the same tolerant way
 /// `estate_table_check` finds the `[estate]` table itself: a raw TOML
 /// value, not a deserialize into [`WorkspaceFile`]. This is what lets
-/// [`Workspace::estate_root_and_data_dir`] read `data_dir` without also
+/// [`Workspace::root_data_dir_override`] read `data_dir` without also
 /// demanding the rest of the manifest — repos, profiles, groups — be
 /// structurally valid. Unreadable (permission, race) answers `None`, the
 /// same "indistinguishable from no file here" tolerance `estate_table_check`
-/// applies; by the time this runs, [`Workspace::find_estate_upward`] has
-/// already required the file to parse as TOML and carry no legacy
-/// vocabulary, so those two failure modes are not re-checked here.
+/// applies; by the time this runs, [`Workspace::is_estate_root`] has already
+/// required the file to parse as TOML and carry no legacy vocabulary, so
+/// those two failure modes are not re-checked here.
 fn estate_data_dir_override(
     config_path: &Path,
     root: &Path,
@@ -1377,10 +1572,49 @@ mod tests {
     }
 
     /// Write a `sergeant.toml` into `root` and parse it.
+    ///
+    /// §6.1: mounts are derived, so a fixture that declares `[[repo]] name =
+    /// "x"` needs a real checkout at `root/repos/x` for the strict loader to
+    /// validate. Every `name = "..."` under a `[[repo]]` in `body` gets one,
+    /// which keeps the fixtures about the *schema* question each test is
+    /// really asking rather than about mount plumbing.
     fn parse(root: &Path, body: &str) -> Result<Workspace, WorkspaceError> {
+        mount_declared_repos(root, body);
+        parse_without_mounting(root, body)
+    }
+
+    /// [`parse`] without the mount scaffolding — for the tests whose whole
+    /// subject *is* what the mounts look like on disk.
+    fn parse_without_mounting(root: &Path, body: &str) -> Result<Workspace, WorkspaceError> {
         let config = root.join(WORKSPACE_FILE);
         std::fs::write(&config, body).expect("sergeant.toml");
         Workspace::from_config(&config)
+    }
+
+    /// Create `root/repos/<name>` as a real git repository for every
+    /// `[[repo]]` `body` declares with a plain name.
+    fn mount_declared_repos(root: &Path, body: &str) {
+        let mut in_repo = false;
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_repo = line == "[[repo]]";
+                continue;
+            }
+            if !in_repo {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("name") else {
+                continue;
+            };
+            let Some(value) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let name = value.trim().trim_matches('"');
+            if crate::domain::is_plain_name(name) {
+                init_repo(&mount_path(root, name));
+            }
+        }
     }
 
     /// A repository name is joined straight onto
@@ -1396,7 +1630,7 @@ mod tests {
         for name in ["../escape", "..", "/etc", "nested/name", ""] {
             let err = parse(
                 root,
-                &format!("[estate]\nname = \"w\"\n\n[[repo]]\nname = \"{name}\"\npath = \".\"\n"),
+                &format!("[estate]\nname = \"w\"\n\n[[repo]]\nname = \"{name}\"\n"),
             )
             .expect_err("a traversing repository name must be refused");
             assert!(
@@ -1409,44 +1643,144 @@ mod tests {
         // everything.
         let workspace = parse(
             root,
-            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("a plain name parses");
         assert_eq!(workspace.repositories[0].name, "solo");
     }
 
-    /// Two names for one checkout would both materialize onto the same
-    /// `sergeant/<work-id>` branch of the same repository: the second
-    /// `git worktree add -b` fails only *after* the first has created a
-    /// branch and a worktree in the user's own checkout. Rejecting it here
-    /// costs nothing; rejecting it there leaves a branch behind.
+    /// §6.1/§6.2: two names can no longer *be* one checkout — the mount is
+    /// derived from the name, so `a` and `b` are `repos/a` and `repos/b` by
+    /// construction. The way an operator could still try is a symlink, and
+    /// that is refused as an alias: git reports the linked checkout's real
+    /// top level, which is not the derived mount.
+    ///
+    /// This replaces the pre-Phase-D `DuplicateRepositoryPath` fixture
+    /// (`path = "."` and `path = "./"`, one repository under two names). The
+    /// defect it guarded — two bindings materializing onto the same
+    /// `sergeant/<work-id>` branch of the same repository, the second `git
+    /// worktree add -b` failing only after the first has already touched the
+    /// user's checkout — is now unreachable through the schema, and reachable
+    /// only through the filesystem, which is what this asserts against.
     #[test]
-    fn two_names_for_one_repository_are_refused_before_anything_is_created() {
+    fn a_symlinked_mount_is_refused_as_an_alias() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path();
-        init_repo(root);
-        let nested = root.join("sub");
-        std::fs::create_dir_all(&nested).expect("sub dir");
+        let real = mount_path(root, "a");
+        init_repo(&real);
+        // `repos/b` is a symlink to `repos/a`: one checkout, two names.
+        std::os::unix::fs::symlink(&real, mount_path(root, "b")).expect("symlink the mount");
 
-        // Distinct names, distinct spellings, one repository: `.`, `./` and a
-        // subdirectory of the same checkout all resolve to one top level.
-        for path in [".", "./", "sub"] {
-            let err = parse(
-                root,
-                &format!(
-                    "[estate]\nname = \"w\"\n\n\
-                     [[repo]]\nname = \"a\"\npath = \".\"\n\n\
-                     [[repo]]\nname = \"b\"\npath = \"{path}\"\n"
-                ),
-            )
-            .expect_err("one repository under two names must be refused");
-            match err {
-                WorkspaceError::DuplicateRepositoryPath { first, second, .. } => {
-                    assert_eq!((first.as_str(), second.as_str()), ("a", "b"));
-                }
-                other => panic!("expected a same-path refusal for {path:?}, got {other}"),
-            }
-        }
+        let err = parse_without_mounting(
+            root,
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"a\"\n\n[[repo]]\nname = \"b\"\n",
+        )
+        .expect_err("a symlinked mount must be refused");
+        let WorkspaceError::RepositoryMountAliased {
+            name,
+            expected,
+            actual,
+            ..
+        } = &err
+        else {
+            panic!("expected an alias refusal, got {err}");
+        };
+        assert_eq!(name, "b");
+        assert!(
+            expected.ends_with("repos/b"),
+            "§15: name the expected derived path, got {expected}"
+        );
+        assert!(
+            actual.ends_with("repos/a"),
+            "§15: name the actual git top level, got {actual}"
+        );
+    }
+
+    /// §6.2/§8.1 check 4: a **linked worktree** — a Work's own surface is the
+    /// case that matters — is refused as a repository source. It owns none of
+    /// the things a mount must own: its branches, common directory, worktree
+    /// registry entries and `sergeant/*` refs all belong to the repository it
+    /// was cut from.
+    #[test]
+    fn a_linked_worktree_is_refused_as_a_repository_source() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let source = dir.path().join("source-repo");
+        init_repo(&source);
+        std::fs::create_dir_all(root.join(REPOS_DIR)).expect("repos dir");
+        let mount = mount_path(root, "borrowed");
+        let output = Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                mount.to_str().expect("utf8 path"),
+                "-b",
+                "wt-branch",
+            ])
+            .current_dir(&source)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git worktree add");
+        assert!(output.status.success(), "worktree add: {output:?}");
+
+        let err = parse_without_mounting(
+            root,
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"borrowed\"\n",
+        )
+        .expect_err("a linked worktree must be refused as a mount");
+        let WorkspaceError::RepositoryMountIsLinkedWorktree {
+            name, common_dir, ..
+        } = &err
+        else {
+            panic!("expected a linked-worktree refusal, got {err}");
+        };
+        assert_eq!(name, "borrowed");
+        assert!(
+            common_dir.contains("source-repo"),
+            "§15: name the actual git common dir, got {common_dir}"
+        );
+    }
+
+    /// §6.1: `[[repo]] path` is removed, and a manifest that still declares
+    /// one is refused by a message that names the removal — not
+    /// `deny_unknown_fields`' generic "unknown field", which would say
+    /// nothing about a key that was required until this release.
+    #[test]
+    fn a_repo_entry_still_declaring_path_is_refused_by_name() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(&mount_path(root, "api"));
+
+        let err = parse_without_mounting(
+            root,
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\npath = \"repos/api\"\n",
+        )
+        .expect_err("a declared path must be refused");
+        let WorkspaceError::RepositoryPathDeclared { name, .. } = &err else {
+            panic!("expected the named removal refusal, got {err}");
+        };
+        assert_eq!(name, "api");
+        let message = err.to_string();
+        assert!(
+            message.contains("no longer exists") && message.contains("repos/<name>"),
+            "the refusal must name the removal and the derived mount: {message}"
+        );
+        // Every read path refuses it, not just the strict one — the edit pen
+        // and `sgt doctor`'s own reader included.
+        let config = root.join(WORKSPACE_FILE);
+        assert!(matches!(
+            Workspace::from_config_structural(&config),
+            Err(WorkspaceError::RepositoryPathDeclared { .. })
+        ));
+        assert!(matches!(
+            Workspace::declared_repos(&config),
+            Err(WorkspaceError::RepositoryPathDeclared { .. })
+        ));
+        assert!(matches!(
+            Workspace::admit(root),
+            Err(EstateRootError::Invalid { .. })
+        ));
     }
 
     /// Two entries with the same *name* collapse two worktrees into one
@@ -1462,8 +1796,8 @@ mod tests {
         let err = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
-             [[repo]]\nname = \"same\"\npath = \".\"\n\n\
-             [[repo]]\nname = \"same\"\npath = \"other\"\n",
+             [[repo]]\nname = \"same\"\n\n\
+             [[repo]]\nname = \"same\"\n",
         )
         .expect_err("a repeated name must be refused");
         assert!(
@@ -1590,7 +1924,7 @@ mod tests {
         let err = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
-             [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
              [[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
              [[profile]]\nname = \"same\"\nbackend = \"claude\"\n",
         )
@@ -1612,7 +1946,7 @@ mod tests {
         let err = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
-             [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
              [[profile]]\nname = \"reckless\"\nbackend = \"claude\"\n\
              [profile.options]\npermission_mode = \"yolo\"\n",
         )
@@ -1631,7 +1965,7 @@ mod tests {
         let workspace = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
-             [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
              [[profile]]\nname = \"careful\"\nbackend = \"claude\"\n\
              [profile.options]\npermission_mode = \"plan\"\n",
         )
@@ -1658,7 +1992,7 @@ mod tests {
 
         let err = parse(
             root,
-            "[workspace]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            "[workspace]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect_err("[workspace] must be refused by name");
         match &err {
@@ -1686,7 +2020,7 @@ mod tests {
 
         let err = parse(
             root,
-            "[estate]\nname = \"w\"\n\n[[repository]]\nname = \"solo\"\npath = \".\"\n",
+            "[estate]\nname = \"w\"\n\n[[repository]]\nname = \"solo\"\n",
         )
         .expect_err("[[repository]] must be refused by name");
         match &err {
@@ -1712,7 +2046,7 @@ mod tests {
 
         let err = parse(
             root,
-            "[workspace]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            "[workspace]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect_err("a mix must still be refused");
         assert!(
@@ -1731,7 +2065,7 @@ mod tests {
 
         let workspace = parse(
             root,
-            "[estate]\nname = \"clean\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            "[estate]\nname = \"clean\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("pure estate vocabulary must parse");
         assert_eq!(workspace.name, "clean");
@@ -1753,8 +2087,8 @@ mod tests {
         let workspace = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
-             [[repo]]\nname = \"api\"\npath = \".\"\n\n\
-             [[repo]]\nname = \"web\"\npath = \"other\"\n\n\
+             [[repo]]\nname = \"api\"\n\n\
+             [[repo]]\nname = \"web\"\n\n\
              [group.payments]\nrepos = [\"api\", \"web\"]\nbrief = \"both sides\"\n",
         )
         .expect("a group over declared repos parses");
@@ -1765,7 +2099,7 @@ mod tests {
         let err = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
-             [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+             [[repo]]\nname = \"api\"\n\n\
              [group.payments]\nrepos = [\"api\", \"ghost\"]\n",
         )
         .expect_err("an undeclared group member must be refused");
@@ -1795,8 +2129,8 @@ mod tests {
         let workspace = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
-             [[repo]]\nname = \"unset\"\npath = \".\"\n\n\
-             [[repo]]\nname = \"loud\"\npath = \"other\"\ninstructions = \"local\"\n",
+             [[repo]]\nname = \"unset\"\n\n\
+             [[repo]]\nname = \"loud\"\ninstructions = \"local\"\n",
         )
         .expect("instructions parses");
         assert_eq!(
@@ -1829,7 +2163,7 @@ mod tests {
         let workspace = parse(
             root,
             "[estate]\nname = \"w\"\nsurfaces_dir = \"../elsewhere-surfaces\"\n\n\
-             [[repo]]\nname = \"solo\"\npath = \".\"\n",
+             [[repo]]\nname = \"solo\"\n",
         )
         .expect("relative surfaces_dir parses");
         assert_eq!(
@@ -1841,7 +2175,7 @@ mod tests {
         let workspace = parse(
             root,
             &format!(
-                "[estate]\nname = \"w\"\nsurfaces_dir = {:?}\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+                "[estate]\nname = \"w\"\nsurfaces_dir = {:?}\n\n[[repo]]\nname = \"solo\"\n",
                 absolute.to_string_lossy()
             ),
         )
@@ -1851,7 +2185,7 @@ mod tests {
         // Unset stays `None` — the daemon's own default is left in force.
         let workspace = parse(
             root,
-            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("no surfaces_dir parses");
         assert_eq!(workspace.surfaces_dir, None);
@@ -1871,7 +2205,7 @@ mod tests {
         let workspace = parse(
             root,
             "[estate]\nname = \"w\"\ndata_dir = \"../elsewhere-data\"\n\n\
-             [[repo]]\nname = \"solo\"\npath = \".\"\n",
+             [[repo]]\nname = \"solo\"\n",
         )
         .expect("relative data_dir parses");
         assert_eq!(workspace.data_dir, Some(root.join("../elsewhere-data")));
@@ -1880,7 +2214,7 @@ mod tests {
         let workspace = parse(
             root,
             &format!(
-                "[estate]\nname = \"w\"\ndata_dir = {:?}\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+                "[estate]\nname = \"w\"\ndata_dir = {:?}\n\n[[repo]]\nname = \"solo\"\n",
                 absolute.to_string_lossy()
             ),
         )
@@ -1891,7 +2225,7 @@ mod tests {
         // force.
         let workspace = parse(
             root,
-            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("no data_dir parses");
         assert_eq!(workspace.data_dir, None);
@@ -1907,9 +2241,7 @@ mod tests {
         init_repo(&root.join("repos").join("solo"));
         std::fs::write(
             root.join(WORKSPACE_FILE),
-            format!(
-                "[estate]\nname = {name:?}\n\n[[repo]]\nname = \"solo\"\npath = \"repos/solo\"\n"
-            ),
+            format!("[estate]\nname = {name:?}\n\n[[repo]]\nname = \"solo\"\n"),
         )
         .expect("write estate sergeant.toml");
     }
@@ -2012,11 +2344,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().join("member");
         init_repo(&root);
-        std::fs::write(
-            root.join(WORKSPACE_FILE),
-            "[[repo]]\nname = \"solo\"\npath = \".\"\n",
-        )
-        .expect("write");
+        std::fs::write(root.join(WORKSPACE_FILE), "[[repo]]\nname = \"solo\"\n").expect("write");
 
         let err = Workspace::admit(&root).expect_err("no [estate] table here");
         assert!(
@@ -2072,7 +2400,7 @@ mod tests {
         init_repo(&root);
         std::fs::write(
             root.join(WORKSPACE_FILE),
-            "[workspace]\nname = \"legacy\"\n\n[[repository]]\nname = \"legacy\"\npath = \".\"\n",
+            "[workspace]\nname = \"legacy\"\n\n[[repository]]\nname = \"legacy\"\n",
         )
         .expect("legacy sergeant.toml");
 
@@ -2101,7 +2429,7 @@ mod tests {
         write_estate(&root, "payments");
         std::fs::write(
             root.join(WORKSPACE_FILE),
-            "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"solo\"\npath = \"repos/solo\"\n\n\
+            "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"solo\"\n\n\
              [group.everything]\nrepos = [\"ghost\"]\n",
         )
         .expect("write");
@@ -2127,7 +2455,7 @@ mod tests {
         init_repo(&root);
         std::fs::write(
             root.join(WORKSPACE_FILE),
-            "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"ghost\"\npath = \"repos/ghost\"\n",
+            "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"ghost\"\n",
         )
         .expect("write");
 
@@ -2258,7 +2586,7 @@ mod tests {
         std::fs::write(
             root.join(WORKSPACE_FILE),
             "[estate]\nname = \"w\"\ndata_dir = \"custom-data\"\n\n\
-             [[repo]]\nname = \"solo\"\npath = \"repos/solo\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
              [[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
              [[profile]]\nname = \"same\"\nbackend = \"fake\"\n",
         )

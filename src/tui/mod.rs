@@ -23,9 +23,10 @@
 //! membership is resolved by the daemon against its own bound manifest
 //! (estate-root proposal §7.2), so the form reaches the identical
 //! resolution `sgt run --repo`/`--group` does without ever reading the
-//! estate from local disk
-//! (`crate::domain::workspace::Workspace::declared_groups_scoped`), which no
-//! module here may reach for. What is still missing is the *catalog*: the
+//! estate from local disk at all — a thing no module here may reach for,
+//! and which (since estate-root Phase D deleted `declared_groups_scoped`
+//! along with the rest of cwd-based discovery) no longer exists to reach
+//! for. What is still missing is the *catalog*: the
 //! daemon does not expose declared repositories and groups over the API yet
 //! (T3's job, §20.4), so both fields are typed rather than chosen.
 //!

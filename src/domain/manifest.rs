@@ -49,7 +49,9 @@ use std::path::{Path, PathBuf};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 use crate::domain::is_plain_name;
-use crate::domain::workspace::{InstructionPolicy, WORKSPACE_FILE, Workspace, WorkspaceError};
+use crate::domain::workspace::{
+    InstructionPolicy, WORKSPACE_FILE, Workspace, WorkspaceError, mount_path,
+};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic};
 use crate::runtime::git::{git_clone, git_succeeds};
 
@@ -121,11 +123,18 @@ pub enum ManifestError {
         #[source]
         source: Box<WorkspaceError>,
     },
-    /// No `[estate]`-bearing `sergeant.toml` was found walking upward from
-    /// `start` (mirrors R-MVP1-12, bounded at `$HOME`).
+    /// `start` is not an estate root (§4.1's exact-root check).
+    ///
+    /// Nothing in this module constructs it — that was already true before
+    /// estate-root Phase D, and it stays true after: the callers that would
+    /// have raised it now refuse *earlier*, at admission, with
+    /// [`crate::domain::workspace::EstateRootError`]'s §4.4 diagnostic,
+    /// which names the expected path and the remedy rather than a bare
+    /// "not found". Retained only because `src/api.rs`'s stable
+    /// `manifest_error_code` map answers `"no_estate"` for it.
     #[error(
-        "no estate found above {start} (bounded at $HOME) — run `sgt init` first, at the \
-         directory that should become the estate root"
+        "{start} is not an estate root — run `sgt init` there, or address the estate that is \
+         one with `sgt -C <estate-root>`"
     )]
     NoEstate { start: String },
     /// A declared repository/group name is not a plain directory/table
@@ -387,7 +396,7 @@ pub fn init_estate(root: &Path, name: Option<&str>) -> Result<InitOutcome, Manif
         commit(root, &doc)?;
     }
 
-    let repos_dir = root.join("repos");
+    let repos_dir = root.join(crate::domain::workspace::REPOS_DIR);
     let repos_dir_created = !repos_dir.exists();
     if repos_dir_created {
         create_dir_all_durable(&repos_dir).map_err(|source| ManifestError::Io {
@@ -487,13 +496,16 @@ pub fn add_repo(
         });
     }
 
-    let repo_path = estate_root.join("repos").join(name);
+    // §6.1: the mount is derived here exactly as the parser derives it —
+    // one function, `workspace::mount_path`, so the writer and the reader
+    // can never disagree about where a repository lives.
+    let repo_path = mount_path(estate_root, name);
     populate_or_verify(name, &repo_path, origin)?;
 
-    let rel_path = format!("repos/{name}");
+    // §6.1: no `path` key. The entry declares a name; the mount follows from
+    // it.
     let mut table = Table::new();
     table.insert("name", value(name));
-    table.insert("path", value(&rel_path));
     if let Some(policy) = instructions {
         table.insert("instructions", value(policy.as_str()));
     }
@@ -926,7 +938,7 @@ mod tests {
         init_repo(&other);
         std::fs::write(
             root.join(WORKSPACE_FILE),
-            "# a human wrote this note\n[[repo]]\nname = \"web\"\npath = \"repos/web\"\n",
+            "# a human wrote this note\n[[repo]]\nname = \"web\"\n",
         )
         .expect("write manifest with a comment, no [estate] yet");
 

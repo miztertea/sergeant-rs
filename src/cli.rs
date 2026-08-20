@@ -628,7 +628,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         }
         Command::Daemon {
             command: Some(DaemonCommand::Stop),
-        } => daemon_stop(&data_dir, sgt.json).await,
+        } => daemon_stop(&data_dir, &estate_root(&estate), sgt.json).await,
         Command::Status => {
             let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             let system = client.get("/v1/system").await?;
@@ -1157,7 +1157,7 @@ async fn repo_command(
             } else {
                 println!(
                     "added repo {name} at {}",
-                    estate_root.join("repos").join(&name).display()
+                    crate::domain::workspace::mount_path(estate_root, &name).display()
                 );
             }
             Ok(())
@@ -1835,7 +1835,7 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// Deliberately does **not** auto-spawn a daemon — asking to stop something
 /// that is not running is answered "already stopped", never "let me start
 /// one so I can stop it", mirroring `sgt doctor`'s own no-auto-spawn rule.
-async fn daemon_stop(data_dir: &Path, json: bool) -> Result<(), CliError> {
+async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<(), CliError> {
     let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
         report_daemon_stop(
             json,
@@ -1844,6 +1844,10 @@ async fn daemon_stop(data_dir: &Path, json: bool) -> Result<(), CliError> {
         );
         return Ok(());
     };
+    // §5.1, before the endpoint is touched: stopping is *using* a daemon,
+    // and a daemon bound to another estate is no more this estate's to stop
+    // than it is this estate's to submit to.
+    check_binding(&descriptor, data_dir, estate_root)?;
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
@@ -2101,7 +2105,22 @@ pub(crate) mod doctor {
                     check.detail
                 );
                 if let Some(remedy) = &check.remedy {
-                    println!("         remedy: {remedy}");
+                    // A remedy may be several lines — §4.4's estate-root
+                    // diagnostic is a whole block. Continuation lines are
+                    // indented to the same column as the first so the
+                    // remedy still reads as one indented thing under its
+                    // check, rather than spilling back to column zero.
+                    let mut lines = remedy.lines();
+                    if let Some(first) = lines.next() {
+                        println!("         remedy: {first}");
+                        for line in lines {
+                            if line.is_empty() {
+                                println!();
+                            } else {
+                                println!("                 {line}");
+                            }
+                        }
+                    }
                 }
             }
             println!(
@@ -2290,6 +2309,15 @@ pub(crate) mod doctor {
             return Check::ok("estate", "not an estate root — nothing to check");
         };
         let manifest_path = estate_root.join(WORKSPACE_FILE);
+        // Estate-root Phase D: a manifest that cannot be parsed at all no
+        // longer reaches this row. `estate_root_check` already ran
+        // `Workspace::admit`, which runs the identical parse — TOML syntax,
+        // the R-MVP1-3 legacy-vocabulary refusal, §6.1's removed `path` key,
+        // duplicate or invalid repository names — and only hands this row an
+        // `estate_root` when all of it passed. Kept as a defensive arm rather
+        // than an `expect`, because "the manifest changed between two reads
+        // of the same doctor run" is a race, not an invariant, and a doctor
+        // that panics on it would be the worst possible answer.
         let declared = match Workspace::declared_repos(&manifest_path) {
             Ok(declared) => declared,
             Err(e) => {
@@ -2333,7 +2361,7 @@ pub(crate) mod doctor {
             });
         }
 
-        let repos_dir = estate_root.join("repos");
+        let repos_dir = estate_root.join(crate::domain::workspace::REPOS_DIR);
         if let Ok(entries) = std::fs::read_dir(&repos_dir) {
             let mut undeclared: Vec<String> = entries
                 .flatten()

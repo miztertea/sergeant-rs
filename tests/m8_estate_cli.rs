@@ -902,8 +902,9 @@ fn run_group_resolves_server_side_into_repositories() {
 /// spawned. Phase C retires that CLI-side lookup entirely (§7.2: resolution
 /// is core-owned), so this test's outcome is no longer "the client-side
 /// carve-out and the daemon's own strict bind disagree" — it is the plain
-/// consequence of `Engine::plan` unconditionally discovering the *whole*
-/// estate (`Workspace::discover_scoped`) before scope resolution ever runs,
+/// consequence of `Engine::plan` unconditionally resolving the *whole*
+/// estate (`Workspace::resolve` against the daemon's bound root, since
+/// estate-root Phase D) before scope resolution ever runs,
 /// exactly the coupling a plain `--repo` submission has always had (matches
 /// the B4 register entry MVP3-C2's own basis cites). `ghost` being outside
 /// the requested group no longer matters: the command still fails, and the
@@ -968,13 +969,21 @@ fn run_group_expansion_itself_survives_an_unrelated_declared_repo_missing_from_d
 // ---------------------------------------------------- estate-resolved data dir
 
 /// guard-map: with no `--data-dir`/`SGT_DATA_DIR`, `sgt doctor` defaults to
-/// `<estate_root>/.sergeant/data` when run from inside a discovered estate —
-/// both from the estate root itself and from a directory nested under it
-/// (R-MVP1-12's own upward walk, reused). `sgt doctor` never auto-spawns a
-/// daemon (its own documented rule), so this needs no `DataDir` guard.
-/// Mutation this kills: `resolve_data_dir` never trying the estate walk at
-/// all (would report the old default instead), or joining the wrong
-/// relative path (would report `.sergeant/data` in the wrong directory).
+/// `<estate_root>/.sergeant/data` when run **at** the estate root. `sgt
+/// doctor` never auto-spawns a daemon (its own documented rule), so this
+/// needs no `DataDir` guard. Mutation this kills: `resolve_data_dir` never
+/// consulting the estate at all (would report the old default instead), or
+/// joining the wrong relative path (would report `.sergeant/data` in the
+/// wrong directory).
+///
+/// **Estate-root Phase D flipped the descendant half of this pin.** It used
+/// to assert the identical answer from `repos/` one level down, via
+/// R-MVP1-12's upward walk. There is no walk any more (§4.1), so the
+/// sibling test below pins the *new* answer from that same directory:
+/// exact-root resolution finds no estate there, the pre-estate platform
+/// default stands, and `sgt doctor` — which still runs outside an estate —
+/// says so in a failing `estate_root` row instead of quietly reporting on
+/// the estate above.
 #[test]
 fn data_dir_defaults_to_estate_local_when_no_flag_or_env() {
     let estate = tempfile::TempDir::new().expect("tempdir");
@@ -993,17 +1002,94 @@ fn data_dir_defaults_to_estate_local_when_no_flag_or_env() {
         .expect("canonical estate root")
         .join(".sergeant/data");
 
-    for cwd in [estate.path().to_path_buf(), estate.path().join("repos")] {
-        let result = run(&cwd, None, &[], &["--json", "doctor"]);
-        // Doctor's health is not the point here (an empty estate reports
-        // fine or warn on unrelated checks); only the resolved path is.
-        let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
-        let reported = std::fs::canonicalize(&reported).unwrap_or(reported);
-        assert_eq!(
-            reported, expected,
-            "cwd {cwd:?} must default to the estate-local data dir"
-        );
-    }
+    let result = run(estate.path(), None, &[], &["--json", "doctor"]);
+    // Doctor's health is not the point here (an empty estate reports fine
+    // or warn on unrelated checks); only the resolved path is.
+    let reported = PathBuf::from(result.json()["data_dir"].as_str().expect("data_dir"));
+    let reported = std::fs::canonicalize(&reported).unwrap_or(reported);
+    assert_eq!(
+        reported, expected,
+        "the estate root must default to the estate-local data dir"
+    );
+}
+
+/// **Phase 0 pin, flipped (§4.1/§4.2).** From `repos/` — one directory below
+/// the estate root — there is no ancestor walk left to find the estate, so:
+///
+/// - the data dir falls through to the pre-estate platform default;
+/// - `sgt doctor` still runs (it is one of the five unscoped commands) and
+///   reports a **failing** `estate_root` row carrying §4.4's remedy;
+/// - an estate-*scoped* verb from the same directory refuses outright, and
+///   spawns nothing.
+// CONTRACT PIN (estate-root Phase D): no upward data-dir/estate discovery from a descendant of the estate root.
+#[test]
+fn a_descendant_of_the_estate_root_finds_no_estate_and_spawns_nothing() {
+    let data_dir = DataDir::new();
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    run(
+        estate.path(),
+        Some(&estate.path().join("init-scratch-data-dir")),
+        &[],
+        &["init"],
+    )
+    .assert_ok("init");
+
+    let xdg = estate.path().join("xdg-home");
+    let home = estate.path().join("home");
+    let env = [
+        ("XDG_DATA_HOME", xdg.to_str().expect("utf8")),
+        ("HOME", home.to_str().expect("utf8")),
+    ];
+    let descendant = estate.path().join("repos");
+
+    let doctor = run(&descendant, None, &env, &["--json", "doctor"]);
+    let report = doctor.json();
+    let reported = PathBuf::from(report["data_dir"].as_str().expect("data_dir"));
+    let expected = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/sergeant")
+    } else {
+        xdg.join("sergeant")
+    };
+    assert_eq!(
+        reported, expected,
+        "no upward walk: a descendant falls through to the pre-estate default"
+    );
+    let estate_row = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "estate_root")
+        .expect("doctor must carry an estate_root row");
+    assert_eq!(
+        estate_row["status"], "fail",
+        "outside an estate root the row must fail: {estate_row}"
+    );
+    let remedy = estate_row["remedy"].as_str().expect("remedy");
+    assert!(
+        remedy.contains("does not search parent directories") && remedy.contains("sgt init"),
+        "§4.4's remedy must be carried: {remedy}"
+    );
+
+    // And an estate-scoped verb from the same place refuses before it could
+    // look up a descriptor or spawn anything (§4.3).
+    let refused = run(
+        &descendant,
+        Some(data_dir.path()),
+        &[],
+        &["run", "should never be admitted"],
+    );
+    refused.assert_fails("run from a descendant of the estate root");
+    assert!(
+        refused
+            .stderr
+            .contains("no estate found in the current directory"),
+        "§4.4's own first line: {}",
+        refused.stderr
+    );
+    assert!(
+        data_dir.daemon_pids().is_empty(),
+        "a refused estate-scoped verb must never spawn a daemon"
+    );
 }
 
 /// guard-map (#164): `sgt init` itself, with no `--data-dir`/`SGT_DATA_DIR`,
@@ -1359,7 +1445,10 @@ fn wait_for_state(cwd: &Path, data_dir: &Path, id: &str, state: &str) -> Value {
 fn work_transcript_and_output_pointer_are_reachable_from_the_real_cli() {
     let data_dir = DataDir::new();
     let repo = tempfile::TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    // §4.1/§6.1: an estate-scoped verb needs an exact estate root with a
+    // derived `repos/<name>` mount — a bare git repo is no longer a
+    // workspace.
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
     write_two_stage_workflow(repo.path());
 
     let submitted = run(
@@ -1460,7 +1549,10 @@ fn work_transcript_and_output_pointer_are_reachable_from_the_real_cli() {
 fn work_retained_and_reap_are_reachable_from_the_real_cli() {
     let data_dir = DataDir::new();
     let repo = tempfile::TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    // §4.1/§6.1: an estate-scoped verb needs an exact estate root with a
+    // derived `repos/<name>` mount — a bare git repo is no longer a
+    // workspace.
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
     write_two_stage_workflow(repo.path());
 
     // `hang` keeps the first stage in flight so the worktree can be dirtied
@@ -1590,7 +1682,10 @@ fn work_retained_and_reap_are_reachable_from_the_real_cli() {
 fn run_turns_and_ceiling_secs_override_the_envelope_for_one_work() {
     let data_dir = DataDir::new();
     let repo = tempfile::TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    // §4.1/§6.1: an estate-scoped verb needs an exact estate root with a
+    // derived `repos/<name>` mount — a bare git repo is no longer a
+    // workspace.
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
     write_two_stage_workflow(repo.path());
 
     let submitted = run(
@@ -1696,6 +1791,10 @@ fn run_turns_and_ceiling_secs_override_the_envelope_for_one_work() {
 fn daemon_stop_drains_admission_and_exits_cleanly() {
     let data_dir = DataDir::new();
     let cwd = tempfile::TempDir::new().expect("tempdir");
+    // §4.2: `daemon`/`daemon stop`/`run` are all estate-scoped, so this rig
+    // needs a real estate root to stand in — the exact-root check runs
+    // before descriptor lookup and before any spawn decision (§4.3).
+    support::scaffold_estate(cwd.path(), "solo", &["solo"]);
 
     // Idempotent: stopping a daemon that was never started is a clean
     // success, not an error — a clean stop refuses nothing, including a
@@ -1710,8 +1809,7 @@ fn daemon_stop_drains_admission_and_exits_cleanly() {
     assert_eq!(idle_stop.json()["status"], "not_running");
 
     // Auto-spawn a real daemon. `status` no longer does this (ADR 0009: it
-    // joined the no-spawn set), so a mutating verb does the spawning here —
-    // `run` with no `--repo`/`--workflow` needs no estate to submit.
+    // joined the no-spawn set), so a mutating verb does the spawning here.
     let submit = run(
         cwd.path(),
         Some(data_dir.path()),

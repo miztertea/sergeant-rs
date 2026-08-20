@@ -324,7 +324,7 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     let path = daemon::descriptor_path(dir.path());
     let bytes = std::fs::read(&path).expect("descriptor readable");
     let descriptor: RuntimeDescriptor = serde_json::from_slice(&bytes).expect("descriptor json");
-    assert_eq!(descriptor.schema, "sergeant.runtime/v1");
+    assert_eq!(descriptor.schema, "sergeant.runtime/v2");
     assert!(
         descriptor.endpoint.starts_with("http://127.0.0.1:"),
         "loopback endpoint, got {}",
@@ -334,6 +334,14 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     assert_eq!(descriptor.api_revision, "v1");
     assert_eq!(descriptor.token, handle.token);
     assert_token_plausible(&descriptor.token);
+    // estate-root §5.1: `v2` exists for these two fields. This daemon was
+    // started against no estate (`DaemonConfig::estate_root` is `None` — the
+    // shape most of this file's in-process rigs use), and the descriptor has
+    // to *say so* rather than omit the question: a client comparing its own
+    // exact root against `None` gets the mismatch refusal, which is the only
+    // safe answer when the daemon would plan against nothing.
+    assert_eq!(descriptor.estate_root, None);
+    assert_eq!(descriptor.manifest_path, None);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -373,6 +381,35 @@ async fn t1_descriptor_lifecycle_and_healthz() {
         "each daemon must publish a fresh random token"
     );
     successor.shutdown().await;
+
+    // The other half of §5.1: a daemon started *against* an estate publishes
+    // the canonical root and its manifest, because that is what every client
+    // compares its own exact root to before using the endpoint. Recorded, not
+    // reconstructed — a reader must never have to re-derive
+    // `<root>/sergeant.toml` (or, worse, walk for it).
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "descriptor-lifecycle", &["solo"]);
+    let root = std::fs::canonicalize(estate.path()).expect("canonical estate root");
+    let bound_dir = TempDir::new().expect("tempdir");
+    let bound = daemon::start_with(
+        bound_dir.path(),
+        DaemonConfig {
+            estate_root: Some(estate.path().to_path_buf()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let descriptor = daemon::read_descriptor(bound_dir.path())
+        .expect("read descriptor")
+        .expect("descriptor published");
+    assert_eq!(descriptor.estate_root.as_deref(), Some(root.as_path()));
+    assert_eq!(
+        descriptor.manifest_path,
+        Some(root.join("sergeant.toml")),
+        "the manifest path travels with the root, so no client reconstructs it"
+    );
+    bound.shutdown().await;
 }
 
 /// A bearer token must be long, high-entropy-looking, and safe to put in a
@@ -1370,29 +1407,80 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
     successor.shutdown().await;
 }
 
+/// A guarded data dir that is **also** an exact estate root (§4.1).
+///
+/// Every estate-scoped verb — which since §4.2 is everything but `sgt`,
+/// `--help`, `--version`, `init` and `doctor` — validates the exact root
+/// before it resolves a data dir, reads a descriptor, or spawns anything
+/// (§4.3). The old rig was a bare temp dir precisely *because* discovery
+/// walked upward and a repository above it would have been found; with the
+/// walk deleted, a bare temp dir is simply not an estate and every CLI test
+/// in this file would refuse before reaching its own subject.
+///
+/// Estate root and data dir are deliberately the same directory here. `fn
+/// sgt` runs the binary in it and passes `--data-dir` explicitly, so the two
+/// roles never compete (the flag outranks the estate rung of
+/// `resolve_data_dir` unconditionally, which `resolve_data_dir_falls_back_
+/// through_sgt_data_dir_then_xdg_then_home` pins separately) — and one
+/// directory keeps `DataDir`'s reaping guard covering the whole rig.
+fn estate_data_dir() -> DataDir {
+    let dir = DataDir::new();
+    support::scaffold_estate(dir.path(), "m2", &["solo"]);
+    dir
+}
+
 /// Run the sgt binary with args against a data dir; capture output.
 ///
 /// The child runs in the data dir, not in whatever directory `cargo test` was
-/// invoked from. From M3 on, `sgt run` sends its working directory as §13
-/// origin metadata and the daemon discovers a workspace from it — so a test
-/// that inherited the crate's own checkout would materialize real git
-/// worktrees off this repository. These M2 tests are about the daemon, the
-/// API and the CLI transport; the data dir is a plain temp dir with no
-/// repository, so `sgt run` submits work that stays `pending`, exactly as it
-/// did when no engine existed. Work surfaces get their own tests in
-/// `m3_execution.rs`, in temp repositories built for the purpose.
+/// invoked from — and since §4.3 that directory has to be a real estate root,
+/// so callers build theirs with [`estate_data_dir`]. A bare `DataDir` here
+/// gets §4.4's "no estate found in the current directory" refusal instead of
+/// whatever the test meant to exercise.
+///
+/// **What that costs, and why it is the honest price.** Until Phase D the
+/// data dir was a plain temp dir with no repository above it, so `sgt run`
+/// submitted work that stayed `pending` and these tests could be about the
+/// daemon, the API and the CLI transport alone. §5.2 removed that shape from
+/// the CLI entirely: the daemon plans against the estate it was *started*
+/// against, the client always names one, and only a daemon bound to nothing
+/// (`DaemonConfig::estate_root: None`, which no CLI path can produce) leaves
+/// a submission `pending`. So a CLI submission here now genuinely runs the
+/// estate's single mount through the compiled-in fake backend. That is
+/// deterministic — the unscripted fake settles every stage inside the submit
+/// call, so `sgt run` answers `completed` — and where a test needs a Work
+/// that is *not* finished, [`sgt_env`] scripts the fake to park it instead of
+/// racing it. Work surfaces still get their own coverage in
+/// `m3_execution.rs`; nothing here asserts about them.
+///
 /// The parameter is a [`DataDir`], not a `&Path`, on purpose: running the
 /// binary against a data dir may auto-spawn a detached daemon, and the guard
 /// is the thing that reaps it. Taking a bare path here is how a future test
 /// would leak one without noticing.
 fn sgt(data_dir: &DataDir, args: &[&str]) -> Output {
-    std::process::Command::new(SGT)
+    sgt_env(data_dir, &[], args)
+}
+
+/// [`sgt`] with extra environment for the child — and therefore for any
+/// daemon it auto-spawns, which inherits it.
+///
+/// The one variable this file passes is `SGT_FAKE_SCRIPT`
+/// (`sergeant_rs::backend::fake::FAKE_SCRIPT_ENV`), whose documented purpose
+/// is exactly this: scripting the compiled-in fake inside a *spawned* daemon,
+/// where no test can hand it a `Vec<FakeStep>` in process. Its steps are one
+/// global FIFO read once at daemon startup, so it must be set on the command
+/// that does the spawning, and it must carry one step per Work that needs
+/// parking.
+fn sgt_env(data_dir: &DataDir, env: &[(&str, &str)], args: &[&str]) -> Output {
+    let mut command = std::process::Command::new(SGT);
+    command
         .current_dir(data_dir.path())
         .arg("--data-dir")
         .arg(data_dir.path())
-        .args(args)
-        .output()
-        .expect("run sgt")
+        .args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("run sgt")
 }
 
 fn descriptor_of(dir: &Path) -> Option<RuntimeDescriptor> {
@@ -1408,9 +1496,15 @@ fn descriptor_of(dir: &Path) -> Option<RuntimeDescriptor> {
 ///
 /// `DataDir`'s own Drop reaps this by /proc scan (SIGTERM, then SIGKILL) —
 /// never by waiting on this `Child`.
+///
+/// §4.2 makes `daemon` estate-scoped like every other verb but the five
+/// unscoped ones, so this runs in `dir` — an [`estate_data_dir`] — for the
+/// same reason [`sgt`] does. Nothing is inherited: the exact root is the
+/// child's own cwd, and §5.1 binds the daemon to it.
 #[allow(clippy::zombie_processes)]
 fn spawn_bare_daemon(dir: &DataDir) {
     let child = std::process::Command::new(SGT)
+        .current_dir(dir.path())
         .arg("--data-dir")
         .arg(dir.path())
         .arg("daemon")
@@ -1475,7 +1569,7 @@ fn stop_daemon(dir: &Path) {
 /// from what the daemon left behind on its way out.
 #[test]
 fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
-    let dir = DataDir::new();
+    let dir = estate_data_dir();
     let output = sgt(&dir, &["run", "auto-spawn a daemon to reap"]);
     assert!(
         output.status.success(),
@@ -1609,7 +1703,7 @@ fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
 
 #[test]
 fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
-    let dir = DataDir::new();
+    let dir = estate_data_dir();
 
     // No daemon running: `sgt run` auto-spawns one and submits.
     let output = sgt(&dir, &["run", "ship the M2 milestone"]);
@@ -1631,7 +1725,14 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     let works = listed["works"].as_array().expect("works array");
     assert_eq!(works.len(), 1);
     assert_eq!(works[0]["intent"], "ship the M2 milestone");
-    assert_eq!(works[0]["state"], "pending");
+    // §5.2: the auto-spawned daemon is bound to the estate this client
+    // admitted (`spawn_daemon` names it with `-C`), so the submission is
+    // planned and run rather than parked. `completed` is the fake backend's
+    // deterministic answer — every stage settles inside the submit call — and
+    // asserting it is what proves the spawned daemon really adopted *this*
+    // estate: a daemon bound to nothing would have left this `pending`.
+    assert_eq!(works[0]["state"], "completed");
+    assert_eq!(works[0]["repositories"], json!(["solo"]));
     assert_eq!(works[0]["created_by"], "cli");
 
     // A second daemon on the same data dir fails closed.
@@ -1654,12 +1755,27 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
 /// `sgt status`, `sgt work show <id>`, `sgt cancel <id>`, in both human and
 /// `--json` form. Everything here talks to a real daemon over the loopback
 /// API — no in-process shortcuts.
+///
+/// **Why the fake is scripted here (§5.2).** `cancel` needs a Work that is
+/// still cancelable, and a CLI submission into a bound estate now genuinely
+/// runs: unscripted, it reaches `completed` inside the submit call and
+/// `cancel` would be answering about a terminal state instead of exercising
+/// the cancel path this test exists for. One `needs_input` step parks the
+/// Work at the first stage — a real, non-terminal state the daemon reports
+/// through `status`/`work show` and a legal `→ canceled` edge — so every
+/// assertion below is about the CLI surface, not about a race with the
+/// engine.
 #[test]
 fn t7b_cli_status_show_and_cancel_through_the_binary() {
-    let dir = DataDir::new();
+    let dir = estate_data_dir();
 
-    // Auto-spawn + submit, reading the id straight out of --json.
-    let output = sgt(&dir, &["--json", "run", "inspect me"]);
+    // Auto-spawn + submit, reading the id straight out of --json. The script
+    // reaches the daemon this command spawns, because the child inherits it.
+    let output = sgt_env(
+        &dir,
+        &[("SGT_FAKE_SCRIPT", "needs_input:which database?")],
+        &["--json", "run", "inspect me"],
+    );
     assert!(
         output.status.success(),
         "sgt run failed: {}",
@@ -1681,14 +1797,14 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("daemon ok"), "status said: {stdout}");
     assert!(stdout.contains("work: 1 total"), "status said: {stdout}");
-    assert!(stdout.contains("pending: 1"), "status said: {stdout}");
+    assert!(stdout.contains("needs_input: 1"), "status said: {stdout}");
 
     // `sgt status --json`: the same facts, machine-shaped.
     let output = sgt(&dir, &["status", "--json"]);
     assert!(output.status.success());
     let status: Value = serde_json::from_slice(&output.stdout).expect("status --json prints JSON");
     assert_eq!(status["work_total"], 1);
-    assert_eq!(status["work_by_state"]["pending"], 1);
+    assert_eq!(status["work_by_state"]["needs_input"], 1);
     assert_eq!(status["system"]["api_revision"], "v1");
     assert_eq!(
         status["system"]["data_dir"].as_str(),
@@ -1701,7 +1817,7 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
     let shown: Value =
         serde_json::from_slice(&output.stdout).expect("work show prints the record as JSON");
     assert_eq!(shown["id"].as_str(), Some(work_id.as_str()));
-    assert_eq!(shown["state"], "pending");
+    assert_eq!(shown["state"], "needs_input");
     assert_eq!(shown["intent"], "inspect me");
 
     let output = sgt(&dir, &["work", "show", &work_id, "--json"]);
@@ -1740,7 +1856,7 @@ fn t7b_cli_status_show_and_cancel_through_the_binary() {
 
 #[test]
 fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
-    let dir = DataDir::new();
+    let dir = estate_data_dir();
     // Scoped threads so both racers share the one guarded data dir rather
     // than a copy of its path: whichever daemon survives the race, the guard
     // that reaps it is the same object.
@@ -1796,23 +1912,39 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
     stop_daemon(dir.path());
 }
 
-#[test]
-fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
-    // Stale: dead PID, refused endpoint → the client replaces it and spawns.
-    let dir = DataDir::new();
-    std::fs::create_dir_all(dir.path()).expect("data dir");
-    let stale = json!({
-        "schema": "sergeant.runtime/v1",
-        "endpoint": "http://127.0.0.1:1",
-        "pid": 999_999_999u32,
+/// Hand-write a `sergeant.runtime/v2` descriptor into `dir`, bound to `dir`
+/// itself as its estate root.
+///
+/// The binding matters even for a descriptor whose whole point is to be
+/// dead: §5.1 has clients verify `estate_root` **before** they judge
+/// staleness or probe the endpoint, so a fabricated descriptor naming some
+/// other root would get the mismatch refusal and the staleness path under
+/// test would never run. The canonical form is what
+/// [`Workspace::admit`](sergeant_rs::domain::workspace::Workspace::admit)
+/// puts in the descriptor, so it is what a fixture must reproduce.
+fn write_fabricated_descriptor(dir: &DataDir, endpoint: &str, pid: u32, token: &str) {
+    let root = std::fs::canonicalize(dir.path()).expect("canonical estate root");
+    let descriptor = json!({
+        "schema": "sergeant.runtime/v2",
+        "endpoint": endpoint,
+        "pid": pid,
         "api_revision": "v1",
-        "token": "dead",
+        "token": token,
+        "estate_root": root,
+        "manifest_path": root.join("sergeant.toml"),
     });
     std::fs::write(
         daemon::descriptor_path(dir.path()),
-        serde_json::to_vec(&stale).expect("stale json"),
+        serde_json::to_vec(&descriptor).expect("descriptor json"),
     )
-    .expect("write stale descriptor");
+    .expect("write fabricated descriptor");
+}
+
+#[test]
+fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
+    // Stale: dead PID, refused endpoint → the client replaces it and spawns.
+    let dir = estate_data_dir();
+    write_fabricated_descriptor(&dir, "http://127.0.0.1:1", 999_999_999, "dead");
     let output = sgt(&dir, &["run", "after stale descriptor"]);
     assert!(
         output.status.success(),
@@ -1825,20 +1957,8 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
 
     // Ambiguous: alive PID (this test process), unresponsive endpoint →
     // fail closed with a diagnostic, never a second daemon.
-    let dir = DataDir::new();
-    std::fs::create_dir_all(dir.path()).expect("data dir");
-    let ambiguous = json!({
-        "schema": "sergeant.runtime/v1",
-        "endpoint": "http://127.0.0.1:1",
-        "pid": std::process::id(),
-        "api_revision": "v1",
-        "token": "ambiguous",
-    });
-    std::fs::write(
-        daemon::descriptor_path(dir.path()),
-        serde_json::to_vec(&ambiguous).expect("ambiguous json"),
-    )
-    .expect("write ambiguous descriptor");
+    let dir = estate_data_dir();
+    write_fabricated_descriptor(&dir, "http://127.0.0.1:1", std::process::id(), "ambiguous");
     let output = sgt(&dir, &["run", "must fail closed"]);
     assert!(
         !output.status.success(),
@@ -1859,42 +1979,61 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
 /// client dead — the same fail-closed rule an unknown snapshot schema gets.
 /// Half-interpreting it could mean talking to the wrong process, or spawning
 /// a second daemon on a data dir that already has an owner.
+///
+/// **Both directions, since estate-root §5.1 bumped the schema to
+/// `sergeant.runtime/v2`.** A newer build's descriptor was always the
+/// forward case; `sergeant.runtime/v1` is now the backward one, and it is not
+/// hypothetical — it is what a daemon from the previous release leaves on
+/// disk. There is deliberately no compatibility shim: a v1 descriptor carries
+/// no `estate_root`, so a client could not verify §5.1's binding against it
+/// at all, and reading it half-way is exactly the "talking to the wrong
+/// process" failure above. Both refusals must also carry the *remedy* (stop
+/// the old daemon and let a restarted one republish), because an operator
+/// staring at a live-but-unusable daemon has no other way to know what to do.
 #[test]
 fn descriptor_with_an_unknown_schema_fails_closed() {
-    let dir = DataDir::new();
-    std::fs::create_dir_all(dir.path()).expect("data dir");
-    let from_the_future = json!({
-        "schema": "sergeant.runtime/v2",
-        "endpoint": "http://127.0.0.1:1",
-        "pid": std::process::id(),
-        "api_revision": "v2",
-        "token": "from-the-future",
-    });
-    let path = daemon::descriptor_path(dir.path());
-    std::fs::write(&path, serde_json::to_vec(&from_the_future).expect("json"))
-        .expect("write future descriptor");
+    for (label, schema) in [
+        ("from the future", "sergeant.runtime/v3"),
+        ("from the previous release", "sergeant.runtime/v1"),
+    ] {
+        let dir = estate_data_dir();
+        let unreadable = json!({
+            "schema": schema,
+            "endpoint": "http://127.0.0.1:1",
+            "pid": std::process::id(),
+            "api_revision": "v1",
+            "token": "unreadable",
+        });
+        let path = daemon::descriptor_path(dir.path());
+        std::fs::write(&path, serde_json::to_vec(&unreadable).expect("json"))
+            .expect("write descriptor");
 
-    let output = sgt(&dir, &["work", "list"]);
-    assert!(
-        !output.status.success(),
-        "an unknown descriptor schema must fail closed, got: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unknown schema") && stderr.contains("sergeant.runtime/v2"),
-        "the diagnostic must name the schema it refused, got: {stderr}"
-    );
-    // It refused *before* acting: no daemon was spawned (spawning is what
-    // creates daemon.log) and the descriptor is untouched.
-    assert!(
-        !dir.path().join("daemon.log").exists(),
-        "a refused descriptor must not spawn a daemon"
-    );
-    assert_eq!(
-        std::fs::read(&path).expect("descriptor still there"),
-        serde_json::to_vec(&from_the_future).expect("json"),
-    );
+        let output = sgt(&dir, &["work", "list"]);
+        assert!(
+            !output.status.success(),
+            "a descriptor {label} must fail closed, got: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unknown schema") && stderr.contains(schema),
+            "the diagnostic must name the schema it refused, got: {stderr}"
+        );
+        assert!(
+            stderr.contains("stop it") && stderr.contains("republishes"),
+            "the refusal must carry the stop/restart remedy, got: {stderr}"
+        );
+        // It refused *before* acting: no daemon was spawned (spawning is what
+        // creates daemon.log) and the descriptor is untouched.
+        assert!(
+            !dir.path().join("daemon.log").exists(),
+            "a refused descriptor must not spawn a daemon"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("descriptor still there"),
+            serde_json::to_vec(&unreadable).expect("json"),
+        );
+    }
 }
 
 /// Two clients replacing the *same* stale descriptor must not leave the
@@ -1905,22 +2044,15 @@ fn descriptor_with_an_unknown_schema_fails_closed() {
 /// successor's record and wedges the data dir for good.
 #[test]
 fn concurrent_stale_replacement_leaves_the_surviving_daemon_discoverable() {
-    let dir = DataDir::new();
-    std::fs::create_dir_all(dir.path()).expect("data dir");
+    let dir = estate_data_dir();
     let blackhole = std::net::TcpListener::bind("127.0.0.1:0").expect("blackhole listener");
     let port = blackhole.local_addr().expect("blackhole addr").port();
-    let stale = json!({
-        "schema": "sergeant.runtime/v1",
-        "endpoint": format!("http://127.0.0.1:{port}"),
-        "pid": 999_999_999u32,
-        "api_revision": "v1",
-        "token": "dead",
-    });
-    std::fs::write(
-        daemon::descriptor_path(dir.path()),
-        serde_json::to_vec(&stale).expect("stale json"),
-    )
-    .expect("write stale descriptor");
+    write_fabricated_descriptor(
+        &dir,
+        &format!("http://127.0.0.1:{port}"),
+        999_999_999,
+        "dead",
+    );
 
     let (out_a, out_b) = std::thread::scope(|scope| {
         let a = scope.spawn(|| sgt(&dir, &["run", "stale racer A"]));
@@ -2349,7 +2481,7 @@ async fn sse_resume_after_a_disconnect_mid_history_replay_yields_exactly_the_rem
 /// state and intent.
 #[test]
 fn work_list_human_form_prints_the_empty_and_populated_branches() {
-    let dir = DataDir::new();
+    let dir = estate_data_dir();
     // `work list` no longer auto-spawns (ADR 0009), so the empty-fleet
     // branch needs a daemon already running with nothing submitted to it.
     spawn_bare_daemon(&dir);
@@ -2374,9 +2506,13 @@ fn work_list_human_form_prints_the_empty_and_populated_branches() {
     let output = sgt(&dir, &["work", "list"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // The state on that line is `completed`, not `pending`: §5.2 binds the
+    // bare daemon above to this estate, so the submission really ran. What is
+    // being read here is the *rendering* — one line, id + state + intent —
+    // and the state has to be whatever the daemon actually answered.
     assert!(
         stdout.contains(&work_id)
-            && stdout.contains("pending")
+            && stdout.contains("completed")
             && stdout.contains("list me in human form"),
         "each work must print one line naming its id, state and intent: {stdout}"
     );
@@ -2392,7 +2528,7 @@ fn work_list_human_form_prints_the_empty_and_populated_branches() {
 /// it.
 #[test]
 fn retry_success_prints_the_human_readable_line() {
-    let dir = DataDir::new();
+    let dir = estate_data_dir();
     let work_id = ulid();
     seed_run_in_state(
         dir.path(),
@@ -2431,19 +2567,65 @@ impl Drop for ReapOnDrop {
     }
 }
 
+/// The data dir `sgt --json doctor` reports it resolved, run in `cwd` with
+/// exactly `env` layered on.
+///
+/// `doctor` is the instrument for the platform-fallback rungs below because
+/// §4.2 leaves it one of the five commands usable *outside* an estate, and
+/// §4.1 leaves nothing else that can stand in a directory which is not a
+/// root. It runs the same `resolve_data_dir` every other command does, it
+/// creates the directory it resolves, and — its own documented rule — it
+/// never spawns a daemon, so nothing here needs reaping.
+fn doctor_data_dir(cwd: &Path, env: &[(&str, &Path)], unset: &[&str]) -> PathBuf {
+    let mut command = Command::new(SGT);
+    command.args(["--json", "doctor"]).current_dir(cwd);
+    for name in unset {
+        command.env_remove(name);
+    }
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = command.output().expect("run sgt doctor");
+    // Not asserted successful on purpose: outside an estate root, `doctor`'s
+    // own `estate_root` row fails (§4.4) and the command exits nonzero — that
+    // is the *correct* answer here, and it still prints its full report.
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("doctor --json must print JSON");
+    PathBuf::from(report["data_dir"].as_str().expect("data_dir"))
+}
+
 /// `resolve_data_dir`'s fallback chain, one link at a time, with no
 /// `--data-dir` flag at all so the client's own env resolution is what is
 /// under test rather than an override of it: `SGT_DATA_DIR` wins outright;
 /// absent that, `$XDG_DATA_HOME/sergeant`; absent both, `$HOME/.local/share/sergeant`.
+///
+/// **What estate-root Phase D changed under this pin, and what it did not.**
+/// The `--data-dir`/`SGT_DATA_DIR` rungs are untouched: they locate a data
+/// dir and have never substituted for root validation (§4.1). What moved is
+/// the rung *beneath* them — "the discovered estate" is now the exact root,
+/// not an upward walk — and that has one consequence for how the rungs below
+/// *it* can be reached at all. An estate-scoped verb like `run` must stand in
+/// a valid root (§4.3), and standing in one means the estate rung resolves
+/// and the platform tail never runs. So the platform rungs are exercised
+/// where they are actually reachable: from a directory that is not a root, by
+/// the one unscoped command that reports what it resolved
+/// ([`doctor_data_dir`]). The first rung keeps its live-daemon evidence,
+/// because `run` is exactly the command whose spawn the override has to
+/// re-point — and now proves one thing more: the env rung outranks the
+/// estate's own default even while standing in the estate.
 #[test]
 fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
-    // SGT_DATA_DIR wins even with XDG_DATA_HOME and HOME also set.
+    // SGT_DATA_DIR wins even with XDG_DATA_HOME and HOME also set — and even
+    // when the estate the command is standing in has a default of its own.
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "data-dir-precedence", &["solo"]);
     let sgt_dir = TempDir::new().expect("tempdir");
     let xdg = TempDir::new().expect("tempdir");
     let home = TempDir::new().expect("tempdir");
     let _reap = ReapOnDrop(sgt_dir.path().to_path_buf());
     let output = Command::new(SGT)
         .args(["run", "resolve data dir fallback probe"])
+        .current_dir(estate.path())
         .env("SGT_DATA_DIR", sgt_dir.path())
         .env("XDG_DATA_HOME", xdg.path())
         .env("HOME", home.path())
@@ -2460,13 +2642,18 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     );
     assert!(!xdg.path().join("sergeant").exists());
     assert!(!home.path().join(".local").exists());
+    assert!(
+        !estate.path().join(".sergeant").exists(),
+        "SGT_DATA_DIR must also outrank the estate's own `.sergeant/data` default \
+         (ADR 0008(a): the estate narrows what the *default* is, it does not outrank \
+         an explicit override)"
+    );
     drop(_reap);
 
     // Absent SGT_DATA_DIR, the OS's own fallback-tail convention is next
-    // (`src/platform/data_dir.rs`, #82). Run from a cwd outside any estate:
-    // an in-tree cwd would let step 3 (estate discovery, `resolve_data_dir`)
-    // resolve first and this fallback rung would never actually be
-    // exercised.
+    // (`src/platform/data_dir.rs`, #82). Run from a cwd that is not an estate
+    // root: standing in one would let the estate rung resolve first and this
+    // fallback rung would never actually be exercised.
     //
     // **#82, closed by measurement (MacBook Pro M3 Pro, 2026-08-15).** This
     // block used to assert `XDG_DATA_HOME/sergeant` unconditionally — true
@@ -2480,29 +2667,21 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     let xdg2 = TempDir::new().expect("tempdir");
     let home2 = TempDir::new().expect("tempdir");
     let cwd2 = TempDir::new().expect("tempdir");
-    let resolved = if cfg!(target_os = "macos") {
+    let expected = if cfg!(target_os = "macos") {
         home2.path().join("Library/Application Support/sergeant")
     } else {
         xdg2.path().join("sergeant")
     };
-    let _reap = ReapOnDrop(resolved.clone());
-    let output = Command::new(SGT)
-        .args(["run", "resolve data dir fallback probe"])
-        .current_dir(cwd2.path())
-        .env_remove("SGT_DATA_DIR")
-        .env("XDG_DATA_HOME", xdg2.path())
-        .env("HOME", home2.path())
-        .output()
-        .expect("run sgt with XDG_DATA_HOME and HOME");
-    assert!(
-        output.status.success(),
-        "sgt run: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let resolved = doctor_data_dir(
+        cwd2.path(),
+        &[("XDG_DATA_HOME", xdg2.path()), ("HOME", home2.path())],
+        &["SGT_DATA_DIR"],
     );
-    assert!(
-        resolved.join("journal").is_dir(),
-        "this platform's own fallback-tail convention must be used: {resolved:?}"
+    assert_eq!(
+        resolved, expected,
+        "this platform's own fallback-tail convention must be used"
     );
+    assert!(resolved.is_dir(), "the resolved data dir must be created");
     if cfg!(target_os = "macos") {
         assert!(
             !xdg2.path().join("sergeant").exists(),
@@ -2511,35 +2690,26 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
     } else {
         assert!(!home2.path().join(".local").exists());
     }
-    drop(_reap);
 
     // Absent both, `$HOME`'s own convention-suffix is the last resort. Same
     // cwd-isolation reasoning as above, and the same platform split.
     let home3 = TempDir::new().expect("tempdir");
     let cwd3 = TempDir::new().expect("tempdir");
-    let resolved = if cfg!(target_os = "macos") {
+    let expected = if cfg!(target_os = "macos") {
         home3.path().join("Library/Application Support/sergeant")
     } else {
         home3.path().join(".local/share/sergeant")
     };
-    let _reap = ReapOnDrop(resolved.clone());
-    let output = Command::new(SGT)
-        .args(["run", "resolve data dir fallback probe"])
-        .current_dir(cwd3.path())
-        .env_remove("SGT_DATA_DIR")
-        .env_remove("XDG_DATA_HOME")
-        .env("HOME", home3.path())
-        .output()
-        .expect("run sgt with only HOME");
-    assert!(
-        output.status.success(),
-        "sgt run: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let resolved = doctor_data_dir(
+        cwd3.path(),
+        &[("HOME", home3.path())],
+        &["SGT_DATA_DIR", "XDG_DATA_HOME"],
     );
-    assert!(
-        resolved.join("journal").is_dir(),
-        "HOME's own convention suffix must be used: {resolved:?}"
+    assert_eq!(
+        resolved, expected,
+        "HOME's own convention suffix must be used"
     );
+    assert!(resolved.is_dir(), "the resolved data dir must be created");
 }
 
 // --------------------------------------------- §22.6 core-lock discipline
@@ -2632,12 +2802,29 @@ fn seed_blocked_run(data_dir: &Path, work_id: &str) {
 }
 
 /// Start a daemon whose only backend is `fake`, so a test can stall it.
+///
+/// Bound to no estate (§5.1's `None`), which is what every caller here wants:
+/// they seed a run into the journal and drive it directly, so a submission
+/// that planned against a real estate would only add topology none of them is
+/// asserting about. [`start_with_fake_bound`] is for the one that does.
 async fn start_with_fake(data_dir: &Path, fake: &FakeBackend) -> DaemonHandle {
+    start_with_fake_bound(data_dir, fake, None).await
+}
+
+/// [`start_with_fake`], bound to `estate_root` (§5.1) — the daemon plans
+/// against that estate and nothing else, whatever a request's `origin.cwd`
+/// says.
+async fn start_with_fake_bound(
+    data_dir: &Path,
+    fake: &FakeBackend,
+    estate_root: Option<&Path>,
+) -> DaemonHandle {
     daemon::start_with(
         data_dir,
         DaemonConfig {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            estate_root: estate_root.map(Path::to_path_buf),
             ..DaemonConfig::default()
         },
     )
@@ -3478,11 +3665,22 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 /// 3.4 MB `.git`, i.e. exactly the regression the failure message named —
 /// dropped the real path to 11.4 works/s and this test still passed.
 ///
-/// So it submits what `scripts/perf/s1-burst.sh` submits: `origin.cwd` in a
-/// seeded repository carrying a two-stage workflow, so every accepted call
-/// discovers a workspace, resolves and binds a workflow, materializes a
-/// worktree, reserves an execution and runs the stages. A call's latency is a
-/// work's end-to-end latency, which is what the A-N3-1 number means.
+/// So it submits what `scripts/perf/s1-burst.sh` submits, over the same work:
+/// a seeded estate carrying a two-stage workflow and one mount, so every
+/// accepted call resolves the estate, resolves and binds a workflow,
+/// materializes a worktree, reserves an execution and runs the stages. A
+/// call's latency is a work's end-to-end latency, which is what the A-N3-1
+/// number means.
+///
+/// **Estate-root §5.2 moved where the topology comes from, not how much of
+/// it is done.** `origin.cwd` used to be what made this the whole submit
+/// path; the daemon is now *bound* to the estate at startup and re-reads its
+/// manifest per plan, so the binding below is what arms the same work. The
+/// requests still carry `origin.cwd` — it is recorded evidence (§13.3) and
+/// the shape `s1-burst.sh` sends — but it decides nothing, and a version of
+/// this test that dropped the binding would silently go back to measuring
+/// the HTTP surface (`Ok(None)`, everything `pending`), which is precisely
+/// what the completion assertion below exists to catch.
 ///
 /// **The floor, and how it is scaled.** A-N3-1's amended budget is ≥24
 /// works/s at burst 50 on a quiet machine. This runs at burst 25 inside a
@@ -3541,12 +3739,11 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     const BURST: usize = 25;
 
     let dir = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    seed_workflow_repo(&repo);
+    let estate = TempDir::new().expect("tempdir");
+    let repo = seed_workflow_estate(estate.path());
 
     let fake = FakeBackend::new(FAKE_BACKEND_NAME);
-    let handle = start_with_fake(dir.path(), &fake).await;
+    let handle = start_with_fake_bound(dir.path(), &fake, Some(estate.path())).await;
     let http = client();
 
     let started = Instant::now();
@@ -3612,13 +3809,20 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     );
 }
 
-/// A repository the submit path can actually run in: one commit, and a
-/// two-stage workflow under `.sergeant/workflows/`.
+/// An estate the submit path can actually run in: one mount with a commit and
+/// a source file, and the two-stage `software-change` workflow. Returns the
+/// mount, which is what a request's `origin.cwd` names.
 ///
-/// The same shape `scripts/perf/s1-burst.sh` seeds, because a throughput floor
-/// asserted here is only comparable to the budget if it submits the same work.
-fn seed_workflow_repo(repo: &Path) {
-    let workflow = repo.join(".sergeant/workflows/software-change");
+/// The same work `scripts/perf/s1-burst.sh` seeds, because a throughput floor
+/// asserted here is only comparable to the budget if it submits the same work
+/// — relocated to §6.1's shape, which is where every part of it now lives: the
+/// checkout at the estate's derived `repos/<name>` mount rather than wherever
+/// a `path` key pointed, and the workflow catalog at the estate root rather
+/// than inside the repository, because §5.2 resolves it against the bound
+/// estate.
+fn seed_workflow_estate(root: &Path) -> PathBuf {
+    support::scaffold_estate(root, "throughput", &["solo"]);
+    let workflow = root.join(".sergeant/workflows/software-change");
     for stage in ["10-implement", "20-review"] {
         std::fs::create_dir_all(workflow.join(stage)).expect("stage dir");
         std::fs::write(
@@ -3633,26 +3837,12 @@ fn seed_workflow_repo(repo: &Path) {
          stages = [\"10-implement\", \"20-review\"]\n",
     )
     .expect("workflow.toml");
+    let repo = root.join("repos").join("solo");
     std::fs::write(repo.join("payments.py"), "def settle(payment):\n    pass\n")
         .expect("source file");
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["add", "-A"],
-        vec!["commit", "-qm", "throughput fixture"],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(repo)
-            .env("GIT_AUTHOR_NAME", "sergeant tests")
-            .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
-            .env("GIT_COMMITTER_NAME", "sergeant tests")
-            .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
-            .expect("run git");
-        assert!(output.status.success(), "git {args:?}: {output:?}");
-    }
+    support::git(&repo, &["add", "-A"]);
+    support::git(&repo, &["commit", "-qm", "throughput fixture"]);
+    repo
 }
 
 // --------------- R-MVP1-6: the intent schema (Lane B, MVP-1)
@@ -4085,39 +4275,17 @@ async fn r_mvp1_6_a_payload_carrying_an_unknown_key_replays_byte_identical() {
 // — and then genuinely calls `retry` (or, where that door does not exist,
 // documents why and proves the door that does).
 //
-// Local helpers: this suite has no repository/workflow machinery of its own
-// (M2's scope predates it), so a minimal, self-contained copy lives here
-// rather than reaching into `m3_execution.rs` (Lane A/B's file).
-
-fn r_mvp1_10_git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("git");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn r_mvp1_10_init_repo(path: &Path) {
-    std::fs::create_dir_all(path).expect("repo dir");
-    r_mvp1_10_git(path, &["init", "-b", "main"]);
-    std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
-    r_mvp1_10_git(path, &["add", "."]);
-    r_mvp1_10_git(path, &["commit", "-m", "initial"]);
-}
+// Fixtures: the estate shape §4.1/§6.1 requires — a root whose own
+// `sergeant.toml` declares `[estate]` and one repository, mounted at the
+// derived `repos/solo`. `support::scaffold_estate` builds exactly that and is
+// shared with every other suite, so the hand-rolled git/init pair this file
+// used to carry is gone rather than kept in sync (the estate is now the unit
+// these tests need; a bare repository is no longer one).
 
 /// A workflow with `n` trivial actor stages, `00-stage`, `01-stage`, ...
+///
+/// Published at the **estate root**, not inside a repository: §5.2 resolves
+/// the catalog against the estate the daemon was started against.
 fn r_mvp1_10_write_n_stage_workflow(root: &Path, name: &str, n: usize) {
     let dir = root.join(".sergeant/workflows").join(name);
     std::fs::create_dir_all(&dir).expect("workflow dir");
@@ -4137,10 +4305,15 @@ fn r_mvp1_10_write_n_stage_workflow(root: &Path, name: &str, n: usize) {
     }
 }
 
+/// Start a daemon **bound** to `estate_root` (§5.1): the fault each test
+/// below injects has to land on a run that really materialized, and a daemon
+/// bound to nothing plans nothing, so binding is what arms every fixture
+/// here rather than a detail of the rig.
 async fn r_mvp1_10_start(
     data_dir: &Path,
     registry: BackendRegistry,
     completion_poll: Duration,
+    estate_root: &Path,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
@@ -4148,6 +4321,7 @@ async fn r_mvp1_10_start(
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll,
+            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -4155,6 +4329,13 @@ async fn r_mvp1_10_start(
     .expect("daemon start")
 }
 
+/// Submit through the API the way the CLI does.
+///
+/// `cwd` is sent because §13.3 still records it as origin evidence, and
+/// leaving it out would stop exercising the field — but since §5.2 it decides
+/// nothing: the daemon plans against the estate it was started against. It is
+/// passed the estate root here so the recorded evidence matches where the
+/// run actually happened.
 async fn r_mvp1_10_submit(
     http: &reqwest::Client,
     handle: &DaemonHandle,
@@ -4243,10 +4424,9 @@ fn r_mvp1_10_block_reason(data_dir: &Path, work_id: &str) -> String {
 async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_cancel() {
     use std::os::unix::fs::PermissionsExt;
 
-    let repos = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
 
     // Arm the fault before the daemon exists: `<data_dir>/surfaces` is the
     // default surfaces root (R-MVP1-1) `materialize` will `mkdir` a work's
@@ -4278,10 +4458,16 @@ async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_ca
 
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
     let registry = BackendRegistry::new().with(Arc::new(fake));
-    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let handle = r_mvp1_10_start(
+        data.path(),
+        registry,
+        Duration::from_millis(30),
+        estate.path(),
+    )
+    .await;
     let http = client();
 
-    let body = r_mvp1_10_submit(&http, &handle, &repo, "materialize will fail", None).await;
+    let body = r_mvp1_10_submit(&http, &handle, estate.path(), "materialize will fail", None).await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(
         body["work"]["state"], "blocked",
@@ -4344,11 +4530,10 @@ async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_ca
 /// `blocked` signal.
 #[tokio::test]
 async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry() {
-    let repos = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
-    r_mvp1_10_write_n_stage_workflow(&repo, "two", 2);
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
+    r_mvp1_10_write_n_stage_workflow(estate.path(), "two", 2);
 
     // `settle(8)` holds stage 1 open ~8 driver ticks so submit's own answer
     // still observes `active`; the pre-armed flip below is what makes stage
@@ -4361,10 +4546,23 @@ async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry
     // succeeds, then the backend refuses `prepare()` from stage 2 on.
     fake.set_available_after_launches(1, "maintenance window");
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
-    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let handle = r_mvp1_10_start(
+        data.path(),
+        registry,
+        Duration::from_millis(30),
+        estate.path(),
+    )
+    .await;
     let http = client();
 
-    let body = r_mvp1_10_submit(&http, &handle, &repo, "flip me mid-run", Some("two")).await;
+    let body = r_mvp1_10_submit(
+        &http,
+        &handle,
+        estate.path(),
+        "flip me mid-run",
+        Some("two"),
+    )
+    .await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(
         body["work"]["state"], "active",
@@ -4421,11 +4619,10 @@ async fn r_mvp1_10_active_to_blocked_from_a_real_backend_refusal_exits_via_retry
 /// concern.
 #[tokio::test]
 async fn r_mvp1_10_needs_input_to_blocked_from_real_envelope_exhaustion_at_send_exits_via_retry() {
-    let repos = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
-    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
+    r_mvp1_10_write_n_stage_workflow(estate.path(), "one", 1);
 
     // DEFAULT_TURN_CAP: turn 1 is the launch, the rest are delivered
     // answers — one `needs_input` step per turn, CAP steps in total.
@@ -4433,10 +4630,16 @@ async fn r_mvp1_10_needs_input_to_blocked_from_real_envelope_exhaustion_at_send_
     let script: Vec<FakeStep> = (0..cap).map(|_| FakeStep::needs_input("more?")).collect();
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
     let registry = BackendRegistry::new().with(Arc::new(fake));
-    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let handle = r_mvp1_10_start(
+        data.path(),
+        registry,
+        Duration::from_millis(30),
+        estate.path(),
+    )
+    .await;
     let http = client();
 
-    let body = r_mvp1_10_submit(&http, &handle, &repo, "keep asking", Some("one")).await;
+    let body = r_mvp1_10_submit(&http, &handle, estate.path(), "keep asking", Some("one")).await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "needs_input", "{body}");
 
@@ -4514,28 +4717,40 @@ async fn r_mvp1_10_needs_input_to_blocked_from_real_envelope_exhaustion_at_send_
 /// `SEND` boundary) even though both land in `active → blocked`.
 #[tokio::test]
 async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
-    let repos = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
     // One more stage than DEFAULT_TURN_CAP: the first `cap` stages spend
     // the whole envelope completing; the next stage's own LAUNCH is the one
     // the cap refuses.
     let cap = DEFAULT_TURN_CAP as usize;
     let stages = cap + 1;
-    r_mvp1_10_write_n_stage_workflow(&repo, "long", stages);
+    r_mvp1_10_write_n_stage_workflow(estate.path(), "long", stages);
     let blocked_stage_id = format!("{cap:02}-stage");
 
     let script: Vec<FakeStep> = (0..stages).map(|_| FakeStep::complete()).collect();
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
     let registry = BackendRegistry::new().with(Arc::new(fake));
-    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let handle = r_mvp1_10_start(
+        data.path(),
+        registry,
+        Duration::from_millis(30),
+        estate.path(),
+    )
+    .await;
     let http = client();
 
     // Every stage settles synchronously (no settle delay), so the whole
     // chain — `cap` completions and the next stage's refused launch — runs
     // inside this one submit request.
-    let body = r_mvp1_10_submit(&http, &handle, &repo, "run past the cap", Some("long")).await;
+    let body = r_mvp1_10_submit(
+        &http,
+        &handle,
+        estate.path(),
+        "run past the cap",
+        Some("long"),
+    )
+    .await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "blocked", "{body}");
     assert_eq!(
@@ -4611,21 +4826,33 @@ async fn r_mvp1_10_envelope_exhausted_at_launch_exits_via_retry() {
 /// on the identical condition.
 #[tokio::test]
 async fn r_mvp1_10_extend_then_retry_genuinely_reopens_the_envelope_exhausted_landing() {
-    let repos = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
     let cap = DEFAULT_TURN_CAP as usize;
     let stages = cap + 1;
-    r_mvp1_10_write_n_stage_workflow(&repo, "long", stages);
+    r_mvp1_10_write_n_stage_workflow(estate.path(), "long", stages);
 
     let script: Vec<FakeStep> = (0..stages).map(|_| FakeStep::complete()).collect();
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
     let registry = BackendRegistry::new().with(Arc::new(fake));
-    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let handle = r_mvp1_10_start(
+        data.path(),
+        registry,
+        Duration::from_millis(30),
+        estate.path(),
+    )
+    .await;
     let http = client();
 
-    let body = r_mvp1_10_submit(&http, &handle, &repo, "extend past the cap", Some("long")).await;
+    let body = r_mvp1_10_submit(
+        &http,
+        &handle,
+        estate.path(),
+        "extend past the cap",
+        Some("long"),
+    )
+    .await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "blocked", "{body}");
     let reason = r_mvp1_10_block_reason(data.path(), &work_id);
@@ -4669,18 +4896,23 @@ async fn r_mvp1_10_extend_then_retry_genuinely_reopens_the_envelope_exhausted_la
 /// must be structured (409, naming the actual state), not a silent no-op.
 #[tokio::test]
 async fn r_mvp1_10_extend_refuses_a_work_that_is_not_blocked() {
-    let repos = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
-    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
+    r_mvp1_10_write_n_stage_workflow(estate.path(), "one", 1);
 
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
     let registry = BackendRegistry::new().with(Arc::new(fake));
-    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let handle = r_mvp1_10_start(
+        data.path(),
+        registry,
+        Duration::from_millis(30),
+        estate.path(),
+    )
+    .await;
     let http = client();
 
-    let body = r_mvp1_10_submit(&http, &handle, &repo, "finishes clean", Some("one")).await;
+    let body = r_mvp1_10_submit(&http, &handle, estate.path(), "finishes clean", Some("one")).await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "completed", "{body}");
 
@@ -4704,18 +4936,23 @@ async fn r_mvp1_10_extend_refuses_a_work_that_is_not_blocked() {
 /// command outcome is journaled.
 #[tokio::test]
 async fn r_mvp1_10_extend_refuses_zero_additional_turns() {
-    let repos = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
-    r_mvp1_10_write_n_stage_workflow(&repo, "one", 1);
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
+    r_mvp1_10_write_n_stage_workflow(estate.path(), "one", 1);
 
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::complete()]);
     let registry = BackendRegistry::new().with(Arc::new(fake));
-    let handle = r_mvp1_10_start(data.path(), registry, Duration::from_millis(30)).await;
+    let handle = r_mvp1_10_start(
+        data.path(),
+        registry,
+        Duration::from_millis(30),
+        estate.path(),
+    )
+    .await;
     let http = client();
 
-    let body = r_mvp1_10_submit(&http, &handle, &repo, "finishes clean", Some("one")).await;
+    let body = r_mvp1_10_submit(&http, &handle, estate.path(), "finishes clean", Some("one")).await;
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
 
     let (status, _, extend_body) = post_json(
@@ -4742,14 +4979,18 @@ async fn r_mvp1_10_extend_refuses_zero_additional_turns() {
 /// the block reason.
 #[test]
 fn r_mvp1_7_sgt_turn_cap_env_var_reaches_a_real_spawned_daemon() {
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    r_mvp1_10_init_repo(&repo);
-    r_mvp1_10_write_n_stage_workflow(&repo, "three", 3);
+    // §4.3: the estate root is admitted before the data dir is resolved or
+    // anything is spawned, so the binary has to run *at* one; §5.1 then binds
+    // the daemon it spawns to that same root (`-C`), which is what makes this
+    // a test of `SGT_TURN_CAP` rather than of where the run's topology came
+    // from.
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "solo", &["solo"]);
+    r_mvp1_10_write_n_stage_workflow(estate.path(), "three", 3);
 
     let data = DataDir::new();
     let output = std::process::Command::new(SGT)
-        .current_dir(&repo)
+        .current_dir(estate.path())
         .arg("--data-dir")
         .arg(data.path())
         .arg("--json")

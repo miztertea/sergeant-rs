@@ -84,31 +84,38 @@ fn http() -> reqwest::Client {
         .expect("client")
 }
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "sergeant tests")
-        .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
-        .env("GIT_COMMITTER_NAME", "sergeant tests")
-        .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+/// An estate root with exactly one repository, and that repository's derived
+/// mount — the only shape a Work can bind to now.
+///
+/// Estate-root §6.1 removed `[[repo]] path`: a mount is always
+/// `<estate-root>/repos/<name>`, so a bare `TempDir` holding a git repo is no
+/// longer anything the engine will plan against. `support::scaffold_solo_estate`
+/// is the shared builder for that shape; the mount comes back because
+/// `origin.cwd` on a submission is recorded evidence only now (§13.3), and the
+/// mount is the honest thing to record.
+///
+/// One repository on purpose, in every caller: a single-repository estate
+/// infers its sole repository on an empty scope, which is what keeps the
+/// submissions below scope-free.
+fn solo_estate(name: &str) -> (TempDir, PathBuf) {
+    let root = TempDir::new().expect("tempdir");
+    let (mount, _head) = support::scaffold_solo_estate(root.path(), name);
+    (root, mount)
 }
 
-fn init_repo(path: &Path) -> PathBuf {
-    std::fs::create_dir_all(path).expect("repo dir");
-    git(path, &["init", "-b", "main"]);
-    std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
-    git(path, &["add", "."]);
-    git(path, &["commit", "-m", "initial"]);
-    path.to_path_buf()
+/// An estate root with a valid `[estate]` manifest and no repositories yet —
+/// the state a fresh `sgt init` leaves, and all a daemon needs to be
+/// *admitted* (§4.1 admission is structural: `Workspace::admit` never
+/// resolves mounts, so "nothing declared yet" is not an estate-identity
+/// fault). Used by the tests whose subject is the daemon's own lifecycle
+/// rather than anything it would plan.
+fn empty_estate(root: &Path, name: &str) {
+    std::fs::create_dir_all(root).expect("estate root");
+    std::fs::write(
+        root.join("sergeant.toml"),
+        format!("[estate]\nname = {name:?}\n"),
+    )
+    .expect("write sergeant.toml");
 }
 
 /// A two-stage workflow so the stage coordinate is non-trivial on screen.
@@ -143,8 +150,16 @@ fn write_solo_workflow(root: &Path) {
     std::fs::write(dir.join("00-only").join("CONTEXT.md"), "context").expect("CONTEXT.md");
 }
 
+/// Start an in-process daemon **bound** to `estate_root` (estate-root §5.1).
+///
+/// The binding is not optional decoration: `Engine::plan` reads the estate the
+/// daemon was started against, never the request's `origin.cwd` (§13.3), so a
+/// daemon left with `estate_root: None` plans against nothing and every
+/// submission below would sit on `pending` forever — no surface, no stage, no
+/// backend, and every content assertion in this file reading a blank row.
 async fn start_fake(
     data_dir: &Path,
+    estate_root: &Path,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
@@ -154,6 +169,7 @@ async fn start_fake(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -240,15 +256,17 @@ fn assert_shows(terminal: &Terminal<TestBackend>, needle: &str, what: &str) {
 #[tokio::test]
 async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_workflow(repo.path());
+    let (estate, mount) = solo_estate("svc");
+    // The workflow package belongs to the *estate*, not to a mount: the
+    // daemon reads `.sergeant/workflows/` under the estate it is bound to.
+    write_workflow(estate.path());
 
     // Two works: one that finishes, one that stops for an answer, so Fleet
     // has to show two different states and the canonical Work stub has
     // something to say about stage and workflow.
     let (handle, _fake) = start_fake(
         data.path(),
+        estate.path(),
         [
             FakeStep::complete_with("first stage done"),
             FakeStep::complete(),
@@ -258,8 +276,8 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     .await;
     let client = client_for(&handle);
 
-    let done = submit(&handle, repo.path(), "finish this one", "tiny").await;
-    let asking = submit(&handle, repo.path(), "ask me something", "tiny").await;
+    let done = submit(&handle, &mount, "finish this one", "tiny").await;
+    let asking = submit(&handle, &mount, "ask me something", "tiny").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -360,7 +378,7 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         .stream_events(app.last_seq)
         .await
         .expect("live tail attaches");
-    let fresh = submit(&handle, repo.path(), "arrived while watching", "tiny").await;
+    let fresh = submit(&handle, &mount, "arrived while watching", "tiny").await;
     assert!(
         !screen_text(&render(&app)).contains(&fresh),
         "the new work must not be on screen before the TUI hears about it"
@@ -468,12 +486,12 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
 #[tokio::test]
 async fn t1c_respond_reaches_the_real_api_through_the_answer_composer() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_solo_workflow(repo.path());
+    let (estate, mount) = solo_estate("svc");
+    write_solo_workflow(estate.path());
 
     let (handle, _fake) = start_fake(
         data.path(),
+        estate.path(),
         [
             FakeStep::needs_input("which retry budget?"),
             FakeStep::complete(),
@@ -481,7 +499,7 @@ async fn t1c_respond_reaches_the_real_api_through_the_answer_composer() {
     )
     .await;
     let client = client_for(&handle);
-    let id = submit(&handle, repo.path(), "ask a question", "solo").await;
+    let id = submit(&handle, &mount, "ask a question", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -540,13 +558,17 @@ async fn t1c_respond_reaches_the_real_api_through_the_answer_composer() {
 #[tokio::test]
 async fn t1c_cancel_reaches_the_real_api_through_the_confirmation() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_solo_workflow(repo.path());
+    let (estate, mount) = solo_estate("svc");
+    write_solo_workflow(estate.path());
 
-    let (handle, _fake) = start_fake(data.path(), [FakeStep::waiting("queued upstream")]).await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::waiting("queued upstream")],
+    )
+    .await;
     let client = client_for(&handle);
-    let id = submit(&handle, repo.path(), "wait around", "solo").await;
+    let id = submit(&handle, &mount, "wait around", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -580,14 +602,17 @@ async fn t1c_cancel_reaches_the_real_api_through_the_confirmation() {
 #[tokio::test]
 async fn t1c_retry_reaches_the_real_api_through_the_confirmation() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_solo_workflow(repo.path());
+    let (estate, mount) = solo_estate("svc");
+    write_solo_workflow(estate.path());
 
-    let (handle, _fake) =
-        start_fake(data.path(), [FakeStep::fail("boom"), FakeStep::complete()]).await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::fail("boom"), FakeStep::complete()],
+    )
+    .await;
     let client = client_for(&handle);
-    let id = submit(&handle, repo.path(), "fail then retry", "solo").await;
+    let id = submit(&handle, &mount, "fail then retry", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -618,13 +643,17 @@ async fn t1c_retry_reaches_the_real_api_through_the_confirmation() {
 #[tokio::test]
 async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_solo_workflow(repo.path());
+    let (estate, mount) = solo_estate("svc");
+    write_solo_workflow(estate.path());
 
-    let (handle, _fake) = start_fake(data.path(), [FakeStep::blocked("envelope exhausted")]).await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::blocked("envelope exhausted")],
+    )
+    .await;
     let client = client_for(&handle);
-    let id = submit(&handle, repo.path(), "run out of turns", "solo").await;
+    let id = submit(&handle, &mount, "run out of turns", "solo").await;
 
     let before = client.work(&id).await.expect("read back");
     assert_eq!(before["work"]["state"], "blocked");
@@ -673,22 +702,22 @@ async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
 /// overlay.
 #[tokio::test]
 async fn t3_estate_add_repo_reaches_the_real_api_off_the_render_loop() {
-    // The default `<estate_root>/.sergeant/data` layout — `src/api.rs`'s
-    // `resolve_estate_root` walks up from the daemon's own data dir to find
-    // it, so the daemon must actually be started on a data dir nested under
-    // a real `sergeant.toml`, not a bare tempdir.
+    // Estate-root §5.1: `src/api.rs`'s `resolve_estate_root` reads the estate
+    // the daemon was *bound* to at start, rather than walking up from its
+    // data dir — so the binding below, not the nesting, is what makes
+    // `POST /v1/estate/repos` resolvable. The default
+    // `<estate_root>/.sergeant/data` layout is kept anyway because that is
+    // where a real `sgt daemon` at this root would put it, and a route that
+    // silently depended on the two agreeing would be invisible otherwise.
+    // No `[[repo]]` entries yet — declaring the first one is the subject.
     let estate_root = TempDir::new().expect("tempdir");
-    std::fs::write(
-        estate_root.path().join("sergeant.toml"),
-        "[estate]\nname = \"t3-tui-estate\"\n",
-    )
-    .expect("write sergeant.toml");
+    empty_estate(estate_root.path(), "t3-tui-estate");
     let data_dir = estate_root.path().join(".sergeant/data");
     std::fs::create_dir_all(&data_dir).expect("data dir");
     let source = TempDir::new().expect("tempdir");
-    init_repo(source.path());
+    support::init_repo(source.path());
 
-    let (handle, _fake) = start_fake(&data_dir, []).await;
+    let (handle, _fake) = start_fake(&data_dir, estate_root.path(), []).await;
     let client = client_for(&handle);
 
     let mut app = App::new();
@@ -771,7 +800,9 @@ async fn t3_estate_add_repo_reaches_the_real_api_off_the_render_loop() {
 #[tokio::test]
 async fn t3_estate_health_renders_the_real_doctor_report() {
     let data = TempDir::new().expect("tempdir");
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let estate = TempDir::new().expect("tempdir");
+    empty_estate(estate.path(), "t3-health-estate");
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let client = client_for(&handle);
 
     let mut app = App::new();
@@ -819,11 +850,12 @@ fn t1_the_tui_has_no_private_shortcut() {
 #[test]
 fn t1_bare_sgt_prints_the_homepage_and_touches_no_daemon() {
     let data = DataDir::new();
-    // Outside any estate: this checkout is itself an estate (clone-is-distro,
-    // per README.md), so a cwd inside it would exercise the estate-aware
-    // branch instead — the same cwd-isolation reasoning
-    // `resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home`
-    // (`tests/m2_daemon_api.rs`) already documents for estate discovery.
+    // Outside any estate. Under exact-root admission (§4.1) that is now a
+    // property of one directory rather than of a whole ancestry: a fresh
+    // tempdir is not an estate root, full stop, and no walk can make it one.
+    // The isolation still matters because the test process's own cwd is the
+    // checkout — which is itself an estate under clone-is-distro (README.md)
+    // — and would take the estate-aware branch the sibling test below covers.
     let cwd = TempDir::new().expect("tempdir outside any estate");
     let output = Command::new(SGT)
         .arg("--data-dir")
@@ -907,13 +939,22 @@ fn t1_bare_sgt_inside_an_estate_names_it_and_touches_no_daemon() {
 /// daemon running refuses rather than materializing one just to have
 /// something to render, and names `sgt doctor` as the remedy the way every
 /// other fail-closed path in this codebase does.
+///
+/// Run from a real estate root (estate-root §4.2/§4.3): `tui` is
+/// estate-scoped, and root validation happens *before* descriptor lookup —
+/// from anywhere else this would refuse with §4.4's no-estate diagnostic
+/// instead, which is a different refusal by a different mechanism and would
+/// leave ADR 0009's rule unmeasured.
 #[test]
 fn t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy() {
     let data = DataDir::new();
+    let estate = TempDir::new().expect("tempdir");
+    empty_estate(estate.path(), "tui-refusal-estate");
     let output = Command::new(SGT)
         .arg("--data-dir")
         .arg(data.path())
         .arg("tui")
+        .current_dir(estate.path())
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run sgt tui");
@@ -947,9 +988,17 @@ fn t1_sgt_tui_refuses_without_a_daemon_and_names_the_remedy() {
 /// specifically pins the no-mistakes review fix that had its unconfirmed
 /// preview path calling `ensure_daemon` — auto-spawning a daemon just to
 /// preview a disposal nothing asked to happen yet.
+///
+/// All seven run from a real estate root, for the reason the TUI sibling
+/// above states: estate-root §4.3 puts exact-root validation ahead of
+/// descriptor lookup, so outside an estate every one of these would refuse
+/// with §4.4's diagnostic before ADR 0009's rule ever came into it — seven
+/// tests passing for a reason that has nothing to do with what they pin.
 #[test]
 fn t1_observation_verbs_refuse_without_a_daemon_and_name_the_remedy() {
     let data = DataDir::new();
+    let estate = TempDir::new().expect("tempdir");
+    empty_estate(estate.path(), "observation-refusal-estate");
     for args in [
         vec!["status"],
         vec!["work", "list"],
@@ -963,6 +1012,7 @@ fn t1_observation_verbs_refuse_without_a_daemon_and_name_the_remedy() {
             .arg("--data-dir")
             .arg(data.path())
             .args(&args)
+            .current_dir(estate.path())
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap_or_else(|e| panic!("run sgt {}: {e}", args.join(" ")));
@@ -1018,6 +1068,13 @@ fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
     }
     let data = DataDir::new();
     let cwd = TempDir::new().expect("tempdir");
+    // Estate-root §4.2: `daemon` and `tui` are both estate-scoped, so the
+    // daemon is started *at* an estate root and the session below names that
+    // same root with `-C`. `script(1)` inherits this process's own working
+    // directory, which is the crate checkout and not an estate, so `-C` is
+    // the only way to name the root without moving a global (§4.1: the flag
+    // names an exact root, and is never searched from either).
+    empty_estate(cwd.path(), "tui-hangup-estate");
     // ADR 0009: `sgt tui` is in the no-spawn set now, so a daemon has to
     // already be running for it to attach to — a bare `sgt tui` with none
     // would refuse before ever touching the terminal, which is not what
@@ -1038,7 +1095,11 @@ fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
     // [command ...]]` — the typescript file is positional and comes first,
     // and the command follows as trailing positional args (measured
     // directly against this host's `/usr/bin/script`).
-    let sgt_tui_command = format!("{SGT} --data-dir {} tui", data.display());
+    let sgt_tui_command = format!(
+        "{SGT} -C {} --data-dir {} tui",
+        cwd.path().display(),
+        data.display()
+    );
     let mut script_command = Command::new("script");
     script_command.arg("-q");
     if cfg!(target_os = "macos") {
@@ -1222,14 +1283,13 @@ fn pid_alive(pid: u32) -> bool {
 #[tokio::test]
 async fn t1_the_events_endpoint_filters_and_tails_by_work() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_workflow(repo.path());
+    let (estate, mount) = solo_estate("svc");
+    write_workflow(estate.path());
 
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let client = client_for(&handle);
-    let first = submit(&handle, repo.path(), "first work", "tiny").await;
-    let second = submit(&handle, repo.path(), "second work", "tiny").await;
+    let first = submit(&handle, &mount, "first work", "tiny").await;
+    let second = submit(&handle, &mount, "second work", "tiny").await;
 
     let all = client.get("/v1/events").await.expect("history");
     let all = all["events"].as_array().expect("events").len();
@@ -1279,12 +1339,16 @@ async fn t1_the_events_endpoint_filters_and_tails_by_work() {
 #[tokio::test]
 async fn a_work_view_whose_work_vanished_falls_back_to_fleet() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_workflow(repo.path());
+    let (estate, mount) = solo_estate("svc");
+    write_workflow(estate.path());
 
-    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("which budget?")]).await;
-    let work_id = submit(&handle, repo.path(), "still here", "tiny").await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::needs_input("which budget?")],
+    )
+    .await;
+    let work_id = submit(&handle, &mount, "still here", "tiny").await;
     let client = client_for(&handle);
 
     let mut app = App::new();
@@ -1344,14 +1408,24 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // test-running host's real $HOME happens to have missing from PATH.
     let home = TempDir::new().expect("tempdir");
     let home = home.path().display().to_string();
-    // #165: a fresh tempdir with no `sergeant.toml` of its own, so the
-    // `workflows` check (and `estate`) see "outside any estate" rather than
-    // walking up past `data`/`bin`/`home` and finding whatever real estate
-    // this test happens to be running inside of (ADR 0008(c)'s self-hosting
-    // case — sergeant-rs's own dev sessions run nested inside a real
-    // estate). Without this, "every check must be ok on a healthy install"
-    // depends on ambient filesystem state above the test process's cwd.
+    // Estate-root §4.2: `doctor` still runs outside an estate, but it now
+    // reports a **failing** `estate_root` row when it is not at one — so
+    // "healthy" and "outside an estate" are no longer compatible, and a
+    // healthy install is by definition one being reported on from its own
+    // estate root. The dedicated fixture root (rather than the test
+    // process's cwd) is still what makes this hermetic, for a sharper
+    // reason than #165's original one: there is no ancestor walk left to
+    // wander into ADR 0008(c)'s self-hosting estate, but cwd is global
+    // process state and `doctor_in` is what names the root here.
+    //
+    // The estate is fully furnished on purpose — one declared repository
+    // present at its derived `repos/<name>` mount (§6.1), one workflow
+    // package — because `estate` and `workflows` both read `warn` on an
+    // estate that has neither, and "every check must be green" is the
+    // claim this arm makes.
     let workspace = TempDir::new().expect("tempdir");
+    support::scaffold_estate(workspace.path(), "healthy-fixture-estate", &["svc"]);
+    write_workflow(workspace.path());
 
     // --- healthy -------------------------------------------------------------
     let (code, stdout, _) = doctor_in(
@@ -1406,16 +1480,23 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "journal",
             "projection",
             "daemon",
+            // Estate-root §4.2/§4.4: is the directory this `sgt doctor` was
+            // run from an estate root at all? It is the row the three
+            // beneath it read their answer from — a single admission,
+            // threaded down the way `data_dir_ok` already is, rather than
+            // three independent searches — which is also why it sits
+            // immediately above them rather than beside `estate`.
+            "estate_root",
             "permission_mode",
             // MVP-3: manifest health beyond "it parses" — declared repos
             // missing on disk (origin as the remedy) and directories under
-            // `repos/` the manifest never declared. `ok` here (a temp dir
-            // outside any estate has nothing to check), same rule as
-            // `permission_mode` above it.
+            // `repos/` the manifest never declared. Green here because the
+            // fixture estate's one declared repository is really at its
+            // derived mount.
             "estate",
-            // #165: how many workflow packages the estate declares — `ok`
-            // here for the same reason `estate`/`permission_mode` are: a
-            // temp dir outside any estate has nothing to check.
+            // #165: how many workflow packages the estate declares. Green
+            // here because the fixture estate declares one; an estate with
+            // none reads `warn`, which is `t3f`'s subject.
             "workflows",
             "disk_pressure",
         ],
@@ -1658,7 +1739,12 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // suite green). Its other three branches are where an operator actually
     // needs it, so they are exercised here.
     let live_data = DataDir::new();
+    // §4.2: `daemon` is estate-scoped, so the rig's daemon has to be started
+    // *at* an estate root. It is deliberately not `workspace` above: the
+    // daemon check reads the descriptor in `live_data`, and nothing about
+    // this arm should depend on the daemon and the doctor sharing an estate.
     let live_cwd = TempDir::new().expect("tempdir");
+    empty_estate(live_cwd.path(), "doctor-live-daemon-estate");
     {
         let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
         let (code, stdout, _) = doctor_in(
@@ -1863,11 +1949,16 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
     let workspace = TempDir::new().expect("tempdir");
-    init_repo(workspace.path());
+    // §6.1: `[[repo]] path` is gone and the mount is derived, so the
+    // repository lives at `repos/solo` rather than being the estate root
+    // itself (`path = "."`, the old shape). The manifest is written by hand
+    // rather than scaffolded because the two `[[profile]]` tables are the
+    // subject and `support::scaffold_estate` declares repositories only.
+    support::init_repo(&workspace.path().join("repos").join("solo"));
     std::fs::write(
         workspace.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n\n\
-         [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"solo\"\n\n\
          [[profile]]\nname = \"quiet\"\nbackend = \"claude\"\n\n\
          [[profile]]\nname = \"careful\"\nbackend = \"claude\"\n\
          [profile.options]\npermission_mode = \"plan\"\n",
@@ -1928,11 +2019,15 @@ fn t3c_doctor_estate_check_names_a_missing_repository_with_its_origin_as_the_rem
     std::fs::write(
         workspace.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n\n\
-         [[repo]]\nname = \"payments\"\npath = \"repos/payments\"\n\
+         [[repo]]\nname = \"payments\"\n\
          origin = \"https://example.com/payments.git\"\n",
     )
     .expect("write sergeant.toml");
-    // Deliberately never create repos/payments — that absence is the point.
+    // No `path` key (§6.1 removed it): the mount this check reports missing
+    // is the derived `repos/payments`, which is deliberately never created —
+    // that absence is the point. §4.1 admission is structural and does not
+    // resolve mounts, so the estate is still admitted and the `estate` row
+    // is still the one that has to notice.
 
     let (_, json, _) = doctor_in(
         workspace.path(),
@@ -1969,14 +2064,18 @@ fn t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos() {
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
     let workspace = TempDir::new().expect("tempdir");
-    init_repo(&workspace.path().join("repos").join("known"));
+    support::init_repo(&workspace.path().join("repos").join("known"));
     std::fs::write(
         workspace.path().join("sergeant.toml"),
-        "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"known\"\npath = \"repos/known\"\n",
+        "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"known\"\n",
     )
     .expect("write sergeant.toml");
-    // On disk but never declared in sergeant.toml.
-    init_repo(&workspace.path().join("repos").join("stray"));
+    // On disk but never declared in sergeant.toml. Both directories sit
+    // under `repos/` because that is now the *only* place a mount can be
+    // (§6.1) — which is what makes "declared but absent" and "present but
+    // undeclared" two readings of one directory listing rather than two
+    // unrelated searches.
+    support::init_repo(&workspace.path().join("repos").join("stray"));
 
     let (_, json, _) = doctor_in(
         workspace.path(),
@@ -2005,9 +2104,19 @@ fn t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos() {
 
 /// MVP-3/E5: a manifest that fails to parse reports file *and* line — via
 /// `toml::de::Error`'s own diagnostic riding `WorkspaceError::Malformed`'s
-/// `Display` through the estate check — never a generic "invalid config".
+/// `Display` — never a generic "invalid config".
+///
+/// **Estate-root §4.1/§4.2 moved which row carries it.** Admission is now the
+/// first thing doctor asks, and a manifest that does not parse cannot be
+/// admitted, so the `estate` row below it reads the already-decided "not an
+/// estate root" answer and has nothing to say. The `estate_root` row is where
+/// the parser's own diagnostic surfaces, split across `detail` (the
+/// refusal's first line) and `remedy` (the rest, §4.4's own words). The
+/// claim is unchanged and so is the mutation it kills: a doctor that
+/// reported "invalid config" without the file or the line leaves an operator
+/// with a broken estate and nowhere to look.
 #[test]
-fn t3e_doctor_estate_check_names_file_and_line_on_a_malformed_manifest() {
+fn t3e_doctor_estate_root_check_names_file_and_line_on_a_malformed_manifest() {
     let bin = TempDir::new().expect("tempdir");
     let claude = stub_claude(bin.path());
     let docker = stub_docker(bin.path());
@@ -2033,16 +2142,29 @@ fn t3e_doctor_estate_check_names_file_and_line_on_a_malformed_manifest() {
         true,
     );
     let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
-    let check = named_check(&report, "estate");
+    let check = named_check(&report, "estate_root");
     assert_eq!(check["status"], "fail", "{check}");
+    // The diagnostic is one §4.4 message split at its first newline, so the
+    // file/line claim is about the row as a whole, not about which half the
+    // renderer happened to put them in.
     let detail = check["detail"].as_str().expect("detail");
+    let remedy = check["remedy"].as_str().expect("remedy");
+    let rendered = format!("{detail}\n{remedy}");
     assert!(
-        detail.contains("sergeant.toml"),
-        "the offending file must be named: {detail}"
+        rendered.contains("sergeant.toml"),
+        "the offending file must be named: {rendered}"
     );
     assert!(
-        detail.to_lowercase().contains("line"),
-        "the parse error must carry a line number, not just \"invalid\": {detail}"
+        rendered.to_lowercase().contains("line"),
+        "the parse error must carry a line number, not just \"invalid\": {rendered}"
+    );
+    // …and the row beneath it must not re-diagnose the same fault under its
+    // own name: it reads `estate_root`'s already-decided answer, and there
+    // is no admitted estate to check.
+    let estate = named_check(&report, "estate");
+    assert_eq!(
+        estate["status"], "ok",
+        "the estate row defers to the estate_root row above it: {estate}"
     );
 }
 
@@ -2590,9 +2712,15 @@ fn doctor(data_dir: &Path, env: &[(&str, &str)], as_json: bool) -> (Option<i32>,
     doctor_in_opt(None, data_dir, env, as_json)
 }
 
-/// [`doctor`], run with the subprocess's cwd set to `workspace` — the only
-/// way to drive `permission_mode_check`'s profile-reporting branch, which
-/// reads `Workspace::discover(&std::env::current_dir())`.
+/// [`doctor`], run with the subprocess's cwd set to `workspace`.
+///
+/// Estate-root §4.1: the effective root of an invocation is `-C <path>` if
+/// given, else the process's own working directory — and `sgt doctor` asks
+/// `Workspace::admit` about exactly that directory, with no ancestor walk to
+/// fall back on. So the cwd is what decides whether the `estate_root`,
+/// `permission_mode`, `estate` and `workflows` rows have anything to report,
+/// and setting it on the subprocess (rather than the test process, which is
+/// global state) is how these tests choose.
 fn doctor_in(
     workspace: &Path,
     data_dir: &Path,
@@ -2948,11 +3076,21 @@ fn t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob() {
     // set, and with no daemon running it would refuse before ever
     // constructing the `ApiClient` this warning comes from. A mutating verb
     // still auto-spawns and reaches the same `ApiClient::new` call.
+    //
+    // From an estate root, because §4.3 puts exact-root validation ahead of
+    // the auto-spawn: outside one, `run` refuses before `ensure_daemon` ever
+    // builds a client, and this test would be asserting about a warning no
+    // code path had the chance to emit. The estate declares no repositories,
+    // which is enough to be admitted (§4.1) and enough to reach the client —
+    // the daemon's own 422 afterward is not this test's subject.
+    let estate = TempDir::new().expect("tempdir");
+    empty_estate(estate.path(), "timeout-knob-estate");
     let output = Command::new(SGT)
         .arg("--data-dir")
         .arg(data.path())
         .arg("run")
         .arg("timeout knob probe")
+        .current_dir(estate.path())
         .env(knob, "5")
         .stdin(std::process::Stdio::null())
         .output()
@@ -2985,12 +3123,20 @@ fn t4_a_client_says_out_loud_when_it_ignores_the_timeout_knob() {
 fn t4_a_client_that_applies_the_knob_is_quiet_about_it() {
     let data = DataDir::new();
     let knob = sergeant_rs::api::CLIENT_TIMEOUT_ENV;
-    // Same reasoning as the sibling test above: `run`, not `status`.
+    // Same reasoning as the sibling test above, on both counts: `run`, not
+    // `status`, and from an estate root so the client is actually built.
+    // This half needs the estate more than the other one does — a refusal
+    // before `ApiClient::new` produces no warning either, so outside an
+    // estate "an override that was applied is not a complaint" would hold
+    // vacuously against a build that never applied anything.
+    let estate = TempDir::new().expect("tempdir");
+    empty_estate(estate.path(), "timeout-knob-estate");
     let output = Command::new(SGT)
         .arg("--data-dir")
         .arg(data.path())
         .arg("run")
         .arg("timeout knob probe")
+        .current_dir(estate.path())
         .env(knob, "300")
         .stdin(std::process::Stdio::null())
         .output()
@@ -3816,6 +3962,7 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
 
     let data = DataDir::new();
     let cwd = TempDir::new().expect("tempdir");
+    empty_estate(cwd.path(), "sigterm-rig-estate");
     let mut spawned = SpawnedDaemon::start(&data, cwd.path(), &[]);
     let pid = spawned.child.id();
     assert!(
@@ -3884,6 +4031,13 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
 fn r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop() {
     let data = DataDir::new();
     let cwd = TempDir::new().expect("tempdir");
+    // A furnished estate, not a bare directory: `daemon` is estate-scoped
+    // (§4.2) so the rig needs a root to start at at all, and this test's two
+    // submissions have to be *admissible* for the pause to be the only thing
+    // that can refuse one. Against a repository-less estate both would be
+    // refused by the manifest, and "a submit while admission is paused must
+    // fail" would hold no matter what the admission gate did.
+    support::scaffold_estate(cwd.path(), "admission-rig-estate", &["svc"]);
     let mut first = SpawnedDaemon::start(&data, cwd.path(), &[]);
     let client = ApiClient::new(&first.endpoint, &first.token).expect("client");
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -3974,8 +4128,14 @@ fn r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop() {
             )
             .await
             .expect("submit after restart must succeed");
-        assert_eq!(
-            accepted["work"]["state"], "pending",
+        // Admitted, which is the whole claim — not `pending`, which it used
+        // to be able to assert only because the daemon planned against
+        // nothing. §5.1 binds this daemon to the estate it was started at,
+        // so a submission is planned inside the request that carried it and
+        // the state that comes back is wherever the run got to. The id is
+        // the durable evidence that admission happened.
+        assert!(
+            accepted["work"]["id"].as_str().is_some_and(|id| !id.is_empty()),
             "the post-restart submission must actually be admitted: {accepted}"
         );
     });
@@ -4007,6 +4167,7 @@ fn r_mvp3_admission_pause_survives_a_kill_between_pause_and_stop() {
 fn the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown() {
     let data = DataDir::new();
     let cwd = TempDir::new().expect("tempdir");
+    empty_estate(cwd.path(), "drop-rig-estate");
 
     let pid = {
         let spawned = SpawnedDaemon::start(&data, cwd.path(), &[]);
@@ -4386,6 +4547,15 @@ enum StopSignal {
 }
 
 /// A `sgt daemon` running as a real child process, from a chosen cwd.
+///
+/// **`cwd` must be an estate root.** `daemon` is estate-scoped (§4.2), root
+/// validation runs before anything else in dispatch (§4.3), and there is no
+/// ancestor walk to rescue a directory that is merely near one — so a rig
+/// pointed at a bare `TempDir` never publishes a descriptor and `start_at`
+/// below panics on the timeout rather than failing where the mistake is.
+/// The root the daemon is started at is also the estate it is *bound* to
+/// (§5.1): it plans against that estate and refuses clients resolving a
+/// different one.
 struct SpawnedDaemon {
     endpoint: String,
     token: String,

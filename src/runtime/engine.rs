@@ -1281,14 +1281,15 @@ impl Engine {
     /// specifically so an unrelated broken repository elsewhere in the
     /// estate could not block a group whose own members were all fine. That
     /// carve-out does not survive moving resolution here: `workspace` above
-    /// is already the strictly-discovered estate (`Workspace::
-    /// discover_scoped`, the same call `plan` makes for routing and
+    /// is already the strictly-resolved estate (`Workspace::resolve` against
+    /// this daemon's bound root — the same call `plan` makes for routing and
     /// instruction-policy regardless of scope), so a `--group` submission
     /// now fails on an unrelated broken repository exactly the way a plain
-    /// `--repo` submission always has — discovery, not group lookup, is
-    /// what requires the whole estate to resolve. `declared_groups_scoped`
-    /// remains in use for the CLI's own local, non-submitting `sgt group
-    /// list` family, untouched by this change.
+    /// `--repo` submission always has — resolving the estate, not group
+    /// lookup, is what requires every declared mount to be present.
+    /// (`declared_groups_scoped`, the on-disk-free parser this note
+    /// describes, is itself gone: estate-root Phase D deleted it with the
+    /// rest of cwd-based discovery.)
     fn resolve_scope(
         workspace: &Workspace,
         context: &SubmitContext<'_>,

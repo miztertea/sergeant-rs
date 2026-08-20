@@ -1188,9 +1188,10 @@ async fn submit_work(
         return *resp;
     }
     // Planning happens with **no lock held**. It reads the filesystem —
-    // `Workspace::discover` walks up to the git root and parses
-    // `sergeant.toml`, `WorkflowDefinition::resolve` reads every stage's
-    // `CONTEXT.md` — and probes every harness the run will use (§17.5). All of
+    // `Workspace::resolve` parses the bound estate's `sergeant.toml` and
+    // validates every derived mount, `WorkflowDefinition::resolve` reads
+    // every stage's `CONTEXT.md` — and probes every harness the run will use
+    // (§17.5). All of
     // that is external I/O on paths the daemon does not own, which §22.6 keeps
     // out from under the core lock; it is also, by construction, side-effect
     // free, so running it before the guard costs nothing but a re-check.
