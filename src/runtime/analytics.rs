@@ -126,7 +126,7 @@ CREATE TABLE events (
 CREATE TABLE work (
     work_id       VARCHAR PRIMARY KEY,
     intent        VARCHAR,
-    workspace     VARCHAR,
+    estate        VARCHAR,
     workflow      VARCHAR,
     backend       VARCHAR,
     route_source  VARCHAR,
@@ -457,7 +457,13 @@ impl Appended {
 struct WorkRow {
     work_id: String,
     intent: Option<String>,
-    workspace: Option<String>,
+    /// estate-root Phase C, §7.4: seeded from `work.submitted`'s
+    /// (pre-Phase-C-only, now always absent for a new Work) `estate`
+    /// field, then overwritten by `workflow.bound`'s plan-time estate name
+    /// once that fires — see the two folds below. `None` for a `pending`
+    /// Work that never reached `workflow.bound` is an honest "not yet
+    /// resolved to an estate", not a lost fact.
+    estate: Option<String>,
     workflow: Option<String>,
     backend: Option<String>,
     route_source: Option<String>,
@@ -568,7 +574,7 @@ impl WorkRow {
         vec![
             Duck::Text(self.work_id.clone()),
             text(self.intent.as_deref()),
-            text(self.workspace.as_deref()),
+            text(self.estate.as_deref()),
             text(self.workflow.as_deref()),
             text(self.backend.as_deref()),
             text(self.route_source.as_deref()),
@@ -971,7 +977,7 @@ impl Analytics {
                         WorkRow {
                             work_id: work_id.to_string(),
                             intent: string(&work["intent"]),
-                            workspace: string(&work["workspace"]),
+                            estate: string(&work["workspace"]),
                             workflow: string(&work["workflow"]),
                             backend: string(&work["backend"]),
                             route_source: None,
@@ -1000,8 +1006,8 @@ impl Analytics {
                     work.backend = string(&event.payload["backend"]);
                     work.route_source = string(&event.payload["route_source"]);
                     work.profile = string(&event.payload["profile"]["name"]);
-                    if let Some(workspace) = string(&event.payload["workspace"]) {
-                        work.workspace = Some(workspace);
+                    if let Some(estate) = string(&event.payload["workspace"]) {
+                        work.estate = Some(estate);
                     }
                 }
             }

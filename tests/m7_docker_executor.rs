@@ -182,7 +182,7 @@ fn spec(command: Vec<&str>, access: WorkspaceAccess) -> ExecuteSpec {
     ExecuteSpec {
         image: PROBE_IMAGE.to_string(),
         command: command.into_iter().map(str::to_string).collect(),
-        workdir: "/workspace".to_string(),
+        workdir: "/estate".to_string(),
         workspace_access: access,
         network: NetworkPolicy::None,
         env: BTreeMap::new(),
@@ -201,7 +201,8 @@ fn request(work_id: &str, execution_id: &str, cwd: &Path, exec: ExecuteSpec) -> 
         model: None,
         profile: None,
         execute: Some(exec),
-        instruction_policy: sergeant_rs::domain::workspace::InstructionPolicy::default(),
+        instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
+        bindings: Vec::new(),
     }
 }
 
@@ -321,7 +322,7 @@ fn workspace_access_governs_writes_both_ways() {
         &ro_execution_id,
         cwd.path(),
         spec(
-            vec!["sh", "-c", "echo nope > /workspace/should-not-exist"],
+            vec!["sh", "-c", "echo nope > /estate/should-not-exist"],
             WorkspaceAccess::ReadOnly,
         ),
     );
@@ -349,7 +350,7 @@ fn workspace_access_governs_writes_both_ways() {
         &rw_execution_id,
         cwd.path(),
         spec(
-            vec!["sh", "-c", "echo yes > /workspace/should-exist"],
+            vec!["sh", "-c", "echo yes > /estate/should-exist"],
             WorkspaceAccess::ReadWrite,
         ),
     );
@@ -375,7 +376,7 @@ fn workspace_access_governs_writes_both_ways() {
 /// actually been inspected on a real container; every other test only
 /// checks the *positive* behavior (a write does or doesn't land). Inspects
 /// the real container Docker created and asserts the negative claims
-/// directly: exactly one mount (the workspace bind, nothing else), not
+/// directly: exactly one mount (the estate bind, nothing else), not
 /// privileged, no added capabilities, no devices.
 #[test]
 fn a_launched_container_carries_no_isolation_escape_hatches() {
@@ -408,10 +409,10 @@ fn a_launched_container_carries_no_isolation_escape_hatches() {
     assert_eq!(
         mounts.len(),
         1,
-        "exactly one mount (the workspace bind), nothing else — no Docker socket, no extra \
+        "exactly one mount (the estate bind), nothing else — no Docker socket, no extra \
          host paths: {mounts:?}"
     );
-    assert_eq!(mounts[0]["Destination"], "/workspace");
+    assert_eq!(mounts[0]["Destination"], "/estate");
     assert!(
         mounts.iter().all(|m| m["Source"]
             .as_str()
@@ -462,7 +463,7 @@ fn a_mount_path_containing_a_space_round_trips_correctly() {
         &execution_id,
         &cwd,
         spec(
-            vec!["sh", "-c", "echo yes > /workspace/should-exist"],
+            vec!["sh", "-c", "echo yes > /estate/should-exist"],
             WorkspaceAccess::ReadWrite,
         ),
     );
@@ -1077,8 +1078,8 @@ fn container_written_files_and_directories_are_owned_by_the_host_worktree_owner(
                 vec![
                     "sh",
                     "-c",
-                    "echo hi > /workspace/owned-file.txt && mkdir /workspace/owned-dir && \
-                     echo inner > /workspace/owned-dir/inner.txt",
+                    "echo hi > /estate/owned-file.txt && mkdir /estate/owned-dir && \
+                     echo inner > /estate/owned-dir/inner.txt",
                 ],
                 WorkspaceAccess::ReadWrite,
             ),
@@ -1132,13 +1133,24 @@ fn container_written_files_and_directories_are_owned_by_the_host_worktree_owner(
 /// using a scripted `docker_bin` that cannot even run `docker version`
 /// (mirroring `DaemonConfig::docker`'s doc: "tests point it at a scripted
 /// `docker_bin` ... without a real Docker Engine").
+///
+/// **Estate-root §5.1/§5.2.** The daemon must be started *bound* to the
+/// estate root or this pin silently stops pinning anything: `Engine::plan`
+/// reads the bound estate, never `origin.cwd`, so an unbound daemon returns
+/// `Ok(None)`, parks the intent at `pending`, and never reaches
+/// `bind_stages` at all — the submission is accepted with 201 and the
+/// `StageKind::Execute` arm this test exists to drive is never entered.
+/// `origin.cwd` therefore names the repository mount as recorded evidence
+/// only (§13.3), and the workflow package lives under the *estate* root's
+/// `.sergeant/workflows/`, because that is the root `plan` hands to
+/// `WorkflowDefinition::resolve`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() {
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
+    let estate = TempDir::new().expect("estate");
+    let (mount, _head) = support::scaffold_solo_estate(estate.path(), "execute-only-repo");
 
-    let workflow_dir = repo.path().join(".sergeant/workflows/execute-only");
+    let workflow_dir = estate.path().join(".sergeant/workflows/execute-only");
     std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
     std::fs::write(
         workflow_dir.join("workflow.toml"),
@@ -1152,7 +1164,7 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
             "kind = \"execute\"\n",
             "image = \"alpine:3\"\n",
             "command = [\"true\"]\n",
-            "workdir = \"/workspace\"\n",
+            "workdir = \"/estate\"\n",
             "workspace_access = \"read_only\"\n",
             "network = \"none\"\n",
         ),
@@ -1163,6 +1175,7 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
     let handle = daemon::start_with(
         data.path(),
         DaemonConfig {
+            estate_root: Some(estate.path().to_path_buf()),
             backends: Arc::new(BackendRegistry::new().with(fake.clone())),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             docker: Some(DockerConfig {
@@ -1183,7 +1196,7 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
             "command_id": ulid::Ulid::generate().to_string(),
             "intent": "must be refused before anything exists",
             "workflow": "execute-only",
-            "origin": {"client": "cli", "cwd": repo.path()},
+            "origin": {"client": "cli", "cwd": mount},
         }))
         .send()
         .await
@@ -1351,14 +1364,25 @@ fn lifecycle_probe_proves_the_real_bind_mount_round_trip() {
 /// requires. This test's own assertion on the file *is* the "available to
 /// the following actor" half of the proof: a real actor's harness would read
 /// the same worktree path this assertion reads.
+///
+/// **Estate-root §5.1/§5.2.** Driving it through the real daemon means the
+/// daemon has to be *bound* to the estate whose repository is being
+/// surfaced: `Engine::plan` topology comes from that binding and from
+/// nowhere else, so an unbound daemon would leave this submission `pending`
+/// forever (`Ok(None)` — no surface, no stages, no container) and the whole
+/// N4 proof would time out rather than fail on anything it claims. The
+/// estate is the §6.1 shape — one derived mount at `<root>/repos/<name>`,
+/// no `[[repo]] path` key — and its workflow package sits under the estate
+/// root's `.sergeant/workflows/`, which is where `plan` resolves it from.
+/// `origin.cwd` is recorded evidence only now (§13.3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forward() {
     require_docker!();
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
+    let estate = TempDir::new().expect("estate");
+    let (mount, _head) = support::scaffold_solo_estate(estate.path(), "mixed-proof-repo");
 
-    let workflow_dir = repo.path().join(".sergeant/workflows/mixed-proof");
+    let workflow_dir = estate.path().join(".sergeant/workflows/mixed-proof");
     std::fs::create_dir_all(workflow_dir.join("00-prepare")).expect("stage dir");
     std::fs::create_dir_all(workflow_dir.join("10-validate")).expect("stage dir");
     std::fs::create_dir_all(workflow_dir.join("20-close")).expect("stage dir");
@@ -1375,8 +1399,8 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
             "[stage.\"10-validate\"]\n",
             "kind = \"execute\"\n",
             "image = \"alpine:3\"\n",
-            "command = [\"sh\", \"-c\", \"echo container-produced-evidence > /workspace/validated.txt\"]\n",
-            "workdir = \"/workspace\"\n",
+            "command = [\"sh\", \"-c\", \"echo container-produced-evidence > /estate/validated.txt\"]\n",
+            "workdir = \"/estate\"\n",
             "workspace_access = \"read_write\"\n",
             "network = \"none\"\n",
         ),
@@ -1390,6 +1414,7 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
     let handle = daemon::start_with(
         data.path(),
         DaemonConfig {
+            estate_root: Some(estate.path().to_path_buf()),
             backends: Arc::new(BackendRegistry::new().with(fake)),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             docker: Some(DockerConfig::new(data.path())),
@@ -1407,7 +1432,7 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
             "command_id": ulid::Ulid::generate().to_string(),
             "intent": "prove actor -> execute -> actor",
             "workflow": "mixed-proof",
-            "origin": {"client": "cli", "cwd": repo.path()},
+            "origin": {"client": "cli", "cwd": mount},
         }))
         .send()
         .await
@@ -1514,32 +1539,6 @@ fn walk_for_marker(dir: &Path) -> bool {
         }
     }
     false
-}
-
-fn init_repo(path: &Path) {
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .env("GIT_AUTHOR_NAME", "sergeant tests")
-            .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
-            .env("GIT_COMMITTER_NAME", "sergeant tests")
-            .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    std::fs::create_dir_all(path).expect("repo dir");
-    git(&["init", "-b", "main"]);
-    std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
-    git(&["add", "."]);
-    git(&["commit", "-m", "initial"]);
 }
 
 /// Poll OBSERVE until the container has exited, panicking on timeout.

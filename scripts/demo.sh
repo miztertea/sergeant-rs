@@ -56,9 +56,19 @@ fi
 [ -x "$SGT" ] || { echo "demo.sh: no sgt binary at $SGT" >&2; exit 1; }
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/sgt-demo-XXXXXX")"
+# The estate root is a directory inside the throwaway (estate-root proposal
+# §4.1: an estate is exactly the directory holding `sergeant.toml`, and no
+# parent of it is ever searched), and the repository is its one derived mount
+# at `repos/<name>` (§6.1 — the path is not configurable, so this is the only
+# place it can be).
+ESTATE="$WORKDIR/estate"
+# The data dir stays outside the estate, named explicitly with `--data-dir`:
+# this is a throwaway rig, and `--data-dir` outranks every other rung (ADR
+# 0008(a)) precisely so a caller can say where state goes without touching
+# the estate it is operating on.
 DATA_DIR="$WORKDIR/data"
-REPO="$WORKDIR/service"
-mkdir -p "$DATA_DIR"
+REPO="$ESTATE/repos/service"
+mkdir -p "$DATA_DIR" "$ESTATE/repos"
 
 # How long the daemon gets to shut down on SIGTERM before SIGKILL, and then
 # to leave the process table. The same ten and five seconds as
@@ -134,7 +144,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-sgt() { "$SGT" --data-dir "$DATA_DIR" "$@"; }
+# Every estate-scoped verb is addressed with `-C` rather than by chdir'ing
+# (C10): the walkthrough moves between the estate root and the mount as it
+# narrates, and naming the root explicitly means no step depends on where the
+# previous one happened to leave the shell.
+sgt() { "$SGT" -C "$ESTATE" --data-dir "$DATA_DIR" "$@"; }
 
 step()     { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 say()      { printf '   %s\n' "$*"; }
@@ -184,28 +198,53 @@ fi
 # ---------------------------------------------------------------------------
 step "a developer clones a repository and prepares it for sergeant"
 
+# Every git invocation below is `git -C "$REPO"`, and every write names an
+# absolute path. Nothing `cd`s.
+#
+# Measured reason (2026-08-20): while this script was being migrated to the
+# estate model, a broken edit left `$REPO` empty in a shell that had already
+# sourced the setup lines. `cd "$REPO"` became `cd ""` — which succeeds and
+# leaves you exactly where you were — so the `git add -A && git commit` two
+# lines later ran in the *sergeant-rs checkout itself* and swallowed every
+# uncommitted file in it. `set -e` cannot catch a `cd` that succeeds. `git -C`
+# can: an empty or missing directory is a hard failure there, never a silent
+# fallback to the caller's working directory.
 git init -q -b main "$REPO"
-cd "$REPO"
-git config user.email demo@example.invalid
-git config user.name  "sergeant demo"
-cat > payments.py <<'PY'
+git -C "$REPO" config user.email demo@example.invalid
+git -C "$REPO" config user.name  "sergeant demo"
+cat > "$REPO/payments.py" <<'PY'
 def settle(payment):
     return gateway.settle(payment)
 PY
-mkdir -p .sergeant/workflows/software-change/{10-implement,20-review}
-cat > .sergeant/workflows/software-change/workflow.toml <<'TOML'
+git -C "$REPO" add -A
+git -C "$REPO" commit -qm "payment settlement worker"
+
+# The estate declares the mount by name; §6.1 derives the path from it, so
+# there is no `path` key to get wrong (and none this schema would accept).
+cat > "$ESTATE/sergeant.toml" <<'TOML'
+[estate]
+name = "payments"
+
+[[repo]]
+name = "service"
+TOML
+
+# Workflows are estate content, resolved against the estate root — not against
+# whichever repository a Work happens to select. One estate, one catalog.
+mkdir -p "$ESTATE"/.sergeant/workflows/software-change/{10-implement,20-review}
+cat > "$ESTATE/.sergeant/workflows/software-change/workflow.toml" <<'TOML'
 [workflow]
 name = "software-change"
 version = "1"
 stages = ["10-implement", "20-review"]
 TOML
-echo "Implement the change." > .sergeant/workflows/software-change/10-implement/CONTEXT.md
-echo "Review it independently." > .sergeant/workflows/software-change/20-review/CONTEXT.md
-git add -A && git commit -qm "payment settlement worker"
+echo "Implement the change." > "$ESTATE/.sergeant/workflows/software-change/10-implement/CONTEXT.md"
+echo "Review it independently." > "$ESTATE/.sergeant/workflows/software-change/20-review/CONTEXT.md"
 
-say "repository: $REPO (branch main)"
+say "estate:     $ESTATE (declares one repository: service)"
+say "repository: $REPO (branch main) — the derived mount, repos/service"
 say "workflow:   software-change — 10-implement → 20-review"
-evidence "the workflow is content, not code: $REPO/.sergeant/workflows/software-change/"
+evidence "the workflow is content, not code: $ESTATE/.sergeant/workflows/software-change/"
 
 # ---------------------------------------------------------------------------
 step "they ask for work — no daemon is running yet"

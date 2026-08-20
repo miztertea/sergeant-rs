@@ -122,6 +122,42 @@ impl EnvelopeRequest {
     }
 }
 
+/// estate-root proposal §7.3/§13.3's structured scope request: exactly what
+/// the client asked for (`--repo`/`--group`/`--all`, as submitted), kept
+/// distinct from [`Work::repositories`] below — the *resolved* list a
+/// core-owned lookup against the bound estate's `groups` produced from this
+/// request (`runtime::engine::Engine::resolve_scope`). §7.3's whole point is
+/// that both survive: a later manifest edit (a group's membership changes, a
+/// repository is renamed) cannot retroactively rewrite what an already
+/// journaled Work was scoped to, because the resolved list is pinned here
+/// too, permanently, beside the request that produced it.
+///
+/// `#[serde(default)]` on [`Work::scope_request`] is what lets every Work
+/// journaled before this field existed replay: it has no `scope_request` key
+/// at all, and defaults to this type's all-empty [`Default`] — the honest
+/// reading for a Work that predates the concept of a structured scope
+/// request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRequest {
+    /// Explicit `--repo`/`scope.repos` names, as submitted (repeatable,
+    /// declaration order, not yet deduplicated against `group`'s members —
+    /// that union happens during resolution, not here).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+    /// `--group`/`scope.group`, as submitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// `--all`/`scope.all`: an explicit whole-estate selection (§7.1's third
+    /// scope form). Journaled as the request form even though it resolves to
+    /// the same repository list a future `--repo` naming every repository
+    /// would — §7.3's "a later manifest edit cannot rewrite the meaning of
+    /// an existing Work" needs to know the client asked for *everything*,
+    /// not for the specific repositories the estate happened to declare that
+    /// day.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+}
+
 /// Event kind: a work item was accepted and entered `pending`.
 pub const KIND_WORK_SUBMITTED: &str = "work.submitted";
 /// Event kind: a work item was canceled.
@@ -255,21 +291,48 @@ impl std::fmt::Display for WorkState {
     }
 }
 
-/// A Work record per §10: id, workspace, intent, targeted repositories,
-/// workflow, state, created_by, created_at. `workflow` and `backend` are
-/// recorded for M3/M4 but not executed in M2.
+/// A Work record per §10: id, intent, targeted repositories (`scope_request`
+/// and its resolution, §7.3), workflow, state, created_by, created_at.
+/// `workflow` and `backend` are recorded for M3/M4 but not executed in M2.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Work {
     /// ULID identifying this work item.
     pub id: String,
-    /// Workspace this work belongs to, when the client scoped it.
+    /// **Deprecated, never written (estate-root Phase C, §7.4).** Before
+    /// Phase C this carried a free-form client-supplied estate label (or,
+    /// later, the discovered estate's name as a submit-time fallback). The
+    /// daemon is bound to exactly one estate now, so the field has no role
+    /// left to play in submission or Work identity — every Work journaled
+    /// from Phase C onward leaves this `None`. It stays in the struct, still
+    /// `#[serde(default)]`, purely so a pre-Phase-C `work.submitted` event
+    /// (the live dogfood estate journals 150+ of them) still deserializes;
+    /// nothing new should ever read or write it. [`Work::scope_request`] and
+    /// [`Work::repositories`] are its replacement (§7.3).
+    ///
+    /// **The name stays `workspace` (§13.2).** The Workspace-to-Estate
+    /// rename moves the domain vocabulary; it does not rewrite history. This
+    /// field exists only to deserialize a key already written into durable
+    /// journals, so renaming it would silently stop reading exactly the
+    /// events it was kept for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     /// The human intent this work exists to satisfy.
     pub intent: String,
-    /// Targeted repositories (recorded; nothing acts on them until M3).
+    /// The *resolved* repositories this Work targets — `scope_request`
+    /// (below), as core-owned resolution against the bound estate's
+    /// `groups`/declared repositories actually expanded it. `Engine::
+    /// resolve_scope` computes this once, at submit; a later manifest edit
+    /// (a group's membership changes) cannot retroactively change what an
+    /// already-journaled Work meant (§7.3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repositories: Vec<String>,
+    /// estate-root proposal §7.3/§13.3's request form: exactly what the
+    /// client asked for (`--repo`/`--group`/`--all`), before resolution.
+    /// `#[serde(default)]`: absent on every Work journaled before this field
+    /// existed, which replays as [`ScopeRequest::default`] — the honest
+    /// reading for a Work that predates the concept.
+    #[serde(default)]
+    pub scope_request: ScopeRequest,
     /// Requested workflow (recorded for M3; not executed in M2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
@@ -296,6 +359,21 @@ pub struct Work {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<EnvelopeRequest>,
+    /// estate-root §8.3: whether the operator typed
+    /// `--override-git-preflight` for *this* submission.
+    ///
+    /// Journaled on the Work itself, not only on the surface plan that
+    /// records what it waived, because the two are different facts and §8.3
+    /// asks for both: an override that turned out to waive nothing is still
+    /// an operator authorization that was given, and `work.submitted` is
+    /// where the submission's own request form lives (beside
+    /// [`Self::scope_request`], for the same §7.3-shaped reason).
+    ///
+    /// `#[serde(default)]`, skipped when false, on [`ScopeRequest::all`]'s
+    /// precedent: absent means not overridden, which is what every Work
+    /// journaled before Phase E recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_preflight_override: bool,
     /// Current state (only mutated by folding journal events).
     pub state: WorkState,
     /// Who submitted it.

@@ -1,6 +1,7 @@
 # ADR 0008: Manifest authority over storage paths
 
-**Status:** Accepted, 2026-08-14.
+**Status:** Accepted, 2026-08-14. **Amended in part, 2026-08-20** — see
+"Amended by the estate-root integration" below (gauntlet finding C7a).
 
 ## Context
 
@@ -106,6 +107,49 @@ accepted, explicit property of this architecture (surfaces nested inside
 the very checkout sergeant might be operating on) rather than an open
 hazard awaiting a fix. Anyone re-reading #64 after this ADR should not
 expect the `XDG_STATE_HOME` flip it originally proposed to land.
+
+## Amended by the estate-root integration (C7a, 2026-08-20)
+
+Part (a) of this decision — "estate-first precedence stands" — was built on
+a mechanism the estate-root contract removes. `resolve_data_dir`'s third rung
+was *estate discovery walking up from `cwd`*: R-MVP1-12's ancestor walk,
+filesystem-first, crossing Git boundaries, bounded at `$HOME`. Phase D
+deletes that walk outright, along with the zero-configuration Git-toplevel
+fallback beneath it (proposal §4.1: "Sergeant does not search parents and
+does not use Git to infer an estate"). R-MVP1-12 is **superseded**.
+
+What survives, and what changes:
+
+- **The manifest keeps its storage-path authority.** (b) is untouched:
+  `[estate] data_dir` is still read, still resolved the same way
+  `surfaces_dir` is, still narrows the daemon's own default rather than
+  outranking an explicit override. The *discovery* of the manifest changes;
+  its *authority* does not.
+- **The rung order is untouched.** `--data-dir`, then `SGT_DATA_DIR`, then
+  the estate, then the pre-estate platform fallback. (a)'s collision
+  argument — `XDG_DATA_HOME` is one global path per machine, estates are
+  per-directory — is exactly as true under exact-root admission as it was
+  under the walk, and is the reason the estate rung stays where it is.
+- **What the estate rung *means* changes.** It is no longer "the nearest
+  `[estate]`-bearing `sergeant.toml` at or above `cwd`" but "`cwd` itself, if
+  `cwd` is an estate root" — one deterministic check against one directory
+  (`Estate::is_estate_root`). From a `repos/<name>` mount one level down,
+  the rung no longer matches at all and resolution falls through to the
+  platform default, where before it would have found the estate above.
+- **(a)'s own rationale gets stronger, not weaker.** It leaned on ADR 0006's
+  explicit launch-time estate binding to argue that estate-before-XDG is not
+  a silent surprise. Exact-root admission finishes that argument: every
+  estate-scoped command now refuses outside a root with §4.4's loud
+  diagnostic before it resolves a data dir at all (§4.3), so the case where
+  a caller silently gets a data dir they did not intend has no path left.
+- **(c) is untouched.** #64 stays re-ruled, and the self-hosting
+  contradiction it named stays an accepted, explicit property.
+
+The proposal's own disposition register carries the same ruling from the
+other side: "R-MVP1-12 / `Workspace::discover_scoped`: upward estate
+discovery across Git boundaries — **Superseded.** Estate-scoped commands
+operate only when the current directory itself contains a valid
+`sergeant.toml`."
 
 ## Open questions
 

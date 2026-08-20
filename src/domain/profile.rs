@@ -11,7 +11,7 @@
 //! `sergeant.toml` cannot invent one. What it deliberately does **not** do is
 //! inspect the values a user puts in `env` and `options` and guess which of
 //! them look secret. That guess has no true positive available to it — a
-//! profile is checked-in workspace configuration, so anything in it is
+//! profile is checked-in estate configuration, so anything in it is
 //! already in the user's repository whatever sergeant thinks — and it has
 //! real false positives: `GIT_AUTHOR_NAME` is launch configuration for the
 //! work branch's commit identity, and any substring rule blunt enough to

@@ -34,6 +34,20 @@ use std::process::Command;
 /// competing mechanism.
 const DATA_DIR_ENV: &str = "SGT_DATA_DIR";
 
+/// §5.3: the canonical estate root this harness session is bound to.
+///
+/// Evidence and convenience, never authority: a later `sgt` invocation
+/// inside the session reads it only to make a *refusal* more informative
+/// (§4.4's descendant diagnostic names both roots). It can never waive the
+/// exact-root check — if Captain cds into a mount and runs `sgt run`, the
+/// tool still refuses and says how to return.
+const ESTATE_ROOT_ENV: &str = "SGT_ESTATE_ROOT";
+
+/// §5.3: which harness composed this environment, so a submission from
+/// inside the session routes by origin affinity (§13) and journals its true
+/// origin client rather than a bare `cli`.
+const ORIGIN_CLIENT_ENV: &str = "SGT_ORIGIN_CLIENT";
+
 /// Per-user toolchain directories `sgt <harness>` prepends to `PATH` before
 /// exec'ing, when they exist on disk. See the module docs for the measured
 /// evidence behind each one. Deliberately a short, named list rather than an
@@ -107,11 +121,19 @@ pub fn compose_path(
 /// Build the [`Command`] `sgt <harness>` execs into: `binary` with `args`
 /// passed straight through (§9's `sgt claude -- --model opus` reaches
 /// `claude` as `--model opus`, unexamined and unmodified), PATH enriched per
-/// [`toolchain_path_dirs`] when `$HOME` resolves, and `SGT_DATA_DIR` bound to
-/// `data_dir` — the same value `cli::resolve_data_dir` already computed for
-/// this invocation, so the binding agrees with whatever ladder rung (flag,
-/// env, estate walk, platform fallback) actually decided it.
-pub fn prepare(binary: &str, args: &[String], data_dir: &Path) -> Command {
+/// [`toolchain_path_dirs`] when `$HOME` resolves, and §5.3's three bindings:
+/// `SGT_ESTATE_ROOT` (the canonical root this invocation already admitted —
+/// §4.3 puts that check *before* harness preparation), `SGT_DATA_DIR` (the
+/// same value `cli::resolve_data_dir` computed for this invocation, so the
+/// binding agrees with whatever ladder rung decided it), and
+/// `SGT_ORIGIN_CLIENT` (the harness's own name).
+///
+/// The harness also starts *in* the estate root, which is what makes the
+/// ordinary `sgt run` inside the session work without a `-C`. That is
+/// convenience layered on top of the binding, not a substitute for it: the
+/// exact-root check still runs on every command, and the environment never
+/// waives it (§5.3).
+pub fn prepare(binary: &str, args: &[String], estate_root: &Path, data_dir: &Path) -> Command {
     let mut command = Command::new(binary);
     command.args(args);
     if let Some(home) = std::env::var_os("HOME") {
@@ -119,7 +141,10 @@ pub fn prepare(binary: &str, args: &[String], data_dir: &Path) -> Command {
         let path = compose_path(std::env::var_os("PATH").as_ref(), &dirs, |dir| dir.exists());
         command.env("PATH", path);
     }
+    command.env(ESTATE_ROOT_ENV, estate_root);
     command.env(DATA_DIR_ENV, data_dir);
+    command.env(ORIGIN_CLIENT_ENV, binary);
+    command.current_dir(estate_root);
     command
 }
 

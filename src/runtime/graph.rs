@@ -157,9 +157,16 @@ impl GraphContext {
                     delta.node(&node, "client", client, None, seq);
                     delta.edge("submitted", &node, &work_node_id, Some(work_id), seq);
                 }
-                if let Some(workspace) = work["workspace"].as_str() {
-                    let node = format!("workspace:{workspace}");
-                    delta.node(&node, "workspace", workspace, None, seq);
+                // estate-root Phase C, §7.4: `work["workspace"]` is a
+                // pre-Phase-C submission field, never written by a new
+                // `work.submitted` — so this branch only ever fires for a
+                // legacy journal replay now. The `workflow.bound` branch
+                // below is the label's live source for every Work
+                // journaled from Phase C onward (plan-time estate name,
+                // not a client-supplied one).
+                if let Some(estate) = work["workspace"].as_str() {
+                    let node = format!("estate:{estate}");
+                    delta.node(&node, "workspace", estate, None, seq);
                     delta.edge("scoped_to", &work_node_id, &node, Some(work_id), seq);
                 }
             }
@@ -179,6 +186,19 @@ impl GraphContext {
                     let node = format!("profile:{profile}");
                     delta.node(&node, "profile", profile, None, seq);
                     delta.edge("uses_profile", &work_node_id, &node, Some(work_id), seq);
+                }
+                // estate-root Phase C, §7.4: the discovered estate name at
+                // plan time (`StartPlan.estate.name`, journaled here
+                // since before Phase C existed) is the label's live source
+                // now that `Work.estate` is never written for a new
+                // submission — analytics.rs's `WorkRow` already prefers
+                // this same field over the submission-time one; this is
+                // that same "tolerate absence, prefer plan-time name"
+                // reading for the graph's `estate` node/edge.
+                if let Some(estate) = event.payload["workspace"].as_str() {
+                    let node = format!("estate:{estate}");
+                    delta.node(&node, "workspace", estate, None, seq);
+                    delta.edge("scoped_to", &work_node_id, &node, Some(work_id), seq);
                 }
             }
             KIND_SURFACE_MATERIALIZED => {

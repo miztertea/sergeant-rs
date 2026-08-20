@@ -3,7 +3,7 @@
 //! §11 is explicit: shell out to the installed Git rather than embedding
 //! libgit2 — "Git already defines the behavior we want; Depot's
 //! responsibility is deterministic orchestration around it". Everything the
-//! surface and workspace layers need from Git goes through this one module so
+//! surface and estate layers need from Git goes through this one module so
 //! there is exactly one place that knows how a Git invocation is spelled,
 //! sandboxed, and read.
 //!
@@ -13,6 +13,28 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+/// Overrides the `git` executable [`command`] invokes, mirroring
+/// `backend::docker::DOCKER_BIN_ENV` (C11: Slice 1's "scripted Git binary"
+/// admission tests had no infrastructure to point at). Without this, every
+/// check this module's callers need to prove — no network, no branch
+/// switch, no fetch/pull/reset on any admission path — could only be
+/// asserted against whatever real `git` happens to be on `PATH`, the one
+/// thing a test can neither control nor safely fake.
+///
+/// Read fresh from the environment inside [`command`] on every invocation
+/// rather than cached in a config struct or a `OnceLock`: a cached value (or
+/// a `OnceLock`, which would stay poisoned for the rest of a parallel test
+/// run) would let one test's override leak into, or block, another's. Tests
+/// point it at a scripted binary to observe — or deny — git invocations
+/// without touching `PATH`.
+///
+/// Setting it is nonetheless a *process-global* act, not a thread-scoped
+/// one, so a test that sets it must own its whole process rather than share
+/// the lib test binary with the many call sites that reach real Git through
+/// this module. `tests/c11_injectable_git.rs` is that process, and carries
+/// the reasoning.
+pub const GIT_BIN_ENV: &str = "SGT_GIT_BIN";
 
 /// Failure running the Git CLI.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +65,53 @@ pub enum GitError {
     },
 }
 
+/// `git rev-parse --path-format=absolute --git-common-dir` in `dir`,
+/// canonicalized: the identity §2.7/§9.4 locks on.
+///
+/// The *common* directory, not the git dir: a linked worktree's own
+/// `.git/worktrees/<name>` is private to it, while the common dir is the
+/// shared object store, the ref storage, and the linked-worktree registry —
+/// the state two concurrent mutators actually collide in. A primary checkout
+/// and every `git worktree add` of it answer with one and the same path,
+/// which is precisely what a lock keyed on the checkout *path* could never
+/// see (proposal §2.7: "different linked worktree paths may share one Git
+/// common directory and therefore one ref/worktree registry while receiving
+/// different locks").
+///
+/// Canonicalized because this is about identity, not spelling: a repository
+/// reached through a symlink (`/tmp` → `/private/tmp` on macOS, an estate
+/// mount behind a symlinked parent) would otherwise answer differently from
+/// the same repository reached directly, and hand two names to one thing.
+/// When canonicalization fails — a path that raced away underneath us — the
+/// absolute answer Git gave is kept as-is rather than discarded: a slightly
+/// less normalized identity still serializes correctly against every other
+/// caller that resolves it the same way, and refusing outright would fail an
+/// operation over a spelling.
+pub fn canonical_git_common_dir(dir: &Path) -> Result<std::path::PathBuf, GitError> {
+    let raw = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let path = std::path::PathBuf::from(raw);
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// `git rev-parse --path-format=absolute --show-toplevel` in `dir`,
+/// canonicalized the same way [`canonical_git_common_dir`] is.
+///
+/// §3.5's "canonical Git top level" half of a repository binding: what the
+/// declared mount path actually resolves to as a working tree, recorded at
+/// admission so later readers compare against what was admitted rather than
+/// re-asking a checkout that may have moved.
+pub fn canonical_git_top_level(dir: &Path) -> Result<std::path::PathBuf, GitError> {
+    let raw = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )?;
+    let path = std::path::PathBuf::from(raw);
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 /// Run `git <args>` in `dir` and return trimmed stdout, or a [`GitError`].
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
     let output = command(dir, args)
@@ -61,6 +130,37 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// [`git`] without the trim: stdout exactly as Git wrote it.
+///
+/// Necessary for `status --porcelain`, whose leading whitespace *is* the
+/// answer — ` M file` (modified, unstaged) and `M  file` (modified, staged)
+/// differ only there, and trimming turns the first into the second. §8.3
+/// requires an override to "record full porcelain evidence"; evidence with
+/// its first status column removed is not that.
+///
+/// Only the trailing newline Git terminates its last record with is dropped,
+/// so a clean tree still answers with an empty string.
+pub fn git_verbatim(dir: &Path, args: &[&str]) -> Result<String, GitError> {
+    let output = command(dir, args)
+        .output()
+        .map_err(|source| GitError::Spawn {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches('\n')
+        .to_string())
 }
 
 /// Whether `git <args>` in `dir` exits zero. Used for existence questions
@@ -134,7 +234,8 @@ pub fn git_submodule_update(dir: &Path) -> Result<String, GitError> {
 
 /// One hermetic Git invocation: no pager, no prompts, no editor, stdin closed.
 fn command(dir: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
+    let git_bin = std::env::var(GIT_BIN_ENV).unwrap_or_else(|_| "git".to_string());
+    let mut command = Command::new(git_bin);
     command
         .arg("--no-pager")
         .args(args)

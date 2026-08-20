@@ -3,8 +3,16 @@
 //!
 //! Retains and updates the original workflow-catalog contract (§19.4):
 //! embedded fallback, an indexed published workflow, drafts excluded, an
-//! unindexed directory excluded, a non-absolute `cwd` rejected, no event
-//! append, and `cwd` discovery matching what `POST /v1/work` would resolve.
+//! unindexed directory excluded, a non-absolute `cwd` rejected, and no event
+//! append.
+//!
+//! **Estate-root §5.2 changed what the catalog is *about*.** It used to
+//! discover a estate from the client's `cwd`, which made "what could I
+//! bind" a question about wherever the caller happened to be standing. The
+//! catalog is now the **bound estate's**, the same estate `POST /v1/work`
+//! plans against — a client cannot be shown a catalog it could not actually
+//! submit into. `cwd` remains in the query grammar and is still validated
+//! (a relative one is still a structured 400), but it is evidence only.
 
 use std::path::Path;
 use std::process::Command;
@@ -46,6 +54,30 @@ fn init_repo(path: &Path) {
     std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
     git(path, &["add", "."]);
     git(path, &["commit", "-m", "initial"]);
+}
+
+/// An estate root at `path` (§4.1) with one derived mount (§6.1), and a
+/// daemon started **bound** to it (§5.1) — the catalog's subject.
+fn init_estate(path: &Path) {
+    init_repo(path);
+    init_repo(&path.join("repos").join("solo"));
+    std::fs::write(
+        path.join("sergeant.toml"),
+        "[estate]\nname = \"catalog-estate\"\n\n[[repo]]\nname = \"solo\"\n",
+    )
+    .expect("write sergeant.toml");
+}
+
+async fn start_bound(data_dir: &Path, estate_root: &Path) -> DaemonHandle {
+    daemon::start_with(
+        data_dir,
+        daemon::DaemonConfig {
+            estate_root: Some(estate_root.to_path_buf()),
+            ..daemon::DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
 }
 
 /// Writes one admitted workflow — `workflow.toml`, one stage's `CONTEXT.md`,
@@ -130,11 +162,11 @@ fn urlencoding_stub(value: &str) -> String {
 async fn a_published_workflow_is_listed_fully_described() {
     let data = TempDir::new().expect("tempdir");
     let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    init_estate(repo.path());
     write_workflow(repo.path(), "implement");
     write_root_catalog(repo.path(), &[("implement", "published")]);
 
-    let handle = daemon::start(data.path()).await.expect("daemon start");
+    let handle = start_bound(data.path(), repo.path()).await;
     let (status, body) = get_status(
         &handle,
         &format!("/v1/workflows?cwd={}", {
@@ -182,8 +214,9 @@ async fn a_published_workflow_is_listed_fully_described() {
     handle.shutdown().await;
 }
 
-/// §11.2's embedded-fallback edge shape: no repository catalog resolves for
-/// `cwd`, so the built-in `software-change` workflow answers instead, with
+/// §11.2's embedded-fallback edge shape: the bound estate publishes no
+/// catalog of its own (here, a daemon bound to no estate at all — §5.1's
+/// `None`), so the built-in `software-change` workflow answers instead, with
 /// `status`/`description`/`tags` all absent (not `null`, not `[]`).
 #[tokio::test]
 async fn no_repository_falls_back_to_the_embedded_workflow() {
@@ -224,7 +257,7 @@ async fn no_repository_falls_back_to_the_embedded_workflow() {
 async fn unindexed_directories_and_draft_rows_are_excluded() {
     let data = TempDir::new().expect("tempdir");
     let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    init_estate(repo.path());
     write_workflow(repo.path(), "implement");
     write_workflow(repo.path(), "shadow"); // on disk, never indexed
     write_workflow(repo.path(), "half-baked");
@@ -233,7 +266,7 @@ async fn unindexed_directories_and_draft_rows_are_excluded() {
         &[("implement", "published"), ("half-baked", "draft")],
     );
 
-    let handle = daemon::start(data.path()).await.expect("daemon start");
+    let handle = start_bound(data.path(), repo.path()).await;
     let (status, body) = get_status(
         &handle,
         &format!(
@@ -279,11 +312,11 @@ async fn a_missing_or_relative_cwd_is_a_structured_400() {
 async fn the_route_appends_no_event() {
     let data = TempDir::new().expect("tempdir");
     let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    init_estate(repo.path());
     write_workflow(repo.path(), "implement");
     write_root_catalog(repo.path(), &[("implement", "published")]);
 
-    let handle = daemon::start(data.path()).await.expect("daemon start");
+    let handle = start_bound(data.path(), repo.path()).await;
     let before = events(&handle).await.len();
     let (status, _) = get_status(
         &handle,

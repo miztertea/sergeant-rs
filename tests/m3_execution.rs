@@ -1,10 +1,10 @@
 //! M3 acceptance tests (docs/gauntlet/contracts/M3.md).
 //!
-//! 1. Zero-config: submit in a temp git repo → a real worktree on a work
-//!    branch cut from HEAD, with a complete binding record and the right base
-//!    SHA.
-//! 2. Multi-repo: `sergeant.toml` with two repositories → one surface, two
-//!    worktree bindings.
+//! 1. Single-repository estate: submit against the estate the daemon is bound
+//!    to → a real worktree on a work branch cut from the mount's HEAD, with a
+//!    complete binding record and the right base SHA.
+//! 2. Multi-repo: an estate manifest declaring two repositories → one surface,
+//!    two worktree bindings.
 //! 3. Full run: scripted to complete every stage → `completed`, stage
 //!    entry/completion journaled in order, worktree removed, branch retained.
 //! 4. needs_input: → `needs_input`; API input resumes the run to completion;
@@ -42,6 +42,7 @@ use sergeant_rs::backend::{
     NativeState, Observation, ProbeReport, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
+use sergeant_rs::domain::estate::InstructionPolicy;
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
 use sergeant_rs::domain::execution::KIND_EXECUTION_RECONCILED;
 use sergeant_rs::domain::work::{
@@ -51,7 +52,6 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
     KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use sergeant_rs::domain::workspace::InstructionPolicy;
 use sergeant_rs::runtime::engine::{Engine, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::{
@@ -108,7 +108,30 @@ fn init_repo(path: &Path) -> String {
     git(path, &["rev-parse", "HEAD"])
 }
 
-/// Write a workflow into a repository: `.sergeant/workflows/<name>/…`.
+/// Scaffold an estate at `root` from a verbatim `sergeant.toml`, creating the
+/// derived mount `<root>/repos/<name>` for every entry of `repos`. Returns
+/// each mount's HEAD SHA, in `repos` order.
+///
+/// [`support::scaffold_estate`] covers the plain shape; this exists for the
+/// manifests these tests need extra keys in (`default_backend`,
+/// `surfaces_dir`, per-repo `instructions`, `[[profile]]`, `[group.*]`).
+/// estate-root §6.1: no entry may carry a `path` — a mount is derived from
+/// the estate root and the repository's own name, never declared.
+fn estate_with_manifest(root: &Path, manifest: &str, repos: &[&str]) -> Vec<String> {
+    std::fs::create_dir_all(root).expect("estate root");
+    let heads = repos
+        .iter()
+        .map(|name| init_repo(&root.join("repos").join(name)))
+        .collect();
+    std::fs::write(root.join("sergeant.toml"), manifest).expect("sergeant.toml");
+    heads
+}
+
+/// Write a workflow into an **estate root**: `.sergeant/workflows/<name>/…`.
+///
+/// estate-root §4.1/§5.2: workflows resolve against `estate.root` — the
+/// directory the manifest lives in — so a fixture written inside a mount is
+/// never found. Every caller here passes the estate root, not a checkout.
 fn write_workflow(root: &Path, name: &str, stages: &[(&str, &str)]) {
     write_workflow_with_tables(root, name, stages, "")
 }
@@ -146,11 +169,19 @@ fn write_two_stage_workflow(root: &Path) {
     );
 }
 
-/// Start a daemon with a scripted registry.
+/// Start a daemon bound to `estate_root`, with a scripted registry.
+///
+/// estate-root §5.1/§5.2: the estate is a property of the *daemon*, fixed at
+/// start and admitted before the data dir is even created. `Engine::plan`
+/// reads the manifest at this root and nowhere else; a submission's
+/// `origin.cwd` is recorded evidence only. `None` starts a daemon bound to no
+/// estate at all — it plans against nothing, so everything it accepts stays
+/// `pending`.
 async fn start_with(
     data_dir: &Path,
     registry: BackendRegistry,
     default: Option<&str>,
+    estate_root: Option<&Path>,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
@@ -158,6 +189,7 @@ async fn start_with(
             backends: Arc::new(registry),
             default_backend: default.map(str::to_string),
             claude: None,
+            estate_root: estate_root.map(Path::to_path_buf),
             ..DaemonConfig::default()
         },
     )
@@ -246,6 +278,22 @@ fn events_of(data_dir: &Path, work_id: &str, kind: &str) -> Vec<Event> {
         .into_iter()
         .filter(|e| e.work_id.as_deref() == Some(work_id) && e.kind == kind)
         .collect()
+}
+
+/// Make each of `paths` writable or not, for tests that need a git write to
+/// fail while every git *read* still succeeds.
+fn set_writable(paths: &[PathBuf], writable: bool) {
+    for path in paths {
+        let mut permissions = std::fs::metadata(path).expect("stat").permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(if writable { 0o755 } else { 0o555 });
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(!writable);
+        std::fs::set_permissions(path, permissions).expect("chmod");
+    }
 }
 
 /// Whether a branch exists in a repository.
@@ -379,26 +427,47 @@ impl Backend for OpaqueBackend {
 
 // ------------------------------------------------------------------ tests
 
-/// 1. Zero-config discovery materializes a real worktree, on a work branch,
-///    cut from the repository's current HEAD, with a complete binding record.
+/// 1. A submission against the estate the daemon is bound to materializes a
+///    real worktree, on a work branch, cut from the mount's current HEAD, with
+///    a complete binding record.
+///
+/// This pinned "zero-config discovery" until estate-root §4.1 deleted it:
+/// there is no ancestor walk and no git-toplevel fallback, so the estate is
+/// the one the daemon was *started* against and the repository is its derived
+/// mount `<estate-root>/repos/solo` (§6.1). What the test measures is
+/// unchanged — everything below the first four lines is about the surface,
+/// not about how the estate was found.
 #[tokio::test]
-async fn t1_zero_config_submit_materializes_a_real_worktree() {
+async fn t1_a_bound_estate_submit_materializes_a_real_worktree() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    let head = init_repo(&repo);
+    let estate = repos.path().join("solo-estate");
+    let (repo, head) = support::scaffold_solo_estate(&estate, "solo");
 
     // A hang keeps the run in flight, so the surface can be inspected while
     // it exists rather than after teardown.
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &repo, "zero config", json!({})).await;
+    let (status, body) = submit(&client, &handle, &estate, "one bound estate", json!({})).await;
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "active");
-    assert_eq!(body["work"]["workspace"], "solo");
+    // estate-root §7.1/§7.4: no scope was submitted at all, and a
+    // one-repository estate infers its sole repository — `Work.estate`
+    // is never written for a new Work (`workflow.bound`'s own `estate`
+    // field, journaled separately, is its replacement — see
+    // `r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities`
+    // below for that assertion).
+    assert_eq!(body["work"]["workspace"], Value::Null);
+    assert_eq!(body["work"]["repositories"], json!(["solo"]));
 
     // The binding records everything §11 asks for.
     let bindings = body["surface"]["bindings"]
@@ -474,34 +543,39 @@ async fn t1_zero_config_submit_materializes_a_real_worktree() {
 async fn t2_multi_repo_workspace_binds_one_worktree_per_repository() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let api = repos.path().join("payments-api");
-    let web = repos.path().join("payments-web");
-    let api_head = init_repo(&api);
-    let web_head = init_repo(&web);
-    std::fs::write(
-        api.join("sergeant.toml"),
-        r#"
-[estate]
-name = "payments"
-
-[[repo]]
-name = "api"
-path = "."
-
-[[repo]]
-name = "web"
-path = "../payments-web"
-"#,
-    )
-    .expect("sergeant.toml");
+    // estate-root §6.1: one estate root, two *derived* mounts. The old shape
+    // — the manifest living inside `api` with `path = "."`, and `web` a
+    // sibling reached by `path = "../payments-web"` — is refused by name now;
+    // a repository is `<estate-root>/repos/<name>` and nothing else.
+    let estate = repos.path().join("payments");
+    let heads = support::scaffold_estate(&estate, "payments", &["api", "web"]);
+    let (api_head, web_head) = (heads[0].clone(), heads[1].clone());
 
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "multi repo", json!({})).await;
+    // estate-root §7.1: "payments" declares two repositories, so this test's
+    // whole point (one surface, two bindings) needs an explicit scope now —
+    // `--all` is the least-assuming choice that still selects both.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "multi repo",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
-    assert_eq!(body["work"]["workspace"], "payments");
+    // §7.4: `Work.estate` is never written for a new Work; §7.3's
+    // resolved-list replacement is asserted via `bindings` below.
+    assert_eq!(body["work"]["workspace"], Value::Null);
 
     let bindings = body["surface"]["bindings"].as_array().expect("bindings");
     assert_eq!(bindings.len(), 2, "one binding per declared repository");
@@ -532,6 +606,44 @@ path = "../payments-web"
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].cwd, root);
 
+    // §10.1: and the backend is handed the complete binding summary, not
+    // only that cwd — which for a multi-repo Work is precisely the case
+    // where the cwd is a directory the Work may *not* write to. Every field
+    // is the one sergeant journaled for that binding.
+    let summary = &starts[0].bindings;
+    assert_eq!(
+        summary.len(),
+        2,
+        "one summary entry per bound repository: {summary:?}"
+    );
+    for (entry, journaled) in summary.iter().zip(bindings) {
+        assert_eq!(entry.repository, journaled["repository"].as_str().unwrap());
+        assert_eq!(
+            entry.worktree_path,
+            PathBuf::from(journaled["worktree_path"].as_str().unwrap()),
+            "the exact worktree path the Work may modify"
+        );
+        assert_eq!(
+            entry.work_branch,
+            journaled["work_branch"].as_str().unwrap()
+        );
+        assert_eq!(
+            entry.base_branch.as_deref(),
+            journaled["base_branch"].as_str()
+        );
+        assert_eq!(
+            entry.base_sha,
+            journaled["base_sha"].as_str().unwrap(),
+            "the exact base SHA, pinned"
+        );
+        assert_ne!(
+            entry.worktree_path, root,
+            "no entry names the surface root: it is not part of the mutation surface"
+        );
+    }
+    assert_eq!(summary[0].base_sha, api_head, "declaration order, again");
+    assert_eq!(summary[1].base_sha, web_head);
+
     handle.shutdown().await;
 }
 
@@ -544,23 +656,36 @@ path = "../payments-web"
 async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let api = repos.path().join("payments-api");
-    let web = repos.path().join("payments-web");
-    init_repo(&api);
-    init_repo(&web);
-    std::fs::write(
-        api.join("sergeant.toml"),
+    let estate = repos.path().join("payments");
+    estate_with_manifest(
+        &estate,
         "[estate]\nname = \"payments\"\n\n\
-         [[repo]]\nname = \"api\"\npath = \".\"\ninstructions = \"suppress\"\n\n\
-         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\ninstructions = \"local\"\n",
-    )
-    .expect("sergeant.toml");
+         [[repo]]\nname = \"api\"\ninstructions = \"suppress\"\n\n\
+         [[repo]]\nname = \"web\"\ninstructions = \"local\"\n",
+        &["api", "web"],
+    );
 
     let (registry, fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "mixed policy", json!({})).await;
+    // estate-root §7.1: an explicit `--all` selects both repositories, so
+    // this test still reaches the instruction-policy check it means to pin
+    // rather than tripping the (now separate) missing-scope refusal first.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "mixed policy",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
     assert_eq!(status, 422, "a mixed policy must refuse at submit: {body}");
     assert_eq!(body["error"]["code"], "instruction_policy_conflict");
     let message = body["error"]["message"].as_str().expect("message");
@@ -586,19 +711,24 @@ async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos(
 async fn r_mvp1_4_local_instructions_policy_is_accepted_at_submit_and_reaches_the_backend() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    std::fs::write(
-        repo.join("sergeant.toml"),
-        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\ninstructions = \"local\"\n",
-    )
-    .expect("sergeant.toml");
+    let estate = repos.path().join("solo-estate");
+    estate_with_manifest(
+        &estate,
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\ninstructions = \"local\"\n",
+        &["solo"],
+    );
 
     let (registry, fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &repo, "local measured", json!({})).await;
+    let (status, body) = submit(&client, &handle, &estate, "local measured", json!({})).await;
     assert_eq!(status, 201, "local must be accepted at submit now: {body}");
     assert_eq!(body["work"]["state"], "active");
 
@@ -625,9 +755,11 @@ async fn r_mvp1_4_local_instructions_policy_is_accepted_at_submit_and_reaches_th
 async fn r_mvp1_11_a_stage_requiring_ask_refuses_at_submit_over_http() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    let dir = repo.join(".sergeant/workflows/asks");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    // §4.1: workflows resolve against the estate root, so the fixture lives
+    // there rather than inside the mount.
+    let dir = estate.join(".sergeant/workflows/asks");
     std::fs::create_dir_all(dir.join("00-interview")).expect("stage dir");
     std::fs::write(
         dir.join("workflow.toml"),
@@ -642,13 +774,19 @@ async fn r_mvp1_11_a_stage_requiring_ask_refuses_at_submit_over_http() {
         ..Capabilities::default()
     });
     let registry = BackendRegistry::new().with(Arc::new(no_ask.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "needs a real ask",
         json!({"workflow": "asks"}),
     )
@@ -685,23 +823,37 @@ async fn r_mvp1_11_a_stage_requiring_ask_refuses_at_submit_over_http() {
 async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let api = repos.path().join("payments-api");
-    let web = repos.path().join("payments-web");
-    init_repo(&api);
-    init_repo(&web);
-    std::fs::write(
-        api.join("sergeant.toml"),
+    let estate = repos.path().join("payments");
+    estate_with_manifest(
+        &estate,
         "[estate]\nname = \"payments\"\n\n\
-         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
-         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\ninstructions = \"suppress\"\n",
-    )
-    .expect("sergeant.toml");
+         [[repo]]\nname = \"api\"\n\n\
+         [[repo]]\nname = \"web\"\ninstructions = \"suppress\"\n",
+        &["api", "web"],
+    );
 
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "uniform policy", json!({})).await;
+    // estate-root §7.1: "payments" declares two repositories, so an empty
+    // scope is refused now — `--all` is this test's explicit request for
+    // both, which is what it actually wants to pin (uniform policy across a
+    // multi-repository bind), orthogonal to which scope form asked for it.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "uniform policy",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "active");
@@ -716,7 +868,7 @@ async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities
             .map(|r| r["name"].as_str().expect("name"))
             .collect::<Vec<_>>(),
         ["api", "web"],
-        "workflow.bound must carry the resolved repository set, not just the workspace name"
+        "workflow.bound must carry the resolved repository set, not just the estate name"
     );
     let identities = payload["instruction_identities"]
         .as_array()
@@ -741,21 +893,27 @@ async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities
 async fn t3_full_run_completes_every_stage_and_retires_the_surface() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    let (repo, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, fake) = one_fake([
         FakeStep::complete_with("first done"),
         FakeStep::complete_with("second done"),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "run to completion",
         json!({"workflow": "tiny"}),
     )
@@ -877,16 +1035,15 @@ async fn t3_full_run_completes_every_stage_and_retires_the_surface() {
 async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bind() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    std::fs::write(
-        repo.join("sergeant.toml"),
-        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+    let estate = repos.path().join("solo-estate");
+    estate_with_manifest(
+        &estate,
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\n\n\
          [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n",
-    )
-    .expect("sergeant.toml");
+        &["solo"],
+    );
     write_workflow_with_tables(
-        &repo,
+        &estate,
         "tagged-tiny",
         &[
             ("00-first", "first stage context"),
@@ -908,13 +1065,19 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     );
     let (registry, fake) = one_fake([FakeStep::complete_with("second done")]);
     let registry = registry.with(Arc::new(alt.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "tagged run",
         json!({"workflow": "tagged-tiny"}),
     )
@@ -944,7 +1107,7 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     // stage, and different context for the stage not yet entered. A fresh
     // `resolve()` of the same name now sees different content...
     write_workflow_with_tables(
-        &repo,
+        &estate,
         "tagged-tiny",
         &[
             ("00-first", "first stage context"),
@@ -952,7 +1115,7 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
         ],
         "\n[stage.\"00-first\"]\nkind = \"actor\"\nharness = \"edited-harness\"\nprofile = \"edited-profile\"\n",
     );
-    let edited = WorkflowDefinition::resolve(&repo, "tagged-tiny").expect("resolve edited");
+    let edited = WorkflowDefinition::resolve(&estate, "tagged-tiny").expect("resolve edited");
     assert_ne!(
         edited.content_hash, pinned_hash,
         "the edit must actually be execution-relevant, or this test proves nothing"
@@ -1015,9 +1178,9 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
 async fn t4_needs_input_parks_the_run_and_input_resumes_it() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, fake) = one_fake([
         FakeStep::needs_input("which database?"),
@@ -1026,13 +1189,19 @@ async fn t4_needs_input_parks_the_run_and_input_resumes_it() {
         FakeStep::complete(),
         FakeStep::complete(),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "ask me something",
         json!({"workflow": "tiny"}),
     )
@@ -1101,22 +1270,28 @@ async fn t4_needs_input_parks_the_run_and_input_resumes_it() {
 async fn t5_failure_records_the_reason_and_retry_re_enters_the_stage() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, fake) = one_fake([
         FakeStep::fail("the tests do not compile"),
         FakeStep::complete(),
         FakeStep::complete(),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "fail then retry",
         json!({"workflow": "tiny"}),
     )
@@ -1199,19 +1374,25 @@ async fn t5_failure_records_the_reason_and_retry_re_enters_the_stage() {
 async fn t6_cancel_mid_stage_leaves_no_zombie_work_state() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    let (repo, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     // `hang` ignores STOP: the native context refuses to die.
     let (registry, fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "cancel me mid stage",
         json!({"workflow": "tiny"}),
     )
@@ -1294,7 +1475,13 @@ async fn t6_cancel_mid_stage_leaves_no_zombie_work_state() {
     // recovery does not even consider it in flight.
     handle.shutdown().await;
     let (registry, _) = one_fake([FakeStep::complete()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let shown = get(&http(), &handle, &format!("/v1/work/{work_id}")).await;
     assert_eq!(shown["work"]["state"], "canceled");
     handle.shutdown().await;
@@ -1302,70 +1489,103 @@ async fn t6_cancel_mid_stage_leaves_no_zombie_work_state() {
 
 /// 7. The §13 precedence chain, end to end through the API, plus the failure
 ///    that lists the options.
+///
+/// Tier three — the estate default — is a property of the *daemon* now, not
+/// of the request: §5.2 gives `origin.cwd` no authority, so a single daemon
+/// can no longer be walked between a defaulted and an undefaulted estate by
+/// varying the submission's cwd. The chain is therefore exercised across two
+/// daemons, one bound to each estate, and the tier ordering assertion is
+/// unchanged — what moved is which process answers, not which rule wins.
 #[tokio::test]
 async fn t7_routing_precedence_and_structured_failure() {
     let repos = TempDir::new().expect("tempdir");
-    let data = TempDir::new().expect("tempdir");
     let plain = repos.path().join("plain");
     let configured = repos.path().join("configured");
-    init_repo(&plain);
-    init_repo(&configured);
-    std::fs::write(
-        configured.join("sergeant.toml"),
-        "[estate]\nname = \"configured\"\ndefault_backend = \"codex\"\n\n[[repo]]\nname = \"configured\"\npath = \".\"\n",
-    )
-    .expect("sergeant.toml");
+    support::scaffold_estate(&plain, "plain", &["plain"]);
+    estate_with_manifest(
+        &configured,
+        "[estate]\nname = \"configured\"\ndefault_backend = \"codex\"\n\n\
+         [[repo]]\nname = \"configured\"\n",
+        &["configured"],
+    );
 
-    let registry = BackendRegistry::new()
-        .with(Arc::new(FakeBackend::scripted(
-            "claude",
-            [FakeStep::hang()],
-        )))
-        .with(Arc::new(FakeBackend::scripted("codex", [FakeStep::hang()])))
-        .with(Arc::new(FakeBackend::scripted(
-            FAKE_BACKEND_NAME,
-            [FakeStep::hang()],
-        )));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    // Three registered identities, rebuilt per daemon: a `BackendRegistry` is
+    // consumed by the start it configures.
+    let routing_registry = || {
+        BackendRegistry::new()
+            .with(Arc::new(FakeBackend::scripted(
+                "claude",
+                [FakeStep::hang()],
+            )))
+            .with(Arc::new(FakeBackend::scripted("codex", [FakeStep::hang()])))
+            .with(Arc::new(FakeBackend::scripted(
+                FAKE_BACKEND_NAME,
+                [FakeStep::hang()],
+            )))
+    };
+    let plain_data = TempDir::new().expect("tempdir");
+    let plain_handle = start_with(
+        plain_data.path(),
+        routing_registry(),
+        Some(FAKE_BACKEND_NAME),
+        Some(&plain),
+    )
+    .await;
+    let configured_data = TempDir::new().expect("tempdir");
+    let configured_handle = start_with(
+        configured_data.path(),
+        routing_registry(),
+        Some(FAKE_BACKEND_NAME),
+        Some(&configured),
+    )
+    .await;
     let client = http();
 
-    // Explicit beats origin affinity beats workspace default beats global.
+    // Explicit beats origin affinity beats estate default beats global.
     let cases = [
         (
+            &plain_handle,
             &plain,
             json!({"backend": "claude", "origin": {"client": "codex", "cwd": plain}}),
             "claude",
             "explicit",
         ),
         (
+            &plain_handle,
             &plain,
             json!({"origin": {"client": "codex", "cwd": plain}}),
             "codex",
             "origin_affinity",
         ),
-        // Affinity and workspace default both populated, and different:
-        // the adjacent tiers are only ordered by a case that presents both.
+        // Affinity and estate default both populated, and different: the
+        // adjacent tiers are only ordered by a case that presents both.
         (
+            &configured_handle,
             &configured,
             json!({"origin": {"client": "claude", "cwd": configured}}),
             "claude",
             "origin_affinity",
         ),
         (
+            &configured_handle,
             &configured,
             json!({"origin": {"client": "cli", "cwd": configured}}),
             "codex",
+            // §13.2's rename left this tier's *journaled* name alone — see
+            // `RouteSource::as_str`. One dated spelling beats two spellings
+            // of one tier in the same journal.
             "workspace_default",
         ),
         (
+            &plain_handle,
             &plain,
             json!({"origin": {"client": "cli", "cwd": plain}}),
             FAKE_BACKEND_NAME,
             "global_default",
         ),
     ];
-    for (cwd, extra, expected_backend, expected_source) in cases {
-        let (status, body) = submit(&client, &handle, cwd, "route me", extra).await;
+    for (handle, cwd, extra, expected_backend, expected_source) in cases {
+        let (status, body) = submit(&client, handle, cwd, "route me", extra).await;
         assert_eq!(status, 201, "submit failed: {body}");
         assert_eq!(
             body["backend"], expected_backend,
@@ -1373,12 +1593,13 @@ async fn t7_routing_precedence_and_structured_failure() {
         );
         assert_eq!(body["route_source"], expected_source);
     }
+    configured_handle.shutdown().await;
 
     // A tier that names an unknown backend fails with the options, and never
     // silently substitutes the one that is available.
     let (status, body) = submit(
         &client,
-        &handle,
+        &plain_handle,
         &plain,
         "unknown backend",
         json!({"backend": "opencode"}),
@@ -1395,13 +1616,16 @@ async fn t7_routing_precedence_and_structured_failure() {
         body["error"]["available_backends"],
         json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
     );
-    handle.shutdown().await;
+    plain_handle.shutdown().await;
 
     // Nothing selected and no global default: a structured failure that lists
-    // what could have been asked for.
+    // what could have been asked for. This daemon is bound to an estate too —
+    // an *unbound* one plans nothing, and §13's no-selection outcome is the
+    // one case a captured intent is allowed to carry (`Engine::plan`), so
+    // reaching the refusal at all requires a real estate to plan against.
     let data = TempDir::new().expect("tempdir");
     let registry = BackendRegistry::new().with(Arc::new(FakeBackend::new("claude")));
-    let handle = start_with(data.path(), registry, None).await;
+    let handle = start_with(data.path(), registry, None, Some(&plain)).await;
     let (status, body) = submit(&http(), &handle, &plain, "nothing selected", json!({})).await;
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
@@ -1437,14 +1661,24 @@ async fn t7_routing_precedence_and_structured_failure() {
 // `fake` and `alt-harness` — make "which harness ran this stage" a fact read
 // off the backends rather than inferred from a payload.
 
-/// A workspace whose `sergeant.toml` declares one profile per harness, and a
-/// three-stage workflow whose stage tables are `tables`.
-fn mixed_harness_repo(repo: &Path, tables: &str) {
-    init_repo(repo);
+/// An estate at `root` whose `sergeant.toml` declares one profile per
+/// harness, plus a three-stage workflow whose stage tables are `tables`. Both
+/// live at the estate root (§4.1); the sole repository is its derived mount
+/// `repos/solo` (§6.1), which is why no entry names a path.
+///
+/// Re-callable on a root it already scaffolded: t7d rewrites the manifest and
+/// the workflow mid-test to prove a *bound* stage decision cannot see later
+/// edits, and re-initializing an already-committed mount would have nothing
+/// to commit.
+fn mixed_harness_repo(root: &Path, tables: &str) {
+    let mount = root.join("repos").join("solo");
+    if !mount.join(".git").exists() {
+        init_repo(&mount);
+    }
     std::fs::write(
-        repo.join("sergeant.toml"),
+        root.join("sergeant.toml"),
         format!(
-            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\n\n\
              [[profile]]\nname = \"alt-profile\"\nbackend = \"alt-harness\"\n\
              default_model = \"alt-model-1\"\n\n\
              [[profile]]\nname = \"default-profile\"\nbackend = \"{FAKE_BACKEND_NAME}\"\n\
@@ -1453,7 +1687,7 @@ fn mixed_harness_repo(repo: &Path, tables: &str) {
     )
     .expect("sergeant.toml");
     write_workflow_with_tables(
-        repo,
+        root,
         "mixed",
         &[
             ("00-a", "stage a context"),
@@ -1471,24 +1705,30 @@ fn mixed_harness_repo(repo: &Path, tables: &str) {
 async fn t7b_a_mixed_harness_workflow_runs_a_then_b_then_a() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
+    let estate = repos.path().join("solo-estate");
     // Stage 10 is the only one that names a harness; 00 and 20 inherit the
     // Work actor default. So the run is default → alt → default: A→B→A.
     mixed_harness_repo(
-        &repo,
+        &estate,
         "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
     );
 
     let alt = FakeBackend::new("alt-harness");
     let (registry, fake) = one_fake([]);
     let registry = registry.with(Arc::new(alt.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "A then B then A",
         json!({"workflow": "mixed"}),
     )
@@ -1551,21 +1791,27 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     // Row 4: registered but probe-unavailable.
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
+    let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
-        &repo,
+        &estate,
         "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\n",
     );
     let alt = FakeBackend::new("alt-harness");
     alt.set_available(false, "alt-harness is not logged in");
     let (registry, fake) = one_fake([]);
     let registry = registry.with(Arc::new(alt.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "unavailable stage harness",
         json!({"workflow": "mixed"}),
     )
@@ -1599,17 +1845,23 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     // Row 4, second shape: a harness no daemon here registers.
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
+    let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
-        &repo,
+        &estate,
         "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"codex\"\n",
     );
     let (registry, fake) = one_fake([]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "unknown stage harness",
         json!({"workflow": "mixed"}),
     )
@@ -1631,19 +1883,25 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     // Row 3's negative: a stage profile that belongs to a different harness.
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
+    let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
-        &repo,
+        &estate,
         "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\n\
          profile = \"default-profile\"\n",
     );
     let (registry, fake) = one_fake([]);
     let registry = registry.with(Arc::new(FakeBackend::new("alt-harness")));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "profile belongs elsewhere",
         json!({"workflow": "mixed"}),
     )
@@ -1668,9 +1926,9 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
 async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
+    let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
-        &repo,
+        &estate,
         "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
     );
 
@@ -1681,13 +1939,19 @@ async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
     );
     let (registry, fake) = one_fake([FakeStep::complete(), FakeStep::complete()]);
     let registry = registry.with(Arc::new(alt.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "retry the pinned stage",
         json!({"workflow": "mixed"}),
     )
@@ -1700,7 +1964,7 @@ async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
     // decision re-derived at retry time would pick this up; a pinned one
     // cannot see it.
     mixed_harness_repo(
-        &repo,
+        &estate,
         format!(
             "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"{FAKE_BACKEND_NAME}\"\n\
              profile = \"default-profile\"\n"
@@ -1747,7 +2011,13 @@ async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
     let alt = FakeBackend::new("alt-harness");
     let (registry, _fake) = one_fake([]);
     let registry = registry.with(Arc::new(alt.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let view = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
     let bound = events_of(data.path(), &work_id, KIND_WORKFLOW_BOUND);
     let bindings = bound[0].payload["stage_bindings"]
@@ -1784,9 +2054,9 @@ async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
 async fn t7f_a_bound_stage_whose_harness_left_the_daemon_blocks_rather_than_substituting() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
+    let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
-        &repo,
+        &estate,
         "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
     );
 
@@ -1797,13 +2067,19 @@ async fn t7f_a_bound_stage_whose_harness_left_the_daemon_blocks_rather_than_subs
     let alt = FakeBackend::new("alt-harness");
     let (registry, fake) = one_fake([FakeStep::fail("stage a could not finish")]);
     let registry = registry.with(Arc::new(alt.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "the harness leaves between the bind and the stage",
         json!({"workflow": "mixed"}),
     )
@@ -1819,13 +2095,19 @@ async fn t7f_a_bound_stage_whose_harness_left_the_daemon_blocks_rather_than_subs
     handle.shutdown().await;
 
     // Second daemon over the same journal, with `alt-harness` deregistered.
-    // Nothing in the workspace changed; the *daemon* did.
+    // Nothing in the estate changed; the *daemon* did.
     let (registry, fake2) = one_fake([FakeStep::complete()]);
     assert!(
         !registry.names().iter().any(|n| n == "alt-harness"),
         "the point of this restart is that the pinned harness is gone"
     );
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
 
     let (status, body) = post(
         &client,
@@ -1899,9 +2181,9 @@ async fn t7f_a_bound_stage_whose_harness_left_the_daemon_blocks_rather_than_subs
 async fn t7e_every_harness_a_run_will_use_is_probed_before_the_lock_is_taken() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
+    let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
-        &repo,
+        &estate,
         "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"alt-harness\"\nprofile = \"alt-profile\"\n",
     );
 
@@ -1909,7 +2191,13 @@ async fn t7e_every_harness_a_run_will_use_is_probed_before_the_lock_is_taken() {
     let alt = FakeBackend::new("alt-harness");
     let (registry, fake) = one_fake([]);
     let registry = registry.with(Arc::new(alt.clone()));
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     assert!(
         alt.probe_count() >= 1 && fake.probe_count() >= 1,
         "daemon startup must probe every registered backend before serving: \
@@ -1931,17 +2219,22 @@ async fn t7e_every_harness_a_run_will_use_is_probed_before_the_lock_is_taken() {
         ),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    );
+    )
+    // §5.2: the estate is bound to the engine, not read off the request.
+    // `cwd` below is still set because a real submission carries one, but it
+    // decides nothing — deleting `with_estate_root` leaves this engine
+    // planning against no estate at all and `plan` answering `Ok(None)`.
+    .with_estate_root(estate.clone());
     assert_eq!(alt.probe_count(), 0, "cold, as a fresh registry is");
 
     let plan = engine
         .plan(&SubmitContext {
-            cwd: Some(&repo),
+            cwd: Some(&estate),
             workflow: Some("mixed"),
             ..SubmitContext::default()
         })
         .expect("plan")
-        .expect("a workspace");
+        .expect("a estate");
     assert!(
         alt.probe_count() >= 1,
         "§17.5's preflight must probe a harness only a stage names — otherwise \
@@ -1964,9 +2257,9 @@ async fn t7e_every_harness_a_run_will_use_is_probed_before_the_lock_is_taken() {
 async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     // `durable` models a native session that outlives the daemon: the same
     // backend instance is registered again after the restart. `volatile`
@@ -1976,13 +2269,13 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
     let registry = BackendRegistry::new()
         .with(Arc::new(durable.clone()))
         .with(Arc::new(volatile.clone()));
-    let handle = start_with(data.path(), registry, Some("durable")).await;
+    let handle = start_with(data.path(), registry, Some("durable"), Some(&estate)).await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "survives the restart",
         json!({"workflow": "tiny", "backend": "durable"}),
     )
@@ -1993,7 +2286,7 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "loses its session",
         json!({"workflow": "tiny", "backend": "volatile"}),
     )
@@ -2026,7 +2319,7 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
     let registry = BackendRegistry::new()
         .with(Arc::new(durable.clone()))
         .with(Arc::new(restarted_volatile.clone()));
-    let handle = start_with(data.path(), registry, Some("durable")).await;
+    let handle = start_with(data.path(), registry, Some("durable"), Some(&estate)).await;
     let client = http();
 
     // Unambiguous: re-observed, resumed, and driven to completion.
@@ -2140,18 +2433,24 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
 #[tokio::test]
 async fn native_liveness_never_decides_work_state_in_either_direction() {
     let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     // Dead process, no signal: `native process dead ≠ work failed`.
     let data = TempDir::new().expect("tempdir");
     let (registry, _fake) = one_fake([FakeStep::hang().with_native(NativeState::Exited)]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let (_, body) = submit(
         &http(),
         &handle,
-        &repo,
+        &estate,
         "exited but silent",
         json!({"workflow": "tiny"}),
     )
@@ -2166,11 +2465,17 @@ async fn native_liveness_never_decides_work_state_in_either_direction() {
     // Live process, explicit completion: `native process alive ≠ work active`.
     let data = TempDir::new().expect("tempdir");
     let (registry, _fake) = one_fake([FakeStep::complete(), FakeStep::complete()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let (_, body) = submit(
         &http(),
         &handle,
-        &repo,
+        &estate,
         "alive but done",
         json!({"workflow": "tiny"}),
     )
@@ -2190,9 +2495,9 @@ async fn native_liveness_never_decides_work_state_in_either_direction() {
 async fn waiting_and_blocked_park_the_work_and_retry_re_enters() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([
         FakeStep::waiting("CI is still running"),
@@ -2200,13 +2505,19 @@ async fn waiting_and_blocked_park_the_work_and_retry_re_enters() {
         FakeStep::complete(),
         FakeStep::complete(),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "park me",
         json!({"workflow": "tiny"}),
     )
@@ -2251,17 +2562,23 @@ async fn waiting_and_blocked_park_the_work_and_retry_re_enters() {
 async fn cancelling_a_failed_work_does_not_rewrite_the_stage_failure() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([FakeStep::fail("out of disk")]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "fail then cancel",
         json!({"workflow": "tiny"}),
     )
@@ -2300,17 +2617,23 @@ async fn cancelling_a_failed_work_does_not_rewrite_the_stage_failure() {
 async fn a_dirty_worktree_is_retained_and_recorded_at_teardown() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "leaves a mess",
         json!({"workflow": "tiny"}),
     )
@@ -2377,17 +2700,23 @@ async fn a_dirty_worktree_is_retained_and_recorded_at_teardown() {
 async fn retained_lists_a_dirty_teardown_and_reap_disposes_of_it_only_when_confirmed() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "leaves a mess for #109",
         json!({"workflow": "tiny"}),
     )
@@ -2492,22 +2821,28 @@ async fn retained_lists_a_dirty_teardown_and_reap_disposes_of_it_only_when_confi
 async fn a_stranded_completion_is_not_reported_as_plain_completed() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([
         FakeStep::waiting("needs a second look"),
         FakeStep::complete_with("first done"),
         FakeStep::complete_with("second done"),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "declares a commit, never makes one",
         json!({"workflow": "tiny"}),
     )
@@ -2598,6 +2933,147 @@ async fn a_stranded_completion_is_not_reported_as_plain_completed() {
     handle.shutdown().await;
 }
 
+/// #173 / §11.7 end to end: a run whose worktree ends on a *different* branch
+/// completes, and says so.
+///
+/// The defect this closes was silent by construction. `final_sha` is read
+/// from `refs/heads/sergeant/<work-id>` and `git status --porcelain` only
+/// asks whether anything is uncommitted, so a worktree that checked out
+/// another branch and committed there was clean by both measures: teardown
+/// reported `removed` at the base SHA, `sgt work show` reported plain
+/// `completed`, and `git worktree remove` deleted the only record of where
+/// the output had actually gone. §17's acceptance line — a worktree ending on
+/// another branch can no longer be reported clean, nor represented as though
+/// the expected branch contains its output — is what these assertions are.
+///
+/// Driven through the real daemon rather than `surface::teardown` directly,
+/// because the claim is about what an operator is told: the finding has to
+/// survive the journal, the projection fold, and both read paths (`work show`
+/// and `work list`) to be worth anything.
+#[tokio::test]
+async fn a_run_that_ends_on_the_wrong_branch_completes_dirty_and_keeps_both_branches() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (repo, base_sha) = support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
+
+    let (registry, _fake) = one_fake([
+        FakeStep::waiting("parks so the fixture can move the worktree"),
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "commits somewhere else entirely",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let work_branch = format!("sergeant/{work_id}");
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // What an actor that mis-drives git does: switch off the assigned branch
+    // and commit the run's output there instead.
+    git(&worktree, &["checkout", "-b", "renegade"]);
+    std::fs::write(worktree.join("output.rs"), "fn main() {}\n").expect("write output");
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-m", "output, on the wrong branch"]);
+    let renegade_sha = git(&worktree, &["rev-parse", "HEAD"]);
+
+    // Retry re-enters the parked stage and the scripted run completes every
+    // remaining stage, driving the whole run through teardown.
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+
+    // A clean worktree on the wrong branch is still removed — the content is
+    // committed and both branches are durable — but the report names where
+    // it actually was.
+    assert_eq!(
+        body["teardown"]["bindings"][0]["disposition"], "removed",
+        "{body}"
+    );
+    assert_eq!(
+        body["teardown"]["bindings"][0]["observed_head"],
+        json!({"head": "branch", "branch": "renegade", "sha": renegade_sha}),
+        "{body}"
+    );
+
+    // §11.5's axis, and the §11.3 finding behind it.
+    assert_eq!(body["integrity"]["disposition"], "dirty", "{body}");
+    let finding = &body["integrity"]["findings"][0];
+    assert_eq!(finding["finding"], "assigned_branch_mismatch", "{body}");
+    assert_eq!(finding["expected_branch"], work_branch, "{body}");
+    assert_eq!(finding["expected_sha"], base_sha, "{body}");
+    assert_eq!(finding["observed_branch"], "renegade", "{body}");
+    assert_eq!(finding["observed_sha"], renegade_sha, "{body}");
+
+    // Work state is untouched (§11.5: no new transition target); only the
+    // reported label carries the axis.
+    assert_eq!(body["work"]["state"], "completed_dirty", "{body}");
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "still `Completed` underneath — terminal, not retryable"
+    );
+
+    // C5: distinguishable from `sgt work list`, not only from `work show`.
+    let list = get(&client, &handle, "/v1/work").await;
+    let row = list["works"]
+        .as_array()
+        .expect("works")
+        .iter()
+        .find(|w| w["id"] == work_id)
+        .expect("the work is listed");
+    assert_eq!(row["state"], "completed_dirty", "{list}");
+    assert_eq!(row["integrity"]["disposition"], "dirty", "{list}");
+
+    // §11.7 / §12.1: both named branches survive in the source repository,
+    // so the commit the run actually made is still reachable by name.
+    assert!(
+        branch_exists(&repo, &work_branch),
+        "the expected branch is always retained, advanced or not"
+    );
+    assert!(
+        branch_exists(&repo, "renegade"),
+        "the branch the run actually used is never deleted either"
+    );
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/heads/renegade"]),
+        renegade_sha,
+        "and it still points at the run's output"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A multi-repository submission where a later repository cannot be
 /// materialized: the earlier ones already have a real branch and worktree in
 /// the user's own checkouts. Those are rolled back and the report is
@@ -2606,26 +3082,66 @@ async fn a_stranded_completion_is_not_reported_as_plain_completed() {
 async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let api = repos.path().join("payments-api");
+    let estate = repos.path().join("payments");
+    let api = estate.join("repos").join("api");
     init_repo(&api);
-    // A repository with no commits at all: a real repository (so the
-    // workspace resolves it) with no HEAD to cut a surface from.
-    let web = repos.path().join("payments-web");
-    std::fs::create_dir_all(&web).expect("repo dir");
-    git(&web, &["init", "-b", "main"]);
+    // A mount §8.1 admits and materialization then cannot write to: a real
+    // repository at the derived path, on a clean attached HEAD with a full
+    // SHA and no colliding ref or path — every question preflight asks is
+    // answered — whose `.git` is read-only, so the `git worktree add` that
+    // comes *after* admission is the thing that fails.
+    //
+    // Before Phase E this was a repository with no commits at all, which
+    // materialization discovered by failing `rev-parse HEAD` mid-way. §8.1
+    // check 7 now refuses that submission before a Work record exists (see
+    // `git_preflight_refuses_an_unresolvable_head_and_says_no_override_applies`),
+    // so it can no longer reach the rollback path this test is about.
+    let web = estate.join("repos").join("web");
+    init_repo(&web);
+    // `.git` *and* its ref storage: git creates the branch before it creates
+    // the worktree registry entry, so leaving `refs/heads` writable would
+    // strand a real `sergeant/<work-id>` branch in `web` — which is not the
+    // failure this test is about (the last assertion below pins that `web`
+    // got nothing at all).
+    let web_readonly = [
+        web.join(".git"),
+        web.join(".git/refs"),
+        web.join(".git/refs/heads"),
+    ];
+    set_writable(&web_readonly, false);
     std::fs::write(
-        api.join("sergeant.toml"),
+        estate.join("sergeant.toml"),
         "[estate]\nname = \"payments\"\n\n\
-         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
-         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\n",
+         [[repo]]\nname = \"api\"\n\n\
+         [[repo]]\nname = \"web\"\n",
     )
     .expect("sergeant.toml");
 
     let (registry, fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "half a surface", json!({})).await;
+    // estate-root §7.1: "payments" declares two repositories; `--all`
+    // selects both so materialization is actually attempted against `web`
+    // and can fail the way this test means to pin.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "half a surface",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
+    // Restored the moment materialization is over, so the rig's own cleanup
+    // can still remove the directory.
+    set_writable(&web_readonly, true);
+
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(
@@ -2697,8 +3213,11 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
 #[tokio::test]
 async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_follows_it() {
     let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = repos.path().join("solo-estate");
+    // The "source checkout" the guard watches is the *mount* (§6.1), so that
+    // is where an in-checkout `data_dir` has to live for either scenario to
+    // mean anything — not the estate root, which is not a repository at all.
+    let repo = estate.join("repos").join("solo");
 
     // Scenario 1: `data_dir` lives *inside* the checkout — before R-MVP1-1
     // this alone doomed every submission, since the surface root was always
@@ -2706,19 +3225,33 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
     // must succeed anyway.
     let data_inside = repo.join(".sergeant-data");
     let outside = repos.path().join("surfaces-outside");
-    std::fs::write(
-        repo.join("sergeant.toml"),
-        format!(
-            "[estate]\nname = \"solo\"\nsurfaces_dir = {:?}\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+    estate_with_manifest(
+        &estate,
+        &format!(
+            "[estate]\nname = \"solo\"\nsurfaces_dir = {:?}\n\n[[repo]]\nname = \"solo\"\n",
             outside.to_string_lossy()
         ),
-    )
-    .expect("sergeant.toml");
+        &["solo"],
+    );
+    // A data dir *inside* the mount is an untracked directory in it, which
+    // §8.1 check 8 correctly reads as a dirty mount. That is a property of
+    // this scenario's unusual layout, not of the split under test, so it is
+    // excluded the ordinary way an operator would exclude it — in the
+    // repository's own `.git/info/exclude`, which needs no commit and adds
+    // nothing to the checkout's tracked content.
+    std::fs::write(repo.join(".git/info/exclude"), ".sergeant-data*\n")
+        .expect("write .git/info/exclude");
 
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(&data_inside, registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        &data_inside,
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
-    let (status, body) = submit(&client, &handle, &repo, "split surfaces root", json!({})).await;
+    let (status, body) = submit(&client, &handle, &estate, "split surfaces root", json!({})).await;
     assert_eq!(status, 201, "submit failed: {body}");
     assert_eq!(
         body["work"]["state"], "active",
@@ -2760,14 +3293,27 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
     // still inside the checkout here — and the guard still refuses it.
     let data_inside2 = repo.join(".sergeant-data-2");
     std::fs::write(
-        repo.join("sergeant.toml"),
-        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
+        estate.join("sergeant.toml"),
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\n",
     )
     .expect("sergeant.toml");
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(&data_inside2, registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        &data_inside2,
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
-    let (status, body) = submit(&client, &handle, &repo, "unsplit still refuses", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "unsplit still refuses",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
     assert_eq!(
         body["work"]["state"], "blocked",
@@ -2802,14 +3348,16 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
 #[test]
 fn r_mvp1_1_sgt_surfaces_dir_env_var_reaches_a_real_spawned_daemon() {
     let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let data = DataDir::new();
     let outside = repos.path().join("surfaces-outside-env");
+    // §4.1/§4.3: the process cwd *is* the estate root the command is
+    // admitted against — there is no walk from a mount up to it.
     let output = Command::new(SGT)
-        .current_dir(&repo)
+        .current_dir(&estate)
         .arg("--data-dir")
         .arg(data.path())
         .arg("--json")
@@ -2863,22 +3411,28 @@ fn r_mvp1_1_sgt_surfaces_dir_env_var_reaches_a_real_spawned_daemon() {
 async fn retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    let base_sha = init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    let (repo, base_sha) = support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([
         FakeStep::fail("boom"),
         FakeStep::complete(),
         FakeStep::complete(),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "branch vanishes before retry",
         json!({"workflow": "tiny"}),
     )
@@ -3033,17 +3587,23 @@ async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journal
 
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "git cannot delete this worktree",
         json!({"workflow": "tiny"}),
     )
@@ -3129,18 +3689,24 @@ async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journal
 async fn cancelling_a_blocked_work_retires_the_stage_it_was_parked_in() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([FakeStep::blocked("needs an architecture decision")]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "block then cancel",
         json!({"workflow": "tiny"}),
     )
@@ -3182,21 +3748,27 @@ async fn cancelling_a_blocked_work_retires_the_stage_it_was_parked_in() {
 async fn a_backend_that_cannot_start_the_next_stage_blocks_with_the_stage_named() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, fake) = one_fake([
         FakeStep::needs_input("which database?"),
         FakeStep::complete(),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "lose the backend mid run",
         json!({"workflow": "tiny"}),
     )
@@ -3254,17 +3826,23 @@ async fn a_backend_that_cannot_start_the_next_stage_blocks_with_the_stage_named(
 async fn input_for_a_forgotten_execution_blocks_with_the_stage_named() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, _fake) = one_fake([FakeStep::needs_input("which database?")]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (_, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "answer a session that did not survive",
         json!({"workflow": "tiny"}),
     )
@@ -3278,7 +3856,13 @@ async fn input_for_a_forgotten_execution_blocks_with_the_stage_named() {
     // leaves the work exactly where it is — the failure surfaces when the
     // answer is actually delivered.
     let (registry, restarted) = one_fake([]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
     assert_eq!(shown["work"]["state"], "needs_input");
@@ -3330,18 +3914,18 @@ async fn input_for_a_forgotten_execution_blocks_with_the_stage_named() {
 async fn a_backend_that_cannot_observe_its_execution_fails_the_work_closed() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let registry = BackendRegistry::new().with(Arc::new(OpaqueBackend::ObserveFails));
-    let handle = start_with(data.path(), registry, Some(OPAQUE_BACKEND)).await;
+    let handle = start_with(data.path(), registry, Some(OPAQUE_BACKEND), Some(&estate)).await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "observe me if you can",
         json!({"workflow": "tiny"}),
     )
@@ -3389,18 +3973,18 @@ async fn a_backend_that_cannot_observe_its_execution_fails_the_work_closed() {
 async fn an_unknown_native_state_blocks_even_when_the_signal_says_completed() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let registry = BackendRegistry::new().with(Arc::new(OpaqueBackend::ObserveUnknown));
-    let handle = start_with(data.path(), registry, Some(OPAQUE_BACKEND)).await;
+    let handle = start_with(data.path(), registry, Some(OPAQUE_BACKEND), Some(&estate)).await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "complete me from an unknown context",
         json!({"workflow": "tiny"}),
     )
@@ -3459,25 +4043,33 @@ async fn an_unknown_native_state_blocks_even_when_the_signal_says_completed() {
 async fn a_workflow_name_that_escapes_the_workflows_directory_is_refused_at_submit() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
     // A perfectly loadable workflow that simply is not in the workflows
-    // directory, so only the guard can be what refuses the submission.
+    // directory, so only the guard can be what refuses the submission. Both
+    // it and the real workflows root hang off the estate root, since that is
+    // the one directory §4.1 resolves workflows against.
     write_workflow(
-        &repo.join("elsewhere"),
+        &estate.join("elsewhere"),
         "outside",
         &[("00-only", "context")],
     );
-    std::fs::create_dir_all(repo.join(".sergeant/workflows")).expect("workflows root");
+    std::fs::create_dir_all(estate.join(".sergeant/workflows")).expect("workflows root");
 
     let (registry, fake) = one_fake([]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "read someone else's workflow",
         json!({"workflow": "../../elsewhere/.sergeant/workflows/outside"}),
     )
@@ -3511,27 +4103,32 @@ async fn a_workflow_name_that_escapes_the_workflows_directory_is_refused_at_subm
 #[tokio::test]
 async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = repos.path().join("solo-estate");
 
     let data = TempDir::new().expect("tempdir");
-    std::fs::write(
-        repo.join("sergeant.toml"),
-        format!(
-            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+    estate_with_manifest(
+        &estate,
+        &format!(
+            "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\n\n\
              [[profile]]\nname = \"enterprise\"\nbackend = \"{FAKE_BACKEND_NAME}\"\n\
              default_model = \"claude-opus-4-7\"\n\
              env = {{ CLAUDE_CONFIG_DIR = \"/tmp/work\", GIT_AUTHOR_NAME = \"sergeant\" }}\n"
         ),
-    )
-    .expect("sergeant.toml");
+        &["solo"],
+    );
     let (registry, fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "with a profile",
         json!({"profile": "enterprise"}),
     )
@@ -3552,7 +4149,7 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "unknown profile",
         json!({"profile": "nope"}),
     )
@@ -3572,32 +4169,37 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
 /// and a model pin meant for a different harness). Nothing pinned it: the
 /// profile that exists in this suite agrees with its route, so the check
 /// could be deleted and every test would still pass. Routing here is the
-/// last tier — no explicit backend, no workspace default — because that is
+/// last tier — no explicit backend, no estate default — because that is
 /// the tier a user is least likely to have in mind when naming a profile.
 #[tokio::test]
 async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_routed() {
     let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = repos.path().join("solo-estate");
 
     let data = TempDir::new().expect("tempdir");
-    std::fs::write(
-        repo.join("sergeant.toml"),
-        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n\n\
+    estate_with_manifest(
+        &estate,
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\n\n\
          [[profile]]\nname = \"elsewhere\"\nbackend = \"codex\"\n\
          default_model = \"gpt-nonexistent\"\n",
-    )
-    .expect("sergeant.toml");
+        &["solo"],
+    );
 
-    // No explicit backend and no workspace default: the daemon's global
-    // default routes this, which is tier four.
+    // No explicit backend and no estate default: the daemon's global default
+    // routes this, which is tier four.
     let (registry, fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "a profile for a backend this work is not routed to",
         json!({"profile": "elsewhere"}),
     )
@@ -3628,17 +4230,22 @@ async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_rout
     handle.shutdown().await;
 }
 
-/// A submission with no repository context is a *captured intent*: there is
-/// no workspace to materialize, which §9 answers definitely rather than
+/// A submission to a daemon bound to no estate is a *captured intent*: there
+/// is nothing to materialize, which §5.1 answers definitely rather than
 /// failing. But "nothing to materialize" is not "nothing to honour" — a
 /// submission that names a backend sergeant cannot route to is refused with
 /// §13's options, instead of being recorded as pending work carrying a
 /// selection nothing will ever run.
+///
+/// This daemon deliberately starts with `estate_root: None`. That is now the
+/// *only* way to reach the no-topology path: §5.2 gives `origin.cwd` no
+/// authority, so a request can no longer talk a bound daemon out of its
+/// estate by pointing somewhere else.
 #[tokio::test]
 async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     let data = TempDir::new().expect("tempdir");
     let (registry, fake) = one_fake([]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME), None).await;
     let client = http();
 
     // No origin at all: accepted, pending, no surface.
@@ -3653,7 +4260,8 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     assert_eq!(body["work"]["state"], "pending");
     assert!(body["surface"].is_null());
 
-    // A cwd that is not a repository is the same answer, not an error.
+    // A cwd this daemon's estate knows nothing about is the same answer, not
+    // an error — the cwd was never what decided it.
     let elsewhere = TempDir::new().expect("tempdir");
     let (status, body) = submit(&client, &handle, elsewhere.path(), "not a repo", json!({})).await;
     assert_eq!(status, 201);
@@ -3695,6 +4303,117 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     handle.shutdown().await;
 }
 
+/// estate-root proposal §7.1: a multi-repository estate refuses an empty
+/// scope with the full remedy body — repo count, declared repos, declared
+/// groups, and the three example invocations — rather than silently
+/// expanding to every repository.
+#[tokio::test]
+async fn a_multi_repo_estate_refuses_an_empty_scope_with_the_7_1_remedy() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("payments");
+    estate_with_manifest(
+        &estate,
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\n\n\
+         [[repo]]\nname = \"web\"\n\n\
+         [group.pair]\nrepos = [\"api\", \"web\"]\n",
+        &["api", "web"],
+    );
+
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &estate, "no scope at all", json!({})).await;
+    assert_eq!(status, 422, "an empty scope must refuse: {body}");
+    assert_eq!(body["error"]["code"], "missing_scope");
+    assert_eq!(body["error"]["repo_count"], 2);
+    assert_eq!(body["error"]["repos"], json!(["api", "web"]));
+    assert_eq!(body["error"]["groups"], json!(["pair"]));
+    assert!(
+        body["error"]["examples"]["repo"].as_str().is_some(),
+        "must offer a --repo example: {body}"
+    );
+    assert!(
+        body["error"]["examples"]["group"]
+            .as_str()
+            .is_some_and(|s| s.contains("pair")),
+        "must offer a --group example naming a real declared group: {body}"
+    );
+    assert_eq!(
+        body["error"]["examples"]["all"],
+        "sgt run \"<intent>\" --all"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("2 repositories"), "got: {message}");
+    assert!(
+        fake.starts().is_empty(),
+        "a missing-scope refusal must never reach a backend"
+    );
+
+    handle.shutdown().await;
+}
+
+/// estate-root proposal §7.1: `--all` is explicit and journaled as the
+/// request form even though it resolves to the same list every declared
+/// repository would — `scope_request.all` must be `true`, not merely a
+/// side effect inferred from `repositories` matching every declared name.
+#[tokio::test]
+async fn run_all_resolves_every_repository_and_journals_the_request_form() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("payments");
+    estate_with_manifest(
+        &estate,
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\n\n\
+         [[repo]]\nname = \"web\"\n",
+        &["api", "web"],
+    );
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "everything, explicitly",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let mut repositories: Vec<String> = body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    repositories.sort();
+    assert_eq!(repositories, vec!["api", "web"]);
+    assert_eq!(
+        body["work"]["scope_request"],
+        json!({"all": true}),
+        "the request form (all: true) must be journaled, not just its resolution: {body}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// The submit crash window (§25's fail-closed rule applied to sergeant's own
 /// bookkeeping). Submitting is several fsynced appends, and a daemon that
 /// dies inside that sequence leaves a `pending` work no verb can move:
@@ -3709,8 +4428,8 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
 async fn a_crash_inside_the_submit_window_fails_closed_with_the_git_evidence() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = repos.path().join("solo-estate");
+    let (repo, _head) = support::scaffold_solo_estate(&estate, "solo");
 
     let crashed = ulid();
     let untouched = ulid();
@@ -3753,7 +4472,13 @@ async fn a_crash_inside_the_submit_window_fails_closed_with_the_git_evidence() {
     }
 
     let (registry, fake) = one_fake([]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
 
     let shown = get(&client, &handle, &format!("/v1/work/{crashed}")).await;
@@ -3788,21 +4513,37 @@ async fn a_crash_inside_the_submit_window_fails_closed_with_the_git_evidence() {
 /// A malformed `sergeant.toml` is refused with the line named, rather than
 /// half-interpreted: checked-in configuration is an instruction, and a typo
 /// that silently means nothing is worse than a refusal.
+///
+/// The daemon starts on a *valid* manifest and each case rewrites it
+/// underneath: §5.1 admits the estate root before the data dir is even
+/// created, so a daemon started against a broken manifest would never come up
+/// at all and there would be no submit to refuse. Re-reading the manifest at
+/// every `plan` — the root is what startup pins, not the file's contents — is
+/// what makes the edit visible here, and it is the same property `sgt repo
+/// add` relies on to reach a running daemon.
 #[tokio::test]
 async fn a_malformed_workspace_file_fails_closed() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    std::fs::write(
-        repo.join("sergeant.toml"),
-        "[estate]\nname = \"solo\"\ndefault_backends = \"fake\"\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n",
-    )
-    .expect("sergeant.toml");
+    let estate = repos.path().join("solo-estate");
+    let (repo, _head) = support::scaffold_solo_estate(&estate, "solo");
+    let manifest = estate.join("sergeant.toml");
 
     let (registry, _fake) = one_fake([]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
-    let (status, body) = submit(&http(), &handle, &repo, "typo in config", json!({})).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+
+    std::fs::write(
+        &manifest,
+        "[estate]\nname = \"solo\"\ndefault_backends = \"fake\"\n\n[[repo]]\nname = \"solo\"\n",
+    )
+    .expect("sergeant.toml");
+    let (status, body) = submit(&http(), &handle, &estate, "typo in config", json!({})).await;
     assert_eq!(status, 422, "a typo'd key must not be ignored: {body}");
     assert_eq!(body["error"]["code"], "workspace_error");
     assert!(
@@ -3813,13 +4554,15 @@ async fn a_malformed_workspace_file_fails_closed() {
         "the diagnostic must name the unknown key: {body}"
     );
 
-    // A declared repository that does not exist is refused too.
+    // A declared repository with no mount at `repos/<name>` is refused too
+    // (§6.1: the mount is derived, so "declared but absent" is the only shape
+    // a missing repository can now take).
     std::fs::write(
-        repo.join("sergeant.toml"),
-        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"ghost\"\npath = \"../nowhere\"\n",
+        &manifest,
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"ghost\"\n",
     )
     .expect("sergeant.toml");
-    let (status, body) = submit(&http(), &handle, &repo, "missing repo", json!({})).await;
+    let (status, body) = submit(&http(), &handle, &estate, "missing repo", json!({})).await;
     assert_eq!(status, 422);
     assert!(
         body["error"]["message"]
@@ -3828,25 +4571,30 @@ async fn a_malformed_workspace_file_fails_closed() {
             .contains("ghost")
     );
 
-    // Two names for one checkout is refused too, and — this is the point —
-    // refused *before* anything is materialized. Both entries would be cut
-    // onto the same `sergeant/<work-id>` branch of the same repository, and
-    // the failure would otherwise land on the second `git worktree add`,
-    // after the first had already put a branch in the user's checkout.
+    // §6.1's removal notice, in the slot the same-path duplicate used to
+    // occupy. Two entries can no longer collide on one checkout — a mount is
+    // `<estate-root>/repos/<name>` and names are already unique — so the
+    // refusal that still has to happen *before* anything is materialized is
+    // the one for a manifest that has not migrated: a `path` key is named and
+    // rejected outright, never quietly ignored while the derived mount is
+    // used behind the operator's back.
     std::fs::write(
-        repo.join("sergeant.toml"),
+        &manifest,
         "[estate]\nname = \"solo\"\n\n\
-         [[repo]]\nname = \"here\"\npath = \".\"\n\n\
-         [[repo]]\nname = \"also-here\"\npath = \"./\"\n",
+         [[repo]]\nname = \"solo\"\npath = \".\"\n",
     )
     .expect("sergeant.toml");
-    let (status, body) = submit(&http(), &handle, &repo, "one repo, two names", json!({})).await;
-    assert_eq!(status, 422, "a same-path duplicate must be refused: {body}");
+    let (status, body) = submit(&http(), &handle, &estate, "a path key survives", json!({})).await;
+    assert_eq!(status, 422, "a declared path must be refused: {body}");
     assert_eq!(body["error"]["code"], "workspace_error");
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("here") && message.contains("also-here"),
-        "the diagnostic must name both entries: {body}"
+        message.contains("solo") && message.contains("`path`"),
+        "the diagnostic must name the entry and the removed key: {body}"
+    );
+    assert!(
+        message.contains("repos/solo"),
+        "and the derived mount the operator must move the checkout to: {body}"
     );
     // Nothing was created behind the refusal: no surface, no branch.
     assert_eq!(
@@ -3858,13 +4606,18 @@ async fn a_malformed_workspace_file_fails_closed() {
     handle.shutdown().await;
 }
 
-// ------------------------------------------------- #22: workspace discovery
-// and binding edge cases beyond R-MVP1-12's own discovery-only fixtures
-// (`src/domain/workspace.rs`'s `#22:`-tagged tests). These are the "remaining
-// edges" `docs/gauntlet/contracts/MVP-1.md`'s R-MVP1-12 pin named and
-// deferred: one table-driven-in-spirit test per shape, through the real
-// daemon/API, asserting the issue's own three things — correct binding
+// ------------------------------------------ #22: repository-topology edges
+// beyond R-MVP1-12's own fixtures (`src/domain/estate.rs`'s `#22:`-tagged
+// tests). These were the "remaining edges" `docs/gauntlet/contracts/MVP-1.md`
+// named and deferred: one table-driven-in-spirit test per shape, through the
+// real daemon/API, asserting the issue's own three things — correct binding
 // record, work completes, teardown clean.
+//
+// Two of the four shapes changed sign under estate-root §6.2, which validates
+// every derived mount: a linked worktree and a symlinked (aliased) checkout
+// are now *refused* as repository mounts rather than bound from, so their
+// tests pin the refusal and the surviving legitimate shape respectively. See
+// each doc comment.
 
 /// A repository with a submodule: the surface actually carries the
 /// submodule's content (not the silent empty directory `git worktree add`
@@ -3883,9 +4636,12 @@ async fn t9_a_repository_with_a_submodule_completes_and_tears_down_clean() {
     git(&inner, &["commit", "-m", "vendored payload"]);
     let inner_head = git(&inner, &["rev-parse", "HEAD"]);
 
-    let outer = repos.path().join("outer");
-    init_repo(&outer);
-    write_two_stage_workflow(&outer);
+    // The submodule's superproject is the estate's own mount (§6.1); the
+    // vendored inner repository stays outside the estate, as an upstream URL
+    // would be.
+    let estate = repos.path().join("outer-estate");
+    let (outer, _head) = support::scaffold_solo_estate(&estate, "outer");
+    write_two_stage_workflow(&estate);
     std::fs::write(
         outer.join(".gitmodules"),
         format!(
@@ -3912,9 +4668,15 @@ async fn t9_a_repository_with_a_submodule_completes_and_tears_down_clean() {
     // A hang keeps the surface in place so its content is inspectable, then
     // a cancel drives real teardown — the same shape t1/t6 already use.
     let (registry, fake) = one_fake([FakeStep::hang()]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
-    let (status, body) = submit(&client, &handle, &outer, "check the submodule", json!({})).await;
+    let (status, body) = submit(&client, &handle, &estate, "check the submodule", json!({})).await;
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     let worktree = PathBuf::from(
@@ -3951,122 +4713,156 @@ async fn t9_a_repository_with_a_submodule_completes_and_tears_down_clean() {
     handle.shutdown().await;
 }
 
-/// The source repository is itself a git worktree — `git worktree add` from
-/// a worktree, not from a repository's main checkout. Nothing about §11's
-/// materialize/teardown path assumes `repository.path` is a main worktree
-/// (`with_repository`/`add_worktree`/`teardown_binding` all just run `git`
-/// with `repository.path`/`binding.source_path` as `cwd`, and git itself
-/// resolves the shared common dir from there), so this exercises that rather
-/// than asserting it from reading the code.
+/// §6.2/§8.1 check 4: a **linked worktree cannot be a repository mount**, and
+/// the refusal names it before anything is materialized.
+///
+/// This pinned the opposite until estate-root landed: `repos/<name>` being a
+/// `git worktree add` of some other repository used to bind and tear down
+/// fine, because nothing in §11's materialize path cares whether
+/// `repository.path` is a main checkout. §6.2 says that is precisely the
+/// problem — a mount must own its own branches, common directory, worktree
+/// registry and `sergeant/*` refs, and a linked worktree owns none of them,
+/// so cutting `sergeant/<work-id>` there writes into a repository the estate
+/// does not own. A Work's own surface *is* a linked worktree, which is the
+/// recursion this closes.
+///
+/// Validation is git's own answer, not a path heuristic: the mount's
+/// `--git-common-dir` resolves outside the mount, which is the fact the
+/// diagnostic reports.
 #[tokio::test]
-async fn t9b_a_worktree_as_the_source_repository_materializes_and_tears_down() {
+async fn t9b_a_linked_worktree_as_a_repository_mount_is_refused_at_submit() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
     let main_repo = repos.path().join("main-repo");
-    let head = init_repo(&main_repo);
-    // The bind source: a linked worktree of `main-repo`, on its own branch —
-    // not the main checkout `git worktree list` would call the repository's
-    // own working directory.
-    let source = repos.path().join("source-worktree");
+    init_repo(&main_repo);
+
+    // A structurally valid estate whose one mount is, at the derived path,
+    // a linked worktree of a repository elsewhere.
+    let estate = repos.path().join("solo-estate");
+    let mount = estate.join("repos").join("solo");
+    std::fs::create_dir_all(mount.parent().expect("repos dir")).expect("repos dir");
     git(
         &main_repo,
         &[
             "worktree",
             "add",
-            source.to_str().expect("utf8 path"),
+            mount.to_str().expect("utf8 path"),
             "-b",
             "a-worktree-of-its-own",
         ],
     );
-    write_two_stage_workflow(&source);
+    std::fs::write(
+        estate.join("sergeant.toml"),
+        "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"solo\"\n",
+    )
+    .expect("sergeant.toml");
+    write_two_stage_workflow(&estate);
 
+    // The daemon comes up: §4.1 admission is structural, and a repository
+    // that cannot be resolved is a repository problem, not an estate-identity
+    // one. The refusal therefore lands where a Work would have bound.
     let (registry, fake) = one_fake([
         FakeStep::complete_with("first done"),
         FakeStep::complete_with("second done"),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (status, body) = submit(
         &client,
         &handle,
-        &source,
-        "bind from a worktree",
+        &estate,
+        "bind from a linked worktree",
         json!({"workflow": "tiny"}),
     )
     .await;
-    assert_eq!(status, 201, "submit failed: {body}");
-    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
-    assert_eq!(body["work"]["state"], "completed");
-    assert_eq!(fake.starts().len(), 2, "one execution per stage");
-
-    // The binding recorded the worktree as its source, and cut from the same
-    // HEAD the worktree itself was on.
-    let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
-    let binding = &materialized[0].payload["surface"]["bindings"][0];
-    assert_eq!(binding["base_sha"], head.as_str());
-    assert_eq!(
-        binding["source_path"].as_str().map(PathBuf::from),
-        Some(PathBuf::from(git(
-            &source,
-            &["rev-parse", "--show-toplevel"]
-        ))),
-        "the binding's source is the worktree itself, not the main checkout"
+    assert_eq!(status, 422, "a linked-worktree mount must refuse: {body}");
+    assert_eq!(body["error"]["code"], "workspace_error");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("linked worktree"),
+        "the diagnostic must name the shape, not just fail: {message}"
+    );
+    assert!(
+        message.contains("git common dir"),
+        "and the evidence git itself gave for it: {message}"
+    );
+    assert!(
+        message.contains("repos/solo"),
+        "and the mount the operator must clone into instead: {message}"
     );
 
-    // Teardown clean, and the original worktree — the bind *source* — is
-    // completely untouched by any of it: still registered, still on its own
-    // branch, nothing about materializing *from* it disturbed it.
-    let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
-    assert!(!worktree.exists(), "the surface worktree is torn down");
-    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
-    assert_eq!(torn[0].payload["report"]["clean"], true);
+    // Refused before any side effect: no execution, no work, and above all no
+    // `sergeant/*` branch cut into the repository that actually owns the
+    // common dir.
     assert!(
-        source.is_dir(),
-        "the source worktree itself must survive teardown of the surface bound from it"
+        fake.starts().is_empty(),
+        "a mount refusal must never reach a backend"
+    );
+    let list = get(&client, &handle, "/v1/work").await;
+    assert!(
+        list["works"].as_array().expect("works").is_empty(),
+        "a mount refusal must not create work: {list}"
     );
     assert_eq!(
-        git(&source, &["rev-parse", "--abbrev-ref", "HEAD"]),
-        "a-worktree-of-its-own",
-        "the source worktree's own branch is undisturbed"
-    );
-    let listing = git(&main_repo, &["worktree", "list"]);
-    assert!(
-        listing.contains(&source.display().to_string()),
-        "the source worktree stays registered against the main repo: {listing}"
+        git(&main_repo, &["branch", "--list", "sergeant/*"]),
+        "",
+        "nothing may be cut into the repository the linked worktree belongs to"
     );
     assert!(
-        !listing.contains(&worktree.display().to_string()),
-        "the torn-down surface worktree must not still be registered: {listing}"
+        !data.path().join("surfaces").exists(),
+        "and no surface was started"
     );
 
     handle.shutdown().await;
 }
 
-/// A symlinked repository root: the path a submission is made from reaches
-/// the repository through a symlink rather than its real path. `materialize`
-/// already canonicalizes both sides of its in-checkout guard for exactly this
-/// reason (`surface.rs`'s own doc on `materialize`) — this proves the
-/// ordinary, non-guard path (an unremarkable submission) also resolves and
-/// completes normally through a symlinked source, not only that the guard
-/// itself is not fooled by one.
+/// A symlinked **estate root**: the path the daemon is bound to reaches the
+/// estate through a symlink rather than its real path — an ordinary shape,
+/// since the bound root is whatever the operator's shell says `cwd` is.
+///
+/// §4.1's admission canonicalizes before pinning, so every mount derived from
+/// it, `materialize`'s in-checkout guard (`surface.rs`'s own doc on
+/// `materialize`, which canonicalizes both sides for exactly this reason) and
+/// teardown all work from the real path, and an unremarkable submission
+/// completes exactly as it would from the real root. The binding assertion
+/// below is what says so: `source_path` is the canonical mount, not the
+/// symlinked spelling that was handed in.
+///
+/// The *other* symlink — a mount that is itself a symlink to a checkout
+/// elsewhere — is the opposite ruling: §6.2 refuses it as an alias
+/// (`RepositoryMountAliased`, pinned in `src/domain/estate.rs`), because
+/// two estates aliasing one checkout is the shared-mount hazard it exists to
+/// stop. Canonicalizing the root is not the same as following a mount.
 #[cfg(unix)]
 #[tokio::test]
-async fn t9c_a_symlinked_repository_root_materializes_and_completes() {
+async fn t9c_a_symlinked_estate_root_materializes_and_completes() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let real = repos.path().join("real-repo");
-    let head = init_repo(&real);
+    let real = repos.path().join("real-estate");
+    let (mount, head) = support::scaffold_solo_estate(&real, "solo");
     write_two_stage_workflow(&real);
-    let via_symlink = repos.path().join("repo-via-symlink");
+    let via_symlink = repos.path().join("estate-via-symlink");
     std::os::unix::fs::symlink(&real, &via_symlink).expect("symlink");
 
     let (registry, fake) = one_fake([
         FakeStep::complete_with("first done"),
         FakeStep::complete_with("second done"),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    // Bound through the symlink, not the real path.
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&via_symlink),
+    )
+    .await;
     let client = http();
-    // Submit from the symlinked path, not the real one.
     let (status, body) = submit(
         &client,
         &handle,
@@ -4083,6 +4879,12 @@ async fn t9c_a_symlinked_repository_root_materializes_and_completes() {
     let materialized = events_of(data.path(), &work_id, KIND_SURFACE_MATERIALIZED);
     let binding = &materialized[0].payload["surface"]["bindings"][0];
     assert_eq!(binding["base_sha"], head.as_str());
+    assert_eq!(
+        binding["source_path"].as_str().map(PathBuf::from),
+        Some(std::fs::canonicalize(&mount).unwrap_or(mount.clone())),
+        "the mount is derived from the *canonical* root, never the symlinked \
+         spelling the daemon was started with"
+    );
     let worktree = PathBuf::from(binding["worktree_path"].as_str().expect("worktree path"));
     assert!(
         !worktree.exists(),
@@ -4090,35 +4892,42 @@ async fn t9c_a_symlinked_repository_root_materializes_and_completes() {
     );
     let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
     assert_eq!(torn[0].payload["report"]["clean"], true);
-    assert!(branch_exists(&real, &format!("sergeant/{work_id}")));
+    assert!(branch_exists(&mount, &format!("sergeant/{work_id}")));
 
     handle.shutdown().await;
 }
 
-/// A path with a space (and a non-ASCII character) in the repository's own
-/// directory name, exercised through the real materialize/complete/teardown
-/// flow rather than only `Workspace::discover` (`src/domain/workspace.rs`'s
-/// own `#22:`-tagged `estate_discovery_handles_a_path_with_a_space` covers
-/// discovery; this is the same shape one level further, through git worktree
-/// creation, a real backend execution `cwd`, and teardown).
+/// A path with a space (and a non-ASCII character) in the estate root's own
+/// directory name — and therefore in every mount derived beneath it —
+/// exercised through the real materialize/complete/teardown flow rather than
+/// only admission (`src/domain/estate.rs`'s own `#22:`-tagged path-with-a-
+/// space fixture covers `Estate::admit`; this is the same shape one level
+/// further, through git worktree creation, a real backend execution `cwd`,
+/// and teardown).
 #[tokio::test]
 async fn t9d_a_path_with_a_space_and_non_ascii_completes_and_tears_down() {
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("répo with spaces");
-    let head = init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("réstate with spaces");
+    let (repo, head) = support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
     let (registry, fake) = one_fake([
         FakeStep::complete_with("first done"),
         FakeStep::complete_with("second done"),
     ]);
-    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
     let client = http();
     let (status, body) = submit(
         &client,
         &handle,
-        &repo,
+        &estate,
         "a path with a space",
         json!({"workflow": "tiny"}),
     )
@@ -4147,13 +4956,17 @@ async fn t9d_a_path_with_a_space_and_non_ascii_completes_and_tears_down() {
 fn cli_respond_and_retry_through_the_binary() {
     let repos = TempDir::new().expect("tempdir");
     let data = DataDir::new();
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
 
+    // §4.3: every estate-scoped command is admitted against the process cwd
+    // itself, so the binary runs from the estate root — a mount beneath it is
+    // not an estate and no longer resolves to one.
+    //
     // The default daemon registry's fake completes every stage, so this run
     // goes end to end without a scripted backend.
-    let output = sgt(&repo, &data, &["--json", "run", "ship it"]);
+    let output = sgt(&estate, &data, &["--json", "run", "ship it"]);
     assert!(
         output.status.success(),
         "sgt run failed: {}",
@@ -4169,7 +4982,7 @@ fn cli_respond_and_retry_through_the_binary() {
     assert_eq!(submitted["route_source"], "global_default");
 
     // `sgt work show` (human form) carries the stage and surface coordinates.
-    let output = sgt(&repo, &data, &["work", "show", &work_id]);
+    let output = sgt(&estate, &data, &["work", "show", &work_id]);
     assert!(output.status.success());
     let shown: Value = serde_json::from_slice(&output.stdout).expect("work show");
     assert_eq!(shown["id"].as_str(), Some(work_id.as_str()));
@@ -4181,13 +4994,13 @@ fn cli_respond_and_retry_through_the_binary() {
 
     // Responding to work that is not waiting exits nonzero with the daemon's
     // own diagnostic (the CLI never invents success).
-    let output = sgt(&repo, &data, &["respond", &work_id, "hello"]);
+    let output = sgt(&estate, &data, &["respond", &work_id, "hello"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("not needs_input"), "respond said: {stderr}");
 
     // Same for retry on a completed work.
-    let output = sgt(&repo, &data, &["retry", &work_id]);
+    let output = sgt(&estate, &data, &["retry", &work_id]);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("only failed, blocked or waiting"),
@@ -4196,6 +5009,184 @@ fn cli_respond_and_retry_through_the_binary() {
     );
 
     stop_daemon(data.path());
+}
+
+/// Scaffold an estate at `root` declaring three repositories (`api`, `web`,
+/// `docs`) — mounted, per §6.1, at `repos/api`, `repos/web`, `repos/docs` —
+/// and one group `pair` = `[api, web]`.
+fn write_three_repo_estate_with_a_group(root: &Path) {
+    estate_with_manifest(
+        root,
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\n\n\
+         [[repo]]\nname = \"web\"\n\n\
+         [[repo]]\nname = \"docs\"\n\n\
+         [group.pair]\nrepos = [\"api\", \"web\"]\n",
+        &["api", "web", "docs"],
+    );
+}
+
+/// estate-root proposal §7.1/§7.2, through the real spawned binary: `--all`
+/// forwards `scope.all` verbatim and the daemon resolves it to every
+/// declared repository; `--group` combined with `--repo` forwards both and
+/// the daemon unions them (dedup) — the CLI performs no expansion of its
+/// own (§7.2's "a client surface adds usability, never functionality").
+#[test]
+fn cli_run_all_and_run_group_plus_repo_wire_shapes() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
+    let estate = repos.path().join("payments");
+    write_three_repo_estate_with_a_group(&estate);
+
+    let output = sgt(&estate, &data, &["--json", "run", "--all", "everything"]);
+    assert!(
+        output.status.success(),
+        "sgt run --all failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("run --json");
+    let mut repositories: Vec<String> = body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    repositories.sort();
+    assert_eq!(repositories, vec!["api", "docs", "web"]);
+    assert_eq!(body["work"]["scope_request"], json!({"all": true}));
+
+    let output = sgt(
+        &estate,
+        &data,
+        &[
+            "--json", "run", "--group", "pair", "--repo", "docs", "union",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "sgt run --group pair --repo docs failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("run --json");
+    let mut repositories: Vec<String> = body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    repositories.sort();
+    assert_eq!(repositories, vec!["api", "docs", "web"]);
+    assert_eq!(
+        body["work"]["scope_request"],
+        json!({"repos": ["docs"], "group": "pair"}),
+        "the request form must carry --repo and --group exactly as submitted, not their union"
+    );
+
+    stop_daemon(data.path());
+}
+
+/// estate-root proposal §7.4: `--estate` is gone from the CLI entirely —
+/// clap refuses the flag itself, before any daemon could ever be asked
+/// about it.
+#[test]
+fn cli_run_rejects_the_removed_workspace_flag() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
+    // A perfectly valid estate root, so the only thing that can refuse this
+    // invocation is clap: §4.3 would otherwise admit the root and go on to
+    // spawn a daemon.
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+
+    let output = sgt(
+        &estate,
+        &data,
+        &["run", "--estate", "payments", "do the thing"],
+    );
+    assert!(
+        !output.status.success(),
+        "--estate must be rejected, not silently accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace") || stderr.to_lowercase().contains("unexpected argument"),
+        "clap's own diagnostic must name the flag: {stderr}"
+    );
+    assert!(
+        data.daemon_pids().is_empty(),
+        "a clap parse failure must never reach ensure_daemon: {stderr}"
+    );
+}
+
+/// estate-root proposal §7.2: scope resolution is core-owned, so a
+/// `scope.group` submitted straight to the API (bypassing the CLI entirely)
+/// and the equivalent `--group` submitted through the real spawned binary
+/// resolve to the identical repository list — proof that the CLI reaches
+/// the same resolution rather than reimplementing it.
+#[tokio::test]
+async fn scope_resolution_is_identical_across_the_cli_and_a_direct_api_submission() {
+    // Leg 1: a direct API submission, no CLI involved at all.
+    let api_repos = TempDir::new().expect("tempdir");
+    let api_data = TempDir::new().expect("tempdir");
+    let api_root = api_repos.path().join("payments");
+    write_three_repo_estate_with_a_group(&api_root);
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(
+        api_data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&api_root),
+    )
+    .await;
+    let client = http();
+    let (status, api_body) = submit(
+        &client,
+        &handle,
+        &api_root,
+        "direct api scope.group",
+        json!({"scope": {"group": "pair"}}),
+    )
+    .await;
+    assert_eq!(status, 201, "direct API submit failed: {api_body}");
+    let mut api_repositories: Vec<String> = api_body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    api_repositories.sort();
+    handle.shutdown().await;
+
+    // Leg 2: the identical scope, through the real CLI binary.
+    let cli_repos = TempDir::new().expect("tempdir");
+    let cli_data = DataDir::new();
+    let cli_root = cli_repos.path().join("payments");
+    write_three_repo_estate_with_a_group(&cli_root);
+    let output = sgt(
+        &cli_root,
+        &cli_data,
+        &["--json", "run", "--group", "pair", "cli --group scope"],
+    );
+    assert!(
+        output.status.success(),
+        "sgt run --group pair failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli_body: Value = serde_json::from_slice(&output.stdout).expect("run --json");
+    let mut cli_repositories: Vec<String> = cli_body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    cli_repositories.sort();
+    stop_daemon(cli_data.path());
+
+    assert_eq!(
+        api_repositories, cli_repositories,
+        "the CLI's --group and a direct API scope.group submission must resolve identically"
+    );
+    assert_eq!(api_repositories, vec!["api", "web"]);
 }
 
 /// Run the sgt binary from `cwd` against `data_dir`.

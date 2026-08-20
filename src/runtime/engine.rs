@@ -33,6 +33,9 @@ use crate::backend::{
     Backend, BackendError, BackendRegistry, BackendSignal, Completion, Deferred, ExecutionHandle,
     NativeState, Observation, PreparedExecution, ResumeRequest, StartRequest,
 };
+use crate::domain::estate::{
+    Estate, EstateError, EstateRootError, InstructionIdentity, InstructionPolicy, RepositorySpec,
+};
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::execution::{
     ExecutionRecord, ExecutionReservation, KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED,
@@ -49,21 +52,19 @@ use crate::domain::workflow::{
     KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
     StageKind, StageStatus, WorkflowDefinition, WorkflowError,
 };
-use crate::domain::workspace::{
-    InstructionIdentity, InstructionPolicy, RepositorySpec, Workspace, WorkspaceError,
-};
+use crate::runtime::preflight::{self, GitPreflight, PreflightRefusal};
 use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
 use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage};
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
     RepositoryBinding, SURFACES_DIR, SurfaceError, SurfacePlan, TeardownReport, WorkSurface,
-    materialize, rematerialize, teardown,
+    materialize_admitted, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SubmitContext<'a> {
-    /// Client's working directory; workspace discovery starts here (§9).
+    /// Client's working directory; estate discovery starts here (§9).
     /// `None` means the client offered no repository context, so there is
     /// nothing to materialize and the work stays `pending`.
     pub cwd: Option<&'a Path>,
@@ -75,25 +76,58 @@ pub struct SubmitContext<'a> {
     pub workflow: Option<&'a str>,
     /// Requested profile name (§14).
     pub profile: Option<&'a str>,
-    /// Requested repository subset; empty means the whole workspace.
-    pub repositories: &'a [String],
+    /// §7.1/§13.3's structured scope request, the CLI/API's `scope.repos` —
+    /// explicit repository names, as submitted. Combined with `group`
+    /// (union, dedup) by [`Engine::resolve_scope`]; never expanded by any
+    /// client, per §7.2's "a client surface adds usability, never
+    /// functionality".
+    pub repos: &'a [String],
+    /// `scope.group` — a declared `[group.<name>]` to expand, resolved
+    /// against *this* daemon's own bound manifest (§7.2), not by the caller.
+    pub group: Option<&'a str>,
+    /// `scope.all` — an explicit whole-estate selection (§7.1's third scope
+    /// form). Owner ruling (2026-08-20): combined with a nonempty `repos`
+    /// and/or a set `group`, this is refused
+    /// ([`EngineError::ConflictingScope`]) rather than silently winning over
+    /// them — [`Engine::resolve_scope`] only resolves to every declared
+    /// repository when `repos`/`group` are both empty/unset.
+    pub all: bool,
+    /// The id the Work *would* be given, for §8.1's checks 9 and 10 — both
+    /// of which are questions about `sergeant/<work-id>` and
+    /// `<surfaces_root>/<work-id>/<repo>`, so the id has to exist before the
+    /// record does. The caller mints it and reuses it for the `Work` it
+    /// creates when planning succeeds; a refusal discards it, which costs
+    /// nothing and is the whole point of asking here.
+    ///
+    /// `None` skips §8.1 entirely: no id, no checks 9/10, nothing admitted.
+    /// That is the shape every non-submission caller of
+    /// [`Engine::plan`](Self) has (routing probes, the runtime's own
+    /// fixtures), and it must not silently become an unadmitted submission —
+    /// which is why [`StartPlan::preflight`] is an `Option`, not an empty
+    /// `Vec` that would read as "admitted, nothing found".
+    pub work_id: Option<&'a str>,
+    /// §8.3's `--override-git-preflight`, exactly as the submission carried
+    /// it. **Never a default and never read from configuration**: this is a
+    /// borrowed request field with no other source, so there is nowhere for a
+    /// run template or an estate manifest to set it from.
+    pub override_git_preflight: bool,
 }
 
 /// A resolved, side-effect-free plan for starting a run.
 ///
 /// Planning is separated from starting so that everything which can be
-/// *decided* — workspace topology, workflow content, routing, profile — is
+/// *decided* — estate topology, workflow content, routing, profile — is
 /// decided before a Work record exists. A submission that cannot be routed is
 /// rejected with §13's available options instead of creating work that
 /// immediately dies.
 #[derive(Debug, Clone)]
 pub struct StartPlan {
-    /// The discovered workspace.
-    pub workspace: Workspace,
+    /// The discovered estate.
+    pub estate: Estate,
     /// Repositories this run targets.
     pub repositories: Vec<RepositorySpec>,
     /// Where this run's surface will be materialized (R-MVP1-1):
-    /// `workspace.surfaces_dir` when the manifest declared one, else the
+    /// `estate.surfaces_dir` when the manifest declared one, else the
     /// engine's own default (`SGT_SURFACES_DIR`, else `<data_dir>/surfaces`).
     /// Resolved once, here, so a mid-flight manifest edit cannot move a
     /// running Work's surface out from under it.
@@ -108,6 +142,15 @@ pub struct StartPlan {
     /// Pinned into `workflow.bound` and read by every later stage entry, so a
     /// retry and a restart reconstruct the same decision.
     pub stage_bindings: Vec<StageBinding>,
+    /// §8.1's Git admission, when this plan was made for a real submission
+    /// (`SubmitContext::work_id` was set).
+    ///
+    /// `None` means no admission was performed — never "admitted and found
+    /// nothing". Materialization reads the pinned base out of this rather
+    /// than re-asking each mount, so the distinction decides whether a Work
+    /// is based on the commit that was *judged* or on whatever HEAD says by
+    /// the time `git worktree add` runs.
+    pub preflight: Option<GitPreflight>,
 }
 
 /// Why `target_work_id`'s branch cannot (yet) be taken over by a gate Work
@@ -548,6 +591,12 @@ pub struct InterruptOutcome {
 /// included, queueing behind someone else's checkout.
 pub struct PendingSurface {
     work_id: String,
+    /// The daemon's data dir, carried so [`Self::perform`] can locate the
+    /// interprocess repository locks (§9.4). Deliberately separate from
+    /// `SurfaceEffect::Materialize`'s `surfaces_root`, which R-MVP1-1 unbound
+    /// from the data dir: an estate may put its surfaces anywhere, and the
+    /// locks still live in the daemon's own storage.
+    data_dir: PathBuf,
     effect: SurfaceEffect,
 }
 
@@ -609,10 +658,18 @@ impl PendingSurface {
             SurfaceEffect::Materialize {
                 surfaces_root,
                 plan,
-            } => SurfaceOutcome::Materialized(materialize(
+            } => SurfaceOutcome::Materialized(materialize_admitted(
+                &self.data_dir,
                 surfaces_root,
                 &self.work_id,
                 &plan.repositories,
+                // §8.2: the base each repository was *admitted* on, not
+                // whatever its HEAD says now. An empty slice (a plan made
+                // without admission) leaves the live read in place, which is
+                // the only thing it could do.
+                plan.preflight
+                    .as_ref()
+                    .map_or(&[][..], |p| p.repositories.as_slice()),
             )),
             SurfaceEffect::Rematerialize { surface, .. } => {
                 // A retry whose worktrees are all still on disk needs no git
@@ -621,9 +678,11 @@ impl PendingSurface {
                 if surface.bindings.iter().all(|b| b.worktree_path.exists()) {
                     return SurfaceOutcome::Rematerialized(Ok(None));
                 }
-                SurfaceOutcome::Rematerialized(rematerialize(surface).map(Some))
+                SurfaceOutcome::Rematerialized(rematerialize(&self.data_dir, surface).map(Some))
             }
-            SurfaceEffect::Teardown { surface, .. } => SurfaceOutcome::TornDown(teardown(surface)),
+            SurfaceEffect::Teardown { surface, .. } => {
+                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface))
+            }
         }
     }
 }
@@ -700,9 +759,15 @@ impl Step {
 /// Failure from an engine operation.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    /// Workspace resolution failed.
+    /// Estate resolution failed.
     #[error(transparent)]
-    Workspace(#[from] WorkspaceError),
+    Estate(#[from] EstateError),
+    /// §4.1's exact-root admission failed for this daemon's **bound** estate
+    /// — the root it was started against no longer resolves. Shares
+    /// `workspace_error`'s wire code: to a client, "this daemon's estate
+    /// cannot be read" is the same class of answer it always was.
+    #[error(transparent)]
+    EstateRoot(#[from] EstateRootError),
     /// Workflow resolution failed.
     #[error(transparent)]
     Workflow(#[from] WorkflowError),
@@ -718,9 +783,59 @@ pub enum EngineError {
     /// Journal append or projection fold failed.
     #[error(transparent)]
     Core(#[from] CoreError),
-    /// The requested repository subset does not match the workspace.
+    /// The requested repository subset does not match the estate.
     #[error("{0}")]
     RepositorySelection(String),
+    /// estate-root proposal §7.1: a multi-repository estate was submitted to
+    /// with no scope selected at all — Sergeant refuses rather than
+    /// silently expanding to every repository. `repo_count`/`repos`/`groups`
+    /// are exactly what the API's structured 422 body names as the remedy
+    /// (§15: "list declared repos/groups and show `--repo`, `--group`,
+    /// `--all`").
+    #[error(
+        "this estate contains {repo_count} repositories, but no Work scope was selected; \
+         select repositories with --repo, a declared group with --group, or the whole estate \
+         explicitly with --all (declared repos: {repos:?}; declared groups: {groups:?})"
+    )]
+    MissingScope {
+        /// How many repositories the estate declares.
+        repo_count: usize,
+        /// Every declared repository's name.
+        repos: Vec<String>,
+        /// Every declared group's name.
+        groups: Vec<String>,
+    },
+    /// §15: `scope.group`/`--group` named a group this estate has not
+    /// declared.
+    #[error("no group named {requested:?} in this estate (declared: {available:?})")]
+    UnknownGroup {
+        /// The group name that was requested.
+        requested: String,
+        /// Every group name the estate does declare.
+        available: Vec<String>,
+    },
+    /// Owner ruling (2026-08-20): `scope.all`/`--all` combined with
+    /// `scope.repos`/`--repo` and/or `scope.group`/`--group` is refused
+    /// rather than `all` silently winning over the other two. §7.1's three
+    /// scope forms are mutually exclusive at the top level — naming both
+    /// "every declared repository" and a specific subset is not a union,
+    /// it is two different answers to "what is this Work about" in one
+    /// request, and Sergeant does not guess which one the caller meant.
+    /// Refused here, in [`Engine::resolve_scope`], before any Work record —
+    /// the same "reject before Work or worktree side effects" timing
+    /// [`EngineError::MissingScope`] already uses.
+    #[error(
+        "scope.all was combined with scope.repos={repos:?} and/or scope.group={group:?}; --all \
+         selects the whole estate and must not be combined with a repository subset — submit \
+         --all alone to select every declared repository, or --repo/--group without --all to \
+         select a subset"
+    )]
+    ConflictingScope {
+        /// `scope.repos`, exactly as submitted alongside `scope.all`.
+        repos: Vec<String>,
+        /// `scope.group`, exactly as submitted alongside `scope.all`, if any.
+        group: Option<String>,
+    },
     /// R-MVP1-4: the selected repositories disagree on `instructions`
     /// policy. One process, one `--setting-sources` — there is nowhere for
     /// two policies to both take effect, so the submission is refused
@@ -735,8 +850,8 @@ pub enum EngineError {
         /// `"<repo>=<policy>"` for every selected repository.
         repos: Vec<String>,
     },
-    /// The requested profile is not declared by the workspace.
-    #[error("no profile named {requested:?} in this workspace (has: {available})")]
+    /// The requested profile is not declared by the estate.
+    #[error("no profile named {requested:?} in this estate (has: {available})")]
     ProfileNotFound {
         /// Requested profile name.
         requested: String,
@@ -840,6 +955,12 @@ pub enum EngineError {
         /// The backend the stage resolved to.
         backend: String,
     },
+    /// §8.1: Git admission preflight refused this submission, before a Work
+    /// record existed and before any Git mutation. Carries every unresolved
+    /// finding, each with its own §15 code and remedy — see
+    /// [`crate::runtime::preflight`].
+    #[error("{0}")]
+    GitPreflight(PreflightRefusal),
     /// §17.5: a workflow declares a `kind = "execute"` stage, but the
     /// `"docker"` backend is not registered or its probe reports
     /// unavailable. Refused before Work or worktree side effects, exactly
@@ -861,15 +982,24 @@ pub enum EngineError {
 
 impl EngineError {
     /// Structured error code for the API.
+    ///
+    /// `"workspace_error"` keeps its pre-rename spelling deliberately.
+    /// §13.2 moves the *domain vocabulary* from Workspace to Estate; a wire
+    /// code is not vocabulary, it is a string clients branch on, and
+    /// renaming it would be a compatibility break wearing a rename's
+    /// clothes. The human message beside it already says "estate".
     pub fn code(&self) -> &'static str {
         match self {
-            EngineError::Workspace(_) => "workspace_error",
+            EngineError::Estate(_) | EngineError::EstateRoot(_) => "workspace_error",
             EngineError::Workflow(_) => "workflow_error",
             EngineError::Route(e) => e.code(),
             EngineError::Surface(_) => "surface_error",
             EngineError::Backend(_) => "backend_error",
             EngineError::Core(_) => "internal",
             EngineError::RepositorySelection(_) => "unknown_repository",
+            EngineError::MissingScope { .. } => "missing_scope",
+            EngineError::UnknownGroup { .. } => "unknown_group",
+            EngineError::ConflictingScope { .. } => "conflicting_scope",
             EngineError::InstructionPolicyConflict { .. } => "instruction_policy_conflict",
             EngineError::ProfileNotFound { .. } => "profile_not_found",
             EngineError::ProfileBackendMismatch { .. } => "profile_backend_mismatch",
@@ -882,6 +1012,10 @@ impl EngineError {
             EngineError::NoSuchStage { .. } => "no_such_stage",
             EngineError::AskCapabilityUnavailable { .. } => "ask_capability_unavailable",
             EngineError::ExecuteBackendUnavailable { .. } => "execute_backend_unavailable",
+            // §15: the code names the *check*, not the phase — "preflight
+            // failed" would tell a client nothing it could act on. Every
+            // other finding travels in the body beside it.
+            EngineError::GitPreflight(refusal) => refusal.code(),
         }
     }
 
@@ -981,6 +1115,20 @@ pub struct Engine {
     /// completion driver alongside [`Self::due_observations`] (see
     /// [`Self::due_interrupts`]).
     pub turn_ceiling: Duration,
+    /// §5.1/§5.2: the one estate this daemon is bound to, admitted at
+    /// startup ([`crate::domain::estate::Estate::admit`]) and pinned
+    /// here for the process's whole life.
+    ///
+    /// **This is the only topology authority.** [`Self::plan`] reads the
+    /// manifest at *this* root; a submission's `origin.cwd` is recorded
+    /// evidence only (§13.3) and can never move it. That is what removes the
+    /// recursion hazard §5.2 names — a child command launched from a Work
+    /// surface rediscovering that linked worktree as a new estate.
+    ///
+    /// `None` only for a daemon started with no estate at all (test rigs and
+    /// the intent-capture path): [`Self::plan`] answers `Ok(None)` there,
+    /// exactly as "no repository context" always has.
+    pub estate_root: Option<PathBuf>,
     /// When each Work's current turn was last (re-)spawned, for the ceiling
     /// sweep. Deliberately **not** journaled or durable: a restart forgets
     /// it, which is acceptable for a soak-test hang bound (never an
@@ -1007,8 +1155,17 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             turn_cap: DEFAULT_TURN_CAP,
             turn_ceiling: DEFAULT_TURN_CEILING,
+            estate_root: None,
             turn_started: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Bind this engine to one estate root (§5.1). The daemon calls this
+    /// once at startup with the canonical root it was started against; every
+    /// later [`Self::plan`] reads that estate and no other.
+    pub fn with_estate_root(mut self, estate_root: PathBuf) -> Self {
+        self.estate_root = Some(estate_root);
+        self
     }
 
     /// Override the daemon-wide turn cap (R-MVP1-7). Wired from
@@ -1071,13 +1228,16 @@ impl Engine {
 
     /// Resolve everything a run needs, without touching anything.
     ///
-    /// `Ok(None)` means "no workspace here": the client gave no working
-    /// directory, or the one it gave is not inside a Git repository. §9's
-    /// discovery has a definite answer in that case — there is no repository
-    /// surface — so the intent is accepted and stays `pending` rather than
-    /// being rejected. Every *other* failure (a malformed `sergeant.toml`, an
-    /// unroutable backend, a missing workflow) is a real error and is
-    /// returned as one.
+    /// **§5.2: the request's cwd has no authority here.** Topology comes from
+    /// [`Self::estate_root`] — the one estate this daemon was started
+    /// against — and from nowhere else. `context.cwd` survives only as
+    /// `origin.cwd`, recorded evidence for diagnostics (§13.3).
+    ///
+    /// `Ok(None)` means "this daemon is bound to no estate": the intent is
+    /// accepted and stays `pending` rather than being rejected, exactly as
+    /// "no repository context" always has. Every *other* failure (a
+    /// `sergeant.toml` that no longer resolves, an unroutable backend, a
+    /// missing workflow) is a real error and is returned as one.
     ///
     /// "No surface" does not mean "no §13". A submission that *names* a
     /// backend has asked for something, and §13's terminal state for a
@@ -1086,51 +1246,47 @@ impl Engine {
     /// chain is consulted either way; only its no-selection outcome is
     /// tolerated here, because a captured intent with no repository has
     /// nothing to route yet and no default to disappoint.
+    ///
+    /// The manifest is re-read from the pinned root on every plan rather
+    /// than cached from startup, so `sgt repo add` reaches a running daemon
+    /// — the *root* is what startup fixes, and the root is what §5 binds.
     pub fn plan(&self, context: &SubmitContext<'_>) -> Result<Option<StartPlan>, EngineError> {
-        let workspace = match context.cwd {
+        let estate = match &self.estate_root {
             None => None,
-            // R-MVP1-12's data-dir scope: bound the upward estate walk at
-            // this engine's own data dir, never above it.
-            Some(cwd) => match Workspace::discover_scoped(cwd, Some(&self.data_dir)) {
-                Ok(workspace) => Some(workspace),
-                Err(WorkspaceError::NotARepository { .. }) => None,
-                Err(e) => return Err(e.into()),
-            },
+            Some(root) => Some(Estate::resolve(root)?),
         };
-        let Some(workspace) = workspace else {
+        let Some(estate) = estate else {
             self.check_selection_is_honourable(context)?;
             return Ok(None);
         };
-        let repositories = workspace
-            .select(context.repositories)
-            .map_err(EngineError::RepositorySelection)?;
+        let repositories = Self::resolve_scope(&estate, context)?;
 
         // R-MVP1-4: one process, one policy. Resolved and refused here, at
         // submit, before a Work record or a worktree exists — the same
         // "reject the submission" timing §17.5 already uses for an
         // unsatisfiable stage requirement.
-        Self::check_instruction_policy(&workspace, &repositories)?;
+        Self::check_instruction_policy(&estate, &repositories)?;
 
         // R-MVP1-1: `[estate] surfaces_dir` narrows the engine's own default,
         // per-submission — resolved once here and pinned into the plan, so a
         // later manifest edit cannot move a running Work's surface.
-        let surfaces_root = workspace
+        let surfaces_root = estate
             .surfaces_dir
             .clone()
             .unwrap_or_else(|| self.surfaces_root.clone());
 
         let workflow_name = context
             .workflow
-            .or(workspace.default_workflow.as_deref())
+            .or(estate.default_workflow.as_deref())
             .unwrap_or(DEFAULT_WORKFLOW)
             .to_string();
-        let workflow = WorkflowDefinition::resolve(&workspace.root, &workflow_name)?;
+        let workflow = WorkflowDefinition::resolve(&estate.root, &workflow_name)?;
 
         let route = route(
             &RouteInputs {
                 explicit: context.backend,
                 origin_client: context.origin_client,
-                workspace_default: workspace.default_backend.as_deref(),
+                estate_default: estate.default_backend.as_deref(),
                 global_default: self.default_backend.as_deref(),
             },
             &self.backends,
@@ -1139,7 +1295,7 @@ impl Engine {
         let profile = match context.profile {
             None => None,
             Some(name) => {
-                let profile = Self::workspace_profile(&workspace, name)?;
+                let profile = Self::estate_profile(&estate, name)?;
                 if profile.backend != route.backend {
                     return Err(EngineError::ProfileBackendMismatch {
                         profile: profile.name,
@@ -1155,17 +1311,139 @@ impl Engine {
         // §17.5's whole-workflow preflight, run here — before a Work record
         // and before a worktree — precisely so an unsatisfiable requirement is
         // "reject the submission" rather than "a work that dies at stage 2".
-        let stage_bindings = self.bind_stages(&workspace, &workflow, &route, profile.as_ref())?;
+        let stage_bindings = self.bind_stages(&estate, &workflow, &route, profile.as_ref())?;
+
+        // §8.1/§8.4, last: the Git admission contract, run for every selected
+        // repository before `work.submitted` and before any Git mutation.
+        //
+        // Last, deliberately. Everything above is a question about
+        // configuration — is this estate readable, is that group declared, can
+        // this workflow route — and every one of those is on §8.3's
+        // never-bypass list too. Answering them first means a submission that
+        // was going to be refused for an unroutable backend is refused for the
+        // unroutable backend, rather than for the dirty mount preflight would
+        // also have found; it also keeps the ~6 git spawns per repository off
+        // submissions that were never going to run.
+        //
+        // Still strictly before the Work exists: `plan` has created nothing at
+        // this point and its caller mints the `Work` only from an `Ok`.
+        let preflight = match context.work_id {
+            None => None,
+            Some(work_id) => Some(
+                preflight::run(
+                    &estate,
+                    &self.data_dir,
+                    &surfaces_root,
+                    work_id,
+                    &repositories,
+                    context.override_git_preflight,
+                )
+                .map_err(EngineError::GitPreflight)?,
+            ),
+        };
 
         Ok(Some(StartPlan {
-            workspace,
+            estate,
             repositories,
             surfaces_root,
             workflow,
             route,
             profile,
             stage_bindings,
+            preflight,
         }))
+    }
+
+    /// estate-root proposal §7.2/§7.1: turn a submission's `{repos, group,
+    /// all}` scope request into the exact repository list to materialize,
+    /// resolved against *this daemon's own* already-discovered `estate`
+    /// — never by a client. §7.2's whole point is that the CLI, the TUI, or
+    /// a direct API caller submitting the identical scope JSON all reach
+    /// this one function and get the identical answer; no client surface
+    /// reimplements group-membership or empty-scope semantics.
+    ///
+    /// Order of decisions, per §7.1 (as amended by the owner's 2026-08-20
+    /// ruling):
+    ///
+    /// 0. `all` combined with a nonempty `repos` and/or a set `group` is
+    ///    refused outright ([`EngineError::ConflictingScope`]) — naming both
+    ///    "every declared repository" and a specific subset is two answers
+    ///    to one question, and `all` no longer silently wins.
+    /// 1. `all` alone: every declared repository (§7.3 still journals the
+    ///    request form separately, so *why* it resolved to everything is
+    ///    never lost even though the resolved list alone couldn't say).
+    /// 2. Otherwise, the union of `repos` and — when `group` names a
+    ///    declared group — that group's members, `repos`-order first, new
+    ///    group members appended, duplicates dropped. An undeclared `group`
+    ///    is refused by name, listing the estate's declared groups (§15).
+    /// 3. An empty union is not "select everything" (§7.1 replaces that
+    ///    reading): a one-repository estate infers its sole repository; a
+    ///    multi-repository estate is refused with the full §7.1 remedy body
+    ///    (repo count, declared repos, declared groups).
+    /// 4. A nonempty selection still goes through [`Estate::select`] for
+    ///    its own checks (unknown name, duplicate name) — this function only
+    ///    decides *what* the name list is, not whether every name in it is
+    ///    valid.
+    ///
+    /// Historical note (MVP3-C2): before this, `run --group`'s expansion was
+    /// pure CLI-side convenience that read group membership through an
+    /// on-disk-free structural parser (`Estate::declared_groups_scoped`)
+    /// specifically so an unrelated broken repository elsewhere in the
+    /// estate could not block a group whose own members were all fine. That
+    /// carve-out does not survive moving resolution here: `estate` above
+    /// is already the strictly-resolved estate (`Estate::resolve` against
+    /// this daemon's bound root — the same call `plan` makes for routing and
+    /// instruction-policy regardless of scope), so a `--group` submission
+    /// now fails on an unrelated broken repository exactly the way a plain
+    /// `--repo` submission always has — resolving the estate, not group
+    /// lookup, is what requires every declared mount to be present.
+    /// (`declared_groups_scoped`, the on-disk-free parser this note
+    /// describes, is itself gone: estate-root Phase D deleted it with the
+    /// rest of cwd-based discovery.)
+    fn resolve_scope(
+        estate: &Estate,
+        context: &SubmitContext<'_>,
+    ) -> Result<Vec<RepositorySpec>, EngineError> {
+        if context.all && (!context.repos.is_empty() || context.group.is_some()) {
+            return Err(EngineError::ConflictingScope {
+                repos: context.repos.to_vec(),
+                group: context.group.map(str::to_string),
+            });
+        }
+        if context.all {
+            return Ok(estate.repositories.clone());
+        }
+
+        let mut names: Vec<String> = context.repos.to_vec();
+        if let Some(group_name) = context.group {
+            let group = estate
+                .groups
+                .get(group_name)
+                .ok_or_else(|| EngineError::UnknownGroup {
+                    requested: group_name.to_string(),
+                    available: estate.groups.keys().cloned().collect(),
+                })?;
+            for repo in &group.repos {
+                if !names.contains(repo) {
+                    names.push(repo.clone());
+                }
+            }
+        }
+
+        if names.is_empty() {
+            if estate.repositories.len() == 1 {
+                return Ok(estate.repositories.clone());
+            }
+            return Err(EngineError::MissingScope {
+                repo_count: estate.repositories.len(),
+                repos: estate.repositories.iter().map(|r| r.name.clone()).collect(),
+                groups: estate.groups.keys().cloned().collect(),
+            });
+        }
+
+        estate
+            .select(&names)
+            .map_err(EngineError::RepositorySelection)
     }
 
     /// R-MVP1-4's submit-time policy check: every selected repository must
@@ -1181,7 +1459,7 @@ impl Engine {
     /// refused, because "one process, one `--setting-sources`" is a fact
     /// about the launch grammar, not about what any single value measures to.
     fn check_instruction_policy(
-        workspace: &Workspace,
+        estate: &Estate,
         repositories: &[RepositorySpec],
     ) -> Result<(), EngineError> {
         if repositories.is_empty() {
@@ -1189,7 +1467,7 @@ impl Engine {
         }
         let resolved: Vec<(String, InstructionPolicy)> = repositories
             .iter()
-            .map(|r| (r.name.clone(), workspace.instruction_policy(&r.name)))
+            .map(|r| (r.name.clone(), estate.instruction_policy(&r.name)))
             .collect();
         let first = resolved[0].1;
         if resolved.iter().any(|(_, policy)| *policy != first) {
@@ -1264,17 +1542,17 @@ impl Engine {
     /// bookkeeping for a mechanism the manifest schema anticipates but this
     /// backend has not implemented, not proof of consumption.
     fn resolve_instruction_identities(
-        workspace: &Workspace,
+        estate: &Estate,
         surface: &WorkSurface,
     ) -> Vec<InstructionIdentity> {
         surface
             .bindings
             .iter()
             .map(|binding| {
-                let policy = workspace.instruction_policy(&binding.repository);
+                let policy = estate.instruction_policy(&binding.repository);
                 let file = binding
                     .worktree_path
-                    .join(crate::domain::workspace::INSTRUCTION_FILE);
+                    .join(crate::domain::estate::INSTRUCTION_FILE);
                 let (path, content_hash) = match std::fs::read(&file) {
                     Ok(bytes) => (Some(file), Some(blake3::hash(&bytes).to_hex().to_string())),
                     Err(_) => (None, None),
@@ -1308,7 +1586,7 @@ impl Engine {
     /// test rather than left to luck.
     fn bind_stages(
         &self,
-        workspace: &Workspace,
+        estate: &Estate,
         workflow: &WorkflowDefinition,
         route: &Route,
         work_profile: Option<&Profile>,
@@ -1365,7 +1643,7 @@ impl Engine {
                     backend: stage_route.backend.clone(),
                 });
             }
-            let profile = self.stage_profile(workspace, stage, &stage_route, work_profile)?;
+            let profile = self.stage_profile(estate, stage, &stage_route, work_profile)?;
             bindings.push(StageBinding {
                 stage_id: stage.id.clone(),
                 index,
@@ -1393,14 +1671,14 @@ impl Engine {
     /// stage's table) is obvious.
     fn stage_profile(
         &self,
-        workspace: &Workspace,
+        estate: &Estate,
         stage: &StageDefinition,
         stage_route: &Route,
         work_profile: Option<&Profile>,
     ) -> Result<Option<Profile>, EngineError> {
         let (profile, tier) = match stage.profile.as_deref() {
             Some(name) => (
-                Some(Self::workspace_profile(workspace, name)?),
+                Some(Self::estate_profile(estate, name)?),
                 format!("stage {:?}", stage.id),
             ),
             None => (
@@ -1422,15 +1700,15 @@ impl Engine {
         Ok(Some(profile))
     }
 
-    /// A profile the workspace declares, or §14's "name them consistently"
+    /// A profile the estate declares, or §14's "name them consistently"
     /// error with the names that do exist.
-    fn workspace_profile(workspace: &Workspace, name: &str) -> Result<Profile, EngineError> {
-        workspace
+    fn estate_profile(estate: &Estate, name: &str) -> Result<Profile, EngineError> {
+        estate
             .profile(name)
             .cloned()
             .ok_or_else(|| EngineError::ProfileNotFound {
                 requested: name.to_string(),
-                available: workspace
+                available: estate
                     .profiles
                     .iter()
                     .map(|p| p.name.as_str())
@@ -1456,7 +1734,7 @@ impl Engine {
             &RouteInputs {
                 explicit: context.backend,
                 origin_client: context.origin_client,
-                workspace_default: None,
+                estate_default: None,
                 global_default: self.default_backend.as_deref(),
             },
             &self.backends,
@@ -1480,6 +1758,21 @@ impl Engine {
     pub fn start(&self, core: &mut Core, work: &Work, plan: &StartPlan) -> Result<(), EngineError> {
         let step = self.begin_start(core, work, plan)?;
         self.run_inline(core, step)
+    }
+
+    /// The [`SurfacePlan`] `surface.materializing` records for `plan`,
+    /// carrying §8.1's admission when the plan has one.
+    ///
+    /// Split out rather than inlined so the "with admission" and "without"
+    /// shapes are one decision in one place: a plan made for a real
+    /// submission always has a [`GitPreflight`], and one made without a
+    /// `work_id` (routing probes, fixtures) never does.
+    fn surface_plan(plan: &StartPlan, work_id: &str) -> SurfacePlan {
+        let base = SurfacePlan::new(&plan.surfaces_root, work_id, &plan.repositories);
+        match &plan.preflight {
+            Some(preflight) => base.with_admission(preflight),
+            None => base,
+        }
     }
 
     /// [`Engine::start`]'s first phase: journal the intent to materialize, and
@@ -1515,11 +1808,16 @@ impl Engine {
             core,
             &work.id,
             KIND_SURFACE_MATERIALIZING,
-            json!({"plan": SurfacePlan::new(&plan.surfaces_root, &work.id, &plan.repositories)}),
+            // §8.3: "the override and every waived finding are journaled with
+            // the Work" — carried on the plan, so the authorization is durable
+            // strictly before the effect it authorized, exactly like the paths
+            // and branches beside it.
+            json!({"plan": Self::surface_plan(plan, &work.id)}),
         )?;
         Ok(Step {
             next: Next::Surface(Box::new(PendingSurface {
                 work_id: work.id.clone(),
+                data_dir: self.data_dir.clone(),
                 effect: SurfaceEffect::Materialize {
                     surfaces_root: plan.surfaces_root.clone(),
                     plan: Box::new(plan.clone()),
@@ -1555,7 +1853,24 @@ impl Engine {
                 SurfaceOutcome::Rematerialized(result),
             ) => self.settle_rematerialize(core, &work_id, &surface, index, attempt, result),
             (SurfaceEffect::Teardown { recovered, .. }, SurfaceOutcome::TornDown(report)) => {
-                let mut payload = json!({"report": report});
+                // §11.5's orthogonal axis, computed at the one point every
+                // terminal path converges on: cancel (`begin_retire_run`),
+                // failure and completion (`settle_stage`'s signal arms), and
+                // the crash-recovery re-run (`reconcile_terminal_surface`,
+                // which reaches here through this same arm and therefore
+                // records the same assessment, marked `recovered`).
+                //
+                // Deliberately *not* computed inside `teardown()`: the same
+                // function also runs as `materialize`'s partial-failure
+                // rollback, which is not a retirement and journals its report
+                // with no `integrity` key at all (see `settle_materialize`).
+                // An absent key means not assessed — never clean (C3).
+                //
+                // A sibling key rather than a field inside `report`: additive
+                // to the payload, so an old `surface.torn_down` deserializes
+                // into the same `TeardownReport` it always did.
+                let integrity = report.integrity();
+                let mut payload = json!({"report": report, "integrity": integrity});
                 if recovered {
                     payload["recovered"] = Value::Bool(true);
                 }
@@ -1643,7 +1958,7 @@ impl Engine {
                 deferred: Deferred::new(),
             });
         }
-        // R-MVP1-4: widened from `workspace: <name>` to the resolved
+        // R-MVP1-4: widened from `estate: <name>` to the resolved
         // repository set plus per-repo instruction-policy identities —
         // additive fields in an immutable event, so a mid-flight manifest
         // edit cannot reach a Work already bound. `check_instruction_policy`
@@ -1651,8 +1966,7 @@ impl Engine {
         // uniform here by construction; identities are still resolved and
         // recorded regardless — R7's "the file the actor will read is the
         // one we recorded" does not wait on `local` being enabled.
-        let instruction_identities =
-            Self::resolve_instruction_identities(&plan.workspace, &surface);
+        let instruction_identities = Self::resolve_instruction_identities(&plan.estate, &surface);
         self.commit(
             core,
             work_id,
@@ -1662,7 +1976,7 @@ impl Engine {
                 "backend": plan.route.backend,
                 "route_source": plan.route.source,
                 "profile": plan.profile,
-                "workspace": plan.workspace.name,
+                "workspace": plan.estate.name,
                 "repositories": plan.repositories,
                 "instruction_identities": instruction_identities,
                 // §12.5's per-stage decisions, pinned with the procedure they
@@ -1919,6 +2233,7 @@ impl Engine {
             return Ok(Step {
                 next: Next::Surface(Box::new(PendingSurface {
                     work_id: work_id.to_string(),
+                    data_dir: self.data_dir.clone(),
                     effect: SurfaceEffect::Rematerialize {
                         surface,
                         index: current.index,
@@ -2727,6 +3042,11 @@ impl Engine {
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile,
             instruction_policy: Some(Self::run_instruction_policy(run)),
+            // §10.1, re-supplied from the journaled surface for the same
+            // reason the pin and the profile are: a restarted adapter has
+            // lost whatever it derived from it, and the Work's mutation
+            // surface is not something it may re-invent from a bare cwd.
+            bindings: surface.binding_summary(),
         })
     }
 
@@ -2962,6 +3282,11 @@ impl Engine {
             // MVP-2 D2 item 1: the policy `workflow.bound` pinned, not
             // re-derived from the live manifest.
             instruction_policy: Self::run_instruction_policy(&run),
+            // §10.1: the complete binding summary, not only a cwd. Taken from
+            // the surface this stage is actually about to run in, so the paths
+            // and refs an adapter states are the ones sergeant journaled —
+            // never re-derived from the manifest or from the filesystem.
+            bindings: surface.binding_summary(),
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -3879,6 +4204,7 @@ impl Engine {
         }
         Next::Surface(Box::new(PendingSurface {
             work_id: work_id.to_string(),
+            data_dir: self.data_dir.clone(),
             effect: SurfaceEffect::Teardown { surface, recovered },
         }))
     }
@@ -4134,6 +4460,220 @@ mod tests {
         );
     }
 
+    // ------------------------- estate-root Phase C: Engine::resolve_scope
+
+    /// A estate fixture for exercising [`Engine::resolve_scope`] directly
+    /// — resolution never touches the filesystem, so `/nowhere` placeholders
+    /// are fine (mirrors `domain::estate::tests`' own fixture pattern).
+    fn scope_fixture(repos: &[&str], groups: &[(&str, &[&str])]) -> Estate {
+        Estate {
+            name: "payments".to_string(),
+            root: PathBuf::from("/nowhere"),
+            repositories: repos
+                .iter()
+                .map(|name| RepositorySpec {
+                    name: name.to_string(),
+                    path: PathBuf::from(format!("/nowhere/{name}")),
+                })
+                .collect(),
+            default_backend: None,
+            default_workflow: None,
+            profiles: Vec::new(),
+            config_path: None,
+            surfaces_dir: None,
+            data_dir: None,
+            repository_policy: BTreeMap::new(),
+            groups: groups
+                .iter()
+                .map(|(name, members)| {
+                    (
+                        name.to_string(),
+                        crate::domain::estate::GroupSpec {
+                            repos: members.iter().map(|m| m.to_string()).collect(),
+                            brief: None,
+                        },
+                    )
+                })
+                .collect(),
+            repository_origin: BTreeMap::new(),
+        }
+    }
+
+    /// Owner ruling (2026-08-20): `--all` combined with `--repo` and/or
+    /// `--group` is refused, naming what was combined — `all` no longer
+    /// silently wins over an explicit repos/group selection.
+    #[test]
+    fn resolve_scope_all_combined_with_repos_or_group_is_refused() {
+        let estate = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let err = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                repos: &["api".to_string()],
+                group: Some("pair"),
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("--all combined with --repo/--group must be refused");
+        match err {
+            EngineError::ConflictingScope { repos, group } => {
+                assert_eq!(repos, vec!["api".to_string()]);
+                assert_eq!(group, Some("pair".to_string()));
+            }
+            other => panic!("expected ConflictingScope, got {other}"),
+        }
+
+        // The refusal fires on `--repo` alone, too, not only in combination
+        // with `--group`.
+        let err = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                repos: &["api".to_string()],
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("--all combined with --repo alone must be refused");
+        assert!(matches!(err, EngineError::ConflictingScope { .. }));
+
+        // And on `--group` alone, with no explicit `--repo`.
+        let err = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                group: Some("pair"),
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("--all combined with --group alone must be refused");
+        assert!(matches!(err, EngineError::ConflictingScope { .. }));
+    }
+
+    /// §7.1: `--all` alone still resolves to every declared repository.
+    #[test]
+    fn resolve_scope_all_alone_still_selects_every_declared_repository() {
+        let estate = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let resolved = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect("all alone must resolve");
+        let mut names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["api", "web"]);
+    }
+
+    /// §7.1: a one-repository estate infers its sole repository on an empty
+    /// scope request.
+    #[test]
+    fn resolve_scope_infers_the_sole_repository_of_a_one_repository_estate_on_empty_scope() {
+        let estate = scope_fixture(&["solo"], &[]);
+        let resolved = Engine::resolve_scope(&estate, &SubmitContext::default())
+            .expect("a one-repository estate infers its sole repository");
+        assert_eq!(
+            resolved.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["solo"]
+        );
+    }
+
+    /// §7.1: a multi-repository estate refuses an empty scope, and the
+    /// refusal carries the full remedy body — repo count, declared repos,
+    /// declared groups.
+    #[test]
+    fn resolve_scope_refuses_an_empty_scope_on_a_multi_repository_estate() {
+        let estate = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let err = Engine::resolve_scope(&estate, &SubmitContext::default())
+            .expect_err("a multi-repository estate must refuse an empty scope");
+        match err {
+            EngineError::MissingScope {
+                repo_count,
+                repos,
+                groups,
+            } => {
+                assert_eq!(repo_count, 2);
+                assert_eq!(repos, vec!["api".to_string(), "web".to_string()]);
+                assert_eq!(groups, vec!["pair".to_string()]);
+            }
+            other => panic!("expected MissingScope, got {other}"),
+        }
+    }
+
+    /// §7.1: `--group` may combine with explicit `--repo` additions — union,
+    /// dedup, `repos` first in declaration order, new group members
+    /// appended.
+    #[test]
+    fn resolve_scope_unions_group_members_with_explicit_repos_and_dedups() {
+        let estate = scope_fixture(&["api", "web", "docs"], &[("pair", &["api", "web"])]);
+        let resolved = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                repos: &["web".to_string(), "docs".to_string()],
+                group: Some("pair"),
+                ..SubmitContext::default()
+            },
+        )
+        .expect("union must resolve");
+        assert_eq!(
+            resolved.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["web", "docs", "api"],
+            "explicit --repo first (declaration order), then new group members appended, with \
+             no duplicate for the repo already named by both"
+        );
+    }
+
+    /// §15: an undeclared `--group` is refused by name, listing the estate's
+    /// declared groups.
+    #[test]
+    fn resolve_scope_refuses_an_undeclared_group_naming_the_declared_ones() {
+        let estate = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let err = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                group: Some("ghost"),
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("an undeclared group must refuse");
+        match err {
+            EngineError::UnknownGroup {
+                requested,
+                available,
+            } => {
+                assert_eq!(requested, "ghost");
+                assert_eq!(available, vec!["pair".to_string()]);
+            }
+            other => panic!("expected UnknownGroup, got {other}"),
+        }
+    }
+
+    /// §15: an unknown `--repo` name is refused by [`Estate::select`],
+    /// naming the estate's declared repositories.
+    #[test]
+    fn resolve_scope_refuses_an_unknown_repository_naming_the_declared_ones() {
+        let estate = scope_fixture(&["api", "web"], &[]);
+        let err = Engine::resolve_scope(
+            &estate,
+            &SubmitContext {
+                repos: &["ghost".to_string()],
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("an unknown repository must refuse");
+        match err {
+            EngineError::RepositorySelection(message) => {
+                assert!(message.contains("ghost"), "got: {message}");
+                assert!(
+                    message.contains("api") && message.contains("web"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected RepositorySelection, got {other}"),
+        }
+    }
+
     /// Every `EngineError`'s wire code, in one table.
     ///
     /// `code()` is the vocabulary `/v1` answers with and the thing a client
@@ -4145,7 +4685,7 @@ mod tests {
     fn every_engine_error_answers_with_its_wire_code() {
         let cases: Vec<(EngineError, &str)> = vec![
             (
-                WorkspaceError::Io {
+                EstateError::Io {
                     path: "/nowhere/sergeant.toml".to_string(),
                     source: std::io::Error::other("unreadable"),
                 }
@@ -4269,6 +4809,28 @@ mod tests {
                 },
                 "no_such_stage",
             ),
+            (
+                EngineError::MissingScope {
+                    repo_count: 2,
+                    repos: vec!["api".to_string(), "web".to_string()],
+                    groups: vec![],
+                },
+                "missing_scope",
+            ),
+            (
+                EngineError::UnknownGroup {
+                    requested: "ghost".to_string(),
+                    available: vec!["payments".to_string()],
+                },
+                "unknown_group",
+            ),
+            (
+                EngineError::ConflictingScope {
+                    repos: vec!["api".to_string()],
+                    group: Some("pair".to_string()),
+                },
+                "conflicting_scope",
+            ),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for (error, code) in &cases {
@@ -4325,7 +4887,7 @@ mod tests {
         // worktrees could never execute anything — and nothing was created,
         // so there is no teardown report to record.
         let plan = StartPlan {
-            workspace: Workspace {
+            estate: Estate {
                 name: "solo".to_string(),
                 root: dir.path().to_path_buf(),
                 repositories: Vec::new(),
@@ -4355,6 +4917,8 @@ mod tests {
             profile: None,
             // N3 (§12.5): one binding per stage, and this plan has no stages.
             stage_bindings: Vec::new(),
+            // No admission: this plan was built by hand, not by `plan`.
+            preflight: None,
         };
 
         engine
@@ -4846,6 +5410,7 @@ mod tests {
             profile: None,
             execute: None,
             instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
         };
         let handle = fake.start(&start_request).expect("fake backend start");
         testing::commit(
@@ -4948,12 +5513,14 @@ mod tests {
                 workspace: None,
                 intent: "review this".to_string(),
                 repositories: Vec::new(),
+                scope_request: Default::default(),
                 workflow: None,
                 backend: None,
                 origin_client: None,
                 profile: None,
                 intent_detail: None,
                 envelope: None,
+                git_preflight_override: false,
                 state,
                 created_by: "test".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -4964,12 +5531,15 @@ mod tests {
             RepositoryBinding {
                 repository: "solo".to_string(),
                 source_path: PathBuf::from("/repos/solo"),
-                base_branch: "main".to_string(),
+                base_branch: Some("main".to_string()),
                 base_sha: "0".repeat(40),
                 worktree_path: PathBuf::from(format!("/data/surfaces/{work_id}/solo")),
                 work_branch: format!("sergeant/{work_id}"),
                 head_sha: "1".repeat(40),
                 origin: BindingOrigin::Cut,
+                canonical_top_level: Some(PathBuf::from("/repos/solo")),
+                canonical_common_dir: Some(PathBuf::from("/repos/solo/.git")),
+                preflight: None,
             }
         }
 
@@ -4997,9 +5567,12 @@ mod tests {
                     worktree_path: PathBuf::from(format!("/data/surfaces/{work_id}/solo")),
                     work_branch: format!("sergeant/{work_id}"),
                     final_sha: Some("1".repeat(40)),
+                    observed_head: None,
+                    findings: Vec::new(),
                     disposition,
                 }],
                 clean,
+                drift: Vec::new(),
             }
         }
 

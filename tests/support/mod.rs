@@ -83,7 +83,7 @@ pub struct ReapedDaemon {
 /// doc comment in `tests/m2_daemon_api.rs` explains why the data dir must
 /// stay outside one), and a data dir nested under this checkout's own
 /// `target/` sits inside that checkout — the walk finds this repo's `.git`
-/// and the daemon materializes a real workspace the test never asked for
+/// and the daemon materializes a real estate the test never asked for
 /// (measured: `t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed`
 /// and two siblings went from `pending` to `blocked` the moment the base
 /// moved under `target/`). `/var/tmp/<name>` is the already-established
@@ -426,4 +426,71 @@ pub fn wait_until_executable(path: &Path) {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+// ----------------------------------------------------- estate fixtures (§4, §6)
+
+/// Run git in `dir` with a fixed identity and no ambient config, panicking
+/// with git's own diagnostic. Shared so every suite's estate fixtures agree
+/// on the hermetic environment (`GIT_CONFIG_GLOBAL=/dev/null` and friends)
+/// rather than each re-deriving it.
+pub fn git(dir: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "sergeant tests")
+        .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
+        .env("GIT_COMMITTER_NAME", "sergeant tests")
+        .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A git repository at `path` with one commit. Returns its HEAD SHA.
+pub fn init_repo(path: &Path) -> String {
+    std::fs::create_dir_all(path).expect("repo dir");
+    git(path, &["init", "-b", "main"]);
+    std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
+    git(path, &["add", "."]);
+    git(path, &["commit", "-m", "initial"]);
+    git(path, &["rev-parse", "HEAD"])
+}
+
+/// Scaffold a valid estate at `root` (estate-root §4.1, §6.1).
+///
+/// Writes a `sergeant.toml` declaring `[estate] name` and one `[[repo]]` per
+/// entry of `repos` — **no `path` keys**, because mounts are derived — and
+/// creates a real git checkout at `root/repos/<name>` for each. Returns the
+/// HEAD SHA of each mount, in `repos` order.
+///
+/// This is the shape every estate-scoped command now requires: exact-root
+/// admission means a bare `TempDir` with a git repo in it is no longer a
+/// estate, and `[[repo]]` entries must resolve to `repos/<name>`.
+pub fn scaffold_estate(root: &Path, name: &str, repos: &[&str]) -> Vec<String> {
+    std::fs::create_dir_all(root).expect("estate root");
+    let mut manifest = format!("[estate]\nname = {name:?}\n");
+    let mut heads = Vec::with_capacity(repos.len());
+    for repo in repos {
+        manifest.push_str(&format!("\n[[repo]]\nname = {repo:?}\n"));
+        heads.push(init_repo(&root.join("repos").join(repo)));
+    }
+    std::fs::write(root.join("sergeant.toml"), manifest).expect("write sergeant.toml");
+    heads
+}
+
+/// [`scaffold_estate`] for the common single-repository case: an estate
+/// named `name` with one mount also named `name`. Returns the mount path and
+/// its HEAD SHA.
+pub fn scaffold_solo_estate(root: &Path, name: &str) -> (PathBuf, String) {
+    let head = scaffold_estate(root, name, &[name]).remove(0);
+    (root.join("repos").join(name), head)
 }

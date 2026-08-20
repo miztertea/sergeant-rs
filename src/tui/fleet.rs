@@ -23,7 +23,7 @@ pub struct WorkRow {
     pub backend: String,
     pub intent: String,
     pub workflow: String,
-    pub workspace: String,
+    pub estate: String,
     pub repositories: String,
     pub turns: String,
     pub created_at: String,
@@ -68,7 +68,7 @@ fn row_from(work: &Value) -> WorkRow {
         backend: field(work, "resolved_backend"),
         intent: field(work, "intent"),
         workflow: field(work, "workflow"),
-        workspace: field(work, "workspace"),
+        estate: field(work, "workspace"),
         repositories,
         turns,
         created_at: field(work, "created_at"),
@@ -76,10 +76,10 @@ fn row_from(work: &Value) -> WorkRow {
     }
 }
 
-/// A row's target: the workspace when declared, else its repositories.
+/// A row's target: the estate when declared, else its repositories.
 fn target(row: &WorkRow) -> String {
-    if row.workspace != "-" {
-        row.workspace.clone()
+    if row.estate != "-" {
+        row.estate.clone()
     } else {
         row.repositories.clone()
     }

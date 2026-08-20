@@ -1,13 +1,13 @@
 //! Domain model: the core types describing work, execution, and workflow.
 
 pub mod distro;
+pub mod estate;
 pub mod event;
 pub mod execution;
 pub mod manifest;
 pub mod profile;
 pub mod work;
 pub mod workflow;
-pub mod workspace;
 
 use std::path::Path;
 
@@ -17,7 +17,7 @@ use std::path::Path;
 /// Three user-controlled names are joined straight onto a root directory —
 /// a workflow name onto `.sergeant/workflows/` ([`workflow::WorkflowDefinition::resolve`]),
 /// a stage id onto its workflow directory, and a repository name onto
-/// `<data-dir>/surfaces/<work-id>/` ([`workspace::Workspace::from_config`]).
+/// `<data-dir>/surfaces/<work-id>/` ([`estate::Estate::from_config`]).
 /// That is one rule, so it lives in one function: a path-traversal guard
 /// copied per module is a guard that can be fixed in one copy and left broken
 /// in the others.

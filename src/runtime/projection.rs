@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::daemon::{KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED};
+use crate::domain::estate::InstructionIdentity;
 use crate::domain::event::Event;
 use crate::domain::execution::{
     ExecutionRecord, ExecutionReservation, KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RESERVED,
@@ -28,8 +29,8 @@ use crate::domain::workflow::{
     KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_STAGE_WAITING,
     KIND_WORKFLOW_BOUND, StageBinding, StageRecord, StageStatus, WorkflowDefinition,
 };
-use crate::domain::workspace::InstructionIdentity;
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
+use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfacePlan,
@@ -377,6 +378,17 @@ pub struct WorkRun {
     /// Teardown report, once the surface has been torn down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teardown: Option<TeardownReport>,
+    /// §11.5's integrity axis, as the retirement that recorded the teardown
+    /// assessed it. Orthogonal to [`Work::state`](crate::domain::work::Work),
+    /// which this never touches (ADR 0007(b)'s pattern: journal and view
+    /// metadata, not a state-machine value).
+    ///
+    /// `None` is **not assessed**, never clean: a `surface.torn_down`
+    /// journaled before this phase carries no assessment, and neither does
+    /// the rollback teardown `materialize` runs on a partial failure. Both
+    /// replay to `None` and every view says so (C3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<IntegrityDisposition>,
     /// Every stage attempt, in the order they were entered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<StageRecord>,
@@ -412,9 +424,9 @@ pub struct WorkRun {
     /// across every entry by construction (`check_instruction_policy`
     /// refuses submission otherwise) — MVP-2 D2 item 1 reads
     /// `.first().policy` off this to resolve the one
-    /// [`crate::domain::workspace::InstructionPolicy`] a `StartRequest`/
+    /// [`crate::domain::estate::InstructionPolicy`] a `StartRequest`/
     /// `ResumeRequest` carries. Empty for a run bound before R-MVP1-4, which
-    /// resolves to [`crate::domain::workspace::InstructionPolicy::Suppress`]
+    /// resolves to [`crate::domain::estate::InstructionPolicy::Suppress`]
     /// the same way an absent manifest entry does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instruction_identities: Vec<InstructionIdentity>,
@@ -710,6 +722,10 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 let run = state.runs.entry(work_id.clone()).or_default();
                 run.surface = Some(surface);
                 run.teardown = None;
+                // A rematerialized surface has not been assessed again yet;
+                // carrying the previous retirement's verdict forward would
+                // report a fact about a teardown this run has replaced.
+                run.integrity = None;
             }
         }
         KIND_SURFACE_TORN_DOWN => {
@@ -717,7 +733,14 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 event.work_id.as_ref(),
                 serde_json::from_value::<TeardownReport>(event.payload["report"].clone()),
             ) {
-                state.runs.entry(work_id.clone()).or_default().teardown = Some(report);
+                let run = state.runs.entry(work_id.clone()).or_default();
+                run.teardown = Some(report);
+                // Additive (§20.5 / C3): a `surface.torn_down` from before
+                // this phase — and the rollback teardown `materialize`
+                // journals on a partial failure — carry no `integrity` key,
+                // and `from_value(Null)` is an error, so both read back as
+                // "not assessed" rather than being defaulted to clean.
+                run.integrity = serde_json::from_value(event.payload["integrity"].clone()).ok();
             }
         }
         KIND_STAGE_ENTERED => {
@@ -1413,5 +1436,111 @@ mod rule_a_eviction_tests {
             "rebuild-on-start must not resurrect an evicted run into memory"
         );
         assert_eq!(rebuilt.state().works[work_id].state, WorkState::Completed);
+    }
+}
+
+#[cfg(test)]
+mod estate_root_phase_c_scope_replay_tests {
+    //! estate-root proposal §7.4: `Work` gained `scope_request` and stopped
+    //! writing `estate` in Phase C. Neither change may take back a
+    //! journal a pre-Phase-C daemon already wrote — the live dogfood estate
+    //! alone carries 150+ `work.submitted` events with a literal `estate`
+    //! key and no `scope_request` key at all. This is that replay contract,
+    //! pinned through the real fold (`work_registry_reducer`, not just
+    //! `serde_json::from_value` in isolation) so a future change to either
+    //! field's `#[serde(default)]` discipline fails here first.
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::work::ScopeRequest;
+    use crate::runtime::testing;
+
+    /// A `work.submitted` payload in exactly the pre-Phase-C shape: a
+    /// `estate` string, a `repositories` list, and no `scope_request`
+    /// key — must still fold into a valid, complete `Work`.
+    #[test]
+    fn a_pre_phase_c_work_submitted_event_replays_with_scope_request_defaulted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01LEGACYWORK0000000";
+
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORK_SUBMITTED,
+            json!({"work": {
+                "id": work_id,
+                "workspace": "payments",
+                "intent": "legacy submission from before Phase C",
+                "repositories": ["api", "web"],
+                "workflow": "software-change",
+                "backend": "claude",
+                "state": "pending",
+                "created_by": "cli",
+                "created_at": "2026-01-01T00:00:00Z",
+            }}),
+        );
+
+        let work = core
+            .registry
+            .state()
+            .works
+            .get(work_id)
+            .expect("a pre-Phase-C work.submitted event must still replay into a Work");
+        assert_eq!(
+            work.workspace.as_deref(),
+            Some("payments"),
+            "the legacy workspace key must still deserialize, even though nothing writes it \
+             anymore"
+        );
+        assert_eq!(work.repositories, vec!["api", "web"]);
+        assert_eq!(
+            work.scope_request,
+            ScopeRequest::default(),
+            "an event with no scope_request key must default, not fail to replay"
+        );
+    }
+
+    /// A `work.submitted` payload in the current (Phase C) shape — a real
+    /// `scope_request` and no `estate` key at all — replays identically,
+    /// and the two shapes stay distinguishable (a legacy Work still reports
+    /// its `estate` label; a new one reports `None`, per §7.4).
+    #[test]
+    fn a_current_shape_work_submitted_event_replays_with_no_workspace_label() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01CURRENTWORK000000";
+
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORK_SUBMITTED,
+            json!({"work": {
+                "id": work_id,
+                "intent": "current-shape submission",
+                "repositories": ["api", "web"],
+                "scope_request": {"repos": ["api", "web"], "group": null, "all": false},
+                "state": "pending",
+                "created_by": "cli",
+                "created_at": "2026-01-01T00:00:00Z",
+            }}),
+        );
+
+        let work = core
+            .registry
+            .state()
+            .works
+            .get(work_id)
+            .expect("a current-shape work.submitted event must replay");
+        assert_eq!(work.workspace, None, "§7.4: never written for a new Work");
+        assert_eq!(
+            work.scope_request,
+            ScopeRequest {
+                repos: vec!["api".to_string(), "web".to_string()],
+                group: None,
+                all: false,
+            }
+        );
     }
 }

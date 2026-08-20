@@ -45,10 +45,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::domain::estate::InstructionPolicy;
 use crate::domain::event::EventDraft;
 use crate::domain::profile::Profile;
 use crate::domain::workflow::ExecuteSpec;
-use crate::domain::workspace::InstructionPolicy;
 
 /// One normalized native event (§20/§27): an adapter's translation of a raw
 /// vendor record into sergeant's `conversation.*`/`tool.*`/`usage.*`
@@ -94,7 +94,7 @@ pub enum RuntimeScope {
     External,
     /// One runtime instance per launch profile (§14).
     PerProfile,
-    /// One runtime instance per workspace.
+    /// One runtime instance per estate.
     PerWorkspace,
     /// Each execution owns its own native runtime; there is no shared
     /// backend-level service to start or attach to.
@@ -179,6 +179,38 @@ pub struct ProbeReport {
     pub detail: Option<String>,
 }
 
+/// One selected repository, as the backend needs to see it (§10.1).
+///
+/// §10.1: "the backend receives the complete binding summary, not only a cwd,
+/// so its prompt/launch grammar can state exact repository paths, expected
+/// branches, and base SHAs". A `cwd` alone cannot say any of that — for a
+/// multi-repo Work it is the surface *root*, and even for a single-repo Work
+/// it names a directory without naming the branch the actor is expected to be
+/// on or the commit it started from.
+///
+/// Every field is a fact sergeant already journaled about the Work's own
+/// [`RepositoryBinding`](crate::runtime::surface::RepositoryBinding). Nothing
+/// here is policy or instruction: what an adapter *does* with it is the
+/// adapter's business, and an adapter that ignores the field entirely still
+/// runs (C2 — core reports only what it can prove).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingSummary {
+    /// Repository name within the Work's scope.
+    pub repository: String,
+    /// The linked worktree this Work may modify — the mutation surface.
+    pub worktree_path: PathBuf,
+    /// Branch the Work executes on in that worktree.
+    pub work_branch: String,
+    /// Branch the work branch was cut from — `None` when the mount was
+    /// admitted detached under §8.3's bounded override, which pins an exact
+    /// `base_sha` and records no named base branch. `#[serde(default)]` so a
+    /// summary journaled before the field became optional still replays.
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    /// Exact commit it was cut from.
+    pub base_sha: String,
+}
+
 /// Everything a backend needs to START one execution for one stage attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartRequest {
@@ -222,6 +254,16 @@ pub struct StartRequest {
     /// is exactly what every such request's actual launch grammar was.
     #[serde(default)]
     pub instruction_policy: InstructionPolicy,
+    /// §10.1's complete binding summary: one entry per repository in the
+    /// Work's scope, in the Work's own scope order.
+    ///
+    /// `#[serde(default)]` to an empty vec, so a `StartRequest` journaled
+    /// before this field existed replays as "no summary supplied" — which is
+    /// exactly what it was. An empty summary is not a claim that the Work has
+    /// no repositories; it is the absence of a claim, and an adapter must not
+    /// read it as a mutation surface of nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<BindingSummary>,
 }
 
 /// Everything a backend needs to RESUME an execution it no longer remembers
@@ -264,6 +306,16 @@ pub struct ResumeRequest {
     /// (`Suppress`) whether or not it actually had one to re-supply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_policy: Option<InstructionPolicy>,
+    /// §10.1's binding summary, re-supplied on RESUME for the same reason the
+    /// model pin and the profile are: a restarted adapter has lost whatever it
+    /// derived from it, and re-deriving the Work's mutation surface from a
+    /// bare `cwd` would be the fabrication this type's contract forbids.
+    ///
+    /// `#[serde(default)]` to empty, exactly as on
+    /// [`StartRequest::bindings`], and read the same way — absence of a
+    /// claim, not a claim of absence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<BindingSummary>,
 }
 
 impl ResumeRequest {
@@ -281,6 +333,7 @@ impl ResumeRequest {
             model: None,
             profile: None,
             instruction_policy: None,
+            bindings: Vec::new(),
         }
     }
 }

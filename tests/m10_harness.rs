@@ -46,6 +46,8 @@ fn write_stub(dir: &Path, name: &str, record: &Path) -> String {
                for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n      \
                printf 'env PATH=%s\\n' \"$PATH\";\n      \
                printf 'env SGT_DATA_DIR=%s\\n' \"${{SGT_DATA_DIR-<unset>}}\";\n      \
+               printf 'env SGT_ESTATE_ROOT=%s\\n' \"${{SGT_ESTATE_ROOT-<unset>}}\";\n      \
+               printf 'env SGT_ORIGIN_CLIENT=%s\\n' \"${{SGT_ORIGIN_CLIENT-<unset>}}\";\n      \
                printf 'end\\n';\n    \
              }} >> \"{record}\";;\n\
          esac\n",
@@ -112,6 +114,11 @@ fn read_launch(record: &Path) -> Launch {
 fn sgt_claude_execs_the_child_pid_equals_the_parent_sgt_pid() {
     let bin = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
+    // §4.2/§5.3: `sgt <harness>` is estate-scoped, and §4.3 puts the
+    // exact-root check before harness preparation *and* exec. `-C` names the
+    // root explicitly so the rig never depends on this test process's cwd.
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "harness-estate", &["solo"]);
     // A HOME with no `.cargo/bin`/`.local/bin` of its own: PATH enrichment
     // must have nothing to prepend, so the stub directory below (listed
     // first on PATH) is what actually resolves as `claude` — not whatever
@@ -121,6 +128,8 @@ fn sgt_claude_execs_the_child_pid_equals_the_parent_sgt_pid() {
     write_stub(bin.path(), "claude", &record);
 
     let mut child = Command::new(SGT)
+        .arg("-C")
+        .arg(estate.path())
         .arg("--data-dir")
         .arg(data.path())
         .arg("claude")
@@ -153,11 +162,18 @@ fn sgt_claude_execs_the_child_pid_equals_the_parent_sgt_pid() {
 fn arguments_after_the_separator_reach_the_harness_verbatim() {
     let bin = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
+    // §4.2/§5.3: `sgt <harness>` is estate-scoped, and §4.3 puts the
+    // exact-root check before harness preparation *and* exec. `-C` names the
+    // root explicitly so the rig never depends on this test process's cwd.
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "harness-estate", &["solo"]);
     let home = TempDir::new().expect("tempdir");
     let record = bin.path().join("record.txt");
     write_stub(bin.path(), "claude", &record);
 
     let mut child = Command::new(SGT)
+        .arg("-C")
+        .arg(estate.path())
         .arg("--data-dir")
         .arg(data.path())
         .arg("claude")
@@ -193,6 +209,11 @@ fn arguments_after_the_separator_reach_the_harness_verbatim() {
 fn the_composed_environment_reaches_the_exec_d_harness() {
     let bin = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
+    // §4.2/§5.3: `sgt <harness>` is estate-scoped, and §4.3 puts the
+    // exact-root check before harness preparation *and* exec. `-C` names the
+    // root explicitly so the rig never depends on this test process's cwd.
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "harness-estate", &["solo"]);
     let home = TempDir::new().expect("tempdir");
     let cargo_bin = home.path().join(".cargo").join("bin");
     std::fs::create_dir_all(&cargo_bin).expect("mkdir cargo bin");
@@ -200,6 +221,8 @@ fn the_composed_environment_reaches_the_exec_d_harness() {
     write_stub(bin.path(), "claude", &record);
 
     let mut child = Command::new(SGT)
+        .arg("-C")
+        .arg(estate.path())
         .arg("--data-dir")
         .arg(data.path())
         .arg("claude")
@@ -220,5 +243,80 @@ fn the_composed_environment_reaches_the_exec_d_harness() {
         Some(data.path().display().to_string()).as_deref(),
         "SGT_DATA_DIR must bind explicitly to the data dir this invocation resolved: {:?}",
         launch.env.get("SGT_DATA_DIR")
+    );
+    // §5.3's other two bindings, composed in the same place and reaching the
+    // same exec: the canonical estate root this invocation already admitted,
+    // and the harness's own name as the origin client.
+    assert_eq!(
+        launch
+            .env
+            .get("SGT_ESTATE_ROOT")
+            .map(|r| std::fs::canonicalize(r).ok()),
+        Some(std::fs::canonicalize(estate.path()).ok()),
+        "SGT_ESTATE_ROOT must bind to the admitted estate root: {:?}",
+        launch.env.get("SGT_ESTATE_ROOT")
+    );
+    assert_eq!(
+        launch.env.get("SGT_ORIGIN_CLIENT").map(String::as_str),
+        Some("claude"),
+        "SGT_ORIGIN_CLIENT must name the harness: {:?}",
+        launch.env.get("SGT_ORIGIN_CLIENT")
+    );
+}
+
+/// §5.3: the environment helps later invocations name the correct root — it
+/// **never waives the exact-current-directory check**. "If Captain cds into
+/// a mount and calls sgt run, the tool still refuses and tells Captain to
+/// return." Asserted directly: with `SGT_ESTATE_ROOT` exported and naming a
+/// perfectly valid estate, an estate-scoped verb run from a mount inside it
+/// still refuses — and the refusal is §4.4's descendant variant, which names
+/// both roots.
+#[test]
+fn the_exported_estate_root_never_waives_the_exact_root_check() {
+    let data = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "bound-estate", &["solo"]);
+    let mount = estate.path().join("repos").join("solo");
+
+    let output = Command::new(SGT)
+        .arg("--data-dir")
+        .arg(data.path())
+        .arg("run")
+        .arg("should never be admitted from a mount")
+        .current_dir(&mount)
+        .env("SGT_ESTATE_ROOT", estate.path())
+        .env("SGT_DATA_DIR", data.path())
+        .env("SGT_ORIGIN_CLIENT", "claude")
+        .output()
+        .expect("run sgt");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a bound environment must not admit a mount as an estate root"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("this command must be run from the estate root"),
+        "§4.4's descendant variant: {stderr}"
+    );
+    assert!(
+        stderr.contains(&mount.display().to_string())
+            || stderr.contains(
+                &std::fs::canonicalize(&mount)
+                    .unwrap_or_else(|_| mount.clone())
+                    .display()
+                    .to_string()
+            ),
+        "it must name the current directory: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            &std::fs::canonicalize(estate.path())
+                .expect("canonical estate root")
+                .display()
+                .to_string()
+        ),
+        "it must name the bound estate root: {stderr}"
     );
 }

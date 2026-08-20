@@ -34,6 +34,7 @@ use crate::daemon::{
     KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
     KIND_DAEMON_STOPPED,
 };
+use crate::domain::estate::{Estate, InstructionPolicy};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::execution::{
     KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
@@ -43,14 +44,14 @@ use crate::domain::manifest::{self, ManifestError};
 use crate::domain::work::{
     EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
     KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
-    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
+    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, ScopeRequest,
+    Work, WorkState,
 };
 use crate::domain::workflow::{
     self, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
     KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED,
     KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use crate::domain::workspace::{InstructionPolicy, Workspace};
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
@@ -60,6 +61,7 @@ use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
     KIND_CONVERSATION_USER, KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
+use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{
     Projection, ProjectionError, WorkRegistry, WorkRun, is_absorbing, rederive_run,
@@ -774,7 +776,78 @@ fn engine_error_body(e: &EngineError) -> Value {
     if let Some(available) = e.available_backends() {
         body["error"]["available_backends"] = json!(available);
     }
+    // estate-root §7.1/§15: a missing-scope refusal carries its remedy as
+    // data too — repo count, declared repos, declared groups, and the three
+    // example invocations (--repo/--group/--all) — so a client never has to
+    // regex the message to build the "select repositories" prompt.
+    if let EngineError::MissingScope {
+        repo_count,
+        repos,
+        groups,
+    } = e
+    {
+        body["error"]["repo_count"] = json!(repo_count);
+        body["error"]["repos"] = json!(repos);
+        body["error"]["groups"] = json!(groups);
+        body["error"]["examples"] = missing_scope_examples(repos, groups);
+    }
+    // §15: an unknown group is refused naming the available ones.
+    if let EngineError::UnknownGroup { available, .. } = e {
+        body["error"]["available_groups"] = json!(available);
+    }
+    // estate-root §8.1/§15: a Git admission refusal carries its whole
+    // taxonomy as data. `error.code` is already the *first* failed check's
+    // stable code (`EngineError::code`), which is what a client branches on;
+    // `findings` is every unresolved check across the whole selected scope,
+    // each naming its repository, its §8.1 check number, its own code, the
+    // evidence, and its remedy — so a multi-repository scope is fixed in one
+    // pass rather than one submission per repository.
+    //
+    // `override_available` is §15's dirty/detached row ("mention the bounded
+    // --override-git-preflight escape hatch") answered as a boolean rather
+    // than left for a client to infer from the code — and answered `false`
+    // for exactly the row that must not offer it: an unresolvable HEAD, where
+    // no exact base can be pinned at all.
+    if let EngineError::GitPreflight(refusal) = e {
+        body["error"]["findings"] = json!(
+            refusal
+                .findings
+                .iter()
+                .map(|finding| json!({
+                    "repository": finding.repository,
+                    "check": finding.check,
+                    "check_number": finding.check.number(),
+                    "code": finding.code(),
+                    "detail": finding.detail,
+                    "remedy": finding.remedy(),
+                    "waivable": finding.check.waivable(),
+                    "porcelain": finding.porcelain,
+                }))
+                .collect::<Vec<Value>>()
+        );
+        body["error"]["override_available"] = json!(refusal.override_would_help());
+    }
     body
+}
+
+/// §7.1's three example invocations for a missing-scope refusal, using real
+/// declared names when the estate has any (more useful than a placeholder),
+/// falling back to a generic `<repo>`/`<group>` when it does not.
+fn missing_scope_examples(repos: &[String], groups: &[String]) -> Value {
+    let repo_example = match repos {
+        [] => "sgt run \"<intent>\" --repo <repo>".to_string(),
+        [one] => format!("sgt run \"<intent>\" --repo {one}"),
+        many => format!("sgt run \"<intent>\" --repo {} --repo {}", many[0], many[1]),
+    };
+    let group_example = match groups.first() {
+        Some(g) => format!("sgt run \"<intent>\" --group {g}"),
+        None => "sgt run \"<intent>\" --group <group>".to_string(),
+    };
+    json!({
+        "repo": repo_example,
+        "group": group_example,
+        "all": "sgt run \"<intent>\" --all",
+    })
 }
 
 /// HTTP status for an engine failure: 4xx where the client can fix it, 500
@@ -1013,10 +1086,12 @@ fn internal_error(e: impl std::fmt::Display) -> Response {
 struct SubmitRequest {
     command_id: String,
     intent: String,
+    /// estate-root proposal §7/§13.3's structured scope request
+    /// (`--repo`/`--group`/`--all`). §7.4: `estate` no longer exists as
+    /// a wire field at all — the daemon is bound to exactly one estate, and
+    /// this is its replacement.
     #[serde(default)]
-    workspace: Option<String>,
-    #[serde(default)]
-    repositories: Vec<String>,
+    scope: ScopeRequest,
     #[serde(default)]
     workflow: Option<String>,
     #[serde(default)]
@@ -1028,9 +1103,9 @@ struct SubmitRequest {
     #[serde(default)]
     origin: Option<Origin>,
     /// R-MVP1-6's structured-intent schema slot. Progressive elaboration of
-    /// `intent`, checked for agreement against `workflow`/`repositories`
-    /// above (§13's one-source-of-truth rule) and journaled verbatim
-    /// otherwise — nothing here drives routing.
+    /// `intent`, checked for agreement against `workflow`/`scope.repos`/
+    /// `scope.group` above (§13's one-source-of-truth rule) and journaled
+    /// verbatim otherwise — nothing here drives routing.
     #[serde(default)]
     intent_detail: Option<IntentDetail>,
     /// MVP-3's submit-time envelope override (`--turns`/`--ceiling-secs`):
@@ -1039,6 +1114,18 @@ struct SubmitRequest {
     /// nothing here drives routing, exactly like `intent_detail` above.
     #[serde(default)]
     envelope: Option<EnvelopeRequest>,
+    /// estate-root §8.3's one bounded override, as `sgt run
+    /// --override-git-preflight` sends it.
+    ///
+    /// **It has exactly one source: this field, on this request.** §8.3: "it
+    /// is never available from run defaults or a run template; the operator
+    /// must type it for that submission." There is deliberately no daemon
+    /// config key, no `[estate]` manifest key, and no profile field that can
+    /// set it — `#[serde(default)]` means a submission that does not say so
+    /// is not overriding anything, and nothing else in the process can make
+    /// this `true`.
+    #[serde(default)]
+    override_git_preflight: bool,
 }
 
 /// R-MVP1-7's envelope override, sanity-checked at submit: a turn cap of 0
@@ -1066,12 +1153,12 @@ fn envelope_out_of_range(req: &SubmitRequest) -> Option<String> {
 }
 
 /// R-MVP1-6's submit-time agreement check: a structured elaboration that
-/// names a `workflow`/`repos` different from what the submission's own
-/// flags say is two answers to "what is this Work about" in one Work, and
-/// §13 requires exactly one source of truth. Absent on either side is not a
-/// disagreement — only *both present and different* is. Repository sets are
-/// compared unordered (a client naming the same repos in a different order
-/// has not disagreed with itself).
+/// names a `workflow`/`repos`/`group` different from what the submission's
+/// own flags say is two answers to "what is this Work about" in one Work,
+/// and §13 requires exactly one source of truth. Absent on either side is
+/// not a disagreement — only *both present and different* is. Repository
+/// sets are compared unordered (a client naming the same repos in a
+/// different order has not disagreed with itself).
 fn intent_detail_disagreement(req: &SubmitRequest) -> Option<String> {
     let detail = req.intent_detail.as_ref()?;
     if let (Some(declared), Some(flag)) = (detail.workflow.as_deref(), req.workflow.as_deref())
@@ -1083,25 +1170,33 @@ fn intent_detail_disagreement(req: &SubmitRequest) -> Option<String> {
         ));
     }
     if let Some(declared) = detail.repos.as_ref()
-        && !req.repositories.is_empty()
+        && !req.scope.repos.is_empty()
     {
         let declared_set: std::collections::BTreeSet<&str> =
             declared.iter().map(String::as_str).collect();
         let flag_set: std::collections::BTreeSet<&str> =
-            req.repositories.iter().map(String::as_str).collect();
+            req.scope.repos.iter().map(String::as_str).collect();
         if declared_set != flag_set {
             return Some(format!(
-                "intent_detail.repos is {declared:?}, but the submission's repositories are \
+                "intent_detail.repos is {declared:?}, but the submission's scope.repos are \
                  {:?}; the two must agree",
-                req.repositories
+                req.scope.repos
             ));
         }
     }
-    // `detail.group` is deliberately not checked here (I3): R-MVP1-5(b)
-    // gives group membership "no new engine surface" in MVP-1 — there is no
-    // `--group` flag yet for it to disagree with, and expanding it into a
-    // repository set to compare is MVP-3's CLI-side job. Revisit this
-    // function when `--group` lands, not before.
+    // estate-root Phase C: `scope.group` is now a real wire field (§13.3),
+    // so `detail.group` gets the same one-source-of-truth check `repos`
+    // and `workflow` already get above — the comment this replaces (I3)
+    // predates `--group` existing as anything but MVP-3's CLI-side-only
+    // expansion, which is exactly what Phase C retires.
+    if let (Some(declared), Some(group)) = (detail.group.as_deref(), req.scope.group.as_deref())
+        && declared != group
+    {
+        return Some(format!(
+            "intent_detail.group is {declared:?}, but the submission's scope.group is \
+             {group:?}; the two must agree"
+        ));
+    }
     None
 }
 
@@ -1111,7 +1206,7 @@ struct Origin {
     /// Front-end harness name, e.g. `claude`. Drives origin affinity.
     #[serde(default)]
     client: Option<String>,
-    /// The client's working directory. Workspace discovery (§9) starts here;
+    /// The client's working directory. Estate discovery (§9) starts here;
     /// a daemon has no cwd of its own, so this is the only honest source for
     /// "which repository is this work about".
     #[serde(default)]
@@ -1137,9 +1232,10 @@ async fn submit_work(
         return *resp;
     }
     // Planning happens with **no lock held**. It reads the filesystem —
-    // `Workspace::discover` walks up to the git root and parses
-    // `sergeant.toml`, `WorkflowDefinition::resolve` reads every stage's
-    // `CONTEXT.md` — and probes every harness the run will use (§17.5). All of
+    // `Estate::resolve` parses the bound estate's `sergeant.toml` and
+    // validates every derived mount, `WorkflowDefinition::resolve` reads
+    // every stage's `CONTEXT.md` — and probes every harness the run will use
+    // (§17.5). All of
     // that is external I/O on paths the daemon does not own, which §22.6 keeps
     // out from under the core lock; it is also, by construction, side-effect
     // free, so running it before the guard costs nothing but a re-check.
@@ -1150,6 +1246,14 @@ async fn submit_work(
     // same single-writer decision it always was — just made after the reading
     // rather than around it.
     let origin = req.origin.clone().unwrap_or_default();
+    // §8.1 checks 9 and 10 are questions about `sergeant/<work-id>` and this
+    // Work's own surface directory, so the id has to exist before the record
+    // does. Minting it here — side-effect free, and *not* durable until the
+    // `work.submitted` append far below — is what lets the whole Git
+    // admission contract run "before a Work record exists". Every path that
+    // does not reach that append (a preflight refusal, a replayed
+    // `command_id`, an empty intent) simply discards it.
+    let work_id_candidate = ulid::Ulid::generate().to_string();
     let planned = if req.intent.trim().is_empty() {
         None
     } else {
@@ -1157,9 +1261,11 @@ async fn submit_work(
         let backend = req.backend.clone();
         let workflow = req.workflow.clone();
         let profile = req.profile.clone();
-        let repositories = req.repositories.clone();
+        let scope = req.scope.clone();
         let origin_cwd = origin.cwd.clone();
         let origin_client = origin.client.clone();
+        let candidate = work_id_candidate.clone();
+        let override_git_preflight = req.override_git_preflight;
         Some(
             blocking(move || {
                 engine.plan(&SubmitContext {
@@ -1168,7 +1274,11 @@ async fn submit_work(
                     backend: backend.as_deref(),
                     workflow: workflow.as_deref(),
                     profile: profile.as_deref(),
-                    repositories: &repositories,
+                    repos: &scope.repos,
+                    group: scope.group.as_deref(),
+                    all: scope.all,
+                    work_id: Some(&candidate),
+                    override_git_preflight,
                 })
             })
             .await,
@@ -1266,7 +1376,7 @@ async fn submit_work(
         );
     }
 
-    // The plan decided above, before the guard: workspace topology, workflow
+    // The plan decided above, before the guard: estate topology, workflow
     // content, routing, profiles and the §17.5 stage preflight, all with no
     // side effects — so a submission that cannot be routed is rejected with
     // §13's available options instead of creating work that immediately dies.
@@ -1289,13 +1399,31 @@ async fn submit_work(
         }
     };
 
+    // §7.3: journaled twice — `scope_request` is exactly what was submitted;
+    // `repositories` is what `plan` (when there was a estate to resolve
+    // against at all) actually resolved it to. When there was no estate
+    // (`plan` is `None` — the client offered no repository context at all),
+    // there is nothing to resolve against, so the raw request is the best
+    // honest answer for `repositories` too, same as before this field had a
+    // resolution step in front of it.
+    let scope_request = req.scope.clone();
+    let resolved_repositories = plan
+        .as_ref()
+        .map(|p| p.repositories.iter().map(|r| r.name.clone()).collect())
+        .unwrap_or_else(|| scope_request.repos.clone());
+
     let work = Work {
-        id: ulid::Ulid::generate().to_string(),
-        workspace: req
-            .workspace
-            .or_else(|| plan.as_ref().map(|p| p.workspace.name.clone())),
+        // The id §8.1's checks 9 and 10 were already asked about, above.
+        id: work_id_candidate,
+        // §7.4: `--workspace`/`SubmitRequest.workspace` no longer exist.
+        // `Work.workspace` is kept only so a pre-Phase-C journal event still
+        // deserializes (`Work::workspace`'s doc comment, which also says why
+        // §13.2's rename deliberately left its name alone); every new Work
+        // leaves it `None`.
+        workspace: None,
         intent: req.intent,
-        repositories: req.repositories,
+        repositories: resolved_repositories,
+        scope_request,
         workflow: req.workflow,
         backend: req.backend,
         origin_client: origin.client,
@@ -1307,6 +1435,8 @@ async fn submit_work(
         // I3's own rule, reused: an empty `{}` override is the same fact as
         // sending nothing.
         envelope: req.envelope.filter(|e| !e.is_empty()),
+        // §8.3: the authorization the operator gave for this one submission.
+        git_preflight_override: req.override_git_preflight,
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),
@@ -1473,7 +1603,34 @@ fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
         BindingDisposition::RetainedDirty { .. } => "retained_dirty",
         BindingDisposition::Missing => "missing",
         BindingDisposition::RetainedError { .. } => "retained_error",
+        BindingDisposition::RetainedUnreferenced { .. } => "retained_unreferenced",
     }
+}
+
+/// §11's integrity axis as a sibling key of `work`, for the two views C5
+/// makes mandatory (`sgt work list`, `sgt work show`).
+///
+/// `None` — the key renders as `null` — is **not assessed**: a Work whose
+/// surface never tore down, and a `surface.torn_down` journaled before Phase
+/// A. It never means clean, which is why this reads `run.integrity` (recorded
+/// by the retirement that assessed it) rather than deriving a verdict here
+/// from a teardown report that may predate the assessment entirely.
+///
+/// The findings and drift travel with the disposition rather than in a third
+/// key: a Work is dirty *because of* something, and a client that has to
+/// join two keys to say why will not.
+fn integrity_view(run: &WorkRun) -> Option<Value> {
+    let disposition = run.integrity?;
+    let teardown = run.teardown.as_ref();
+    Some(json!({
+        "disposition": disposition,
+        "findings": teardown
+            .map(|t| t.findings().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+        // §11.4: reported beside the findings, never among them, and never
+        // part of the disposition.
+        "drift": teardown.map(|t| t.drift.clone()).unwrap_or_default(),
+    }))
 }
 
 /// ADR 0007(b): a closing stage that declares a commit as its durable
@@ -1517,7 +1674,24 @@ fn stranded_completion(work: &Work, run: &WorkRun) -> bool {
 /// every other state-machine consumer still see `Completed`; only the
 /// string an operator reads first changes.
 fn reported_state(work: &Work, run: Option<&WorkRun>) -> &'static str {
-    if run.is_some_and(|r| stranded_completion(work, r)) {
+    // §11.5: `completed_dirty` is the compact label for completed + dirty,
+    // and it is now reached two ways that union rather than compete. ADR
+    // 0007(b)'s `stranded_completion` infers dirtiness from the output
+    // pointer alone, which is all a pre-Phase-A journal can offer; §11's
+    // integrity disposition is the assessment retirement actually recorded.
+    // Either one is enough.
+    //
+    // `failed` and `canceled` keep their true state strings even when dirty
+    // (§11.5 adds no `failed_dirty` label and no transition target); the
+    // `integrity` sibling key carries that axis, and `sgt work list` renders
+    // it beside the state so C5's "distinguishable in default output" holds
+    // for all three terminal states.
+    let dirty_completion = run.is_some_and(|r| {
+        stranded_completion(work, r)
+            || (work.state == WorkState::Completed
+                && r.integrity == Some(IntegrityDisposition::Dirty))
+    });
+    if dirty_completion {
         "completed_dirty"
     } else {
         work.state.as_str()
@@ -1563,6 +1737,10 @@ fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
         "backend": run.as_ref().and_then(|r| r.backend.clone()),
         "route_source": run.as_ref().and_then(|r| r.route_source.clone()),
         "teardown": run.as_ref().and_then(|r| r.teardown.clone()),
+        // §11.5's orthogonal axis (C5, mandatory): the disposition retirement
+        // recorded, the §11.3 findings behind it, and §11.4's unattributed
+        // estate drift. `null` until a retirement assessed it.
+        "integrity": run.as_ref().and_then(integrity_view),
         // R-MVP1-2's sibling: named per repository once there is something to
         // point at.
         "output": work.and_then(|w| run.as_ref().and_then(|r| output_pointer(w, r))),
@@ -1650,6 +1828,15 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
                     run.as_ref()
                         .and_then(|r| r.backend.clone())
                         .map_or(Value::Null, Value::String),
+                );
+                // C5: `sgt work list` is the default output a terminal-dirty
+                // Work must be distinguishable in. `state` above already
+                // carries it for a dirty *completion* (`completed_dirty`);
+                // this is what carries it for a dirty `failed`/`canceled`,
+                // whose state strings §11.5 leaves alone.
+                object.insert(
+                    "integrity".to_string(),
+                    run.as_ref().and_then(integrity_view).unwrap_or(Value::Null),
                 );
                 // MVP-3's envelope-visibility item, folded onto the fleet
                 // view exactly the way `work_view` folds it onto a single
@@ -1744,7 +1931,7 @@ async fn list_work(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowsQuery {
-    /// The client's working directory — workspace discovery (§9) starts
+    /// The client's working directory — estate discovery (§9) starts
     /// here, exactly as [`Origin::cwd`] does for `POST /v1/work`, so what
     /// this route shows as available matches what submission would actually
     /// resolve (§19.4's "cwd discovery matches submission").
@@ -1789,16 +1976,22 @@ fn catalog_entry_json(entry: &workflow::CatalogEntry) -> Value {
     value
 }
 
-/// The catalog `GET /v1/workflows` answers with, for a resolved `cwd`
-/// (§11.2, Decisions T2-39/T2-40): the repository's own root-indexed
-/// published workflows when one resolves and has any, else the embedded
-/// `software-change` fallback, else (only when the embedded fallback itself
-/// fails to load) an empty list — fails closed per §19.4, never a `4xx` for
-/// this shape.
-fn workflow_catalog_entries(cwd: &std::path::Path, data_dir: &std::path::Path) -> Vec<Value> {
-    let repo_entries = match Workspace::discover_scoped(cwd, Some(data_dir)) {
-        Ok(workspace) => workflow::catalog(&workspace.root),
-        Err(_) => Vec::new(),
+/// The catalog `GET /v1/workflows` answers with (§11.2, Decisions
+/// T2-39/T2-40): the **bound estate's** own root-indexed published workflows
+/// when it has any, else the embedded `software-change` fallback, else (only
+/// when the embedded fallback itself fails to load) an empty list — fails
+/// closed per §19.4, never a `4xx` for this shape.
+///
+/// §5.2, estate-root Phase D: this used to discover a estate from the
+/// client's `cwd`, which made "what could I bind" a question about wherever
+/// the caller happened to be standing. It is now a question about the one
+/// estate this daemon is bound to, the same estate `submit_work`'s plan
+/// resolves against — a client cannot be shown a catalog it could not
+/// actually submit into.
+fn workflow_catalog_entries(estate_root: Option<&std::path::Path>) -> Vec<Value> {
+    let repo_entries = match estate_root {
+        Some(root) => workflow::catalog(root),
+        None => Vec::new(),
     };
     let entries = if !repo_entries.is_empty() {
         repo_entries
@@ -1816,7 +2009,7 @@ fn workflow_catalog_entries(cwd: &std::path::Path, data_dir: &std::path::Path) -
 
 /// `GET /v1/workflows?cwd=<percent-encoded path>` — the read-only workflow
 /// catalog (§11.2): what the client's own submission could bind now. Reuses
-/// the same workspace discovery [`submit_work`]'s plan does, the same
+/// the same estate discovery [`submit_work`]'s plan does, the same
 /// workflow loader and validation, the root publication boundary
 /// (§11.1, [`workflow::catalog`]), and the same embedded fallback. Performs
 /// no mutation, holds no core lock (nothing here reads or writes registry
@@ -1829,6 +2022,10 @@ async fn list_workflows(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
+    // `cwd` stays in the query grammar (a client that has one still sends
+    // it) but is evidence only now — §5.2 removed its authority over
+    // topology. It is still validated so an obviously-broken client hears
+    // about it rather than silently getting the estate's catalog.
     let cwd = PathBuf::from(&req.cwd);
     if !cwd.is_absolute() {
         return error_response(
@@ -1837,8 +2034,8 @@ async fn list_workflows(
             "cwd must be an absolute path",
         );
     }
-    let data_dir = state.data_dir.clone();
-    let workflows = blocking(move || workflow_catalog_entries(&cwd, &data_dir)).await;
+    let estate_root = state.engine.estate_root.clone();
+    let workflows = blocking(move || workflow_catalog_entries(estate_root.as_deref())).await;
     Json(json!({"workflows": workflows})).into_response()
 }
 
@@ -2488,7 +2685,11 @@ async fn reap_work(
     // its duration. Reap is rare and explicit, never on a hot path, so this
     // is accepted rather than plumbed through the async effect system the
     // way `teardown` itself is.
-    let report = blocking_sync(|| reap(&surface, &teardown));
+    // `state.data_dir` is this daemon's own storage — where §9.4's
+    // interprocess repository locks live. Reap's one guarded span (a `git
+    // worktree remove --force` on a retained-dirty binding) takes the same
+    // lock every other registry mutation in the surface module does.
+    let report = blocking_sync(|| reap(&state.data_dir, &surface, &teardown));
     let result = json!({"report": report});
     record_and_respond(
         &mut core,
@@ -2560,19 +2761,14 @@ async fn list_retained(State(state): State<ApiState>) -> Response {
 /// that is itself one, `sgt`'s own self-hosting shape among them) would
 /// silently resolve to the wrong manifest rather than failing closed — the
 /// one outcome R-NS-4's discipline exists to prevent.
-fn resolve_estate_root(data_dir: &std::path::Path) -> Result<PathBuf, Box<Response>> {
-    match Workspace::estate_root(data_dir, None) {
-        Ok(Some(root)) => Ok(root),
-        Ok(None) => Err(Box::new(error_response(
+fn resolve_estate_root(state: &ApiState) -> Result<PathBuf, Box<Response>> {
+    match state.engine.estate_root.clone() {
+        Some(root) => Ok(root),
+        None => Err(Box::new(error_response(
             StatusCode::NOT_FOUND,
             "no_estate",
-            "no estate found walking up from this daemon's data dir (bounded at $HOME) — run \
-             `sgt init` first, or start the daemon on a data dir under the estate root",
-        ))),
-        Err(e) => Err(Box::new(error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "estate_invalid",
-            e.to_string(),
+            "this daemon is bound to no estate — start it from an estate root (`sgt daemon` \
+             from the root, or `sgt -C <estate-root> daemon`)",
         ))),
     }
 }
@@ -2637,8 +2833,8 @@ fn manifest_error_response(e: &ManifestError) -> Response {
 }
 
 /// The declared repositories, read the same way `sgt repo list --json` does.
-fn workspace_read(estate_root: &std::path::Path) -> Result<Workspace, Box<Response>> {
-    Workspace::from_config_allow_empty(&estate_root.join(crate::domain::workspace::WORKSPACE_FILE))
+fn workspace_read(estate_root: &std::path::Path) -> Result<Estate, Box<Response>> {
+    Estate::from_config_allow_empty(&estate_root.join(crate::domain::estate::MANIFEST_FILE))
         .map_err(|e| {
             Box::new(error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -2651,23 +2847,23 @@ fn workspace_read(estate_root: &std::path::Path) -> Result<Workspace, Box<Respon
 /// `GET /v1/estate/repos` (§16.2) — the same read `sgt repo list --json`
 /// already performs, over the daemon's own estate.
 async fn estate_list_repos(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
-    let workspace = match workspace_read(&estate_root) {
+    let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
     };
-    let repos: Vec<Value> = workspace
+    let repos: Vec<Value> = estate
         .repositories
         .iter()
         .map(|r| {
             json!({
                 "name": r.name,
                 "path": r.path,
-                "origin": workspace.repository_origin(&r.name),
-                "instructions": workspace.instruction_policy(&r.name).as_str(),
+                "origin": estate.repository_origin(&r.name),
+                "instructions": estate.instruction_policy(&r.name).as_str(),
             })
         })
         .collect();
@@ -2709,7 +2905,7 @@ async fn estate_add_repo(
             );
         }
     };
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2736,7 +2932,7 @@ async fn estate_add_repo(
 /// exactly; the group-reference refusal it returns reaches the caller
 /// structured, not reworded.
 async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2749,15 +2945,15 @@ async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<Stri
 /// `GET /v1/estate/groups` (§16.2) — the same read `sgt group list --json`
 /// already performs.
 async fn estate_list_groups(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
-    let workspace = match workspace_read(&estate_root) {
+    let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
     };
-    let groups: Vec<Value> = workspace
+    let groups: Vec<Value> = estate
         .groups
         .iter()
         .map(|(name, g)| json!({"name": name, "repos": g.repos, "brief": g.brief}))
@@ -2785,7 +2981,7 @@ async fn estate_add_group(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2838,7 +3034,7 @@ async fn estate_remove_group(
             }
         }
     };
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2848,10 +3044,24 @@ async fn estate_remove_group(
     }
 }
 
+/// The directory `GET /v1/doctor` reports the estate rows against: this
+/// daemon's own bound estate root (§5.1), never the daemon process's cwd —
+/// a long-running daemon's cwd is not reliably anything. With no bound
+/// estate the data dir stands in, and the estate-root row correctly fails
+/// there, which is exactly what a daemon started outside an estate should
+/// report.
+fn doctor_root(state: &ApiState) -> PathBuf {
+    state
+        .engine
+        .estate_root
+        .clone()
+        .unwrap_or_else(|| state.data_dir.clone())
+}
+
 /// `GET /v1/doctor` (§16.3) — the same `doctor::Report::to_json()`
 /// `sgt doctor --json` already prints, computed exactly once here.
 async fn doctor_report(State(state): State<ApiState>) -> Response {
-    let report = doctor::run(&state.data_dir).await;
+    let report = doctor::run(&state.data_dir, &doctor_root(&state)).await;
     Json(report.to_json()).into_response()
 }
 
@@ -4785,7 +4995,8 @@ mod tests {
             model: None,
             profile: None,
             execute: None,
-            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
+            instruction_policy: crate::domain::estate::InstructionPolicy::default(),
+            bindings: Vec::new(),
         };
         let handle = {
             use crate::backend::Backend;
@@ -5064,6 +5275,179 @@ mod tests {
             "an evicted stranded completion must not silently revert to plain \
              completed in `sgt work list` just because its run cache entry \
              aged out: {row}"
+        );
+    }
+
+    /// Amendment C3, the whole of it: a `surface.torn_down` journaled before
+    /// Phase A existed replays unchanged, and its integrity reads as **not
+    /// assessed** — never defaulted to clean.
+    ///
+    /// The distinction is the entire point of the amendment. An absent
+    /// assessment defaulted to `clean` would be core inventing a fact about
+    /// a retirement that predates the machinery that could have established
+    /// it — the exact silent-clean-report failure §17 says must become
+    /// impossible. So the payload here is hand-built rather than serialized
+    /// from today's types (the same technique
+    /// `a_stranded_completion_survives_terminal_run_cache_eviction` above
+    /// uses): a struct that gains a field cannot prove anything about an
+    /// event that never had it, only a literal old-shape payload can.
+    ///
+    /// Three things are checked past the disposition itself: the report
+    /// still deserializes into a `TeardownReport` (so `run.teardown` is
+    /// `Some`, and `runtime::recovery`'s completion-tail sweep — keyed on
+    /// `teardown.is_none()` — does not suddenly consider this work stranded);
+    /// ADR 0007(b)'s `completed_dirty` still fires from the output pointer
+    /// alone, which is all a pre-Phase-A journal can offer; and a new-shape
+    /// payload beside it does report its assessment.
+    #[test]
+    fn an_old_shape_torn_down_payload_replays_as_integrity_not_assessed() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        // Exactly the shape `surface.torn_down` had before this phase: no
+        // `integrity` sibling key, no `findings`, no `observed_head`, no
+        // `drift`.
+        fn old_shape_teardown(work_id: &str, clean: bool, disposition: Value) -> Value {
+            let mut binding = json!({
+                "repository": "solo",
+                "worktree_path": "/data/surfaces/x/solo",
+                "work_branch": format!("sergeant/{work_id}"),
+                "final_sha": "0".repeat(40),
+            });
+            let object = binding.as_object_mut().expect("binding object");
+            for (key, value) in disposition.as_object().expect("disposition object") {
+                object.insert(key.clone(), value.clone());
+            }
+            json!({"report": {"work_id": work_id, "clean": clean, "bindings": [binding]}})
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        // An ordinary old completion: clean removal, nothing to report.
+        let ordinary = "01OLDSHAPE0000000001";
+        testing::submit(&mut core, ordinary, "torn down before Phase A");
+        testing::commit(
+            &mut core,
+            ordinary,
+            KIND_SURFACE_MATERIALIZED,
+            surface(ordinary),
+        );
+        testing::commit(&mut core, ordinary, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            ordinary,
+            KIND_SURFACE_TORN_DOWN,
+            old_shape_teardown(ordinary, true, json!({"disposition": "removed"})),
+        );
+
+        // An old stranded completion: ADR 0007(b)'s inference is all the
+        // journal can offer, and it must keep working untouched.
+        let stranded = "01OLDSHAPE0000000002";
+        testing::submit(&mut core, stranded, "declares a commit, never makes one");
+        testing::commit(
+            &mut core,
+            stranded,
+            KIND_SURFACE_MATERIALIZED,
+            surface(stranded),
+        );
+        testing::commit(&mut core, stranded, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            stranded,
+            KIND_SURFACE_TORN_DOWN,
+            old_shape_teardown(
+                stranded,
+                false,
+                json!({"disposition": "retained_dirty", "changes": " M half-done.rs"}),
+            ),
+        );
+
+        for work_id in [ordinary, stranded] {
+            let registry = core.registry.state();
+            let run = registry.run_view(work_id).expect("run");
+            assert!(
+                run.teardown.is_some(),
+                "{work_id}: the old-shape report must still deserialize, or \
+                 recovery's completion-tail sweep would treat this work as \
+                 stranded on every restart"
+            );
+            assert_eq!(
+                run.integrity, None,
+                "{work_id}: an absent assessment is 'not assessed', never clean"
+            );
+        }
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        let ordinary_view = work_view(&core, &engine, ordinary);
+        assert!(
+            ordinary_view["integrity"].is_null(),
+            "not assessed renders as null, not as a clean disposition: {ordinary_view}"
+        );
+        assert_eq!(ordinary_view["work"]["state"], "completed");
+        assert_eq!(
+            work_view(&core, &engine, stranded)["work"]["state"],
+            "completed_dirty",
+            "ADR 0007(b)'s output-pointer inference is unchanged by §11"
+        );
+
+        // And the new shape does carry its assessment through the same fold.
+        let assessed = "01NEWSHAPE0000000001";
+        testing::submit(&mut core, assessed, "assessed at retirement");
+        testing::commit(
+            &mut core,
+            assessed,
+            KIND_SURFACE_MATERIALIZED,
+            surface(assessed),
+        );
+        testing::commit(&mut core, assessed, KIND_WORK_COMPLETED, json!({}));
+        let mut payload = old_shape_teardown(assessed, true, json!({"disposition": "removed"}));
+        payload["report"]["bindings"][0]["findings"] = json!([{
+            "finding": "assigned_branch_mismatch",
+            "repository": "solo",
+            "worktree_path": "/data/surfaces/x/solo",
+            "expected_branch": format!("sergeant/{assessed}"),
+            "expected_sha": "0".repeat(40),
+            "observed_branch": "renegade",
+            "observed_sha": "1".repeat(40),
+            "evidence": "ended on renegade",
+        }]);
+        payload["integrity"] = json!("dirty");
+        testing::commit(&mut core, assessed, KIND_SURFACE_TORN_DOWN, payload);
+
+        let view = work_view(&core, &engine, assessed);
+        assert_eq!(view["integrity"]["disposition"], "dirty");
+        assert_eq!(
+            view["integrity"]["findings"][0]["finding"],
+            "assigned_branch_mismatch"
+        );
+        assert_eq!(
+            view["work"]["state"], "completed_dirty",
+            "a dirty completion reports the §11.5 compact label even without \
+             ADR 0007(b)'s stranded inference"
         );
     }
 }

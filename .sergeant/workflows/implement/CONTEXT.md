@@ -73,6 +73,10 @@ evidence.
 - `30-review` delegates to **code-review**, dispatched as its own
   separately-admitted Work (not context composition — see that stage's own
   `CONTEXT.md`). `code-review`'s own placement is settled (STAND, ICM-R2).
+  Under the estate-root contract, that dispatch is a submission Captain
+  makes from the estate root, not a command `30-review`'s own worker types
+  from inside its Work surface — see the second engine-gap note that
+  stage's `CONTEXT.md` carries.
 
 ## Notes for reviewers
 

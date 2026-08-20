@@ -11,6 +11,17 @@
 //! watch` itself, deliberately *not* auto-spawned) daemon never survives a
 //! test.
 //!
+//! **Every invocation in this suite runs from an estate root** (estate-root
+//! §4.1/§4.2). `watch`, `run`, `respond`, `cancel`, `work show` and `daemon`
+//! are all estate-scoped, and §4.3 puts the exact-root check ahead of
+//! descriptor lookup — so a test whose cwd is merely a git repository no
+//! longer reaches the behavior it means to pin at all; it collects §4.4's
+//! refusal instead. The fixtures are therefore [`support::scaffold_estate`]
+//! estates with derived `repos/<name>` mounts (§6.1), never bare
+//! `init_repo`'d temp dirs, and the daemon a `run` auto-spawns is bound to
+//! that one estate (§5.1) — which is why the scenarios below that need two
+//! independent daemons scaffold two estates, not just two data dirs.
+//!
 //! **A recurring adaptation, stated once.** The fake backend resolves every
 //! LAUNCH/SEND synchronously within the HTTP request that caused it — the
 //! `settle` delay `src/backend/fake.rs` documents (an async completion
@@ -50,34 +61,20 @@ const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 // helpers
 // ---------------------------------------------------------------------------
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "sergeant tests")
-        .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
-        .env("GIT_COMMITTER_NAME", "sergeant tests")
-        .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// A real git repository with one commit — a valid workspace root for
-/// zero-config discovery from `cwd` (M3's own pattern).
-fn init_repo(path: &Path) {
-    std::fs::create_dir_all(path).expect("repo dir");
-    git(path, &["init", "-b", "main"]);
-    std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
-    git(path, &["add", "."]);
-    git(path, &["commit", "-m", "initial"]);
+/// A single-mount estate root, which is what an estate-scoped verb now
+/// requires (§4.1): a `sergeant.toml` declaring `[estate]` plus one `[[repo]]`
+/// whose mount is *derived* as `repos/solo` (§6.1 — the `path` key is gone,
+/// so a repository can no longer be declared anywhere else). One mount also
+/// keeps `sgt run`'s scope unambiguous without a `--repo` flag: §7.1 makes
+/// whole-estate selection explicit only where there is more than one
+/// repository to choose between.
+///
+/// Returned as the owning `TempDir` — dropping it removes the estate, so
+/// callers must bind it for the life of the test.
+fn solo_estate() -> TempDir {
+    let root = TempDir::new().expect("tempdir");
+    support::scaffold_estate(root.path(), "watch-estate", &["solo"]);
+    root
 }
 
 /// One completed `sgt` invocation.
@@ -114,12 +111,22 @@ impl Output {
 /// work submitted, no state transitions to race a freshly attached watch
 /// against) has to start it this way instead.
 ///
+/// `-C <estate>` is what binds it (§5.1): `sgt daemon` is itself
+/// estate-scoped, and a daemon started with no estate would plan against
+/// nothing — but more to the point here, the client that later attaches
+/// checks `descriptor.estate_root` against its own resolved root, so a
+/// daemon bound to a different estate (or to none) is refused rather than
+/// used. `-C` names it explicitly instead of relying on this child's cwd,
+/// exactly as `spawn_daemon` in `src/cli.rs` does.
+///
 /// `DataDir`'s own Drop reaps this by /proc scan (SIGTERM, then SIGKILL) —
 /// never by waiting on this `Child`.
 #[allow(clippy::zombie_processes)]
-fn spawn_bare_daemon(data_dir: &DataDir) {
+fn spawn_bare_daemon(estate: &Path, data_dir: &DataDir) {
     let mut command = Command::new(SGT);
     command
+        .arg("-C")
+        .arg(estate)
         .arg("--data-dir")
         .arg(data_dir.path())
         .arg("daemon")
@@ -158,7 +165,10 @@ fn spawn_bare_daemon(data_dir: &DataDir) {
     }
 }
 
-/// Run `sgt` to completion from `cwd` against `data_dir`.
+/// Run `sgt` to completion from `cwd` against `data_dir`. Every caller but
+/// R-WATCH-3's refusal arm passes an estate root: `cwd` is the effective
+/// root this invocation is admitted (or refused) against (§4.1), since no
+/// test here uses `-C`.
 fn sgt(cwd: &Path, data_dir: &DataDir, args: &[&str]) -> Output {
     let output = Command::new(SGT)
         .current_dir(cwd)
@@ -174,25 +184,39 @@ fn sgt(cwd: &Path, data_dir: &DataDir, args: &[&str]) -> Output {
     }
 }
 
-/// Submit fake-backend work from inside `repo` (zero-config workspace
-/// discovery from `cwd`, M3's own pattern — no `--repo` needed). `script` is
-/// `SGT_FAKE_SCRIPT`'s grammar; it only has an effect the first time it
-/// reaches a data dir with no daemon yet (the daemon reads the env once, at
-/// its own spawn, and its `FakeBackend`'s script is one FIFO shared by every
-/// LAUNCH/SEND on that daemon regardless of which Work asks —
+/// Submit fake-backend work from the estate root at `estate` — the only
+/// directory `sgt run` is admitted from (§4.1/§4.2); the mount underneath is
+/// selected by the estate's own manifest, or by `scope` where the estate
+/// declares more than one. `script` is `SGT_FAKE_SCRIPT`'s grammar; it only
+/// has an effect the first time it reaches a data dir with no daemon yet
+/// (the daemon reads the env once, at its own spawn, and its `FakeBackend`'s
+/// script is one FIFO shared by every LAUNCH/SEND on that daemon regardless
+/// of which Work asks —
 /// `parsed_steps_are_one_global_fifo_shared_across_executions_and_sends`
 /// pins this at the unit level). An empty script defaults every stage to an
 /// immediate `complete` (`FakeBackend::next_step`'s own default).
-fn submit(repo: &Path, data_dir: &DataDir, script: &str, intent: &str) -> Value {
+///
+/// This is also the call that binds the daemon: the client admits `estate`
+/// first and passes it to the daemon it spawns (§5.1), so every later
+/// `watch`/`respond`/`cancel` in the same test must name the same root or be
+/// refused by the descriptor check.
+fn submit_scoped(
+    estate: &Path,
+    data_dir: &DataDir,
+    script: &str,
+    intent: &str,
+    scope: &[&str],
+) -> Value {
     let mut command = Command::new(SGT);
     command
-        .current_dir(repo)
+        .current_dir(estate)
         .arg("--data-dir")
         .arg(data_dir.path());
     if !script.is_empty() {
         command.env("SGT_FAKE_SCRIPT", script);
     }
     command.args(["--json", "run", intent, "--backend", "fake"]);
+    command.args(scope);
     let output = command.output().expect("run sgt run");
     let out = Output {
         code: output.status.code(),
@@ -201,6 +225,11 @@ fn submit(repo: &Path, data_dir: &DataDir, script: &str, intent: &str) -> Value 
     };
     out.assert_ok("sgt run");
     out.json()
+}
+
+/// [`submit_scoped`] for the single-mount estate every test but W5 uses.
+fn submit(estate: &Path, data_dir: &DataDir, script: &str, intent: &str) -> Value {
+    submit_scoped(estate, data_dir, script, intent, &[])
 }
 
 /// A backgrounded `sgt` process (always `watch` in this suite): piped
@@ -353,11 +382,10 @@ fn journal_len(data_dir: &Path) -> usize {
 #[test]
 fn w1_scoped_wait_is_silent_then_delivers_exactly_one_notice() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     let submitted = submit(
-        repo.path(),
+        estate.path(),
         &data,
         "hang",
         "W1: stays active until canceled",
@@ -365,13 +393,13 @@ fn w1_scoped_wait_is_silent_then_delivers_exactly_one_notice() {
     let id = submitted["work"]["id"].as_str().expect("id").to_string();
     assert_eq!(submitted["work"]["state"], "active");
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch", &id]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch", &id]);
     assert!(
         watch.recv_line(Duration::from_millis(700)).is_none(),
         "must stay silent while the Work is merely active"
     );
 
-    let canceled = sgt(repo.path(), &data, &["--json", "cancel", &id]);
+    let canceled = sgt(estate.path(), &data, &["--json", "cancel", &id]);
     canceled.assert_ok("cancel");
     assert_eq!(canceled.json()["work"]["state"], "canceled");
 
@@ -405,17 +433,16 @@ fn w1_scoped_wait_is_silent_then_delivers_exactly_one_notice() {
 #[test]
 fn w2_already_completed_work_returns_immediately() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
-    let submitted = submit(repo.path(), &data, "", "W2: completes immediately");
+    let submitted = submit(estate.path(), &data, "", "W2: completes immediately");
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
     assert_eq!(
         submitted["work"]["state"], "completed",
         "an unscripted fake defaults every stage to an immediate complete"
     );
 
-    let out = sgt(repo.path(), &data, &["--json", "watch", &id]);
+    let out = sgt(estate.path(), &data, &["--json", "watch", &id]);
     out.assert_ok("watch on an already-completed Work");
     let notice: Value = serde_json::from_str(out.stdout.trim())
         .unwrap_or_else(|e| panic!("stdout is not one JSON object ({e}): {}", out.stdout));
@@ -446,16 +473,20 @@ fn w2_already_completed_work_returns_immediately() {
 #[test]
 fn w3_a_transition_forced_inside_the_held_window_is_reported_exactly_once() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
-    let submitted = submit(repo.path(), &data, "hang", "W3: transition inside the hold");
+    let submitted = submit(
+        estate.path(),
+        &data,
+        "hang",
+        "W3: transition inside the hold",
+    );
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
     assert_eq!(submitted["work"]["state"], "active");
 
     let hold = data.path().join("w3.hold");
     let watch = WatchProc::spawn_env(
-        repo.path(),
+        estate.path(),
         &data,
         &[("SGT_WATCH_TEST_HOLD", hold.to_str().unwrap())],
         &["--json", "watch", &id, "--follow"],
@@ -468,7 +499,7 @@ fn w3_a_transition_forced_inside_the_held_window_is_reported_exactly_once() {
     // The forcing transition: proven (by .ready above) to land after attach,
     // and it can only reach the client after release below — i.e. strictly
     // inside the race window R-WATCH-6 exists to instrument.
-    let canceled = sgt(repo.path(), &data, &["--json", "cancel", &id]);
+    let canceled = sgt(estate.path(), &data, &["--json", "cancel", &id]);
     canceled.assert_ok("cancel inside the hold");
 
     release_hold(&hold);
@@ -507,11 +538,10 @@ fn w3_a_transition_forced_inside_the_held_window_is_reported_exactly_once() {
 #[test]
 fn w4_a_stale_trigger_does_not_produce_stale_meaning() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     let submitted = submit(
-        repo.path(),
+        estate.path(),
         &data,
         "needs_input:what backoff?;complete:done",
         "W4: respond-then-complete inside the hold",
@@ -521,7 +551,7 @@ fn w4_a_stale_trigger_does_not_produce_stale_meaning() {
 
     let hold = data.path().join("w4.hold");
     let watch = WatchProc::spawn_env(
-        repo.path(),
+        estate.path(),
         &data,
         &[("SGT_WATCH_TEST_HOLD", hold.to_str().unwrap())],
         &["--json", "watch", &id],
@@ -532,7 +562,7 @@ fn w4_a_stale_trigger_does_not_produce_stale_meaning() {
     );
 
     let responded = sgt(
-        repo.path(),
+        estate.path(),
         &data,
         &["--json", "respond", &id, "3 attempts, exp backoff"],
     );
@@ -566,24 +596,46 @@ fn w4_a_stale_trigger_does_not_produce_stale_meaning() {
 // W5 — estate-wide watch begins now
 // ---------------------------------------------------------------------------
 
+/// W5: an unscoped `sgt watch` covers the whole estate, and starts at the
+/// moment it attaches — a completion that is already history when it
+/// subscribes is never replayed to it, and one that lands afterward is.
+///
+/// The two Works now live in two *mounts of one estate* rather than two
+/// unrelated git repositories: §5.1 binds a daemon to exactly one estate and
+/// §4.1 admits only an exact root, so "two repositories, one data dir" is no
+/// longer expressible — the second `run` would be refused by the descriptor
+/// check before it submitted anything. Two mounts under one root is the
+/// shape that still makes "estate-wide" mean more than "this repository",
+/// which is the half of W5 that matters; §7.1 then requires the mount to be
+/// named explicitly, since a multi-repository estate is never inferred.
 #[test]
 fn w5_estate_wide_watch_begins_now_not_from_history() {
     let data = DataDir::new();
-    let repo_a = TempDir::new().expect("tempdir");
-    init_repo(repo_a.path());
-    let repo_b = TempDir::new().expect("tempdir");
-    init_repo(repo_b.path());
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "w5-estate", &["alpha", "beta"]);
 
-    let a = submit(repo_a.path(), &data, "", "W5: historical, must not replay");
+    let a = submit_scoped(
+        estate.path(),
+        &data,
+        "",
+        "W5: historical, must not replay",
+        &["--repo", "alpha"],
+    );
     assert_eq!(a["work"]["state"], "completed");
 
-    let watch = WatchProc::spawn(repo_a.path(), &data, &["--json", "watch"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch"]);
     assert!(
         watch.recv_line(Duration::from_millis(700)).is_none(),
         "the historical completion must not be replayed"
     );
 
-    let b = submit(repo_b.path(), &data, "", "W5: new, must be emitted");
+    let b = submit_scoped(
+        estate.path(),
+        &data,
+        "",
+        "W5: new, must be emitted",
+        &["--repo", "beta"],
+    );
     let b_id = b["work"]["id"].as_str().unwrap().to_string();
 
     let line = watch
@@ -607,18 +659,17 @@ fn w5_estate_wide_watch_begins_now_not_from_history() {
 #[test]
 fn w6_follow_mode_continues_past_needs_input_then_exits_on_completion() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     let submitted = submit(
-        repo.path(),
+        estate.path(),
         &data,
         "needs_input:which retry budget?",
         "W6: follow",
     );
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch", &id, "--follow"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch", &id, "--follow"]);
     let first = watch
         .recv_line(Duration::from_secs(10))
         .expect("current_state notice");
@@ -633,7 +684,7 @@ fn w6_follow_mode_continues_past_needs_input_then_exits_on_completion() {
     );
 
     let responded = sgt(
-        repo.path(),
+        estate.path(),
         &data,
         &["--json", "respond", &id, "3 attempts, exp backoff"],
     );
@@ -660,19 +711,18 @@ fn w6_follow_mode_continues_past_needs_input_then_exits_on_completion() {
 #[test]
 fn w7_stream_closure_is_honest_and_never_restarts_the_daemon() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     // `status` no longer auto-spawns (ADR 0009); `run` would, but it would
     // also leave an asynchronous state transition racing the watch attached
     // just below. A bare daemon spawn avoids both.
-    spawn_bare_daemon(&data);
+    spawn_bare_daemon(estate.path(), &data);
     assert_eq!(data.daemon_pids().len(), 1);
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch"]);
     assert!(watch.recv_line(Duration::from_millis(300)).is_none());
 
-    let stop = sgt(repo.path(), &data, &["--json", "daemon", "stop"]);
+    let stop = sgt(estate.path(), &data, &["--json", "daemon", "stop"]);
     stop.assert_ok("daemon stop");
 
     let mut watch = watch;
@@ -709,19 +759,27 @@ fn w7_stream_closure_is_honest_and_never_restarts_the_daemon() {
 #[test]
 fn w8_json_stdout_is_protocol_no_banner_no_heartbeat_no_stderr_leak() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
-    let submitted = submit(repo.path(), &data, "needs_input:q1?;needs_input:q2?", "W8");
+    let submitted = submit(
+        estate.path(),
+        &data,
+        "needs_input:q1?;needs_input:q2?",
+        "W8",
+    );
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch", &id, "--follow"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch", &id, "--follow"]);
     let first = watch
         .recv_line(Duration::from_secs(10))
         .expect("first notice");
     let _: Value = serde_json::from_str(&first).expect("independently parseable JSON object");
 
-    let responded = sgt(repo.path(), &data, &["--json", "respond", &id, "answer 1"]);
+    let responded = sgt(
+        estate.path(),
+        &data,
+        &["--json", "respond", &id, "answer 1"],
+    );
     responded.assert_ok("respond");
 
     let second = watch
@@ -753,11 +811,10 @@ fn w8_json_stdout_is_protocol_no_banner_no_heartbeat_no_stderr_leak() {
 #[test]
 fn r_watch_1_waiting_emits_and_follow_continues_past_it() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     let submitted = submit(
-        repo.path(),
+        estate.path(),
         &data,
         "waiting:external dependency",
         "R-WATCH-1: waiting",
@@ -765,7 +822,7 @@ fn r_watch_1_waiting_emits_and_follow_continues_past_it() {
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
     assert_eq!(submitted["work"]["state"], "waiting");
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch", &id, "--follow"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch", &id, "--follow"]);
     let first = watch
         .recv_line(Duration::from_secs(10))
         .expect("exactly one notice for entering waiting");
@@ -778,7 +835,7 @@ fn r_watch_1_waiting_emits_and_follow_continues_past_it() {
         "waiting is nonterminal — a scoped --follow must stay attached, not exit"
     );
 
-    let canceled = sgt(repo.path(), &data, &["--json", "cancel", &id]);
+    let canceled = sgt(estate.path(), &data, &["--json", "cancel", &id]);
     canceled.assert_ok("cancel from waiting");
 
     let second = watch
@@ -833,25 +890,28 @@ fn r_watch_10d_the_watch_set_vocabulary_matches_the_amended_wording() {
 #[test]
 fn r_watch_2_two_different_questions_in_one_attempt_produce_two_notices() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     let submitted = submit(
-        repo.path(),
+        estate.path(),
         &data,
         "needs_input:question A?;needs_input:question B?",
         "R-WATCH-2: two questions",
     );
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch", &id, "--follow"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch", &id, "--follow"]);
     let first = watch
         .recv_line(Duration::from_secs(10))
         .expect("question A notice");
     let first: Value = serde_json::from_str(&first).expect("parses");
     assert_eq!(first["snapshot"]["stage"]["detail"], "question A?");
 
-    let responded = sgt(repo.path(), &data, &["--json", "respond", &id, "answer A"]);
+    let responded = sgt(
+        estate.path(),
+        &data,
+        &["--json", "respond", &id, "answer A"],
+    );
     responded.assert_ok("respond to A");
     assert_eq!(responded.json()["stage"]["detail"], "question B?");
     assert_eq!(
@@ -886,25 +946,24 @@ fn r_watch_2_two_different_questions_in_one_attempt_produce_two_notices() {
 #[test]
 fn r_watch_2_a_repeated_identical_question_does_not_re_emit() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     let submitted = submit(
-        repo.path(),
+        estate.path(),
         &data,
         "needs_input:same question?;needs_input:same question?",
         "R-WATCH-2: same question twice",
     );
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch", &id, "--follow"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch", &id, "--follow"]);
     let first = watch
         .recv_line(Duration::from_secs(10))
         .expect("the initial current_state notice");
     let first: Value = serde_json::from_str(&first).expect("parses");
     assert_eq!(first["snapshot"]["stage"]["detail"], "same question?");
 
-    let responded = sgt(repo.path(), &data, &["--json", "respond", &id, "answer"]);
+    let responded = sgt(estate.path(), &data, &["--json", "respond", &id, "answer"]);
     responded.assert_ok("respond — still needs_input, same detail");
     assert_eq!(responded.json()["work"]["state"], "needs_input");
     assert_eq!(responded.json()["stage"]["detail"], "same question?");
@@ -927,15 +986,26 @@ fn r_watch_2_a_repeated_identical_question_does_not_re_emit() {
 /// `t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed` — a data
 /// dir with zero daemons gets a refusal naming the remedy, exit nonzero, and
 /// the process table proves nothing was spawned.
+///
+/// Both refusal *causes* are pinned here, because §4.3 reorders them and the
+/// no-spawn promise has to survive either one. From a valid estate root the
+/// refusal is still `observe_connect`'s: there is no descriptor, and an
+/// observation verb declines to make one. From a directory that is not an
+/// estate root the refusal comes even earlier — root admission precedes
+/// descriptor lookup, so `sgt watch` never even learns whether a daemon
+/// exists — and the process table must be just as empty afterward.
 #[test]
 fn r_watch_3_watch_against_a_dataless_dir_refuses_and_spawns_nothing() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     assert!(data.daemon_pids().is_empty(), "must start with no daemon");
 
-    let out = sgt(repo.path(), &data, &["watch", "01SOMENONEXISTENTWORKID000"]);
+    let out = sgt(
+        estate.path(),
+        &data,
+        &["watch", "01SOMENONEXISTENTWORKID000"],
+    );
     assert_ne!(out.code, Some(0), "must exit nonzero: {out:?}");
     assert!(
         out.stderr.contains("no daemon is running for"),
@@ -950,6 +1020,25 @@ fn r_watch_3_watch_against_a_dataless_dir_refuses_and_spawns_nothing() {
     assert!(
         data.daemon_pids().is_empty(),
         "sgt watch must never have spawned a daemon"
+    );
+
+    // §4.3/§4.4: the same no-spawn guarantee one gate earlier. `repos/solo`
+    // is a real git checkout *inside* a real estate — precisely what the
+    // deleted upward walk and git fallback used to admit — and it is refused
+    // with §4.4's first line, having touched no descriptor.
+    let mount = estate.path().join("repos").join("solo");
+    let outside = sgt(&mount, &data, &["watch", "01SOMENONEXISTENTWORKID000"]);
+    assert_ne!(outside.code, Some(0), "must exit nonzero: {outside:?}");
+    assert!(
+        outside
+            .stderr
+            .contains("no estate found in the current directory"),
+        "§4.4's own first line, not a daemon diagnostic: {}",
+        outside.stderr
+    );
+    assert!(
+        data.daemon_pids().is_empty(),
+        "a root refusal must spawn nothing either — it happens before descriptor lookup"
     );
 
     data.reap();
@@ -971,23 +1060,26 @@ fn r_watch_9_snapshot_deep_equals_the_work_endpoint_body() {
     // share a daemon (measured: the first version of this test shared one
     // `DataDir` and the second submission silently got the first
     // submission's already-empty script, completing immediately instead of
-    // landing on `needs_input`).
+    // landing on `needs_input`). Two daemons now also means two *estates*:
+    // §5.1 binds each daemon to the root its spawning client admitted, and a
+    // client only ever attaches to a descriptor whose `estate_root` equals
+    // its own — so the pairing is one estate per data dir, not one estate
+    // shared by both.
 
     // -- current_state / completed --------------------------------------
     let data_a = DataDir::new();
-    let repo_a = TempDir::new().expect("tempdir");
-    init_repo(repo_a.path());
+    let estate_a = solo_estate();
     let a = submit(
-        repo_a.path(),
+        estate_a.path(),
         &data_a,
         "",
         "R-WATCH-9: completed current_state",
     );
     let a_id = a["work"]["id"].as_str().unwrap().to_string();
-    let watch_a = sgt(repo_a.path(), &data_a, &["--json", "watch", &a_id]);
+    let watch_a = sgt(estate_a.path(), &data_a, &["--json", "watch", &a_id]);
     watch_a.assert_ok("watch a completed Work");
     let notice_a: Value = serde_json::from_str(watch_a.stdout.trim()).expect("parses");
-    let endpoint_a = sgt(repo_a.path(), &data_a, &["--json", "work", "show", &a_id]);
+    let endpoint_a = sgt(estate_a.path(), &data_a, &["--json", "work", "show", &a_id]);
     endpoint_a.assert_ok("work show");
     assert_eq!(
         notice_a["snapshot"],
@@ -998,10 +1090,9 @@ fn r_watch_9_snapshot_deep_equals_the_work_endpoint_body() {
 
     // -- state_transition / needs_input -----------------------------------
     let data_b = DataDir::new();
-    let repo_b = TempDir::new().expect("tempdir");
-    init_repo(repo_b.path());
+    let estate_b = solo_estate();
     let b = submit(
-        repo_b.path(),
+        estate_b.path(),
         &data_b,
         "needs_input:q1?;needs_input:q2?",
         "R-WATCH-9: needs_input state_transition",
@@ -1009,7 +1100,7 @@ fn r_watch_9_snapshot_deep_equals_the_work_endpoint_body() {
     let b_id = b["work"]["id"].as_str().unwrap().to_string();
     assert_eq!(b["work"]["state"], "needs_input");
     let watch_b = WatchProc::spawn(
-        repo_b.path(),
+        estate_b.path(),
         &data_b,
         &["--json", "watch", &b_id, "--follow"],
     );
@@ -1017,7 +1108,7 @@ fn r_watch_9_snapshot_deep_equals_the_work_endpoint_body() {
         .recv_line(Duration::from_secs(10))
         .expect("current_state for q1");
     let responded = sgt(
-        repo_b.path(),
+        estate_b.path(),
         &data_b,
         &["--json", "respond", &b_id, "answer 1"],
     );
@@ -1027,7 +1118,7 @@ fn r_watch_9_snapshot_deep_equals_the_work_endpoint_body() {
         .expect("state_transition for q2");
     let second: Value = serde_json::from_str(&second).expect("parses");
     assert_eq!(second["reason"], "state_transition");
-    let endpoint_b = sgt(repo_b.path(), &data_b, &["--json", "work", "show", &b_id]);
+    let endpoint_b = sgt(estate_b.path(), &data_b, &["--json", "work", "show", &b_id]);
     endpoint_b.assert_ok("work show");
     assert_eq!(
         second["snapshot"],
@@ -1049,24 +1140,23 @@ fn r_watch_9_snapshot_deep_equals_the_work_endpoint_body() {
 #[test]
 fn r_watch_9_a_live_completed_transition_is_reported_without_waiting_for_teardown() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
     let submitted = submit(
-        repo.path(),
+        estate.path(),
         &data,
         "needs_input:one more thing?",
         "R-WATCH-9: lag honesty",
     );
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
 
-    let watch = WatchProc::spawn(repo.path(), &data, &["--json", "watch", &id, "--follow"]);
+    let watch = WatchProc::spawn(estate.path(), &data, &["--json", "watch", &id, "--follow"]);
     let _current = watch
         .recv_line(Duration::from_secs(10))
         .expect("current_state for needs_input");
 
     let start = Instant::now();
-    let responded = sgt(repo.path(), &data, &["--json", "respond", &id, "answer"]);
+    let responded = sgt(estate.path(), &data, &["--json", "respond", &id, "answer"]);
     responded.assert_ok("respond drives it to completion");
 
     let line = watch
@@ -1096,16 +1186,15 @@ fn r_watch_9_a_live_completed_transition_is_reported_without_waiting_for_teardow
 #[test]
 fn r_watch_10a_signals_end_the_watcher_natively_with_no_side_effects() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
+    let estate = solo_estate();
 
-    let submitted = submit(repo.path(), &data, "hang", "R-WATCH-10a: signal test");
+    let submitted = submit(estate.path(), &data, "hang", "R-WATCH-10a: signal test");
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
 
     for (flag, expected_signal) in [("-INT", 2), ("-TERM", 15)] {
         let before = journal_len(data.path());
 
-        let watch = WatchProc::spawn(repo.path(), &data, &["watch", &id]);
+        let watch = WatchProc::spawn(estate.path(), &data, &["watch", &id]);
         assert!(
             watch.recv_line(Duration::from_millis(500)).is_none(),
             "must be genuinely blocked before the signal"
@@ -1134,7 +1223,7 @@ fn r_watch_10a_signals_end_the_watcher_natively_with_no_side_effects() {
         );
     }
 
-    let show = sgt(repo.path(), &data, &["--json", "work", "show", &id]);
+    let show = sgt(estate.path(), &data, &["--json", "work", "show", &id]);
     show.assert_ok("work show");
     assert_eq!(
         show.json()["work"]["state"],

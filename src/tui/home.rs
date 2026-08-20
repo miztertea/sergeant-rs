@@ -29,7 +29,7 @@ enum Field {
     Workflow,
     Backend,
     Profile,
-    Workspace,
+    Group,
     Repositories,
     TurnCap,
     CeilingSecs,
@@ -41,7 +41,7 @@ const FIELDS: [Field; 9] = [
     Field::Workflow,
     Field::Backend,
     Field::Profile,
-    Field::Workspace,
+    Field::Group,
     Field::Repositories,
     Field::TurnCap,
     Field::CeilingSecs,
@@ -55,7 +55,7 @@ impl Field {
             Field::Workflow => "workflow",
             Field::Backend => "backend",
             Field::Profile => "profile",
-            Field::Workspace => "workspace",
+            Field::Group => "group",
             Field::Repositories => "repositories",
             Field::TurnCap => "turns",
             Field::CeilingSecs => "ceiling",
@@ -97,16 +97,22 @@ pub struct NewWorkForm {
     pub workflow: String,
     pub backend: String,
     pub profile: String,
-    pub workspace: String,
-    /// Free text, split on whitespace/commas at submission — §9.1 names a
-    /// group-expansion path shared with `sgt run --group`, but that path
-    /// reads the estate manifest from local disk
-    /// (`Workspace::declared_groups_scoped`), which no TUI module may do:
-    /// the TUI reaches the crate only through `crate::api` (§30, `t5`/`t5b`),
-    /// and the daemon does not expose declared repositories/groups over the
-    /// API yet — that is T3's job (§20.4, the `/v1/estate/*` routes). Until
-    /// then this field takes explicit repository names, exactly what
-    /// `sgt run --repo` already accepts without `--group`.
+    /// One declared group name, forwarded verbatim as `scope.group` —
+    /// exactly what `sgt run --group` sends. estate-root proposal §7.2 moved
+    /// expansion into the daemon, so naming a group here costs the TUI no
+    /// local manifest read — which no module under this tree may do anyway
+    /// (the TUI reaches the crate only through `crate::api`, §30,
+    /// `t5`/`t5b`), and which estate-root Phase D removed the machinery for
+    /// entirely when it deleted cwd-based discovery. The daemon still does not
+    /// expose the declared repositories/groups over the API — that is T3's
+    /// job (§20.4, the `/v1/estate/*` routes) — so the name is typed rather
+    /// than chosen from a catalog, and an unknown one comes back as §15's
+    /// 422 naming the available groups.
+    pub group: String,
+    /// Free text, split on whitespace/commas at submission, forwarded as
+    /// `scope.repos` — exactly what `sgt run --repo` sends. Combines with
+    /// [`NewWorkForm::group`] above (§7.2's union, deduplicated during
+    /// resolution).
     pub repositories: String,
     pub turn_cap: String,
     pub ceiling_secs: String,
@@ -203,7 +209,7 @@ impl NewWorkForm {
             Field::Workflow => Some(&mut self.workflow),
             Field::Backend => Some(&mut self.backend),
             Field::Profile => Some(&mut self.profile),
-            Field::Workspace => Some(&mut self.workspace),
+            Field::Group => Some(&mut self.group),
             Field::Repositories => Some(&mut self.repositories),
             Field::TurnCap => Some(&mut self.turn_cap),
             Field::CeilingSecs => Some(&mut self.ceiling_secs),
@@ -227,7 +233,15 @@ impl NewWorkForm {
     }
 
     /// §9.1's field mapping onto current submission semantics — the same
-    /// body shape `sgt run` already sends to `POST /v1/work`.
+    /// body shape `sgt run` already sends to `POST /v1/work`, including
+    /// estate-root proposal §13.3's structured `scope`: the form forwards
+    /// what the operator named and expands nothing, so a group typed here
+    /// resolves through the daemon's `Engine::resolve_scope` — the very
+    /// function `sgt run --group` reaches (§7.2's "a client surface adds
+    /// usability, never functionality"). There is no `--all` control:
+    /// leaving both scope fields empty on a multi-repository estate is
+    /// refused with §7.1's remedy, which lands in `last_error` beside the
+    /// form.
     fn body(&self) -> Value {
         let repositories: Vec<String> = self
             .repositories
@@ -251,8 +265,11 @@ impl NewWorkForm {
             "workflow": non_empty(&self.workflow),
             "backend": non_empty(&self.backend),
             "profile": non_empty(&self.profile),
-            "repositories": repositories,
-            "workspace": non_empty(&self.workspace),
+            "scope": {
+                "repos": repositories,
+                "group": non_empty(&self.group),
+                "all": false,
+            },
             "envelope": envelope,
             "created_by": "tui",
             "origin": {"client": "tui", "cwd": std::env::current_dir().ok()},
@@ -279,7 +296,7 @@ impl Default for NewWorkForm {
             workflow: String::new(),
             backend: String::new(),
             profile: String::new(),
-            workspace: String::new(),
+            group: String::new(),
             repositories: String::new(),
             turn_cap: String::new(),
             ceiling_secs: String::new(),
@@ -382,7 +399,7 @@ fn field_line<'a>(form: &'a NewWorkForm, field: Field, focused: bool) -> Line<'a
         Field::Workflow => form.workflow.as_str(),
         Field::Backend => form.backend.as_str(),
         Field::Profile => form.profile.as_str(),
-        Field::Workspace => form.workspace.as_str(),
+        Field::Group => form.group.as_str(),
         Field::Repositories => form.repositories.as_str(),
         Field::TurnCap => form.turn_cap.as_str(),
         Field::CeilingSecs => form.ceiling_secs.as_str(),
@@ -571,11 +588,34 @@ mod tests {
         };
         assert_eq!(body["intent"], "fix the thing");
         assert_eq!(body["workflow"], "implement");
-        assert_eq!(body["repositories"], json!(["svc-a", "svc-b"]));
+        assert_eq!(body["scope"]["repos"], json!(["svc-a", "svc-b"]));
         assert_eq!(body["envelope"]["turn_cap"], 12);
         assert_eq!(body["created_by"], "tui");
         assert_eq!(body["origin"]["client"], "tui");
         assert!(form.last_error.is_none());
+    }
+
+    /// estate-root proposal §13.3/§7.2: scope travels in exactly one place,
+    /// the structured `scope` block the daemon resolves — never as the
+    /// pre-§7 top-level `repositories`/`estate` keys, which no longer
+    /// exist on the wire and would be silently ignored on deserialize,
+    /// dropping the operator's selection without a word.
+    #[test]
+    fn scope_is_the_only_place_the_form_expresses_a_selection() {
+        let mut form = NewWorkForm {
+            group: "core".to_string(),
+            repositories: "svc-a".to_string(),
+            ..NewWorkForm::default()
+        };
+        form.intent.set_text("scope me");
+        let body = form.body();
+        assert_eq!(body["scope"]["repos"], json!(["svc-a"]));
+        assert_eq!(body["scope"]["group"], "core");
+        assert_eq!(body["scope"]["all"], false);
+        assert!(
+            body.get("repositories").is_none() && body.get("workspace").is_none(),
+            "the pre-§7 wire keys are gone, not sent alongside: {body}"
+        );
     }
 
     #[test]

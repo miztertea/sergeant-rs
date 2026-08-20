@@ -51,6 +51,22 @@ recovery, and unified telemetry, but at minimum preserves `code-review`'s
 own four checkpoints and authority envelope, which context composition
 would not).
 
+**Second engine gap, estate-root contract (2026-08-20):** this stage itself
+runs as a worker inside the Work's own linked-worktree surface
+(`surface/<work-id>/<name>`), not the estate root — no `sergeant.toml`
+lives there. Under the exact-root contract, `sgt run` and every other
+estate-scoped command now refuse outright from anywhere but the exact
+estate root (AGENTS.md's estate/Git model table; `sgt run --help`'s own
+root-gate behavior), so the "could even submit another `sgt run`" fallback
+above is not something this stage's own actor can literally type from its
+surface today, on top of the nested-workflow-invocation gap already filed.
+This stage's own output should record the dispatch this work needs
+(the diff, and that `code-review` is the target), for Captain — operating
+from the estate root — to actually submit; it is not, and was never
+meant to be, an instruction for the worker to invoke an estate-scoped `sgt`
+command from inside its own surface (AGENTS.md §14.4: workers do not
+"invoke estate-scoped sgt commands from their surface").
+
 ## Helper: commit (folded from demoted `40-commit`, N1 adjudication A4)
 
 `40-commit` was classified at extraction as deterministic machinery (ladder §6.5) with no checkpoint argument beyond the boilerplate; per adjudication A4 it is demoted and its behavior folded here as the concluding helper invocation of this checkpoint, subordinate to this stage's own judgment-bearing outcome:

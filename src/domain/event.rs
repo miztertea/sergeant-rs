@@ -54,7 +54,7 @@ pub struct Event {
     pub timestamp: String,
     /// Emitter of the event.
     pub source: EventSource,
-    /// Workspace this event belongs to, when applicable. Absent keys and
+    /// Estate this event belongs to, when applicable. Absent keys and
     /// explicit `null`s in stored lines both read as `None`; this version's
     /// writer never emits the key when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,7 +87,7 @@ pub struct Event {
 pub struct EventDraft {
     /// Emitter of the event.
     pub source: EventSource,
-    /// Optional workspace scope.
+    /// Optional estate scope.
     pub workspace_id: Option<String>,
     /// Optional work scope.
     pub work_id: Option<String>,

@@ -37,6 +37,27 @@ owns the rules for changing sergeant-rs's own code; `README.md` owns
 install/quickstart. When two sources disagree about a behavior, the one
 that owns that topic wins.
 
+## Session start
+
+A Captain session begins at the exact estate root: the one directory
+containing `./sergeant.toml`. Read it — or the `sgt` surfaces that render
+it (`sgt doctor`, `sgt repo list`, `sgt group list`) — before acting.
+Sergeant does not search parent directories for an estate and does not
+fall back to a plain Git checkout; every estate-scoped command refuses
+outright anywhere else, before daemon contact, naming the same remedy:
+`cd` to the estate root, `sgt -C <estate-root>` to name it without moving,
+or `sgt init` if this directory should become one. Only `sgt --help`,
+`--version`, `sgt init`, and `sgt doctor` work outside an estate at all.
+
+## Estate and Git model
+
+| Path | Owner | What it is |
+|---|---|---|
+| estate root | Captain | `sergeant.toml`, `AGENTS.md`, `skills/`, `.sergeant/` — the one directory every estate-scoped command requires |
+| `repos/<name>` | estate | clean base checkout `sgt repo add` clones — workers never edit it |
+| `<surfaces-dir>/<work-id>/<repo>` (default `.sergeant/data/surfaces/`) | worker | linked worktree a Work is bound to — its actual mutation surface |
+| `sergeant/<work-id>` | Work | durable output branch in each targeted repo, retained after every terminal outcome |
+
 ## Trigger → skill/workflow routing table
 
 | Trigger | Load | Owns |
@@ -203,6 +224,53 @@ that dispatched work goes through, just without leaving the session. This
 routing judgment belongs to the harness; sergeant's core makes no claim
 about it.
 
+**Captain captains** — emphasis, not a narrower rule than the table above.
+Captain's normal mode is dispatching Work and shaping intent, not writing
+code turn by turn; the ROUTING table's in-session criteria (an explicit
+user ask, one owning repository) are exactly as permitted as they were
+before this sentence existed. This states which mode is the default, not
+which is allowed.
+
+### ESTATE — Captain's estate discipline
+
+*What must be true before, and stay true during, repository Work.*
+
+Before dispatching meaningful repository Work, Captain:
+
+- confirms it is at the exact estate root (Session start, above) —
+  everything below assumes an estate-scoped command would not simply
+  refuse;
+- reads `sgt doctor`, the declared repositories/groups, and any relevant
+  workflow templates;
+- reconciles active and terminal-dirty Work already touching the intended
+  repositories (OBSERVATION, below) before adding more;
+- selects the intended repository scope explicitly — `--repo`, `--group`,
+  or `--all`; a multi-repository estate never lets omission mean
+  "everything";
+- confirms the mounted checkouts (`repos/<name>`) are on the intended
+  committed base — admission pins each selected mount's clean, attached
+  HEAD; it does not fetch, pull, switch branches, or infer a remote
+  default;
+- dispatches rather than coding concurrently in the mounts.
+
+Core repeats and enforces every mechanical Git check named above; this
+list is Captain's own discipline on top of it, not a substitute for it.
+
+A worker is told its exact selected paths, base, and assigned branch. It
+does not:
+
+- edit a `repos/` mount;
+- create a replacement branch;
+- navigate into another Work's surface;
+- expand its own repository scope;
+- invoke an estate-scoped `sgt` command from its own surface — no
+  `sergeant.toml` lives there, and Session start's refusal applies even
+  from inside it.
+
+A violation is reported dirty (the integrity disposition riding beside
+`sgt work show`'s terminal state), never silently treated as ordinary
+output.
+
 ### OBSERVATION — what counts as knowing
 
 *Do I actually know this, or do I only know a process exists?*
@@ -263,6 +331,9 @@ current binary rather than asserted from memory. No SHOULD sentence above
 implies any of this — the two registers are not interchangeable, and the
 gap between them is where judgment (the ladders above) does its work.
 
+- An estate-scoped command run anywhere but the exact estate root refuses
+  before daemon contact — no upward search, no Git-repository fallback
+  (Session start, above).
 - A second daemon cannot take the same data directory: the exclusive
   `daemon.lock` makes a second start attempt fail outright, not race.
 - A workflow stage needing a capability its bound backend lacks is refused
@@ -270,6 +341,13 @@ gap between them is where judgment (the ladders above) does its work.
   before any Work or worktree exists, never discovered mid-run.
 - Each targeted repository gets its own isolated git worktree per Work;
   one surface's changes cannot bleed into another's.
+- Admission requires each selected mount's clean, attached HEAD and pins
+  its exact SHA; `sgt` never fetches, pulls, switches branches, or infers
+  a remote default to get there — a dirty or detached mount is refused
+  unless the operator types the one bounded `--override-git-preflight`
+  for that submission.
+- A Work's output branch (`sergeant/<work-id>`) is retained after every
+  terminal outcome; nothing here deletes it automatically.
 - A manifest edit that would leave `sergeant.toml` invalid, or a start
   against an unmeasured/unsupported backend version, is refused before
   anything is written or run.
