@@ -133,7 +133,7 @@ What survives, and what changes:
 - **What the estate rung *means* changes.** It is no longer "the nearest
   `[estate]`-bearing `sergeant.toml` at or above `cwd`" but "`cwd` itself, if
   `cwd` is an estate root" — one deterministic check against one directory
-  (`Workspace::is_estate_root`). From a `repos/<name>` mount one level down,
+  (`Estate::is_estate_root`). From a `repos/<name>` mount one level down,
   the rung no longer matches at all and resolution falls through to the
   platform default, where before it would have found the estate above.
 - **(a)'s own rationale gets stronger, not weaker.** It leaned on ADR 0006's
