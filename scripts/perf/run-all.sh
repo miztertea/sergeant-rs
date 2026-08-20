@@ -80,7 +80,11 @@ printf '\n\033[1m######## run complete ########\033[0m\n' | tee -a "$LOG"
 # Final sweep across everything the run created.
 PERF_OUT="$OUT" PERF_SCENARIO=run-all PERF_SUMMARY_TSV="$OUT/run-all-summary.tsv" PERF_REPOS=()
 : > "$OUT/run-all-summary.tsv"
-for repo in "$OUT"/*/scratch/*/repo; do [ -d "$repo" ] && PERF_REPOS+=("$repo"); done
+# Each scenario's scratch estate mounts its one repository at
+# <scenario>/scratch/<scenario>/estate/repos/<name> (perf_estate_scaffold);
+# idle-baseline's own scaffold has no work driven through it but still
+# mounts one, so it is picked up here the same way.
+for repo in "$OUT"/*/scratch/*/estate/repos/*; do [ -d "$repo/.git" ] && PERF_REPOS+=("$repo"); done
 perf_hygiene final | tee -a "$LOG"
 
 python3 - "$OUT" <<'PY' | tee -a "$LOG"

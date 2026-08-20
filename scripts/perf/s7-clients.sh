@@ -32,10 +32,11 @@ SOCK_MAIN="sgtperf-main-$$"
 SOCK_ORPHAN="sgtperf-orphan-$$"
 
 DD="$PERF_SCRATCH/s7/data"
-REPO="$PERF_SCRATCH/s7/repo"
+ESTATE="$PERF_SCRATCH/s7/estate"
 rm -rf "$PERF_SCRATCH/s7"
 mkdir -p "$DD"
-perf_seed_repo "$REPO"
+perf_estate_scaffold "$ESTATE"
+REPO="$PERF_REPO"
 perf_daemon_start "$DD"
 perf_kv idle_window_s "$IDLE"
 perf_kv burst "$BURST"
@@ -59,7 +60,7 @@ perf_kv seed_work "${SEED_WORK:-none}"
 # ---------------------------------------------------------------- attach
 perf_step "attaching the TUI under tmux"
 tmux -L "$SOCK_MAIN" new-session -d -s tui -x 200 -y 50 \
-  "exec '$SGT_BIN' --data-dir '$DD' tui"
+  "exec '$SGT_BIN' -C '$PERF_ESTATE_ROOT' --data-dir '$DD' tui"
 tmux -L "$SOCK_MAIN" set-option -t tui remain-on-exit on >/dev/null 2>&1 || true
 sleep 3
 TUI_PID="$(tmux -L "$SOCK_MAIN" list-panes -t tui -F '#{pane_pid}' 2>/dev/null | head -1)"
@@ -107,7 +108,7 @@ burst_job=$!
 
 # The diagnostic commands, concurrent with the burst.
 sleep 0.3
-perf_mark st0; "$SGT_BIN" --data-dir "$DD" --json status > "$PERF_OUT/s7-status.json" 2>/dev/null || true; perf_mark st1
+perf_mark st0; perf_sgt --data-dir "$DD" --json status > "$PERF_OUT/s7-status.json" 2>/dev/null || true; perf_mark st1
 perf_kv sgt_status_ms "$(perf_ms $((st1 - st0)))"
 perf_mark d0; "$SGT_BIN" --data-dir "$DD" --json doctor > "$PERF_OUT/s7-doctor.json" 2>/dev/null || true; perf_mark d1
 perf_kv sgt_doctor_ms "$(perf_ms $((d1 - d0)))"
@@ -161,7 +162,7 @@ perf_kv daemon_fds_after_tui "$(perf_proc_fds "$PERF_DAEMON_PID")"
 # ------------------------------------------------- orphan SIGTERM repro
 perf_step "orphan repro: tmux kill-server, then SIGTERM the surviving TUI"
 tmux -L "$SOCK_ORPHAN" new-session -d -s orphan -x 200 -y 50 \
-  "exec '$SGT_BIN' --data-dir '$DD' tui"
+  "exec '$SGT_BIN' -C '$PERF_ESTATE_ROOT' --data-dir '$DD' tui"
 sleep 3
 ORPHAN_PID="$(tmux -L "$SOCK_ORPHAN" list-panes -t orphan -F '#{pane_pid}' 2>/dev/null | head -1)"
 perf_kv orphan_tui_pid "${ORPHAN_PID:-none}"
