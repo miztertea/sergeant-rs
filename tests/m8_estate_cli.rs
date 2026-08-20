@@ -1770,6 +1770,101 @@ fn work_retained_and_reap_are_reachable_from_the_real_cli() {
     data_dir.reap();
 }
 
+/// guard-map: `sgt work sweep` (#159), reachable end to end through the real
+/// CLI/daemon. The bare verb classifies and mutates nothing;
+/// `--delete-redundant` alone prints exactly what `--yes` would destroy and
+/// still mutates nothing; `--yes` deletes the redundant branch and leaves the
+/// orphan — the one this estate's journal has no Work for — standing.
+/// Mutation this kills: the preview path deleting anything, the confirmed
+/// path widening past `redundant`, or either path failing to reach the
+/// daemon at all.
+#[test]
+fn work_sweep_classifies_previews_then_deletes_from_the_real_cli() {
+    let data_dir = DataDir::new();
+    let repo = tempfile::TempDir::new().expect("tempdir");
+    support::scaffold_estate(repo.path(), "solo", &["solo"]);
+    write_two_stage_workflow(repo.path());
+    let mount = repo.path().join("repos").join("solo");
+
+    let submitted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &[
+            "--json",
+            "run",
+            "--workflow",
+            "tiny",
+            "leave a branch behind",
+        ],
+    );
+    submitted.assert_ok("run");
+    let work_id = submitted.json()["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    wait_for_state(repo.path(), data_dir.path(), &work_id, "completed");
+    let work_branch = format!("sergeant/{work_id}");
+
+    // A `sergeant/*` ref this estate's journal knows nothing about (#172).
+    let orphan = "sergeant/01BOGUSBOGUSBOGUSBOGUSBOGUS";
+    git(&mount, &["branch", orphan, "main"]);
+
+    let report = run(repo.path(), Some(data_dir.path()), &[], &["work", "sweep"]);
+    report.assert_ok("work sweep");
+    for expected in ["default branch: main", "redundant", "orphan", &work_branch] {
+        assert!(
+            report.stdout.contains(expected),
+            "the report must name {expected:?}: {}",
+            report.stdout
+        );
+    }
+
+    let refs_before = git(&mount, &["for-each-ref", "--format=%(refname:short)"]);
+    let preview = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "sweep", "--delete-redundant"],
+    );
+    preview.assert_ok("work sweep --delete-redundant (preview)");
+    assert!(
+        preview.stdout.contains("--yes would permanently delete:")
+            && preview.stdout.contains(&work_branch),
+        "the preview must name exactly what --yes would destroy: {}",
+        preview.stdout
+    );
+    assert!(
+        !preview.stdout.contains(orphan),
+        "an orphan is never deletable, so it must not appear in the deletion preview: {}",
+        preview.stdout
+    );
+    assert_eq!(
+        refs_before,
+        git(&mount, &["for-each-ref", "--format=%(refname:short)"]),
+        "a preview must not touch a single ref"
+    );
+
+    let deleted = run(
+        repo.path(),
+        Some(data_dir.path()),
+        &[],
+        &["work", "sweep", "--delete-redundant", "--yes"],
+    );
+    deleted.assert_ok("work sweep --delete-redundant --yes");
+    assert!(
+        deleted.stdout.contains("deleted at"),
+        "got: {}",
+        deleted.stdout
+    );
+    let refs_after = git(&mount, &["for-each-ref", "--format=%(refname:short)"]);
+    assert!(!refs_after.contains(&work_branch), "{refs_after}");
+    assert!(refs_after.contains(orphan), "{refs_after}");
+    assert!(refs_after.contains("main"), "{refs_after}");
+
+    data_dir.reap();
+}
+
 // -------------------------------------------------- envelope / daemon stop
 
 /// guard-map: `sgt run --turns N --ceiling-secs S` (checkpoint-friction

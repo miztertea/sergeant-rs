@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use crate::api::{ApiClient, ClientError};
 use crate::daemon::{self, RuntimeDescriptor};
 use crate::domain::estate::{Estate, EstateRoot, RootSource};
+use crate::runtime::sweep::SweepTarget;
 
 /// How long the client waits for a spawned daemon to publish a healthy
 /// descriptor before giving up.
@@ -436,6 +437,29 @@ enum WorkCommand {
         /// Actually perform the deletion. Without it, this only previews
         /// what would be destroyed.
         #[arg(long)]
+        yes: bool,
+    },
+    /// §12.3's deliberate sweep (#159): classify every `sergeant/*` branch
+    /// in every mount of this estate — `active` (a Work is still on it),
+    /// `redundant` (its tip is already contained in the mount's default
+    /// branch, so it holds no unique commits), `retained` (a terminal Work's
+    /// unique work), `orphan` (a `sergeant/*` ref sergeant never journaled)
+    /// — and report each mount's prunable worktree registrations.
+    ///
+    /// Deliberately not part of `sgt doctor`: this walks every mount's ref
+    /// store and asks git about ancestry per branch, where doctor's
+    /// git-surfaces row is a cheap count off the journal.
+    ///
+    /// Reports only, unless `--delete-redundant --yes` is given. Nothing but
+    /// a `redundant` branch is ever deletable, and the daemon re-proves that
+    /// per branch at deletion time.
+    Sweep {
+        /// Delete the branches classified `redundant`. Without `--yes` this
+        /// only prints exactly what would be deleted.
+        #[arg(long)]
+        delete_redundant: bool,
+        /// Actually perform the deletion (requires `--delete-redundant`).
+        #[arg(long, requires = "delete_redundant")]
         yes: bool,
     },
 }
@@ -908,6 +932,66 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Work {
+            command:
+                WorkCommand::Sweep {
+                    delete_redundant,
+                    yes,
+                },
+        } => {
+            // Classification mutates nothing, so it connects like `retained`
+            // (ADR 0009: observation must not materialize the thing
+            // observed). Only the confirmed deletion joins `reap`'s bucket
+            // and may spawn a daemon.
+            let client = if delete_redundant && yes {
+                ensure_daemon(&data_dir, &estate_root(&estate)).await?
+            } else {
+                observe_connect(&data_dir, &estate_root(&estate)).await?
+            };
+            let report = client.sweep().await?;
+            if !delete_redundant {
+                if sgt.json {
+                    print_json(&report);
+                } else {
+                    print_sweep(&report);
+                }
+                return Ok(());
+            }
+            let redundant = redundant_branches(&report);
+            if !yes {
+                if sgt.json {
+                    let targets: Vec<&SweepTarget> = redundant.iter().map(|(t, _)| t).collect();
+                    print_json(&json!({"would_delete": targets}));
+                } else if redundant.is_empty() {
+                    println!("nothing is classified redundant — nothing to delete");
+                } else {
+                    println!("--yes would permanently delete:");
+                    for (target, tip) in &redundant {
+                        println!("  {}  {}  {tip}", target.repository, target.branch);
+                    }
+                    println!("re-run with --yes to actually delete these");
+                }
+                return Ok(());
+            }
+            if redundant.is_empty() {
+                if sgt.json {
+                    print_json(&json!({"deleted": []}));
+                } else {
+                    println!("nothing is classified redundant — nothing to delete");
+                }
+                return Ok(());
+            }
+            // The daemon re-classifies every one of these before deleting
+            // any of it; this list is a request, not a grant.
+            let targets: Vec<SweepTarget> = redundant.into_iter().map(|(t, _)| t).collect();
+            let result = client.sweep_delete(&targets, true).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_sweep_deletion(&result);
+            }
+            Ok(())
+        }
         Command::Work { command } => {
             let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             match command {
@@ -1011,9 +1095,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     }
                     Ok(())
                 }
-                // Handled by the dedicated `ensure_daemon` arm above, since
-                // reap mutates durable state — never reachable here.
+                // Both are handled by their own dedicated arms above —
+                // never reachable here.
                 WorkCommand::Reap { .. } => unreachable!("reap is matched before this arm"),
+                WorkCommand::Sweep { .. } => unreachable!("sweep is matched before this arm"),
             }
         }
         Command::Analytics { name } => {
@@ -1522,6 +1607,135 @@ fn print_reap_report(result: &Value) {
             _ => println!("{repository}: {outcome}"),
         }
     }
+}
+
+/// §12.3's sweep report (`GET /v1/sweep`, `sgt work sweep`): every mount's
+/// `sergeant/*` refs with what each one is, the default branch every
+/// `redundant` verdict is relative to, and the mount's prunable worktree
+/// registrations with git's own remedy.
+fn print_sweep(report: &Value) {
+    let empty = Vec::new();
+    let repositories = report["repositories"].as_array().unwrap_or(&empty);
+    if repositories.is_empty() {
+        println!("no repositories declared — nothing to sweep");
+        return;
+    }
+    let mut redundant = 0usize;
+    for repository in repositories {
+        let name = repository["repository"].as_str().unwrap_or("?");
+        match repository["default_branch"].as_str() {
+            Some(default) => println!("{name} (default branch: {default})"),
+            None => println!("{name} (HEAD is detached — redundancy cannot be proven here)"),
+        }
+        if let Some(unreadable) = repository["unreadable"].as_str() {
+            println!("  cannot read this mount: {unreadable}");
+            continue;
+        }
+        let branches = repository["branches"].as_array().unwrap_or(&empty);
+        if branches.is_empty() {
+            println!("  no sergeant/* branches");
+        }
+        for branch in branches {
+            let classification = branch["classification"].as_str().unwrap_or("?");
+            if classification == "redundant" {
+                redundant += 1;
+            }
+            println!(
+                "  {:<9} {}  {}  {}",
+                classification,
+                branch["branch"].as_str().unwrap_or("?"),
+                short_sha(branch["tip"].as_str().unwrap_or("?")),
+                branch["detail"].as_str().unwrap_or(""),
+            );
+        }
+        let prunable = repository["prunable_worktrees"].as_u64().unwrap_or(0);
+        if prunable > 0 {
+            println!(
+                "  {prunable} prunable worktree registration(s) — remedy: `git -C {} worktree \
+                 prune`",
+                repository["path"].as_str().unwrap_or("?"),
+            );
+        }
+    }
+    if let Some(note) = report["note"].as_str() {
+        println!("note: {note}");
+    }
+    if redundant > 0 {
+        println!(
+            "{redundant} branch(es) classified redundant; preview the deletion with `sgt work \
+             sweep --delete-redundant`"
+        );
+    }
+}
+
+/// The sweep's deletion result (`POST /v1/sweep`, `sgt work sweep
+/// --delete-redundant --yes`): what actually happened to each requested
+/// branch, including every one the daemon's own re-classification refused.
+fn print_sweep_deletion(result: &Value) {
+    let empty = Vec::new();
+    let deleted = result["deleted"].as_array().unwrap_or(&empty);
+    if deleted.is_empty() {
+        println!("nothing was deleted");
+        return;
+    }
+    for entry in deleted {
+        let where_ = format!(
+            "{}  {}",
+            entry["repository"].as_str().unwrap_or("?"),
+            entry["branch"].as_str().unwrap_or("?"),
+        );
+        match entry["outcome"].as_str() {
+            Some("deleted") => println!(
+                "{where_}: deleted at {}",
+                short_sha(entry["tip"].as_str().unwrap_or("?")),
+            ),
+            Some("refused") => println!(
+                "{where_}: refused — {}",
+                entry["reason"].as_str().unwrap_or("?"),
+            ),
+            Some("failed") => println!(
+                "{where_}: failed — {}",
+                entry["detail"].as_str().unwrap_or("?"),
+            ),
+            _ => println!("{where_}: {}", entry["outcome"]),
+        }
+    }
+}
+
+/// Every branch the daemon's classification pass called `redundant`, paired
+/// with the tip it currently points at — what the unconfirmed preview prints
+/// and what `--yes` submits.
+fn redundant_branches(report: &Value) -> Vec<(SweepTarget, String)> {
+    let empty = Vec::new();
+    report["repositories"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .flat_map(|repository| {
+            let name = repository["repository"].as_str().unwrap_or("?").to_string();
+            repository["branches"]
+                .as_array()
+                .unwrap_or(&empty)
+                .iter()
+                .filter(|branch| branch["classification"].as_str() == Some("redundant"))
+                .map(|branch| {
+                    (
+                        SweepTarget {
+                            repository: name.clone(),
+                            branch: branch["branch"].as_str().unwrap_or("?").to_string(),
+                        },
+                        branch["tip"].as_str().unwrap_or("?").to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A commit for a report column: git's own abbreviation length, with a
+/// short-or-missing value passed through as-is rather than sliced blindly.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 /// A canned query's answer as a plain aligned table (M6 owns presentation).
