@@ -630,7 +630,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             command: Some(DaemonCommand::Stop),
         } => daemon_stop(&data_dir, sgt.json).await,
         Command::Status => {
-            let client = observe_connect(&data_dir).await?;
+            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             let system = client.get("/v1/system").await?;
             let works = client.get("/v1/work").await?;
             let mut counts = std::collections::BTreeMap::<String, u64>::new();
@@ -793,7 +793,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // `retained` (ADR 0009: observation must not materialize the
             // thing observed) rather than auto-spawning a daemon.
             if !yes {
-                let client = observe_connect(&data_dir).await?;
+                let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
                 let retained = client.retained().await?;
                 let mine: Vec<&Value> = retained["retained"]
                     .as_array()
@@ -830,7 +830,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Work { command } => {
-            let client = observe_connect(&data_dir).await?;
+            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             match command {
                 WorkCommand::List => {
                     let result = client.get("/v1/work").await?;
@@ -938,7 +938,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Analytics { name } => {
-            let client = observe_connect(&data_dir).await?;
+            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             let result = match &name {
                 Some(name) => client.get(&format!("/v1/analytics/{name}")).await?,
                 None => client.get("/v1/analytics").await?,
@@ -970,7 +970,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         Command::Watch { id, follow } => {
             // R-WATCH-3 / ADR 0009: never `ensure_daemon` — this verb
             // refuses rather than spawns.
-            let client = observe_connect(&data_dir).await?;
+            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             let options = crate::watch::WatchOptions {
                 work_id: id,
                 follow,
@@ -996,7 +996,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // ADR 0009/0010: the TUI never auto-spawns — it is in the
             // no-spawn set like every other observation surface, and bare
             // `sgt` no longer falls into it by default.
-            let client = observe_connect(&data_dir).await?;
+            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             crate::tui::run(client).await.map_err(CliError::from)
         }
         Command::Doctor => {
@@ -1603,6 +1603,11 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         .build()?;
 
     let stale = if let Some(descriptor) = daemon::read_descriptor(data_dir)? {
+        // §5.1: verify the binding **before** the endpoint is used for
+        // anything, and before any decision that could spawn. A daemon bound
+        // to another estate is a named refusal — never a connection, and
+        // never a second daemon over the same data dir.
+        check_binding(&descriptor, data_dir, estate_root)?;
         if healthz_ok(&http, &descriptor.endpoint).await {
             return client_for(&descriptor);
         }
@@ -1645,9 +1650,14 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
     while Instant::now() < deadline {
         if let Ok(Some(descriptor)) = daemon::read_descriptor(data_dir)
             && !is_stale_descriptor(stale.as_ref(), &descriptor)
-            && healthz_ok(&http, &descriptor.endpoint).await
         {
-            return client_for(&descriptor);
+            // The winner of the spawn race may be another client's child,
+            // and §5.1 applies to it exactly as it did above: a daemon bound
+            // elsewhere is refused, not adopted.
+            check_binding(&descriptor, data_dir, estate_root)?;
+            if healthz_ok(&http, &descriptor.endpoint).await {
+                return client_for(&descriptor);
+            }
         }
         tokio::time::sleep(SPAWN_POLL).await;
     }
@@ -1661,6 +1671,20 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
 
 fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
     ApiClient::new(&descriptor.endpoint, &descriptor.token).map_err(CliError::from)
+}
+
+/// §5.1/§15: refuse a descriptor bound to a different estate, naming both
+/// roots. Runs before the endpoint is probed, connected to, or used to
+/// decide whether to spawn — "never connect, never a second daemon on the
+/// same data dir" is only true if the check comes first.
+fn check_binding(
+    descriptor: &RuntimeDescriptor,
+    data_dir: &Path,
+    estate_root: &Path,
+) -> Result<(), CliError> {
+    descriptor
+        .check_estate_root(data_dir, Some(estate_root))
+        .map_err(|e| CliError::new(e.to_string()))
 }
 
 /// Every observation verb's daemon connection (ADR 0009, D5; ruled first for
@@ -1682,7 +1706,7 @@ fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
 /// 3. A descriptor naming a live PID that does not answer `/healthz` → the
 ///    same ambiguous, fail-closed refusal `ensure_daemon` gives, spawn
 ///    nothing.
-async fn observe_connect(data_dir: &Path) -> Result<ApiClient, CliError> {
+async fn observe_connect(data_dir: &Path, estate_root: &Path) -> Result<ApiClient, CliError> {
     let path = daemon::descriptor_path(data_dir);
     let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
         return Err(CliError::new(format!(
@@ -1692,6 +1716,9 @@ async fn observe_connect(data_dir: &Path) -> Result<ApiClient, CliError> {
             data_dir.display(),
         )));
     };
+    // §5.1, before the endpoint is touched at all — the same gate
+    // `ensure_daemon` applies, for the same reason.
+    check_binding(&descriptor, data_dir, estate_root)?;
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
@@ -1752,6 +1779,9 @@ fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
         .append(true)
         .open(data_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
+    // §5.1, C10: the spawned daemon is bound to the estate this client
+    // already admitted — named explicitly with `-C` rather than inherited
+    // from a cwd the detached child does not reliably keep.
     command
         .arg("-C")
         .arg(estate_root)
