@@ -359,6 +359,21 @@ pub struct Work {
     /// existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<EnvelopeRequest>,
+    /// estate-root §8.3: whether the operator typed
+    /// `--override-git-preflight` for *this* submission.
+    ///
+    /// Journaled on the Work itself, not only on the surface plan that
+    /// records what it waived, because the two are different facts and §8.3
+    /// asks for both: an override that turned out to waive nothing is still
+    /// an operator authorization that was given, and `work.submitted` is
+    /// where the submission's own request form lives (beside
+    /// [`Self::scope_request`], for the same §7.3-shaped reason).
+    ///
+    /// `#[serde(default)]`, skipped when false, on [`ScopeRequest::all`]'s
+    /// precedent: absent means not overridden, which is what every Work
+    /// journaled before Phase E recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub git_preflight_override: bool,
     /// Current state (only mutated by folding journal events).
     pub state: WorkState,
     /// Who submitted it.

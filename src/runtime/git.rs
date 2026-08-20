@@ -132,6 +132,37 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// [`git`] without the trim: stdout exactly as Git wrote it.
+///
+/// Necessary for `status --porcelain`, whose leading whitespace *is* the
+/// answer — ` M file` (modified, unstaged) and `M  file` (modified, staged)
+/// differ only there, and trimming turns the first into the second. §8.3
+/// requires an override to "record full porcelain evidence"; evidence with
+/// its first status column removed is not that.
+///
+/// Only the trailing newline Git terminates its last record with is dropped,
+/// so a clean tree still answers with an empty string.
+pub fn git_verbatim(dir: &Path, args: &[&str]) -> Result<String, GitError> {
+    let output = command(dir, args)
+        .output()
+        .map_err(|source| GitError::Spawn {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches('\n')
+        .to_string())
+}
+
 /// Whether `git <args>` in `dir` exits zero. Used for existence questions
 /// (`is this a work tree?`, `does this branch exist?`) where the failing case
 /// is an answer, not an error.

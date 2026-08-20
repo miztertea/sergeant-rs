@@ -52,12 +52,13 @@ use crate::domain::workflow::{
     KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
     StageKind, StageStatus, WorkflowDefinition, WorkflowError,
 };
+use crate::runtime::preflight::{self, GitPreflight, PreflightRefusal};
 use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
 use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage};
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
     RepositoryBinding, SURFACES_DIR, SurfaceError, SurfacePlan, TeardownReport, WorkSurface,
-    materialize, rematerialize, teardown,
+    materialize_admitted, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
@@ -89,6 +90,25 @@ pub struct SubmitContext<'a> {
     /// resolves to every declared repository and does not also require
     /// `repos`/`group` to be empty.
     pub all: bool,
+    /// The id the Work *would* be given, for §8.1's checks 9 and 10 — both
+    /// of which are questions about `sergeant/<work-id>` and
+    /// `<surfaces_root>/<work-id>/<repo>`, so the id has to exist before the
+    /// record does. The caller mints it and reuses it for the `Work` it
+    /// creates when planning succeeds; a refusal discards it, which costs
+    /// nothing and is the whole point of asking here.
+    ///
+    /// `None` skips §8.1 entirely: no id, no checks 9/10, nothing admitted.
+    /// That is the shape every non-submission caller of
+    /// [`Engine::plan`](Self) has (routing probes, the runtime's own
+    /// fixtures), and it must not silently become an unadmitted submission —
+    /// which is why [`StartPlan::preflight`] is an `Option`, not an empty
+    /// `Vec` that would read as "admitted, nothing found".
+    pub work_id: Option<&'a str>,
+    /// §8.3's `--override-git-preflight`, exactly as the submission carried
+    /// it. **Never a default and never read from configuration**: this is a
+    /// borrowed request field with no other source, so there is nowhere for a
+    /// run template or an estate manifest to set it from.
+    pub override_git_preflight: bool,
 }
 
 /// A resolved, side-effect-free plan for starting a run.
@@ -120,6 +140,15 @@ pub struct StartPlan {
     /// Pinned into `workflow.bound` and read by every later stage entry, so a
     /// retry and a restart reconstruct the same decision.
     pub stage_bindings: Vec<StageBinding>,
+    /// §8.1's Git admission, when this plan was made for a real submission
+    /// (`SubmitContext::work_id` was set).
+    ///
+    /// `None` means no admission was performed — never "admitted and found
+    /// nothing". Materialization reads the pinned base out of this rather
+    /// than re-asking each mount, so the distinction decides whether a Work
+    /// is based on the commit that was *judged* or on whatever HEAD says by
+    /// the time `git worktree add` runs.
+    pub preflight: Option<GitPreflight>,
 }
 
 /// Why `target_work_id`'s branch cannot (yet) be taken over by a gate Work
@@ -627,11 +656,18 @@ impl PendingSurface {
             SurfaceEffect::Materialize {
                 surfaces_root,
                 plan,
-            } => SurfaceOutcome::Materialized(materialize(
+            } => SurfaceOutcome::Materialized(materialize_admitted(
                 &self.data_dir,
                 surfaces_root,
                 &self.work_id,
                 &plan.repositories,
+                // §8.2: the base each repository was *admitted* on, not
+                // whatever its HEAD says now. An empty slice (a plan made
+                // without admission) leaves the live read in place, which is
+                // the only thing it could do.
+                plan.preflight
+                    .as_ref()
+                    .map_or(&[][..], |p| p.repositories.as_slice()),
             )),
             SurfaceEffect::Rematerialize { surface, .. } => {
                 // A retry whose worktrees are all still on disk needs no git
@@ -895,6 +931,12 @@ pub enum EngineError {
         /// The backend the stage resolved to.
         backend: String,
     },
+    /// §8.1: Git admission preflight refused this submission, before a Work
+    /// record existed and before any Git mutation. Carries every unresolved
+    /// finding, each with its own §15 code and remedy — see
+    /// [`crate::runtime::preflight`].
+    #[error("{0}")]
+    GitPreflight(PreflightRefusal),
     /// §17.5: a workflow declares a `kind = "execute"` stage, but the
     /// `"docker"` backend is not registered or its probe reports
     /// unavailable. Refused before Work or worktree side effects, exactly
@@ -945,6 +987,10 @@ impl EngineError {
             EngineError::NoSuchStage { .. } => "no_such_stage",
             EngineError::AskCapabilityUnavailable { .. } => "ask_capability_unavailable",
             EngineError::ExecuteBackendUnavailable { .. } => "execute_backend_unavailable",
+            // §15: the code names the *check*, not the phase — "preflight
+            // failed" would tell a client nothing it could act on. Every
+            // other finding travels in the body beside it.
+            EngineError::GitPreflight(refusal) => refusal.code(),
         }
     }
 
@@ -1242,6 +1288,35 @@ impl Engine {
         // "reject the submission" rather than "a work that dies at stage 2".
         let stage_bindings = self.bind_stages(&estate, &workflow, &route, profile.as_ref())?;
 
+        // §8.1/§8.4, last: the Git admission contract, run for every selected
+        // repository before `work.submitted` and before any Git mutation.
+        //
+        // Last, deliberately. Everything above is a question about
+        // configuration — is this estate readable, is that group declared, can
+        // this workflow route — and every one of those is on §8.3's
+        // never-bypass list too. Answering them first means a submission that
+        // was going to be refused for an unroutable backend is refused for the
+        // unroutable backend, rather than for the dirty mount preflight would
+        // also have found; it also keeps the ~6 git spawns per repository off
+        // submissions that were never going to run.
+        //
+        // Still strictly before the Work exists: `plan` has created nothing at
+        // this point and its caller mints the `Work` only from an `Ok`.
+        let preflight = match context.work_id {
+            None => None,
+            Some(work_id) => Some(
+                preflight::run(
+                    &estate,
+                    &self.data_dir,
+                    &surfaces_root,
+                    work_id,
+                    &repositories,
+                    context.override_git_preflight,
+                )
+                .map_err(EngineError::GitPreflight)?,
+            ),
+        };
+
         Ok(Some(StartPlan {
             estate,
             repositories,
@@ -1250,6 +1325,7 @@ impl Engine {
             route,
             profile,
             stage_bindings,
+            preflight,
         }))
     }
 
@@ -1649,6 +1725,21 @@ impl Engine {
         self.run_inline(core, step)
     }
 
+    /// The [`SurfacePlan`] `surface.materializing` records for `plan`,
+    /// carrying §8.1's admission when the plan has one.
+    ///
+    /// Split out rather than inlined so the "with admission" and "without"
+    /// shapes are one decision in one place: a plan made for a real
+    /// submission always has a [`GitPreflight`], and one made without a
+    /// `work_id` (routing probes, fixtures) never does.
+    fn surface_plan(plan: &StartPlan, work_id: &str) -> SurfacePlan {
+        let base = SurfacePlan::new(&plan.surfaces_root, work_id, &plan.repositories);
+        match &plan.preflight {
+            Some(preflight) => base.with_admission(preflight),
+            None => base,
+        }
+    }
+
     /// [`Engine::start`]'s first phase: journal the intent to materialize, and
     /// hand the git back to the caller.
     ///
@@ -1682,7 +1773,11 @@ impl Engine {
             core,
             &work.id,
             KIND_SURFACE_MATERIALIZING,
-            json!({"plan": SurfacePlan::new(&plan.surfaces_root, &work.id, &plan.repositories)}),
+            // §8.3: "the override and every waived finding are journaled with
+            // the Work" — carried on the plan, so the authorization is durable
+            // strictly before the effect it authorized, exactly like the paths
+            // and branches beside it.
+            json!({"plan": Self::surface_plan(plan, &work.id)}),
         )?;
         Ok(Step {
             next: Next::Surface(Box::new(PendingSurface {
@@ -4733,6 +4828,8 @@ mod tests {
             profile: None,
             // N3 (§12.5): one binding per stage, and this plan has no stages.
             stage_bindings: Vec::new(),
+            // No admission: this plan was built by hand, not by `plan`.
+            preflight: None,
         };
 
         engine
@@ -5334,6 +5431,7 @@ mod tests {
                 profile: None,
                 intent_detail: None,
                 envelope: None,
+                git_preflight_override: false,
                 state,
                 created_by: "test".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -5344,7 +5442,7 @@ mod tests {
             RepositoryBinding {
                 repository: "solo".to_string(),
                 source_path: PathBuf::from("/repos/solo"),
-                base_branch: "main".to_string(),
+                base_branch: Some("main".to_string()),
                 base_sha: "0".repeat(40),
                 worktree_path: PathBuf::from(format!("/data/surfaces/{work_id}/solo")),
                 work_branch: format!("sergeant/{work_id}"),
@@ -5352,6 +5450,7 @@ mod tests {
                 origin: BindingOrigin::Cut,
                 canonical_top_level: Some(PathBuf::from("/repos/solo")),
                 canonical_common_dir: Some(PathBuf::from("/repos/solo/.git")),
+                preflight: None,
             }
         }
 

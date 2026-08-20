@@ -39,6 +39,7 @@ use crate::runtime::git::{
 use crate::runtime::integrity::{
     DriftAttribution, EstateDriftObservation, IntegrityDisposition, IntegrityFinding, ObservedHead,
 };
+use crate::runtime::preflight::{AdmittedRepository, GitPreflight, PreflightEvidence};
 use crate::runtime::repolock::{self, RepoLockError};
 
 /// Directory under the data dir holding all work surfaces.
@@ -229,8 +230,23 @@ pub struct RepositoryBinding {
     pub repository: String,
     /// Source repository top level (never written to by execution).
     pub source_path: PathBuf,
-    /// Branch the surface was cut from (`(detached)` if HEAD was detached).
-    pub base_branch: String,
+    /// Branch the surface was cut from — §3.5's "observed base branch, **if
+    /// attached**".
+    ///
+    /// `None` is the honest record for a detached mount admitted under §8.3's
+    /// bounded override: that admission pins an exact `base_sha` and, in the
+    /// proposal's own words, records "no named base branch". Before Phase E
+    /// this was a `String` carrying the sentinel `"(detached)"` — a value that
+    /// *looks* like a branch name (git's ref grammar permits parentheses)
+    /// sitting in the field every reader branches on.
+    ///
+    /// `#[serde(default)]` so a binding journaled before this change replays
+    /// exactly what it recorded, the old sentinel included (as
+    /// `Some("(detached)")`). Serialized even when `None`: an explicit `null`
+    /// *is* the record that this Work has no named base branch, and a missing
+    /// key would be indistinguishable from a payload predating the field.
+    #[serde(default)]
+    pub base_branch: Option<String>,
     /// Commit the surface was cut from.
     pub base_sha: String,
     /// Worktree path under the data dir.
@@ -268,6 +284,17 @@ pub struct RepositoryBinding {
     /// [`Self::canonical_top_level`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical_common_dir: Option<PathBuf>,
+    /// §3.5's "preflight result and any authorized override evidence": what
+    /// §8.1 admitted this repository on, and what §8.3 waived to get there.
+    ///
+    /// `Option` + `#[serde(default)]` on the same amendment-C3 grounds as the
+    /// two canonical identities above: `None` on a binding journaled before
+    /// Phase E means *no preflight ran*, which is a different and more honest
+    /// fact than an empty [`PreflightEvidence`] (preflight ran, waived
+    /// nothing). `None` is also what a `materialize` call with no admission
+    /// record records — the direct-call path the runtime's own tests use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<PreflightEvidence>,
 }
 
 /// What materialization is about to create, recorded before it creates any of
@@ -287,6 +314,26 @@ pub struct SurfacePlan {
     pub work_branch: String,
     /// Repositories that will get a worktree, in estate order.
     pub repositories: Vec<RepositorySpec>,
+    /// §8.1's admission for this plan: the pinned base each repository was
+    /// admitted on, plus every §8.3 finding the operator's override waived.
+    ///
+    /// Journaled here, in `surface.materializing`, because that event is the
+    /// last thing written before `git worktree add` can touch a repository
+    /// sergeant does not own — so "the override and every waived finding are
+    /// journaled with the Work" (§8.3) is durable strictly before the effect
+    /// it authorized, exactly like the plan it travels in.
+    ///
+    /// `#[serde(default)]`: a plan journaled before Phase E replays with an
+    /// empty admission, which is the honest reading (no preflight ran), and
+    /// materialization treats an absent record as "read the mount live", the
+    /// only thing it could ever do then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admitted: Vec<AdmittedRepository>,
+    /// Whether the submission carried `--override-git-preflight` (§8.3).
+    /// Recorded even when it waived nothing: the operator's authorization is
+    /// a fact about the submission, not about what it happened to excuse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub override_git_preflight: bool,
 }
 
 impl SurfacePlan {
@@ -302,7 +349,20 @@ impl SurfacePlan {
             root: surface_root(surfaces_root, work_id),
             work_branch: work_branch(work_id),
             repositories: repositories.to_vec(),
+            admitted: Vec::new(),
+            override_git_preflight: false,
         }
+    }
+
+    /// The same plan, carrying §8.1's admission record.
+    ///
+    /// A builder rather than a fifth parameter on [`Self::new`]: a plan
+    /// reconstructed from a pre-Phase-E journal event legitimately has no
+    /// admission, and every caller that has one has it as a unit.
+    pub fn with_admission(mut self, preflight: &GitPreflight) -> Self {
+        self.admitted = preflight.repositories.clone();
+        self.override_git_preflight = preflight.override_requested;
+        self
     }
 }
 
@@ -617,6 +677,40 @@ pub fn materialize(
     work_id: &str,
     repositories: &[RepositorySpec],
 ) -> Result<WorkSurface, SurfaceError> {
+    materialize_with(data_dir, surfaces_root, work_id, repositories, &[])
+}
+
+/// [`materialize`] against §8.1's admitted facts rather than a live re-read
+/// of each mount — the submission path.
+///
+/// This is what makes §8.2's pin real. `materialize` asks each mount for its
+/// HEAD at the moment it runs; preflight already asked, judged the answer, and
+/// journaled it in the plan, so re-asking here would mean the commit a Work is
+/// based on is not necessarily the commit that was admitted — a mount whose
+/// branch advanced in between would silently move the base, and a detached
+/// mount admitted under §8.3 would re-derive a base branch the override
+/// deliberately recorded as absent.
+///
+/// A repository with no matching admission record falls back to the live read,
+/// which is exactly what [`materialize`] does for every repository: the two
+/// share one body, so the admitted path cannot drift from the direct one.
+pub fn materialize_admitted(
+    data_dir: &Path,
+    surfaces_root: &Path,
+    work_id: &str,
+    repositories: &[RepositorySpec],
+    admitted: &[AdmittedRepository],
+) -> Result<WorkSurface, SurfaceError> {
+    materialize_with(data_dir, surfaces_root, work_id, repositories, admitted)
+}
+
+fn materialize_with(
+    data_dir: &Path,
+    surfaces_root: &Path,
+    work_id: &str,
+    repositories: &[RepositorySpec],
+    admitted: &[AdmittedRepository],
+) -> Result<WorkSurface, SurfaceError> {
     if repositories.is_empty() {
         return Err(SurfaceError::NoRepositories);
     }
@@ -633,12 +727,16 @@ pub fn materialize(
 
     let mut bindings: Vec<RepositoryBinding> = Vec::with_capacity(repositories.len());
     for repository in repositories {
-        let outcome = match materialize_one(data_dir, &root, &canonical_root, &branch, repository) {
-            Ok(binding) => init_submodules_if_present(&binding.worktree_path)
-                .map(|()| binding.clone())
-                .map_err(|err| (Some(binding), err)),
-            Err(err) => Err((None, err)),
-        };
+        let pin = admitted
+            .iter()
+            .find(|record| record.repository == repository.name);
+        let outcome =
+            match materialize_one(data_dir, &root, &canonical_root, &branch, repository, pin) {
+                Ok(binding) => init_submodules_if_present(&binding.worktree_path)
+                    .map(|()| binding.clone())
+                    .map_err(|err| (Some(binding), err)),
+                Err(err) => Err((None, err)),
+            };
         match outcome {
             Ok(binding) => bindings.push(binding),
             Err((created, err)) => {
@@ -678,6 +776,7 @@ fn materialize_one(
     canonical_root: &Path,
     branch: &str,
     repository: &RepositorySpec,
+    pin: Option<&AdmittedRepository>,
 ) -> Result<RepositoryBinding, SurfaceError> {
     let worktree_path = root.join(&repository.name);
     let canonical_repo_path =
@@ -705,23 +804,44 @@ fn materialize_one(
     // actual checkout agree with each other; a one-commit lag behind the tip
     // is the same fact it was before (the submit captured a snapshot of HEAD
     // at request time, and that snapshot is what the run executes on).
-    let base_sha = git(&repository.path, &["rev-parse", "HEAD"])?;
-    // A detached HEAD has no branch name; record the fact rather than
-    // inventing one.
-    let base_branch = git(
-        &repository.path,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .unwrap_or_else(|_| "(detached)".to_string());
+    //
+    // §8.2, Phase E: when this materialization came through admission, none of
+    // that reading happens at all — `pin` already carries the base preflight
+    // judged, and re-deriving it here would mean the Work is based on whatever
+    // the mount says *now* rather than on the fact that was admitted and
+    // journaled.  The live read below is the direct-call path (and every
+    // pre-Phase-E replay), unchanged.
+    let base_sha = match pin {
+        Some(record) => record.base_sha.clone(),
+        None => git(&repository.path, &["rev-parse", "HEAD"])?,
+    };
+    // A detached HEAD has no branch name; record the *absence* rather than
+    // inventing a sentinel that reads like one.
+    let base_branch = match pin {
+        Some(record) => record.base_branch.clone(),
+        None => git(
+            &repository.path,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+        .ok(),
+    };
 
     // §3.5's two canonical identities, read here — once, outside the lock,
     // alongside the other admission facts — and then used for both purposes
     // they exist for: the lock key below, and the binding's own record of what
     // this repository *was* at admission.  Deriving them here rather than
     // inside the span is the whole point: `with_repository` must never spawn
-    // a `git rev-parse` while holding a registry lock.
-    let canonical_top_level = canonical_git_top_level(&repository.path).ok();
-    let canonical_common_dir = canonical_git_common_dir(&repository.path).ok();
+    // a `git rev-parse` while holding a registry lock.  An admitted
+    // materialization has both already, resolved by the same two functions
+    // during preflight.
+    let canonical_top_level = match pin {
+        Some(record) => Some(record.canonical_top_level.clone()),
+        None => canonical_git_top_level(&repository.path).ok(),
+    };
+    let canonical_common_dir = match pin {
+        Some(record) => Some(record.canonical_common_dir.clone()),
+        None => canonical_git_common_dir(&repository.path).ok(),
+    };
     let gate =
         RepositoryGate::from_common_dir(data_dir, canonical_common_dir.clone(), &repository.path);
 
@@ -807,6 +927,11 @@ fn materialize_one(
         // that path is not a common directory — journaling it as one would
         // record a value that only usually means what the field says.
         canonical_common_dir,
+        // §3.5: the preflight result travels with the binding it admitted.
+        // `None` when this materialization did not come through admission —
+        // "no preflight ran" is a different fact from "preflight waived
+        // nothing".
+        preflight: pin.map(|record| record.evidence.clone()),
     })
 }
 
@@ -1068,6 +1193,12 @@ fn attach_one(
         },
         canonical_top_level,
         canonical_common_dir,
+        // Carried over from the target's own binding, exactly like
+        // `base_branch`/`base_sha` above: this binding did not go through an
+        // admission of its own — it attached to a branch a different Work
+        // already admitted — so the honest record is that Work's evidence,
+        // not a fresh empty one implying nothing was ever waived.
+        preflight: target.preflight.clone(),
     })
 }
 
@@ -2324,6 +2455,63 @@ mod tests {
             name: "solo".to_string(),
             path: path.to_path_buf(),
         }
+    }
+
+    /// Amendment C3: every journal change is additive. A `surface.materialized`
+    /// payload written before Phase E has no `preflight` key and a plain
+    /// string `base_branch`, and both must replay as exactly the facts they
+    /// recorded — nothing invented, and "no preflight ran" distinguishable
+    /// from "preflight waived nothing".
+    #[test]
+    fn a_pre_phase_e_binding_replays_with_no_preflight_evidence() {
+        let payload = serde_json::json!({
+            "repository": "api",
+            "source_path": "/estate/repos/api",
+            "base_branch": "main",
+            "base_sha": "a".repeat(40),
+            "worktree_path": "/data/surfaces/01OLD/api",
+            "work_branch": "sergeant/01OLD",
+            "head_sha": "a".repeat(40),
+        });
+        let binding: RepositoryBinding =
+            serde_json::from_value(payload).expect("a pre-Phase-E binding still deserializes");
+        assert_eq!(binding.base_branch.as_deref(), Some("main"));
+        assert_eq!(
+            binding.preflight, None,
+            "absent means no preflight ran — never an empty evidence record, which would \
+             claim preflight ran and waived nothing"
+        );
+        assert_eq!(binding.origin, BindingOrigin::Cut);
+        assert_eq!(binding.canonical_top_level, None);
+
+        // And the detached sentinel that field used to carry replays as the
+        // string it was, rather than being silently reinterpreted as absence.
+        let detached = serde_json::json!({
+            "repository": "api",
+            "source_path": "/estate/repos/api",
+            "base_branch": "(detached)",
+            "base_sha": "b".repeat(40),
+            "worktree_path": "/data/surfaces/01OLD/api",
+            "work_branch": "sergeant/01OLD",
+            "head_sha": "b".repeat(40),
+        });
+        let binding: RepositoryBinding = serde_json::from_value(detached).expect("replays");
+        assert_eq!(binding.base_branch.as_deref(), Some("(detached)"));
+    }
+
+    /// The same rule for the plan: a `surface.materializing` from before
+    /// Phase E carries no admission at all, and materializing from it falls
+    /// back to reading the mount — the only thing it could ever do.
+    #[test]
+    fn a_pre_phase_e_surface_plan_replays_with_no_admission() {
+        let payload = serde_json::json!({
+            "root": "/data/surfaces/01OLD",
+            "work_branch": "sergeant/01OLD",
+            "repositories": [{"name": "api", "path": "/estate/repos/api"}],
+        });
+        let plan: SurfacePlan = serde_json::from_value(payload).expect("replays");
+        assert!(plan.admitted.is_empty());
+        assert!(!plan.override_git_preflight);
     }
 
     /// §11: "runtime work surfaces live outside the source checkout". A data

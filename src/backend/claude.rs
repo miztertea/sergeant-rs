@@ -290,7 +290,13 @@ fn mutation_surface_section(bindings: &[BindingSummary]) -> String {
             binding.repository,
             binding.worktree_path.display(),
             binding.work_branch,
-            binding.base_branch,
+            // A detached admission (§8.3's bounded override) has no named
+            // base branch; say so rather than print a `None`-shaped
+            // placeholder the actor would have to interpret.
+            binding
+                .base_branch
+                .as_deref()
+                .unwrap_or("no named base branch (detached admission)"),
             binding.base_sha,
         ));
     }
@@ -2401,7 +2407,7 @@ mod tests {
             repository: repository.to_string(),
             worktree_path: PathBuf::from(format!("/data/surfaces/01PROMPT/{repository}")),
             work_branch: "sergeant/01PROMPT".to_string(),
-            base_branch: "main".to_string(),
+            base_branch: Some("main".to_string()),
             base_sha: sha.to_string(),
         }
     }
@@ -2461,6 +2467,43 @@ mod tests {
         // And the exclusions §10.1 lists, with the mounts named explicitly.
         assert!(surface.contains("`repos/`"), "{surface}");
         assert!(surface.contains("and nothing else"), "{surface}");
+    }
+
+    /// §8.3's bounded override admits a detached mount, which records an exact
+    /// `base_sha` and no named base branch. The actor is told that in words —
+    /// not a `None`-shaped placeholder it would have to interpret — and the
+    /// pin itself is still carried in full, because the SHA is the only base
+    /// fact such a binding has.
+    #[test]
+    fn a_detached_admission_says_it_has_no_named_base_branch_and_still_names_the_sha() {
+        let api_sha = "c".repeat(40);
+        let web_sha = "d".repeat(40);
+        let mut detached = binding("web", &web_sha);
+        detached.base_branch = None;
+        let request = prompt_request(vec![binding("api", &api_sha), detached]);
+        let prompt = compose_launch_prompt(&request);
+
+        let sections: Vec<&str> = prompt.split("\n\n").collect();
+        let surface = sections[2];
+        assert!(
+            surface.contains(&format!(
+                "- web: /data/surfaces/01PROMPT/web (branch sergeant/01PROMPT, \
+                 cut from no named base branch (detached admission) at {web_sha})"
+            )),
+            "{surface}"
+        );
+        // The named-base arm is unaffected by the detached one beside it.
+        assert!(
+            surface.contains(&format!(
+                "- api: /data/surfaces/01PROMPT/api (branch sergeant/01PROMPT, \
+                 cut from main at {api_sha})"
+            )),
+            "{surface}"
+        );
+        assert!(
+            !surface.contains("None"),
+            "no Rust-shaped placeholder reaches the actor: {surface}"
+        );
     }
 
     /// C2/C3: a request with no binding summary — a `StartRequest` replayed

@@ -1,5 +1,5 @@
 //! Runtime: journal, projections, git, surfaces, integrity, repository
-//! locking, routing, engine, recovery.
+//! locking, git admission preflight, routing, engine, recovery.
 
 pub mod analytics;
 pub mod blob;
@@ -9,6 +9,7 @@ pub mod git;
 pub mod graph;
 pub mod integrity;
 pub mod journal;
+pub mod preflight;
 pub mod projection;
 pub mod recovery;
 pub mod repolock;

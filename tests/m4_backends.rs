@@ -6360,7 +6360,7 @@ fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
     assert_eq!(summary.len(), 1, "one bound repository: {summary:?}");
     assert_eq!(summary[0].repository, "solo");
     assert_eq!(summary[0].work_branch, format!("sergeant/{work_id}"));
-    assert_eq!(summary[0].base_branch, "main");
+    assert_eq!(summary[0].base_branch.as_deref(), Some("main"));
     assert_eq!(summary[0].base_sha, "0".repeat(40));
     assert_eq!(summary[0].worktree_path, data.path());
     let reconciled = events_of(core, work_id, KIND_EXECUTION_RECONCILED);

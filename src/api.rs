@@ -795,6 +795,38 @@ fn engine_error_body(e: &EngineError) -> Value {
     if let EngineError::UnknownGroup { available, .. } = e {
         body["error"]["available_groups"] = json!(available);
     }
+    // estate-root §8.1/§15: a Git admission refusal carries its whole
+    // taxonomy as data. `error.code` is already the *first* failed check's
+    // stable code (`EngineError::code`), which is what a client branches on;
+    // `findings` is every unresolved check across the whole selected scope,
+    // each naming its repository, its §8.1 check number, its own code, the
+    // evidence, and its remedy — so a multi-repository scope is fixed in one
+    // pass rather than one submission per repository.
+    //
+    // `override_available` is §15's dirty/detached row ("mention the bounded
+    // --override-git-preflight escape hatch") answered as a boolean rather
+    // than left for a client to infer from the code — and answered `false`
+    // for exactly the row that must not offer it: an unresolvable HEAD, where
+    // no exact base can be pinned at all.
+    if let EngineError::GitPreflight(refusal) = e {
+        body["error"]["findings"] = json!(
+            refusal
+                .findings
+                .iter()
+                .map(|finding| json!({
+                    "repository": finding.repository,
+                    "check": finding.check,
+                    "check_number": finding.check.number(),
+                    "code": finding.code(),
+                    "detail": finding.detail,
+                    "remedy": finding.remedy(),
+                    "waivable": finding.check.waivable(),
+                    "porcelain": finding.porcelain,
+                }))
+                .collect::<Vec<Value>>()
+        );
+        body["error"]["override_available"] = json!(refusal.override_would_help());
+    }
     body
 }
 
@@ -1082,6 +1114,18 @@ struct SubmitRequest {
     /// nothing here drives routing, exactly like `intent_detail` above.
     #[serde(default)]
     envelope: Option<EnvelopeRequest>,
+    /// estate-root §8.3's one bounded override, as `sgt run
+    /// --override-git-preflight` sends it.
+    ///
+    /// **It has exactly one source: this field, on this request.** §8.3: "it
+    /// is never available from run defaults or a run template; the operator
+    /// must type it for that submission." There is deliberately no daemon
+    /// config key, no `[estate]` manifest key, and no profile field that can
+    /// set it — `#[serde(default)]` means a submission that does not say so
+    /// is not overriding anything, and nothing else in the process can make
+    /// this `true`.
+    #[serde(default)]
+    override_git_preflight: bool,
 }
 
 /// R-MVP1-7's envelope override, sanity-checked at submit: a turn cap of 0
@@ -1202,6 +1246,14 @@ async fn submit_work(
     // same single-writer decision it always was — just made after the reading
     // rather than around it.
     let origin = req.origin.clone().unwrap_or_default();
+    // §8.1 checks 9 and 10 are questions about `sergeant/<work-id>` and this
+    // Work's own surface directory, so the id has to exist before the record
+    // does. Minting it here — side-effect free, and *not* durable until the
+    // `work.submitted` append far below — is what lets the whole Git
+    // admission contract run "before a Work record exists". Every path that
+    // does not reach that append (a preflight refusal, a replayed
+    // `command_id`, an empty intent) simply discards it.
+    let work_id_candidate = ulid::Ulid::generate().to_string();
     let planned = if req.intent.trim().is_empty() {
         None
     } else {
@@ -1212,6 +1264,8 @@ async fn submit_work(
         let scope = req.scope.clone();
         let origin_cwd = origin.cwd.clone();
         let origin_client = origin.client.clone();
+        let candidate = work_id_candidate.clone();
+        let override_git_preflight = req.override_git_preflight;
         Some(
             blocking(move || {
                 engine.plan(&SubmitContext {
@@ -1223,6 +1277,8 @@ async fn submit_work(
                     repos: &scope.repos,
                     group: scope.group.as_deref(),
                     all: scope.all,
+                    work_id: Some(&candidate),
+                    override_git_preflight,
                 })
             })
             .await,
@@ -1357,7 +1413,8 @@ async fn submit_work(
         .unwrap_or_else(|| scope_request.repos.clone());
 
     let work = Work {
-        id: ulid::Ulid::generate().to_string(),
+        // The id §8.1's checks 9 and 10 were already asked about, above.
+        id: work_id_candidate,
         // §7.4: `--workspace`/`SubmitRequest.workspace` no longer exist.
         // `Work.workspace` is kept only so a pre-Phase-C journal event still
         // deserializes (`Work::workspace`'s doc comment, which also says why
@@ -1378,6 +1435,8 @@ async fn submit_work(
         // I3's own rule, reused: an empty `{}` override is the same fact as
         // sending nothing.
         envelope: req.envelope.filter(|e| !e.is_empty()),
+        // §8.3: the authorization the operator gave for this one submission.
+        git_preflight_override: req.override_git_preflight,
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),

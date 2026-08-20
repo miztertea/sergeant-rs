@@ -3459,6 +3459,12 @@ fn t11_external_effects_live_only_in_the_out_of_lock_performers() {
 
     for effect in [
         "materialize(",
+        // estate-root Phase E: the submission path calls this instead of
+        // `materialize` (it hands over §8.1's admitted base rather than
+        // re-reading each mount). It is the same external effect and must
+        // stay inside the same out-of-lock performer, so it is named here —
+        // a new entry point must not be able to slip the guard this test is.
+        "materialize_admitted(",
         "rematerialize(",
         "teardown(",
         "backend.launch(",

@@ -132,6 +132,27 @@ enum Command {
         /// applies otherwise).
         #[arg(long)]
         ceiling_secs: Option<u64>,
+        /// estate-root §8.3's one bounded override of the Git admission
+        /// preflight. Waives exactly two normal cautions, and only because an
+        /// exact commit can still be pinned in both: a **dirty** mount (the
+        /// Work is based on the committed HEAD, the full porcelain evidence
+        /// is journaled, and the uncommitted changes are explicitly excluded)
+        /// and a **detached** mount (the exact HEAD is pinned and no named
+        /// base branch is recorded).
+        ///
+        /// It never waives an invalid estate, unresolved scope, an unknown
+        /// repository, an aliased mount, an unresolvable top level/common
+        /// dir/commit, a lock conflict, an existing Work ref or path, a
+        /// failed surface construction, or a backend/workflow/profile
+        /// failure. "Override may waive policy caution. It may not replace a
+        /// missing fact or overcome mechanical impossibility."
+        ///
+        /// Deliberately a flag on this one verb and nothing else: §8.3 makes
+        /// it unavailable from run defaults and run templates, so there is no
+        /// config key, no `[estate]` key and no profile field that can supply
+        /// it — the operator types it for that submission or it is not set.
+        #[arg(long)]
+        override_git_preflight: bool,
     },
     /// Inspect work items.
     Work {
@@ -700,6 +721,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             all,
             turns,
             ceiling_secs,
+            override_git_preflight,
         } => {
             // estate-root proposal §7.2: scope resolution is core-owned. The
             // CLI forwards `--repo`/`--group`/`--all` verbatim as
@@ -729,6 +751,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     "all": all,
                 },
                 "envelope": envelope,
+                // §8.3: forwarded verbatim from the flag, with no default
+                // layer of any kind between the two — the daemon reads it off
+                // this one request field.
+                "override_git_preflight": override_git_preflight,
                 "created_by": "cli",
                 "origin": origin(),
             });
