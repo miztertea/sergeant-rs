@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiClient, ClientError};
 use crate::daemon::{self, RuntimeDescriptor};
+use crate::domain::workspace::{EstateRoot, RootSource, Workspace};
 
 /// How long the client waits for a spawned daemon to publish a healthy
 /// descriptor before giving up.
@@ -53,7 +54,15 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
     about = "sergeant-rs: local agent execution surface"
 )]
 struct Sgt {
-    /// Data directory (default: $SGT_DATA_DIR, then the discovered estate's
+    /// Estate root to address, instead of the current directory (C10).
+    ///
+    /// Names an **exact** root: no search happens from it, and it is
+    /// validated by exactly the same rule the current directory is (§4.1).
+    /// The CLI is agent-first — an agent should not have to mutate its own
+    /// working directory to address an estate.
+    #[arg(short = 'C', global = true, value_name = "ESTATE_ROOT")]
+    chdir: Option<PathBuf>,
+    /// Data directory (default: $SGT_DATA_DIR, then the estate root's
     /// .sergeant/data, then $XDG_DATA_HOME/sergeant, then
     /// ~/.local/share/sergeant).
     #[arg(long, global = true)]
@@ -495,60 +504,126 @@ pub fn main() -> ExitCode {
     }
 }
 
+/// The exact directory this invocation addresses (§4.1, C10): `-C <path>`
+/// when given, else the process's own working directory. Never searched
+/// from, in either case.
+fn effective_root(chdir: Option<&Path>) -> Result<(PathBuf, RootSource), CliError> {
+    match chdir {
+        Some(path) => Ok((path.to_path_buf(), RootSource::Flag)),
+        None => Ok((std::env::current_dir()?, RootSource::Cwd)),
+    }
+}
+
+/// `SGT_ESTATE_ROOT`, when it names a *valid* estate root strictly above
+/// `dir` — §4.4's second diagnostic block, and the only thing this variable
+/// is ever consulted for. **It never waives the exact-root check** (§5.3):
+/// it can only make a refusal more informative, never turn one into an
+/// admission.
+fn bound_root_above(dir: &Path) -> Option<PathBuf> {
+    let bound = std::env::var_os("SGT_ESTATE_ROOT")?;
+    let bound = std::fs::canonicalize(PathBuf::from(bound)).ok()?;
+    let here = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if here == bound || !here.starts_with(&bound) {
+        return None;
+    }
+    Workspace::admit(&bound).ok().map(|admitted| admitted.path)
+}
+
+/// §4.1/§4.3's gate: admit the exact root, or refuse with §4.4's diagnostic.
+///
+/// Every estate-scoped command calls this **first** — before data-dir
+/// resolution, descriptor lookup, spawn, API call, repository inspection, or
+/// harness exec — so a directory mistake can never attach to or spawn the
+/// wrong daemon.
+fn admit_root(dir: &Path, source: RootSource) -> Result<EstateRoot, CliError> {
+    Workspace::admit(dir).map_err(|e| {
+        let e = if source == RootSource::Flag {
+            e.via_flag()
+        } else {
+            e
+        };
+        let e = match bound_root_above(dir) {
+            Some(bound) => e.with_bound_root(bound),
+            None => e,
+        };
+        CliError::new(e.to_string())
+    })
+}
+
 /// Resolve the data dir: `--data-dir` flag, `SGT_DATA_DIR` — both unchanged,
-/// unconditional precedence — then (U-R2, MVP-3's estate-resolved default) an
-/// estate discovered by walking upward from the current directory, mirroring
-/// R-MVP1-12: filesystem-first, crossing git boundaries, bounded at `$HOME`.
-/// When one is found, the default is the manifest's own `[estate] data_dir`
-/// if it declares one (ADR 0008(b)), else `<estate_root>/.sergeant/data` —
-/// the same path `sgt init` scaffolds a `.gitignore` entry for
-/// ([`crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR`]). Both `data_dir`
-/// and the hardcoded default sit *below* the flag and `SGT_DATA_DIR`: ADR
-/// 0008(a) upholds estate-first precedence over the pre-estate platform
-/// fallback unchanged, and does not touch the flag/env rungs above it — a
-/// manifest declaration is consulted only once estate discovery has already
-/// won that race, narrowing what it would otherwise default to, exactly as
-/// `surfaces_dir` narrows the daemon's own default rather than outranking an
-/// explicit override. This is a new fallback *rung*, not a replacement: only
-/// once no estate is found (or the current directory cannot even be read)
-/// does resolution fall through to the pre-estate default, which is a
-/// platform fact ([`crate::platform::data_dir`], #82) — `$XDG_DATA_HOME/sergeant`
-/// or `~/.local/share/sergeant` on Linux, unchanged from before that
-/// boundary existed.
-fn resolve_data_dir(flag: Option<PathBuf>) -> Result<PathBuf, CliError> {
+/// unconditional precedence — then (U-R2, MVP-3's estate-resolved default)
+/// the estate at `root`, when `root` is one. The default there is the
+/// manifest's own `[estate] data_dir` if it declares one (ADR 0008(b)), else
+/// `<estate_root>/.sergeant/data` — the same path `sgt init` scaffolds a
+/// `.gitignore` entry for ([`crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR`]).
+/// Both `data_dir` and the hardcoded default sit *below* the flag and
+/// `SGT_DATA_DIR`: ADR 0008(a) upholds estate-first precedence over the
+/// pre-estate platform fallback unchanged, and does not touch the flag/env
+/// rungs above it — a manifest declaration is consulted only once the estate
+/// has already won that race, narrowing what it would otherwise default to,
+/// exactly as `surfaces_dir` narrows the daemon's own default rather than
+/// outranking an explicit override. Only once `root` is not an estate root
+/// (the unscoped commands' case — an estate-scoped one never gets this far,
+/// §4.3) does resolution fall through to the pre-estate default, a platform
+/// fact ([`crate::platform::data_dir`], #82).
+///
+/// **Estate-root Phase D:** the "discovered estate" rung is now the *exact*
+/// root, never an upward walk. The flag/env rungs above it are untouched —
+/// they locate a data dir, and have never substituted for root validation.
+fn resolve_data_dir(flag: Option<PathBuf>, root: &Path) -> Result<PathBuf, CliError> {
     if let Some(dir) = flag {
         return Ok(dir);
     }
     if let Some(dir) = std::env::var_os("SGT_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    if let Ok(cwd) = std::env::current_dir()
-        && let Some((estate_root, data_dir)) =
-            crate::domain::workspace::Workspace::estate_root_and_data_dir(&cwd, None)?
-    {
-        return Ok(data_dir.unwrap_or_else(|| {
-            estate_root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR)
-        }));
+    if Workspace::is_estate_root(root)? {
+        return Ok(Workspace::root_data_dir_override(root)?
+            .unwrap_or_else(|| root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR)));
     }
     crate::platform::data_dir::fallback_dir(|name| std::env::var_os(name)).map_err(CliError::new)
 }
 
+/// §4.2: which commands require an exact estate root, and which are
+/// deliberately usable outside one.
+///
+/// Estate-scoped: `run`, `status`, `work *`, `respond`/`retry`/`extend`/
+/// `cancel`, `watch`, `analytics`, `tui`, `daemon`(+`stop`), `repo *`,
+/// `group *`, `workflow *`, and the four harnesses. Unscoped: bare `sgt`,
+/// `--help`, `--version`, `init`, `doctor` — nothing else.
+fn is_estate_scoped(command: &Command) -> bool {
+    !matches!(command, Command::Doctor | Command::Init { .. })
+}
+
 async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
     let data_dir_flag = sgt.data_dir.clone();
-    let data_dir = resolve_data_dir(sgt.data_dir)?;
+    let (root, root_source) = effective_root(sgt.chdir.as_deref())?;
     let Some(command) = sgt.command else {
         // ADR 0010 (D6, deviation from proposal §30 registered in
         // `GAUNTLET.md`): bare `sgt` is a homepage, not the TUI, and it
         // contacts no daemon at all — that is what dissolves ADR 0009's
         // hardest case (a human-facing surface with nothing to reconnect
         // to) rather than answering it. `sgt tui` is the explicit verb.
-        print_homepage();
+        print_homepage(&root);
         return Ok(());
     };
+    // §4.3: root validation precedes data-directory resolution, runtime-
+    // descriptor lookup, daemon auto-spawn, API calls, repository
+    // inspection, and harness preparation or exec. A directory mistake
+    // therefore cannot attach to or spawn the wrong daemon.
+    let estate = if is_estate_scoped(&command) {
+        Some(admit_root(&root, root_source)?)
+    } else {
+        None
+    };
+    let data_dir = resolve_data_dir(
+        sgt.data_dir,
+        estate.as_ref().map(|e| e.path.as_path()).unwrap_or(&root),
+    )?;
     match command {
         Command::Daemon { command: None } => {
             tracing_subscriber::fmt().init();
-            daemon::run_until_signal(&data_dir).await?;
+            daemon::run_until_signal(&data_dir, estate.as_ref().map(|e| e.path.as_path())).await?;
             Ok(())
         }
         Command::Daemon {
@@ -636,7 +711,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // expansion (MVP-3 finding MVP3-C2, R-MVP1-5(b)); §7.2's own
             // rule — "a client surface adds usability, never functionality"
             // — is exactly what retires that.
-            let client = ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
             } else {
@@ -666,7 +741,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Respond { id, input } => {
-            let client = ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "input": input,
@@ -680,7 +755,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Retry { id } => {
-            let client = ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/retry"), &body).await?;
             if sgt.json {
@@ -694,7 +769,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             id,
             additional_turns,
         } => {
-            let client = ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "additional_turns": additional_turns,
@@ -745,7 +820,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
                 return Ok(());
             }
-            let client = ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let result = client.reap(&id, true).await?;
             if sgt.json {
                 print_json(&result);
@@ -878,7 +953,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Cancel { id } => {
-            let client = ensure_daemon(&data_dir).await?;
+            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/cancel"), &body).await?;
             if sgt.json {
@@ -925,7 +1000,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             crate::tui::run(client).await.map_err(CliError::from)
         }
         Command::Doctor => {
-            let report = doctor::run(&data_dir).await;
+            let report = doctor::run(&data_dir, &root).await;
             if sgt.json {
                 print_json(&report.to_json());
             } else {
@@ -941,7 +1016,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Init { name } => {
-            let cwd = std::env::current_dir()?;
+            let cwd = root.clone();
             let outcome = crate::domain::manifest::init_estate(&cwd, name.as_deref())?;
             // ADR 0014 decision 1: the distro (AGENTS.md, skills/,
             // .sergeant/common/contexts/, .sergeant/workflows/) is embedded
@@ -955,8 +1030,8 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // fresh estate estate discovery had nothing to find yet and
             // this report would otherwise self-check the pre-estate
             // fallback and call it `[ok]` (#164).
-            let data_dir = resolve_data_dir(data_dir_flag)?;
-            let report = doctor::run(&data_dir).await;
+            let data_dir = resolve_data_dir(data_dir_flag, &cwd)?;
+            let report = doctor::run(&data_dir, &cwd).await;
             if sgt.json {
                 print_json(&json!({
                     "outcome": {
@@ -1007,47 +1082,59 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 Err(CliError::silent())
             }
         }
-        Command::Repo { command } => repo_command(sgt.json, &data_dir, command).await,
-        Command::Group { command } => group_command(sgt.json, &data_dir, command).await,
-        Command::Workflow { command } => workflow_command(sgt.json, &data_dir, command).await,
-        Command::Claude { args } => exec_harness("claude", &args, &data_dir),
-        Command::Codex { args } => exec_harness("codex", &args, &data_dir),
-        Command::Opencode { args } => exec_harness("opencode", &args, &data_dir),
-        Command::Goose { args } => exec_harness("goose", &args, &data_dir),
+        Command::Repo { command } => repo_command(sgt.json, &estate_root(&estate), command).await,
+        Command::Group { command } => group_command(sgt.json, &estate_root(&estate), command).await,
+        Command::Workflow { command } => {
+            workflow_command(sgt.json, &estate_root(&estate), command).await
+        }
+        Command::Claude { args } => exec_harness("claude", &args, &estate_root(&estate), &data_dir),
+        Command::Codex { args } => exec_harness("codex", &args, &estate_root(&estate), &data_dir),
+        Command::Opencode { args } => {
+            exec_harness("opencode", &args, &estate_root(&estate), &data_dir)
+        }
+        Command::Goose { args } => exec_harness("goose", &args, &estate_root(&estate), &data_dir),
     }
 }
 
-/// `sgt <harness>`'s dispatch (ADR 0006, D2): compose the environment, bind
-/// `data_dir` — already resolved by [`resolve_data_dir`]'s own ladder, so
-/// this binds to exactly what this invocation decided rather than
-/// re-deriving it — then exec. [`crate::harness::exec`] only ever returns on
-/// failure; a successful exec replaces this process and never returns here
-/// at all, which is the whole point of the boundary (module docs).
-fn exec_harness(binary: &str, args: &[String], data_dir: &Path) -> Result<(), CliError> {
-    let command = crate::harness::prepare(binary, args, data_dir);
+/// `sgt <harness>`'s dispatch (ADR 0006, D2, §5.3): the exact root has
+/// already been admitted by [`dispatch`] before this runs (§4.3 — validation
+/// precedes harness preparation *and* exec), so this composes the
+/// environment, binds `estate_root`/`data_dir`, and execs.
+/// [`crate::harness::exec`] only ever returns on failure; a successful exec
+/// replaces this process and never returns here at all, which is the whole
+/// point of the boundary (module docs).
+fn exec_harness(
+    binary: &str,
+    args: &[String],
+    estate_root: &Path,
+    data_dir: &Path,
+) -> Result<(), CliError> {
+    let command = crate::harness::prepare(binary, args, estate_root, data_dir);
     let err = crate::harness::exec(command);
     Err(CliError::new(format!("cannot exec `{binary}`: {err}")))
 }
 
-/// The estate root every `sgt repo`/`sgt group` verb edits: discovered from
-/// the current directory (R-MVP1-12's own walk, bounded at `$HOME` and at
-/// this daemon's own data dir), never created by these verbs — that is
-/// `sgt init`'s job.
-fn discover_estate_root(data_dir: &Path) -> Result<PathBuf, CliError> {
-    let cwd = std::env::current_dir()?;
-    crate::domain::workspace::Workspace::estate_root(&cwd, Some(data_dir))?.ok_or_else(|| {
-        CliError::new(
-            "no estate found above the current directory (bounded at $HOME) — run `sgt init` \
-             first, at the directory that should become the estate root",
-        )
-    })
+/// The admitted root, for the estate-scoped arms of [`dispatch`].
+///
+/// Infallible by construction: [`dispatch`] admits the root for every
+/// command [`is_estate_scoped`] answers `true` for, before any of these arms
+/// can run — §4.3's ordering, expressed in the types rather than re-checked.
+fn estate_root(estate: &Option<EstateRoot>) -> PathBuf {
+    estate
+        .as_ref()
+        .expect("dispatch admits the root for every estate-scoped command")
+        .path
+        .clone()
 }
 
 /// `sgt repo add/remove/list` (MVP-3): a pure manifest edit/read, no daemon
 /// involved — repository declarations are estate topology (§9), not runtime
 /// state.
-async fn repo_command(json: bool, data_dir: &Path, command: RepoCommand) -> Result<(), CliError> {
-    let estate_root = discover_estate_root(data_dir)?;
+async fn repo_command(
+    json: bool,
+    estate_root: &Path,
+    command: RepoCommand,
+) -> Result<(), CliError> {
     match command {
         RepoCommand::Add {
             name,
@@ -1064,7 +1151,7 @@ async fn repo_command(json: bool, data_dir: &Path, command: RepoCommand) -> Resu
                     )));
                 }
             };
-            crate::domain::manifest::add_repo(&estate_root, &name, origin.as_deref(), policy)?;
+            crate::domain::manifest::add_repo(estate_root, &name, origin.as_deref(), policy)?;
             if json {
                 print_json(&json!({"added": name}));
             } else {
@@ -1076,7 +1163,7 @@ async fn repo_command(json: bool, data_dir: &Path, command: RepoCommand) -> Resu
             Ok(())
         }
         RepoCommand::Remove { name } => {
-            crate::domain::manifest::remove_repo(&estate_root, &name)?;
+            crate::domain::manifest::remove_repo(estate_root, &name)?;
             if json {
                 print_json(&json!({"removed": name}));
             } else {
@@ -1117,11 +1204,14 @@ async fn repo_command(json: bool, data_dir: &Path, command: RepoCommand) -> Resu
 
 /// `sgt group add/remove/list` (MVP-3): a pure manifest edit/read, same
 /// rationale as [`repo_command`].
-async fn group_command(json: bool, data_dir: &Path, command: GroupCommand) -> Result<(), CliError> {
-    let estate_root = discover_estate_root(data_dir)?;
+async fn group_command(
+    json: bool,
+    estate_root: &Path,
+    command: GroupCommand,
+) -> Result<(), CliError> {
     match command {
         GroupCommand::Add { name, repos, brief } => {
-            crate::domain::manifest::add_group(&estate_root, &name, &repos, brief.as_deref())?;
+            crate::domain::manifest::add_group(estate_root, &name, &repos, brief.as_deref())?;
             if json {
                 print_json(&json!({"group": name}));
             } else {
@@ -1130,7 +1220,7 @@ async fn group_command(json: bool, data_dir: &Path, command: GroupCommand) -> Re
             Ok(())
         }
         GroupCommand::Remove { name, repos } => {
-            crate::domain::manifest::remove_group(&estate_root, &name, &repos)?;
+            crate::domain::manifest::remove_group(estate_root, &name, &repos)?;
             if json {
                 print_json(&json!({"group": name}));
             } else if repos.is_empty() {
@@ -1174,13 +1264,12 @@ async fn group_command(json: bool, data_dir: &Path, command: GroupCommand) -> Re
 /// daemon involved.
 async fn workflow_command(
     json: bool,
-    data_dir: &Path,
+    estate_root: &Path,
     command: WorkflowCommand,
 ) -> Result<(), CliError> {
-    let estate_root = discover_estate_root(data_dir)?;
     match command {
         WorkflowCommand::Fork { name } => {
-            let forked = crate::domain::workflow::fork(&estate_root, &name)?;
+            let forked = crate::domain::workflow::fork(estate_root, &name)?;
             if json {
                 print_json(&json!({"forked": name, "path": forked.display().to_string()}));
             } else {
@@ -1463,25 +1552,24 @@ const LOGO: &str = r"
 /// that direction: outside an estate it points at `sgt init`; inside one it
 /// names the estate and its declared repository count, the same client-side
 /// manifest read every other estate-aware verb in this binary does.
-fn print_homepage() {
+fn print_homepage(root: &Path) {
     println!("{}", LOGO.trim_end_matches('\n'));
     println!();
-    let estate = std::env::current_dir().ok().and_then(|cwd| {
-        crate::domain::workspace::Workspace::estate_root(&cwd, None)
-            .ok()
-            .flatten()
-    });
-    match estate {
-        Some(root) => {
-            let manifest = root.join(crate::domain::workspace::WORKSPACE_FILE);
-            match crate::domain::workspace::Workspace::from_config_allow_empty(&manifest) {
+    // §4.1: the exact directory, never a parent. Bare `sgt` is unscoped, so
+    // "this is not an estate root" is information here, not a refusal.
+    match Workspace::admit(root) {
+        Ok(admitted) => {
+            match Workspace::from_config_allow_empty(&admitted.manifest_path) {
                 Ok(workspace) => println!(
                     "estate {:?} at {} — {} repositories declared",
                     workspace.name,
-                    root.display(),
+                    admitted.path.display(),
                     workspace.repositories.len(),
                 ),
-                Err(e) => println!("estate at {} could not be read: {e}", root.display()),
+                Err(e) => println!(
+                    "estate at {} could not be read: {e}",
+                    admitted.path.display()
+                ),
             }
             println!();
             println!("  sgt doctor              diagnose this installation");
@@ -1489,10 +1577,12 @@ fn print_homepage() {
             println!("  sgt run \"<intent>\"      submit work");
             println!("  sgt tui                 open the cockpit");
         }
-        None => {
-            println!("no estate found above the current directory");
+        Err(_) => {
+            println!("{} is not an estate root", root.display());
+            println!("(sergeant does not search parent directories for one)");
             println!();
             println!("  sgt init                scaffold one here");
+            println!("  sgt -C <estate-root>    address an estate elsewhere");
             println!("  sgt doctor              diagnose this installation");
         }
     }
@@ -1507,7 +1597,7 @@ fn print_homepage() {
 /// API client ([`ApiClient`], defined next to the router it speaks to). Only
 /// the mutating verbs (ADR 0009) come through here; every observation verb,
 /// TUI included, goes through [`observe_connect`] instead.
-async fn ensure_daemon(data_dir: &Path) -> Result<ApiClient, CliError> {
+async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient, CliError> {
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
@@ -1543,7 +1633,7 @@ async fn ensure_daemon(data_dir: &Path) -> Result<ApiClient, CliError> {
         None
     };
 
-    spawn_daemon(data_dir)?;
+    spawn_daemon(data_dir, estate_root)?;
 
     // Wait for a healthy descriptor. It may be written by our child or by a
     // concurrently racing client's child — either is fine; the daemon lock
@@ -1654,7 +1744,7 @@ async fn healthz_ok(http: &reqwest::Client, endpoint: &str) -> bool {
 /// `daemon.log` in the data dir. The child is *not* waited on — it outlives
 /// this client by design; losing the daemon-lock race makes it exit on its
 /// own.
-fn spawn_daemon(data_dir: &Path) -> Result<(), CliError> {
+fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
     std::fs::create_dir_all(data_dir)?;
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
@@ -1663,6 +1753,8 @@ fn spawn_daemon(data_dir: &Path) -> Result<(), CliError> {
         .open(data_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
     command
+        .arg("-C")
+        .arg(estate_root)
         .arg("--data-dir")
         .arg(data_dir)
         .arg("daemon")
@@ -1844,6 +1936,7 @@ pub(crate) mod doctor {
     };
     use crate::backend::docker::{self, DockerBackend, DockerConfig};
     use crate::daemon;
+    use crate::domain::workspace::WORKSPACE_FILE;
     use crate::runtime::analytics::Analytics;
     use crate::runtime::journal::Journal;
 
@@ -1993,7 +2086,7 @@ pub(crate) mod doctor {
     }
 
     /// Run every check against `data_dir`.
-    pub async fn run(data_dir: &Path) -> Report {
+    pub async fn run(data_dir: &Path, root: &Path) -> Report {
         let mut checks = vec![git_check(), claude_check(data_dir), environment_check()];
         // #67: the data dir's own existence and writability is checked
         // before anything that lives *inside* it — the docker adapter's
@@ -2020,9 +2113,18 @@ pub(crate) mod doctor {
         checks.push(journal_check);
         checks.push(projection_check(data_dir, journal_ok));
         checks.push(daemon_check(data_dir).await);
-        checks.push(permission_mode_check(data_dir));
-        checks.push(estate_check(data_dir));
-        checks.push(workflows_check(data_dir));
+        // §4.2: `sgt doctor` is usable outside an estate and never searches
+        // upward. The estate-root row is the one that says out loud whether
+        // this directory is an estate root at all — a failing row with the
+        // §4.4 remedy when it is not, rather than a walk that quietly finds
+        // some other estate and reports on that instead. Threaded down to
+        // the rows beneath it exactly the way `data_dir_ok` is: they decline
+        // by name instead of each re-deriving the same answer.
+        let (estate_root_check, admitted) = estate_root_check(root);
+        checks.push(estate_root_check);
+        checks.push(permission_mode_check(admitted.as_deref()));
+        checks.push(estate_check(admitted.as_deref()));
+        checks.push(workflows_check(admitted.as_deref()));
         // N4/#23 (retention Rule B): disk pressure inside the data dir. Runs
         // after everything above regardless of their outcome — knowing "is
         // this installation about to run out of disk" does not depend on the
@@ -2034,32 +2136,72 @@ pub(crate) mod doctor {
         }
     }
 
+    /// §4.2/§4.4: is the directory this `sgt doctor` was run from an estate
+    /// root at all?
+    ///
+    /// `sgt doctor` is one of the five commands usable outside an estate,
+    /// and §4.2 is explicit about what it must do there: "reports
+    /// installation health and a failing estate-root row with the remedy to
+    /// cd or initialize. It does not start a daemon." So this row **never
+    /// searches upward** — it asks [`Workspace::admit`] about exactly one
+    /// directory — and answers with §4.4's own diagnostic when the answer is
+    /// no, rather than quietly reporting on some other estate found above.
+    ///
+    /// Returns the admitted root alongside the row, so the three estate rows
+    /// beneath it read one already-decided answer instead of each deriving
+    /// their own (the same threading `data_dir_ok` uses).
+    fn estate_root_check(root: &Path) -> (Check, Option<PathBuf>) {
+        use crate::domain::workspace::Workspace;
+
+        match Workspace::admit(root) {
+            Ok(admitted) => {
+                let check = Check::ok(
+                    "estate_root",
+                    format!("{} is an estate root", admitted.path.display()),
+                );
+                (check, Some(admitted.path))
+            }
+            Err(e) => {
+                let e = match super::bound_root_above(root) {
+                    Some(bound) => e.with_bound_root(bound),
+                    None => e,
+                };
+                // The diagnostic already carries the expected path, the
+                // "no parent search" explanation, and the remedy, in §4.4's
+                // own words. Splitting it into detail/remedy would either
+                // duplicate it or lose half of it, so the detail is its
+                // first line and the remedy is the rest.
+                let rendered = e.to_string();
+                let (first, rest) = rendered.split_once('\n').unwrap_or((&rendered, ""));
+                (
+                    Check::fail("estate_root", first.to_string(), rest.trim().to_string()),
+                    None,
+                )
+            }
+        }
+    }
+
     /// §31, #47: the effective `--permission-mode` behavior each declared
     /// profile launches with — the same question `a_profile_is_launch_
     /// configuration_carried_to_the_claude_adapter` pins in code, surfaced
     /// where an operator reading `sgt doctor` will actually see it.
     ///
-    /// Workspace discovery, not the data dir: profiles live in
-    /// `sergeant.toml` at the repository the doctor is *run from*, which is
+    /// The estate manifest, not the data dir: profiles live in
+    /// `sergeant.toml` at the estate root the doctor is *run from*, which is
     /// also why a malformed `permission_mode` here reads as this check's own
     /// failure rather than a mysterious daemon-side refusal later — #47's
     /// fail-closed load already ran by the time this string is built.
-    fn permission_mode_check(data_dir: &Path) -> Check {
-        use crate::domain::workspace::{Workspace, WorkspaceError};
+    ///
+    /// `estate_root` is [`estate_root_check`]'s already-admitted answer
+    /// (§4.1's exact root, `None` when this directory is not one) — never a
+    /// second, independent search.
+    fn permission_mode_check(estate_root: Option<&Path>) -> Check {
+        use crate::domain::workspace::Workspace;
 
-        let cwd = match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                return Check::warn(
-                    "permission_mode",
-                    format!("cannot read the current directory: {e}"),
-                    "run `sgt doctor` from inside the workspace whose profiles you want reported",
-                );
-            }
+        let Some(estate_root) = estate_root else {
+            return Check::ok("permission_mode", "not an estate root — nothing to report");
         };
-        // R-MVP1-12's data-dir scope: bound the upward estate walk at this
-        // installation's own data dir, never above it.
-        match Workspace::discover_scoped(&cwd, Some(data_dir)) {
+        match Workspace::from_config_allow_empty(&estate_root.join(WORKSPACE_FILE)) {
             Ok(workspace) if workspace.profiles.is_empty() => Check::ok(
                 "permission_mode",
                 "no profiles declared — every execution launches with no --permission-mode \
@@ -2081,13 +2223,9 @@ pub(crate) mod doctor {
                     .collect();
                 Check::ok("permission_mode", modes.join(", "))
             }
-            Err(WorkspaceError::NotARepository { .. }) => Check::ok(
-                "permission_mode",
-                "not inside a workspace — nothing to report",
-            ),
             Err(e) => Check::warn(
                 "permission_mode",
-                format!("cannot read this workspace's profiles: {e}"),
+                format!("cannot read this estate's profiles: {e}"),
                 "fix sergeant.toml at the location the error names",
             ),
         }
@@ -2115,31 +2253,11 @@ pub(crate) mod doctor {
     /// one, else the `sgt repo add` command that would set one) and
     /// present-but-undeclared (a directory under `repos/` no `[[repo]]`
     /// entry names).
-    fn estate_check(data_dir: &Path) -> Check {
-        use crate::domain::workspace::{WORKSPACE_FILE, Workspace};
+    fn estate_check(estate_root: Option<&Path>) -> Check {
+        use crate::domain::workspace::Workspace;
 
-        let cwd = match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                return Check::warn(
-                    "estate",
-                    format!("cannot read the current directory: {e}"),
-                    "run `sgt doctor` from inside the estate you want checked",
-                );
-            }
-        };
-        let estate_root = match Workspace::estate_root(&cwd, Some(data_dir)) {
-            Ok(root) => root,
-            Err(e) => {
-                return Check::fail(
-                    "estate",
-                    e.to_string(),
-                    "fix sergeant.toml at the file and location named above",
-                );
-            }
-        };
         let Some(estate_root) = estate_root else {
-            return Check::ok("estate", "not inside an estate — nothing to check");
+            return Check::ok("estate", "not an estate root — nothing to check");
         };
         let manifest_path = estate_root.join(WORKSPACE_FILE);
         let declared = match Workspace::declared_repos(&manifest_path) {
@@ -2250,34 +2368,13 @@ pub(crate) mod doctor {
     /// default still runs unnamed dispatch (§30), so an estate with none is
     /// degraded, not broken. Drift among local packages is also `warn`, not
     /// `fail`: a stale fork still runs — it is stale, not broken.
-    fn workflows_check(data_dir: &Path) -> Check {
+    fn workflows_check(estate_root: Option<&Path>) -> Check {
         use crate::domain::workflow::{
             LOCAL_WORKFLOW_ROOT, WORKFLOW_ROOT, read_index_front_matter,
         };
-        use crate::domain::workspace::Workspace;
 
-        let cwd = match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(e) => {
-                return Check::warn(
-                    "workflows",
-                    format!("cannot read the current directory: {e}"),
-                    "run `sgt doctor` from inside the estate you want checked",
-                );
-            }
-        };
-        let estate_root = match Workspace::estate_root(&cwd, Some(data_dir)) {
-            Ok(root) => root,
-            Err(e) => {
-                return Check::fail(
-                    "workflows",
-                    e.to_string(),
-                    "fix sergeant.toml at the file and location named above",
-                );
-            }
-        };
         let Some(estate_root) = estate_root else {
-            return Check::ok("workflows", "not inside an estate — nothing to check");
+            return Check::ok("workflows", "not an estate root — nothing to check");
         };
 
         let workflows_dir = estate_root.join(WORKFLOW_ROOT);

@@ -1,10 +1,14 @@
 //! Workspace: the repository surface work originates from (proposal §9).
 //!
-//! Single-repository use requires **zero configuration**: the workspace is
-//! whatever `git rev-parse --show-toplevel` says, named after that directory.
-//! Multi-repository use adds one optional checked-in file at the top level
-//! (`sergeant.toml`, deviation D1) declaring the estate name, its
-//! repositories, its defaults, its profiles, and its groups.
+//! **Exact-root admission (estate-root proposal §4.1, Phase D).** An estate is
+//! exactly the directory that itself contains a `sergeant.toml` which parses,
+//! declares `[estate]`, and satisfies the manifest schema. There is no
+//! ancestor walk and no zero-configuration Git fallback: `Workspace::admit`
+//! answers one deterministic question about one directory, and
+//! [`EstateRootError`] carries §4.4's loud corrective diagnostic when the
+//! answer is no. R-MVP1-12 (upward estate discovery across Git boundaries)
+//! and the single-repository zero-config workspace are both **superseded** —
+//! a one-repository installation is an estate with one declared repository.
 //!
 //! **R-MVP1-3: estate vocabulary.** `[estate]` / `[[repo]]` / `[[profile]]` /
 //! `[group.<name>]`, `deny_unknown_fields`. The pre-estate vocabulary
@@ -236,19 +240,246 @@ pub struct Workspace {
     pub repository_origin: BTreeMap<String, String>,
 }
 
+/// An admitted estate root (§4.1): the canonical directory that *is* the
+/// estate, and the manifest that made it one. Produced only by
+/// [`Workspace::admit`], so holding one is proof the exact-root check has
+/// already passed — the type every later step (data-dir resolution,
+/// descriptor lookup, spawn, API call, harness exec) takes as its
+/// precondition, per §4.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EstateRoot {
+    /// Canonical estate root directory.
+    pub path: PathBuf,
+    /// `<path>/sergeant.toml`.
+    pub manifest_path: PathBuf,
+}
+
+/// Where the directory being admitted came from — only ever a wording
+/// difference in [`EstateRootError`]'s remedy, never a difference in the
+/// check itself (C10: `-C` *names* an exact root, it does not search from
+/// one, and it earns no leniency for doing so).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RootSource {
+    /// The process's own working directory.
+    #[default]
+    Cwd,
+    /// An explicit `sgt -C <path>` (C10).
+    Flag,
+}
+
+impl RootSource {
+    /// How the diagnostic names the directory.
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Cwd => "the current directory",
+            Self::Flag => "the directory named by -C",
+        }
+    }
+}
+
+/// §4.4's loud corrective diagnostics: an estate-scoped command refused
+/// before it touched a data dir, a descriptor, a daemon, or a repository.
+///
+/// Every variant's `Display` is the full multi-line block §4.4 specifies —
+/// what was expected, why no parent was searched, and the concrete remedy —
+/// because the whole value of exact-root admission is that the refusal
+/// teaches the operator where they actually are.
+#[derive(Debug, thiserror::Error)]
+pub enum EstateRootError {
+    /// No `sergeant.toml` in the exact directory (§4.4, first block).
+    NoEstate {
+        /// The directory that was checked, canonical.
+        root: PathBuf,
+        /// The path that would have made it an estate.
+        expected: PathBuf,
+        /// How that directory was chosen.
+        via: RootSource,
+    },
+    /// A valid estate root is bound in this environment (`SGT_ESTATE_ROOT`)
+    /// and sits strictly above the directory being addressed — §4.4's
+    /// second block, which names both roots.
+    Descendant {
+        /// The directory that was checked, canonical.
+        root: PathBuf,
+        /// The bound estate root above it, canonical.
+        bound_root: PathBuf,
+        /// How that directory was chosen.
+        via: RootSource,
+    },
+    /// A `sergeant.toml` is there, but declares no `[estate]` table — a
+    /// member repository's own config is not an estate root.
+    NotAnEstate {
+        /// The directory that was checked, canonical.
+        root: PathBuf,
+        /// The file that was read.
+        manifest_path: PathBuf,
+        /// How that directory was chosen.
+        via: RootSource,
+    },
+    /// The manifest exists but is invalid. §4.4's last rule: surface the
+    /// exact parser/schema diagnostic and **never** fall through to another
+    /// estate.
+    Invalid {
+        /// The file that was read.
+        manifest_path: PathBuf,
+        /// The exact diagnostic, line and key included.
+        source: Box<WorkspaceError>,
+    },
+}
+
+impl std::fmt::Display for EstateRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoEstate { expected, via, .. } => write!(
+                f,
+                "no estate found in {subject}\n\
+                 \n\
+                 Expected:\n  \
+                 {expected}\n\
+                 \n\
+                 Sergeant does not search parent directories for an estate. This prevents a\n\
+                 Captain session or Work from silently attaching to the wrong environment.\n\
+                 \n\
+                 Are you in the intended estate root?\n  \
+                 {remedy}\n\
+                 \n\
+                 If this directory should become a new estate:\n  \
+                 sgt init",
+                subject = via.subject(),
+                expected = expected.display(),
+                remedy = match via {
+                    RootSource::Cwd => "cd <estate-root>",
+                    RootSource::Flag => "sgt -C <estate-root> <command>",
+                },
+            ),
+            Self::Descendant {
+                root,
+                bound_root,
+                via,
+            } => write!(
+                f,
+                "this command must be run from the estate root\n\
+                 \n\
+                 {label}:\n  \
+                 {root}\n\
+                 \n\
+                 Bound estate root:\n  \
+                 {bound_root}\n\
+                 \n\
+                 Return to the root and retry:\n  \
+                 {remedy}",
+                label = match via {
+                    RootSource::Cwd => "Current directory",
+                    RootSource::Flag => "Directory named by -C",
+                },
+                root = root.display(),
+                bound_root = bound_root.display(),
+                remedy = match via {
+                    RootSource::Cwd => format!("cd {}", bound_root.display()),
+                    RootSource::Flag => format!("sgt -C {} <command>", bound_root.display()),
+                },
+            ),
+            Self::NotAnEstate {
+                manifest_path, via, ..
+            } => write!(
+                f,
+                "no estate found in {subject}\n\
+                 \n\
+                 Read:\n  \
+                 {manifest_path}\n\
+                 \n\
+                 That file declares no [estate] table, so it is a repository's own config, not\n\
+                 an estate root. Sergeant does not search parent directories for one.\n\
+                 \n\
+                 Are you in the intended estate root?\n  \
+                 {remedy}\n\
+                 \n\
+                 If this directory should become a new estate:\n  \
+                 sgt init",
+                subject = via.subject(),
+                manifest_path = manifest_path.display(),
+                remedy = match via {
+                    RootSource::Cwd => "cd <estate-root>",
+                    RootSource::Flag => "sgt -C <estate-root> <command>",
+                },
+            ),
+            Self::Invalid {
+                manifest_path,
+                source,
+            } => write!(
+                f,
+                "the estate manifest is invalid\n\
+                 \n\
+                 Read:\n  \
+                 {manifest_path}\n\
+                 \n\
+                 {source}\n\
+                 \n\
+                 Sergeant does not search parent directories for another estate. Fix the file\n\
+                 above and retry.",
+                manifest_path = manifest_path.display(),
+            ),
+        }
+    }
+}
+
+impl EstateRootError {
+    /// Re-word this refusal for a root named by `sgt -C` rather than the
+    /// process's cwd (C10). The *check* is identical either way; only the
+    /// remedy line changes, so an agent that addressed the wrong path with
+    /// `-C` is told to fix `-C`, not to `cd`.
+    pub fn via_flag(self) -> Self {
+        match self {
+            Self::NoEstate { root, expected, .. } => Self::NoEstate {
+                root,
+                expected,
+                via: RootSource::Flag,
+            },
+            Self::Descendant {
+                root, bound_root, ..
+            } => Self::Descendant {
+                root,
+                bound_root,
+                via: RootSource::Flag,
+            },
+            Self::NotAnEstate {
+                root,
+                manifest_path,
+                ..
+            } => Self::NotAnEstate {
+                root,
+                manifest_path,
+                via: RootSource::Flag,
+            },
+            invalid @ Self::Invalid { .. } => invalid,
+        }
+    }
+
+    /// §4.4's second block: a "there is no estate here" refusal becomes "you
+    /// are inside one, one level down" when `bound_root` is a *valid* estate
+    /// root strictly above the directory that was checked. Only the
+    /// nothing-here variants are upgraded — a manifest that exists and is
+    /// broken keeps its own exact diagnostic, which §4.4 requires never be
+    /// traded for a pointer at some other estate.
+    pub fn with_bound_root(self, bound_root: PathBuf) -> Self {
+        match self {
+            Self::NoEstate { root, via, .. } | Self::NotAnEstate { root, via, .. }
+                if root.starts_with(&bound_root) && root != bound_root =>
+            {
+                Self::Descendant {
+                    root,
+                    bound_root,
+                    via,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 /// Failure resolving a workspace.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
-    /// The starting directory is not inside a Git repository. This is not a
-    /// misconfiguration — it is the answer "there is no workspace here" — so
-    /// callers distinguish it from the errors below.
-    #[error("{path} is not inside a git repository: {source}")]
-    NotARepository {
-        /// The directory discovery started from.
-        path: String,
-        /// Git's own diagnostic.
-        source: GitError,
-    },
     /// Git itself failed while resolving the workspace.
     #[error(transparent)]
     Git(#[from] GitError),
@@ -377,12 +608,13 @@ pub enum WorkspaceError {
 
 /// The `sergeant.toml` file shape (§9, R-MVP1-3's estate vocabulary).
 ///
-/// `estate` is `Option`, not required: a `sergeant.toml` reached only via
-/// [`Workspace::discover`]'s zero-config git-toplevel fallback (a "member
-/// repo's own config", R-MVP1-12) is a perfectly valid `Workspace` — it just
-/// has no estate metadata to contribute, and its absence is exactly the
-/// signal the upward walk uses to keep looking for the real estate root
-/// rather than mistaking a member's own file for one.
+/// `estate` is `Option` at the *parser* level, not at the admission level: a
+/// `sergeant.toml` with no `[estate]` table is a member repository's own
+/// config, and [`Workspace::admit`] refuses it by name
+/// ([`EstateRootError::NotAnEstate`]) rather than mistaking it for an estate
+/// root. The field stays optional here because `src/domain/manifest.rs`'s
+/// edit pen legitimately parses a manifest mid-scaffold, before `[estate]`
+/// has been written.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceFile {
@@ -477,144 +709,73 @@ fn check_legacy_vocabulary(text: &str, file: &str) -> Result<(), WorkspaceError>
 }
 
 impl Workspace {
-    /// Discover the workspace containing `start` (§9, R-MVP1-12).
+    /// §4.1's one deterministic check, run against exactly `dir` and nothing
+    /// else: is this directory an estate root?
     ///
-    /// **R-MVP1-12: estate discovery walks past inner `.git` boundaries.**
-    /// `git rev-parse --show-toplevel` stops at the innermost `.git`, so from
-    /// inside a member repository it can only ever find that member — never
-    /// an estate root above it. This walks upward from `start`,
-    /// filesystem-first, crossing git boundaries, for the nearest
-    /// `sergeant.toml` carrying an `[estate]` table; a `sergeant.toml`
-    /// without one is a member repo's own config, not an estate, and does
-    /// not stop the walk. Bounded at `$HOME` or the filesystem root,
-    /// whichever comes first. First match wins.
+    /// `dir/sergeant.toml` must exist, parse, declare `[estate]`, and satisfy
+    /// the manifest schema. **No parent is examined and Git is never
+    /// consulted** — that is the whole point of the rule (§4.1: "Sergeant
+    /// does not search parents and does not use Git to infer an estate"),
+    /// and it is what makes a directory mistake incapable of attaching a
+    /// session to the wrong environment.
     ///
-    /// When no `[estate]`-bearing file is found on the way up, this falls
-    /// back to the zero-config path unchanged: `git rev-parse
-    /// --show-toplevel`, one repository named after the directory, its
-    /// topology replaced by a `sergeant.toml` found exactly there (with or
-    /// without `[estate]` — the git-toplevel fallback accepts either, since
-    /// there is nothing further up to prefer it over).
-    ///
-    /// Equivalent to [`Self::discover_scoped`] with no explicit data-dir
-    /// scope — kept as the unscoped entry point so every existing caller
-    /// and fixture that has no data dir of its own to bound against (most
-    /// of this module's own tests among them) keeps working unchanged.
-    pub fn discover(start: &Path) -> Result<Self, WorkspaceError> {
-        Self::discover_scoped(start, None)
-    }
-
-    /// [`Self::discover`], plus R-MVP1-12's other half: the walk never
-    /// ascends past an explicit `--data-dir`/`SGT_DATA_DIR` scope, when the
-    /// caller has one. `$HOME` and the data-dir scope are both candidate
-    /// boundaries; the walk stops at whichever it reaches first ascending
-    /// from `start` (checking that directory's own `sergeant.toml` before
-    /// stopping, exactly as the `$HOME` boundary already does) — a data-dir
-    /// scope that sits *below* `start` (not on its ancestor chain at all,
-    /// the ordinary case: the data dir defaults to
-    /// `~/.local/share/sergeant`, unrelated to any repository) is never
-    /// reached during the ascent and so never changes the outcome; only a
-    /// scope that is itself an ancestor of `start` — the A8 self-hosting
-    /// shape, "data dir in-estate" (`docs/gauntlet/contracts/MVP-1.md`'s own
-    /// Acceptance) — can narrow it.
-    pub fn discover_scoped(start: &Path, data_dir: Option<&Path>) -> Result<Self, WorkspaceError> {
-        if let Some(estate_config) = Self::find_estate_upward(start, data_dir)? {
-            return Self::from_config(&estate_config);
-        }
-        let toplevel = git(start, &["rev-parse", "--show-toplevel"]).map_err(|source| {
-            WorkspaceError::NotARepository {
-                path: start.display().to_string(),
-                source,
-            }
-        })?;
-        let root = PathBuf::from(toplevel);
-        let config_path = root.join(WORKSPACE_FILE);
-        if config_path.is_file() {
-            Self::from_config(&config_path)
-        } else {
-            Ok(Self {
-                name: repo_name(&root),
-                repositories: vec![RepositorySpec {
-                    name: repo_name(&root),
-                    path: root.clone(),
-                }],
+    /// Schema validation here is [`Self::from_config_structural`]'s: every
+    /// check the strict loader makes *except* resolving each declared
+    /// repository through git. A declared repository that is not on disk yet
+    /// is a repository problem, not an estate-identity problem — the design
+    /// capture's own wrongness contract ("a broken repo blocks works
+    /// targeting it, not the estate") — so it must not make the estate
+    /// itself inadmissible, block `sgt repo add`, or refuse a daemon start.
+    /// [`Self::resolve`] is the strict half, for callers that are about to
+    /// bind a Work.
+    pub fn admit(dir: &Path) -> Result<EstateRoot, EstateRootError> {
+        let root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let manifest_path = root.join(WORKSPACE_FILE);
+        if !manifest_path.is_file() {
+            return Err(EstateRootError::NoEstate {
                 root,
-                default_backend: None,
-                default_workflow: None,
-                profiles: Vec::new(),
-                config_path: None,
-                surfaces_dir: None,
-                data_dir: None,
-                repository_policy: BTreeMap::new(),
-                groups: BTreeMap::new(),
-                repository_origin: BTreeMap::new(),
-            })
+                expected: manifest_path,
+                via: RootSource::Cwd,
+            });
         }
+        match estate_table_check(&manifest_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(EstateRootError::NotAnEstate {
+                    root,
+                    manifest_path,
+                    via: RootSource::Cwd,
+                });
+            }
+            Err(e) => {
+                return Err(EstateRootError::Invalid {
+                    manifest_path,
+                    source: Box::new(e),
+                });
+            }
+        }
+        if let Err(e) = Self::from_config_structural(&manifest_path) {
+            return Err(EstateRootError::Invalid {
+                manifest_path,
+                source: Box::new(e),
+            });
+        }
+        Ok(EstateRoot {
+            path: root,
+            manifest_path,
+        })
     }
 
-    /// Walk upward from `start` for the nearest `sergeant.toml` carrying an
-    /// `[estate]` table (R-MVP1-12). Ancestors are canonicalized once before
-    /// the walk (the same symlink hazard `surface.rs:286-289` already
-    /// defends against). Returns `None` rather than an error when nothing
-    /// matches — that is "no estate here", not a malformed-config failure;
-    /// a `sergeant.toml` this walk *does* choose still gets the full
-    /// fail-closed treatment via [`Self::from_config`].
-    ///
-    /// A `sergeant.toml` found along the way whose TOML cannot even be
-    /// parsed enough to check for `[estate]` is treated as "not an estate,
-    /// keep walking" rather than a hard failure: it is not the file this
-    /// walk is trying to find, and an unrelated member repo's broken config
-    /// must not be able to block estate discovery for everything below it.
-    fn find_estate_upward(
-        start: &Path,
-        data_dir: Option<&Path>,
-    ) -> Result<Option<PathBuf>, WorkspaceError> {
-        let boundary = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .and_then(|home| std::fs::canonicalize(&home).ok());
-        let data_dir_scope = data_dir.and_then(|d| std::fs::canonicalize(d).ok());
-        Self::find_estate_upward_bounded(start, boundary.as_deref(), data_dir_scope.as_deref())
-    }
-
-    /// [`Self::find_estate_upward`] with both boundaries passed in rather
-    /// than read from the process environment / caller — split out so each
-    /// is testable without mutating a process-global that every other test
-    /// in this binary also reads (`backend/claude.rs`'s own `$HOME`
-    /// fallback among them). `data_dir_scope` implements R-MVP1-12's
-    /// "never above an explicit `--data-dir`/`SGT_DATA_DIR` scope": one more
-    /// candidate boundary alongside `$HOME`, checked at every directory the
-    /// walk visits so it stops at whichever boundary it reaches first.
-    ///
-    /// A `sergeant.toml` found on the way up that is readable but carries
-    /// legacy vocabulary or fails to parse fails the whole walk closed
-    /// (`Err`), exactly as one found directly would (R-MVP1-3's named
-    /// migration refusal) — this module's own header doctrine, "a typo that
-    /// silently means nothing is worse than a refusal that names the line,"
-    /// applies to a file this walk steps over just as much as one it
-    /// chooses. A file the walk cannot even *read* (permission, race) is not
-    /// this walk's failure to report and is treated as "not an estate, keep
-    /// walking" — the one case genuinely indistinguishable from "no file
-    /// here at all".
-    fn find_estate_upward_bounded(
-        start: &Path,
-        boundary: Option<&Path>,
-        data_dir_scope: Option<&Path>,
-    ) -> Result<Option<PathBuf>, WorkspaceError> {
-        let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
-        let mut dir: &Path = &start;
-        loop {
-            let candidate = dir.join(WORKSPACE_FILE);
-            if candidate.is_file() && estate_table_check(&candidate)? {
-                return Ok(Some(candidate));
-            }
-            if boundary == Some(dir) || data_dir_scope == Some(dir) {
-                return Ok(None);
-            }
-            dir = match dir.parent() {
-                Some(parent) => parent,
-                None => return Ok(None),
-            };
-        }
+    /// [`Self::admit`], then the full strict load: every declared repository
+    /// resolved on disk against its derived `repos/<name>` mount (§6.1).
+    /// This is what the engine plans against — a Work must never bind a
+    /// repository that is not really there.
+    pub fn resolve(dir: &Path) -> Result<Self, EstateRootError> {
+        let admitted = Self::admit(dir)?;
+        Self::from_config(&admitted.manifest_path).map_err(|source| EstateRootError::Invalid {
+            manifest_path: admitted.manifest_path,
+            source: Box::new(source),
+        })
     }
 
     /// Parse and validate a `sergeant.toml` into a workspace.
@@ -736,34 +897,6 @@ impl Workspace {
         config_path: &Path,
     ) -> Result<BTreeMap<String, GroupSpec>, WorkspaceError> {
         Ok(Self::from_config_impl_structural(config_path)?.groups)
-    }
-
-    /// [`Self::discover_scoped`]'s shape, but landing on
-    /// [`Self::from_config_structural`] instead of the strict resolver at
-    /// both branches (a found `[estate]`-bearing config, or a plain member
-    /// `sergeant.toml` at the zero-config git toplevel) — the disk-free
-    /// counterpart a group-membership-only caller wants. Returns an empty
-    /// map, never an error, for the true zero-config case (no `sergeant.toml`
-    /// at all): there is nothing to declare a group in.
-    pub fn declared_groups_scoped(
-        start: &Path,
-        data_dir: Option<&Path>,
-    ) -> Result<BTreeMap<String, GroupSpec>, WorkspaceError> {
-        if let Some(estate_config) = Self::find_estate_upward(start, data_dir)? {
-            return Self::declared_groups(&estate_config);
-        }
-        let toplevel = git(start, &["rev-parse", "--show-toplevel"]).map_err(|source| {
-            WorkspaceError::NotARepository {
-                path: start.display().to_string(),
-                source,
-            }
-        })?;
-        let config_path = PathBuf::from(toplevel).join(WORKSPACE_FILE);
-        if config_path.is_file() {
-            Self::declared_groups(&config_path)
-        } else {
-            Ok(BTreeMap::new())
-        }
     }
 
     fn from_config_impl(
@@ -1065,53 +1198,37 @@ impl Workspace {
         self.repository_origin.get(repository).map(String::as_str)
     }
 
-    /// The directory holding the nearest ancestor `sergeant.toml` carrying an
-    /// `[estate]` table (R-MVP1-12's own upward walk, delegated to rather
-    /// than duplicated), without resolving or validating any `[[repo]]`
-    /// entry. Used where only "is there an estate here, and where" is
-    /// needed — MVP-3's estate-resolved data-dir default and the manifest
-    /// edit pen (`src/domain/manifest.rs`) — because a full [`Self::discover`]
-    /// would refuse a freshly scaffolded, repo-less estate via
-    /// `NoRepositories` before either of those ever gets to run.
-    pub fn estate_root(
-        start: &Path,
-        data_dir: Option<&Path>,
-    ) -> Result<Option<PathBuf>, WorkspaceError> {
-        Ok(Self::find_estate_upward(start, data_dir)?
-            .and_then(|config| config.parent().map(Path::to_path_buf)))
+    /// Whether `dir` is *itself* an estate root, tolerantly: `Ok(true)` iff
+    /// `dir/sergeant.toml` exists, parses as TOML, carries no legacy
+    /// vocabulary, and declares `[estate]`. **No parent is examined.**
+    ///
+    /// Deliberately **not** [`Self::admit`]: `src/cli.rs`'s
+    /// `resolve_data_dir` runs ahead of every command including `sgt
+    /// doctor`, whose entire job is diagnosing a broken manifest gracefully.
+    /// A structural defect elsewhere in the file — a duplicate profile, an
+    /// unknown group member, an invalid permission mode — has nothing to do
+    /// with `data_dir` and must not stop `doctor` from ever running. This
+    /// answers only the question it needs, at [`estate_table_check`]'s own
+    /// tolerance.
+    pub fn is_estate_root(dir: &Path) -> Result<bool, WorkspaceError> {
+        let manifest_path = dir.join(WORKSPACE_FILE);
+        if !manifest_path.is_file() {
+            return Ok(false);
+        }
+        estate_table_check(&manifest_path)
     }
 
-    /// [`Self::estate_root`]'s sibling for `src/cli.rs`'s `resolve_data_dir`
-    /// (ADR 0008(b)): the discovered estate root together with its
-    /// manifest's `[estate] data_dir` override, if any. `None` when no
-    /// estate is found; `Some((root, None))` when one is found but declares
-    /// no override, leaving the caller's own default in force exactly as
-    /// `surfaces_dir` does.
-    ///
-    /// Deliberately **not** [`Self::from_config_structural`]:
-    /// `resolve_data_dir` runs at the top of every `dispatch`, ahead of
-    /// every command including `sgt doctor`, whose entire job is diagnosing
-    /// a broken manifest gracefully. A structural defect elsewhere in the
-    /// file — a duplicate profile, an unknown group member, an invalid
-    /// permission mode — has nothing to do with `data_dir` and must not
-    /// stop `doctor` from ever running. This reads only the one field it
-    /// needs, at the same tolerance [`estate_table_check`] already applies
-    /// to find the file in the first place: valid TOML syntax and no
-    /// legacy vocabulary are required, everything else about the manifest's
-    /// shape is not.
-    pub fn estate_root_and_data_dir(
-        start: &Path,
-        data_dir_scope: Option<&Path>,
-    ) -> Result<Option<(PathBuf, Option<PathBuf>)>, WorkspaceError> {
-        let Some(config_path) = Self::find_estate_upward(start, data_dir_scope)? else {
+    /// `src/cli.rs`'s `resolve_data_dir` (ADR 0008(b)): `dir`'s own
+    /// `[estate] data_dir` override, if `dir` is an estate root and declares
+    /// one. `Ok(None)` when `dir` is not an estate root at all, or is one
+    /// that declares no override — leaving the caller's own default in force
+    /// exactly as `surfaces_dir` does. Same tolerance as
+    /// [`Self::is_estate_root`], and for the same reason.
+    pub fn root_data_dir_override(dir: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
+        if !Self::is_estate_root(dir)? {
             return Ok(None);
-        };
-        let root = config_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let data_dir = estate_data_dir_override(&config_path, &root)?;
-        Ok(Some((root, data_dir)))
+        }
+        estate_data_dir_override(&dir.join(WORKSPACE_FILE), dir)
     }
 
     /// Restrict the workspace to the named repositories (the submit request's
@@ -1176,17 +1293,12 @@ fn repo_name(root: &Path) -> String {
         .unwrap_or_else(|| "workspace".to_string())
 }
 
-/// Whether `config_path` parses as TOML and has a top-level `[estate]` key
-/// (R-MVP1-12). Any failure to read or parse — this is a *probe* during an
-/// upward walk, not the file the walk is committed to — answers `false`:
-/// "not an estate, keep walking", never a hard error for a file that was
-/// never going to be chosen anyway.
-/// Whether `config_path` carries an `[estate]` table — [`Workspace::
-/// find_estate_upward_bounded`]'s match predicate. `Ok(false)` for a file
-/// this walk cannot even read (permission, race — indistinguishable from
-/// "no file here"). `Err` for one it CAN read but that is malformed or
-/// carries legacy vocabulary (W5/R-MVP1-3): those are not silently skipped
-/// — see the walk's own doc comment.
+/// Whether `config_path` carries an `[estate]` table — [`Workspace::admit`]'s
+/// own predicate. `Ok(false)` for a file that cannot even be read
+/// (permission, race — indistinguishable from "no file here"). `Err` for one
+/// that CAN be read but is malformed or carries legacy vocabulary
+/// (W5/R-MVP1-3): §4.4's last rule is that an invalid manifest surfaces its
+/// exact diagnostic and never falls through.
 fn estate_table_check(config_path: &Path) -> Result<bool, WorkspaceError> {
     let Ok(text) = std::fs::read_to_string(config_path) else {
         return Ok(false);
@@ -1785,473 +1897,385 @@ mod tests {
         assert_eq!(workspace.data_dir, None);
     }
 
-    /// `resolve_data_dir` (`src/cli.rs`) calls
-    /// [`Workspace::estate_root_and_data_dir`] at the top of every command
-    /// dispatch, including `sgt doctor` — whose entire purpose is to
-    /// diagnose a broken manifest. A structural defect unrelated to
-    /// `data_dir` (here, a duplicate profile name — the same manifest both
-    /// [`Workspace::from_config`] and [`Workspace::from_config_structural`]
-    /// refuse) must not stop `data_dir` from being found, or `doctor` could
-    /// never run against the very manifest it exists to diagnose.
-    #[test]
-    fn estate_data_dir_is_found_even_when_the_rest_of_the_manifest_is_structurally_broken() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let root = dir.path();
-        init_repo(root);
-        let config_path = root.join(WORKSPACE_FILE);
-        std::fs::write(
-            &config_path,
-            "[estate]\nname = \"w\"\ndata_dir = \"custom-data\"\n\n\
-             [[repo]]\nname = \"solo\"\npath = \".\"\n\n\
-             [[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
-             [[profile]]\nname = \"same\"\nbackend = \"fake\"\n",
-        )
-        .expect("sergeant.toml");
+    // ---- §4.1: exact-root admission (R-MVP1-12 superseded) ----------------
 
-        // Both strict resolvers refuse this manifest outright.
-        assert!(Workspace::from_config(&config_path).is_err());
-        assert!(matches!(
-            Workspace::from_config_structural(&config_path),
-            Err(WorkspaceError::DuplicateProfile { .. })
-        ));
-
-        // But locating the estate and its `data_dir` override does not.
-        let (found_root, data_dir) = Workspace::estate_root_and_data_dir(root, None)
-            .expect("an unrelated structural defect must not fail data-dir lookup")
-            .expect("an estate is found");
-        assert_eq!(
-            std::fs::canonicalize(&found_root).ok(),
-            std::fs::canonicalize(root).ok()
-        );
-        // Canonicalized on both sides, same as `found_root` above: `root`
-        // (production) is already canonical (`find_estate_upward_bounded`
-        // canonicalizes `start` before walking up), but this test's own
-        // `root` local is `TempDir`'s raw path. On Linux those happen to be
-        // identical; on macOS `/var` is a symlink to `/private/var` (like
-        // `/tmp` -> `/private/tmp`), so the raw and canonical forms diverge
-        // and a direct comparison fails there (#127, first measured on the
-        // MacBook Pro M3 Pro arrival trip, 2026-08-15).
-        assert_eq!(
-            data_dir
-                .as_deref()
-                .and_then(|p| std::fs::canonicalize(p).ok()),
-            std::fs::canonicalize(root.join("custom-data")).ok()
-        );
-    }
-
-    // ---- R-MVP1-12: estate discovery past inner `.git` --------------------
-
-    /// A `sergeant.toml` under `root` with an `[estate]` table, in `root`'s
-    /// own git repository.
+    /// A `sergeant.toml` under `root` with an `[estate]` table, declaring one
+    /// repository at the derived `repos/<name>` mount (§6.1), in `root`'s own
+    /// git repository.
     fn write_estate(root: &Path, name: &str) {
         init_repo(root);
+        init_repo(&root.join("repos").join("solo"));
         std::fs::write(
             root.join(WORKSPACE_FILE),
-            format!("[estate]\nname = {name:?}\n\n[[repo]]\nname = \"solo\"\npath = \".\"\n"),
+            format!(
+                "[estate]\nname = {name:?}\n\n[[repo]]\nname = \"solo\"\npath = \"repos/solo\"\n"
+            ),
         )
         .expect("write estate sergeant.toml");
     }
 
-    /// #22: discovery from inside a member repository nested under an estate
-    /// root finds the estate above it — `git rev-parse --show-toplevel`
-    /// alone could never do this, since it stops at the member's own
-    /// `.git`.
+    /// §4.1's happy path: the directory that itself carries an
+    /// `[estate]`-bearing `sergeant.toml` is admitted, and the admission
+    /// names the canonical root and the manifest that made it one.
     #[test]
-    fn estate_discovery_walks_upward_past_an_inner_git_boundary() {
+    fn admit_accepts_the_exact_directory_that_carries_the_manifest() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let estate_root = dir.path().join("estate");
         std::fs::create_dir_all(&estate_root).expect("estate dir");
-        write_estate(&estate_root, "outer-estate");
+        write_estate(&estate_root, "payments");
 
-        let member = estate_root.join("repos").join("payments-api");
-        init_repo(&member);
-
-        let workspace = Workspace::discover(&member).expect("discovery finds the outer estate");
-        assert_eq!(workspace.name, "outer-estate");
+        let admitted = Workspace::admit(&estate_root).expect("the exact root is admitted");
         assert_eq!(
-            std::fs::canonicalize(&workspace.root).ok(),
+            Some(admitted.path.clone()),
             std::fs::canonicalize(&estate_root).ok()
         );
+        assert_eq!(admitted.manifest_path, admitted.path.join(WORKSPACE_FILE));
+
+        let estate = Workspace::resolve(&estate_root).expect("the strict load agrees");
+        assert_eq!(estate.name, "payments");
     }
 
-    /// #22: a member repository with its own `sergeant.toml` — one with no
-    /// `[estate]` table, so it is a member's own config, not an estate — does
-    /// not stop the upward walk; the outer estate is still found.
-    #[test]
-    fn a_member_repos_own_sergeant_toml_without_estate_does_not_stop_the_walk() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let estate_root = dir.path().join("estate");
-        std::fs::create_dir_all(&estate_root).expect("estate dir");
-        write_estate(&estate_root, "outer-estate");
-
-        let member = estate_root.join("repos").join("payments-api");
-        init_repo(&member);
-        // The member's own config: no [estate] table, just its own
-        // single-repository declaration.
-        std::fs::write(
-            member.join(WORKSPACE_FILE),
-            "[[repo]]\nname = \"payments-api\"\npath = \".\"\n",
-        )
-        .expect("write member's own sergeant.toml");
-
-        let workspace = Workspace::discover(&member)
-            .expect("discovery must walk past the member's own non-estate config");
-        assert_eq!(
-            workspace.name, "outer-estate",
-            "the member's own sergeant.toml (no [estate]) must not be mistaken for the estate"
-        );
-    }
-
-    /// #22: a git worktree nested inside the estate directory tree (its
-    /// `.git` is a *file* pointing at another repository entirely) does not
-    /// confuse the filesystem-first walk — it never consults git at all.
-    #[test]
-    fn a_nested_worktree_inside_the_estate_still_finds_it() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let estate_root = dir.path().join("estate");
-        std::fs::create_dir_all(&estate_root).expect("estate dir");
-        write_estate(&estate_root, "outer-estate");
-
-        let other_repo = dir.path().join("other-repo");
-        init_repo(&other_repo);
-        let worktree = estate_root.join("nested-worktree");
-        let output = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                worktree.to_str().expect("utf8 path"),
-                "-b",
-                "wt-branch",
-            ])
-            .current_dir(&other_repo)
-            .output()
-            .expect("git worktree add");
-        assert!(output.status.success(), "worktree add: {output:?}");
-
-        let workspace =
-            Workspace::discover(&worktree).expect("discovery finds the estate from a worktree");
-        assert_eq!(workspace.name, "outer-estate");
-    }
-
-    /// #22: a path containing a space is not special-cased anywhere in the
-    /// walk — plain `PathBuf` handling is enough.
-    #[test]
-    fn estate_discovery_handles_a_path_with_a_space() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let estate_root = dir.path().join("the estate");
-        std::fs::create_dir_all(&estate_root).expect("estate dir");
-        write_estate(&estate_root, "spaced-estate");
-
-        let member = estate_root.join("repos").join("payments api");
-        init_repo(&member);
-
-        let workspace =
-            Workspace::discover(&member).expect("a space in the path must not break discovery");
-        assert_eq!(workspace.name, "spaced-estate");
-    }
-
-    /// #22: no `sergeant.toml` with `[estate]` anywhere on the way up falls
-    /// back to the zero-config, git-toplevel behavior, unchanged.
-    ///
-    /// Deliberately includes a plain, non-estate `sergeant.toml` *above*
-    /// `root` (not merely "no sergeant.toml at all" — the guard-map
-    /// mutation this test must kill is `has_estate_table`'s own check
-    /// dropped from the walk's match predicate, i.e. `if candidate.is_file()
-    /// && has_estate_table(...)` weakened to `if candidate.is_file()`; with
-    /// no file anywhere on the ascent path, that mutated predicate is never
-    /// exercised with a file present, so a fixture with no file at all
-    /// cannot distinguish the mutant from the real thing). With the file in
-    /// place, the mutant would wrongly treat it as an estate root and
-    /// `from_config` it — landing a different workspace (`config_path`
-    /// `Some`, a different `name`) than the zero-config fallback this test
-    /// asserts.
-    #[test]
-    fn no_estate_anywhere_falls_back_to_zero_config_unchanged() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let root = dir.path().join("solo-repo");
-        init_repo(&root);
-        // A non-estate sergeant.toml, above `root`, on the walk's ascent
-        // path — present, but without `[estate]`, so it must not stop the
-        // walk (this module's own "a sergeant.toml without [estate] is a
-        // member's own config, not an estate" rule) and discovery still
-        // falls all the way back to zero-config.
-        std::fs::write(
-            dir.path().join(WORKSPACE_FILE),
-            "[[repo]]\nname = \"unrelated\"\npath = \".\"\n",
-        )
-        .expect("write non-estate sergeant.toml");
-
-        let workspace = Workspace::discover(&root).expect("zero-config fallback");
-        assert_eq!(workspace.repositories.len(), 1);
-        assert_eq!(
-            std::fs::canonicalize(&workspace.repositories[0].path).ok(),
-            std::fs::canonicalize(&root).ok()
-        );
-        assert!(workspace.config_path.is_none());
-        assert_eq!(
-            workspace.name,
-            repo_name(&std::fs::canonicalize(&root).unwrap_or(root)),
-            "the zero-config name is the repo's own directory name, not the \
-             unrelated sergeant.toml's"
-        );
-    }
-
-    /// #22: starting outside any git repository at all is the unchanged
-    /// `NotARepository` answer — the estate walk does not manufacture a
-    /// workspace where §9 says there is none.
-    #[test]
-    fn discovery_outside_any_repository_is_refused_unchanged() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        // A bare directory tree with no `.git` anywhere and (by construction
-        // of a fresh tempdir) no `[estate]`-bearing `sergeant.toml` above it
-        // either.
-        let err = Workspace::discover(dir.path()).expect_err("no repository here");
-        assert!(
-            matches!(err, WorkspaceError::NotARepository { .. }),
-            "got {err}"
-        );
-    }
-
-    /// C7a/Phase D: today, an estate whose `sergeant.toml` sits in an
-    /// ancestor directory is discovered from a descendant cwd via the
-    /// upward walk this pin exists to flip away from — Phase D moves to
-    /// exact-root resolution only (no ancestor walk, no git fallback;
-    /// `estate_root` comes from the daemon config / runtime descriptor
-    /// instead). This is the same shape as
-    /// `estate_discovery_walks_upward_past_an_inner_git_boundary` above,
-    /// marked separately because that test's *purpose* is "the walk works
-    /// correctly" (a fact worth keeping while ancestor-walk discovery still
-    /// exists) whereas this pin's purpose is "the walk exists at all" (a
-    /// fact Phase D removes outright, at which point this specific test
-    /// must be flipped rather than merely edited around).
+    /// **Phase 0 pin #1, flipped (C7a).** The ancestor walk is gone: a
+    /// descendant cwd — the `repos/<name>` mount that used to resolve to the
+    /// estate above it — is now refused by name, and the refusal is §4.4's,
+    /// not a generic "not found". Nothing above the directory is examined.
     // CONTRACT PIN (estate-root Phase D): ancestor-walk discovery is removed; a descendant cwd no longer finds an estate above it.
     #[test]
-    fn contract_pin_ancestor_walk_discovers_estate_from_descendant_cwd() {
+    fn a_descendant_cwd_is_refused_and_never_finds_the_estate_above_it() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let estate_root = dir.path().join("estate");
         std::fs::create_dir_all(&estate_root).expect("estate dir");
         write_estate(&estate_root, "ancestor-estate");
 
-        let member = estate_root.join("repos").join("payments-api");
-        init_repo(&member);
-
-        let workspace = Workspace::discover(&member)
-            .expect("today, discovery from a descendant cwd walks up and finds the estate");
-        assert_eq!(workspace.name, "ancestor-estate");
-        assert_eq!(
-            std::fs::canonicalize(&workspace.root).ok(),
-            std::fs::canonicalize(&estate_root).ok(),
-            "the discovered root is the ancestor directory, not the descendant cwd"
+        let member = estate_root.join("repos").join("solo");
+        let err = Workspace::admit(&member)
+            .expect_err("exact-root admission must refuse a descendant of the estate");
+        assert!(
+            matches!(err, EstateRootError::NoEstate { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("no estate found in the current directory"),
+            "§4.4's own first line: {message}"
+        );
+        assert!(
+            message.contains("does not search parent directories"),
+            "the refusal must say why no ancestor was consulted: {message}"
+        );
+        assert!(
+            message.contains(&member.join(WORKSPACE_FILE).display().to_string())
+                || message.contains(
+                    &std::fs::canonicalize(&member)
+                        .unwrap_or_else(|_| member.clone())
+                        .join(WORKSPACE_FILE)
+                        .display()
+                        .to_string()
+                ),
+            "the refusal must name the exact path it expected: {message}"
+        );
+        assert!(
+            message.contains("sgt init"),
+            "the refusal must name the init remedy: {message}"
         );
     }
 
-    /// C7a/Phase D: today, a plain git repository with no `sergeant.toml`
-    /// anywhere above it falls back to `git rev-parse --show-toplevel` and
-    /// yields a single-repository workspace with no config file at all —
-    /// R-MVP1-12's "single-repository use requires zero configuration".
-    /// Phase D removes this fallback along with the ancestor walk: exact-root
-    /// resolution has nothing to fall back *to* once there is no upward
-    /// search.
+    /// **Phase 0 pin #2, flipped (C7a).** The zero-config Git fallback is
+    /// gone: a plain git repository with no `sergeant.toml` anywhere is no
+    /// longer a workspace, it is "no estate here" — exact-root resolution has
+    /// nothing to fall back *to*.
     // CONTRACT PIN (estate-root Phase D): zero-config git fallback is removed; a repo with no sergeant.toml anywhere above no longer resolves to a workspace.
     #[test]
-    fn contract_pin_zero_config_git_fallback_yields_a_single_repo_workspace() {
+    fn a_plain_git_repository_with_no_manifest_is_no_longer_a_workspace() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().join("plain-repo");
         init_repo(&root);
         // No `sergeant.toml` anywhere in this fixture, at `root` or above it.
 
-        let workspace = Workspace::discover(&root)
-            .expect("today, a plain git repo with no sergeant.toml falls back to git toplevel");
-        assert_eq!(workspace.repositories.len(), 1);
+        let err = Workspace::admit(&root).expect_err("there is no estate here");
         assert!(
-            workspace.config_path.is_none(),
-            "the zero-config fallback has no sergeant.toml to point at"
+            matches!(err, EstateRootError::NoEstate { .. }),
+            "a git repository is not an estate: {err:?}"
         );
-        assert_eq!(
-            std::fs::canonicalize(&workspace.repositories[0].path).ok(),
-            std::fs::canonicalize(&root).ok(),
-            "the single repository is the git toplevel itself"
+        assert!(
+            Workspace::resolve(&root).is_err(),
+            "the strict resolver must refuse too — no git fallback survives anywhere"
         );
     }
 
-    /// The upward walk is bounded at `$HOME` (or the filesystem root):
-    /// an `[estate]`-bearing `sergeant.toml` *above* the boundary is never
-    /// found, even though the walk would otherwise reach it. Exercises
-    /// [`Workspace::find_estate_upward_bounded`] directly with an explicit
-    /// boundary rather than mutating the process's real `$HOME`, which every
-    /// other test in this binary also reads (L5: tests must not step on each
-    /// other through shared process state).
+    /// A `sergeant.toml` that is there but declares no `[estate]` table is a
+    /// member repository's own config. It is refused **by name** rather than
+    /// silently skipped (there is nothing to skip *to* any more), and the
+    /// remedy names `sgt init`.
     #[test]
-    fn the_upward_walk_is_bounded_and_never_crosses_it() {
+    fn a_manifest_without_an_estate_table_is_refused_by_name() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let above_boundary = dir.path().join("above");
-        let boundary = above_boundary.join("home-equivalent");
-        let below_boundary = boundary.join("estate").join("repos").join("member");
-        std::fs::create_dir_all(&below_boundary).expect("nested dirs");
-
-        // An estate at `above_boundary` — outside the search space once the
-        // boundary is `boundary`.
-        write_estate(&above_boundary, "outside-the-boundary");
-        // No estate at or below `boundary`.
-        std::fs::create_dir_all(boundary.join("estate")).expect("estate dir");
-        init_repo(&below_boundary);
-        // Canonicalized explicitly, matching what `find_estate_upward`
-        // itself does to `$HOME` — the walk canonicalizes `start`'s
-        // ancestors, so an uncanonicalized boundary could mismatch on a
-        // host where the temp root is reached through a symlink.
-        let boundary = std::fs::canonicalize(&boundary).expect("canonical boundary");
-
-        let found = Workspace::find_estate_upward_bounded(&below_boundary, Some(&boundary), None)
-            .expect("no legacy/malformed sergeant.toml in this fixture");
-        assert_eq!(
-            found, None,
-            "an estate above the boundary must never be found"
-        );
-
-        // The same estate, found once it is unbounded (or the boundary is
-        // above it) — proving the walk itself works and the bound is what
-        // stopped it, not a bug in the walk.
-        let found_unbounded =
-            Workspace::find_estate_upward_bounded(&below_boundary, Some(&above_boundary), None)
-                .expect("no legacy/malformed sergeant.toml in this fixture");
-        assert!(
-            found_unbounded.is_some(),
-            "the same estate must be found once the boundary includes it"
-        );
-    }
-
-    /// R-MVP1-12's other half: "never above an explicit `--data-dir`/
-    /// `SGT_DATA_DIR` scope." A data-dir scope that sits on `start`'s own
-    /// ancestor chain, strictly between `start` and the estate config, must
-    /// stop the walk there — never letting it reach the estate even one
-    /// directory further up — while a data-dir scope that is not on the
-    /// ancestor chain at all (the ordinary case: the data dir usually has
-    /// nothing to do with whichever repository a submission runs against)
-    /// must not change the outcome.
-    #[test]
-    fn the_data_dir_scope_bounds_the_walk_like_home_does() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let home = dir.path().join("home");
-        let estate_root = home.join("estate");
-        let repos_dir = estate_root.join("repos");
-        let member = repos_dir.join("member");
-        let unrelated_scope = home.join("scratch-data-dir");
-        std::fs::create_dir_all(&member).expect("member dir");
-        std::fs::create_dir_all(&unrelated_scope).expect("unrelated scope dir");
-        init_repo(&member);
-
-        // An estate at `estate_root` — inside `$HOME`, so an unscoped walk
-        // (or one bounded only by `$HOME`) finds it fine.
-        write_estate(&estate_root, "in-estate-data-dir");
-        let home = std::fs::canonicalize(&home).expect("canonical home");
-        let repos_dir = std::fs::canonicalize(&repos_dir).expect("canonical repos dir");
-        let unrelated_scope =
-            std::fs::canonicalize(&unrelated_scope).expect("canonical unrelated scope");
-
-        let found_unscoped = Workspace::find_estate_upward_bounded(&member, Some(&home), None)
-            .expect("no legacy/malformed sergeant.toml in this fixture");
-        assert!(
-            found_unscoped.is_some(),
-            "without a data-dir scope, the $HOME boundary alone finds the estate"
-        );
-
-        // A data-dir scope that is NOT on `member`'s ancestor chain at all
-        // — the ordinary case — must not change the outcome.
-        let found_unrelated_scope =
-            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&unrelated_scope))
-                .expect("no legacy/malformed sergeant.toml in this fixture");
-        assert!(
-            found_unrelated_scope.is_some(),
-            "a data-dir scope that is not an ancestor of `start` must not change the outcome"
-        );
-
-        // The scope genuinely is an ancestor of `start`, strictly below the
-        // estate's own `sergeant.toml` (`repos/`, one level under
-        // `estate_root`) — the A8 self-hosting shape, data dir in-estate.
-        // The walk must stop there, never reaching `estate_root` one
-        // directory further up.
-        let found_ancestor_scope =
-            Workspace::find_estate_upward_bounded(&member, Some(&home), Some(&repos_dir))
-                .expect("no legacy/malformed sergeant.toml in this fixture");
-        assert_eq!(
-            found_ancestor_scope, None,
-            "a data-dir scope that IS an ancestor of `start` must stop the walk there, \
-             never letting it reach the estate config even one directory further up"
-        );
-    }
-
-    // -------------------------------------------------- W5: legacy/malformed
-    // sergeant.toml on the way up fails closed, not silently skipped
-
-    /// R-MVP1-3's named migration refusal must fire for a legacy-vocabulary
-    /// `sergeant.toml` the upward walk steps over on its way to (what would
-    /// otherwise be) an estate above it — not just one chosen directly.
-    /// Before this fix, `has_estate_table` swallowed the parse/legacy
-    /// failure and the walk silently treated it as "not an estate, keep
-    /// walking", falling through all the way to the zero-config member-repo
-    /// fallback with no diagnostic at all.
-    #[test]
-    fn a_legacy_vocabulary_sergeant_toml_on_the_way_up_fails_the_walk_closed() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let estate_root = dir.path().join("estate");
-        let member = estate_root.join("repos").join("member");
-        std::fs::create_dir_all(&member).expect("member dir");
-        init_repo(&member);
+        let root = dir.path().join("member");
+        init_repo(&root);
         std::fs::write(
-            estate_root.join(WORKSPACE_FILE),
-            "[workspace]\nname = \"legacy\"\n\n[[repository]]\nname = \"legacy\"\npath = \".\"\n",
-        )
-        .expect("legacy sergeant.toml");
-
-        let err = Workspace::find_estate_upward_bounded(&member, None, None)
-            .expect_err("a legacy-vocabulary file on the way up must refuse, not be skipped");
-        assert!(
-            matches!(err, WorkspaceError::LegacyVocabulary { .. }),
-            "got {err}"
-        );
-    }
-
-    /// Same shape, a `sergeant.toml` on the way up that is not even valid
-    /// TOML: the walk must refuse, not silently skip it and fall through to
-    /// the zero-config fallback.
-    #[test]
-    fn a_malformed_sergeant_toml_on_the_way_up_fails_the_walk_closed() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let estate_root = dir.path().join("estate");
-        let member = estate_root.join("repos").join("member");
-        std::fs::create_dir_all(&member).expect("member dir");
-        init_repo(&member);
-        std::fs::write(estate_root.join(WORKSPACE_FILE), "this is not [ toml").expect("write");
-
-        let err = Workspace::find_estate_upward_bounded(&member, None, None)
-            .expect_err("a malformed file on the way up must refuse, not be skipped");
-        assert!(matches!(err, WorkspaceError::Malformed { .. }), "got {err}");
-    }
-
-    /// The control this pair calibrates against: a plain member-repo
-    /// `sergeant.toml` with no `[estate]` and no legacy vocabulary at all —
-    /// still not an error, still "keep walking" (this module's own
-    /// `a_member_repos_own_sergeant_toml_without_estate_does_not_stop_the_walk`
-    /// test covers the full discovery path; this one pins the lower-level
-    /// walk function directly).
-    #[test]
-    fn a_plain_member_sergeant_toml_with_no_estate_table_does_not_fail_the_walk() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let estate_root = dir.path().join("estate");
-        let member = estate_root.join("repos").join("member");
-        std::fs::create_dir_all(&member).expect("member dir");
-        init_repo(&member);
-        std::fs::write(
-            member.join(WORKSPACE_FILE),
+            root.join(WORKSPACE_FILE),
             "[[repo]]\nname = \"solo\"\npath = \".\"\n",
         )
         .expect("write");
 
-        let found = Workspace::find_estate_upward_bounded(&member, None, None)
-            .expect("a plain non-estate sergeant.toml must not fail the walk");
+        let err = Workspace::admit(&root).expect_err("no [estate] table here");
+        assert!(
+            matches!(err, EstateRootError::NotAnEstate { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("declares no [estate] table"),
+            "the refusal must name the missing table: {message}"
+        );
+        assert!(
+            message.contains("does not search parent directories"),
+            "still no ancestor search: {message}"
+        );
+    }
+
+    /// §4.4's last rule: an invalid manifest surfaces the exact parser
+    /// diagnostic and never falls through to another estate. Here, one that
+    /// is not valid TOML at all.
+    #[test]
+    fn a_malformed_manifest_surfaces_the_parser_diagnostic_and_never_falls_through() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        let inner = estate_root.join("inner");
+        std::fs::create_dir_all(&inner).expect("dirs");
+        write_estate(&estate_root, "outer-estate");
+        std::fs::write(inner.join(WORKSPACE_FILE), "this is not [ toml").expect("write");
+
+        let err = Workspace::admit(&inner).expect_err("a malformed manifest must refuse");
+        assert!(
+            matches!(err, EstateRootError::Invalid { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("the estate manifest is invalid"),
+            "got {message}"
+        );
+        assert!(
+            !message.contains("outer-estate"),
+            "an invalid manifest must never point at a different estate: {message}"
+        );
+    }
+
+    /// R-MVP1-3's named migration refusal survives exact-root admission: a
+    /// legacy-vocabulary manifest is refused as invalid, carrying its own
+    /// migration remedy rather than a generic unknown-field error.
+    #[test]
+    fn a_legacy_vocabulary_manifest_is_refused_with_its_migration_remedy() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("legacy");
+        init_repo(&root);
+        std::fs::write(
+            root.join(WORKSPACE_FILE),
+            "[workspace]\nname = \"legacy\"\n\n[[repository]]\nname = \"legacy\"\npath = \".\"\n",
+        )
+        .expect("legacy sergeant.toml");
+
+        let err = Workspace::admit(&root).expect_err("legacy vocabulary must refuse");
+        let EstateRootError::Invalid { source, .. } = &err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(
+            matches!(**source, WorkspaceError::LegacyVocabulary { .. }),
+            "got {source}"
+        );
+        assert!(
+            err.to_string().contains("[estate]"),
+            "the migration remedy must name the new table: {err}"
+        );
+    }
+
+    /// A manifest whose *schema* is broken — a group naming an undeclared
+    /// repository — is inadmissible: §4.1 requires the file "satisfy the
+    /// manifest schema", not merely parse.
+    #[test]
+    fn a_schema_invalid_manifest_is_inadmissible() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("estate");
+        std::fs::create_dir_all(&root).expect("estate dir");
+        write_estate(&root, "payments");
+        std::fs::write(
+            root.join(WORKSPACE_FILE),
+            "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"solo\"\npath = \"repos/solo\"\n\n\
+             [group.everything]\nrepos = [\"ghost\"]\n",
+        )
+        .expect("write");
+
+        let err = Workspace::admit(&root).expect_err("an unknown group member is a schema defect");
+        assert!(
+            matches!(err, EstateRootError::Invalid { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// A declared repository that is not on disk yet does **not** make the
+    /// estate inadmissible — that is a repository problem, not an
+    /// estate-identity problem (the design capture's own wrongness contract:
+    /// "a broken repo blocks works targeting it, not the estate"). The strict
+    /// [`Workspace::resolve`] still refuses it, which is the half that
+    /// protects a Work from binding a repository that is not really there.
+    #[test]
+    fn a_declared_repo_missing_from_disk_does_not_make_the_estate_inadmissible() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("estate");
+        std::fs::create_dir_all(&root).expect("estate dir");
+        init_repo(&root);
+        std::fs::write(
+            root.join(WORKSPACE_FILE),
+            "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"ghost\"\npath = \"repos/ghost\"\n",
+        )
+        .expect("write");
+
+        Workspace::admit(&root).expect("admission is about estate identity, not repo presence");
+        assert!(
+            Workspace::resolve(&root).is_err(),
+            "the strict load must still refuse a repository that is not on disk"
+        );
+    }
+
+    /// §4.4's second block: when a *valid* estate root is bound in the
+    /// environment and sits strictly above the directory being addressed,
+    /// the refusal names both roots and tells the operator to return.
+    #[test]
+    fn a_bound_estate_root_above_the_cwd_names_both_roots() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        std::fs::create_dir_all(&estate_root).expect("estate dir");
+        write_estate(&estate_root, "payments");
+        let estate_root = std::fs::canonicalize(&estate_root).expect("canonical estate root");
+        let member = estate_root.join("repos").join("solo");
+
+        let err = Workspace::admit(&member)
+            .expect_err("a descendant is refused")
+            .with_bound_root(estate_root.clone());
+        assert!(
+            matches!(err, EstateRootError::Descendant { .. }),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("this command must be run from the estate root"),
+            "§4.4's own first line: {message}"
+        );
+        assert!(
+            message.contains(&member.display().to_string()),
+            "must name the current directory: {message}"
+        );
+        assert!(
+            message.contains(&estate_root.display().to_string()),
+            "must name the bound estate root: {message}"
+        );
+        assert!(
+            message.contains(&format!("cd {}", estate_root.display())),
+            "must give the exact cd remedy: {message}"
+        );
+    }
+
+    /// A bound root that is **not** an ancestor of the directory being
+    /// addressed never rewrites the diagnostic — the descendant variant is
+    /// about "you are inside the bound estate, one level down", not about
+    /// any two unrelated directories.
+    #[test]
+    fn an_unrelated_bound_root_does_not_become_the_descendant_diagnostic() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&estate_root).expect("estate dir");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere dir");
+        write_estate(&estate_root, "payments");
+        let estate_root = std::fs::canonicalize(&estate_root).expect("canonical");
+
+        let err = Workspace::admit(&elsewhere)
+            .expect_err("no estate here")
+            .with_bound_root(estate_root);
+        assert!(
+            matches!(err, EstateRootError::NoEstate { .. }),
+            "an unrelated bound root must leave the diagnostic alone: {err:?}"
+        );
+    }
+
+    /// A bound root never rewrites an *invalid-manifest* refusal: §4.4
+    /// requires the exact parser diagnostic, and trading it for a pointer at
+    /// some other estate is exactly the fall-through the rule forbids.
+    #[test]
+    fn a_bound_root_never_replaces_an_invalid_manifest_diagnostic() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate_root = dir.path().join("estate");
+        let inner = estate_root.join("inner");
+        std::fs::create_dir_all(&inner).expect("dirs");
+        write_estate(&estate_root, "payments");
+        std::fs::write(inner.join(WORKSPACE_FILE), "this is not [ toml").expect("write");
+        let estate_root = std::fs::canonicalize(&estate_root).expect("canonical");
+
+        let err = Workspace::admit(&inner)
+            .expect_err("malformed")
+            .with_bound_root(estate_root);
+        assert!(
+            matches!(err, EstateRootError::Invalid { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// C10: `-C` names an exact root and earns no leniency for it — the same
+    /// refusal fires, only the remedy line changes from `cd` to `-C`.
+    #[test]
+    fn the_dash_c_wording_changes_the_remedy_but_never_the_check() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("not-an-estate");
+        std::fs::create_dir_all(&root).expect("dir");
+
+        let err = Workspace::admit(&root).expect_err("no estate").via_flag();
+        assert!(
+            matches!(err, EstateRootError::NoEstate { .. }),
+            "the check is identical: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("the directory named by -C"),
+            "got {message}"
+        );
+        assert!(
+            message.contains("sgt -C <estate-root>"),
+            "the remedy must be the flag, not cd: {message}"
+        );
+    }
+
+    /// `is_estate_root`/`root_data_dir_override` are the tolerant pair
+    /// `resolve_data_dir` runs ahead of `sgt doctor`: they answer about
+    /// exactly one directory, never a parent, and a structural defect
+    /// elsewhere in the manifest does not stop them.
+    #[test]
+    fn the_tolerant_data_dir_lookup_is_exact_root_and_survives_a_broken_manifest() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path().join("estate");
+        let inner = root.join("inner");
+        std::fs::create_dir_all(&inner).expect("dirs");
+        std::fs::write(
+            root.join(WORKSPACE_FILE),
+            "[estate]\nname = \"w\"\ndata_dir = \"custom-data\"\n\n\
+             [[repo]]\nname = \"solo\"\npath = \"repos/solo\"\n\n\
+             [[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
+             [[profile]]\nname = \"same\"\nbackend = \"fake\"\n",
+        )
+        .expect("write");
+
+        assert!(Workspace::is_estate_root(&root).expect("tolerant probe"));
         assert_eq!(
-            found, None,
-            "a member's own non-estate config does not stop the walk (no estate above it here)"
+            Workspace::root_data_dir_override(&root).expect("tolerant lookup"),
+            Some(root.join("custom-data")),
+            "an unrelated structural defect must not stop the data-dir lookup"
+        );
+        // ...and it never looks up. A descendant is simply not an estate root.
+        assert!(!Workspace::is_estate_root(&inner).expect("tolerant probe"));
+        assert_eq!(
+            Workspace::root_data_dir_override(&inner).expect("tolerant lookup"),
+            None,
+            "no ancestor search here either"
         );
     }
 
