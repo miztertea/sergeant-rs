@@ -1,15 +1,30 @@
 # Rule C — Journal Segment Archival, Blob Liveness, and Derived-Store Growth
 
 Status: Proposed — awaiting owner ratification
-Date: 2026-08-20
+Date: 2026-08-20 (revised the same day after evaluation-gauntlet findings)
 Audit basis: `miztertea/sergeant-rs` `backlog/w5-archival-design` @ `a730983c`
 (integration branch carrying waves 1–2 of the backlog close-out sprint)
-Scope: Journal segment retention, the replay contract's floor, blob-store
-liveness, DuckDB growth, `sgt doctor`'s growth axis, and the explicit
-maintenance verb
+Scope: Journal segment retention, the replay contract's floor, §26 command
+idempotency across that floor, blob-store liveness, DuckDB growth,
+`sgt doctor`'s growth axis, and the explicit maintenance verb
 Product behavior: Changed — the journal gains an archive tier and a
-non-zero replay floor; nothing is deleted, and no automatic action is
-added
+non-zero replay floor; below-floor reads gain a declared contract; §26
+exact-once degrades below the floor from replayed-body to named-refusal;
+nothing else is deleted, and no automatic action is added
+
+**Revision note.** The first draft of this document was evaluated and
+returned seven confirmed findings, two of them blockers: a naive replay
+floor would have silently re-armed duplicate-Work creation through the §26
+command ledger, and would have broken `sgt work transcript`, default
+`/v1/events`, SSE, and `sgt doctor` outright on the first archived segment.
+Both are resolved here (§3.1, §4.4), along with a false crash-safety claim
+(§4.3), an undercounted full-replay consumer (§1.5), an unbounded guard-hold
+in the verb itself (§4.8), a doctor-versus-archival race (§4.8), and one
+arithmetic slip (§1.3). Where the fixes cost complexity, this document says
+so at the point it is incurred rather than in a summary; where the earlier
+draft was wrong, it says that too, because the *shape* of what it missed —
+persisting one derived structure and assuming that exhausted the set — is
+the failure mode I9 and its pinning test now exist to prevent.
 
 ────────
 
@@ -22,11 +37,13 @@ added
 | Retention ruling, 2026-08-11 (Rule C, amended at adjudication): binding trigger is rebuild-on-start > 30 s; ladder is compress-cold-segments-first, then snapshot/truncate | **Honored, with one correction offered for ruling.** Compression is adopted — as a rider on archival rather than as a standalone rung — but §3.5 shows compression addresses *disk*, while the ruled trigger is *time*. A cheaper rung 0 (§4.1) sits below both. Open question Q1. |
 | Retention ruling, Rule B: `sgt doctor` disk-pressure check | **Extended.** The shipped check (`src/cli.rs:3018`, thresholds at `3042-3043`) measures *free space*, not *growth* — it cannot see a data dir growing to 500 GB on a disk with 600 GB free (§3.4). A growth axis is added beside it. |
 | Retention ruling, Rule B: blob GC deferred, trigger = 20 GiB blob share or the first real deletion policy question | **Kept deferred, and deflated honestly.** §3.3 shows mark-sweep as constrained by this design reclaims only never-referenced blobs, because archival never deletes history. The real blob lever is a policy question the owner must answer (Q6), exactly as Rule B predicted. |
-| Issue #4 / wave 2's bounded terminal-Work cache (`src/runtime/projection.rs:366,378`) and its miss path (`projection.rs:1141-1150`) | **Load-bearing new constraint, and a beneficiary.** The miss path is a *full* journal replay under the core guard. At 1M events that is a ~26–34 s stall on `sgt work show` (§1.5). The archive manifest's per-segment work-id set turns it into a two-segment read — ~35× less time under the guard (§4.5). |
-| Issue #159 / estate-root contract §12.1, §12.3: durable artifacts are never auto-deleted; explicit deletion is a separate maintenance action | **Followed exactly.** `sgt journal archive` previews by default, acts only on `--yes`, and deletes nothing at all. |
+| Issue #4 / wave 2's bounded terminal-Work cache (`src/runtime/projection.rs:366,378`) and its miss path (`projection.rs:1141-1150`) | **Load-bearing new constraint, and a beneficiary.** The miss path is a *full* journal replay under the core guard. At 1M events that is a ~26–34 s stall on `sgt work show` (§1.5). The archive manifest's per-segment work-id set turns it into a two-segment read — ~35× less time under the guard (§4.6). |
+| §26 command idempotency — `WorkRegistry::commands` / `command_works` (`projection.rs:246-280`), consulted by `replay_command` at the top of every mutating handler (`api.rs:1027-1080`) | **Safety-load-bearing, and it constrains the design.** A naive replay floor would drop the ledger for archived history and silently re-arm duplicate-Work creation on a retried `command_id`. The manifest carries the command *keys*; below-floor retries are refused by name, never re-executed (§3.1, Q8). |
+| `sgt work transcript` (`api.rs:2173-2200`) — a full from-seq-0 replay under the core guard, already disclosed as unbounded in its own doc comment | **Third full-replay consumer, named.** Rung 3 shrinks its input to the segments the manifest names, and §7 states plainly that this is a mitigation, not the "journal reader the core does not own" that the comment says a real fix needs. |
+| Issue #159 / estate-root contract §12.1, §12.3: durable artifacts are never auto-deleted; explicit deletion is a separate maintenance action | **Followed, with one named exception.** `sgt journal archive` previews by default and acts only on `--yes`. Startup reconciliation completes an unlink that a crash interrupted — an operator-authorized act finished later, the same shape as `recovery.rs`'s interrupted teardown (I4, Q9). |
 | `sgt work reap --yes` (`src/cli.rs:422`, `POST /v1/work/{id}/reap`) | **Precedent adopted** for the verb's shape: explicit, confirmed, reported per item, never scheduled. |
 | ADR 0008 (manifest authority over storage paths) | **Respected.** The archive lives inside the already-resolved data dir (`<data-dir>/journal/archive/`). No new manifest key, no new resolution rung. |
-| ADR 0012 (estate and doctor are daemon API surface) | **Binding.** The journal holds an exclusive advisory lock for the daemon's lifetime (`src/runtime/journal.rs:68,256`), so the archive verb cannot be an offline file mover. It is a daemon API call (§4.7). |
+| ADR 0012 (estate and doctor are daemon API surface) | **Binding.** The journal holds an exclusive advisory lock for the daemon's lifetime (`src/runtime/journal.rs:68,256`), so the archive verb cannot be an offline file mover. It is a daemon API call (§4.8). |
 | `src/runtime/recovery.rs:118-123` — stranded `surfaces/<work-id>/` directories, "a garbage collector's job… Tracked as issue #17" | **Named, and left out of scope** (§7). Surface-directory reclamation shares this issue's number but not its invariants; it is a filesystem sweep against journaled evidence, and belongs with #159's verb, not with the replay contract. |
 | Kickoff ruling 7 (2026-08-20): every default argued for Linux/macOS/WSL, never tuned to Cerberus | **Binding on every number in §4.** Cerberus's 54.6k ev/s appears once, as one point in a platform spread, and is never the basis of a default. |
 
@@ -95,10 +112,11 @@ marginal rate 0.44 s + 1,000,000 / 39,400 ev/s     = 25.8 s
 ```
 
 (The marginal rate removes the measured ~440 ms fixed overhead:
-50,000 / (1.71 − 0.44) = 39.4k ev/s.) Cerberus measured 54.6k ev/s, which
-puts the same mark at 18.8 s. So across one known platform spread, **1M
-events is 19–34 s of cold start — at or past the ruled 30 s trigger, not a
-safe distance from it.** The 2026-08-11 ruling estimated the trigger at
+50,000 / (1.71 − 0.44) = 39.4k ev/s.) Cerberus measured 54.6k ev/s
+(`docs/perf/baseline-cerberus-2026-08-11.md`, S5: 50k events in 924.09 ms →
+54,553 ev/s), which puts the same mark at 18.3 s. So across one known
+platform spread, **1M events is 18–34 s of cold start — at or past the ruled
+30 s trigger, not a safe distance from it.** The 2026-08-11 ruling estimated the trigger at
 ~1.6M events from Cerberus's rate alone; argued across the platform target
 set (ADR 0001: Linux, macOS, WSL) rather than from the fastest measured
 host, the trigger arrives at roughly 1M.
@@ -145,7 +163,7 @@ grow to 599 GB while the check reports `ok`. The check measures the wrong
 axis for this problem: it sees headroom, never growth, and it never sees
 rebuild time at all.
 
-### 1.5 The constraint that did not exist when Rule C was deferred
+### 1.5 The constraints that did not exist when Rule C was deferred
 
 Wave 2 landed the bounded terminal-Work cache for #4. Its miss path is:
 
@@ -169,10 +187,33 @@ core guard is held (`src/api.rs:1514,1569`). At 1M events, `sgt work show`
 on the 1,025th-oldest terminal Work costs 26–34 s **and queues every other
 request behind it**. That is not a slow read; it is a daemon-wide stall.
 
-So Rule C now has a second consumer of "full replay" to answer for, and it
-is the more user-visible one. Any archival design that makes this path
-worse is disqualified. §4.5 shows the recommended design makes it ~35×
-better.
+**And it is not the only one.** `sgt work transcript` is a *third*
+full-replay consumer under the same guard, and the codebase already
+discloses it in its own doc comment (`src/api.rs:2173-2186`):
+
+> `events_after(0)` below runs a full from-seq-0 journal replay while
+> `core` — the exclusive `CoreGuard` — is still held… `resolve_run`'s
+> `terminal_runs` cache accepts the identical shape only as a rare,
+> capacity-bounded cache-miss fallback; **there is no equivalent bound
+> here, because a work's conversation history is unbounded and not capped
+> by any terminal-state cache.** Closing this for good needs a journal
+> reader the core does not own.
+
+So the honest count is **three** consumers of full replay, not two, and
+transcript is the *worse* of the two guard-held ones: the #4 miss path is at
+least rate-limited by a 1024-entry cache, while `work_transcript` takes a
+full replay on **every** call, for any Work, hit or miss, and its cost is
+uncapped by design.
+
+An earlier draft of this document said "a second consumer" and sold rung 3
+solely on `rederive_registry_for`. That was the exact failure this document
+criticizes elsewhere — presenting a partial fix as if it exhausted the
+problem — and it is corrected here. §4.6 extends the fix to transcript and
+states plainly what it does and does not close.
+
+Any archival design that makes any of these three paths worse is
+disqualified. That rule now has teeth it did not have in the earlier draft:
+§4.4 exists because a naive floor makes `work_transcript` fail outright.
 
 ### 1.6 The startup cost nobody has named
 
@@ -233,10 +274,44 @@ begin expecting at that floor + 1 — and must make the floor itself part of
 the checkable binding, so a missing archive is a named failure and never a
 silently short history.
 
-The related mechanism already exists and is the model to copy:
-`Journal::replay_after` (`journal.rs:454`) already skips whole segments
-using `first_seq` (`journal.rs:574`) and resumes seq validation from the
-first kept segment. Archival's floor is the same idea made durable.
+**The earlier draft of this document proposed copying
+`Journal::replay_after` as the model for a non-zero floor. That was wrong,
+and the way it is wrong is the sharpest mechanical hazard in the whole
+design.** `Replay::after` recomputes `expected` from a real segment's
+`first_seq` *only* when some segment satisfies `first_seq <= after + 1`
+(`journal.rs:548-565`). When every live segment begins **above** `after + 1`
+— which is precisely what archival produces for every below-floor `after` —
+the loop breaks on its first iteration, `keep` and `expected` are never
+assigned, and `expected` keeps its initialized value of `1`. The next
+`Replay::next()` then compares the first live event's real seq (580,679 in
+§4.8's worked example) against `expected == 1` and fails with
+`SeqDiscontinuity`.
+
+`Replay::new` (`journal.rs:473-477`, and every other construction path)
+hardcodes the same `expected = 1`.
+
+So the root cause generalizes: **`Replay` has exactly one code path that can
+ever expect a seq other than 1, and archival is precisely the condition that
+makes that path not fire.** The moment any segment is archived, every reader
+that does not go through the manifest gets a spurious hard error.
+
+That is not a corner case. `events_after(0)` is what `sgt work transcript`
+calls unconditionally (`api.rs:2196`), what `GET /v1/events` defaults to
+(`EventsQuery::from` defaults to 0, `api.rs:3322-3325`), what a fresh SSE
+connection without `Last-Event-ID` uses (`api.rs:3391-3399,3455`), and
+`replay_data_dir` — doctor's lock-free path — is a bare `Replay::new`
+(`journal.rs:473-477`). All four break on the first archival pass.
+
+**Therefore I3 is stated as a contract, not as a mechanism:**
+
+> Every `Replay` construction takes its expected floor **explicitly**. No
+> construction path may infer `1`. A request for events below the floor is
+> either served from the archive through the manifest, or answered with a
+> named `ArchivedRange` outcome the surface renders honestly — **never**
+> with `SeqDiscontinuity`, which keeps its single existing meaning: the
+> history on disk is corrupt.
+
+§4.4 specifies the behavior for every one of those consumers by name.
 
 ### 2.4 I4 — Nothing is deleted except by an explicit maintenance action
 
@@ -245,6 +320,18 @@ action with its own authorization and dry-run evidence",
 `docs/proposals/estate-root-git.md:971-973`) and the shipped precedent
 (`sgt work reap --yes`) bind here. No automatic reaper, no scheduled sweep,
 no on-start compaction, no deletion as a side effect of any other verb.
+
+**One named exception, and it must be named rather than left implicit.**
+Startup reconciliation (§4.3) completes the unlink of a live-directory
+segment whose archived counterpart is present and hash-verified — a deletion
+the daemon performs without anyone typing anything at that moment. It is
+permitted because it *completes an operator-authorized action interrupted by
+a crash*, which is exactly what `src/runtime/recovery.rs` already does for an
+interrupted surface teardown: recovery acts on evidence that something was
+left unfinished. It is not permitted to reclaim anything nobody authorized —
+which is the same line `recovery.rs:118-123` draws when it refuses to delete
+stranded surface directories and defers them to a garbage collector. Q9 asks
+the owner to ratify that distinction explicitly.
 
 ### 2.5 I5 — Archived data is replayable, or it is explicitly out of contract
 
@@ -292,6 +379,38 @@ race a live writer. Combined with ADR 0012 (estate and doctor are daemon API
 surface), the archive verb **must** be a daemon API call with a CLI front
 end, exactly like reap.
 
+**Corollary the earlier draft missed:** doctor is a *second, unsynchronized*
+reader of the same directory. `journal_check` calls
+`Journal::replay_data_dir(data_dir)` directly (`cli.rs:3290`), bypassing both
+the `CoreGuard` and the OS lock, and that function's doc comment
+(`journal.rs:468-477`) tolerates exactly one race — a torn last line of the
+live segment — and declares "every other `Malformed`… is corruption, not a
+race, and must fail closed exactly as it does today." Archival introduces a
+second race class (segments renamed and unlinked underneath a lock-free
+scan). Adding a mutation pass without extending that tolerance would make
+`sgt doctor` report corruption during a perfectly healthy archival run.
+§4.8 specifies the concurrency story.
+
+### 2.9 I9 — The floor state must be complete, and completeness must be tested
+
+This invariant exists because the earlier draft violated it. It persisted
+the slim index rows so `work list` would survive archival, and stopped
+there — missing that `WorkRegistry::catch_up` also folds the **command
+idempotency ledger** (`commands` and `command_works`,
+`projection.rs:264-280`, `1087-1100`), which is safety-load-bearing and not
+disposable (§3.1).
+
+> Any registry state that a floor-started replay can no longer derive is
+> either (a) carried in the archive manifest's **FloorState**, or (b)
+> explicitly declared out of contract with its consequence named. There is
+> no third option, and the boundary is pinned by a test, not by prose.
+
+The pinning test is specified in §6: fold the full journal and fold
+floor+FloorState, then assert the resulting `WorkRegistry` values are equal
+on every field, with an *enumerated allowlist* of fields permitted to
+differ. A new registry field added without deciding its archival disposition
+fails that test rather than shipping a silent hole.
+
 ────────
 
 ## 3. The design space
@@ -313,10 +432,8 @@ they are not the same design:
   time** — it saves disk, which is the axis the trigger is not on.
 - **(a-ii) Archive and skip replay.** Cold start reads only the live
   window. This is what actually attacks the binding constraint. It also
-  immediately violates I2: the works whose events live only in archived
-  segments would vanish from `work list`, because the slim index
-  (`projection.rs:410-440`) is itself rebuilt by full replay and has no
-  durable form.
+  immediately violates I2 and I9: the state that `WorkRegistry::catch_up`
+  folds from below-floor events simply stops existing.
 
 **This is the crux of Rule C, and the 2026-08-11 ruling identified it
 exactly:** "Segments interleave works, so archiving 'old' segments while
@@ -325,18 +442,73 @@ retirement requires a load-bearing snapshot/checkpoint, which is exactly the
 B1 machinery ruled dormant."
 
 The ruling is right that (a-ii) requires persisting something derived. What
-this proposal adds is a measurement of *how much*: the durable artifact
-needed is not a projection snapshot. It is `WorkIndexRow` — six scalar
-fields (`id`, `intent`, `state`, `integrity`, `created_at`, `updated_at`),
-plus one added `last_seq` (§4.3), all of which are **terminal-immutable for
-exactly the Works that qualify for archival**. At ~200 B/row that is 12.5 MB
-for 62,500 Works. And unlike a
-projection snapshot, it is re-derivable at any moment by replaying the
-archive, which makes its binding checkable (I1b) rather than trusted.
+this proposal adds is an accounting of *exactly what*. The reducer
+`catch_up` drives (`apply_registry_event`) writes four things that outlive
+the live window:
 
-**Disposition: ADOPTED**, as (a-ii) with the narrowed durable artifact, and
-gated on the owner permitting that narrowing (Q2). If Q2 is ruled against,
-this collapses to (a-i) and Rule C can only ever address disk.
+**1. `works` / `runs` — full Work and run state.** Bounded already by wave
+2's caches; a floor-started replay simply doesn't populate them for archived
+Works, and the miss path (§4.6) re-derives on demand. **Nothing to
+persist.**
+
+**2. `work_index` — the slim index row.** Six scalar fields (`id`,
+`intent`, `state`, `integrity`, `created_at`, `updated_at`) plus one added
+`last_seq` (§4.3). All terminal-immutable for exactly the Works that
+qualify. ~200 B/row → 12.5 MB at 62,500 Works. **Persist.**
+
+**3. `commands` — the §26 command idempotency ledger.** *This is the one the
+earlier draft missed, and it is not disposable.* `CommandOutcome` records
+the status and exact response body of every accepted or rejected mutating
+command, and its doc comment states the promise plainly: a repeated
+`command_id` "replays this record verbatim instead of re-executing —
+including across a daemon restart, because the registry is rebuilt from the
+journal" (`projection.rs:246-250`). `replay_command` /`record_and_respond`
+consult it at the top of every mutating handler (`api.rs:1027-1080`).
+
+**4. `command_works` — the crash-window index.** Maps `command_id` → the
+Work id a submit created, and its own doc comment names the stakes: without
+it "a client retry of the same `command_id` would look brand new and create
+a *second* Work record, breaking exact-once for the one case §26 exists to
+serve: retry after an uncertain outcome" (`projection.rs:270-280`).
+
+**So a naive floor silently re-arms duplicate-Work creation.** Once the
+segment holding a submit's `command.accepted` is archived, a cold start
+after that point has no record of the command, and a client retrying that
+`command_id` gets a *second* Work. This is a safety regression, not a
+convenience one, and it is the reason §3.1's disposition is narrower than
+the earlier draft's.
+
+**Three ways to answer it, and why the third wins:**
+
+- **Exclude command events from eligibility.** Every mutating command
+  journals one, so command events are spread through essentially every
+  segment. This makes almost nothing archivable. **Dead on arrival.**
+- **Persist the full `commands` map.** `CommandOutcome.result` is the entire
+  original response body — for a submit, the whole Work JSON. At ~4 commands
+  per Work and 1–2 kB each, 62,500 Works is 250k entries and 250–500 MB of
+  manifest. That does not bound growth; it relocates it. **Rejected.**
+- **Persist the command *keys*, not the outcomes.** The manifest carries the
+  archived `command_id` set, plus the `command_id → work_id` mapping for
+  submits (two ULIDs, ~60 B/entry; ~10 MB at 250k commands — the same order
+  as the index rows). A retried below-floor `command_id` is then **refused
+  with a named error, never re-executed**, and for a submit the refusal
+  names the Work that command already created. **Adopted.**
+
+The honest cost: below the floor, §26 degrades from "replay the identical
+response" to "refuse, and name the Work if there is one." The **safety**
+property — never re-execute, never create a duplicate Work — is preserved
+exactly. The **convenience** property — a byte-identical replayed body — is
+lost. That is a contract change to §26 and it is Q8, not an implementation
+detail.
+
+Together these are the manifest's **FloorState** (§4.3), and I9 requires a
+test that pins its completeness rather than trusting this list to have been
+exhaustive — because this list was demonstrably not exhaustive one draft ago.
+
+**Disposition: ADOPTED**, as (a-ii) with the narrowed durable artifacts
+above, gated on the owner permitting the narrowing (Q2) and the §26
+degradation (Q8). If either is ruled against, this collapses to (a-i) and
+Rule C can only ever address disk, never rebuild time.
 
 ### 3.2 (b) Work-retirement-based compaction
 
@@ -479,8 +651,16 @@ replays into one (§1.6, §4.1). This is offered as Q1 rather than assumed.
 
 ## 4. Recommended composition
 
-Five rungs, cheapest-first. Each is separately shippable and each is
-useless-but-harmless if the one above it is skipped.
+Five rungs, cheapest-first (§4.1, §4.2, §4.3, §4.6, §4.7). Each is separately
+shippable and each is useless-but-harmless if the one above it is skipped.
+
+Three sections between them are **not** rungs and are not optional:
+
+- **§4.4, the below-floor read contract**, is a hard prerequisite for §4.3.
+  Archival cannot ship before it, because the first archived segment breaks
+  four working read paths without it.
+- **§4.5** derives the one default the composition rests on.
+- **§4.8** specifies the verb and its concurrency obligations.
 
 ### 4.1 Rung 0 — one cold-start replay instead of three
 
@@ -547,7 +727,8 @@ The remedy line names `sgt journal archive --dry-run`. It deletes nothing.
   00000043.ndjson
   .lock
   archive/
-    manifest.json
+    manifest.ndjson
+    .staging/
     00000001.ndjson.zst
     00000002.ndjson.zst
     ...
@@ -556,48 +737,72 @@ The remedy line names `sgt journal archive --dry-run`. It deletes nothing.
 Inside the already-resolved data dir; no new manifest key, no new resolution
 rung (ADR 0008).
 
-**`manifest.json`** — itself a derived artifact, re-buildable by reading the
-archived segments:
+**`manifest.ndjson` is append-only**, folded at read time — the same shape as
+the journal itself. This is not decoration: §4.8 commits one segment at a
+time so the verb's guard-hold stays bounded, and a rewrite-the-whole-file
+manifest would mean re-fsyncing a 10–20 MB document 38 times in the worked
+example. An append is one line and one fsync.
+
+Three record types:
 
 ```json
-{
-  "schema": "sergeant.journal-archive/v1",
-  "archived_through_seq": 580678,
-  "segments": [
-    {
-      "index": 1,
-      "first_seq": 1,
-      "last_seq": 15281,
-      "events": 15281,
-      "raw_bytes": 8388401,
-      "stored_bytes": 998112,
-      "codec": "zstd",
-      "blake3": "b3:…",
-      "work_ids": ["01H…", "01H…"]
-    }
-  ],
-  "index_rows": [
-    { "id": "01H…", "intent": "…", "state": "completed",
-      "integrity": "clean", "created_at": "…", "updated_at": "…",
-      "last_seq": 15044 }
-  ]
-}
+{"t":"segment","index":1,"first_seq":1,"last_seq":15281,"events":15281,
+ "raw_bytes":8388401,"stored_bytes":998112,"codec":"zstd","blake3":"b3:…",
+ "work_ids":["01H…","01H…"]}
+{"t":"work","id":"01H…","intent":"…","state":"completed","integrity":"clean",
+ "created_at":"…","updated_at":"…","last_seq":15044}
+{"t":"command","command_id":"01H…","work_id":"01H…"}
+{"t":"floor","archived_through_seq":15281,"segments":1,"blake3_chain":"b3:…"}
 ```
 
-`last_seq` is not part of `WorkIndexRow` today; it is added because it is
-what lets the miss path skip the live window entirely (§4.5). It costs one
-`u64` per row and is derived from the same pass that evaluates eligibility.
+A `floor` line commits everything appended since the previous one. **The
+floor is the last `floor` line's `archived_through_seq`, and nothing else in
+the file is authoritative until a `floor` line follows it** — which is what
+makes a crash mid-append harmless: a partial tail is discarded exactly the
+way a torn journal tail is.
+
+The `work` and `command` lines together are the **FloorState** (I9):
+
+- `work` — the slim index row, plus `last_seq`, which is not part of
+  `WorkIndexRow` today and is added because it is what lets a read skip the
+  live window entirely (§4.6).
+- `command` — the §26 ledger *keys* (§3.1): one line per archived
+  `command_id`, carrying `work_id` when the command was a submit. This is
+  what keeps a retried below-floor `command_id` from creating a duplicate
+  Work. The `CommandOutcome` *bodies* are deliberately not carried; see §3.1
+  for the cost of that and Q8 for the ruling it needs.
+
+Both are produced by folding the **same** `apply_registry_event` arms the
+live reducer uses, not by a hand-rolled subset — and I9's pinning test
+(§6) is what keeps them from drifting apart.
+
+The whole manifest is re-derivable by replaying the archived segments, which
+is what makes it a checkable cache rather than a second truth (I1).
+
+**Manifest growth, stated rather than waved at.** One `segment` line per
+archived segment, one `work` line per archived Work, one `command` line per
+archived command. At 62,500 Works / 250k commands / 65 segments that is
+~22 MB, folded once at daemon start. It grows with history, like everything
+else here — the difference is that it grows at ~1/40th the rate of the
+journal it replaces. If an estate ever passes ~1M archived Works this
+becomes its own Rule C problem in miniature; that is honest, and it is far
+past any horizon in §1.3.
 
 **Archival eligibility.** A segment is archivable if and only if:
 
 1. it is not the currently-open segment; **and**
-2. it is older than the live window (§4.4); **and**
+2. it is older than the live window (§4.5); **and**
 3. every event in it carries a `work_id` whose Work is **terminal and
    settled** — the same `is_absorbing` + `run_is_settled` predicate wave 2
    already uses for cache eviction (`projection.rs:644,701`) — and whose
-   `WorkIndexRow` is written into `index_rows`; **and**
+   `work` FloorState line is appended; **and**
 4. every event in it *without* a `work_id` is of a kind on an explicit
-   archivable allowlist (Q5).
+   archivable allowlist (Q5); **and**
+5. every `command.accepted` / `command.rejected` event in it has its
+   `command` FloorState line appended (§3.1). Command events do **not** block
+   eligibility — that variant was considered and is dead on arrival, since
+   essentially every segment holds one — but a segment cannot be archived
+   until its commands are in the FloorState.
 
 Condition 3 is the ruling's "segments interleave works" objection answered
 directly rather than argued around: a segment holding even one event of a
@@ -607,31 +812,132 @@ can stall archival indefinitely.** That is accepted, not worked around — the
 *why* the live journal is not shrinking, and the honest remedy is to finish
 or cancel that Work.
 
-**Replay contract change.** `Replay` gains a floor. Given a manifest with
-`archived_through_seq = N`:
+**Replay contract change.** Every `Replay` construction takes its floor
+explicitly (I3); none may infer 1. Per-consumer behavior is specified in
+§4.4. Two mechanical notes belong here:
 
-- **Live replay** (cold start, `Journal::replay`) begins expecting seq
-  `N+1`, and validates that the first live segment's `first_seq` is exactly
-  `N+1`. A mismatch is a hard failure with a named remedy, never a shortened
-  history.
 - **Full replay** (`Journal::replay_from_archive`, new) reads archived
   segments in index order, verifying each against its recorded `blake3`
   before decoding, then continues into the live segments — one continuous
   seq chain from 1, exactly as today.
-- `replay_data_dir` (doctor's lock-free path, `journal.rs:473`) reads the
-  manifest and reports the floor, so an archived history never reads as a
-  seq gap. Its torn-tail classification (`journal.rs:87-101,166-175`) is
-  unaffected: archived segments are immutable and closed, so a torn tail is
-  still only ever possible on the last line of the last live segment.
+- Torn-tail classification (`journal.rs:87-101,166-175`) is unaffected:
+  archived segments are immutable and closed, so a torn tail is still only
+  ever possible on the last line of the last live segment — and on the last
+  line of `manifest.ndjson`, which is discarded the same way.
+
+**Startup reconciliation.** The earlier draft claimed "manifest before
+unlink, so a crash at any point leaves either the original or a
+manifest-listed archive, never a hole." That claim was false in one window.
+A crash between the `floor` line's fsync and the original's unlink leaves
+the original segment **still in the live directory and already below the
+floor**. `list_segments` would return it as the lowest-index live segment,
+its `first_seq` far below `archived_through_seq + 1`, and floor validation
+would then refuse to start the daemon — the exact state a §6 acceptance
+criterion says cannot exist.
+
+So the step is specified rather than assumed. `Journal::open`, before
+validating the floor:
+
+1. folds `manifest.ndjson` to the last committed `floor` line, discarding
+   any uncommitted tail;
+2. for each live-directory segment whose entire `[first_seq, last_seq]`
+   range is `<= archived_through_seq`: verifies the archived counterpart is
+   present and its `blake3` matches, then **completes the pending unlink**;
+3. reports any live segment below the floor whose counterpart does *not*
+   verify as a hard, named failure — that is corruption, not an interrupted
+   move;
+4. only then validates that the first remaining live segment's `first_seq`
+   equals `archived_through_seq + 1`.
+
+This is a deletion the daemon performs unprompted, which is why I4 names it
+as an explicit exception: it completes an operator-authorized action
+interrupted by a crash, the same shape as `recovery.rs` finishing an
+interrupted teardown. Q9 asks the owner to ratify that reading.
+
+The reverse window — after the staged file is renamed into `archive/` but
+before the `floor` line commits — is benign by construction: the original is
+still live, the floor has not moved, and the orphan in `archive/` is `sgt
+journal verify`'s "present but unlisted" class. Reconciliation never deletes
+from `archive/`; it only ever completes a pending unlink of a *live* segment
+whose archived twin hash-verifies.
+
+**Cost of this, stated:** the crash-safety story is no longer "one atomic
+rename." It is a two-phase commit with a reconciliation pass, which is more
+machinery than the earlier draft implied and is one more thing that has to
+be crash-tested (§6).
 
 **Compression** rides the move: a segment is compressed as it is archived
 (`.ndjson.zst`), never in place, never on a live segment. This is the
 2026-08-11 ladder's rung 1, folded in at zero extra machinery. Expected
 5–10× on NDJSON with repetitive keys — **unmeasured**, §5.4.
 
-**Nothing is deleted.** Archival is a move plus a compress. The bytes stay.
+**Nothing is deleted** except the live copy of a segment whose compressed
+twin is on disk and hash-verified. Archival is a move plus a compress. The
+bytes stay.
 
-### 4.4 The live-window default, argued from platform posture
+### 4.4 The below-floor read contract
+
+I3 says no `Replay` may infer a floor of 1 and no below-floor read may
+surface as `SeqDiscontinuity`. This section discharges that for **every**
+from-seq-0 or below-floor consumer in the tree, by name. The earlier draft
+specified none of them, and would have shipped a spurious hard error on
+`sgt work transcript`, `GET /v1/events`, SSE, and `sgt doctor` the moment
+the first segment was archived.
+
+| consumer | call site | today | after archival |
+|---|---|---|---|
+| cold-start registry fold | `daemon.rs:460` | `replay()` from 1 | floor replay + FloorState fold (§4.3) |
+| DuckDB rebuild | `daemon.rs:467` | `replay()` from 1 | floor replay; analytics below the floor is **declared out of contract** (§7) and doctor says so |
+| #4 miss path | `projection.rs:1141` | full replay under guard | manifest-directed archived read (§4.6) |
+| `sgt work transcript` | `api.rs:2196`, `events_after(0)` | full replay under guard | manifest-directed archived read for that Work (§4.6) |
+| `GET /v1/events` (default `from=0`) | `api.rs:3322-3325` | full replay | live window + `truncated_below` marker |
+| SSE without `Last-Event-ID` | `api.rs:3391-3399,3455` | `events_after(0)` | live window + one leading `archived-range` event, then live |
+| SSE with a below-floor `Last-Event-ID` | same | `replay_after(n)` | same marker; the client learns its resume point is gone |
+| `sgt doctor` journal check | `cli.rs:3290` → `replay_data_dir` | `Replay::new`, expects 1 | manifest-aware floor, with the concurrency rule of §4.8 |
+
+Three rules generate that table.
+
+**R1 — the floor is always explicit.** `Replay` takes `expect_from` at
+construction. `Journal::replay()` passes the manifest floor;
+`replay_from_archive()` passes 1; `replay_after(n)` passes
+`max(n + 1, floor)` and keeps its existing segment-skipping on top. The
+`expected = 1` default disappears from the type. This one change is what
+makes the rest of the table possible, and it is the smallest possible fix
+for the root cause named in I3.
+
+**R2 — a below-floor request is answered, not refused.** Two shapes,
+chosen by what the caller is actually asking:
+
+- **Per-Work reads** — `work show`, `work transcript` — ask *what happened*,
+  and the manifest can answer: the `work` line's `last_seq` says whether the
+  live window is even needed, and the `segment` lines' `work_ids` say which
+  archived segments to read. These get real history, not a marker (§4.6).
+- **Stream reads** — `/v1/events`, SSE — ask *what is happening*. They get
+  the live window plus an explicit `truncated_below: <floor>` field (SSE: one
+  leading `archived-range` event before the history replay). The surface
+  renders "events before seq N are archived" rather than pretending the
+  stream starts at the beginning.
+
+Q10 asks the owner to ratify that split, because it is a product decision as
+much as a mechanical one.
+
+**R3 — one named error, distinct from corruption.**
+`JournalError::ArchivedRange { requested_after, archived_through }` is
+returned when a caller genuinely needs below-floor events and the archive
+cannot serve them — a missing or unverifiable archived segment. It surfaces
+as HTTP 409 `archived_range` with a remedy naming `sgt journal verify`.
+`SeqDiscontinuity` keeps exactly one meaning, unchanged: **the history on
+disk is corrupt.** Conflating the two is what the earlier draft would have
+done by accident, and it is the difference between "some old history moved"
+and "your journal is broken."
+
+**Cost, stated.** This is real API surface: a new error variant, a new
+response field on two endpoints, a new SSE event type, and a client-visible
+behavior change for `/v1/events?from=0`. It is the price of archival being
+honest instead of silent, and it is why §6 tests every row of the table
+above rather than only the cold-start path.
+
+### 4.5 The live-window default, argued from platform posture
 
 The window is the amount of journal a cold start must always replay. The
 budget it is derived from:
@@ -681,41 +987,58 @@ recommends it when the live journal exceeds 2× the window (32 segments /
 256 MiB), the point at which one pass reclaims at least half the live
 journal.
 
-### 4.5 Rung 3 — archival repairs the #4 miss path
+### 4.6 Rung 3 — a manifest-directed per-Work read, for both guard-held paths
 
 This is the argument that makes rung 2 worth its complexity even before the
-rebuild-time benefit lands.
+rebuild-time benefit lands. It applies to **both** of §1.5's guard-held
+consumers, not just the one the earlier draft named.
 
-`rederive_registry_for` today walks every event and discards ~99.99% of them
-(§1.5). With the manifest, the miss path becomes:
+The shared mechanism — one lookup, used by both:
 
-1. `work_index` confirms the id exists (already the case, `api.rs:1522`);
-2. the manifest's `work_ids` sets name the archived segments containing that
-   Work — typically one or two, because a Work's events are contiguous in
-   time;
-3. the index row's `last_seq` decides whether the live window can be skipped
-   entirely: if `last_seq <= archived_through_seq`, no live segment can
-   contain an event for that Work, so none is read;
-4. replay reads only the named segments, filtered as today.
+1. `work_index` (or the `work` FloorState line) confirms the id exists
+   (already the case, `api.rs:1522`);
+2. the manifest's `segment` lines' `work_ids` name the archived segments
+   containing that Work — typically one or two, because a Work's events are
+   contiguous in time;
+3. the `work` line's `last_seq` decides whether the live window is needed at
+   all: if `last_seq <= archived_through_seq`, no live segment can contain an
+   event for that Work, so none is read;
+4. the read covers only the named segments, filtered as today.
 
-At 1M events with a 16-segment live window, for a fully-archived Work:
-**two archived segments (~30k events) instead of 1M** — roughly 0.8 s
-instead of 26–34 s, a ~35× reduction in how long the core guard is held.
-For a Work entirely inside the live window (the common case) the cost is
-unchanged. For the boundary case — a Work spanning the archive floor —
-step 3 fails and the live window is read too, giving ~7 s at that scale:
-still 4× better, and it is the rarest of the three cases.
+**For the #4 miss path** (`rederive_registry_for`, which today walks every
+event and discards ~99.99% of them): at 1M events with a 16-segment live
+window, for a fully-archived Work, **two archived segments (~30k events)
+instead of 1M** — roughly 0.8 s instead of 26–34 s, a ~35× reduction in
+guard-hold. A Work inside the live window is unchanged. A Work spanning the
+floor fails step 3 and reads the live window too: ~7 s at that scale, still
+4× better, and the rarest of the three cases.
 
-Recording `work_ids` and `last_seq` in the manifest costs nothing extra: the
-archival pass already reads every event in every candidate segment to
-evaluate eligibility condition 3.
+**For `sgt work transcript`** (`api.rs:2196`), the same lookup replaces
+`events_after(0)` with a per-Work archived read. The arithmetic is the same,
+but **what it closes is not**, and the difference must be stated:
 
-### 4.6 Rung 4 — blob liveness, kept deferred
+- The #4 miss path becomes *bounded* — the manifest names a small, fixed set
+  of segments and the cache absorbs repeats.
+- `work_transcript` becomes *proportional to one Work's own history* instead
+  of proportional to all history. That is a large improvement and it is not
+  a bound: the code comment at `api.rs:2173-2186` is right that "a work's
+  conversation history is unbounded," and a single deep Work (S3 measured
+  1,010 events on one) still reads every segment it touches, under the guard.
+- The comment says closing this "for good needs a journal reader the core
+  does not own." **This design does not deliver that reader.** It shrinks the
+  input; it does not release the guard. Rung 3 is a mitigation for
+  `work_transcript`, not a fix, and it should not be sold as one.
+
+Recording `work_ids` and `last_seq` costs nothing extra: the archival pass
+already reads every event in every candidate segment to evaluate eligibility
+condition 3.
+
+### 4.7 Rung 4 — blob liveness, kept deferred
 
 No blob deletion ships. Rule B's trigger stands unchanged. What ships is the
 groundwork that makes the eventual sweep cheap and correct:
 
-- the per-segment `work_ids` set (already required by §4.5);
+- the per-segment `work_ids` set (already required by §4.6);
 - an acceptance test that **no code path writes a blob without a journal
   event naming it** — Rule B's own acceptance clause, restated because the
   mark pass's correctness rests entirely on it;
@@ -727,7 +1050,7 @@ groundwork that makes the eventual sweep cheap and correct:
 `sgt doctor` reports blob share against Rule B's 20 GiB backstop (§4.2). If
 that fires, a blob-GC design contract fires with it — as already ruled.
 
-### 4.7 The maintenance verb
+### 4.8 The maintenance verb
 
 ```text
 sgt journal archive              # preview; the default, always safe
@@ -756,29 +1079,110 @@ sgt journal archive --dry-run
   run with --yes to proceed
 ```
 
-The archival pass itself:
+**The pass must not hold the core guard for its own duration.** The earlier
+draft took the guard in step 1 and held it through compress, fsync, rename,
+and unlink for every segment — 38 segments and 304 MiB in the worked example
+above. A document that spends four sections establishing that a guard-held
+stall is a daemon-wide, disqualifying failure mode cannot then recommend, in
+a doctor remedy line, a verb whose own guard-hold is unexamined. §1.5's rule
+("any design that makes these paths worse is disqualified") applies to this
+design too.
 
-1. takes the core guard (single writer, I8);
-2. evaluates eligibility over candidate segments;
-3. for each eligible segment: compress to a temp file, `fsync`, rename into
-   `archive/`, `fsync` the directory, then `fsync`-rename the updated
-   manifest, then unlink the original — **manifest before unlink**, so a
-   crash at any point leaves either the original or a manifest-listed
-   archive, never a hole;
-4. journals `journal.archived` with the seq range, segment count, and byte
-   counts, so the act is itself in the history it archives.
+So the pass is windowed. **Per segment**, not per pass:
 
-`sgt journal verify` re-reads every archived segment, checks its `blake3`,
-and checks that the seq chain across archive-plus-live is contiguous from 1.
-It is the answer to "is my history intact" and it is what the acceptance
-criteria in §6 test against.
+*Outside the guard* — the expensive part, and it needs no exclusivity
+because an archival candidate is by definition never the open segment, so
+its file is closed and immutable:
+
+1. read the segment, evaluate eligibility, and fold its `work`/`command`
+   FloorState rows;
+2. compress into `archive/.staging/<index>.ndjson.zst`, `fsync` it.
+
+*Inside the guard* — bounded, a handful of metadata operations independent
+of segment size:
+
+3. re-verify the segment is still a candidate (nothing archived it
+   meanwhile, no Work un-settled);
+4. rename staging → `archive/`, `fsync` the directory;
+5. append the `work`/`command`/`segment` lines and a `floor` line to
+   `manifest.ndjson`, `fsync`;
+6. unlink the original.
+
+*Then release the guard* before starting the next segment.
+
+7. Once the pass finishes, journal `journal.archived` with the seq range,
+   segment count, and byte counts, so the act is itself in the history it
+   archives.
+
+Guard-hold therefore scales with **segment count × a few fsyncs**, not with
+bytes, and other requests interleave between segments.
+
+**What this costs, stated.** Three things:
+
+- **The pass is no longer atomic across segments.** A crash or a
+  cancellation mid-pass leaves a partially archived journal. That is safe by
+  construction — the floor advances one committed segment at a time and
+  every intermediate state is valid — but "archival is all-or-nothing" is no
+  longer true, and the preview should say how far a partial run got.
+- **One manifest commit per segment**, which is exactly why the manifest is
+  append-only NDJSON (§4.3) rather than a rewritten JSON document. 38
+  appends and 38 fsyncs, not 38 rewrites of a 22 MB file.
+- **The guard-hold is bounded but not measured.** Six fsync-class operations
+  per segment on an unknown filesystem is an estimate, not a number. §5.6
+  measures it, and until it does, this is a designed-for bound rather than a
+  demonstrated one.
+
+**`sgt journal verify`** re-reads every archived segment, checks its
+`blake3`, and checks that the seq chain across archive-plus-live is
+contiguous from 1. Its anomaly classes are:
+
+1. an archived segment listed in the manifest but absent;
+2. an archived segment whose bytes no longer match its `blake3`;
+3. a manifest `segment` line whose file is absent (same as 1, named
+   separately because the remedy differs: restore vs. re-archive);
+4. a file present in `archive/` that no `segment` line names — the benign
+   orphan of an interrupted pre-commit crash;
+5. **a segment present in the live directory whose range is already below
+   the floor** — the pending-unlink state of §4.3. Reported as
+   *reconcilable*, not corrupt, with the remedy "restart the daemon; startup
+   reconciliation completes it." Verify never performs the unlink itself,
+   because verify is a read verb.
+
+Class 5 is the one the earlier draft's four-class list could not express,
+which is how the crash-window contradiction went unnoticed.
+
+**Doctor versus a live archival pass.** `sgt doctor`'s `journal_check` calls
+`Journal::replay_data_dir` directly (`cli.rs:3290`) — no `CoreGuard`, no OS
+lock — and that function tolerates exactly one race today: a torn last line
+of the live segment (`journal.rs:468-477`). Archival adds a second race
+class, and without a rule for it a healthy archival run would make doctor
+report corruption. The rule:
+
+- **Order the reads so the common race is benign.** `replay_data_dir` lists
+  segments **first**, then folds the manifest, then discards any listed
+  segment lying entirely below the floor it just read. A floor that advanced
+  between the two reads then produces a skip, not a gap.
+- **Retry once on a vanished segment.** A listed segment that is gone when
+  opened is treated exactly as the existing torn-tail race is: retry the
+  whole `replay_data_dir` once. A second failure is corruption and fails
+  closed, unchanged. This extends the function's tolerance doc by exactly one
+  named case — the minimum honest change.
+- **A quiescence marker is rejected.** Having the lock-free reader wait for
+  the daemon to be idle would reintroduce the synchronization
+  `replay_data_dir` exists to avoid, and would make `sgt doctor` block on a
+  long archival run.
+
+Cost: doctor's journal check can perform two full lock-free scans in the
+rare racing run, roughly doubling that check's cost while an archival pass
+is in flight. `journal_growth` reports when it retried, so the cost is
+visible rather than mysterious.
 
 ────────
 
 ## 5. Measurement plan — what to measure before implementing
 
 The issue names one measurement ("measure rebuild at 1M events"). It needs
-five. Every one runs on the committed harness (`scripts/perf/`), which
+six. Every one runs on the committed harness (`scripts/perf/`), which
 scaffolds its own scratch estate — `perf_init` creates `<outdir>/scratch`,
 `perf_seed_repo` builds a throwaway git repo and workflow, and
 `perf_daemon_start` runs the release binary against a scratch data dir
@@ -854,7 +1258,7 @@ codec becomes a per-tier choice rather than a default.
 
 ### 5.5 Replay rate on a second platform target
 
-The live-window default (§4.4) rests on an *assumed* 2× penalty for the
+The live-window default (§4.5) rests on an *assumed* 2× penalty for the
 slowest platform target, because neither macOS nor WSL2 has ever been
 measured for replay. Run `s5-journal.sh` at reduced marks
 (`PERF_S5_MARKS="50000 250000"`) on a macOS host and inside a WSL2 distro
@@ -865,12 +1269,36 @@ that configuration a hard refusal, not a slow one).
 too small. Per ruling 7 this is the measurement that lets the default be
 argued for the platform targets rather than assumed from one host.
 
-### 5.6 What is NOT measured first
+### 5.6 The archive verb's own guard-hold and compress-side throughput
+
+§4.8 bounds the guard-hold to "segment count × a few fsyncs" by design. That
+is an argument, not a measurement, and this document disqualifies other
+designs on exactly this axis — so it must measure its own.
+
+On the 1M-event corpus from §5.1, run a realistic first archival pass (the
+worked scale: ~38 eligible segments, ~304 MiB) and record:
+
+- compress-side wall time per segment, outside the guard (read + zstd +
+  fsync) — this is what makes the *pass* slow, and it is fine that it is;
+- **guard-held wall time per segment** (re-verify + rename + dir fsync +
+  manifest append + fsync + unlink) — p50/p95/max;
+- total guard-held time summed across the pass, and the longest single
+  uninterrupted hold;
+- concurrent request latency (`sgt status`, a submit) sampled throughout the
+  pass, which is the number an operator actually feels.
+
+**What it decides.** Whether the windowed pass is genuinely invisible to
+concurrent traffic, or whether per-segment metadata commits on a slow
+filesystem add up to a stall of their own. If p95 guard-hold is not small,
+the manifest commit batches across K segments and reconciliation tolerates K
+pending unlinks — a change §4.3's reconciliation step already accommodates.
+
+### 5.7 What is NOT measured first
 
 The #4 miss-path cost (§1.5) needs no new measurement — it is a full replay
 by inspection, so §5.1's rebuild figure *is* its figure, minus the DuckDB
-fold. It is called out because doctor should report it (§4.2), not because
-it is uncertain.
+fold. The same is true of `work_transcript`. Both are called out because
+doctor should report them (§4.2), not because they are uncertain.
 
 ────────
 
@@ -887,12 +1315,11 @@ it is uncertain.
 - A missing, truncated, or hash-mismatched archived segment is a named hard
   failure at the first full replay that needs it — never a short history,
   never a silent seq gap.
-- A manifest whose `archived_through_seq` does not equal
-  `first live segment.first_seq − 1` is a named hard failure at daemon
-  start.
-- `sgt journal verify` detects each of: a deleted archived segment, a
-  flipped byte in one, a manifest listing a segment that is absent, and a
-  segment present but unlisted.
+- A manifest whose committed floor does not equal
+  `first live segment.first_seq − 1` **after startup reconciliation** is a
+  named hard failure at daemon start.
+- An uncommitted tail on `manifest.ndjson` (lines after the last `floor`) is
+  discarded exactly as a torn journal tail is, and the daemon starts.
 - Torn-tail classification is unchanged: `possible_torn_tail` is still true
   only for the last line of the last **live** segment
   (`journal.rs:87-101,166-175`).
@@ -901,27 +1328,99 @@ it is uncertain.
   (`journal.rs:74`) continues to bound the monotonic counter, which
   archival does not reset.
 
+### FloorState completeness (I9) — the pinning test
+
+- **The generative test:** seed a journal, archive a prefix, then assert
+  that folding `full replay` and folding `floor replay + FloorState` produce
+  `WorkRegistry` values equal on **every** field, against an *enumerated
+  allowlist* of fields permitted to differ. Adding a field to `WorkRegistry`
+  without deciding its archival disposition must fail this test. This is the
+  criterion that would have caught the command-ledger hole in the earlier
+  draft, and it is the most important test in this list.
+- The allowlist starts as exactly `{ commands (values only) }` — keys are
+  carried, `CommandOutcome` bodies are not (§3.1, Q8) — and `works`/`runs`
+  for archived Works, which are re-derived on demand (§4.6).
+- `commands` **keys** and `command_works` after floor replay + FloorState
+  equal those after full replay, exactly.
+- FloorState rows are produced by the same `apply_registry_event` arms the
+  live reducer uses — asserted by construction, not by a parallel
+  implementation.
+
+### §26 exact-once across the floor
+
+- A submit whose `command.accepted` is below the floor, retried with the
+  same `command_id` after a cold start, creates **no second Work** — it is
+  refused with the named error and the response names the existing Work id.
+- The same holds for the crash-window shape: `work.submitted` archived,
+  `command.accepted` never written, retry after restart still resolves to
+  the existing Work via the archived `command_works` mapping.
+- A non-submit mutating command (`cancel`, `reap`) retried below the floor
+  is refused, never re-executed.
+- A command *above* the floor still replays its byte-identical body,
+  unchanged from today.
+
+### Below-floor reads (§4.4)
+
+- Every row of §4.4's consumer table has a test at a seeded archived scale.
+- **No** below-floor read returns `SeqDiscontinuity`. A test asserts the
+  specific error/marker per consumer.
+- `sgt work transcript` on a fully-archived Work returns the same events it
+  returned before archival.
+- `GET /v1/events` with no `from` returns the live window plus
+  `truncated_below` equal to the floor.
+- A fresh SSE connection with no `Last-Event-ID`, and one with a below-floor
+  `Last-Event-ID`, both receive the `archived-range` marker and then live
+  events — neither errors, neither silently starts mid-history.
+- `Replay` has no construction path that defaults `expected` to 1 —
+  asserted by the type's signature, not by a runtime check.
+
 ### Archival correctness
 
 - A segment containing any event of a non-terminal or unsettled Work is
   never archived, and the blocking Work is named in the preview.
 - A segment containing a non-work-scoped event whose kind is not on the
   allowlist is never archived.
-- Crash injection at every point in the archival pass (after compress,
-  after rename, after manifest write, before unlink) leaves a journal that
-  passes `sgt journal verify` and a daemon that starts.
+- Crash injection at every point in the archival pass — after compress,
+  after staging fsync, after rename into `archive/`, after the `floor`
+  append, before unlink, and mid-pass between segments — leaves a journal
+  that passes `sgt journal verify` and a daemon that starts. The
+  after-`floor`-before-unlink case specifically must exercise startup
+  reconciliation.
+- Startup reconciliation completes a pending unlink only when the archived
+  twin hash-verifies; a below-floor live segment whose twin does *not*
+  verify is a named hard failure, not a silent deletion.
+- `sgt journal verify` detects each of its five anomaly classes (§4.8),
+  including class 5 (pending unlink), and reports class 5 as reconcilable
+  rather than corrupt.
 - The pass journals `journal.archived`; a replay of the post-archival
   journal contains that event.
-- Archival deletes no bytes. A byte-count assertion before and after: raw
-  archived bytes are recoverable by decompression, and no blob is touched.
+- Archival deletes no bytes beyond the live copy of a hash-verified archived
+  segment. A byte-count assertion before and after: raw archived bytes are
+  recoverable by decompression, and no blob is touched.
 
-### #4 miss path
+### Concurrency
+
+- A `sgt doctor` loop running continuously against a live archival pass over
+  ≥8 segments reports healthy on every iteration and **never** reports
+  corruption or a seq gap.
+- `replay_data_dir` lists segments before folding the manifest, and discards
+  listed segments entirely below the floor.
+- A segment that vanishes between listing and open triggers exactly one
+  retry; a second failure fails closed as corruption, unchanged.
+- The archive pass's guard-hold per segment is asserted against a budget in
+  a test, so a regression to whole-pass guard-holding is caught.
+- Concurrent submits and reads complete normally throughout an archival
+  pass.
+
+### Guard-held per-Work reads
 
 - `rederive_work` on a Work whose events are entirely archived reads only
   the segments the manifest names for it, and returns a `Work` identical to
   the pre-archival re-derivation.
-- The miss-path replay budget is asserted in a test at a seeded scale, so a
-  regression to full-replay is caught.
+- `work_transcript` on such a Work likewise reads only the named segments,
+  and returns events identical to the pre-archival call.
+- Both paths' replay budgets are asserted in tests at a seeded scale, so a
+  regression to full-replay is caught for either.
 
 ### Diagnostics and verbs
 
@@ -975,14 +1474,26 @@ the fake backend throughout. Add a reduced-mark run on macOS and inside WSL2
 to replace the assumed 2× slow-platform penalty with a measurement. This is
 the gate the 2026-08-11 ruling set on Rule C and it blocks issue 4.
 
-**4. `[journal] Implement segment archival: archive/ + manifest + replay floor + sgt journal archive`**
-Implement §4.3–§4.7 of `docs/proposals/journal-archival-rule-c.md`: move
+**4. `[journal] Give Replay an explicit floor and specify every below-floor read`**
+`Replay::new` hardcodes `expected = 1` and `Replay::after` only overrides it
+when a segment's `first_seq <= after + 1` (`journal.rs:548-565`), so the
+first archived segment would make `sgt work transcript` (`api.rs:2196`),
+default `GET /v1/events` (`api.rs:3322`), fresh SSE (`api.rs:3391,3455`), and
+doctor's `replay_data_dir` all fail with a spurious `SeqDiscontinuity`. Take
+the floor explicitly at every construction, add a distinct `ArchivedRange`
+outcome, and specify each consumer per §4.4's table. **This is a hard
+prerequisite for issue 5 — archival cannot ship before it.**
+
+**5. `[journal] Implement segment archival: archive/ + manifest + FloorState + sgt journal archive`**
+Implement §4.3–§4.8 of `docs/proposals/journal-archival-rule-c.md`: move
 cold, fully-settled segments to `<data-dir>/journal/archive/` compressed,
-record ranges/hashes/work-ids/index-rows in a manifest, teach `Replay` a
-non-zero seq floor, and add the explicit preview-by-default `sgt journal
-archive` and `sgt journal verify` daemon verbs. Nothing is deleted; archived
-data stays inside the replay contract. Blocked on issue 3's measurements and
-on the owner's ruling of Q2 (whether the slim index may be persisted).
+record ranges/hashes/work-ids plus the FloorState (slim index rows and §26
+command keys) in an append-only manifest, add startup reconciliation for the
+pending-unlink crash window, and add the preview-by-default `sgt journal
+archive` and `sgt journal verify` daemon verbs with the windowed guard-hold
+of §4.8. Blocked on issue 3's measurements, issue 4's floor contract, and the
+owner's rulings on Q2 (persisted FloorState) and Q8 (§26 degradation below
+the floor).
 
 ────────
 
@@ -990,16 +1501,28 @@ on the owner's ruling of Q2 (whether the slim index may be persisted).
 
 This proposal does not:
 
-- delete any journal event, any segment, or any blob, automatically or
-  otherwise;
+- delete any journal event or any blob, automatically or otherwise (the one
+  deletion in the design is the live copy of a hash-verified archived
+  segment, §4.3);
 - add a retention configuration surface to `sergeant.toml`;
 - add any age-based or clock-based rule (the #4 ruling's "count-bound, no
   clocks" posture carries here);
 - rewrite, renumber, or compact history (§3.2);
 - introduce projection snapshotting in the general B1 sense — only the
-  narrowed, re-derivable index rows of §4.3, and only if Q2 permits;
+  narrowed, re-derivable FloorState of §4.3, and only if Q2 permits;
 - give DuckDB a retention policy of its own (it is deleted and rebuilt on
-  every start, `analytics.rs:708`; it inherits the journal's horizon);
+  every start, `analytics.rs:708`; it inherits the journal's horizon).
+  **Declared consequence, per I5:** once a floor exists, DuckDB is rebuilt
+  from the live window only, so analytics over archived Works returns no
+  rows. That is data out of the analytical contract, and it must be said
+  where a user meets it — `sgt analytics` and `journal_growth` both report
+  the analytical floor, so an empty result reads as "archived," never as
+  "never happened." Recovering it means a full `replay_from_archive`
+  rebuild, which is available and slow, not impossible;
+- close `work_transcript`'s unbounded guard-held read. Rung 3 shrinks its
+  input by naming the segments; it does not hand the read to a journal
+  reader outside the core, which is what `api.rs:2173-2186` says a real fix
+  requires (§4.6);
 - reclaim stranded `surfaces/<work-id>/` directories
   (`src/runtime/recovery.rs:118-123`) — same issue number, different
   invariants; that is a filesystem sweep against journaled evidence and
@@ -1022,18 +1545,21 @@ than a standalone rung, and insert rung 0 (one startup replay instead of
 three, §4.1) below both — it is free, invariant-neutral, and is the only
 available ~3× on the axis the trigger is actually on.
 
-**Q2. May the slim index be persisted, or does B1 stay fully closed?**
+**Q2. May the FloorState be persisted, or does B1 stay fully closed?**
 This is the load-bearing question. Archival that skips replay of archived
-segments *requires* a durable form of `WorkIndexRow` — otherwise archived
-Works vanish from `work list` (§3.1). If B1 stays fully closed, archival can
-only ever save disk, never rebuild time, and Rule C cannot address its own
-binding trigger.
-*Recommendation: permit, narrowly.* Seven scalar fields per Work, terminal-
-immutable for exactly the Works that qualify, ~12.5 MB at 62,500 Works,
-re-derivable at will by replaying the archive, and binding-checked by
-`archived_through_seq` plus per-segment BLAKE3. That is a cache with a
-mechanical proof of freshness, not a second truth — which is the specific
-property B1's identity binding was dormant for want of.
+segments *requires* a durable form of the registry state those events built:
+the slim index rows **and** the §26 command-ledger keys (§3.1). If B1 stays
+fully closed, archival can only ever save disk, never rebuild time, and Rule
+C cannot address its own binding trigger.
+*Recommendation: permit, narrowly.* Seven scalar fields per Work plus two
+ULIDs per command, terminal-immutable for exactly the entries that qualify,
+~22 MB at 62,500 Works and 250k commands, re-derivable at will by replaying
+the archive, and binding-checked by the committed floor plus per-segment
+BLAKE3. That is a cache with a mechanical proof of freshness, not a second
+truth — which is the specific property B1's identity binding was dormant for
+want of. The scope of what must be persisted grew between drafts, which is
+why I9's pinning test matters more than this recommendation does: the answer
+to "what else did we miss" has to be a test, not a promise.
 
 **Q3. Does this amend ADR 0003?**
 *Recommendation: no, as specified.* ADR 0003 promises resumability, not
@@ -1082,6 +1608,45 @@ Work. If measurement later shows this stalls archival in practice, the
 answer is a narrower predicate (per-Work event extraction), not a flag that
 waives the invariant.
 
+**Q8. May §26's exact-once contract degrade below the archive floor?**
+Above the floor, a retried `command_id` replays a byte-identical response.
+Below it, this design carries only the command *keys* — so a retry is
+**refused with a named error**, and for a submit the refusal names the Work
+that command already created (§3.1). The alternative, persisting every
+`CommandOutcome` body, would put 250–500 MB of response JSON in the
+manifest and relocate the growth this proposal exists to bound.
+*Recommendation: permit the degradation.* The **safety** property §26 exists
+for — never re-execute, never create a duplicate Work — is preserved
+exactly; only the byte-identical-replay convenience is lost, and only for
+commands older than the entire live window (weeks of history), which is far
+outside any plausible client retry horizon. But this is a change to a stated
+contract, so it is the owner's to make, not the implementation's.
+
+**Q9. Is completing an interrupted unlink at daemon start "automatic
+deletion" under I4?**
+Startup reconciliation deletes a live segment whose archived twin
+hash-verifies, without anyone typing anything at that moment (§4.3).
+*Recommendation: rule it permitted, and write the distinction into I4.* It
+completes an action the operator authorized with `--yes` and a crash
+interrupted — the same thing `recovery.rs` does for an interrupted surface
+teardown. It is *not* permission to reclaim anything nobody authorized,
+which is the line `recovery.rs:118-123` already draws when it refuses to
+delete stranded surface directories. Left unstated, this reads as a
+violation of the estate contract's deletion rule; stated, it is a bounded
+exception with a precedent.
+
+**Q10. What does a below-floor stream read return?**
+`GET /v1/events?from=0` and a fresh SSE connection ask for history that no
+longer starts where they assume. Three options: serve it from the archive,
+return the live window with an explicit truncation marker, or refuse.
+*Recommendation: split by what the caller is asking* (§4.4). Per-Work reads
+(`work show`, `work transcript`) ask *what happened* and get real archived
+history through the manifest. Stream reads ask *what is happening* and get
+the live window plus a `truncated_below` marker, because serving a stream
+subscriber the entire archive is the cost profile this whole proposal is
+trying to eliminate. Either way the answer is never `SeqDiscontinuity` —
+that error keeps its single meaning, which is that the journal is corrupt.
+
 ────────
 
 ## 9. Final statement
@@ -1092,10 +1657,13 @@ After this proposal lands, the growth story is:
 cold start replays one window, not the whole history
 cold segments move to archive/ compressed, and stay replayable
 the replay floor is explicit, hash-checked, and verifiable
+no reader ever infers a floor of 1, and no below-floor read
+  reports corruption — it is served, or it is named
+a retried old command is refused by name, never re-executed
 an evicted Work re-derives from two segments, not from all of them
 sgt doctor reports growth and rebuild time, not just free space
-sgt journal archive previews by default and deletes nothing
-nothing is ever removed except by an operator who typed --yes
+sgt journal archive previews by default, holds the guard per rename
+nothing is removed but the live copy of a hash-verified archive
 ```
 
 And the invariant survives intact:
