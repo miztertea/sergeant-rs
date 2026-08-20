@@ -22,12 +22,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
 
 cov_stage_begin c3-m2_daemon_api
-cov_run cargo llvm-cov --no-report --test m2_daemon_api || cov_fail "m2_daemon_api failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m2_daemon_api --locked || cov_fail "m2_daemon_api failed under instrumentation"
 cov_stage_end 2 "m2 spawns clients and daemons; more than the test binary's own profile must arrive, \
 or no subprocess flushed and the suite's real coverage is missing"
 
 cov_stage_begin c3-m6_surfaces
-cov_run cargo llvm-cov --no-report --test m6_surfaces || cov_fail "m6_surfaces failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m6_surfaces --locked || cov_fail "m6_surfaces failed under instrumentation"
 cov_stage_end 2 "m6 spawns daemons (TUI, doctor) and runs scripts/demo.sh; more than the test \
 binary's own profile must arrive, or no subprocess flushed"
 
@@ -43,6 +43,6 @@ binary's own profile must arrive, or no subprocess flushed"
 # The trade is stated rather than hidden: on a Docker-capable host this stage
 # will not catch a subprocess that silently failed to flush.
 cov_stage_begin c3-m7_docker_executor
-cov_run cargo llvm-cov --no-report --test m7_docker_executor || cov_fail "m7_docker_executor failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m7_docker_executor --locked || cov_fail "m7_docker_executor failed under instrumentation"
 cov_stage_end 1 "the m7 test binary must write its own profile; container subprocesses are not \
 required because the suite self-skips where Docker is unreachable"

@@ -31,9 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          components: clippy, rustfmt
+      - name: rustup toolchain install (rust-toolchain.toml pins the version; -c adds clippy+rustfmt)
+        run: rustup toolchain install -c clippy,rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
@@ -41,10 +40,13 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --locked
+
+      - name: git diff --exit-code (no step above should have mutated a tracked file)
+        run: git diff --exit-code
 
   shellcheck:
     # ADR 0004 (D7): hygiene, not a version gate — shellcheck has no bash-3.2
@@ -82,12 +84,41 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: rustup toolchain install (rust-toolchain.toml pins the version)
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: cargo check
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
+
+  msrv:
+    # W1 §E: measured floor, not recon's static 1.88.0 prediction — the
+    # extra minor version comes from this crate's own use of
+    # std::fs::File::try_lock/TryLockError (stabilized 1.89.0), which a
+    # cargo-metadata pass over dependency rust-version fields cannot see.
+    # Verified empirically: cargo +1.89.0 check --locked --all-targets and
+    # cargo +1.89.0 test --locked both passed cleanly before this job and
+    # Cargo.toml's rust-version were added. Check only, no clippy — lint
+    # policy belongs to the pinned dev compiler (rust-toolchain.toml), not
+    # to this deliberately-older floor.
+    runs-on: ubuntu-latest
+    env:
+      # Single source of truth for this job's two 1.89.0 uses below. Keep in
+      # sync with Cargo.toml's rust-version (see the comment there) — YAML
+      # and TOML can't share a literal without added machinery, so this only
+      # collapses the duplication within this job, from two sites to one.
+      MSRV: 1.89.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: rustup toolchain install (MSRV floor — deliberately older than rust-toolchain.toml's pin)
+        run: rustup toolchain install ${{ env.MSRV }} --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo check --locked --all-targets (MSRV floor — check only, no clippy on an old compiler)
+        run: cargo +${{ env.MSRV }} check --locked --all-targets
 
   dependency-policy:
     # proposal §5.2: routine PRs check bans/licenses/sources only. Advisories
@@ -99,8 +130,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: "cargo metadata --locked (guard: belt-and-suspenders around the action's own --locked argument below)"
+        run: cargo metadata --locked --format-version 1 >/dev/null
+
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
+          arguments: --all-features --locked
           command: check bans licenses sources
 
   dependency-review:
