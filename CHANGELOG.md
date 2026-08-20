@@ -82,6 +82,28 @@ released before a release can proceed.
   works outside an estate, still never searches upward, and still never
   starts a daemon.
 
+- **`sgt doctor` gains a cheap `git_surfaces` row (estate-root proposal
+  §12.2).** One bounded summary — active works, active linked worktrees,
+  retained worktrees, retained patches, retained artifact size, journaled
+  Work branches, terminal dirty Works — derived from the journal plus
+  retained-artifact filesystem metadata only, never a per-branch `git`
+  walk. Silent (`ok`, "not an estate root") outside an estate; names `sgt
+  work retained`/`sgt work show`/`sgt work reap` as the separate
+  inspection/cleanup remedy when residue is nonzero. Classifies nothing as
+  merged or redundant and deletes nothing — §12.3's expensive
+  reconciliation stays future work.
+
+- **Doctrine-skew tests (`tests/f_doctrine_skew.rs`, estate-root proposal
+  §18).** New, focused tooling — no `validate-skew` or similar existed
+  before this. Checks: AGENTS.md's "Session start" claims (the unscoped
+  command set, the root-gate refusal wording, the `-C` flag) against the
+  real binary; no `CONTEXT.md` under the embedded `.sergeant/workflows/`
+  distro instructs a stage actor to run an estate-scoped `sgt` command from
+  inside its own Work surface without a disclaiming note nearby; the
+  estate-root proposal's own canonical manifest example (§13.1) still
+  parses under the current schema; no shipped workflow/skill content
+  quotes the removed `--workspace` flag (C12 regression pin).
+
 ### Changed
 
 - **Every Work is now admitted against a complete Git preflight before it
@@ -257,6 +279,58 @@ released before a release can proceed.
   `package-installer` job comment is corrected to match — it previously
   read as though the shipped installer consumed the checksums `dist` also
   generates; it does not.
+
+- **AGENTS.md gains a session-start invariant and an estate/Git model table
+  (estate-root proposal §14.1/§14.2).** A new "Session start" section
+  states the exact-root rule up front — no upward search, no Git fallback,
+  the same remedy the real root-gate diagnostic gives — and names which
+  four commands work outside an estate; a new "Estate and Git model" table
+  fixes the vocabulary (estate root, `repos/<name>`, the surfaces
+  directory, `sergeant/<work-id>`) before the routing table uses it. A new
+  "ESTATE — Captain's estate discipline" section (§14.3/§14.4) states
+  Captain's pre-Work checklist and what a worker never does (edit a mount,
+  create a replacement branch, navigate into another Work's surface,
+  expand its own scope, invoke an estate-scoped command from its own
+  surface). "Captain captains" lands as emphasis, per the owner's
+  2026-08-20 ruling (gauntlet finding C1): Captain's normal mode is
+  dispatching Work and shaping intent, not writing code turn by turn — the
+  existing ROUTING table's in-session allowances (BU-0004/BU-0009) are
+  unchanged, not narrowed. `CAN — enforceable authority` gains three
+  bullets for behavior already enforced: the root gate, the Git preflight,
+  and durable branch retention.
+
+- **README.md and docs/glossary.md corrected off the exact-root contract.**
+  The data-dir precedence description no longer describes upward directory
+  search; `sgt run`'s documented flags drop the removed `--workspace` and
+  add `--all`/`--override-git-preflight`; "the workspace's own
+  `software-change` workflow" is corrected to "the estate's own."
+  `docs/glossary.md` gains the estate-root proposal's seven §14.7 terms:
+  Estate, Repository Mount, Work Scope, Repository Binding, Work Surface,
+  Integrity Disposition, Estate Drift.
+
+- **Embedded distro swept for exact-root skew (C12 and §14.6).**
+  `.sergeant/workflows/dispatch/05-classify-risk/CONTEXT.md`'s restated
+  `sgt run --help` option list drops the removed `--workspace` flag (the
+  one instance C12 named, confirmed the only one by a full sweep of
+  `AGENTS.md`, `skills/`, `.sergeant/common/contexts/`, and
+  `.sergeant/workflows/`) and adds `--all`/`--override-git-preflight`/the
+  global `-C`/`--data-dir`/`--json` flags it was missing. Six sites that
+  described a stage actor
+  dispatching nested Work or delivering an escalation response as its own
+  literal `sgt run`/`sgt respond` invocation from inside its own Work
+  surface — `implement/30-review`, `implement`'s own `CONTEXT.md`,
+  `worker-mission/20-implement`, `worker-mission`'s own `CONTEXT.md`, and
+  `dispatch/80-monitor` plus `dispatch`'s own `CONTEXT.md` — gain an
+  explicit note that the worker's own Work surface is not an estate root
+  and the command would refuse from there today; the actual submission is
+  Captain's, from the estate root.
+
+- **ADR 0008's estate-root amendment verified, not redone.** Phase D
+  already amended it ("Amended by the estate-root integration (C7a,
+  2026-08-20)"): the manifest keeps storage-path authority, discovery
+  becomes exact-root, and R-MVP1-12 is marked superseded. Confirmed
+  current against this phase's own doctrine rewrite; no further change
+  needed for C7a.
 
 ## [0.1.0] - 2026-08-19
 
