@@ -92,6 +92,28 @@ jobs:
       - name: cargo check
         run: cargo check --locked --all-targets
 
+  msrv:
+    # W1 §E: measured floor, not recon's static 1.88.0 prediction — the
+    # extra minor version comes from this crate's own use of
+    # std::fs::File::try_lock/TryLockError (stabilized 1.89.0), which a
+    # cargo-metadata pass over dependency rust-version fields cannot see.
+    # Verified empirically: cargo +1.89.0 check --locked --all-targets and
+    # cargo +1.89.0 test --locked both passed cleanly before this job and
+    # Cargo.toml's rust-version were added. Check only, no clippy — lint
+    # policy belongs to the pinned dev compiler (rust-toolchain.toml), not
+    # to this deliberately-older floor.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: rustup toolchain install (MSRV floor — deliberately older than rust-toolchain.toml's pin)
+        run: rustup toolchain install 1.89.0 --profile minimal
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo check --locked --all-targets (MSRV floor — check only, no clippy on an old compiler)
+        run: cargo +1.89.0 check --locked --all-targets
+
   dependency-policy:
     # proposal §5.2: routine PRs check bans/licenses/sources only. Advisories
     # deliberately excluded here — a new RustSec advisory can land against an
