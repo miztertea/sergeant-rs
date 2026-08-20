@@ -2755,6 +2755,11 @@ impl Engine {
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
             profile: stage_profile,
             instruction_policy: Some(Self::run_instruction_policy(run)),
+            // §10.1, re-supplied from the journaled surface for the same
+            // reason the pin and the profile are: a restarted adapter has
+            // lost whatever it derived from it, and the Work's mutation
+            // surface is not something it may re-invent from a bare cwd.
+            bindings: surface.binding_summary(),
         })
     }
 
@@ -2990,6 +2995,11 @@ impl Engine {
             // MVP-2 D2 item 1: the policy `workflow.bound` pinned, not
             // re-derived from the live manifest.
             instruction_policy: Self::run_instruction_policy(&run),
+            // §10.1: the complete binding summary, not only a cwd. Taken from
+            // the surface this stage is actually about to run in, so the paths
+            // and refs an adapter states are the ones sergeant journaled —
+            // never re-derived from the manifest or from the filesystem.
+            bindings: surface.binding_summary(),
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -4875,6 +4885,7 @@ mod tests {
             profile: None,
             execute: None,
             instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
         };
         let handle = fake.start(&start_request).expect("fake backend start");
         testing::commit(

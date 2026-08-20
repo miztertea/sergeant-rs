@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::backend::BindingSummary;
 use crate::domain::workspace::RepositorySpec;
 use crate::runtime::fsutil::create_dir_all_durable;
 use crate::runtime::git::{
@@ -325,6 +326,27 @@ impl WorkSurface {
             [only] => only.worktree_path.clone(),
             _ => self.root.clone(),
         }
+    }
+
+    /// §10.1's binding summary: the exact worktrees this Work may modify,
+    /// with the branch and base commit each was bound to, in scope order.
+    ///
+    /// [`Self::execution_cwd`] answers "where does the process start", which
+    /// for a multi-repo Work is the surface root — a directory the Work may
+    /// *not* write to. This answers the different and more important question
+    /// a backend's launch grammar needs: which directories are the mutation
+    /// surface, and what is each one supposed to be.
+    pub fn binding_summary(&self) -> Vec<BindingSummary> {
+        self.bindings
+            .iter()
+            .map(|b| BindingSummary {
+                repository: b.repository.clone(),
+                worktree_path: b.worktree_path.clone(),
+                work_branch: b.work_branch.clone(),
+                base_branch: b.base_branch.clone(),
+                base_sha: b.base_sha.clone(),
+            })
+            .collect()
     }
 }
 

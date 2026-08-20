@@ -202,6 +202,7 @@ fn request(work_id: &str, execution_id: &str, cwd: &Path, exec: ExecuteSpec) -> 
         profile: None,
         execute: Some(exec),
         instruction_policy: sergeant_rs::domain::workspace::InstructionPolicy::default(),
+        bindings: Vec::new(),
     }
 }
 

@@ -532,6 +532,44 @@ path = "../payments-web"
     assert_eq!(starts.len(), 1);
     assert_eq!(starts[0].cwd, root);
 
+    // §10.1: and the backend is handed the complete binding summary, not
+    // only that cwd — which for a multi-repo Work is precisely the case
+    // where the cwd is a directory the Work may *not* write to. Every field
+    // is the one sergeant journaled for that binding.
+    let summary = &starts[0].bindings;
+    assert_eq!(
+        summary.len(),
+        2,
+        "one summary entry per bound repository: {summary:?}"
+    );
+    for (entry, journaled) in summary.iter().zip(bindings) {
+        assert_eq!(entry.repository, journaled["repository"].as_str().unwrap());
+        assert_eq!(
+            entry.worktree_path,
+            PathBuf::from(journaled["worktree_path"].as_str().unwrap()),
+            "the exact worktree path the Work may modify"
+        );
+        assert_eq!(
+            entry.work_branch,
+            journaled["work_branch"].as_str().unwrap()
+        );
+        assert_eq!(
+            entry.base_branch,
+            journaled["base_branch"].as_str().unwrap()
+        );
+        assert_eq!(
+            entry.base_sha,
+            journaled["base_sha"].as_str().unwrap(),
+            "the exact base SHA, pinned"
+        );
+        assert_ne!(
+            entry.worktree_path, root,
+            "no entry names the surface root: it is not part of the mutation surface"
+        );
+    }
+    assert_eq!(summary[0].base_sha, api_head, "declaration order, again");
+    assert_eq!(summary[1].base_sha, web_head);
+
     handle.shutdown().await;
 }
 

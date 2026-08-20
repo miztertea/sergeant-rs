@@ -4848,6 +4848,7 @@ mod tests {
             profile: None,
             execute: None,
             instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
+            bindings: Vec::new(),
         };
         let handle = {
             use crate::backend::Backend;
