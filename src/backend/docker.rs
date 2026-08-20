@@ -130,7 +130,7 @@ pub const LABEL_SCHEMA: &str = "io.sergeant.schema";
 pub const SCHEMA_VERSION: &str = "execution/v1";
 
 /// Container-side mount point for the work surface (§16.6).
-const WORKSPACE_MOUNT: &str = "/workspace";
+const WORKSPACE_MOUNT: &str = "/estate";
 
 /// The small, always-pullable image [`DockerBackend::lifecycle_probe`] uses
 /// in production (`sgt doctor`) — see its own doc for why a test may need a
@@ -1310,7 +1310,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::domain::workspace::InstructionPolicy;
+    use crate::domain::estate::InstructionPolicy;
 
     fn config() -> (tempfile::TempDir, DockerConfig) {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1349,7 +1349,7 @@ mod tests {
             execute: Some(ExecuteSpec {
                 image: "alpine:3".into(),
                 command: vec!["true".into()],
-                workdir: "/workspace".into(),
+                workdir: "/estate".into(),
                 workspace_access: WorkspaceAccess::ReadOnly,
                 network: NetworkPolicy::None,
                 env: BTreeMap::new(),
@@ -1474,7 +1474,7 @@ mod tests {
             let spec = ExecuteSpec {
                 image: "alpine:3".into(),
                 command: vec!["true".into()],
-                workdir: "/workspace".into(),
+                workdir: "/estate".into(),
                 workspace_access: WorkspaceAccess::ReadOnly,
                 network: NetworkPolicy::None,
                 env: BTreeMap::new(),

@@ -34,6 +34,7 @@ use crate::daemon::{
     KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
     KIND_DAEMON_STOPPED,
 };
+use crate::domain::estate::{Estate, InstructionPolicy};
 use crate::domain::event::{Event, EventDraft, EventSource, rfc3339_utc_now};
 use crate::domain::execution::{
     KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
@@ -51,7 +52,6 @@ use crate::domain::workflow::{
     KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED,
     KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use crate::domain::workspace::{InstructionPolicy, Workspace};
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
@@ -1055,7 +1055,7 @@ struct SubmitRequest {
     command_id: String,
     intent: String,
     /// estate-root proposal §7/§13.3's structured scope request
-    /// (`--repo`/`--group`/`--all`). §7.4: `workspace` no longer exists as
+    /// (`--repo`/`--group`/`--all`). §7.4: `estate` no longer exists as
     /// a wire field at all — the daemon is bound to exactly one estate, and
     /// this is its replacement.
     #[serde(default)]
@@ -1162,7 +1162,7 @@ struct Origin {
     /// Front-end harness name, e.g. `claude`. Drives origin affinity.
     #[serde(default)]
     client: Option<String>,
-    /// The client's working directory. Workspace discovery (§9) starts here;
+    /// The client's working directory. Estate discovery (§9) starts here;
     /// a daemon has no cwd of its own, so this is the only honest source for
     /// "which repository is this work about".
     #[serde(default)]
@@ -1188,9 +1188,10 @@ async fn submit_work(
         return *resp;
     }
     // Planning happens with **no lock held**. It reads the filesystem —
-    // `Workspace::discover` walks up to the git root and parses
-    // `sergeant.toml`, `WorkflowDefinition::resolve` reads every stage's
-    // `CONTEXT.md` — and probes every harness the run will use (§17.5). All of
+    // `Estate::resolve` parses the bound estate's `sergeant.toml` and
+    // validates every derived mount, `WorkflowDefinition::resolve` reads
+    // every stage's `CONTEXT.md` — and probes every harness the run will use
+    // (§17.5). All of
     // that is external I/O on paths the daemon does not own, which §22.6 keeps
     // out from under the core lock; it is also, by construction, side-effect
     // free, so running it before the guard costs nothing but a re-check.
@@ -1319,7 +1320,7 @@ async fn submit_work(
         );
     }
 
-    // The plan decided above, before the guard: workspace topology, workflow
+    // The plan decided above, before the guard: estate topology, workflow
     // content, routing, profiles and the §17.5 stage preflight, all with no
     // side effects — so a submission that cannot be routed is rejected with
     // §13's available options instead of creating work that immediately dies.
@@ -1343,8 +1344,8 @@ async fn submit_work(
     };
 
     // §7.3: journaled twice — `scope_request` is exactly what was submitted;
-    // `repositories` is what `plan` (when there was a workspace to resolve
-    // against at all) actually resolved it to. When there was no workspace
+    // `repositories` is what `plan` (when there was a estate to resolve
+    // against at all) actually resolved it to. When there was no estate
     // (`plan` is `None` — the client offered no repository context at all),
     // there is nothing to resolve against, so the raw request is the best
     // honest answer for `repositories` too, same as before this field had a
@@ -1359,7 +1360,8 @@ async fn submit_work(
         id: ulid::Ulid::generate().to_string(),
         // §7.4: `--workspace`/`SubmitRequest.workspace` no longer exist.
         // `Work.workspace` is kept only so a pre-Phase-C journal event still
-        // deserializes (`Work::workspace`'s doc comment); every new Work
+        // deserializes (`Work::workspace`'s doc comment, which also says why
+        // §13.2's rename deliberately left its name alone); every new Work
         // leaves it `None`.
         workspace: None,
         intent: req.intent,
@@ -1870,7 +1872,7 @@ async fn list_work(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowsQuery {
-    /// The client's working directory — workspace discovery (§9) starts
+    /// The client's working directory — estate discovery (§9) starts
     /// here, exactly as [`Origin::cwd`] does for `POST /v1/work`, so what
     /// this route shows as available matches what submission would actually
     /// resolve (§19.4's "cwd discovery matches submission").
@@ -1915,16 +1917,22 @@ fn catalog_entry_json(entry: &workflow::CatalogEntry) -> Value {
     value
 }
 
-/// The catalog `GET /v1/workflows` answers with, for a resolved `cwd`
-/// (§11.2, Decisions T2-39/T2-40): the repository's own root-indexed
-/// published workflows when one resolves and has any, else the embedded
-/// `software-change` fallback, else (only when the embedded fallback itself
-/// fails to load) an empty list — fails closed per §19.4, never a `4xx` for
-/// this shape.
-fn workflow_catalog_entries(cwd: &std::path::Path, data_dir: &std::path::Path) -> Vec<Value> {
-    let repo_entries = match Workspace::discover_scoped(cwd, Some(data_dir)) {
-        Ok(workspace) => workflow::catalog(&workspace.root),
-        Err(_) => Vec::new(),
+/// The catalog `GET /v1/workflows` answers with (§11.2, Decisions
+/// T2-39/T2-40): the **bound estate's** own root-indexed published workflows
+/// when it has any, else the embedded `software-change` fallback, else (only
+/// when the embedded fallback itself fails to load) an empty list — fails
+/// closed per §19.4, never a `4xx` for this shape.
+///
+/// §5.2, estate-root Phase D: this used to discover a estate from the
+/// client's `cwd`, which made "what could I bind" a question about wherever
+/// the caller happened to be standing. It is now a question about the one
+/// estate this daemon is bound to, the same estate `submit_work`'s plan
+/// resolves against — a client cannot be shown a catalog it could not
+/// actually submit into.
+fn workflow_catalog_entries(estate_root: Option<&std::path::Path>) -> Vec<Value> {
+    let repo_entries = match estate_root {
+        Some(root) => workflow::catalog(root),
+        None => Vec::new(),
     };
     let entries = if !repo_entries.is_empty() {
         repo_entries
@@ -1942,7 +1950,7 @@ fn workflow_catalog_entries(cwd: &std::path::Path, data_dir: &std::path::Path) -
 
 /// `GET /v1/workflows?cwd=<percent-encoded path>` — the read-only workflow
 /// catalog (§11.2): what the client's own submission could bind now. Reuses
-/// the same workspace discovery [`submit_work`]'s plan does, the same
+/// the same estate discovery [`submit_work`]'s plan does, the same
 /// workflow loader and validation, the root publication boundary
 /// (§11.1, [`workflow::catalog`]), and the same embedded fallback. Performs
 /// no mutation, holds no core lock (nothing here reads or writes registry
@@ -1955,6 +1963,10 @@ async fn list_workflows(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
+    // `cwd` stays in the query grammar (a client that has one still sends
+    // it) but is evidence only now — §5.2 removed its authority over
+    // topology. It is still validated so an obviously-broken client hears
+    // about it rather than silently getting the estate's catalog.
     let cwd = PathBuf::from(&req.cwd);
     if !cwd.is_absolute() {
         return error_response(
@@ -1963,8 +1975,8 @@ async fn list_workflows(
             "cwd must be an absolute path",
         );
     }
-    let data_dir = state.data_dir.clone();
-    let workflows = blocking(move || workflow_catalog_entries(&cwd, &data_dir)).await;
+    let estate_root = state.engine.estate_root.clone();
+    let workflows = blocking(move || workflow_catalog_entries(estate_root.as_deref())).await;
     Json(json!({"workflows": workflows})).into_response()
 }
 
@@ -2690,19 +2702,14 @@ async fn list_retained(State(state): State<ApiState>) -> Response {
 /// that is itself one, `sgt`'s own self-hosting shape among them) would
 /// silently resolve to the wrong manifest rather than failing closed — the
 /// one outcome R-NS-4's discipline exists to prevent.
-fn resolve_estate_root(data_dir: &std::path::Path) -> Result<PathBuf, Box<Response>> {
-    match Workspace::estate_root(data_dir, None) {
-        Ok(Some(root)) => Ok(root),
-        Ok(None) => Err(Box::new(error_response(
+fn resolve_estate_root(state: &ApiState) -> Result<PathBuf, Box<Response>> {
+    match state.engine.estate_root.clone() {
+        Some(root) => Ok(root),
+        None => Err(Box::new(error_response(
             StatusCode::NOT_FOUND,
             "no_estate",
-            "no estate found walking up from this daemon's data dir (bounded at $HOME) — run \
-             `sgt init` first, or start the daemon on a data dir under the estate root",
-        ))),
-        Err(e) => Err(Box::new(error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "estate_invalid",
-            e.to_string(),
+            "this daemon is bound to no estate — start it from an estate root (`sgt daemon` \
+             from the root, or `sgt -C <estate-root> daemon`)",
         ))),
     }
 }
@@ -2767,8 +2774,8 @@ fn manifest_error_response(e: &ManifestError) -> Response {
 }
 
 /// The declared repositories, read the same way `sgt repo list --json` does.
-fn workspace_read(estate_root: &std::path::Path) -> Result<Workspace, Box<Response>> {
-    Workspace::from_config_allow_empty(&estate_root.join(crate::domain::workspace::WORKSPACE_FILE))
+fn workspace_read(estate_root: &std::path::Path) -> Result<Estate, Box<Response>> {
+    Estate::from_config_allow_empty(&estate_root.join(crate::domain::estate::MANIFEST_FILE))
         .map_err(|e| {
             Box::new(error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -2781,23 +2788,23 @@ fn workspace_read(estate_root: &std::path::Path) -> Result<Workspace, Box<Respon
 /// `GET /v1/estate/repos` (§16.2) — the same read `sgt repo list --json`
 /// already performs, over the daemon's own estate.
 async fn estate_list_repos(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
-    let workspace = match workspace_read(&estate_root) {
+    let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
     };
-    let repos: Vec<Value> = workspace
+    let repos: Vec<Value> = estate
         .repositories
         .iter()
         .map(|r| {
             json!({
                 "name": r.name,
                 "path": r.path,
-                "origin": workspace.repository_origin(&r.name),
-                "instructions": workspace.instruction_policy(&r.name).as_str(),
+                "origin": estate.repository_origin(&r.name),
+                "instructions": estate.instruction_policy(&r.name).as_str(),
             })
         })
         .collect();
@@ -2839,7 +2846,7 @@ async fn estate_add_repo(
             );
         }
     };
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2866,7 +2873,7 @@ async fn estate_add_repo(
 /// exactly; the group-reference refusal it returns reaches the caller
 /// structured, not reworded.
 async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2879,15 +2886,15 @@ async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<Stri
 /// `GET /v1/estate/groups` (§16.2) — the same read `sgt group list --json`
 /// already performs.
 async fn estate_list_groups(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
-    let workspace = match workspace_read(&estate_root) {
+    let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
     };
-    let groups: Vec<Value> = workspace
+    let groups: Vec<Value> = estate
         .groups
         .iter()
         .map(|(name, g)| json!({"name": name, "repos": g.repos, "brief": g.brief}))
@@ -2915,7 +2922,7 @@ async fn estate_add_group(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2968,7 +2975,7 @@ async fn estate_remove_group(
             }
         }
     };
-    let estate_root = match resolve_estate_root(&state.data_dir) {
+    let estate_root = match resolve_estate_root(&state) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -2978,10 +2985,24 @@ async fn estate_remove_group(
     }
 }
 
+/// The directory `GET /v1/doctor` reports the estate rows against: this
+/// daemon's own bound estate root (§5.1), never the daemon process's cwd —
+/// a long-running daemon's cwd is not reliably anything. With no bound
+/// estate the data dir stands in, and the estate-root row correctly fails
+/// there, which is exactly what a daemon started outside an estate should
+/// report.
+fn doctor_root(state: &ApiState) -> PathBuf {
+    state
+        .engine
+        .estate_root
+        .clone()
+        .unwrap_or_else(|| state.data_dir.clone())
+}
+
 /// `GET /v1/doctor` (§16.3) — the same `doctor::Report::to_json()`
 /// `sgt doctor --json` already prints, computed exactly once here.
 async fn doctor_report(State(state): State<ApiState>) -> Response {
-    let report = doctor::run(&state.data_dir).await;
+    let report = doctor::run(&state.data_dir, &doctor_root(&state)).await;
     Json(report.to_json()).into_response()
 }
 
@@ -4915,7 +4936,7 @@ mod tests {
             model: None,
             profile: None,
             execute: None,
-            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
+            instruction_policy: crate::domain::estate::InstructionPolicy::default(),
             bindings: Vec::new(),
         };
         let handle = {

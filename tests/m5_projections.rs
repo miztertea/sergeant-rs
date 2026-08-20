@@ -68,34 +68,12 @@ fn http() -> reqwest::Client {
         .expect("client")
 }
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "sergeant tests")
-        .env("GIT_AUTHOR_EMAIL", "tests@example.invalid")
-        .env("GIT_COMMITTER_NAME", "sergeant tests")
-        .env("GIT_COMMITTER_EMAIL", "tests@example.invalid")
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn init_repo(path: &Path) -> String {
-    std::fs::create_dir_all(path).expect("repo dir");
-    git(path, &["init", "-b", "main"]);
-    std::fs::write(path.join("README.md"), "# fixture\n").expect("write file");
-    git(path, &["add", "."]);
-    git(path, &["commit", "-m", "initial"]);
-    git(path, &["rev-parse", "HEAD"])
-}
-
 /// A two-stage workflow, so stage progression and `preceded` edges exist.
+///
+/// Written at the **estate root**, never inside a repository: `Engine::plan`
+/// resolves a workflow name against `estate.root` — the estate the daemon
+/// was bound to (§5.1) — and estate-root §6.1 makes that root the only
+/// topology authority, so a package sitting under a mount is never consulted.
 fn write_two_stage_workflow(root: &Path) {
     let dir = root.join(".sergeant/workflows/tiny");
     std::fs::create_dir_all(&dir).expect("workflow dir");
@@ -110,8 +88,33 @@ fn write_two_stage_workflow(root: &Path) {
     }
 }
 
+/// A scaffolded estate every daemon rig below is bound to: `[estate]` plus
+/// one declared repository whose mount is the derived `repos/solo` (§6.1),
+/// with the two-stage workflow at the root. Returns the root's `TempDir` (the
+/// caller must keep it alive), the mount, and the mount's HEAD.
+///
+/// estate-root §4.1 deleted the ancestor walk and the zero-config
+/// git-toplevel fallback, so the shape these tests used to build — a bare
+/// `TempDir` with `git init` in it — is not a estate at all any more. A
+/// run through it would produce no surface, no stages and no executions, and
+/// every projection assertion here would be measuring an empty fold.
+fn estate() -> (TempDir, PathBuf, String) {
+    let root = TempDir::new().expect("tempdir");
+    let (mount, head) = support::scaffold_solo_estate(root.path(), "solo");
+    write_two_stage_workflow(root.path());
+    (root, mount, head)
+}
+
+/// A daemon over the fake backend, **bound to `estate_root`** (§5.1).
+///
+/// The binding is load-bearing, not decoration: `Engine::plan` reads the
+/// estate the daemon was started against and treats the request's
+/// `origin.cwd` as recorded evidence only (§13.3), so a daemon left with
+/// `estate_root: None` plans against nothing and every submission below would
+/// sit at `pending` forever.
 async fn start_fake(
     data_dir: &Path,
+    estate_root: &Path,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
@@ -121,6 +124,7 @@ async fn start_fake(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -164,6 +168,10 @@ async fn get_status(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, 
     (status, resp.json().await.expect("json body"))
 }
 
+/// Submit work. `cwd` is §13.3 recorded evidence and nothing else — since
+/// §5.2 the plan is made against the estate the daemon was *bound* to, so
+/// this argument decides nothing about topology; it is passed the estate root
+/// only so `origin.cwd` in the journal names something real.
 async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, extra: Value) -> Value {
     let mut body = json!({
         "command_id": ulid(),
@@ -214,22 +222,23 @@ async fn analytics_snapshot(handle: &DaemonHandle) -> Value {
     Value::Object(snapshot)
 }
 
-/// Run a two-stage workflow to completion in a fresh repo, returning the
-/// data dir, the repo dir and the work id. The daemon is stopped on return.
+/// Run a two-stage workflow to completion in a fresh estate, returning the
+/// data dir, the estate root and the work id. The daemon is stopped on
+/// return, so callers restart their own — bound to the same root, because
+/// §5.1 binds a daemon for its whole life and a restart is a new daemon.
 async fn completed_run() -> (TempDir, TempDir, String) {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
     let (handle, _fake) = start_fake(
         data.path(),
+        estate.path(),
         [FakeStep::complete_with("first done"), FakeStep::complete()],
     )
     .await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "measure the projection",
         json!({"workflow": "tiny"}),
     )
@@ -238,7 +247,7 @@ async fn completed_run() -> (TempDir, TempDir, String) {
     let shown = get(&handle, &format!("/v1/work/{work_id}")).await;
     assert_eq!(shown["work"]["state"], "completed", "run: {shown}");
     handle.shutdown().await;
-    (data, repo, work_id)
+    (data, estate, work_id)
 }
 
 // -------------------------------------------- 1. rebuild determinism
@@ -258,14 +267,13 @@ async fn completed_run() -> (TempDir, TempDir, String) {
 #[tokio::test]
 async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
     // A run with real variety: a failure, an operator retry, and a
     // completion — so the analytics have something to disagree about.
     let (handle, _fake) = start_fake(
         data.path(),
+        estate.path(),
         [
             FakeStep::fail("first attempt broke"),
             FakeStep::complete(),
@@ -275,7 +283,7 @@ async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
     .await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "rebuild me",
         json!({"workflow": "tiny"}),
     )
@@ -322,7 +330,7 @@ async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
     assert!(db.exists(), "the daemon must have created {}", db.display());
     std::fs::remove_file(&db).expect("delete the projection");
 
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     assert!(db.exists(), "restart must rebuild {}", db.display());
     let after = analytics_snapshot(&handle).await;
     let events_rows = get(&handle, "/v1/analytics").await["tables"]
@@ -356,10 +364,10 @@ async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
 /// echoed a cached answer could not pass both.)
 #[tokio::test]
 async fn a_fresh_daemon_answers_from_the_journal_alone() {
-    let (data, _repo, work_id) = completed_run().await;
+    let (data, estate, work_id) = completed_run().await;
     std::fs::remove_dir_all(data.path().join(PROJECTIONS_DIR)).expect("delete projections");
 
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let answer = get(&handle, "/v1/analytics/execution_touched").await;
     let rows = answer["rows"].as_array().expect("rows");
     assert!(
@@ -384,7 +392,7 @@ async fn a_fresh_daemon_answers_from_the_journal_alone() {
 /// clean slate.
 #[tokio::test]
 async fn a_restart_over_the_existing_projection_file_rebuilds_it() {
-    let (data, _repo, work_id) = completed_run().await;
+    let (data, estate, work_id) = completed_run().await;
     assert!(
         duckdb_path(data.path()).exists(),
         "the first daemon left its projection behind"
@@ -392,10 +400,10 @@ async fn a_restart_over_the_existing_projection_file_rebuilds_it() {
 
     // Restart with the file still there, twice — a projection that appended
     // to itself instead of being rebuilt would double its rows here.
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let first = analytics_snapshot(&handle).await;
     handle.shutdown().await;
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let second = analytics_snapshot(&handle).await;
     let graph = get(&handle, &format!("/v1/graph/work/{work_id}")).await;
     handle.shutdown().await;
@@ -482,15 +490,17 @@ fn a_fold_that_fails_part_way_never_answers_out_of_a_short_table() {
 #[tokio::test]
 async fn a_projection_that_cannot_catch_up_answers_503_and_never_wrong_rows() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
-    let (handle, _fake) =
-        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::complete(), FakeStep::complete()],
+    )
+    .await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "still answerable",
         json!({"workflow": "tiny"}),
     )
@@ -657,7 +667,7 @@ fn t2_the_duckdb_file_has_exactly_one_owner() {
     //
     // Private-by-default does not cover this on its own. `Analytics` is a
     // public struct in a public module, so `pub conn: Connection` compiles
-    // and is reachable from anywhere in the workspace — and a consumer
+    // and is reachable from anywhere in the estate — and a consumer
     // written against it (`analytics.conn.execute(..)`) names the lowercase
     // crate token nowhere, so the scan above would not see it either. The
     // field declaration is therefore pinned directly.
@@ -699,10 +709,10 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 /// `source_seq` fails something.
 #[tokio::test]
 async fn t3_every_graph_edge_resolves_to_an_event_that_justifies_it() {
-    let (data, _repo, work_id) = completed_run().await;
+    let (data, estate, work_id) = completed_run().await;
     let journal = Provenance::new(journal_events(data.path()));
 
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let graph = get(&handle, &format!("/v1/graph/work/{work_id}")).await;
     handle.shutdown().await;
 
@@ -865,7 +875,7 @@ impl Provenance {
             // estate-root Phase C, §7.4: `scoped_to` has two justifying
             // shapes now — `work.submitted`'s `workspace` field (legacy
             // journal replay only; a new Work never carries it) and
-            // `workflow.bound`'s own `workspace` field (the live source, the
+            // `workflow.bound`'s own `estate` field (the live source, the
             // plan-time estate name — same field `analytics.rs`'s `WorkRow`
             // already prefers).
             "scoped_to" => {
@@ -873,14 +883,14 @@ impl Provenance {
                     && from == submitted_work
                     && to
                         == format!(
-                            "workspace:{}",
+                            "estate:{}",
                             payload["work"]["workspace"].as_str().unwrap_or_default()
                         ))
                     || (event.kind == "workflow.bound"
                         && from == work
                         && to
                             == format!(
-                                "workspace:{}",
+                                "estate:{}",
                                 payload["workspace"].as_str().unwrap_or_default()
                             ))
             }
@@ -1188,10 +1198,10 @@ fn provenance_fixture() -> Vec<Event> {
 /// `rebuilding_reproduces_the_conversation_tables_a_real_adapter_fills`.
 #[tokio::test]
 async fn t4_deleting_the_projections_directory_loses_nothing() {
-    let (data, _repo, work_id) = completed_run().await;
+    let (data, estate, work_id) = completed_run().await;
     let journal_before = journal_events(data.path());
 
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let work_before = get(&handle, &format!("/v1/work/{work_id}")).await;
     let snapshot_before = analytics_snapshot(&handle).await;
     let graph_before = get(&handle, &format!("/v1/graph/work/{work_id}")).await;
@@ -1201,7 +1211,7 @@ async fn t4_deleting_the_projections_directory_loses_nothing() {
     assert!(projections.join(DUCKDB_FILE).exists());
     std::fs::remove_dir_all(&projections).expect("delete the whole projections dir");
 
-    let (handle, _fake) = start_fake(data.path(), []).await;
+    let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let work_after = get(&handle, &format!("/v1/work/{work_id}")).await;
     let snapshot_after = analytics_snapshot(&handle).await;
     let mut graph_after = get(&handle, &format!("/v1/graph/work/{work_id}")).await;
@@ -1240,9 +1250,7 @@ async fn t4_deleting_the_projections_directory_loses_nothing() {
 #[tokio::test]
 async fn t5_enabled_export_emits_the_span_tree_and_metrics() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
     let spans = InMemorySpanExporter::default();
     let metrics = InMemoryMetricExporter::default();
@@ -1258,6 +1266,10 @@ async fn t5_enabled_export_emits_the_span_tree_and_metrics() {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             telemetry: Some(telemetry.clone()),
+            // §5.1, spelled out here rather than through `start_fake`: this
+            // rig needs its own `telemetry` field, and an unbound daemon
+            // would export a `work` span with no stages under it.
+            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1265,7 +1277,7 @@ async fn t5_enabled_export_emits_the_span_tree_and_metrics() {
     .expect("daemon start");
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "trace me",
         json!({"workflow": "tiny"}),
     )
@@ -1483,9 +1495,7 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
     };
 
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
     // A pipeline the daemon was *not* given, installed process-wide. Anything
     // reaching for an ambient tracer or meter lands in these exporters.
@@ -1500,11 +1510,15 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
     opentelemetry::global::set_tracer_provider(ambient_traces.clone());
     opentelemetry::global::set_meter_provider(ambient_meters.clone());
 
-    let (handle, _fake) =
-        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::complete(), FakeStep::complete()],
+    )
+    .await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "no trace",
         json!({"workflow": "tiny"}),
     )
@@ -1632,15 +1646,14 @@ fn item_source<'a>(source: &'a str, signature: &str) -> &'a str {
 #[tokio::test]
 async fn t6_the_daemon_answers_three_section_22_questions() {
     let data = DataDir::new();
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
     // A run that blocks, is retried, and then completes: enough history for
     // "how long does work remain blocked" and "which backend retries most"
     // to have non-trivial answers.
     let (handle, _fake) = start_fake(
         data.path(),
+        estate.path(),
         [
             FakeStep::blocked("waiting on a human"),
             FakeStep::complete(),
@@ -1650,7 +1663,7 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
     .await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "answer me",
         json!({"workflow": "tiny"}),
     )
@@ -1719,9 +1732,13 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
     // daemon rebuilding its projections from the same on-disk journal.
     // `analytics`/`work show` no longer auto-spawn (ADR 0009), so the
     // daemon this section reads through is started explicitly rather than
-    // by the first CLI call itself.
-    spawn_bare_daemon(&data);
-    let listed = sgt(&data, &["analytics"]);
+    // by the first CLI call itself — and both it and the client calls name
+    // the estate with `-C` (§4.2: `analytics`, `work *` and `daemon` are all
+    // estate-scoped; §4.1: nothing searches upward from the cwd any more, so
+    // the root has to be named, and naming it keeps this rig independent of
+    // the test process's own working directory).
+    spawn_bare_daemon(&data, estate.path());
+    let listed = sgt(&data, estate.path(), &["analytics"]);
     for canned in CANNED_QUERIES {
         assert!(
             listed.contains(canned.name),
@@ -1733,7 +1750,7 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
         listed.contains("graph_edges"),
         "the projection's tables are reported: {listed}"
     );
-    let answered = sgt(&data, &["analytics", "backend_retries"]);
+    let answered = sgt(&data, estate.path(), &["analytics", "backend_retries"]);
     assert!(
         answered.contains("Which backend produces the most retries?")
             && answered.contains(FAKE_BACKEND_NAME),
@@ -1741,13 +1758,14 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
     );
 
     // And §23's minimal CLI rendering, which must show provenance.
-    let rendered = sgt(&data, &["work", "show", &work_id, "--graph"]);
+    let rendered = sgt(&data, estate.path(), &["work", "show", &work_id, "--graph"]);
     assert!(
         rendered.contains("--executes-->") && rendered.contains("seq "),
         "`sgt work show --graph` renders edges with their source seq: {rendered}"
     );
     let as_json: Value = serde_json::from_str(&sgt(
         &data,
+        estate.path(),
         &["--json", "work", "show", &work_id, "--graph"],
     ))
     .expect("json graph");
@@ -1765,24 +1783,32 @@ async fn t6_the_daemon_answers_three_section_22_questions() {
     // worktree path and finalize commit; before this fix cli.rs's key
     // whitelist silently dropped it (and `teardown`) from the printed
     // record.
-    let shown = sgt(&data, &["work", "show", &work_id]);
+    let shown = sgt(&data, estate.path(), &["work", "show", &work_id]);
     assert!(
         shown.contains("retained_branch") && shown.contains(&format!("sergeant/{work_id}")),
         "`sgt work show` (human form) must render the output pointer's retained branch: {shown}"
     );
 }
 
-/// Spawn a bare `sgt daemon` directly, not through auto-spawn.
+/// Spawn a bare `sgt daemon` directly, not through auto-spawn, bound to
+/// `estate_root`.
 ///
 /// `status`/`work`/`analytics`/`tui` no longer auto-spawn (ADR 0009), so a
 /// scenario that wants to read through the CLI without submitting new work
 /// via it has to start the daemon this way first.
 ///
+/// `-C` is what binds it (§4.2/§5.1): `sgt daemon` is estate-scoped, it
+/// refuses outside an exact root, and the root it admits is what it publishes
+/// in its `sergeant.runtime/v2` descriptor — which every client call below
+/// then verifies against its own `-C` before connecting.
+///
 /// `DataDir`'s own Drop reaps this by /proc scan (SIGTERM, then SIGKILL) —
 /// never by waiting on this `Child`.
 #[allow(clippy::zombie_processes)]
-fn spawn_bare_daemon(data_dir: &DataDir) {
+fn spawn_bare_daemon(data_dir: &DataDir, estate_root: &Path) {
     let child = std::process::Command::new(SGT)
+        .arg("-C")
+        .arg(estate_root)
         .arg("--data-dir")
         .arg(data_dir.path())
         .arg("daemon")
@@ -1816,10 +1842,17 @@ fn spawn_bare_daemon(data_dir: &DataDir) {
     }
 }
 
-/// Run `sgt` against a data dir, returning stdout (the CLI spawns and reuses
-/// its own daemon, so this exercises the client path a human has).
-fn sgt(data_dir: &DataDir, args: &[&str]) -> String {
+/// Run `sgt` against a data dir and an estate root, returning stdout — the
+/// client path a human has.
+///
+/// `-C <root>` rather than a cwd: §4.1 removed the ancestor walk, so every
+/// estate-scoped verb needs the exact root named, and naming it explicitly
+/// keeps this out of `current_dir`, which is global process state a
+/// concurrently running test could not share.
+fn sgt(data_dir: &DataDir, estate_root: &Path, args: &[&str]) -> String {
     let output = Command::new(SGT)
+        .arg("-C")
+        .arg(estate_root)
         .arg("--data-dir")
         .arg(data_dir.path())
         .args(args)
@@ -1890,11 +1923,18 @@ fn stub_claude(dir: &Path) -> PathBuf {
     path
 }
 
-/// A daemon running the *real* Claude adapter over the stand-in binary.
+/// A daemon running the *real* Claude adapter over the stand-in binary,
+/// bound to `estate_root` (§5.1) like every other rig here — without the
+/// binding there is no plan, no execution, and therefore no §27 conversation
+/// events for the tables these tests exist to fill.
 ///
 /// The backend registry is deliberately empty: the daemon registers the real
 /// adapter itself, so nothing here is a fake wearing the adapter's name.
-async fn start_claude(data_dir: &Path, telemetry: Option<Arc<Telemetry>>) -> DaemonHandle {
+async fn start_claude(
+    data_dir: &Path,
+    estate_root: &Path,
+    telemetry: Option<Arc<Telemetry>>,
+) -> DaemonHandle {
     let mut claude = ClaudeConfig::new(data_dir);
     claude.executable = stub_claude(data_dir);
     daemon::start_with(
@@ -1904,6 +1944,7 @@ async fn start_claude(data_dir: &Path, telemetry: Option<Arc<Telemetry>>) -> Dae
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
             telemetry,
+            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1922,19 +1963,17 @@ async fn start_claude(data_dir: &Path, telemetry: Option<Arc<Telemetry>>) -> Dae
 #[tokio::test]
 async fn real_adapter_events_populate_the_conversation_tables_and_tool_spans() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
     let spans = InMemorySpanExporter::default();
     let telemetry = Arc::new(Telemetry::with_exporters(
         spans.clone(),
         InMemoryMetricExporter::default(),
     ));
-    let handle = start_claude(data.path(), Some(telemetry.clone())).await;
+    let handle = start_claude(data.path(), estate.path(), Some(telemetry.clone())).await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "say hello",
         json!({"workflow": "tiny"}),
     )
@@ -2112,14 +2151,12 @@ async fn real_adapter_events_populate_the_conversation_tables_and_tool_spans() {
 #[tokio::test]
 async fn rebuilding_reproduces_the_conversation_tables_a_real_adapter_fills() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
-    let handle = start_claude(data.path(), None).await;
+    let handle = start_claude(data.path(), estate.path(), None).await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "say hello",
         json!({"workflow": "tiny"}),
     )
@@ -2476,17 +2513,22 @@ fn synthetic_run(work_id: &str) -> Vec<sergeant_rs::domain::event::EventDraft> {
 /// re-derivation, not merely a live in-memory hit.
 #[tokio::test]
 async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_commit() {
-    let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    let base_sha = init_repo(&repo);
-    write_two_stage_workflow(&repo);
+    // §6.1: the mount is derived, not declared — `repos/solo` under the
+    // estate root is the only place this repository can live, which is also
+    // what makes `source_repo` below a checkable fact rather than an echo of
+    // whatever path the manifest happened to name.
+    let (estate, repo, base_sha) = estate();
 
-    let (handle, _fake) =
-        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::complete(), FakeStep::complete()],
+    )
+    .await;
     let body = submit(
         &handle,
-        &repo,
+        estate.path(),
         "point me at the output",
         json!({"workflow": "tiny"}),
     )
@@ -2508,8 +2550,9 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
     // on macOS the test's own raw TempDir path differs from its canonical
     // form (`/var` is a symlink to `/private/var`, same family as
     // `/tmp` -> `/private/tmp`) — first measured on the MacBook Pro M3 Pro
-    // arrival trip, 2026-08-15, same root cause as
-    // `domain::workspace::tests::estate_data_dir_is_found_even_when_the_rest_of_the_manifest_is_structurally_broken`.
+    // arrival trip, 2026-08-15. Same root cause as the canonicalization
+    // `Estate::admit` itself does (§4.1), pinned by
+    // `domain::estate::tests::admit_accepts_the_exact_directory_that_carries_the_manifest`.
     assert_eq!(
         std::fs::canonicalize(
             repo_out["source_repo"]
@@ -2528,7 +2571,7 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
     // The branch itself really is there, at that commit, in the source repo
     // — the pointer names a real, checkable fact, not a projection artifact.
     assert_eq!(
-        git(
+        support::git(
             &repo,
             &["rev-parse", &format!("refs/heads/sergeant/{work_id}")]
         ),
@@ -2541,7 +2584,7 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
     // pointer — like every other view `work show` composes — must read back
     // byte-identical, whether or not R-MVP1-9 eviction reclaimed this work's
     // run in between (it did: `Completed` is absorbing).
-    let (handle2, _fake2) = start_fake(data.path(), []).await;
+    let (handle2, _fake2) = start_fake(data.path(), estate.path(), []).await;
     let after = get(&handle2, &format!("/v1/work/{work_id}")).await;
     assert_eq!(
         after["output"], output,
@@ -2562,16 +2605,18 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
 /// conversation yet" for a work that never existed.
 #[tokio::test]
 async fn work_transcript_endpoint_exists_and_answers_a_real_work_and_a_404() {
-    let repo = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
 
-    let (handle, _fake) =
-        start_fake(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [FakeStep::complete(), FakeStep::complete()],
+    )
+    .await;
     let created = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "read my transcript",
         json!({"workflow": "tiny"}),
     )
@@ -2608,9 +2653,7 @@ async fn work_transcript_endpoint_exists_and_answers_a_real_work_and_a_404() {
 /// `Completed` work, and both are checked field-by-field, not one subtree.
 #[tokio::test]
 async fn r_mvp1_9_the_fleet_view_matches_the_single_work_view_for_an_evicted_work() {
-    let repo = TempDir::new().expect("tempdir");
-    init_repo(repo.path());
-    write_two_stage_workflow(repo.path());
+    let (estate, _mount, _head) = estate();
     let data = DataDir::new();
 
     // One work that completes (Completed is absorbing: it WILL be evicted),
@@ -2618,6 +2661,7 @@ async fn r_mvp1_9_the_fleet_view_matches_the_single_work_view_for_an_evicted_wor
     // live control).
     let (handle, _fake) = start_fake(
         data.path(),
+        estate.path(),
         [
             FakeStep::complete(),
             FakeStep::complete(),
@@ -2627,7 +2671,7 @@ async fn r_mvp1_9_the_fleet_view_matches_the_single_work_view_for_an_evicted_wor
     .await;
     let completed = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "this one finishes",
         json!({"workflow": "tiny"}),
     )
@@ -2640,7 +2684,7 @@ async fn r_mvp1_9_the_fleet_view_matches_the_single_work_view_for_an_evicted_wor
 
     let failed = submit(
         &handle,
-        repo.path(),
+        estate.path(),
         "this one fails",
         json!({"workflow": "tiny"}),
     )

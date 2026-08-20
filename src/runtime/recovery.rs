@@ -531,7 +531,7 @@ mod tests {
 
     /// A temp git repository with one commit, run with a fixture identity so
     /// nothing depends on the machine's own git config.
-    fn repo(path: &std::path::Path) -> crate::domain::workspace::RepositorySpec {
+    fn repo(path: &std::path::Path) -> crate::domain::estate::RepositorySpec {
         std::fs::create_dir_all(path).expect("repo dir");
         for args in [
             vec!["init", "-b", "main"],
@@ -550,7 +550,7 @@ mod tests {
                 .expect("git");
             assert!(output.status.success(), "git {args:?}: {output:?}");
         }
-        crate::domain::workspace::RepositorySpec {
+        crate::domain::estate::RepositorySpec {
             name: "solo".to_string(),
             path: path.to_path_buf(),
         }

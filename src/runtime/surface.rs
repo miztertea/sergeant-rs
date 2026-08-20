@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::BindingSummary;
-use crate::domain::workspace::RepositorySpec;
+use crate::domain::estate::RepositorySpec;
 use crate::runtime::fsutil::create_dir_all_durable;
 use crate::runtime::git::{
     GitError, canonical_git_common_dir, canonical_git_top_level, git, git_submodule_update,
@@ -225,7 +225,7 @@ pub enum BindingOrigin {
 /// What §11 requires each repository binding to record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositoryBinding {
-    /// Repository name within the workspace.
+    /// Repository name within the estate.
     pub repository: String,
     /// Source repository top level (never written to by execution).
     pub source_path: PathBuf,
@@ -285,7 +285,7 @@ pub struct SurfacePlan {
     pub root: PathBuf,
     /// Branch every worktree will be cut onto.
     pub work_branch: String,
-    /// Repositories that will get a worktree, in workspace order.
+    /// Repositories that will get a worktree, in estate order.
     pub repositories: Vec<RepositorySpec>,
 }
 
@@ -313,7 +313,7 @@ pub struct WorkSurface {
     pub work_id: String,
     /// Root directory holding the worktrees.
     pub root: PathBuf,
-    /// One binding per repository, in workspace order.
+    /// One binding per repository, in estate order.
     pub bindings: Vec<RepositoryBinding>,
 }
 

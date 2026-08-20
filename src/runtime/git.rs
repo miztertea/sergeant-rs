@@ -3,7 +3,7 @@
 //! §11 is explicit: shell out to the installed Git rather than embedding
 //! libgit2 — "Git already defines the behavior we want; Depot's
 //! responsibility is deterministic orchestration around it". Everything the
-//! surface and workspace layers need from Git goes through this one module so
+//! surface and estate layers need from Git goes through this one module so
 //! there is exactly one place that knows how a Git invocation is spelled,
 //! sandboxed, and read.
 //!

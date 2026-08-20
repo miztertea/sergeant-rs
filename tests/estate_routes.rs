@@ -9,10 +9,12 @@
 //! m8_estate_cli.rs` builds one for `sgt repo add`'s populate-or-verify.
 //!
 //! Every estate here uses the default `<estate_root>/.sergeant/data` layout
-//! — `src/api.rs`'s `resolve_estate_root` finds it by walking up from
-//! `data_dir` alone, with no dependency on the test process's own working
-//! directory (deliberately: `current_dir` is global process state, and nothing
-//! here needs to touch it).
+//! and starts its daemon **bound** to the estate root (estate-root §5.1):
+//! `src/api.rs`'s `resolve_estate_root` reads that binding off the engine
+//! rather than walking up from `data_dir`, so these routes depend on nothing
+//! but the root the daemon was started against — and, as before, not at all
+//! on the test process's own working directory (`current_dir` is global
+//! process state, and nothing here needs to touch it).
 
 use std::path::Path;
 use std::process::Command;
@@ -66,10 +68,18 @@ fn estate() -> (TempDir, std::path::PathBuf) {
     (root, data_dir)
 }
 
-async fn start(data_dir: &Path) -> DaemonHandle {
-    daemon::start_with(data_dir, DaemonConfig::default())
-        .await
-        .expect("daemon start")
+/// Start a daemon on `data_dir`, **bound** to `estate_root` (§5.1). Every
+/// `/v1/estate/*` route resolves the estate through that binding now.
+async fn start(data_dir: &Path, estate_root: &Path) -> DaemonHandle {
+    daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            estate_root: Some(estate_root.to_path_buf()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
 }
 
 fn client_for(handle: &DaemonHandle) -> ApiClient {
@@ -81,7 +91,7 @@ fn client_for(handle: &DaemonHandle) -> ApiClient {
 #[tokio::test]
 async fn get_estate_repos_reflects_the_manifest_empty_then_populated() {
     let (root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let empty = client.repos().await.expect("get repos");
@@ -110,8 +120,8 @@ async fn get_estate_repos_reflects_the_manifest_empty_then_populated() {
 
 #[tokio::test]
 async fn post_estate_repos_honors_the_instructions_choice() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -132,8 +142,8 @@ async fn post_estate_repos_honors_the_instructions_choice() {
 
 #[tokio::test]
 async fn post_estate_repos_refuses_a_duplicate_name_with_the_manifest_refusal() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -161,7 +171,7 @@ async fn post_estate_repos_refuses_a_duplicate_name_with_the_manifest_refusal() 
 #[tokio::test]
 async fn delete_estate_repos_removes_the_declaration_but_not_the_clone() {
     let (root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -186,8 +196,8 @@ async fn delete_estate_repos_removes_the_declaration_but_not_the_clone() {
 
 #[tokio::test]
 async fn delete_estate_repos_refuses_while_a_group_still_references_it() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -220,8 +230,8 @@ async fn delete_estate_repos_refuses_while_a_group_still_references_it() {
 
 #[tokio::test]
 async fn post_estate_groups_creates_then_extends_by_union() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -260,8 +270,8 @@ async fn post_estate_groups_creates_then_extends_by_union() {
 
 #[tokio::test]
 async fn post_estate_groups_refuses_an_undeclared_member() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let err = client
@@ -278,8 +288,8 @@ async fn post_estate_groups_refuses_an_undeclared_member() {
 
 #[tokio::test]
 async fn get_estate_groups_reflects_the_manifest() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -305,8 +315,8 @@ async fn get_estate_groups_reflects_the_manifest() {
 
 #[tokio::test]
 async fn delete_estate_groups_with_named_repos_removes_only_those_members() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -342,8 +352,8 @@ async fn delete_estate_groups_with_named_repos_removes_only_those_members() {
 
 #[tokio::test]
 async fn delete_estate_groups_with_no_repos_removes_the_whole_group() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -371,8 +381,8 @@ async fn delete_estate_groups_with_no_repos_removes_the_whole_group() {
 
 #[tokio::test]
 async fn delete_estate_groups_refuses_a_nonmember() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let source = TempDir::new().expect("source repo tempdir");
@@ -402,8 +412,8 @@ async fn delete_estate_groups_refuses_a_nonmember() {
 
 #[tokio::test]
 async fn get_doctor_matches_the_shape_sgt_doctor_json_already_prints() {
-    let (_root, data_dir) = estate();
-    let handle = start(&data_dir).await;
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
     let client = client_for(&handle);
 
     let report = client.doctor().await.expect("get doctor report");

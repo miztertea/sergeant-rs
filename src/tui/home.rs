@@ -100,9 +100,10 @@ pub struct NewWorkForm {
     /// One declared group name, forwarded verbatim as `scope.group` —
     /// exactly what `sgt run --group` sends. estate-root proposal §7.2 moved
     /// expansion into the daemon, so naming a group here costs the TUI no
-    /// local manifest read (`Workspace::declared_groups_scoped`), which no
-    /// module under this tree may do anyway: the TUI reaches the crate only
-    /// through `crate::api` (§30, `t5`/`t5b`). The daemon still does not
+    /// local manifest read — which no module under this tree may do anyway
+    /// (the TUI reaches the crate only through `crate::api`, §30,
+    /// `t5`/`t5b`), and which estate-root Phase D removed the machinery for
+    /// entirely when it deleted cwd-based discovery. The daemon still does not
     /// expose the declared repositories/groups over the API — that is T3's
     /// job (§20.4, the `/v1/estate/*` routes) — so the name is typed rather
     /// than chosen from a catalog, and an unknown one comes back as §15's
@@ -596,7 +597,7 @@ mod tests {
 
     /// estate-root proposal §13.3/§7.2: scope travels in exactly one place,
     /// the structured `scope` block the daemon resolves — never as the
-    /// pre-§7 top-level `repositories`/`workspace` keys, which no longer
+    /// pre-§7 top-level `repositories`/`estate` keys, which no longer
     /// exist on the wire and would be silently ignored on deserialize,
     /// dropping the operator's selection without a word.
     #[test]

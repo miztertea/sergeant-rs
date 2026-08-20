@@ -46,6 +46,21 @@
 //! it. Between them the two live tests exercise every §37 backend-contract
 //! verb against the installed binary — probe, start, identity, send,
 //! observe, history, interrupt, resume, stop, restart/reconcile.
+//!
+//! **Estate-root §4.1/§5.1/§6.1 moved every fixture in this file that runs a
+//! plan or a daemon.** A bare `TempDir` with a git repo in it used to be a
+//! estate, because discovery walked up from the submission's `cwd` and,
+//! failing that, took the git top level. Both are gone: an estate is exactly
+//! a directory whose own `sergeant.toml` declares `[estate]`, its mounts are
+//! derived `<estate-root>/repos/<name>`, and the *daemon* — not the request
+//! — names which estate is in play. So the fixture here is
+//! [`support::scaffold_solo_estate`]'s root, the engine carries
+//! [`Engine::with_estate_root`], and every `daemon::start_with` that expects
+//! its submission to reach a surface passes `estate_root`. A daemon bound to
+//! nothing plans against nothing and leaves work `pending` (§5.2), which is
+//! the shape an unmigrated fixture now fails as. `origin.cwd` is still
+//! submitted, and still asserted where a test cares, but it is recorded
+//! evidence only (§13.3) — it can no longer select anything.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -68,6 +83,7 @@ use sergeant_rs::backend::{
     Deferred, ExecutionHandle, NativeState, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, journaling_sink};
+use sergeant_rs::domain::estate::{InstructionPolicy, RepositorySpec};
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
 use sergeant_rs::domain::execution::{
     KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
@@ -82,7 +98,6 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED,
     KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use sergeant_rs::domain::workspace::{InstructionPolicy, RepositorySpec};
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
 use sergeant_rs::runtime::engine::{
     DEFAULT_TURN_CAP, Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, Next, PendingLaunch,
@@ -1032,8 +1047,8 @@ fn the_live_gate_skips_on_both_of_the_contracts_conditions() {
 #[tokio::test]
 async fn the_real_adapter_journals_from_the_daemon_request_path() {
     let data = TempDir::new().expect("tempdir");
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
+    let estate = TempDir::new().expect("estate");
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     let stub = StubClaude::passing(data.path());
     stub.replays(&recorded_turn());
     let mut claude = ClaudeConfig::new(data.path());
@@ -1045,6 +1060,11 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
             backends: Arc::new(BackendRegistry::new()),
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
+            // §5.1: the window this test opens only exists once a turn is
+            // really spawned, and a daemon bound to no estate never plans one
+            // — the submission would stop at `pending` with the adapter never
+            // reached.
+            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1058,7 +1078,7 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "drive the real adapter",
-            "origin": {"client": "cli", "cwd": repo.path()},
+            "origin": {"client": "cli", "cwd": repo},
         }))
         .send()
         .await
@@ -1181,16 +1201,33 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
 /// stuck stage still fails the test rather than the suite's patience.
 const SETTLE_BUDGET: Duration = Duration::from_secs(30);
 
-/// Start a daemon whose only backend is the real Claude adapter over `stub`.
-async fn start_with_stub(data_dir: &Path, stub: &StubClaude) -> daemon::DaemonHandle {
-    start_with_stub_polling(data_dir, stub, DaemonConfig::default().completion_poll).await
+/// Start a daemon **bound to `estate_root`** (§5.1) whose only backend is the
+/// real Claude adapter over `stub`.
+async fn start_with_stub(
+    data_dir: &Path,
+    estate_root: &Path,
+    stub: &StubClaude,
+) -> daemon::DaemonHandle {
+    start_with_stub_polling(
+        data_dir,
+        estate_root,
+        stub,
+        DaemonConfig::default().completion_poll,
+    )
+    .await
 }
 
 /// [`start_with_stub`] with the completion driver's cadence chosen by the
 /// caller — the only way to stand *inside* the window between a turn ending
 /// and the daemon settling it.
+///
+/// The binding is not optional here: every test below submits work that has
+/// to reach a real turn, and §5.2 plans against the daemon's estate rather
+/// than the request's `cwd`, so an unbound daemon parks the submission at
+/// `pending` and no window ever opens.
 async fn start_with_stub_polling(
     data_dir: &Path,
+    estate_root: &Path,
     stub: &StubClaude,
     completion_poll: Duration,
 ) -> daemon::DaemonHandle {
@@ -1203,6 +1240,7 @@ async fn start_with_stub_polling(
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
             completion_poll,
+            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1211,11 +1249,31 @@ async fn start_with_stub_polling(
 }
 
 /// Submit one work through the real API and return its `work_view` body.
+///
+/// `cwd` is submitted because a real client submits it, and it still lands in
+/// `origin.cwd` — but since §5.2 it selects nothing: the daemon plans against
+/// the estate it was started with. The empty scope below is what actually
+/// picks the repository, via §7.1's sole-repository inference, which is why
+/// every caller of *this* helper binds a one-mount estate. Use
+/// [`submit_scoped_over_api`] where the estate declares more than one.
 async fn submit_over_api(
     http: &reqwest::Client,
     handle: &daemon::DaemonHandle,
     cwd: &Path,
     intent: &str,
+) -> Value {
+    submit_scoped_over_api(http, handle, cwd, intent, &[]).await
+}
+
+/// [`submit_over_api`] naming an explicit `scope.repos` (§7.1's first scope
+/// form), for a bound estate with more than one declared mount — where an
+/// empty scope is a `MissingScope` refusal, not a guess.
+async fn submit_scoped_over_api(
+    http: &reqwest::Client,
+    handle: &daemon::DaemonHandle,
+    cwd: &Path,
+    intent: &str,
+    repos: &[&str],
 ) -> Value {
     http.post(format!("{}/v1/work", handle.endpoint))
         .bearer_auth(&handle.token)
@@ -1223,6 +1281,7 @@ async fn submit_over_api(
             "command_id": ulid(),
             "intent": intent,
             "origin": {"client": "cli", "cwd": cwd},
+            "scope": {"repos": repos},
         }))
         .send()
         .await
@@ -1347,14 +1406,14 @@ fn client_mutations(events: &[Event]) -> Vec<String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_client_crank() {
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
+    let estate = TempDir::new().expect("estate");
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     let stub = StubClaude::passing(data.path());
     stub.replays(&recorded_turn()).stalls_until_released();
 
-    let handle = start_with_stub(data.path(), &stub).await;
+    let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, repo.path(), "settle me by yourself").await;
+    let submitted = submit_over_api(&http, &handle, &repo, "settle me by yourself").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1488,8 +1547,8 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr() {
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
+    let estate = TempDir::new().expect("estate");
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     // Attempt 1's verbatim refusal, from `docs/gauntlet/runs/runB/run-manifest.md`.
     let refusal = "--dangerously-skip-permissions cannot be used with root/sudo privileges for \
          security reasons\n";
@@ -1501,9 +1560,9 @@ async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr()
         .writes_stderr(refusal)
         .exits_with(1);
 
-    let handle = start_with_stub(data.path(), &stub).await;
+    let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, repo.path(), "refuse me by yourself").await;
+    let submitted = submit_over_api(&http, &handle, &repo, "refuse me by yourself").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1584,17 +1643,18 @@ async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
+    let estate = TempDir::new().expect("estate");
     let home = TempDir::new().expect("claude home");
-    init_repo(repo.path());
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     let stub = StubClaude::passing(data.path());
     stub.replays(&recorded_turn()).stalls_until_released();
 
     // An hour's cadence: the first tick never arrives, so the window between
     // the turn ending and the daemon settling it stays open for the whole run.
-    let handle = start_with_stub_polling(data.path(), &stub, Duration::from_secs(3600)).await;
+    let handle =
+        start_with_stub_polling(data.path(), estate.path(), &stub, Duration::from_secs(3600)).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, repo.path(), "crash on me").await;
+    let submitted = submit_over_api(&http, &handle, &repo, "crash on me").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1653,6 +1713,13 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
             backends: Arc::new(BackendRegistry::new()),
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
+            // §5.1: an operator restarting a daemon restarts it against the
+            // same estate, and the descriptor the second daemon publishes has
+            // to agree with the first one's. Reconciliation itself reads the
+            // journal, not the manifest — but a restart that quietly dropped
+            // the binding would be a different daemon, not this one coming
+            // back.
+            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1707,15 +1774,15 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_crank() {
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
+    let estate = TempDir::new().expect("estate");
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     let stub = StubClaude::passing(data.path());
     stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
         .stalls_until_released();
 
-    let handle = start_with_stub(data.path(), &stub).await;
+    let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, repo.path(), "ask me first").await;
+    let submitted = submit_over_api(&http, &handle, &repo, "ask me first").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1867,16 +1934,16 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
+    let estate = TempDir::new().expect("estate");
     let home = TempDir::new().expect("claude home");
-    init_repo(repo.path());
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     let stub = StubClaude::passing(data.path());
     stub.replays(&recorded_turn_with_ask("postgres or sqlite?"))
         .stalls_until_released();
 
-    let handle = start_with_stub(data.path(), &stub).await;
+    let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, repo.path(), "crash me during a respond").await;
+    let submitted = submit_over_api(&http, &handle, &repo, "crash me during a respond").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1944,6 +2011,8 @@ async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
             backends: Arc::new(BackendRegistry::new()),
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
+            // Same §5.1 restart binding as the launch-path sibling above.
+            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -2525,7 +2594,7 @@ fn bypass_permissions_requires_explicit_profile_opt_in() {
 
 /// #47: an unrecognized `permission_mode` is refused at the launch boundary
 /// too (defense in depth alongside the profile-load check in
-/// `domain::workspace`), for a `Profile` built directly rather than parsed
+/// `domain::estate`), for a `Profile` built directly rather than parsed
 /// from a `sergeant.toml` — the shape every test in this file (and any
 /// future non-file caller) uses.
 #[test]
@@ -4719,6 +4788,10 @@ fn r5_stale_execution_identity_is_refused_not_adopted() {
 #[tokio::test]
 async fn r6_client_disconnect_mid_run_has_no_consequence() {
     let data = TempDir::new().expect("tempdir");
+    // Scaffolded before the daemon, not beside the submit as it used to be:
+    // §5.1 admits the estate at start_with, so the root has to exist first.
+    let estate = TempDir::new().expect("estate");
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
     let handle = daemon::start_with(
@@ -4727,6 +4800,7 @@ async fn r6_client_disconnect_mid_run_has_no_consequence() {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
+            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -4744,15 +4818,13 @@ async fn r6_client_disconnect_mid_run_has_no_consequence() {
     assert!(stream.status().is_success());
 
     // ...a run in flight (the hang keeps it active)...
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
     let submitted: Value = client
         .post(format!("{}/v1/work", handle.endpoint))
         .bearer_auth(&handle.token)
         .json(&json!({
             "command_id": ulid(),
             "intent": "outlive your client",
-            "origin": {"client": "cli", "cwd": repo.path()},
+            "origin": {"client": "cli", "cwd": repo},
         }))
         .send()
         .await
@@ -4840,23 +4912,25 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
 
 // ------------------- §14.2 applied to git: the surface effect boundary
 //
-// INV-N3-02: submission held the core mutex across `Workspace::discover`, every
+// INV-N3-02: submission held the core mutex across the manifest load, every
 // stage's `CONTEXT.md` read and three `git` fork/exec/wait cycles per
 // repository; cancel held it across `git worktree remove`; retry across the
 // re-attachment. `git worktree add` on a 3.4 MB `.git` measures 86 ms in this
 // container, and the repository is one the daemon does not own and cannot
 // bound. These pin the phase split the way n1 pins it for the harness: at the
 // moment the authoritative phase returns, the git provably has not run.
+//
+// Estate-root §6.1 only moved *where* that repository is: each fixture below
+// is now an estate root with its one mount at `repos/solo`, and the engine
+// carries the binding a daemon would have given it.
 
-/// A workspace plan for `repo`, resolved exactly as a submission would.
-fn plan_for(engine: &Engine, repo: &Path) -> sergeant_rs::runtime::engine::StartPlan {
+/// The plan a submission into this engine's bound estate resolves to (§5.2:
+/// there is no other estate a submission could name, so this takes no path).
+fn plan_for(engine: &Engine) -> sergeant_rs::runtime::engine::StartPlan {
     engine
-        .plan(&SubmitContext {
-            cwd: Some(repo),
-            ..SubmitContext::default()
-        })
+        .plan(&SubmitContext::default())
         .expect("plan")
-        .expect("a workspace")
+        .expect("the engine's bound estate")
 }
 
 /// §14.2 phase 1 for a surface: `begin_start` journals the *intent* to
@@ -4866,20 +4940,20 @@ fn plan_for(engine: &Engine, repo: &Path) -> sergeant_rs::runtime::engine::Start
 #[test]
 fn n19_materializing_a_surface_is_an_effect_the_caller_performs() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(estate.path(), "solo");
     let fake = FakeBackend::new(FAKE_BACKEND_NAME);
     let engine = Engine::new(
         Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    );
+    )
+    .with_estate_root(estate.path().to_path_buf());
     let mut core = core(data.path());
     let work_id = "01N3SURFACE1";
     submit_work(&mut core, work_id, "materialize me");
     let work = core.registry.state().works[work_id].clone();
-    let plan = plan_for(&engine, &repo);
+    let plan = plan_for(&engine);
 
     let step = engine
         .begin_start(&mut core, &work, &plan)
@@ -4932,20 +5006,20 @@ fn n19_materializing_a_surface_is_an_effect_the_caller_performs() {
 #[test]
 fn n20_tearing_a_surface_down_is_an_effect_the_caller_performs() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(estate.path(), "solo");
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
     let engine = Engine::new(
         Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    );
+    )
+    .with_estate_root(estate.path().to_path_buf());
     let mut core = core(data.path());
     let work_id = "01N3SURFACE2";
     submit_work(&mut core, work_id, "cancel me");
     let work = core.registry.state().works[work_id].clone();
-    let plan = plan_for(&engine, &repo);
+    let plan = plan_for(&engine);
     engine.start(&mut core, &work, &plan).expect("start");
     let worktree = core.registry.state().runs[work_id]
         .surface
@@ -4989,20 +5063,20 @@ fn n20_tearing_a_surface_down_is_an_effect_the_caller_performs() {
 #[test]
 fn n21_a_cancel_during_materialization_records_the_surface_and_tears_it_down() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(estate.path(), "solo");
     let fake = FakeBackend::new(FAKE_BACKEND_NAME);
     let engine = Engine::new(
         Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    );
+    )
+    .with_estate_root(estate.path().to_path_buf());
     let mut core = core(data.path());
     let work_id = "01N3SURFACE3";
     submit_work(&mut core, work_id, "cancel me mid-git");
     let work = core.registry.state().works[work_id].clone();
-    let plan = plan_for(&engine, &repo);
+    let plan = plan_for(&engine);
 
     let step = engine
         .begin_start(&mut core, &work, &plan)
@@ -5489,7 +5563,7 @@ fn a3_real_claude_interrupt_leaves_the_conversation_resumable() {
 
 /// A run parked in `blocked` on stage `00-only`, ready for `retry` to reserve
 /// a second attempt. Retry is the cheapest door into the reservation path
-/// that does not need a real workspace on disk.
+/// that does not need a real estate on disk.
 fn journal_blocked_run(core: &mut Core, work_id: &str, backend: &str, cwd: &Path) {
     submit_work(core, work_id, "reserve me a stage");
     commit(
@@ -8453,10 +8527,12 @@ fn admitted_workflows_root() -> Option<std::path::PathBuf> {
 #[test]
 fn r_mvp1_7_a_scripted_run_exceeding_the_cap_blocks_at_exactly_n_spawned_turns() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_n_stage_workflow(&repo, "capped", 4);
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(estate.path(), "solo");
+    // §4.1/§6.1: `.sergeant/workflows` is the *estate's*, resolved from the
+    // root `Engine::plan` is bound to — not from whichever mount a caller
+    // happened to be standing in.
+    write_n_stage_workflow(estate.path(), "capped", 4);
 
     let fake = FakeBackend::new(FAKE_BACKEND_NAME); // completes every stage
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
@@ -8465,16 +8541,16 @@ fn r_mvp1_7_a_scripted_run_exceeding_the_cap_blocks_at_exactly_n_spawned_turns()
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
     )
-    .with_turn_cap(2);
+    .with_turn_cap(2)
+    .with_estate_root(estate.path().to_path_buf());
     let mut core = core(data.path());
     let plan = engine
         .plan(&SubmitContext {
-            cwd: Some(&repo),
             workflow: Some("capped"),
             ..SubmitContext::default()
         })
         .expect("plan")
-        .expect("a workspace");
+        .expect("the engine's bound estate");
 
     let work_id = "01MVP17CAP";
     submit_work(&mut core, work_id, "spend more turns than the cap allows");
@@ -8627,10 +8703,9 @@ fn r_mvp1_11_requires_ask_declares_on_a_real_on_disk_workflow_package() {
 #[test]
 fn r_mvp1_11_a_stage_requiring_ask_refuses_against_a_backend_that_cannot_ask() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_ask_workflow(&repo);
+    let estate = TempDir::new().expect("tempdir");
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
+    write_ask_workflow(estate.path());
 
     let no_ask = FakeBackend::scripted(FAKE_BACKEND_NAME, []).with_capabilities(Capabilities {
         ask: false,
@@ -8640,11 +8715,11 @@ fn r_mvp1_11_a_stage_requiring_ask_refuses_against_a_backend_that_cannot_ask() {
         Arc::new(BackendRegistry::new().with(Arc::new(no_ask))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    );
+    )
+    .with_estate_root(estate.path().to_path_buf());
 
     let err = engine
         .plan(&SubmitContext {
-            cwd: Some(&repo),
             workflow: Some("asks"),
             ..SubmitContext::default()
         })
@@ -8668,7 +8743,9 @@ fn r_mvp1_11_a_stage_requiring_ask_refuses_against_a_backend_that_cannot_ask() {
     );
     assert!(
         !repo.join(".git").join("worktrees").exists(),
-        "refused before any worktree side effect"
+        "refused before any worktree side effect — checked on the derived \
+         mount (§6.1), which is the only place a surface could have been cut \
+         from"
     );
 }
 
@@ -8677,25 +8754,24 @@ fn r_mvp1_11_a_stage_requiring_ask_refuses_against_a_backend_that_cannot_ask() {
 #[test]
 fn r_mvp1_11_the_same_workflow_submits_against_a_backend_that_can_ask() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_ask_workflow(&repo);
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(estate.path(), "solo");
+    write_ask_workflow(estate.path());
 
     let can_ask = FakeBackend::scripted(FAKE_BACKEND_NAME, []); // ask: true by default
     let engine = Engine::new(
         Arc::new(BackendRegistry::new().with(Arc::new(can_ask))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    );
+    )
+    .with_estate_root(estate.path().to_path_buf());
     let plan = engine
         .plan(&SubmitContext {
-            cwd: Some(&repo),
             workflow: Some("asks"),
             ..SubmitContext::default()
         })
         .expect("plan")
-        .expect("a workspace");
+        .expect("the engine's bound estate");
     assert_eq!(plan.workflow.name, "asks");
 }
 
@@ -8705,9 +8781,8 @@ fn r_mvp1_11_the_same_workflow_submits_against_a_backend_that_can_ask() {
 #[test]
 fn r_mvp1_11_an_undeclared_workflow_is_unaffected_by_a_backend_that_cannot_ask() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("plain");
-    init_repo(&repo);
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(estate.path(), "plain");
     // No workflow written: the embedded `software-change` default, whose
     // stages declare no `requires_ask` at all.
 
@@ -8719,14 +8794,12 @@ fn r_mvp1_11_an_undeclared_workflow_is_unaffected_by_a_backend_that_cannot_ask()
         Arc::new(BackendRegistry::new().with(Arc::new(no_ask))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    );
+    )
+    .with_estate_root(estate.path().to_path_buf());
     let plan = engine
-        .plan(&SubmitContext {
-            cwd: Some(&repo),
-            ..SubmitContext::default()
-        })
+        .plan(&SubmitContext::default())
         .expect("plan")
-        .expect("a workspace");
+        .expect("the engine's bound estate");
     assert!(!plan.workflow.stages.is_empty());
 }
 
@@ -8783,8 +8856,8 @@ fn interrupt_budget(ceiling: Duration, poll: Duration) -> Duration {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() {
     let data = support::DataDir::new();
-    let repo = TempDir::new().expect("repo");
-    init_repo(repo.path());
+    let estate = TempDir::new().expect("estate");
+    let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
     let poll = Duration::from_millis(50);
     let ceiling = Duration::from_millis(150);
@@ -8795,13 +8868,14 @@ async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() 
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll: poll,
             turn_ceiling: ceiling,
+            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
     .await
     .expect("daemon start");
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, repo.path(), "hang forever").await;
+    let submitted = submit_over_api(&http, &handle, &repo, "hang forever").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -8870,13 +8944,19 @@ async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() 
 /// Two simultaneously-hung turns, both overdue in the same driver tick, is
 /// the shape that exercises "more than one entry in one `overdue` batch" —
 /// both must end up interrupted, never just the first.
+///
+/// The two turns are still two *different* repositories, which since §6.1 is
+/// two derived mounts under one estate rather than two unrelated git repos:
+/// one daemon is bound to one estate (§5.1), so the fixture's independence
+/// now comes from `scope.repos` naming a different mount per submission —
+/// §7.1's first scope form, and the only thing that could pick between them
+/// now that `origin.cwd` selects nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn r_mvp1_7_two_simultaneously_overdue_hangs_are_both_interrupted() {
     let data = support::DataDir::new();
-    let repo_a = TempDir::new().expect("repo a");
-    let repo_b = TempDir::new().expect("repo b");
-    init_repo(repo_a.path());
-    init_repo(repo_b.path());
+    let estate = TempDir::new().expect("estate");
+    support::scaffold_estate(estate.path(), "two-hangs", &["repo-a", "repo-b"]);
+    let mount = |name: &str| estate.path().join("repos").join(name);
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang(), FakeStep::hang()]);
     let poll = Duration::from_millis(50);
     let ceiling = Duration::from_millis(150);
@@ -8887,14 +8967,15 @@ async fn r_mvp1_7_two_simultaneously_overdue_hangs_are_both_interrupted() {
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll: poll,
             turn_ceiling: ceiling,
+            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
     .await
     .expect("daemon start");
     let http = reqwest::Client::new();
-    let a = submit_over_api(&http, &handle, repo_a.path(), "hang a").await;
-    let b = submit_over_api(&http, &handle, repo_b.path(), "hang b").await;
+    let a = submit_scoped_over_api(&http, &handle, &mount("repo-a"), "hang a", &["repo-a"]).await;
+    let b = submit_scoped_over_api(&http, &handle, &mount("repo-b"), "hang b", &["repo-b"]).await;
     let work_a = a["work"]["id"].as_str().expect("work id").to_string();
     let work_b = b["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(a["work"]["state"], "active");
@@ -8945,10 +9026,9 @@ async fn r_mvp1_7_two_simultaneously_overdue_hangs_are_both_interrupted() {
 #[test]
 fn r_mvp1_7_a_consumed_crossing_whose_turn_ended_is_journaled_stale_not_delivered() {
     let data = TempDir::new().expect("tempdir");
-    let repos = TempDir::new().expect("tempdir");
-    let repo = repos.path().join("solo");
-    init_repo(&repo);
-    write_n_stage_workflow(&repo, "hangs", 1);
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(estate.path(), "solo");
+    write_n_stage_workflow(estate.path(), "hangs", 1);
 
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
@@ -8957,16 +9037,16 @@ fn r_mvp1_7_a_consumed_crossing_whose_turn_ended_is_journaled_stale_not_delivere
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
     )
-    .with_turn_ceiling(Duration::ZERO);
+    .with_turn_ceiling(Duration::ZERO)
+    .with_estate_root(estate.path().to_path_buf());
     let mut core = core(data.path());
     let plan = engine
         .plan(&SubmitContext {
-            cwd: Some(&repo),
             workflow: Some("hangs"),
             ..SubmitContext::default()
         })
         .expect("plan")
-        .expect("a workspace");
+        .expect("the engine's bound estate");
     let work_id = "01MVP17STALE";
     submit_work(
         &mut core,
