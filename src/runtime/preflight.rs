@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::estate::{Estate, EstateError, MANIFEST_FILE, RepositorySpec, validate_mount};
 use crate::platform::fs_locking::{self, Reliability};
-use crate::runtime::git::{canonical_git_common_dir, git, git_succeeds};
+use crate::runtime::git::{canonical_git_common_dir, git, git_succeeds, git_verbatim};
 use crate::runtime::repolock;
 use crate::runtime::surface::{surface_root, work_branch};
 
@@ -599,7 +599,10 @@ fn check_one(
     // Check 8: clean index *and* working tree. `--porcelain` reports both,
     // and `runtime::git` already runs every invocation with
     // `GIT_OPTIONAL_LOCKS=0`, so asking does not write to the mount's index.
-    let porcelain = git(mount, &["status", "--porcelain"]).map_err(|e| {
+    // Verbatim, not trimmed: the leading column of a porcelain record is the
+    // index status, and ` M file` trimmed becomes `M file` — a different
+    // answer. §8.3's "full porcelain evidence" means the bytes git wrote.
+    let porcelain = git_verbatim(mount, &["status", "--porcelain"]).map_err(|e| {
         PreflightFinding::new(
             name,
             PreflightCheck::WorktreeClean,
@@ -900,5 +903,498 @@ mod tests {
         // A branch that is not one of ours is reported verbatim rather than
         // mangled into a work id it never was.
         assert_eq!(owning_work_id("main"), "main");
+    }
+
+    // ------------------------------------------------- §8.1, one case each
+    //
+    // The taxonomy is only worth having if each check can actually be made
+    // to fail on its own, so each of the eleven below constructs exactly one
+    // unresolved fact against an otherwise perfectly admissible estate and
+    // asserts which check names it.
+    //
+    // Every fixture resolves the estate *first* and then breaks the mount.
+    // That is not a shortcut around `Estate::resolve` — it is §8.4's whole
+    // point in miniature: the manifest was read at one moment, admission
+    // happens at another, and the daemon re-enforces the mechanical contract
+    // at the second moment rather than trusting the first.
+
+    /// One git command in `dir` with a fixture identity and no ambient
+    /// config, so these tests behave the same on a host with no global git
+    /// identity as on one with several.
+    fn git_fixture(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?} in {dir:?}: {output:?}"
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// The Work id every fixture admits against, and the branch it implies.
+    const WORK: &str = "01PREFLIGHT0000000000";
+
+    /// A scratch estate with `repos` mounted and one commit each, resolved.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        estate: Estate,
+        data: PathBuf,
+        surfaces: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(repos: &[&str]) -> Self {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let root = dir.path().join("estate");
+            std::fs::create_dir_all(&root).expect("estate root");
+            let mut manifest = String::from("[estate]\nname = \"fixture\"\n");
+            for repo in repos {
+                manifest.push_str(&format!("\n[[repo]]\nname = {repo:?}\n"));
+                let mount = root.join("repos").join(repo);
+                std::fs::create_dir_all(&mount).expect("mount");
+                git_fixture(&mount, &["init", "-b", "main"]);
+                std::fs::write(mount.join("README.md"), "# fixture\n").expect("write");
+                git_fixture(&mount, &["add", "."]);
+                git_fixture(&mount, &["commit", "-m", "initial"]);
+            }
+            std::fs::write(root.join(MANIFEST_FILE), manifest).expect("manifest");
+            let estate = Estate::resolve(&root).expect("a scaffolded estate resolves");
+            Self {
+                data: dir.path().join("data"),
+                surfaces: dir.path().join("surfaces"),
+                _dir: dir,
+                estate,
+            }
+        }
+
+        fn mount(&self, name: &str) -> PathBuf {
+            self.estate
+                .repositories
+                .iter()
+                .find(|r| r.name == name)
+                .expect("declared repository")
+                .path
+                .clone()
+        }
+
+        fn run(&self, override_requested: bool) -> Result<GitPreflight, PreflightRefusal> {
+            run(
+                &self.estate,
+                &self.data,
+                &self.surfaces,
+                WORK,
+                &self.estate.repositories,
+                override_requested,
+            )
+        }
+
+        /// The single check a refusal names, asserting there is exactly one.
+        fn refused_check(&self, override_requested: bool) -> PreflightCheck {
+            let refusal = self
+                .run(override_requested)
+                .expect_err("this fixture must be refused");
+            assert_eq!(
+                refusal.findings.len(),
+                1,
+                "one broken fact, one finding: {refusal:?}"
+            );
+            refusal.findings[0].check
+        }
+    }
+
+    /// Check 1. The mount is gone between manifest resolution and admission.
+    #[test]
+    fn check_1_a_missing_mount_is_named_as_a_missing_mount() {
+        let fixture = Fixture::new(&["solo"]);
+        std::fs::remove_dir_all(fixture.mount("solo")).expect("remove the mount");
+        assert_eq!(fixture.refused_check(false), PreflightCheck::MountPresent);
+    }
+
+    /// Check 2. The mount is replaced by a symlink to a checkout elsewhere —
+    /// §6.2's shared-mount aliasing, which a canonical comparison alone
+    /// cannot see because it would happily follow the link.
+    #[test]
+    fn check_2_a_symlinked_mount_is_named_as_an_alias() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        let elsewhere = fixture._dir.path().join("someone-elses-clone");
+        std::fs::create_dir_all(&elsewhere).expect("clone dir");
+        git_fixture(&elsewhere, &["init", "-b", "main"]);
+        git_fixture(&elsewhere, &["commit", "--allow-empty", "-m", "initial"]);
+        std::fs::remove_dir_all(&mount).expect("remove the real mount");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, &mount).expect("symlink the mount");
+        assert_eq!(
+            fixture.refused_check(false),
+            PreflightCheck::MountNotAliased
+        );
+    }
+
+    /// Check 3. The mount exists but git cannot call it a top level at all —
+    /// the `.git` directory is gone, so there is nothing to resolve.
+    #[test]
+    fn check_3_a_mount_that_is_no_longer_a_repository_is_named_at_the_top_level() {
+        let fixture = Fixture::new(&["solo"]);
+        std::fs::remove_dir_all(fixture.mount("solo").join(".git")).expect("de-git the mount");
+        assert_eq!(fixture.refused_check(false), PreflightCheck::MountTopLevel);
+    }
+
+    /// Check 4. The mount is a linked worktree of some other repository —
+    /// exactly the recursion §6.2 refuses, including a Work's own surface
+    /// declared back as a source.
+    #[test]
+    fn check_4_a_linked_worktree_mount_is_named_as_one() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        let upstream = fixture._dir.path().join("upstream");
+        std::fs::create_dir_all(&upstream).expect("upstream dir");
+        git_fixture(&upstream, &["init", "-b", "main"]);
+        git_fixture(&upstream, &["commit", "--allow-empty", "-m", "initial"]);
+        std::fs::remove_dir_all(&mount).expect("remove the primary checkout");
+        git_fixture(
+            &upstream,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                &mount.display().to_string(),
+                "HEAD",
+            ],
+        );
+        assert_eq!(
+            fixture.refused_check(false),
+            PreflightCheck::MountPrimaryCheckout
+        );
+    }
+
+    /// Check 5. The repository's lock cannot be taken, so the registry
+    /// mutation materialization would perform is refused *now* rather than
+    /// discovered half-way through it.
+    ///
+    /// Driven through the un-openable arm (`locks/` occupied by a file, so
+    /// the lock's own directory cannot be created) rather than the contended
+    /// one: a held lock is *waited out* by design (§9.4's contender
+    /// semantics), so making preflight refuse that way would mean spending
+    /// `repolock::LOCK_BUDGET` — thirty seconds — inside a unit test to
+    /// assert a taxonomy entry. Both arms are the same
+    /// [`repolock::RepoLockError`], classified identically, and
+    /// `repolock`'s own suite already covers the timeout half.
+    #[test]
+    fn check_5_a_common_dir_that_cannot_be_locked_is_named_as_such() {
+        let fixture = Fixture::new(&["solo"]);
+        std::fs::create_dir_all(&fixture.data).expect("data dir");
+        std::fs::write(fixture.data.join(repolock::LOCKS_DIR), "not a directory")
+            .expect("occupy the locks directory with a file");
+        let refusal = fixture
+            .run(true)
+            .expect_err("an unlockable repository is refused");
+        assert_eq!(refusal.findings[0].check, PreflightCheck::CommonDirLockable);
+        assert!(
+            !refusal.override_would_help(),
+            "§8.3 never bypasses a lock conflict"
+        );
+        let lock_path = repolock::lock_path(
+            &fixture.data,
+            &canonical_git_common_dir(&fixture.mount("solo")).expect("common dir"),
+        );
+        assert!(
+            refusal.findings[0]
+                .detail
+                .contains(&lock_path.display().to_string()),
+            "the refusal names the lock it could not take: {}",
+            refusal.findings[0].detail
+        );
+    }
+
+    /// Check 6. A detached HEAD, refused without the override. (The override
+    /// arm is `an_override_admits_a_detached_mount_with_no_named_base_branch`
+    /// below.)
+    #[test]
+    fn check_6_a_detached_head_is_named_and_is_waivable() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        let head = git_fixture(&mount, &["rev-parse", "HEAD"]);
+        git_fixture(&mount, &["checkout", "--detach", &head]);
+        assert_eq!(fixture.refused_check(false), PreflightCheck::HeadAttached);
+        assert!(PreflightCheck::HeadAttached.waivable());
+    }
+
+    /// Check 7. An unborn branch: HEAD is a perfectly ordinary symref to
+    /// `refs/heads/main`, so check 6 passes — there is simply no commit.
+    /// Refused, and *not* waivable: §8.3 may waive a caution, never a
+    /// missing fact.
+    #[test]
+    fn check_7_an_unresolvable_head_is_named_and_the_override_does_not_help() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        // Roll the only branch back to nothing: `main` still exists as
+        // HEAD's symref target, but points at no commit.
+        git_fixture(&mount, &["update-ref", "-d", "refs/heads/main"]);
+        assert_eq!(fixture.refused_check(false), PreflightCheck::HeadFullSha);
+        assert_eq!(
+            fixture.refused_check(true),
+            PreflightCheck::HeadFullSha,
+            "§8.3: an override may not replace a missing fact"
+        );
+    }
+
+    /// Check 8. A dirty mount, refused without the override, with the full
+    /// porcelain evidence already attached to the finding.
+    #[test]
+    fn check_8_a_dirty_mount_is_named_and_carries_its_porcelain_evidence() {
+        let fixture = Fixture::new(&["solo"]);
+        std::fs::write(fixture.mount("solo").join("README.md"), "edited\n").expect("dirty it");
+        let refusal = fixture.run(false).expect_err("a dirty mount is refused");
+        assert_eq!(refusal.findings[0].check, PreflightCheck::WorktreeClean);
+        assert_eq!(
+            refusal.findings[0].porcelain.as_deref(),
+            Some(" M README.md"),
+            "§8.3's evidence is the porcelain output verbatim — leading column and \
+             all, since ` M` (unstaged) and `M ` (staged) differ only there"
+        );
+        assert!(refusal.override_would_help());
+    }
+
+    /// Check 9. `sergeant/<work-id>` already exists, and the refusal names
+    /// the Work that owns it (§15) rather than deleting or reusing it.
+    #[test]
+    fn check_9_an_existing_work_branch_is_named_with_its_owning_work() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        git_fixture(&mount, &["branch", &work_branch(WORK)]);
+        let refusal = fixture.run(true).expect_err("a ref collision is refused");
+        assert_eq!(refusal.findings[0].check, PreflightCheck::WorkBranchAbsent);
+        assert!(
+            refusal.findings[0].detail.contains(WORK),
+            "§15: name the ref and the Work that owns it: {}",
+            refusal.findings[0].detail
+        );
+        assert!(
+            !refusal.override_would_help(),
+            "§8.3 never bypasses an existing Work ref"
+        );
+        assert!(
+            git_succeeds(
+                &mount,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{}", work_branch(WORK))
+                ]
+            ),
+            "and the ref is still there — never deleted or reused automatically"
+        );
+    }
+
+    /// Check 10, first half: something is already at the planned worktree
+    /// path.
+    #[test]
+    fn check_10_an_occupied_worktree_path_is_named() {
+        let fixture = Fixture::new(&["solo"]);
+        let planned = surface_root(&fixture.surfaces, WORK).join("solo");
+        std::fs::create_dir_all(&planned).expect("occupy the planned path");
+        let refusal = fixture.run(true).expect_err("a path collision is refused");
+        assert_eq!(
+            refusal.findings[0].check,
+            PreflightCheck::WorktreePathAbsent
+        );
+        assert!(!refusal.override_would_help());
+    }
+
+    /// Check 10, second half: nothing is at the path, but git still has it
+    /// registered — the two halves fail apart, which is why both are asked.
+    #[test]
+    fn check_10_a_registered_but_absent_worktree_path_is_also_named() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        let planned = surface_root(&fixture.surfaces, WORK).join("solo");
+        std::fs::create_dir_all(planned.parent().expect("surface root")).expect("surface root");
+        git_fixture(
+            &mount,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "stale",
+                &planned.display().to_string(),
+                "HEAD",
+            ],
+        );
+        std::fs::remove_dir_all(&planned).expect("delete the directory by hand");
+        assert!(
+            !planned.exists(),
+            "the path is gone, the registration is not"
+        );
+        let refusal = fixture
+            .run(true)
+            .expect_err("a stale registration is refused");
+        assert_eq!(
+            refusal.findings[0].check,
+            PreflightCheck::WorktreePathAbsent
+        );
+        assert!(
+            refusal.findings[0].detail.contains("registered"),
+            "the two halves of check 10 are distinguishable in the evidence: {}",
+            refusal.findings[0].detail
+        );
+    }
+
+    /// Check 11. Two repositories, one of them unplannable: the whole scope
+    /// is refused, the good repository is *not* admitted, and the refusal
+    /// says so in its own finding rather than leaving it to be inferred.
+    #[test]
+    fn check_11_one_unplannable_repository_refuses_the_whole_scope() {
+        let fixture = Fixture::new(&["api", "web"]);
+        std::fs::write(fixture.mount("web").join("README.md"), "edited\n").expect("dirty it");
+        let refusal = fixture.run(false).expect_err("the scope is refused");
+        assert_eq!(
+            refusal.findings.len(),
+            2,
+            "the repository's own finding, then the scope's: {refusal:?}"
+        );
+        assert_eq!(refusal.findings[0].check, PreflightCheck::WorktreeClean);
+        assert_eq!(refusal.findings[0].repository, "web");
+        assert_eq!(
+            refusal.findings[1].check,
+            PreflightCheck::AllRepositoriesPlanned
+        );
+        assert!(
+            refusal.findings[1].detail.contains("1 of 2"),
+            "check 11 names how much of the scope could not be planned: {}",
+            refusal.findings[1].detail
+        );
+        // `api` was perfectly admissible and is still refused, because §8.1
+        // check 11 is about the whole scope planning before the *first* side
+        // effect — not about admitting whatever happens to be fine.
+        assert_eq!(refusal.code(), "git_preflight_dirty_mount");
+    }
+
+    /// A single-repository scope does not get check 11's finding appended:
+    /// "1 of 1 could not be planned" restates the finding above it, and a
+    /// taxonomy that pads every refusal teaches a client to ignore it.
+    #[test]
+    fn a_single_repository_refusal_carries_only_its_own_finding() {
+        let fixture = Fixture::new(&["solo"]);
+        std::fs::write(fixture.mount("solo").join("README.md"), "edited\n").expect("dirty it");
+        let refusal = fixture.run(false).expect_err("refused");
+        assert_eq!(refusal.findings.len(), 1, "{refusal:?}");
+    }
+
+    /// The ordinary case, and the shape everything above is measured
+    /// against: a clean attached mount admits, pins §8.2's exact base, and
+    /// records that nothing was waived.
+    #[test]
+    fn a_clean_attached_mount_is_admitted_with_its_exact_base_pinned() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        let head = git_fixture(&mount, &["rev-parse", "HEAD"]);
+        let admitted = fixture.run(false).expect("a clean mount is admitted");
+
+        assert_eq!(admitted.work_id, WORK);
+        assert!(!admitted.override_requested);
+        assert_eq!(admitted.repositories.len(), 1);
+        let solo = admitted
+            .repository("solo")
+            .expect("the admitted repository");
+        assert_eq!(solo.base_branch.as_deref(), Some("main"));
+        assert_eq!(solo.base_sha, head);
+        assert!(is_full_object_id(&solo.base_sha));
+        assert_eq!(solo.work_branch, work_branch(WORK));
+        assert_eq!(
+            solo.worktree_path,
+            surface_root(&fixture.surfaces, WORK).join("solo")
+        );
+        assert_eq!(solo.canonical_top_level, mount);
+        assert!(solo.canonical_common_dir.starts_with(&mount));
+        assert!(!solo.evidence.waived_anything());
+        assert_eq!(admitted.waived().count(), 0);
+    }
+
+    /// §8.3, dirty arm: the override admits, pins the *committed* HEAD, and
+    /// journals both the porcelain evidence and an explicit statement that
+    /// the uncommitted changes are excluded from the Work base.
+    #[test]
+    fn an_override_admits_a_dirty_mount_and_records_what_it_excluded() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        let committed = git_fixture(&mount, &["rev-parse", "HEAD"]);
+        std::fs::write(mount.join("README.md"), "edited\n").expect("dirty it");
+        std::fs::write(mount.join("untracked.txt"), "new\n").expect("and untracked");
+
+        let admitted = fixture.run(true).expect("the override admits it");
+        let solo = admitted.repository("solo").expect("admitted");
+        assert_eq!(
+            solo.base_sha, committed,
+            "§8.3: the Work is based on the committed HEAD"
+        );
+        assert_eq!(solo.base_branch.as_deref(), Some("main"));
+        assert!(solo.evidence.override_authorized);
+        assert_eq!(solo.evidence.waived.len(), 1);
+        assert_eq!(solo.evidence.waived[0].check, PreflightCheck::WorktreeClean);
+        let porcelain = solo.evidence.waived[0]
+            .porcelain
+            .as_deref()
+            .expect("§8.3 requires the full porcelain evidence");
+        assert!(porcelain.contains(" M README.md"), "{porcelain}");
+        assert!(porcelain.contains("?? untracked.txt"), "{porcelain}");
+        let excluded = solo
+            .evidence
+            .uncommitted_excluded
+            .as_deref()
+            .expect("§8.3 requires the exclusion to be stated explicitly");
+        assert!(
+            excluded.contains("excluded from the Work base"),
+            "{excluded}"
+        );
+        assert!(excluded.contains(&committed), "{excluded}");
+    }
+
+    /// §8.3, detached arm: the override admits, pins the exact HEAD, and
+    /// records **no** named base branch — the whole reason `base_branch` is
+    /// an `Option` rather than a sentinel string.
+    #[test]
+    fn an_override_admits_a_detached_mount_with_no_named_base_branch() {
+        let fixture = Fixture::new(&["solo"]);
+        let mount = fixture.mount("solo");
+        let head = git_fixture(&mount, &["rev-parse", "HEAD"]);
+        git_fixture(&mount, &["checkout", "--detach", &head]);
+
+        let admitted = fixture.run(true).expect("the override admits it");
+        let solo = admitted.repository("solo").expect("admitted");
+        assert_eq!(solo.base_sha, head, "the exact HEAD is still pinned");
+        assert_eq!(
+            solo.base_branch, None,
+            "§8.3: a detached admission records no named base branch"
+        );
+        assert_eq!(solo.evidence.waived.len(), 1);
+        assert_eq!(solo.evidence.waived[0].check, PreflightCheck::HeadAttached);
+        assert!(
+            solo.evidence.uncommitted_excluded.is_none(),
+            "nothing was excluded: the mount was clean, only detached"
+        );
+    }
+
+    /// An override that finds nothing to waive still records that the
+    /// operator gave it — the authorization is a fact about the submission,
+    /// not about what it happened to excuse.
+    #[test]
+    fn an_override_over_a_clean_mount_waives_nothing_and_says_so() {
+        let fixture = Fixture::new(&["solo"]);
+        let admitted = fixture.run(true).expect("admitted");
+        assert!(admitted.override_requested);
+        let solo = admitted.repository("solo").expect("admitted");
+        assert!(solo.evidence.override_authorized);
+        assert!(!solo.evidence.waived_anything());
     }
 }
