@@ -43,7 +43,8 @@ use crate::domain::manifest::{self, ManifestError};
 use crate::domain::work::{
     EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
     KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
-    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, Work, WorkState,
+    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, ScopeRequest,
+    Work, WorkState,
 };
 use crate::domain::workflow::{
     self, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
@@ -775,7 +776,46 @@ fn engine_error_body(e: &EngineError) -> Value {
     if let Some(available) = e.available_backends() {
         body["error"]["available_backends"] = json!(available);
     }
+    // estate-root §7.1/§15: a missing-scope refusal carries its remedy as
+    // data too — repo count, declared repos, declared groups, and the three
+    // example invocations (--repo/--group/--all) — so a client never has to
+    // regex the message to build the "select repositories" prompt.
+    if let EngineError::MissingScope {
+        repo_count,
+        repos,
+        groups,
+    } = e
+    {
+        body["error"]["repo_count"] = json!(repo_count);
+        body["error"]["repos"] = json!(repos);
+        body["error"]["groups"] = json!(groups);
+        body["error"]["examples"] = missing_scope_examples(repos, groups);
+    }
+    // §15: an unknown group is refused naming the available ones.
+    if let EngineError::UnknownGroup { available, .. } = e {
+        body["error"]["available_groups"] = json!(available);
+    }
     body
+}
+
+/// §7.1's three example invocations for a missing-scope refusal, using real
+/// declared names when the estate has any (more useful than a placeholder),
+/// falling back to a generic `<repo>`/`<group>` when it does not.
+fn missing_scope_examples(repos: &[String], groups: &[String]) -> Value {
+    let repo_example = match repos {
+        [] => "sgt run \"<intent>\" --repo <repo>".to_string(),
+        [one] => format!("sgt run \"<intent>\" --repo {one}"),
+        many => format!("sgt run \"<intent>\" --repo {} --repo {}", many[0], many[1]),
+    };
+    let group_example = match groups.first() {
+        Some(g) => format!("sgt run \"<intent>\" --group {g}"),
+        None => "sgt run \"<intent>\" --group <group>".to_string(),
+    };
+    json!({
+        "repo": repo_example,
+        "group": group_example,
+        "all": "sgt run \"<intent>\" --all",
+    })
 }
 
 /// HTTP status for an engine failure: 4xx where the client can fix it, 500
@@ -1014,10 +1054,12 @@ fn internal_error(e: impl std::fmt::Display) -> Response {
 struct SubmitRequest {
     command_id: String,
     intent: String,
+    /// estate-root proposal §7/§13.3's structured scope request
+    /// (`--repo`/`--group`/`--all`). §7.4: `workspace` no longer exists as
+    /// a wire field at all — the daemon is bound to exactly one estate, and
+    /// this is its replacement.
     #[serde(default)]
-    workspace: Option<String>,
-    #[serde(default)]
-    repositories: Vec<String>,
+    scope: ScopeRequest,
     #[serde(default)]
     workflow: Option<String>,
     #[serde(default)]
@@ -1029,9 +1071,9 @@ struct SubmitRequest {
     #[serde(default)]
     origin: Option<Origin>,
     /// R-MVP1-6's structured-intent schema slot. Progressive elaboration of
-    /// `intent`, checked for agreement against `workflow`/`repositories`
-    /// above (§13's one-source-of-truth rule) and journaled verbatim
-    /// otherwise — nothing here drives routing.
+    /// `intent`, checked for agreement against `workflow`/`scope.repos`/
+    /// `scope.group` above (§13's one-source-of-truth rule) and journaled
+    /// verbatim otherwise — nothing here drives routing.
     #[serde(default)]
     intent_detail: Option<IntentDetail>,
     /// MVP-3's submit-time envelope override (`--turns`/`--ceiling-secs`):
@@ -1067,12 +1109,12 @@ fn envelope_out_of_range(req: &SubmitRequest) -> Option<String> {
 }
 
 /// R-MVP1-6's submit-time agreement check: a structured elaboration that
-/// names a `workflow`/`repos` different from what the submission's own
-/// flags say is two answers to "what is this Work about" in one Work, and
-/// §13 requires exactly one source of truth. Absent on either side is not a
-/// disagreement — only *both present and different* is. Repository sets are
-/// compared unordered (a client naming the same repos in a different order
-/// has not disagreed with itself).
+/// names a `workflow`/`repos`/`group` different from what the submission's
+/// own flags say is two answers to "what is this Work about" in one Work,
+/// and §13 requires exactly one source of truth. Absent on either side is
+/// not a disagreement — only *both present and different* is. Repository
+/// sets are compared unordered (a client naming the same repos in a
+/// different order has not disagreed with itself).
 fn intent_detail_disagreement(req: &SubmitRequest) -> Option<String> {
     let detail = req.intent_detail.as_ref()?;
     if let (Some(declared), Some(flag)) = (detail.workflow.as_deref(), req.workflow.as_deref())
@@ -1084,25 +1126,33 @@ fn intent_detail_disagreement(req: &SubmitRequest) -> Option<String> {
         ));
     }
     if let Some(declared) = detail.repos.as_ref()
-        && !req.repositories.is_empty()
+        && !req.scope.repos.is_empty()
     {
         let declared_set: std::collections::BTreeSet<&str> =
             declared.iter().map(String::as_str).collect();
         let flag_set: std::collections::BTreeSet<&str> =
-            req.repositories.iter().map(String::as_str).collect();
+            req.scope.repos.iter().map(String::as_str).collect();
         if declared_set != flag_set {
             return Some(format!(
-                "intent_detail.repos is {declared:?}, but the submission's repositories are \
+                "intent_detail.repos is {declared:?}, but the submission's scope.repos are \
                  {:?}; the two must agree",
-                req.repositories
+                req.scope.repos
             ));
         }
     }
-    // `detail.group` is deliberately not checked here (I3): R-MVP1-5(b)
-    // gives group membership "no new engine surface" in MVP-1 — there is no
-    // `--group` flag yet for it to disagree with, and expanding it into a
-    // repository set to compare is MVP-3's CLI-side job. Revisit this
-    // function when `--group` lands, not before.
+    // estate-root Phase C: `scope.group` is now a real wire field (§13.3),
+    // so `detail.group` gets the same one-source-of-truth check `repos`
+    // and `workflow` already get above — the comment this replaces (I3)
+    // predates `--group` existing as anything but MVP-3's CLI-side-only
+    // expansion, which is exactly what Phase C retires.
+    if let (Some(declared), Some(group)) = (detail.group.as_deref(), req.scope.group.as_deref())
+        && declared != group
+    {
+        return Some(format!(
+            "intent_detail.group is {declared:?}, but the submission's scope.group is \
+             {group:?}; the two must agree"
+        ));
+    }
     None
 }
 
@@ -1158,7 +1208,7 @@ async fn submit_work(
         let backend = req.backend.clone();
         let workflow = req.workflow.clone();
         let profile = req.profile.clone();
-        let repositories = req.repositories.clone();
+        let scope = req.scope.clone();
         let origin_cwd = origin.cwd.clone();
         let origin_client = origin.client.clone();
         Some(
@@ -1169,7 +1219,9 @@ async fn submit_work(
                     backend: backend.as_deref(),
                     workflow: workflow.as_deref(),
                     profile: profile.as_deref(),
-                    repositories: &repositories,
+                    repos: &scope.repos,
+                    group: scope.group.as_deref(),
+                    all: scope.all,
                 })
             })
             .await,
@@ -1290,13 +1342,29 @@ async fn submit_work(
         }
     };
 
+    // §7.3: journaled twice — `scope_request` is exactly what was submitted;
+    // `repositories` is what `plan` (when there was a workspace to resolve
+    // against at all) actually resolved it to. When there was no workspace
+    // (`plan` is `None` — the client offered no repository context at all),
+    // there is nothing to resolve against, so the raw request is the best
+    // honest answer for `repositories` too, same as before this field had a
+    // resolution step in front of it.
+    let scope_request = req.scope.clone();
+    let resolved_repositories = plan
+        .as_ref()
+        .map(|p| p.repositories.iter().map(|r| r.name.clone()).collect())
+        .unwrap_or_else(|| scope_request.repos.clone());
+
     let work = Work {
         id: ulid::Ulid::generate().to_string(),
-        workspace: req
-            .workspace
-            .or_else(|| plan.as_ref().map(|p| p.workspace.name.clone())),
+        // §7.4: `--workspace`/`SubmitRequest.workspace` no longer exist.
+        // `Work.workspace` is kept only so a pre-Phase-C journal event still
+        // deserializes (`Work::workspace`'s doc comment); every new Work
+        // leaves it `None`.
+        workspace: None,
         intent: req.intent,
-        repositories: req.repositories,
+        repositories: resolved_repositories,
+        scope_request,
         workflow: req.workflow,
         backend: req.backend,
         origin_client: origin.client,
