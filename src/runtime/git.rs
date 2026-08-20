@@ -14,6 +14,28 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// Overrides the `git` executable [`command`] invokes, mirroring
+/// `backend::docker::DOCKER_BIN_ENV` (C11: Slice 1's "scripted Git binary"
+/// admission tests had no infrastructure to point at). Without this, every
+/// check this module's callers need to prove — no network, no branch
+/// switch, no fetch/pull/reset on any admission path — could only be
+/// asserted against whatever real `git` happens to be on `PATH`, the one
+/// thing a test can neither control nor safely fake.
+///
+/// Read fresh from the environment inside [`command`] on every invocation
+/// rather than cached in a config struct or a `OnceLock`: a cached value (or
+/// a `OnceLock`, which would stay poisoned for the rest of a parallel test
+/// run) would let one test's override leak into, or block, another's. Tests
+/// point it at a scripted binary to observe — or deny — git invocations
+/// without touching `PATH`.
+///
+/// Setting it is nonetheless a *process-global* act, not a thread-scoped
+/// one, so a test that sets it must own its whole process rather than share
+/// the lib test binary with the many call sites that reach real Git through
+/// this module. `tests/c11_injectable_git.rs` is that process, and carries
+/// the reasoning.
+pub const GIT_BIN_ENV: &str = "SGT_GIT_BIN";
+
 /// Failure running the Git CLI.
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
@@ -134,7 +156,8 @@ pub fn git_submodule_update(dir: &Path) -> Result<String, GitError> {
 
 /// One hermetic Git invocation: no pager, no prompts, no editor, stdin closed.
 fn command(dir: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
+    let git_bin = std::env::var(GIT_BIN_ENV).unwrap_or_else(|_| "git".to_string());
+    let mut command = Command::new(git_bin);
     command
         .arg("--no-pager")
         .args(args)
