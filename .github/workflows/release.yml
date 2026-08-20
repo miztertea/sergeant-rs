@@ -280,6 +280,28 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: record build environment
+        run: |
+          mkdir -p target/distrib
+          {
+            echo "commit: ${{ github.sha }}"
+            echo "target: ${{ matrix.target }}"
+            echo "runner-os: ${{ runner.os }}"
+            echo "runner-arch: ${{ runner.arch }}"
+            echo
+            echo "--- rustc -Vv ---"
+            rustc -Vv
+            echo
+            echo "--- cargo -V ---"
+            cargo -V
+            echo
+            echo "--- git --version ---"
+            git --version
+            echo
+            echo "--- bash --version ---"
+            bash --version
+          } > target/distrib/build-environment-${{ matrix.target }}.txt
+
       - name: install dist (pinned to workspace.metadata.dist's cargo-dist-version)
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
@@ -532,7 +554,9 @@ jobs:
             sgt_bin_x86_64-unknown-linux-gnu.cdx.json \
             sgt_bin_aarch64-apple-darwin.cdx.json \
             sergeant-rs-installer.sh \
-            SHA256SUMS.txt; do
+            SHA256SUMS.txt \
+            build-environment-x86_64-unknown-linux-gnu.txt \
+            build-environment-aarch64-apple-darwin.txt; do
             if [ ! -f "$f" ]; then
               echo "::error::release manifest missing expected asset $f" >&2
               exit 1
@@ -571,7 +595,8 @@ jobs:
             release-assets/*.sha256 \
             release-assets/*.cdx.json \
             release-assets/sergeant-rs-installer.sh \
-            release-assets/SHA256SUMS.txt
+            release-assets/SHA256SUMS.txt \
+            release-assets/build-environment-*.txt
 
       # A tag is not a unique key for a draft — GitHub lets multiple drafts
       # share one tag_name, which is exactly what let a stale dry-run draft
