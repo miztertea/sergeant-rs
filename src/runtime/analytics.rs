@@ -457,6 +457,12 @@ impl Appended {
 struct WorkRow {
     work_id: String,
     intent: Option<String>,
+    /// estate-root Phase C, §7.4: seeded from `work.submitted`'s
+    /// (pre-Phase-C-only, now always absent for a new Work) `workspace`
+    /// field, then overwritten by `workflow.bound`'s plan-time estate name
+    /// once that fires — see the two folds below. `None` for a `pending`
+    /// Work that never reached `workflow.bound` is an honest "not yet
+    /// resolved to an estate", not a lost fact.
     workspace: Option<String>,
     workflow: Option<String>,
     backend: Option<String>,
