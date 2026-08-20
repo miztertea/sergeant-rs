@@ -4997,9 +4997,12 @@ mod tests {
                     worktree_path: PathBuf::from(format!("/data/surfaces/{work_id}/solo")),
                     work_branch: format!("sergeant/{work_id}"),
                     final_sha: Some("1".repeat(40)),
+                    observed_head: None,
+                    findings: Vec::new(),
                     disposition,
                 }],
                 clean,
+                drift: Vec::new(),
             }
         }
 

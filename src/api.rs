@@ -1473,6 +1473,7 @@ fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
         BindingDisposition::RetainedDirty { .. } => "retained_dirty",
         BindingDisposition::Missing => "missing",
         BindingDisposition::RetainedError { .. } => "retained_error",
+        BindingDisposition::RetainedUnreferenced { .. } => "retained_unreferenced",
     }
 }
 
