@@ -6,7 +6,7 @@
 //!         ↓
 //! origin/client affinity
 //!         ↓
-//! workspace default
+//! estate default
 //!         ↓
 //! global default
 //!         ↓
@@ -40,7 +40,7 @@ pub enum RouteSource {
     Explicit,
     /// The origin client's affinity (§13).
     OriginAffinity,
-    /// The workspace's `default_backend` in `sergeant.toml`.
+    /// The estate's `default_backend` in `sergeant.toml`.
     WorkspaceDefault,
     /// The daemon's global default.
     GlobalDefault,
@@ -56,6 +56,13 @@ pub enum RouteSource {
 
 impl RouteSource {
     /// The tier's canonical snake_case name.
+    ///
+    /// `workspace_default` keeps its pre-rename spelling: §13.2 moves the
+    /// domain vocabulary, and this string is neither — it is a journaled
+    /// value (`workflow.bound`'s `route_source`, and every `sgt work show`
+    /// and analytics row derived from it) already written into durable
+    /// history. Renaming it would make two spellings of one tier appear in
+    /// the same journal, which is worse than one dated spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             RouteSource::Explicit => "explicit",
@@ -84,8 +91,8 @@ pub struct RouteInputs<'a> {
     pub explicit: Option<&'a str>,
     /// Origin client name from the request (§13's `origin.client`).
     pub origin_client: Option<&'a str>,
-    /// Workspace default from `sergeant.toml`.
-    pub workspace_default: Option<&'a str>,
+    /// Estate default from `sergeant.toml`.
+    pub estate_default: Option<&'a str>,
     /// The daemon's global default.
     pub global_default: Option<&'a str>,
 }
@@ -182,7 +189,7 @@ pub fn route(inputs: &RouteInputs<'_>, registry: &BackendRegistry) -> Result<Rou
         &[
             (RouteSource::Explicit, inputs.explicit),
             (RouteSource::OriginAffinity, affinity),
-            (RouteSource::WorkspaceDefault, inputs.workspace_default),
+            (RouteSource::WorkspaceDefault, inputs.estate_default),
             (RouteSource::GlobalDefault, inputs.global_default),
         ],
         registry,
@@ -276,7 +283,7 @@ mod tests {
         let all = RouteInputs {
             explicit: Some("claude"),
             origin_client: Some("codex"),
-            workspace_default: Some("fake"),
+            estate_default: Some("fake"),
             global_default: Some("fake"),
         };
         assert_eq!(
@@ -299,14 +306,14 @@ mod tests {
             }
         );
 
-        let workspace = RouteInputs {
+        let estate = RouteInputs {
             explicit: None,
             origin_client: Some("terminal"),
-            workspace_default: Some("claude"),
+            estate_default: Some("claude"),
             global_default: Some("fake"),
         };
         assert_eq!(
-            route(&workspace, &registry).expect("workspace wins"),
+            route(&estate, &registry).expect("estate wins"),
             Route {
                 backend: "claude".to_string(),
                 source: RouteSource::WorkspaceDefault
@@ -316,7 +323,7 @@ mod tests {
         let global = RouteInputs {
             explicit: None,
             origin_client: Some("terminal"),
-            workspace_default: None,
+            estate_default: None,
             global_default: Some("fake"),
         };
         assert_eq!(
@@ -364,7 +371,7 @@ mod tests {
                 ..RouteInputs::default()
             },
             RouteInputs {
-                workspace_default: Some("claude"),
+                estate_default: Some("claude"),
                 global_default: Some("codex"),
                 ..RouteInputs::default()
             },

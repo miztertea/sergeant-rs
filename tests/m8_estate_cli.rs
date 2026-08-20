@@ -903,16 +903,16 @@ fn run_group_resolves_server_side_into_repositories() {
 /// is core-owned), so this test's outcome is no longer "the client-side
 /// carve-out and the daemon's own strict bind disagree" — it is the plain
 /// consequence of `Engine::plan` unconditionally resolving the *whole*
-/// estate (`Workspace::resolve` against the daemon's bound root, since
+/// estate (`Estate::resolve` against the daemon's bound root, since
 /// estate-root Phase D) before scope resolution ever runs,
 /// exactly the coupling a plain `--repo` submission has always had (matches
 /// the B4 register entry MVP3-C2's own basis cites). `ghost` being outside
 /// the requested group no longer matters: the command still fails, and the
 /// daemon's own 422 is what names `ghost` as the actual defect.
 ///
-/// guard-map: a resolution path that somehow skipped or lightened workspace
+/// guard-map: a resolution path that somehow skipped or lightened estate
 /// discovery for a `--group` submission (say, resolving groups against a
-/// separately-read, on-disk-free manifest instead of the same `workspace`
+/// separately-read, on-disk-free manifest instead of the same `estate`
 /// `plan` already discovered) would make this pass with no daemon-side
 /// evidence of `ghost` at all — the `daemon_pids` assertion below is what
 /// catches that regression.
@@ -1447,7 +1447,7 @@ fn work_transcript_and_output_pointer_are_reachable_from_the_real_cli() {
     let repo = tempfile::TempDir::new().expect("tempdir");
     // §4.1/§6.1: an estate-scoped verb needs an exact estate root with a
     // derived `repos/<name>` mount — a bare git repo is no longer a
-    // workspace.
+    // estate.
     support::scaffold_estate(repo.path(), "solo", &["solo"]);
     write_two_stage_workflow(repo.path());
 
@@ -1551,7 +1551,7 @@ fn work_retained_and_reap_are_reachable_from_the_real_cli() {
     let repo = tempfile::TempDir::new().expect("tempdir");
     // §4.1/§6.1: an estate-scoped verb needs an exact estate root with a
     // derived `repos/<name>` mount — a bare git repo is no longer a
-    // workspace.
+    // estate.
     support::scaffold_estate(repo.path(), "solo", &["solo"]);
     write_two_stage_workflow(repo.path());
 
@@ -1684,7 +1684,7 @@ fn run_turns_and_ceiling_secs_override_the_envelope_for_one_work() {
     let repo = tempfile::TempDir::new().expect("tempdir");
     // §4.1/§6.1: an estate-scoped verb needs an exact estate root with a
     // derived `repos/<name>` mount — a bare git repo is no longer a
-    // workspace.
+    // estate.
     support::scaffold_estate(repo.path(), "solo", &["solo"]);
     write_two_stage_workflow(repo.path());
 

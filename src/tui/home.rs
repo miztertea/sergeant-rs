@@ -597,7 +597,7 @@ mod tests {
 
     /// estate-root proposal §13.3/§7.2: scope travels in exactly one place,
     /// the structured `scope` block the daemon resolves — never as the
-    /// pre-§7 top-level `repositories`/`workspace` keys, which no longer
+    /// pre-§7 top-level `repositories`/`estate` keys, which no longer
     /// exist on the wire and would be silently ignored on deserialize,
     /// dropping the operator's selection without a word.
     #[test]

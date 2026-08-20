@@ -7,7 +7,7 @@
 //! format-preserving in-memory document (`toml_edit`, "comments are for the
 //! human" — a hand-written comment elsewhere in the file survives an sgt
 //! edit), then the *whole resulting file* is round-tripped through
-//! [`Workspace::from_config_structural`] — the same fail-closed schema-level
+//! [`Estate::from_config_structural`] — the same fail-closed schema-level
 //! parser every other reader of `sergeant.toml` uses, minus the on-disk
 //! repository resolution (MVP-3 invariants finding MVP3-C1: an edit
 //! validates the manifest it would produce, not the on-disk state of every
@@ -48,10 +48,8 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
+use crate::domain::estate::{Estate, EstateError, InstructionPolicy, MANIFEST_FILE, mount_path};
 use crate::domain::is_plain_name;
-use crate::domain::workspace::{
-    InstructionPolicy, WORKSPACE_FILE, Workspace, WorkspaceError, mount_path,
-};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic};
 use crate::runtime::git::{git_clone, git_succeeds};
 
@@ -60,7 +58,7 @@ use crate::runtime::git::{git_clone, git_succeeds};
 /// itself, and this module's own scratch files. None belong in the estate's
 /// own history — `.sergeant/data` is machine-local runtime state (journal,
 /// blobs, projections), `repos/` is populated clones of *other*
-/// repositories' own histories, `sergeant.toml` is [`WORKSPACE_FILE`] itself
+/// repositories' own histories, `sergeant.toml` is [`MANIFEST_FILE`] itself
 /// and is per-installation by design (#71: `sgt init` is what generates it,
 /// so a colleague's own checkout can never carry the same one — leaving it
 /// untracked left every subsequent `git status` in a clone-is-distro
@@ -115,20 +113,20 @@ pub enum ManifestError {
     )]
     Locked { path: String },
     /// The edit, once applied, produced a manifest this build's own parser
-    /// refuses — named by the wrapped [`WorkspaceError`], which already
+    /// refuses — named by the wrapped [`EstateError`], which already
     /// carries its own remedy.
     #[error("this edit would leave {path} invalid: {source}")]
     Invalid {
         path: String,
         #[source]
-        source: Box<WorkspaceError>,
+        source: Box<EstateError>,
     },
     /// `start` is not an estate root (§4.1's exact-root check).
     ///
     /// Nothing in this module constructs it — that was already true before
     /// estate-root Phase D, and it stays true after: the callers that would
     /// have raised it now refuse *earlier*, at admission, with
-    /// [`crate::domain::workspace::EstateRootError`]'s §4.4 diagnostic,
+    /// [`crate::domain::estate::EstateRootError`]'s §4.4 diagnostic,
     /// which names the expected path and the remedy rather than a bare
     /// "not found". Retained only because `src/api.rs`'s stable
     /// `manifest_error_code` map answers `"no_estate"` for it.
@@ -320,12 +318,12 @@ fn read_document(manifest_path: &Path) -> Result<(DocumentMut, bool), ManifestEr
 
 /// Validate `doc` by writing it to a throwaway file beside the real manifest
 /// and running the schema-level parser/validator every manifest edit shares
-/// ([`Workspace::from_config_structural`]) — never the real path, so a
+/// ([`Estate::from_config_structural`]) — never the real path, so a
 /// refused edit leaves nothing behind but its own tmp file, which is removed
-/// either way. Returns the validated [`Workspace`] on success, so callers
+/// either way. Returns the validated [`Estate`] on success, so callers
 /// that need it do not have to parse a third time.
 ///
-/// Deliberately **not** [`Workspace::from_config_allow_empty`] (MVP-3
+/// Deliberately **not** [`Estate::from_config_allow_empty`] (MVP-3
 /// invariants finding MVP3-C1): that resolves every declared `[[repo]]`
 /// through git and fails closed at the first one not present on disk, so an
 /// estate with even one uncloned repository — including a freshly `git
@@ -336,15 +334,15 @@ fn read_document(manifest_path: &Path) -> Result<(DocumentMut, bool), ManifestEr
 /// only the on-disk resolution; a repository an edit itself populates or
 /// verifies (`add_repo`'s `populate_or_verify`) is already checked directly
 /// by that caller.
-fn validate(root: &Path, doc: &DocumentMut) -> Result<Workspace, ManifestError> {
-    let manifest_path = root.join(WORKSPACE_FILE);
+fn validate(root: &Path, doc: &DocumentMut) -> Result<Estate, ManifestError> {
+    let manifest_path = root.join(MANIFEST_FILE);
     let probe_path = root.join(format!("sergeant.toml.validate-{}", ulid::Ulid::generate()));
     let text = doc.to_string();
     std::fs::write(&probe_path, &text).map_err(|source| ManifestError::Io {
         path: probe_path.display().to_string(),
         source,
     })?;
-    let outcome = Workspace::from_config_structural(&probe_path);
+    let outcome = Estate::from_config_structural(&probe_path);
     let _ = std::fs::remove_file(&probe_path);
     outcome.map_err(|source| ManifestError::Invalid {
         path: manifest_path.display().to_string(),
@@ -355,7 +353,7 @@ fn validate(root: &Path, doc: &DocumentMut) -> Result<Workspace, ManifestError> 
 /// Commit a validated edit: atomic write of `doc`'s rendered text over the
 /// real manifest path.
 fn commit(root: &Path, doc: &DocumentMut) -> Result<(), ManifestError> {
-    let manifest_path = root.join(WORKSPACE_FILE);
+    let manifest_path = root.join(MANIFEST_FILE);
     write_atomic(&manifest_path, doc.to_string().as_bytes()).map_err(|source| ManifestError::Io {
         path: manifest_path.display().to_string(),
         source,
@@ -371,7 +369,7 @@ fn commit(root: &Path, doc: &DocumentMut) -> Result<(), ManifestError> {
 /// estate, because it is the command that creates one: it targets exactly
 /// where it is invoked, the same way `git init` does.
 pub fn init_estate(root: &Path, name: Option<&str>) -> Result<InitOutcome, ManifestError> {
-    let manifest_path = root.join(WORKSPACE_FILE);
+    let manifest_path = root.join(MANIFEST_FILE);
     let _lock = ManifestLock::acquire(root)?;
 
     let (mut doc, existed) = read_document(&manifest_path)?;
@@ -396,7 +394,7 @@ pub fn init_estate(root: &Path, name: Option<&str>) -> Result<InitOutcome, Manif
         commit(root, &doc)?;
     }
 
-    let repos_dir = root.join(crate::domain::workspace::REPOS_DIR);
+    let repos_dir = root.join(crate::domain::estate::REPOS_DIR);
     let repos_dir_created = !repos_dir.exists();
     if repos_dir_created {
         create_dir_all_durable(&repos_dir).map_err(|source| ManifestError::Io {
@@ -485,7 +483,7 @@ pub fn add_repo(
             name: name.to_string(),
         });
     }
-    let manifest_path = estate_root.join(WORKSPACE_FILE);
+    let manifest_path = estate_root.join(MANIFEST_FILE);
     let _lock = ManifestLock::acquire(estate_root)?;
     let (mut doc, _existed) = read_document(&manifest_path)?;
 
@@ -497,7 +495,7 @@ pub fn add_repo(
     }
 
     // §6.1: the mount is derived here exactly as the parser derives it —
-    // one function, `workspace::mount_path`, so the writer and the reader
+    // one function, `estate::mount_path`, so the writer and the reader
     // can never disagree about where a repository lives.
     let repo_path = mount_path(estate_root, name);
     populate_or_verify(name, &repo_path, origin)?;
@@ -571,7 +569,7 @@ fn populate_or_verify(
 /// a manifest edit, never a `rm -rf` of a working tree that may hold
 /// uncommitted changes.
 pub fn remove_repo(estate_root: &Path, name: &str) -> Result<(), ManifestError> {
-    let manifest_path = estate_root.join(WORKSPACE_FILE);
+    let manifest_path = estate_root.join(MANIFEST_FILE);
     let _lock = ManifestLock::acquire(estate_root)?;
     let (mut doc, _existed) = read_document(&manifest_path)?;
 
@@ -624,7 +622,7 @@ pub fn add_group(
             name: name.to_string(),
         });
     }
-    let manifest_path = estate_root.join(WORKSPACE_FILE);
+    let manifest_path = estate_root.join(MANIFEST_FILE);
     let _lock = ManifestLock::acquire(estate_root)?;
     let (mut doc, _existed) = read_document(&manifest_path)?;
 
@@ -684,7 +682,7 @@ pub fn add_group(
 /// the whole group; with one or more, removes just those members (each must
 /// actually be a member — fail closed otherwise), leaving the rest.
 pub fn remove_group(estate_root: &Path, name: &str, repos: &[String]) -> Result<(), ManifestError> {
-    let manifest_path = estate_root.join(WORKSPACE_FILE);
+    let manifest_path = estate_root.join(MANIFEST_FILE);
     let _lock = ManifestLock::acquire(estate_root)?;
     let (mut doc, _existed) = read_document(&manifest_path)?;
 
@@ -781,7 +779,7 @@ fn groups_table_mut<'a>(
 
 /// Declared `[[repo]]` names, in file order — used by every op above that
 /// needs to validate a name against what is already declared without a full
-/// [`Workspace`] parse (which would resolve every path via `git`, work this
+/// [`Estate`] parse (which would resolve every path via `git`, work this
 /// module's own callers have not necessarily earned yet mid-edit).
 fn repo_names(doc: &DocumentMut) -> Vec<String> {
     doc.get("repo")
@@ -820,7 +818,7 @@ mod tests {
     use std::process::Command;
 
     /// A temp git repository with one commit — mirrors
-    /// `domain::workspace::tests::init_repo`, duplicated rather than shared
+    /// `domain::estate::tests::init_repo`, duplicated rather than shared
     /// because that helper is private to its own `#[cfg(test)]` module.
     fn init_repo(path: &Path) {
         std::fs::create_dir_all(path).expect("repo dir");
@@ -867,7 +865,7 @@ mod tests {
         assert!(first.gitignore_updated);
 
         let manifest_after_first =
-            std::fs::read_to_string(root.join(WORKSPACE_FILE)).expect("read manifest");
+            std::fs::read_to_string(root.join(MANIFEST_FILE)).expect("read manifest");
         let gitignore_after_first =
             std::fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert!(
@@ -884,7 +882,7 @@ mod tests {
         );
 
         let manifest_after_second =
-            std::fs::read_to_string(root.join(WORKSPACE_FILE)).expect("read manifest");
+            std::fs::read_to_string(root.join(MANIFEST_FILE)).expect("read manifest");
         let gitignore_after_second =
             std::fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
         assert_eq!(
@@ -900,9 +898,9 @@ mod tests {
             "the first run's name must survive — a second init must not rename the estate"
         );
 
-        let workspace = Workspace::from_config_allow_empty(&root.join(WORKSPACE_FILE))
+        let estate = Estate::from_config_allow_empty(&root.join(MANIFEST_FILE))
             .expect("scaffolded manifest parses");
-        assert_eq!(workspace.name, "my-estate");
+        assert_eq!(estate.name, "my-estate");
     }
 
     /// guard-map: `sgt init` scaffolds every `.gitignore` entry
@@ -928,7 +926,7 @@ mod tests {
     /// guard-map: `sgt init` preserves a hand-written comment elsewhere in an
     /// existing `sergeant.toml` — the format-preserving edit's whole reason
     /// to exist over a blind serde round-trip. Mutation this kills:
-    /// replacing the `toml_edit` document with a serde `WorkspaceFile`
+    /// replacing the `toml_edit` document with a serde `EstateFile`
     /// round-trip (which drops comments).
     #[test]
     fn init_preserves_hand_written_comments_in_an_existing_manifest() {
@@ -937,14 +935,14 @@ mod tests {
         let other = root.join("repos").join("web");
         init_repo(&other);
         std::fs::write(
-            root.join(WORKSPACE_FILE),
+            root.join(MANIFEST_FILE),
             "# a human wrote this note\n[[repo]]\nname = \"web\"\n",
         )
         .expect("write manifest with a comment, no [estate] yet");
 
         init_estate(root, Some("commented")).expect("init onto an existing manifest");
 
-        let text = std::fs::read_to_string(root.join(WORKSPACE_FILE)).expect("read");
+        let text = std::fs::read_to_string(root.join(MANIFEST_FILE)).expect("read");
         assert!(
             text.contains("# a human wrote this note"),
             "a format-preserving edit must not drop an existing comment, got:\n{text}"
@@ -1008,17 +1006,14 @@ mod tests {
         .expect("clone from origin");
 
         assert!(root.join("repos").join("api").join(".git").exists());
-        let workspace = Workspace::from_config(&root.join(WORKSPACE_FILE)).expect("parses");
-        assert_eq!(workspace.repositories.len(), 1);
-        assert_eq!(workspace.repositories[0].name, "api");
+        let estate = Estate::from_config(&root.join(MANIFEST_FILE)).expect("parses");
+        assert_eq!(estate.repositories.len(), 1);
+        assert_eq!(estate.repositories[0].name, "api");
         assert_eq!(
-            workspace.repository_origin("api"),
+            estate.repository_origin("api"),
             Some(upstream.to_str().expect("utf8"))
         );
-        assert_eq!(
-            workspace.instruction_policy("api"),
-            InstructionPolicy::Local
-        );
+        assert_eq!(estate.instruction_policy("api"), InstructionPolicy::Local);
     }
 
     /// `sgt repo add --origin <url>` passes a human-supplied string straight
@@ -1113,16 +1108,16 @@ mod tests {
         remove_group(root, "pair", &["a".to_string()]).expect("drop a from the group");
         remove_repo(root, "a").expect("now removable");
 
-        let workspace = Workspace::from_config(&root.join(WORKSPACE_FILE)).expect("parses");
+        let estate = Estate::from_config(&root.join(MANIFEST_FILE)).expect("parses");
         assert_eq!(
-            workspace
+            estate
                 .repositories
                 .iter()
                 .map(|r| r.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["b"]
         );
-        assert_eq!(workspace.groups["pair"].repos, vec!["b".to_string()]);
+        assert_eq!(estate.groups["pair"].repos, vec!["b".to_string()]);
     }
 
     /// guard-map: `add_group` refuses an undeclared member, naming it and
@@ -1152,8 +1147,8 @@ mod tests {
         }
         // Refused before anything was written — the manifest still has no
         // group at all.
-        let workspace = Workspace::from_config(&root.join(WORKSPACE_FILE)).expect("parses");
-        assert!(workspace.groups.is_empty());
+        let estate = Estate::from_config(&root.join(MANIFEST_FILE)).expect("parses");
+        assert!(estate.groups.is_empty());
     }
 
     /// guard-map: `add_group`'s mkdir-p semantics — re-adding an existing
@@ -1174,8 +1169,8 @@ mod tests {
         add_group(root, "trio", &["a".to_string(), "b".to_string()], None).expect("union");
         add_group(root, "trio", &["c".to_string()], None).expect("union again");
 
-        let workspace = Workspace::from_config(&root.join(WORKSPACE_FILE)).expect("parses");
-        let group = &workspace.groups["trio"];
+        let estate = Estate::from_config(&root.join(MANIFEST_FILE)).expect("parses");
+        let group = &estate.groups["trio"];
         let mut members = group.repos.clone();
         members.sort();
         assert_eq!(
@@ -1211,8 +1206,8 @@ mod tests {
         );
 
         remove_group(root, "pair", &[]).expect("remove the whole group");
-        let workspace = Workspace::from_config(&root.join(WORKSPACE_FILE)).expect("parses");
-        assert!(!workspace.groups.contains_key("pair"));
+        let estate = Estate::from_config(&root.join(MANIFEST_FILE)).expect("parses");
+        assert!(!estate.groups.contains_key("pair"));
 
         let err = remove_group(root, "pair", &[]).expect_err("already gone");
         assert!(
@@ -1232,7 +1227,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path();
         init_estate(root, Some("e")).expect("init");
-        let manifest_path = root.join(WORKSPACE_FILE);
+        let manifest_path = root.join(MANIFEST_FILE);
 
         std::fs::write(
             &manifest_path,
@@ -1305,8 +1300,8 @@ mod tests {
         result_a.expect("a added");
         result_b.expect("b added");
 
-        let workspace = Workspace::from_config(&root.join(WORKSPACE_FILE)).expect("parses");
-        let mut names: Vec<&str> = workspace
+        let estate = Estate::from_config(&root.join(MANIFEST_FILE)).expect("parses");
+        let mut names: Vec<&str> = estate
             .repositories
             .iter()
             .map(|r| r.name.as_str())
@@ -1324,9 +1319,9 @@ mod tests {
     /// `repos/` state, and every edit that only concerns `b` still succeeds.
     ///
     /// guard-map: reverting `validate` to
-    /// `Workspace::from_config_allow_empty` (the strict, on-disk-resolving
+    /// `Estate::from_config_allow_empty` (the strict, on-disk-resolving
     /// parser) makes every assertion below fail with `ManifestError::Invalid`
-    /// wrapping `WorkspaceError::RepositoryNotFound { name: "a", .. }`.
+    /// wrapping `EstateError::RepositoryNotFound { name: "a", .. }`.
     #[test]
     fn a_missing_unrelated_repo_does_not_block_edits_that_do_not_touch_it() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1359,8 +1354,7 @@ mod tests {
 
         // `a` is still declared (never removed) and the manifest is still
         // structurally valid — proving the above edits really did land.
-        let declared =
-            Workspace::declared_repos(&root.join(WORKSPACE_FILE)).expect("declared_repos");
+        let declared = Estate::declared_repos(&root.join(MANIFEST_FILE)).expect("declared_repos");
         let mut names: Vec<&str> = declared.iter().map(|r| r.name.as_str()).collect();
         names.sort();
         assert_eq!(names, vec!["a", "c"]);

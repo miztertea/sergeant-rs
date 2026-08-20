@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 
 use crate::api::{ApiClient, ClientError};
 use crate::daemon::{self, RuntimeDescriptor};
-use crate::domain::workspace::{EstateRoot, RootSource, Workspace};
+use crate::domain::estate::{Estate, EstateRoot, RootSource};
 
 /// How long the client waits for a spawned daemon to publish a healthy
 /// descriptor before giving up.
@@ -93,7 +93,7 @@ enum Command {
     Run {
         /// The intent to submit.
         intent: String,
-        /// Workflow to run (default: the workspace's, else `software-change`).
+        /// Workflow to run (default: the estate's, else `software-change`).
         #[arg(long)]
         workflow: Option<String>,
         /// Backend to run on (§13's explicit tier).
@@ -451,8 +451,8 @@ impl From<daemon::DaemonError> for CliError {
     }
 }
 
-impl From<crate::domain::workspace::WorkspaceError> for CliError {
-    fn from(e: crate::domain::workspace::WorkspaceError) -> Self {
+impl From<crate::domain::estate::EstateError> for CliError {
+    fn from(e: crate::domain::estate::EstateError) -> Self {
         Self(e.to_string())
     }
 }
@@ -526,7 +526,7 @@ fn bound_root_above(dir: &Path) -> Option<PathBuf> {
     if here == bound || !here.starts_with(&bound) {
         return None;
     }
-    Workspace::admit(&bound).ok().map(|admitted| admitted.path)
+    Estate::admit(&bound).ok().map(|admitted| admitted.path)
 }
 
 /// §4.1/§4.3's gate: admit the exact root, or refuse with §4.4's diagnostic.
@@ -536,7 +536,7 @@ fn bound_root_above(dir: &Path) -> Option<PathBuf> {
 /// harness exec — so a directory mistake can never attach to or spawn the
 /// wrong daemon.
 fn admit_root(dir: &Path, source: RootSource) -> Result<EstateRoot, CliError> {
-    Workspace::admit(dir).map_err(|e| {
+    Estate::admit(dir).map_err(|e| {
         let e = if source == RootSource::Flag {
             e.via_flag()
         } else {
@@ -577,8 +577,8 @@ fn resolve_data_dir(flag: Option<PathBuf>, root: &Path) -> Result<PathBuf, CliEr
     if let Some(dir) = std::env::var_os("SGT_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    if Workspace::is_estate_root(root)? {
-        return Ok(Workspace::root_data_dir_override(root)?
+    if Estate::is_estate_root(root)? {
+        return Ok(Estate::root_data_dir_override(root)?
             .unwrap_or_else(|| root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR)));
     }
     crate::platform::data_dir::fallback_dir(|name| std::env::var_os(name)).map_err(CliError::new)
@@ -1143,8 +1143,8 @@ async fn repo_command(
         } => {
             let policy = match instructions.as_deref() {
                 None => None,
-                Some("local") => Some(crate::domain::workspace::InstructionPolicy::Local),
-                Some("suppress") => Some(crate::domain::workspace::InstructionPolicy::Suppress),
+                Some("local") => Some(crate::domain::estate::InstructionPolicy::Local),
+                Some("suppress") => Some(crate::domain::estate::InstructionPolicy::Suppress),
                 Some(other) => {
                     return Err(CliError::new(format!(
                         "--instructions {other:?} is not recognized (use \"local\" or \"suppress\")"
@@ -1157,7 +1157,7 @@ async fn repo_command(
             } else {
                 println!(
                     "added repo {name} at {}",
-                    crate::domain::workspace::mount_path(estate_root, &name).display()
+                    crate::domain::estate::mount_path(estate_root, &name).display()
                 );
             }
             Ok(())
@@ -1172,28 +1172,28 @@ async fn repo_command(
             Ok(())
         }
         RepoCommand::List => {
-            let workspace = crate::domain::workspace::Workspace::from_config_allow_empty(
-                &estate_root.join(crate::domain::workspace::WORKSPACE_FILE),
+            let estate = crate::domain::estate::Estate::from_config_allow_empty(
+                &estate_root.join(crate::domain::estate::MANIFEST_FILE),
             )?;
             if json {
                 print_json(&json!({
-                    "repositories": workspace.repositories.iter().map(|r| json!({
+                    "repositories": estate.repositories.iter().map(|r| json!({
                         "name": r.name,
                         "path": r.path,
-                        "instructions": workspace.instruction_policy(&r.name).as_str(),
-                        "origin": workspace.repository_origin(&r.name),
+                        "instructions": estate.instruction_policy(&r.name).as_str(),
+                        "origin": estate.repository_origin(&r.name),
                     })).collect::<Vec<_>>(),
                 }));
-            } else if workspace.repositories.is_empty() {
+            } else if estate.repositories.is_empty() {
                 println!("no repositories declared");
             } else {
-                for r in &workspace.repositories {
+                for r in &estate.repositories {
                     println!(
                         "{}  {}  instructions={}  origin={}",
                         r.name,
                         r.path.display(),
-                        workspace.instruction_policy(&r.name),
-                        workspace.repository_origin(&r.name).unwrap_or("-"),
+                        estate.instruction_policy(&r.name),
+                        estate.repository_origin(&r.name).unwrap_or("-"),
                     );
                 }
             }
@@ -1231,21 +1231,21 @@ async fn group_command(
             Ok(())
         }
         GroupCommand::List => {
-            let workspace = crate::domain::workspace::Workspace::from_config_allow_empty(
-                &estate_root.join(crate::domain::workspace::WORKSPACE_FILE),
+            let estate = crate::domain::estate::Estate::from_config_allow_empty(
+                &estate_root.join(crate::domain::estate::MANIFEST_FILE),
             )?;
             if json {
                 print_json(&json!({
-                    "groups": workspace.groups.iter().map(|(name, g)| json!({
+                    "groups": estate.groups.iter().map(|(name, g)| json!({
                         "name": name,
                         "repos": g.repos,
                         "brief": g.brief,
                     })).collect::<Vec<_>>(),
                 }));
-            } else if workspace.groups.is_empty() {
+            } else if estate.groups.is_empty() {
                 println!("no groups declared");
             } else {
-                for (name, g) in &workspace.groups {
+                for (name, g) in &estate.groups {
                     let brief = g
                         .brief
                         .as_deref()
@@ -1519,7 +1519,7 @@ fn print_work_line(verb: &str, result: &Value) {
 }
 
 /// §13's origin metadata for this invocation: which front end is asking, and
-/// the directory workspace discovery should start from. The client owns the
+/// the directory estate discovery should start from. The client owns the
 /// cwd — the daemon has none — so discovery input has to travel with the
 /// request. `SGT_ORIGIN_CLIENT` lets a front-end harness declare itself; a
 /// bare terminal is just `cli`, which names no backend and therefore falls
@@ -1557,14 +1557,14 @@ fn print_homepage(root: &Path) {
     println!();
     // §4.1: the exact directory, never a parent. Bare `sgt` is unscoped, so
     // "this is not an estate root" is information here, not a refusal.
-    match Workspace::admit(root) {
+    match Estate::admit(root) {
         Ok(admitted) => {
-            match Workspace::from_config_allow_empty(&admitted.manifest_path) {
-                Ok(workspace) => println!(
+            match Estate::from_config_allow_empty(&admitted.manifest_path) {
+                Ok(estate) => println!(
                     "estate {:?} at {} — {} repositories declared",
-                    workspace.name,
+                    estate.name,
                     admitted.path.display(),
-                    workspace.repositories.len(),
+                    estate.repositories.len(),
                 ),
                 Err(e) => println!(
                     "estate at {} could not be read: {e}",
@@ -1970,7 +1970,7 @@ pub(crate) mod doctor {
     };
     use crate::backend::docker::{self, DockerBackend, DockerConfig};
     use crate::daemon;
-    use crate::domain::workspace::WORKSPACE_FILE;
+    use crate::domain::estate::MANIFEST_FILE;
     use crate::runtime::analytics::Analytics;
     use crate::runtime::journal::Journal;
 
@@ -2192,7 +2192,7 @@ pub(crate) mod doctor {
     /// and §4.2 is explicit about what it must do there: "reports
     /// installation health and a failing estate-root row with the remedy to
     /// cd or initialize. It does not start a daemon." So this row **never
-    /// searches upward** — it asks [`Workspace::admit`] about exactly one
+    /// searches upward** — it asks [`Estate::admit`] about exactly one
     /// directory — and answers with §4.4's own diagnostic when the answer is
     /// no, rather than quietly reporting on some other estate found above.
     ///
@@ -2200,9 +2200,9 @@ pub(crate) mod doctor {
     /// beneath it read one already-decided answer instead of each deriving
     /// their own (the same threading `data_dir_ok` uses).
     fn estate_root_check(root: &Path) -> (Check, Option<PathBuf>) {
-        use crate::domain::workspace::Workspace;
+        use crate::domain::estate::Estate;
 
-        match Workspace::admit(root) {
+        match Estate::admit(root) {
             Ok(admitted) => {
                 let check = Check::ok(
                     "estate_root",
@@ -2245,24 +2245,24 @@ pub(crate) mod doctor {
     /// (§4.1's exact root, `None` when this directory is not one) — never a
     /// second, independent search.
     fn permission_mode_check(estate_root: Option<&Path>) -> Check {
-        use crate::domain::workspace::Workspace;
+        use crate::domain::estate::Estate;
 
         let Some(estate_root) = estate_root else {
             return Check::ok("permission_mode", "not an estate root — nothing to report");
         };
-        match Workspace::from_config_allow_empty(&estate_root.join(WORKSPACE_FILE)) {
-            Ok(workspace) if workspace.profiles.is_empty() => Check::ok(
+        match Estate::from_config_allow_empty(&estate_root.join(MANIFEST_FILE)) {
+            Ok(estate) if estate.profiles.is_empty() => Check::ok(
                 "permission_mode",
                 "no profiles declared — every execution launches with no --permission-mode \
                  flag at all (the CLI's own default)",
             ),
-            Ok(workspace) => {
-                let modes: Vec<String> = workspace
+            Ok(estate) => {
+                let modes: Vec<String> = estate
                     .profiles
                     .iter()
                     .map(|p| {
                         // Already validated at load (#47): from_config would
-                        // have refused the workspace before this ran.
+                        // have refused the estate before this ran.
                         let effective = match p.permission_mode().ok().flatten() {
                             Some(mode) => mode.as_cli_value().to_string(),
                             None => "unspecified -> no flag (CLI default)".to_string(),
@@ -2287,15 +2287,15 @@ pub(crate) mod doctor {
     /// A manifest that fails to parse at all (malformed TOML, R-MVP1-3's
     /// legacy-vocabulary refusal, a duplicate or invalid repository name)
     /// reports that failure's own message as this check's detail — every
-    /// `WorkspaceError` variant already names its file and the offending
+    /// `EstateError` variant already names its file and the offending
     /// key, and `Malformed` additionally carries `toml::de::Error`'s own
     /// line/column, so nothing here needs to reconstruct that.
     ///
     /// Once the manifest parses, this looks past what execution's own
-    /// strict loader (`Workspace::from_config`) would ever tell you, because
+    /// strict loader (`Estate::from_config`) would ever tell you, because
     /// that loader fails closed at the *first* problem it finds — right for
     /// launching a Work, useless for "what is wrong with my estate right
-    /// now": it uses [`crate::domain::workspace::Workspace::declared_repos`]
+    /// now": it uses [`crate::domain::estate::Estate::declared_repos`]
     /// instead, which names every declared repository regardless of whether
     /// earlier ones are missing, then cross-checks two directions —
     /// declared-but-absent (remedy: the declared `origin`, when there is
@@ -2303,22 +2303,22 @@ pub(crate) mod doctor {
     /// present-but-undeclared (a directory under `repos/` no `[[repo]]`
     /// entry names).
     fn estate_check(estate_root: Option<&Path>) -> Check {
-        use crate::domain::workspace::Workspace;
+        use crate::domain::estate::Estate;
 
         let Some(estate_root) = estate_root else {
             return Check::ok("estate", "not an estate root — nothing to check");
         };
-        let manifest_path = estate_root.join(WORKSPACE_FILE);
+        let manifest_path = estate_root.join(MANIFEST_FILE);
         // Estate-root Phase D: a manifest that cannot be parsed at all no
         // longer reaches this row. `estate_root_check` already ran
-        // `Workspace::admit`, which runs the identical parse — TOML syntax,
+        // `Estate::admit`, which runs the identical parse — TOML syntax,
         // the R-MVP1-3 legacy-vocabulary refusal, §6.1's removed `path` key,
         // duplicate or invalid repository names — and only hands this row an
         // `estate_root` when all of it passed. Kept as a defensive arm rather
         // than an `expect`, because "the manifest changed between two reads
         // of the same doctor run" is a race, not an invariant, and a doctor
         // that panics on it would be the worst possible answer.
-        let declared = match Workspace::declared_repos(&manifest_path) {
+        let declared = match Estate::declared_repos(&manifest_path) {
             Ok(declared) => declared,
             Err(e) => {
                 return Check::fail(
@@ -2361,7 +2361,7 @@ pub(crate) mod doctor {
             });
         }
 
-        let repos_dir = estate_root.join(crate::domain::workspace::REPOS_DIR);
+        let repos_dir = estate_root.join(crate::domain::estate::REPOS_DIR);
         if let Ok(entries) = std::fs::read_dir(&repos_dir) {
             let mut undeclared: Vec<String> = entries
                 .flatten()
@@ -2372,7 +2372,7 @@ pub(crate) mod doctor {
             undeclared.sort();
             for name in undeclared {
                 details.push(format!(
-                    "repos/{name} is on disk but not declared in {WORKSPACE_FILE}"
+                    "repos/{name} is on disk but not declared in {MANIFEST_FILE}"
                 ));
                 remedies.push(format!(
                     "{name}: declare it — `sgt repo add {name}` (or remove the directory if it \
@@ -2404,7 +2404,7 @@ pub(crate) mod doctor {
     /// submit with nothing in this report to explain why. The full fix —
     /// `sgt init` writing real packages, or resolution falling back to a
     /// binary-embedded set with more than one member — is Phase 3 embedding
-    /// (`reference/proposal-product-workspace-split.md`), out of scope
+    /// (`reference/proposal-product-estate-split.md`), out of scope
     /// here; this check exists so "zero" is something `sgt doctor` says out
     /// loud instead of a fact a submitter only learns from a 422.
     ///

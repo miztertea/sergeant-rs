@@ -60,7 +60,7 @@ pub const LOCAL_WORKFLOW_ROOT: &str = ".sergeant/local/workflows";
 pub const WORKFLOW_FILE: &str = "workflow.toml";
 /// Actor-readable stage context file inside a stage directory.
 pub const CONTEXT_FILE: &str = "CONTEXT.md";
-/// Name of the built-in workflow used when a workspace ships none.
+/// Name of the built-in workflow used when a estate ships none.
 pub const DEFAULT_WORKFLOW: &str = "software-change";
 /// Source marker for the embedded built-in workflow.
 pub const SOURCE_EMBEDDED: &str = "embedded";
@@ -266,7 +266,7 @@ pub struct StageDefinition {
 /// that "retry uses the same pinned stage harness/profile/model decision" and
 /// that "restart reconstructs the same decision from the journal". A decision
 /// re-derived at entry time would be re-derived against whatever the registry,
-/// the workspace's `sergeant.toml` and the harness probes say *then* — so a
+/// the estate's `sergeant.toml` and the harness probes say *then* — so a
 /// retry after an operator edited a profile, or a restart after a harness went
 /// unavailable, would silently run a different execution than the one the run
 /// was admitted with. Deciding once, before the Work exists, and journaling the
@@ -623,7 +623,7 @@ const EMBEDDED_CONTEXTS: &[(&str, &str)] = &[
 ];
 
 impl WorkflowDefinition {
-    /// Resolve `name` for a workspace rooted at `root`.
+    /// Resolve `name` for a estate rooted at `root`.
     ///
     /// A repository's own `.sergeant/local/workflows/<name>/` always wins
     /// over the stock `.sergeant/workflows/<name>/` of the same name
@@ -815,12 +815,12 @@ pub struct CatalogEntry {
     pub front_matter: Option<WorkflowIndexFrontMatter>,
 }
 
-/// Directory a named workflow would live in for a workspace root.
+/// Directory a named workflow would live in for a estate root.
 pub fn workflow_dir(root: &Path, name: &str) -> PathBuf {
     root.join(WORKFLOW_ROOT).join(name)
 }
 
-/// Directory a named workflow's local fork would live in for a workspace
+/// Directory a named workflow's local fork would live in for a estate
 /// root ([`LOCAL_WORKFLOW_ROOT`]).
 pub fn local_workflow_dir(root: &Path, name: &str) -> PathBuf {
     root.join(LOCAL_WORKFLOW_ROOT).join(name)
@@ -1783,7 +1783,7 @@ mod tests {
                 "kind = \"execute\"\n",
                 "image = \"python:3.13-slim\"\n",
                 "command = [\"python\", \"validate.py\"]\n",
-                "workdir = \"/workspace\"\n",
+                "workdir = \"/estate\"\n",
                 "workspace_access = \"read_write\"\n",
                 "network = \"none\"\n",
             ),
@@ -1810,7 +1810,7 @@ mod tests {
             spec.command,
             vec!["python".to_string(), "validate.py".to_string()]
         );
-        assert_eq!(spec.workdir, "/workspace");
+        assert_eq!(spec.workdir, "/estate");
         assert_eq!(spec.workspace_access, WorkspaceAccess::ReadWrite);
         assert_eq!(spec.network, NetworkPolicy::None);
         assert!(spec.env.is_empty());
@@ -1840,7 +1840,7 @@ mod tests {
                 "kind = \"execute\"\n",
                 "image = \"alpine:3\"\n",
                 "command = [\"true\"]\n",
-                "workdir = \"/workspace\"\n",
+                "workdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\n",
                 "network = \"none\"\n",
             ),
@@ -1869,7 +1869,7 @@ mod tests {
                 "no-image",
                 concat!(
                     "command = [\"true\"]\n",
-                    "workdir = \"/workspace\"\n",
+                    "workdir = \"/estate\"\n",
                     "workspace_access = \"read_only\"\n",
                     "network = \"none\"\n"
                 ),
@@ -1878,7 +1878,7 @@ mod tests {
                 "no-command",
                 concat!(
                     "image = \"alpine:3\"\n",
-                    "workdir = \"/workspace\"\n",
+                    "workdir = \"/estate\"\n",
                     "workspace_access = \"read_only\"\n",
                     "network = \"none\"\n"
                 ),
@@ -1897,7 +1897,7 @@ mod tests {
                 concat!(
                     "image = \"alpine:3\"\n",
                     "command = [\"true\"]\n",
-                    "workdir = \"/workspace\"\n",
+                    "workdir = \"/estate\"\n",
                     "network = \"none\"\n"
                 ),
             ),
@@ -1906,7 +1906,7 @@ mod tests {
                 concat!(
                     "image = \"alpine:3\"\n",
                     "command = [\"true\"]\n",
-                    "workdir = \"/workspace\"\n",
+                    "workdir = \"/estate\"\n",
                     "workspace_access = \"read_only\"\n"
                 ),
             ),
@@ -1947,7 +1947,7 @@ mod tests {
             concat!(
                 "[workflow]\nname = \"bad-access\"\nversion = \"1\"\nstages = [\"00-only\"]\n\n",
                 "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
-                "command = [\"true\"]\nworkdir = \"/workspace\"\n",
+                "command = [\"true\"]\nworkdir = \"/estate\"\n",
                 "workspace_access = \"read_and_write_and_more\"\nnetwork = \"none\"\n",
             ),
         )
@@ -1965,7 +1965,7 @@ mod tests {
             concat!(
                 "[workflow]\nname = \"bad-network\"\nversion = \"1\"\nstages = [\"00-only\"]\n\n",
                 "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
-                "command = [\"true\"]\nworkdir = \"/workspace\"\n",
+                "command = [\"true\"]\nworkdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\nnetwork = \"bridge\"\n",
             ),
         )
@@ -1992,7 +1992,7 @@ mod tests {
                 "[workflow]\nname = \"misplaced-actor-field\"\nversion = \"1\"\n",
                 "stages = [\"00-only\"]\n\n",
                 "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
-                "command = [\"true\"]\nworkdir = \"/workspace\"\n",
+                "command = [\"true\"]\nworkdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\nnetwork = \"none\"\nharness = \"claude\"\n",
             ),
         )
@@ -2272,7 +2272,7 @@ mod tests {
                 "kind = \"execute\"\n",
                 "image = \"alpine:3\"\n",
                 "command = [\"true\"]\n",
-                "workdir = \"/workspace\"\n",
+                "workdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\n",
                 "network = \"none\"\n",
             ),
@@ -2297,7 +2297,7 @@ mod tests {
                 "kind = \"execute\"\n",
                 "image = \"alpine:3.19\"\n", // the only difference from the baseline above
                 "command = [\"true\"]\n",
-                "workdir = \"/workspace\"\n",
+                "workdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\n",
                 "network = \"none\"\n",
             ),

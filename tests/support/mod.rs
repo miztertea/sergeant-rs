@@ -83,7 +83,7 @@ pub struct ReapedDaemon {
 /// doc comment in `tests/m2_daemon_api.rs` explains why the data dir must
 /// stay outside one), and a data dir nested under this checkout's own
 /// `target/` sits inside that checkout — the walk finds this repo's `.git`
-/// and the daemon materializes a real workspace the test never asked for
+/// and the daemon materializes a real estate the test never asked for
 /// (measured: `t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed`
 /// and two siblings went from `pending` to `blocked` the moment the base
 /// moved under `target/`). `/var/tmp/<name>` is the already-established
@@ -474,7 +474,7 @@ pub fn init_repo(path: &Path) -> String {
 ///
 /// This is the shape every estate-scoped command now requires: exact-root
 /// admission means a bare `TempDir` with a git repo in it is no longer a
-/// workspace, and `[[repo]]` entries must resolve to `repos/<name>`.
+/// estate, and `[[repo]]` entries must resolve to `repos/<name>`.
 pub fn scaffold_estate(root: &Path, name: &str, repos: &[&str]) -> Vec<String> {
     std::fs::create_dir_all(root).expect("estate root");
     let mut manifest = format!("[estate]\nname = {name:?}\n");

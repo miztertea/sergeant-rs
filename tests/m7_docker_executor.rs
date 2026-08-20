@@ -182,7 +182,7 @@ fn spec(command: Vec<&str>, access: WorkspaceAccess) -> ExecuteSpec {
     ExecuteSpec {
         image: PROBE_IMAGE.to_string(),
         command: command.into_iter().map(str::to_string).collect(),
-        workdir: "/workspace".to_string(),
+        workdir: "/estate".to_string(),
         workspace_access: access,
         network: NetworkPolicy::None,
         env: BTreeMap::new(),
@@ -201,7 +201,7 @@ fn request(work_id: &str, execution_id: &str, cwd: &Path, exec: ExecuteSpec) -> 
         model: None,
         profile: None,
         execute: Some(exec),
-        instruction_policy: sergeant_rs::domain::workspace::InstructionPolicy::default(),
+        instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
         bindings: Vec::new(),
     }
 }
@@ -322,7 +322,7 @@ fn workspace_access_governs_writes_both_ways() {
         &ro_execution_id,
         cwd.path(),
         spec(
-            vec!["sh", "-c", "echo nope > /workspace/should-not-exist"],
+            vec!["sh", "-c", "echo nope > /estate/should-not-exist"],
             WorkspaceAccess::ReadOnly,
         ),
     );
@@ -350,7 +350,7 @@ fn workspace_access_governs_writes_both_ways() {
         &rw_execution_id,
         cwd.path(),
         spec(
-            vec!["sh", "-c", "echo yes > /workspace/should-exist"],
+            vec!["sh", "-c", "echo yes > /estate/should-exist"],
             WorkspaceAccess::ReadWrite,
         ),
     );
@@ -376,7 +376,7 @@ fn workspace_access_governs_writes_both_ways() {
 /// actually been inspected on a real container; every other test only
 /// checks the *positive* behavior (a write does or doesn't land). Inspects
 /// the real container Docker created and asserts the negative claims
-/// directly: exactly one mount (the workspace bind, nothing else), not
+/// directly: exactly one mount (the estate bind, nothing else), not
 /// privileged, no added capabilities, no devices.
 #[test]
 fn a_launched_container_carries_no_isolation_escape_hatches() {
@@ -409,10 +409,10 @@ fn a_launched_container_carries_no_isolation_escape_hatches() {
     assert_eq!(
         mounts.len(),
         1,
-        "exactly one mount (the workspace bind), nothing else — no Docker socket, no extra \
+        "exactly one mount (the estate bind), nothing else — no Docker socket, no extra \
          host paths: {mounts:?}"
     );
-    assert_eq!(mounts[0]["Destination"], "/workspace");
+    assert_eq!(mounts[0]["Destination"], "/estate");
     assert!(
         mounts.iter().all(|m| m["Source"]
             .as_str()
@@ -463,7 +463,7 @@ fn a_mount_path_containing_a_space_round_trips_correctly() {
         &execution_id,
         &cwd,
         spec(
-            vec!["sh", "-c", "echo yes > /workspace/should-exist"],
+            vec!["sh", "-c", "echo yes > /estate/should-exist"],
             WorkspaceAccess::ReadWrite,
         ),
     );
@@ -1078,8 +1078,8 @@ fn container_written_files_and_directories_are_owned_by_the_host_worktree_owner(
                 vec![
                     "sh",
                     "-c",
-                    "echo hi > /workspace/owned-file.txt && mkdir /workspace/owned-dir && \
-                     echo inner > /workspace/owned-dir/inner.txt",
+                    "echo hi > /estate/owned-file.txt && mkdir /estate/owned-dir && \
+                     echo inner > /estate/owned-dir/inner.txt",
                 ],
                 WorkspaceAccess::ReadWrite,
             ),
@@ -1164,7 +1164,7 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
             "kind = \"execute\"\n",
             "image = \"alpine:3\"\n",
             "command = [\"true\"]\n",
-            "workdir = \"/workspace\"\n",
+            "workdir = \"/estate\"\n",
             "workspace_access = \"read_only\"\n",
             "network = \"none\"\n",
         ),
@@ -1399,8 +1399,8 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
             "[stage.\"10-validate\"]\n",
             "kind = \"execute\"\n",
             "image = \"alpine:3\"\n",
-            "command = [\"sh\", \"-c\", \"echo container-produced-evidence > /workspace/validated.txt\"]\n",
-            "workdir = \"/workspace\"\n",
+            "command = [\"sh\", \"-c\", \"echo container-produced-evidence > /estate/validated.txt\"]\n",
+            "workdir = \"/estate\"\n",
             "workspace_access = \"read_write\"\n",
             "network = \"none\"\n",
         ),

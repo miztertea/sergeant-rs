@@ -299,7 +299,7 @@ pub struct Work {
     /// ULID identifying this work item.
     pub id: String,
     /// **Deprecated, never written (estate-root Phase C, §7.4).** Before
-    /// Phase C this carried a free-form client-supplied workspace label (or,
+    /// Phase C this carried a free-form client-supplied estate label (or,
     /// later, the discovered estate's name as a submit-time fallback). The
     /// daemon is bound to exactly one estate now, so the field has no role
     /// left to play in submission or Work identity — every Work journaled
@@ -308,6 +308,12 @@ pub struct Work {
     /// (the live dogfood estate journals 150+ of them) still deserializes;
     /// nothing new should ever read or write it. [`Work::scope_request`] and
     /// [`Work::repositories`] are its replacement (§7.3).
+    ///
+    /// **The name stays `workspace` (§13.2).** The Workspace-to-Estate
+    /// rename moves the domain vocabulary; it does not rewrite history. This
+    /// field exists only to deserialize a key already written into durable
+    /// journals, so renaming it would silently stop reading exactly the
+    /// events it was kept for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     /// The human intent this work exists to satisfy.

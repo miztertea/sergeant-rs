@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::daemon::{KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED};
+use crate::domain::estate::InstructionIdentity;
 use crate::domain::event::Event;
 use crate::domain::execution::{
     ExecutionRecord, ExecutionReservation, KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RESERVED,
@@ -28,7 +29,6 @@ use crate::domain::workflow::{
     KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_STAGE_WAITING,
     KIND_WORKFLOW_BOUND, StageBinding, StageRecord, StageStatus, WorkflowDefinition,
 };
-use crate::domain::workspace::InstructionIdentity;
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError};
@@ -424,9 +424,9 @@ pub struct WorkRun {
     /// across every entry by construction (`check_instruction_policy`
     /// refuses submission otherwise) — MVP-2 D2 item 1 reads
     /// `.first().policy` off this to resolve the one
-    /// [`crate::domain::workspace::InstructionPolicy`] a `StartRequest`/
+    /// [`crate::domain::estate::InstructionPolicy`] a `StartRequest`/
     /// `ResumeRequest` carries. Empty for a run bound before R-MVP1-4, which
-    /// resolves to [`crate::domain::workspace::InstructionPolicy::Suppress`]
+    /// resolves to [`crate::domain::estate::InstructionPolicy::Suppress`]
     /// the same way an absent manifest entry does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub instruction_identities: Vec<InstructionIdentity>,
@@ -1442,9 +1442,9 @@ mod rule_a_eviction_tests {
 #[cfg(test)]
 mod estate_root_phase_c_scope_replay_tests {
     //! estate-root proposal §7.4: `Work` gained `scope_request` and stopped
-    //! writing `workspace` in Phase C. Neither change may take back a
+    //! writing `estate` in Phase C. Neither change may take back a
     //! journal a pre-Phase-C daemon already wrote — the live dogfood estate
-    //! alone carries 150+ `work.submitted` events with a literal `workspace`
+    //! alone carries 150+ `work.submitted` events with a literal `estate`
     //! key and no `scope_request` key at all. This is that replay contract,
     //! pinned through the real fold (`work_registry_reducer`, not just
     //! `serde_json::from_value` in isolation) so a future change to either
@@ -1457,7 +1457,7 @@ mod estate_root_phase_c_scope_replay_tests {
     use crate::runtime::testing;
 
     /// A `work.submitted` payload in exactly the pre-Phase-C shape: a
-    /// `workspace` string, a `repositories` list, and no `scope_request`
+    /// `estate` string, a `repositories` list, and no `scope_request`
     /// key — must still fold into a valid, complete `Work`.
     #[test]
     fn a_pre_phase_c_work_submitted_event_replays_with_scope_request_defaulted() {
@@ -1503,9 +1503,9 @@ mod estate_root_phase_c_scope_replay_tests {
     }
 
     /// A `work.submitted` payload in the current (Phase C) shape — a real
-    /// `scope_request` and no `workspace` key at all — replays identically,
+    /// `scope_request` and no `estate` key at all — replays identically,
     /// and the two shapes stay distinguishable (a legacy Work still reports
-    /// its `workspace` label; a new one reports `None`, per §7.4).
+    /// its `estate` label; a new one reports `None`, per §7.4).
     #[test]
     fn a_current_shape_work_submitted_event_replays_with_no_workspace_label() {
         let dir = tempfile::TempDir::new().expect("tempdir");

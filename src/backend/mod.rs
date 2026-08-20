@@ -45,10 +45,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::domain::estate::InstructionPolicy;
 use crate::domain::event::EventDraft;
 use crate::domain::profile::Profile;
 use crate::domain::workflow::ExecuteSpec;
-use crate::domain::workspace::InstructionPolicy;
 
 /// One normalized native event (§20/§27): an adapter's translation of a raw
 /// vendor record into sergeant's `conversation.*`/`tool.*`/`usage.*`
@@ -94,7 +94,7 @@ pub enum RuntimeScope {
     External,
     /// One runtime instance per launch profile (§14).
     PerProfile,
-    /// One runtime instance per workspace.
+    /// One runtime instance per estate.
     PerWorkspace,
     /// Each execution owns its own native runtime; there is no shared
     /// backend-level service to start or attach to.

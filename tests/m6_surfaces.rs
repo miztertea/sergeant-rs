@@ -105,7 +105,7 @@ fn solo_estate(name: &str) -> (TempDir, PathBuf) {
 
 /// An estate root with a valid `[estate]` manifest and no repositories yet —
 /// the state a fresh `sgt init` leaves, and all a daemon needs to be
-/// *admitted* (§4.1 admission is structural: `Workspace::admit` never
+/// *admitted* (§4.1 admission is structural: `Estate::admit` never
 /// resolves mounts, so "nothing declared yet" is not an estate-identity
 /// fault). Used by the tests whose subject is the daemon's own lifecycle
 /// rather than anything it would plan.
@@ -1423,13 +1423,13 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // package — because `estate` and `workflows` both read `warn` on an
     // estate that has neither, and "every check must be green" is the
     // claim this arm makes.
-    let workspace = TempDir::new().expect("tempdir");
-    support::scaffold_estate(workspace.path(), "healthy-fixture-estate", &["svc"]);
-    write_workflow(workspace.path());
+    let estate = TempDir::new().expect("tempdir");
+    support::scaffold_estate(estate.path(), "healthy-fixture-estate", &["svc"]);
+    write_workflow(estate.path());
 
     // --- healthy -------------------------------------------------------------
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1440,7 +1440,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
     let (code, healthy_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1542,7 +1542,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let used = TempDir::new().expect("tempdir");
     seed_journal(used.path(), 5);
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         used.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1557,7 +1557,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         "a populated healthy install must exit 0:\n{stdout}"
     );
     let (_, used_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         used.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1587,7 +1587,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // …and a journal it cannot replay is a failure, not a shrug.
     corrupt_journal(used.path());
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         used.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1598,7 +1598,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     assert_ne!(code, Some(0), "an unreplayable journal must exit nonzero");
     let (_, torn_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         used.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1632,7 +1632,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // Stability: the same environment produces the same shape (keys, names,
     // order, statuses) — only details may move.
     let (_, first_again, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1653,14 +1653,14 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // --- an absent claude -----------------------------------------------------
     let missing = bin.path().join("no-such-claude").display().to_string();
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &missing), ("SGT_DOCKER_BIN", &docker)],
         false,
     );
     assert_ne!(code, Some(0), "an unusable claude must exit nonzero");
     let (_, absent_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &missing), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -1696,7 +1696,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let no_git = bin.path().join("empty-path");
     std::fs::create_dir_all(&no_git).expect("mkdir");
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1710,7 +1710,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         "an unusable git must exit nonzero:\n{stdout}"
     );
     let (_, no_git_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1740,7 +1740,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // needs it, so they are exercised here.
     let live_data = DataDir::new();
     // §4.2: `daemon` is estate-scoped, so the rig's daemon has to be started
-    // *at* an estate root. It is deliberately not `workspace` above: the
+    // *at* an estate root. It is deliberately not `estate` above: the
     // daemon check reads the descriptor in `live_data`, and nothing about
     // this arm should depend on the daemon and the doctor sharing an estate.
     let live_cwd = TempDir::new().expect("tempdir");
@@ -1748,7 +1748,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     {
         let running = SpawnedDaemon::start(&live_data, live_cwd.path(), &[]);
         let (code, stdout, _) = doctor_in(
-            workspace.path(),
+            estate.path(),
             live_data.path(),
             &[
                 ("SGT_CLAUDE_BIN", &claude),
@@ -1763,7 +1763,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "a healthy install with a daemon behind it must exit 0:\n{stdout}"
         );
         let (_, live_json, _) = doctor_in(
-            workspace.path(),
+            estate.path(),
             live_data.path(),
             &[
                 ("SGT_CLAUDE_BIN", &claude),
@@ -1796,7 +1796,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let stale = TempDir::new().expect("tempdir");
     write_descriptor(stale.path(), dead_pid(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         stale.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1811,7 +1811,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         "a stale descriptor is harmless and must not fail the install:\n{stdout}"
     );
     let (_, stale_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         stale.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1843,7 +1843,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         .expect("spawn a process to stand in for a wedged daemon");
     write_descriptor(occupied.path(), squatter.id(), "http://127.0.0.1:1");
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         occupied.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1858,7 +1858,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         "a live pid behind a dead endpoint must exit nonzero:\n{stdout}"
     );
     let (_, wedged_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         occupied.path(),
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1893,7 +1893,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     let blocked = bin.path().join("not-a-directory");
     std::fs::write(&blocked, b"this is a file").expect("write file");
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         &blocked,
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1904,7 +1904,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     );
     assert_ne!(code, Some(0), "an unusable data dir must exit nonzero");
     let (_, broken_json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         &blocked,
         &[
             ("SGT_CLAUDE_BIN", &claude),
@@ -1939,7 +1939,7 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
 /// nothing ever reads what `detail` actually says. A doctor that reported a
 /// constant ("unspecified -> no flag") for every profile regardless of its
 /// real `permission_mode` passed the whole suite before this test existed.
-/// This drives doctor from a workspace with two profiles — one unspecified,
+/// This drives doctor from a estate with two profiles — one unspecified,
 /// one `plan` — and asserts the detail names both profiles and their real
 /// effective modes (#47's surfacing half).
 #[test]
@@ -1948,15 +1948,15 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     let claude = stub_claude(bin.path());
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
-    let workspace = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     // §6.1: `[[repo]] path` is gone and the mount is derived, so the
     // repository lives at `repos/solo` rather than being the estate root
     // itself (`path = "."`, the old shape). The manifest is written by hand
     // rather than scaffolded because the two `[[profile]]` tables are the
     // subject and `support::scaffold_estate` declares repositories only.
-    support::init_repo(&workspace.path().join("repos").join("solo"));
+    support::init_repo(&estate.path().join("repos").join("solo"));
     std::fs::write(
-        workspace.path().join("sergeant.toml"),
+        estate.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n\n\
          [[repo]]\nname = \"solo\"\n\n\
          [[profile]]\nname = \"quiet\"\nbackend = \"claude\"\n\n\
@@ -1966,14 +1966,14 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     .expect("write sergeant.toml");
 
     let (code, stdout, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         false,
     );
     assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2015,9 +2015,9 @@ fn t3c_doctor_estate_check_names_a_missing_repository_with_its_origin_as_the_rem
     let claude = stub_claude(bin.path());
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
-    let workspace = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     std::fs::write(
-        workspace.path().join("sergeant.toml"),
+        estate.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n\n\
          [[repo]]\nname = \"payments\"\n\
          origin = \"https://example.com/payments.git\"\n",
@@ -2030,7 +2030,7 @@ fn t3c_doctor_estate_check_names_a_missing_repository_with_its_origin_as_the_rem
     // is still the one that has to notice.
 
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2063,10 +2063,10 @@ fn t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos() {
     let claude = stub_claude(bin.path());
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
-    let workspace = TempDir::new().expect("tempdir");
-    support::init_repo(&workspace.path().join("repos").join("known"));
+    let estate = TempDir::new().expect("tempdir");
+    support::init_repo(&estate.path().join("repos").join("known"));
     std::fs::write(
-        workspace.path().join("sergeant.toml"),
+        estate.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"known\"\n",
     )
     .expect("write sergeant.toml");
@@ -2075,10 +2075,10 @@ fn t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos() {
     // (§6.1) — which is what makes "declared but absent" and "present but
     // undeclared" two readings of one directory listing rather than two
     // unrelated searches.
-    support::init_repo(&workspace.path().join("repos").join("stray"));
+    support::init_repo(&estate.path().join("repos").join("stray"));
 
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2103,7 +2103,7 @@ fn t3d_doctor_estate_check_flags_an_undeclared_directory_under_repos() {
 }
 
 /// MVP-3/E5: a manifest that fails to parse reports file *and* line — via
-/// `toml::de::Error`'s own diagnostic riding `WorkspaceError::Malformed`'s
+/// `toml::de::Error`'s own diagnostic riding `EstateError::Malformed`'s
 /// `Display` — never a generic "invalid config".
 ///
 /// **Estate-root §4.1/§4.2 moved which row carries it.** Admission is now the
@@ -2121,22 +2121,22 @@ fn t3e_doctor_estate_root_check_names_file_and_line_on_a_malformed_manifest() {
     let claude = stub_claude(bin.path());
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
-    let workspace = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     std::fs::write(
-        workspace.path().join("sergeant.toml"),
+        estate.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n\nthis is not valid toml >>>\n",
     )
     .expect("write sergeant.toml");
 
     let (code, _, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         false,
     );
     assert_ne!(code, Some(0), "a broken manifest must exit nonzero");
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2183,15 +2183,15 @@ fn t3f_doctor_workflows_check_reports_zero_then_a_declared_package() {
     let claude = stub_claude(bin.path());
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
-    let workspace = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     std::fs::write(
-        workspace.path().join("sergeant.toml"),
+        estate.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n",
     )
     .expect("write sergeant.toml");
 
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2207,10 +2207,10 @@ fn t3f_doctor_workflows_check_reports_zero_then_a_declared_package() {
     assert!(check["remedy"].as_str().is_some(), "{check}");
 
     // A directory with no `workflow.toml` must not count as a package.
-    std::fs::create_dir_all(workspace.path().join(".sergeant/workflows/not-a-package"))
+    std::fs::create_dir_all(estate.path().join(".sergeant/workflows/not-a-package"))
         .expect("mkdir");
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2223,7 +2223,7 @@ fn t3f_doctor_workflows_check_reports_zero_then_a_declared_package() {
     );
 
     // A real package flips the check to `ok` and names it.
-    let package_dir = workspace.path().join(".sergeant/workflows/research");
+    let package_dir = estate.path().join(".sergeant/workflows/research");
     std::fs::create_dir_all(&package_dir).expect("mkdir");
     std::fs::write(
         package_dir.join("workflow.toml"),
@@ -2232,7 +2232,7 @@ fn t3f_doctor_workflows_check_reports_zero_then_a_declared_package() {
     .expect("write workflow.toml");
 
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2261,14 +2261,14 @@ fn t3g_doctor_workflows_check_reports_local_shadow_and_edition_drift() {
     let claude = stub_claude(bin.path());
     let docker = stub_docker(bin.path());
     let data = TempDir::new().expect("tempdir");
-    let workspace = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
     std::fs::write(
-        workspace.path().join("sergeant.toml"),
+        estate.path().join("sergeant.toml"),
         "[estate]\nname = \"w\"\n",
     )
     .expect("write sergeant.toml");
 
-    let stock = workspace.path().join(".sergeant/workflows/research");
+    let stock = estate.path().join(".sergeant/workflows/research");
     std::fs::create_dir_all(&stock).expect("mkdir stock");
     std::fs::write(
         stock.join("workflow.toml"),
@@ -2278,7 +2278,7 @@ fn t3g_doctor_workflows_check_reports_local_shadow_and_edition_drift() {
 
     // A local fork at the current binary edition: shadows stock, no drift.
     let current_edition = env!("CARGO_PKG_VERSION");
-    let fresh_local = workspace.path().join(".sergeant/local/workflows/research");
+    let fresh_local = estate.path().join(".sergeant/local/workflows/research");
     std::fs::create_dir_all(&fresh_local).expect("mkdir local");
     std::fs::write(
         fresh_local.join("workflow.toml"),
@@ -2292,7 +2292,7 @@ fn t3g_doctor_workflows_check_reports_local_shadow_and_edition_drift() {
     .expect("write index.md");
 
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2318,7 +2318,7 @@ fn t3g_doctor_workflows_check_reports_local_shadow_and_edition_drift() {
     .expect("rewrite index.md with a stale edition");
 
     let (_, json, _) = doctor_in(
-        workspace.path(),
+        estate.path(),
         data.path(),
         &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
         true,
@@ -2712,33 +2712,33 @@ fn doctor(data_dir: &Path, env: &[(&str, &str)], as_json: bool) -> (Option<i32>,
     doctor_in_opt(None, data_dir, env, as_json)
 }
 
-/// [`doctor`], run with the subprocess's cwd set to `workspace`.
+/// [`doctor`], run with the subprocess's cwd set to `estate`.
 ///
 /// Estate-root §4.1: the effective root of an invocation is `-C <path>` if
 /// given, else the process's own working directory — and `sgt doctor` asks
-/// `Workspace::admit` about exactly that directory, with no ancestor walk to
+/// `Estate::admit` about exactly that directory, with no ancestor walk to
 /// fall back on. So the cwd is what decides whether the `estate_root`,
 /// `permission_mode`, `estate` and `workflows` rows have anything to report,
 /// and setting it on the subprocess (rather than the test process, which is
 /// global state) is how these tests choose.
 fn doctor_in(
-    workspace: &Path,
+    estate: &Path,
     data_dir: &Path,
     env: &[(&str, &str)],
     as_json: bool,
 ) -> (Option<i32>, String, String) {
-    doctor_in_opt(Some(workspace), data_dir, env, as_json)
+    doctor_in_opt(Some(estate), data_dir, env, as_json)
 }
 
 fn doctor_in_opt(
-    workspace: Option<&Path>,
+    estate: Option<&Path>,
     data_dir: &Path,
     env: &[(&str, &str)],
     as_json: bool,
 ) -> (Option<i32>, String, String) {
     let mut command = Command::new(SGT);
-    if let Some(workspace) = workspace {
-        command.current_dir(workspace);
+    if let Some(estate) = estate {
+        command.current_dir(estate);
     }
     command.arg("--data-dir").arg(data_dir);
     if as_json {

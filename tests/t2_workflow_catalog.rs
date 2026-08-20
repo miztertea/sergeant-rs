@@ -7,7 +7,7 @@
 //! append.
 //!
 //! **Estate-root §5.2 changed what the catalog is *about*.** It used to
-//! discover a workspace from the client's `cwd`, which made "what could I
+//! discover a estate from the client's `cwd`, which made "what could I
 //! bind" a question about wherever the caller happened to be standing. The
 //! catalog is now the **bound estate's**, the same estate `POST /v1/work`
 //! plans against — a client cannot be shown a catalog it could not actually

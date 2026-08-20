@@ -633,7 +633,7 @@ impl WorkScreen {
         lines.push(kv("created at", &field_text(&w["created_at"])));
         blank(&mut lines);
 
-        heading("Workspace", &mut lines);
+        heading("Estate", &mut lines);
         lines.push(kv("workspace", &field_text(&w["workspace"])));
         lines.push(kv("repositories", &join_str_array(&w["repositories"])));
         blank(&mut lines);
@@ -1196,7 +1196,7 @@ fn header_lines(screen: &WorkScreen, live: Live) -> Vec<Line<'static>> {
     }
 
     let target = match w["workspace"].as_str() {
-        Some(workspace) => workspace.to_string(),
+        Some(estate) => estate.to_string(),
         None => join_str_array(&w["repositories"]),
     };
     lines.push(Line::from(Span::styled(

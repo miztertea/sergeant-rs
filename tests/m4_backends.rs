@@ -49,7 +49,7 @@
 //!
 //! **Estate-root §4.1/§5.1/§6.1 moved every fixture in this file that runs a
 //! plan or a daemon.** A bare `TempDir` with a git repo in it used to be a
-//! workspace, because discovery walked up from the submission's `cwd` and,
+//! estate, because discovery walked up from the submission's `cwd` and,
 //! failing that, took the git top level. Both are gone: an estate is exactly
 //! a directory whose own `sergeant.toml` declares `[estate]`, its mounts are
 //! derived `<estate-root>/repos/<name>`, and the *daemon* — not the request
@@ -83,6 +83,7 @@ use sergeant_rs::backend::{
     Deferred, ExecutionHandle, NativeState, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, journaling_sink};
+use sergeant_rs::domain::estate::{InstructionPolicy, RepositorySpec};
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
 use sergeant_rs::domain::execution::{
     KIND_EXECUTION_ABANDONED, KIND_EXECUTION_RECONCILED, KIND_EXECUTION_RESERVED,
@@ -97,7 +98,6 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_ENTERED, KIND_STAGE_INPUT_RECEIVED,
     KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use sergeant_rs::domain::workspace::{InstructionPolicy, RepositorySpec};
 use sergeant_rs::runtime::blob::{BlobRef, BlobStore};
 use sergeant_rs::runtime::engine::{
     DEFAULT_TURN_CAP, Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, Next, PendingLaunch,
@@ -2594,7 +2594,7 @@ fn bypass_permissions_requires_explicit_profile_opt_in() {
 
 /// #47: an unrecognized `permission_mode` is refused at the launch boundary
 /// too (defense in depth alongside the profile-load check in
-/// `domain::workspace`), for a `Profile` built directly rather than parsed
+/// `domain::estate`), for a `Profile` built directly rather than parsed
 /// from a `sergeant.toml` — the shape every test in this file (and any
 /// future non-file caller) uses.
 #[test]
@@ -5563,7 +5563,7 @@ fn a3_real_claude_interrupt_leaves_the_conversation_resumable() {
 
 /// A run parked in `blocked` on stage `00-only`, ready for `retry` to reserve
 /// a second attempt. Retry is the cheapest door into the reservation path
-/// that does not need a real workspace on disk.
+/// that does not need a real estate on disk.
 fn journal_blocked_run(core: &mut Core, work_id: &str, backend: &str, cwd: &Path) {
     submit_work(core, work_id, "reserve me a stage");
     commit(

@@ -128,9 +128,9 @@ use super::{
     ExecutionHandle, NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport,
     ResumeRequest, RuntimeScope, StartRequest,
 };
+use crate::domain::estate::InstructionPolicy;
 use crate::domain::event::{Event, EventDraft, EventSource};
 use crate::domain::profile::Profile;
-use crate::domain::workspace::InstructionPolicy;
 use crate::runtime::blob::BlobStore;
 use crate::runtime::graph::KIND_CONVERSATION_ASK;
 use crate::runtime::journal::JournalError;
@@ -1006,7 +1006,7 @@ impl ClaudeBackend {
     ///
     /// #47: the permission mode is validated here too (defense in depth
     /// alongside the profile-load check in
-    /// [`crate::domain::workspace::Workspace::from_config`]) — a `Profile`
+    /// [`crate::domain::estate::Estate::from_config`]) — a `Profile`
     /// can reach this adapter without ever having passed through a
     /// `sergeant.toml` parse (built directly by a test, or by a future
     /// caller), so the launch boundary itself must still refuse an
@@ -2391,7 +2391,7 @@ mod tests {
             model: None,
             profile: None,
             execute: None,
-            instruction_policy: crate::domain::workspace::InstructionPolicy::default(),
+            instruction_policy: crate::domain::estate::InstructionPolicy::default(),
             bindings,
         }
     }

@@ -71,7 +71,7 @@ fn http() -> reqwest::Client {
 /// A two-stage workflow, so stage progression and `preceded` edges exist.
 ///
 /// Written at the **estate root**, never inside a repository: `Engine::plan`
-/// resolves a workflow name against `workspace.root` — the estate the daemon
+/// resolves a workflow name against `estate.root` — the estate the daemon
 /// was bound to (§5.1) — and estate-root §6.1 makes that root the only
 /// topology authority, so a package sitting under a mount is never consulted.
 fn write_two_stage_workflow(root: &Path) {
@@ -95,7 +95,7 @@ fn write_two_stage_workflow(root: &Path) {
 ///
 /// estate-root §4.1 deleted the ancestor walk and the zero-config
 /// git-toplevel fallback, so the shape these tests used to build — a bare
-/// `TempDir` with `git init` in it — is not a workspace at all any more. A
+/// `TempDir` with `git init` in it — is not a estate at all any more. A
 /// run through it would produce no surface, no stages and no executions, and
 /// every projection assertion here would be measuring an empty fold.
 fn estate() -> (TempDir, PathBuf, String) {
@@ -667,7 +667,7 @@ fn t2_the_duckdb_file_has_exactly_one_owner() {
     //
     // Private-by-default does not cover this on its own. `Analytics` is a
     // public struct in a public module, so `pub conn: Connection` compiles
-    // and is reachable from anywhere in the workspace — and a consumer
+    // and is reachable from anywhere in the estate — and a consumer
     // written against it (`analytics.conn.execute(..)`) names the lowercase
     // crate token nowhere, so the scan above would not see it either. The
     // field declaration is therefore pinned directly.
@@ -875,7 +875,7 @@ impl Provenance {
             // estate-root Phase C, §7.4: `scoped_to` has two justifying
             // shapes now — `work.submitted`'s `workspace` field (legacy
             // journal replay only; a new Work never carries it) and
-            // `workflow.bound`'s own `workspace` field (the live source, the
+            // `workflow.bound`'s own `estate` field (the live source, the
             // plan-time estate name — same field `analytics.rs`'s `WorkRow`
             // already prefers).
             "scoped_to" => {
@@ -883,14 +883,14 @@ impl Provenance {
                     && from == submitted_work
                     && to
                         == format!(
-                            "workspace:{}",
+                            "estate:{}",
                             payload["work"]["workspace"].as_str().unwrap_or_default()
                         ))
                     || (event.kind == "workflow.bound"
                         && from == work
                         && to
                             == format!(
-                                "workspace:{}",
+                                "estate:{}",
                                 payload["workspace"].as_str().unwrap_or_default()
                             ))
             }
@@ -2551,8 +2551,8 @@ async fn r_mvp1_2_the_output_pointer_names_source_branch_worktree_and_finalize_c
     // form (`/var` is a symlink to `/private/var`, same family as
     // `/tmp` -> `/private/tmp`) — first measured on the MacBook Pro M3 Pro
     // arrival trip, 2026-08-15. Same root cause as the canonicalization
-    // `Workspace::admit` itself does (§4.1), pinned by
-    // `domain::workspace::tests::admit_accepts_the_exact_directory_that_carries_the_manifest`.
+    // `Estate::admit` itself does (§4.1), pinned by
+    // `domain::estate::tests::admit_accepts_the_exact_directory_that_carries_the_manifest`.
     assert_eq!(
         std::fs::canonicalize(
             repo_out["source_repo"]

@@ -1659,7 +1659,7 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
 ///
 /// `/var/tmp/sgt-rs-tests`, not `target/tmp` under the crate root: a data
 /// dir nested inside this checkout sits under a directory `sgt run`'s own
-/// workspace-discovery walks upward through looking for `.git` (`fn sgt`'s
+/// estate-discovery walks upward through looking for `.git` (`fn sgt`'s
 /// doc comment above explains why these M2 tests need a data dir with no
 /// discoverable repository above it) — the first version of this fix
 /// nested it there and turned every `pending` in this file into `blocked`
@@ -1920,7 +1920,7 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
 /// staleness or probe the endpoint, so a fabricated descriptor naming some
 /// other root would get the mismatch refusal and the staleness path under
 /// test would never run. The canonical form is what
-/// [`Workspace::admit`](sergeant_rs::domain::workspace::Workspace::admit)
+/// [`Estate::admit`](sergeant_rs::domain::estate::Estate::admit)
 /// puts in the descriptor, so it is what a fixture must reproduce.
 fn write_fabricated_descriptor(dir: &DataDir, endpoint: &str, pid: u32, token: &str) {
     let root = std::fs::canonicalize(dir.path()).expect("canonical estate root");
@@ -3657,7 +3657,7 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 ///
 /// Round-2 finding N3R2-04: the first version of this posted
 /// `{command_id, intent}` with no `origin.cwd`, which `Engine::plan` answers
-/// with `Ok(None)` — no workspace discovery, no workflow resolution, no
+/// with `Ok(None)` — no estate discovery, no workflow resolution, no
 /// `git worktree add`, no reservation, no launch. It measured 1200 works/s
 /// against a floor of 4 and called that a 6× margin on a 24 works/s budget
 /// measured over the whole submit path. An 86 ms external effect put back
@@ -3802,7 +3802,7 @@ async fn t12_submission_throughput_has_an_automated_floor() {
          {BUDGET} works/s at burst 50 (docs/perf/n3-two-phase-boundary-2026-08-10.md) \
          divided by a {CONTENTION_ALLOWANCE}× allowance for a shared test host gives \
          12.0 on Linux; revised to {THROUGHPUT_FLOOR} on M3 Pro / macOS due to \
-         git-spawn overhead (#128). This is the whole submit path — workspace discovery, \
+         git-spawn overhead (#128). This is the whole submit path — estate discovery, \
          workflow bind, `git worktree add`, reservation, launch — so any external effect \
          of ~80 ms or more put back under the core lock lands below it, whatever the host \
          speed."

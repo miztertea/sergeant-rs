@@ -164,9 +164,9 @@ impl GraphContext {
                 // below is the label's live source for every Work
                 // journaled from Phase C onward (plan-time estate name,
                 // not a client-supplied one).
-                if let Some(workspace) = work["workspace"].as_str() {
-                    let node = format!("workspace:{workspace}");
-                    delta.node(&node, "workspace", workspace, None, seq);
+                if let Some(estate) = work["workspace"].as_str() {
+                    let node = format!("estate:{estate}");
+                    delta.node(&node, "workspace", estate, None, seq);
                     delta.edge("scoped_to", &work_node_id, &node, Some(work_id), seq);
                 }
             }
@@ -188,16 +188,16 @@ impl GraphContext {
                     delta.edge("uses_profile", &work_node_id, &node, Some(work_id), seq);
                 }
                 // estate-root Phase C, §7.4: the discovered estate name at
-                // plan time (`StartPlan.workspace.name`, journaled here
+                // plan time (`StartPlan.estate.name`, journaled here
                 // since before Phase C existed) is the label's live source
-                // now that `Work.workspace` is never written for a new
+                // now that `Work.estate` is never written for a new
                 // submission — analytics.rs's `WorkRow` already prefers
                 // this same field over the submission-time one; this is
                 // that same "tolerate absence, prefer plan-time name"
-                // reading for the graph's `workspace` node/edge.
-                if let Some(workspace) = event.payload["workspace"].as_str() {
-                    let node = format!("workspace:{workspace}");
-                    delta.node(&node, "workspace", workspace, None, seq);
+                // reading for the graph's `estate` node/edge.
+                if let Some(estate) = event.payload["workspace"].as_str() {
+                    let node = format!("estate:{estate}");
+                    delta.node(&node, "workspace", estate, None, seq);
                     delta.edge("scoped_to", &work_node_id, &node, Some(work_id), seq);
                 }
             }

@@ -1,19 +1,19 @@
-//! Workspace: the repository surface work originates from (proposal §9).
+//! Estate: the repository surface work originates from (proposal §9).
 //!
 //! **Exact-root admission (estate-root proposal §4.1, Phase D).** An estate is
 //! exactly the directory that itself contains a `sergeant.toml` which parses,
 //! declares `[estate]`, and satisfies the manifest schema. There is no
-//! ancestor walk and no zero-configuration Git fallback: `Workspace::admit`
+//! ancestor walk and no zero-configuration Git fallback: `Estate::admit`
 //! answers one deterministic question about one directory, and
 //! [`EstateRootError`] carries §4.4's loud corrective diagnostic when the
 //! answer is no. R-MVP1-12 (upward estate discovery across Git boundaries)
-//! and the single-repository zero-config workspace are both **superseded** —
+//! and the single-repository zero-config estate are both **superseded** —
 //! a one-repository installation is an estate with one declared repository.
 //!
 //! **R-MVP1-3: estate vocabulary.** `[estate]` / `[[repo]]` / `[[profile]]` /
 //! `[group.<name>]`, `deny_unknown_fields`. The pre-estate vocabulary
 //! (`[workspace]`, `[[repository]]`) is not merely unknown — using it raises
-//! a **named migration refusal** ([`WorkspaceError::LegacyVocabulary`])
+//! a **named migration refusal** ([`EstateError::LegacyVocabulary`])
 //! rather than a generic serde diagnostic, because a schema rename deserves a
 //! remedy, not a "field does not exist" message pointing at nothing. Mixing
 //! old and new vocabulary hits the refusal on the first legacy key found.
@@ -38,8 +38,8 @@ use crate::domain::is_plain_name;
 use crate::domain::profile::Profile;
 use crate::runtime::git::{GitError, canonical_git_common_dir, canonical_git_top_level};
 
-/// Checked-in workspace configuration file name (D1: `depot.toml` upstream).
-pub const WORKSPACE_FILE: &str = "sergeant.toml";
+/// Checked-in estate configuration file name (D1: `depot.toml` upstream).
+pub const MANIFEST_FILE: &str = "sergeant.toml";
 
 /// The one directory every repository mount lives under, relative to the
 /// estate root (§6.1: `<estate-root>/repos/<name>`). Derived, never
@@ -79,7 +79,7 @@ pub fn mount_path(estate_root: &Path, name: &str) -> PathBuf {
 /// is honest bookkeeping for a file nothing here currently reads.
 pub const INSTRUCTION_FILE: &str = "AGENTS.md";
 
-/// One repository bound into a workspace.
+/// One repository bound into a estate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySpec {
     /// Name used in surfaces, bindings and `--repo` selection.
@@ -91,7 +91,7 @@ pub struct RepositorySpec {
 }
 
 /// One `[[repo]]` entry read straight off `sergeant.toml`, before any
-/// on-disk existence check — see [`Workspace::declared_repos`]. Unlike
+/// on-disk existence check — see [`Estate::declared_repos`]. Unlike
 /// [`RepositorySpec::path`] (mount-validated, guaranteed to be this estate's
 /// own ordinary checkout), `path` here is only §6.1's derived mount
 /// (`<root>/repos/<name>`) and may point at nothing.
@@ -192,27 +192,27 @@ pub struct InstructionIdentity {
     pub content_hash: Option<String>,
 }
 
-/// A resolved workspace: topology and defaults, never transient state.
+/// A resolved estate: topology and defaults, never transient state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Workspace {
+pub struct Estate {
     /// Estate name, from `[estate] name`.
     pub name: String,
     /// The estate root: the canonical directory holding `sergeant.toml`, and
     /// the directory every mount is derived beneath (§6.1).
     pub root: PathBuf,
-    /// Repositories in the workspace, in declaration order.
+    /// Repositories in the estate, in declaration order.
     pub repositories: Vec<RepositorySpec>,
-    /// Workspace-level default backend (§13's third precedence tier).
+    /// Estate-level default backend (§13's third precedence tier).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_backend: Option<String>,
-    /// Workspace-level default workflow.
+    /// Estate-level default workflow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_workflow: Option<String>,
-    /// Profiles declared for this workspace (§14).
+    /// Profiles declared for this estate (§14).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<Profile>,
     /// Path of the `sergeant.toml` that produced this estate. `Option` only
-    /// because the type predates exact-root admission; every workspace this
+    /// because the type predates exact-root admission; every estate this
     /// build can construct has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<PathBuf>,
@@ -235,7 +235,7 @@ pub struct Workspace {
     /// Per-repository instruction policy (R-MVP1-4), keyed by repository
     /// name. A name absent from this map — a `[[repo]]` entry that declared
     /// no `instructions` — resolves to [`InstructionPolicy::Suppress`] via
-    /// [`Workspace::instruction_policy`].
+    /// [`Estate::instruction_policy`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repository_policy: BTreeMap<String, InstructionPolicy>,
     /// `[group.<name>]` declarations, validated (every member is a declared
@@ -257,7 +257,7 @@ pub struct Workspace {
 
 /// An admitted estate root (§4.1): the canonical directory that *is* the
 /// estate, and the manifest that made it one. Produced only by
-/// [`Workspace::admit`], so holding one is proof the exact-root check has
+/// [`Estate::admit`], so holding one is proof the exact-root check has
 /// already passed — the type every later step (data-dir resolution,
 /// descriptor lookup, spawn, API call, harness exec) takes as its
 /// precondition, per §4.3.
@@ -338,7 +338,7 @@ pub enum EstateRootError {
         /// The file that was read.
         manifest_path: PathBuf,
         /// The exact diagnostic, line and key included.
-        source: Box<WorkspaceError>,
+        source: Box<EstateError>,
     },
 }
 
@@ -492,10 +492,10 @@ impl EstateRootError {
     }
 }
 
-/// Failure resolving a workspace.
+/// Failure resolving a estate.
 #[derive(Debug, thiserror::Error)]
-pub enum WorkspaceError {
-    /// Git itself failed while resolving the workspace.
+pub enum EstateError {
+    /// Git itself failed while resolving the estate.
     #[error(transparent)]
     Git(#[from] GitError),
     /// `sergeant.toml` could not be read.
@@ -687,14 +687,14 @@ pub enum WorkspaceError {
 ///
 /// `estate` is `Option` at the *parser* level, not at the admission level: a
 /// `sergeant.toml` with no `[estate]` table is a member repository's own
-/// config, and [`Workspace::admit`] refuses it by name
+/// config, and [`Estate::admit`] refuses it by name
 /// ([`EstateRootError::NotAnEstate`]) rather than mistaking it for an estate
 /// root. The field stays optional here because `src/domain/manifest.rs`'s
 /// edit pen legitimately parses a manifest mid-scaffold, before `[estate]`
 /// has been written.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkspaceFile {
+struct EstateFile {
     #[serde(default)]
     estate: Option<EstateSection>,
     #[serde(default)]
@@ -727,7 +727,7 @@ struct EstateSection {
 ///
 /// **§6.1: there is no `path`.** A repository's mount is derived, not
 /// configured — `<estate-root>/repos/<name>`, always. A manifest that still
-/// declares one gets [`WorkspaceError::RepositoryPathDeclared`], a named
+/// declares one gets [`EstateError::RepositoryPathDeclared`], a named
 /// removal notice, rather than `deny_unknown_fields`' generic "unknown
 /// field" pointing at a key that used to be required.
 #[derive(Debug, Deserialize)]
@@ -738,7 +738,7 @@ struct RepositoryEntry {
     #[serde(default)]
     instructions: InstructionPolicy,
     /// MVP-3 `sgt repo add`'s clone-or-verify source. Recorded, never acted
-    /// on by this module beyond bookkeeping (see [`Workspace::repository_origin`]).
+    /// on by this module beyond bookkeeping (see [`Estate::repository_origin`]).
     #[serde(default)]
     origin: Option<String>,
 }
@@ -783,8 +783,8 @@ fn canonical_leaf(dir: &Path) -> PathBuf {
 /// legacy tables: `deny_unknown_fields` would answer "unknown field `path`"
 /// about a key that was *required* until this release, which names nothing
 /// an operator can act on. §6.1's removal deserves the migration notice.
-fn check_removed_repo_path(text: &str, file: &str) -> Result<(), WorkspaceError> {
-    let value: toml::Value = toml::from_str(text).map_err(|source| WorkspaceError::Malformed {
+fn check_removed_repo_path(text: &str, file: &str) -> Result<(), EstateError> {
+    let value: toml::Value = toml::from_str(text).map_err(|source| EstateError::Malformed {
         path: file.to_string(),
         source,
     })?;
@@ -796,7 +796,7 @@ fn check_removed_repo_path(text: &str, file: &str) -> Result<(), WorkspaceError>
             continue;
         };
         if table.contains_key("path") {
-            return Err(WorkspaceError::RepositoryPathDeclared {
+            return Err(EstateError::RepositoryPathDeclared {
                 file: file.to_string(),
                 name: table
                     .get("name")
@@ -822,7 +822,7 @@ fn check_removed_repo_path(text: &str, file: &str) -> Result<(), WorkspaceError>
 ///
 /// Returns the canonical mount on success, so callers record the resolved
 /// path rather than the declared one.
-fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, WorkspaceError> {
+fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, EstateError> {
     // Check 2, first half, and the one case a canonical comparison alone
     // cannot see: the mount *itself* being a symlink. `canonicalize` would
     // happily follow it and then agree with git that the target is the top
@@ -834,7 +834,7 @@ fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, Works
     {
         let actual = std::fs::canonicalize(mount)
             .unwrap_or_else(|_| std::fs::read_link(mount).unwrap_or_else(|_| mount.to_path_buf()));
-        return Err(WorkspaceError::RepositoryMountAliased {
+        return Err(EstateError::RepositoryMountAliased {
             file: file.to_string(),
             name: name.to_string(),
             expected: canonical_leaf(mount).display().to_string(),
@@ -842,7 +842,7 @@ fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, Works
         });
     }
     let top_level =
-        canonical_git_top_level(mount).map_err(|_| WorkspaceError::RepositoryNotFound {
+        canonical_git_top_level(mount).map_err(|_| EstateError::RepositoryNotFound {
             file: file.to_string(),
             name: name.to_string(),
             path: mount.display().to_string(),
@@ -856,7 +856,7 @@ fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, Works
     // alias does not.
     let canonical_mount = canonical_leaf(mount);
     if top_level != canonical_mount {
-        return Err(WorkspaceError::RepositoryMountAliased {
+        return Err(EstateError::RepositoryMountAliased {
             file: file.to_string(),
             name: name.to_string(),
             expected: canonical_mount.display().to_string(),
@@ -866,13 +866,13 @@ fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, Works
     // A primary checkout's common dir is `<top level>/.git`; a linked
     // worktree's points back into the repository it was cut from.
     let common_dir =
-        canonical_git_common_dir(mount).map_err(|_| WorkspaceError::RepositoryNotFound {
+        canonical_git_common_dir(mount).map_err(|_| EstateError::RepositoryNotFound {
             file: file.to_string(),
             name: name.to_string(),
             path: mount.display().to_string(),
         })?;
     if !common_dir.starts_with(&canonical_mount) {
-        return Err(WorkspaceError::RepositoryMountIsLinkedWorktree {
+        return Err(EstateError::RepositoryMountIsLinkedWorktree {
             file: file.to_string(),
             name: name.to_string(),
             path: canonical_mount.display().to_string(),
@@ -886,8 +886,8 @@ fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, Works
 /// (R-MVP1-3: "one probe before parse, not a second parser" — this reads the
 /// same `toml::Value` `deny_unknown_fields` would reject anyway, just early
 /// enough to name the migration instead of a generic unknown-field error).
-fn check_legacy_vocabulary(text: &str, file: &str) -> Result<(), WorkspaceError> {
-    let value: toml::Value = toml::from_str(text).map_err(|source| WorkspaceError::Malformed {
+fn check_legacy_vocabulary(text: &str, file: &str) -> Result<(), EstateError> {
+    let value: toml::Value = toml::from_str(text).map_err(|source| EstateError::Malformed {
         path: file.to_string(),
         source,
     })?;
@@ -896,7 +896,7 @@ fn check_legacy_vocabulary(text: &str, file: &str) -> Result<(), WorkspaceError>
     };
     for (legacy, expected, remedy) in LEGACY_TABLES {
         if table.contains_key(*legacy) {
-            return Err(WorkspaceError::LegacyVocabulary {
+            return Err(EstateError::LegacyVocabulary {
                 file: file.to_string(),
                 found: (*legacy).to_string(),
                 expected: (*expected).to_string(),
@@ -907,7 +907,7 @@ fn check_legacy_vocabulary(text: &str, file: &str) -> Result<(), WorkspaceError>
     Ok(())
 }
 
-impl Workspace {
+impl Estate {
     /// §4.1's one deterministic check, run against exactly `dir` and nothing
     /// else: is this directory an estate root?
     ///
@@ -929,7 +929,7 @@ impl Workspace {
     /// bind a Work.
     pub fn admit(dir: &Path) -> Result<EstateRoot, EstateRootError> {
         let root = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let manifest_path = root.join(WORKSPACE_FILE);
+        let manifest_path = root.join(MANIFEST_FILE);
         if !manifest_path.is_file() {
             return Err(EstateRootError::NoEstate {
                 root,
@@ -977,8 +977,8 @@ impl Workspace {
         })
     }
 
-    /// Parse and validate a `sergeant.toml` into a workspace.
-    pub fn from_config(config_path: &Path) -> Result<Self, WorkspaceError> {
+    /// Parse and validate a `sergeant.toml` into a estate.
+    pub fn from_config(config_path: &Path) -> Result<Self, EstateError> {
         Self::from_config_impl(config_path, false)
     }
 
@@ -995,7 +995,7 @@ impl Workspace {
     /// duplicate/invalid names, group membership, profile validity — still
     /// applies in full; this relaxes exactly the one rule that is about
     /// "nothing to declare yet", not "something is wrong".
-    pub fn from_config_allow_empty(config_path: &Path) -> Result<Self, WorkspaceError> {
+    pub fn from_config_allow_empty(config_path: &Path) -> Result<Self, EstateError> {
         Self::from_config_impl(config_path, true)
     }
 
@@ -1014,16 +1014,16 @@ impl Workspace {
     /// because those are manifest bugs, not "not cloned yet", and a
     /// diagnostic should refuse to read a broken manifest the same way
     /// execution does, naming the same file, line and key.
-    pub fn declared_repos(config_path: &Path) -> Result<Vec<DeclaredRepo>, WorkspaceError> {
+    pub fn declared_repos(config_path: &Path) -> Result<Vec<DeclaredRepo>, EstateError> {
         let file = config_path.display().to_string();
-        let text = std::fs::read_to_string(config_path).map_err(|source| WorkspaceError::Io {
+        let text = std::fs::read_to_string(config_path).map_err(|source| EstateError::Io {
             path: file.clone(),
             source,
         })?;
         check_legacy_vocabulary(&text, &file)?;
         check_removed_repo_path(&text, &file)?;
-        let parsed: WorkspaceFile =
-            toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
+        let parsed: EstateFile =
+            toml::from_str(&text).map_err(|source| EstateError::Malformed {
                 path: file.clone(),
                 source,
             })?;
@@ -1035,13 +1035,13 @@ impl Workspace {
         let mut declared = Vec::with_capacity(parsed.repo.len());
         for entry in parsed.repo {
             if !is_plain_name(&entry.name) {
-                return Err(WorkspaceError::InvalidRepositoryName {
+                return Err(EstateError::InvalidRepositoryName {
                     file,
                     name: entry.name,
                 });
             }
             if !seen.insert(entry.name.clone()) {
-                return Err(WorkspaceError::DuplicateRepository {
+                return Err(EstateError::DuplicateRepository {
                     file,
                     name: entry.name,
                 });
@@ -1065,7 +1065,7 @@ impl Workspace {
     /// git. [`RepositorySpec::path`] here is only the declared path joined
     /// onto `root` (see [`DeclaredRepo`]'s own doc for the same distinction),
     /// so a name that resolves fine and one that points at nothing both parse
-    /// identically; [`WorkspaceError::DuplicateRepositoryPath`] — which needs
+    /// identically; [`EstateError::DuplicateRepositoryPath`] — which needs
     /// git to know two declared paths are the same checkout — is the one
     /// schema check this cannot make and does not attempt.
     ///
@@ -1082,30 +1082,25 @@ impl Workspace {
     /// A repository an edit itself populates or verifies (`sgt repo add`'s
     /// `populate_or_verify`) is already checked on disk by that caller,
     /// directly — this validator does not need to repeat it.
-    pub fn from_config_structural(config_path: &Path) -> Result<Self, WorkspaceError> {
+    pub fn from_config_structural(config_path: &Path) -> Result<Self, EstateError> {
         Self::from_config_impl_structural(config_path)
     }
 
     /// [`Self::declared_repos`]'s sibling for `[group.<name>]`: every
     /// declared group, membership validated against declared repository
-    /// names (the same [`WorkspaceError::UnknownGroupMember`] check
+    /// names (the same [`EstateError::UnknownGroupMember`] check
     /// [`Self::from_config_impl`] runs), without resolving any repository on
     /// disk. Used where only membership is wanted — `sgt run --group`'s
     /// client-side expansion (`src/cli.rs`) — so an unrelated missing
     /// repository cannot block a group whose own members are all fine (same
     /// root cause and remedy as [`Self::from_config_structural`]).
-    pub fn declared_groups(
-        config_path: &Path,
-    ) -> Result<BTreeMap<String, GroupSpec>, WorkspaceError> {
+    pub fn declared_groups(config_path: &Path) -> Result<BTreeMap<String, GroupSpec>, EstateError> {
         Ok(Self::from_config_impl_structural(config_path)?.groups)
     }
 
-    fn from_config_impl(
-        config_path: &Path,
-        allow_empty_repos: bool,
-    ) -> Result<Self, WorkspaceError> {
+    fn from_config_impl(config_path: &Path, allow_empty_repos: bool) -> Result<Self, EstateError> {
         let file = config_path.display().to_string();
-        let text = std::fs::read_to_string(config_path).map_err(|source| WorkspaceError::Io {
+        let text = std::fs::read_to_string(config_path).map_err(|source| EstateError::Io {
             path: file.clone(),
             source,
         })?;
@@ -1115,8 +1110,8 @@ impl Workspace {
         // name the rename instead of a generic unknown-field error.
         check_legacy_vocabulary(&text, &file)?;
         check_removed_repo_path(&text, &file)?;
-        let parsed: WorkspaceFile =
-            toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
+        let parsed: EstateFile =
+            toml::from_str(&text).map_err(|source| EstateError::Malformed {
                 path: file.clone(),
                 source,
             })?;
@@ -1126,7 +1121,7 @@ impl Workspace {
             .unwrap_or_else(|| PathBuf::from("."));
 
         if parsed.repo.is_empty() && !allow_empty_repos {
-            return Err(WorkspaceError::NoRepositories { file });
+            return Err(EstateError::NoRepositories { file });
         }
         let mut seen = BTreeSet::new();
         // Identity of a repository is its resolved top level, not the name
@@ -1138,13 +1133,13 @@ impl Workspace {
         let mut repository_origin = BTreeMap::new();
         for entry in parsed.repo {
             if !is_plain_name(&entry.name) {
-                return Err(WorkspaceError::InvalidRepositoryName {
+                return Err(EstateError::InvalidRepositoryName {
                     file,
                     name: entry.name,
                 });
             }
             if !seen.insert(entry.name.clone()) {
-                return Err(WorkspaceError::DuplicateRepository {
+                return Err(EstateError::DuplicateRepository {
                     file,
                     name: entry.name,
                 });
@@ -1153,7 +1148,7 @@ impl Workspace {
             // this estate's own ordinary checkout before anything binds it.
             let resolved = validate_mount(&file, &entry.name, &mount_path(&root, &entry.name))?;
             if let Some(first) = seen_paths.get(&resolved) {
-                return Err(WorkspaceError::DuplicateRepositoryPath {
+                return Err(EstateError::DuplicateRepositoryPath {
                     file,
                     first: first.clone(),
                     second: entry.name,
@@ -1174,7 +1169,7 @@ impl Workspace {
         let mut seen = BTreeSet::new();
         for profile in &parsed.profile {
             if !seen.insert(profile.name.clone()) {
-                return Err(WorkspaceError::DuplicateProfile {
+                return Err(EstateError::DuplicateProfile {
                     file,
                     name: profile.name.clone(),
                 });
@@ -1183,7 +1178,7 @@ impl Workspace {
             // config load, rather than surfacing later as an unmeasured CLI
             // argument failure at launch time.
             if let Err(source) = profile.permission_mode() {
-                return Err(WorkspaceError::InvalidPermissionMode {
+                return Err(EstateError::InvalidPermissionMode {
                     file,
                     profile: profile.name.clone(),
                     source,
@@ -1196,7 +1191,7 @@ impl Workspace {
         for (group_name, entry) in parsed.group {
             for member in &entry.repos {
                 if !declared_repo_names.contains(&member.as_str()) {
-                    return Err(WorkspaceError::UnknownGroupMember {
+                    return Err(EstateError::UnknownGroupMember {
                         file,
                         group: group_name,
                         name: member.clone(),
@@ -1252,16 +1247,16 @@ impl Workspace {
     /// list (every caller is a manifest edit, which may legitimately be
     /// scaffolding a repo-less estate — same reason
     /// [`Self::from_config_allow_empty`] relaxes it).
-    fn from_config_impl_structural(config_path: &Path) -> Result<Self, WorkspaceError> {
+    fn from_config_impl_structural(config_path: &Path) -> Result<Self, EstateError> {
         let file = config_path.display().to_string();
-        let text = std::fs::read_to_string(config_path).map_err(|source| WorkspaceError::Io {
+        let text = std::fs::read_to_string(config_path).map_err(|source| EstateError::Io {
             path: file.clone(),
             source,
         })?;
         check_legacy_vocabulary(&text, &file)?;
         check_removed_repo_path(&text, &file)?;
-        let parsed: WorkspaceFile =
-            toml::from_str(&text).map_err(|source| WorkspaceError::Malformed {
+        let parsed: EstateFile =
+            toml::from_str(&text).map_err(|source| EstateError::Malformed {
                 path: file.clone(),
                 source,
             })?;
@@ -1276,13 +1271,13 @@ impl Workspace {
         let mut repository_origin = BTreeMap::new();
         for entry in parsed.repo {
             if !is_plain_name(&entry.name) {
-                return Err(WorkspaceError::InvalidRepositoryName {
+                return Err(EstateError::InvalidRepositoryName {
                     file,
                     name: entry.name,
                 });
             }
             if !seen.insert(entry.name.clone()) {
-                return Err(WorkspaceError::DuplicateRepository {
+                return Err(EstateError::DuplicateRepository {
                     file,
                     name: entry.name,
                 });
@@ -1303,13 +1298,13 @@ impl Workspace {
         let mut seen = BTreeSet::new();
         for profile in &parsed.profile {
             if !seen.insert(profile.name.clone()) {
-                return Err(WorkspaceError::DuplicateProfile {
+                return Err(EstateError::DuplicateProfile {
                     file,
                     name: profile.name.clone(),
                 });
             }
             if let Err(source) = profile.permission_mode() {
-                return Err(WorkspaceError::InvalidPermissionMode {
+                return Err(EstateError::InvalidPermissionMode {
                     file,
                     profile: profile.name.clone(),
                     source,
@@ -1322,7 +1317,7 @@ impl Workspace {
         for (group_name, entry) in parsed.group {
             for member in &entry.repos {
                 if !declared_repo_names.contains(&member.as_str()) {
-                    return Err(WorkspaceError::UnknownGroupMember {
+                    return Err(EstateError::UnknownGroupMember {
                         file,
                         group: group_name,
                         name: member.clone(),
@@ -1371,7 +1366,7 @@ impl Workspace {
         })
     }
 
-    /// The profile with this name, if the workspace declares one.
+    /// The profile with this name, if the estate declares one.
     pub fn profile(&self, name: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.name == name)
     }
@@ -1405,8 +1400,8 @@ impl Workspace {
     /// with `data_dir` and must not stop `doctor` from ever running. This
     /// answers only the question it needs, at [`estate_table_check`]'s own
     /// tolerance.
-    pub fn is_estate_root(dir: &Path) -> Result<bool, WorkspaceError> {
-        let manifest_path = dir.join(WORKSPACE_FILE);
+    pub fn is_estate_root(dir: &Path) -> Result<bool, EstateError> {
+        let manifest_path = dir.join(MANIFEST_FILE);
         if !manifest_path.is_file() {
             return Ok(false);
         }
@@ -1419,14 +1414,14 @@ impl Workspace {
     /// that declares no override — leaving the caller's own default in force
     /// exactly as `surfaces_dir` does. Same tolerance as
     /// [`Self::is_estate_root`], and for the same reason.
-    pub fn root_data_dir_override(dir: &Path) -> Result<Option<PathBuf>, WorkspaceError> {
+    pub fn root_data_dir_override(dir: &Path) -> Result<Option<PathBuf>, EstateError> {
         if !Self::is_estate_root(dir)? {
             return Ok(None);
         }
-        estate_data_dir_override(&dir.join(WORKSPACE_FILE), dir)
+        estate_data_dir_override(&dir.join(MANIFEST_FILE), dir)
     }
 
-    /// Restrict the workspace to the named repositories (the submit request's
+    /// Restrict the estate to the named repositories (the submit request's
     /// resolved scope — see `runtime::engine::Engine::resolve_scope`, the
     /// caller that turns `--repo`/`--group`/`--all` into this exact name
     /// list). An unknown name is an error rather than a silently empty
@@ -1447,7 +1442,7 @@ impl Workspace {
     pub fn select(&self, names: &[String]) -> Result<Vec<RepositorySpec>, String> {
         if names.is_empty() {
             return Err(format!(
-                "no repositories selected for workspace {:?}; an empty selection is refused, \
+                "no repositories selected for estate {:?}; an empty selection is refused, \
                  not expanded to every declared repository (estate-root Phase C, §7.1) — \
                  select explicitly with --repo, --group, or --all",
                 self.name
@@ -1458,7 +1453,7 @@ impl Workspace {
         for name in names {
             if !seen.insert(name.clone()) {
                 return Err(format!(
-                    "repository selection lists {name:?} twice for workspace {:?}",
+                    "repository selection lists {name:?} twice for estate {:?}",
                     self.name
                 ));
             }
@@ -1466,7 +1461,7 @@ impl Workspace {
                 Some(repo) => selected.push(repo.clone()),
                 None => {
                     return Err(format!(
-                        "workspace {:?} has no repository {name:?} (has: {})",
+                        "estate {:?} has no repository {name:?} (has: {})",
                         self.name,
                         self.repositories
                             .iter()
@@ -1485,23 +1480,23 @@ impl Workspace {
 fn repo_name(root: &Path) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "workspace".to_string())
+        .unwrap_or_else(|| "estate".to_string())
 }
 
-/// Whether `config_path` carries an `[estate]` table — [`Workspace::admit`]'s
+/// Whether `config_path` carries an `[estate]` table — [`Estate::admit`]'s
 /// own predicate. `Ok(false)` for a file that cannot even be read
 /// (permission, race — indistinguishable from "no file here"). `Err` for one
 /// that CAN be read but is malformed or carries legacy vocabulary
 /// (W5/R-MVP1-3): §4.4's last rule is that an invalid manifest surfaces its
 /// exact diagnostic and never falls through.
-fn estate_table_check(config_path: &Path) -> Result<bool, WorkspaceError> {
+fn estate_table_check(config_path: &Path) -> Result<bool, EstateError> {
     let Ok(text) = std::fs::read_to_string(config_path) else {
         return Ok(false);
     };
     let file = config_path.display().to_string();
     check_legacy_vocabulary(&text, &file)?;
     let value: toml::Value =
-        toml::from_str(&text).map_err(|source| WorkspaceError::Malformed { path: file, source })?;
+        toml::from_str(&text).map_err(|source| EstateError::Malformed { path: file, source })?;
     Ok(value
         .as_table()
         .is_some_and(|table| table.contains_key("estate")))
@@ -1509,27 +1504,27 @@ fn estate_table_check(config_path: &Path) -> Result<bool, WorkspaceError> {
 
 /// [`estate_table_check`]'s sibling for `data_dir` (ADR 0008(b)): the
 /// `[estate] data_dir` string, if any, resolved onto `root` exactly as
-/// [`Workspace::from_config_impl_structural`] resolves it — relative joins
+/// [`Estate::from_config_impl_structural`] resolves it — relative joins
 /// on, absolute passes through — but reached the same tolerant way
 /// `estate_table_check` finds the `[estate]` table itself: a raw TOML
-/// value, not a deserialize into [`WorkspaceFile`]. This is what lets
-/// [`Workspace::root_data_dir_override`] read `data_dir` without also
+/// value, not a deserialize into [`EstateFile`]. This is what lets
+/// [`Estate::root_data_dir_override`] read `data_dir` without also
 /// demanding the rest of the manifest — repos, profiles, groups — be
 /// structurally valid. Unreadable (permission, race) answers `None`, the
 /// same "indistinguishable from no file here" tolerance `estate_table_check`
-/// applies; by the time this runs, [`Workspace::is_estate_root`] has already
+/// applies; by the time this runs, [`Estate::is_estate_root`] has already
 /// required the file to parse as TOML and carry no legacy vocabulary, so
 /// those two failure modes are not re-checked here.
 fn estate_data_dir_override(
     config_path: &Path,
     root: &Path,
-) -> Result<Option<PathBuf>, WorkspaceError> {
+) -> Result<Option<PathBuf>, EstateError> {
     let Ok(text) = std::fs::read_to_string(config_path) else {
         return Ok(None);
     };
     let file = config_path.display().to_string();
     let value: toml::Value =
-        toml::from_str(&text).map_err(|source| WorkspaceError::Malformed { path: file, source })?;
+        toml::from_str(&text).map_err(|source| EstateError::Malformed { path: file, source })?;
     Ok(value
         .get("estate")
         .and_then(|estate| estate.get("data_dir"))
@@ -1578,17 +1573,17 @@ mod tests {
     /// validate. Every `name = "..."` under a `[[repo]]` in `body` gets one,
     /// which keeps the fixtures about the *schema* question each test is
     /// really asking rather than about mount plumbing.
-    fn parse(root: &Path, body: &str) -> Result<Workspace, WorkspaceError> {
+    fn parse(root: &Path, body: &str) -> Result<Estate, EstateError> {
         mount_declared_repos(root, body);
         parse_without_mounting(root, body)
     }
 
     /// [`parse`] without the mount scaffolding — for the tests whose whole
     /// subject *is* what the mounts look like on disk.
-    fn parse_without_mounting(root: &Path, body: &str) -> Result<Workspace, WorkspaceError> {
-        let config = root.join(WORKSPACE_FILE);
+    fn parse_without_mounting(root: &Path, body: &str) -> Result<Estate, EstateError> {
+        let config = root.join(MANIFEST_FILE);
         std::fs::write(&config, body).expect("sergeant.toml");
-        Workspace::from_config(&config)
+        Estate::from_config(&config)
     }
 
     /// Create `root/repos/<name>` as a real git repository for every
@@ -1634,19 +1629,19 @@ mod tests {
             )
             .expect_err("a traversing repository name must be refused");
             assert!(
-                matches!(err, WorkspaceError::InvalidRepositoryName { .. }),
+                matches!(err, EstateError::InvalidRepositoryName { .. }),
                 "{name:?} must be refused as a name, got {err}"
             );
         }
 
         // And the ordinary case still parses, so the guard is not refusing
         // everything.
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("a plain name parses");
-        assert_eq!(workspace.repositories[0].name, "solo");
+        assert_eq!(estate.repositories[0].name, "solo");
     }
 
     /// §6.1/§6.2: two names can no longer *be* one checkout — the mount is
@@ -1676,7 +1671,7 @@ mod tests {
             "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"a\"\n\n[[repo]]\nname = \"b\"\n",
         )
         .expect_err("a symlinked mount must be refused");
-        let WorkspaceError::RepositoryMountAliased {
+        let EstateError::RepositoryMountAliased {
             name,
             expected,
             actual,
@@ -1729,7 +1724,7 @@ mod tests {
             "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"borrowed\"\n",
         )
         .expect_err("a linked worktree must be refused as a mount");
-        let WorkspaceError::RepositoryMountIsLinkedWorktree {
+        let EstateError::RepositoryMountIsLinkedWorktree {
             name, common_dir, ..
         } = &err
         else {
@@ -1757,7 +1752,7 @@ mod tests {
             "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\npath = \"repos/api\"\n",
         )
         .expect_err("a declared path must be refused");
-        let WorkspaceError::RepositoryPathDeclared { name, .. } = &err else {
+        let EstateError::RepositoryPathDeclared { name, .. } = &err else {
             panic!("expected the named removal refusal, got {err}");
         };
         assert_eq!(name, "api");
@@ -1768,17 +1763,17 @@ mod tests {
         );
         // Every read path refuses it, not just the strict one — the edit pen
         // and `sgt doctor`'s own reader included.
-        let config = root.join(WORKSPACE_FILE);
+        let config = root.join(MANIFEST_FILE);
         assert!(matches!(
-            Workspace::from_config_structural(&config),
-            Err(WorkspaceError::RepositoryPathDeclared { .. })
+            Estate::from_config_structural(&config),
+            Err(EstateError::RepositoryPathDeclared { .. })
         ));
         assert!(matches!(
-            Workspace::declared_repos(&config),
-            Err(WorkspaceError::RepositoryPathDeclared { .. })
+            Estate::declared_repos(&config),
+            Err(EstateError::RepositoryPathDeclared { .. })
         ));
         assert!(matches!(
-            Workspace::admit(root),
+            Estate::admit(root),
             Err(EstateRootError::Invalid { .. })
         ));
     }
@@ -1801,7 +1796,7 @@ mod tests {
         )
         .expect_err("a repeated name must be refused");
         assert!(
-            matches!(&err, WorkspaceError::DuplicateRepository { name, .. } if name == "same"),
+            matches!(&err, EstateError::DuplicateRepository { name, .. } if name == "same"),
             "got {err}"
         );
     }
@@ -1811,7 +1806,7 @@ mod tests {
     /// same-path collision, arriving through the API instead of the file.
     #[test]
     fn a_repository_named_twice_in_one_selection_is_refused() {
-        let workspace = Workspace {
+        let estate = Estate {
             name: "payments".to_string(),
             root: PathBuf::from("/nowhere"),
             repositories: vec![
@@ -1835,7 +1830,7 @@ mod tests {
             repository_origin: BTreeMap::new(),
         };
 
-        let selected = workspace
+        let selected = estate
             .select(&["web".to_string(), "api".to_string()])
             .expect("distinct names select");
         assert_eq!(
@@ -1843,13 +1838,13 @@ mod tests {
             ["web", "api"]
         );
 
-        let err = workspace
+        let err = estate
             .select(&["api".to_string(), "api".to_string()])
             .expect_err("a repeated selection must be refused");
         assert!(err.contains("twice"), "got {err}");
 
         // An unknown name still names what does exist.
-        let err = workspace
+        let err = estate
             .select(&["ghost".to_string()])
             .expect_err("unknown repository");
         assert!(err.contains("api, web"), "got {err}");
@@ -1863,7 +1858,7 @@ mod tests {
     /// `select` itself no longer papers over an undecided scope.
     #[test]
     fn empty_selection_is_refused_at_the_domain_layer() {
-        let workspace = Workspace {
+        let estate = Estate {
             name: "payments".to_string(),
             root: PathBuf::from("/nowhere"),
             repositories: vec![
@@ -1887,17 +1882,17 @@ mod tests {
             repository_origin: BTreeMap::new(),
         };
 
-        let err = workspace
+        let err = estate
             .select(&[])
             .expect_err("an empty selection must now be refused, not expanded to \"all\"");
         assert!(
             err.contains("payments") && err.contains("--all"),
-            "the refusal should name the workspace and the remedy vocabulary, got: {err}"
+            "the refusal should name the estate and the remedy vocabulary, got: {err}"
         );
     }
 
     /// `sergeant.toml` declaring no `[[repo]]` entries at all is
-    /// refused rather than accepted as a workspace with nothing to act on.
+    /// refused rather than accepted as a estate with nothing to act on.
     #[test]
     fn a_workspace_config_with_no_repositories_is_refused() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1907,7 +1902,7 @@ mod tests {
         let err = parse(root, "[estate]\nname = \"empty\"\n")
             .expect_err("no repositories at all must be refused");
         assert!(
-            matches!(&err, WorkspaceError::NoRepositories { file } if file.ends_with(WORKSPACE_FILE)),
+            matches!(&err, EstateError::NoRepositories { file } if file.ends_with(MANIFEST_FILE)),
             "expected NoRepositories naming the config file, got {err}"
         );
     }
@@ -1930,7 +1925,7 @@ mod tests {
         )
         .expect_err("a repeated profile name must be refused");
         assert!(
-            matches!(&err, WorkspaceError::DuplicateProfile { name, .. } if name == "same"),
+            matches!(&err, EstateError::DuplicateProfile { name, .. } if name == "same"),
             "got {err}"
         );
     }
@@ -1952,7 +1947,7 @@ mod tests {
         )
         .expect_err("an unrecognized permission_mode must be refused");
         match &err {
-            WorkspaceError::InvalidPermissionMode {
+            EstateError::InvalidPermissionMode {
                 profile, source, ..
             } => {
                 assert_eq!(profile, "reckless");
@@ -1962,7 +1957,7 @@ mod tests {
         }
 
         // The five vocabulary values, plus unspecified, all still parse.
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
              [[repo]]\nname = \"solo\"\n\n\
@@ -1971,7 +1966,7 @@ mod tests {
         )
         .expect("a listed permission_mode value parses");
         assert_eq!(
-            workspace.profiles[0]
+            estate.profiles[0]
                 .permission_mode()
                 .expect("validated at load")
                 .map(|m| m.as_cli_value()),
@@ -1996,7 +1991,7 @@ mod tests {
         )
         .expect_err("[workspace] must be refused by name");
         match &err {
-            WorkspaceError::LegacyVocabulary {
+            EstateError::LegacyVocabulary {
                 found,
                 expected,
                 remedy,
@@ -2024,7 +2019,7 @@ mod tests {
         )
         .expect_err("[[repository]] must be refused by name");
         match &err {
-            WorkspaceError::LegacyVocabulary {
+            EstateError::LegacyVocabulary {
                 found, expected, ..
             } => {
                 assert_eq!(found, "repository");
@@ -2050,7 +2045,7 @@ mod tests {
         )
         .expect_err("a mix must still be refused");
         assert!(
-            matches!(&err, WorkspaceError::LegacyVocabulary { found, .. } if found == "workspace"),
+            matches!(&err, EstateError::LegacyVocabulary { found, .. } if found == "workspace"),
             "got {err}"
         );
     }
@@ -2063,12 +2058,12 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"clean\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("pure estate vocabulary must parse");
-        assert_eq!(workspace.name, "clean");
+        assert_eq!(estate.name, "clean");
     }
 
     // ---- R-MVP1-3: `[group.<name>]` ---------------------------------------
@@ -2084,7 +2079,7 @@ mod tests {
         let other = root.join("other");
         init_repo(&other);
 
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
              [[repo]]\nname = \"api\"\n\n\
@@ -2092,7 +2087,7 @@ mod tests {
              [group.payments]\nrepos = [\"api\", \"web\"]\nbrief = \"both sides\"\n",
         )
         .expect("a group over declared repos parses");
-        let group = workspace.groups.get("payments").expect("group present");
+        let group = estate.groups.get("payments").expect("group present");
         assert_eq!(group.repos, vec!["api".to_string(), "web".to_string()]);
         assert_eq!(group.brief.as_deref(), Some("both sides"));
 
@@ -2104,7 +2099,7 @@ mod tests {
         )
         .expect_err("an undeclared group member must be refused");
         match &err {
-            WorkspaceError::UnknownGroupMember { group, name, .. } => {
+            EstateError::UnknownGroupMember { group, name, .. } => {
                 assert_eq!(group, "payments");
                 assert_eq!(name, "ghost");
             }
@@ -2126,7 +2121,7 @@ mod tests {
         let other = root.join("other");
         init_repo(&other);
 
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\n\n\
              [[repo]]\nname = \"unset\"\n\n\
@@ -2134,18 +2129,15 @@ mod tests {
         )
         .expect("instructions parses");
         assert_eq!(
-            workspace.instruction_policy("unset"),
+            estate.instruction_policy("unset"),
             InstructionPolicy::Suppress,
             "an unset instructions value must default to suppress, byte-identical to today"
         );
-        assert_eq!(
-            workspace.instruction_policy("loud"),
-            InstructionPolicy::Local
-        );
+        assert_eq!(estate.instruction_policy("loud"), InstructionPolicy::Local);
         // A name the manifest never declared still resolves rather than
         // panicking — callers ask this for arbitrary selected repos.
         assert_eq!(
-            workspace.instruction_policy("nowhere"),
+            estate.instruction_policy("nowhere"),
             InstructionPolicy::Suppress
         );
     }
@@ -2160,19 +2152,19 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\nsurfaces_dir = \"../elsewhere-surfaces\"\n\n\
              [[repo]]\nname = \"solo\"\n",
         )
         .expect("relative surfaces_dir parses");
         assert_eq!(
-            workspace.surfaces_dir,
+            estate.surfaces_dir,
             Some(root.join("../elsewhere-surfaces"))
         );
 
         let absolute = dir.path().join("abs-surfaces");
-        let workspace = parse(
+        let estate = parse(
             root,
             &format!(
                 "[estate]\nname = \"w\"\nsurfaces_dir = {:?}\n\n[[repo]]\nname = \"solo\"\n",
@@ -2180,15 +2172,15 @@ mod tests {
             ),
         )
         .expect("absolute surfaces_dir parses");
-        assert_eq!(workspace.surfaces_dir, Some(absolute));
+        assert_eq!(estate.surfaces_dir, Some(absolute));
 
         // Unset stays `None` — the daemon's own default is left in force.
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("no surfaces_dir parses");
-        assert_eq!(workspace.surfaces_dir, None);
+        assert_eq!(estate.surfaces_dir, None);
     }
 
     // ---- ADR 0008(b): `[estate] data_dir` ---------------------------------
@@ -2202,16 +2194,16 @@ mod tests {
         let root = dir.path();
         init_repo(root);
 
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\ndata_dir = \"../elsewhere-data\"\n\n\
              [[repo]]\nname = \"solo\"\n",
         )
         .expect("relative data_dir parses");
-        assert_eq!(workspace.data_dir, Some(root.join("../elsewhere-data")));
+        assert_eq!(estate.data_dir, Some(root.join("../elsewhere-data")));
 
         let absolute = dir.path().join("abs-data");
-        let workspace = parse(
+        let estate = parse(
             root,
             &format!(
                 "[estate]\nname = \"w\"\ndata_dir = {:?}\n\n[[repo]]\nname = \"solo\"\n",
@@ -2219,16 +2211,16 @@ mod tests {
             ),
         )
         .expect("absolute data_dir parses");
-        assert_eq!(workspace.data_dir, Some(absolute));
+        assert_eq!(estate.data_dir, Some(absolute));
 
         // Unset stays `None` — `resolve_data_dir`'s own default is left in
         // force.
-        let workspace = parse(
+        let estate = parse(
             root,
             "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"solo\"\n",
         )
         .expect("no data_dir parses");
-        assert_eq!(workspace.data_dir, None);
+        assert_eq!(estate.data_dir, None);
     }
 
     // ---- §4.1: exact-root admission (R-MVP1-12 superseded) ----------------
@@ -2240,7 +2232,7 @@ mod tests {
         init_repo(root);
         init_repo(&root.join("repos").join("solo"));
         std::fs::write(
-            root.join(WORKSPACE_FILE),
+            root.join(MANIFEST_FILE),
             format!("[estate]\nname = {name:?}\n\n[[repo]]\nname = \"solo\"\n"),
         )
         .expect("write estate sergeant.toml");
@@ -2256,14 +2248,14 @@ mod tests {
         std::fs::create_dir_all(&estate_root).expect("estate dir");
         write_estate(&estate_root, "payments");
 
-        let admitted = Workspace::admit(&estate_root).expect("the exact root is admitted");
+        let admitted = Estate::admit(&estate_root).expect("the exact root is admitted");
         assert_eq!(
             Some(admitted.path.clone()),
             std::fs::canonicalize(&estate_root).ok()
         );
-        assert_eq!(admitted.manifest_path, admitted.path.join(WORKSPACE_FILE));
+        assert_eq!(admitted.manifest_path, admitted.path.join(MANIFEST_FILE));
 
-        let estate = Workspace::resolve(&estate_root).expect("the strict load agrees");
+        let estate = Estate::resolve(&estate_root).expect("the strict load agrees");
         assert_eq!(estate.name, "payments");
     }
 
@@ -2280,7 +2272,7 @@ mod tests {
         write_estate(&estate_root, "ancestor-estate");
 
         let member = estate_root.join("repos").join("solo");
-        let err = Workspace::admit(&member)
+        let err = Estate::admit(&member)
             .expect_err("exact-root admission must refuse a descendant of the estate");
         assert!(
             matches!(err, EstateRootError::NoEstate { .. }),
@@ -2296,11 +2288,11 @@ mod tests {
             "the refusal must say why no ancestor was consulted: {message}"
         );
         assert!(
-            message.contains(&member.join(WORKSPACE_FILE).display().to_string())
+            message.contains(&member.join(MANIFEST_FILE).display().to_string())
                 || message.contains(
                     &std::fs::canonicalize(&member)
                         .unwrap_or_else(|_| member.clone())
-                        .join(WORKSPACE_FILE)
+                        .join(MANIFEST_FILE)
                         .display()
                         .to_string()
                 ),
@@ -2314,9 +2306,9 @@ mod tests {
 
     /// **Phase 0 pin #2, flipped (C7a).** The zero-config Git fallback is
     /// gone: a plain git repository with no `sergeant.toml` anywhere is no
-    /// longer a workspace, it is "no estate here" — exact-root resolution has
+    /// longer a estate, it is "no estate here" — exact-root resolution has
     /// nothing to fall back *to*.
-    // CONTRACT PIN (estate-root Phase D): zero-config git fallback is removed; a repo with no sergeant.toml anywhere above no longer resolves to a workspace.
+    // CONTRACT PIN (estate-root Phase D): zero-config git fallback is removed; a repo with no sergeant.toml anywhere above no longer resolves to a estate.
     #[test]
     fn a_plain_git_repository_with_no_manifest_is_no_longer_a_workspace() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -2324,13 +2316,13 @@ mod tests {
         init_repo(&root);
         // No `sergeant.toml` anywhere in this fixture, at `root` or above it.
 
-        let err = Workspace::admit(&root).expect_err("there is no estate here");
+        let err = Estate::admit(&root).expect_err("there is no estate here");
         assert!(
             matches!(err, EstateRootError::NoEstate { .. }),
             "a git repository is not an estate: {err:?}"
         );
         assert!(
-            Workspace::resolve(&root).is_err(),
+            Estate::resolve(&root).is_err(),
             "the strict resolver must refuse too — no git fallback survives anywhere"
         );
     }
@@ -2344,9 +2336,9 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.path().join("member");
         init_repo(&root);
-        std::fs::write(root.join(WORKSPACE_FILE), "[[repo]]\nname = \"solo\"\n").expect("write");
+        std::fs::write(root.join(MANIFEST_FILE), "[[repo]]\nname = \"solo\"\n").expect("write");
 
-        let err = Workspace::admit(&root).expect_err("no [estate] table here");
+        let err = Estate::admit(&root).expect_err("no [estate] table here");
         assert!(
             matches!(err, EstateRootError::NotAnEstate { .. }),
             "got {err:?}"
@@ -2372,9 +2364,9 @@ mod tests {
         let inner = estate_root.join("inner");
         std::fs::create_dir_all(&inner).expect("dirs");
         write_estate(&estate_root, "outer-estate");
-        std::fs::write(inner.join(WORKSPACE_FILE), "this is not [ toml").expect("write");
+        std::fs::write(inner.join(MANIFEST_FILE), "this is not [ toml").expect("write");
 
-        let err = Workspace::admit(&inner).expect_err("a malformed manifest must refuse");
+        let err = Estate::admit(&inner).expect_err("a malformed manifest must refuse");
         assert!(
             matches!(err, EstateRootError::Invalid { .. }),
             "got {err:?}"
@@ -2399,17 +2391,17 @@ mod tests {
         let root = dir.path().join("legacy");
         init_repo(&root);
         std::fs::write(
-            root.join(WORKSPACE_FILE),
+            root.join(MANIFEST_FILE),
             "[workspace]\nname = \"legacy\"\n\n[[repository]]\nname = \"legacy\"\n",
         )
         .expect("legacy sergeant.toml");
 
-        let err = Workspace::admit(&root).expect_err("legacy vocabulary must refuse");
+        let err = Estate::admit(&root).expect_err("legacy vocabulary must refuse");
         let EstateRootError::Invalid { source, .. } = &err else {
             panic!("expected Invalid, got {err:?}");
         };
         assert!(
-            matches!(**source, WorkspaceError::LegacyVocabulary { .. }),
+            matches!(**source, EstateError::LegacyVocabulary { .. }),
             "got {source}"
         );
         assert!(
@@ -2428,13 +2420,13 @@ mod tests {
         std::fs::create_dir_all(&root).expect("estate dir");
         write_estate(&root, "payments");
         std::fs::write(
-            root.join(WORKSPACE_FILE),
+            root.join(MANIFEST_FILE),
             "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"solo\"\n\n\
              [group.everything]\nrepos = [\"ghost\"]\n",
         )
         .expect("write");
 
-        let err = Workspace::admit(&root).expect_err("an unknown group member is a schema defect");
+        let err = Estate::admit(&root).expect_err("an unknown group member is a schema defect");
         assert!(
             matches!(err, EstateRootError::Invalid { .. }),
             "got {err:?}"
@@ -2445,7 +2437,7 @@ mod tests {
     /// estate inadmissible — that is a repository problem, not an
     /// estate-identity problem (the design capture's own wrongness contract:
     /// "a broken repo blocks works targeting it, not the estate"). The strict
-    /// [`Workspace::resolve`] still refuses it, which is the half that
+    /// [`Estate::resolve`] still refuses it, which is the half that
     /// protects a Work from binding a repository that is not really there.
     #[test]
     fn a_declared_repo_missing_from_disk_does_not_make_the_estate_inadmissible() {
@@ -2454,14 +2446,14 @@ mod tests {
         std::fs::create_dir_all(&root).expect("estate dir");
         init_repo(&root);
         std::fs::write(
-            root.join(WORKSPACE_FILE),
+            root.join(MANIFEST_FILE),
             "[estate]\nname = \"payments\"\n\n[[repo]]\nname = \"ghost\"\n",
         )
         .expect("write");
 
-        Workspace::admit(&root).expect("admission is about estate identity, not repo presence");
+        Estate::admit(&root).expect("admission is about estate identity, not repo presence");
         assert!(
-            Workspace::resolve(&root).is_err(),
+            Estate::resolve(&root).is_err(),
             "the strict load must still refuse a repository that is not on disk"
         );
     }
@@ -2478,7 +2470,7 @@ mod tests {
         let estate_root = std::fs::canonicalize(&estate_root).expect("canonical estate root");
         let member = estate_root.join("repos").join("solo");
 
-        let err = Workspace::admit(&member)
+        let err = Estate::admit(&member)
             .expect_err("a descendant is refused")
             .with_bound_root(estate_root.clone());
         assert!(
@@ -2518,7 +2510,7 @@ mod tests {
         write_estate(&estate_root, "payments");
         let estate_root = std::fs::canonicalize(&estate_root).expect("canonical");
 
-        let err = Workspace::admit(&elsewhere)
+        let err = Estate::admit(&elsewhere)
             .expect_err("no estate here")
             .with_bound_root(estate_root);
         assert!(
@@ -2537,10 +2529,10 @@ mod tests {
         let inner = estate_root.join("inner");
         std::fs::create_dir_all(&inner).expect("dirs");
         write_estate(&estate_root, "payments");
-        std::fs::write(inner.join(WORKSPACE_FILE), "this is not [ toml").expect("write");
+        std::fs::write(inner.join(MANIFEST_FILE), "this is not [ toml").expect("write");
         let estate_root = std::fs::canonicalize(&estate_root).expect("canonical");
 
-        let err = Workspace::admit(&inner)
+        let err = Estate::admit(&inner)
             .expect_err("malformed")
             .with_bound_root(estate_root);
         assert!(
@@ -2557,7 +2549,7 @@ mod tests {
         let root = dir.path().join("not-an-estate");
         std::fs::create_dir_all(&root).expect("dir");
 
-        let err = Workspace::admit(&root).expect_err("no estate").via_flag();
+        let err = Estate::admit(&root).expect_err("no estate").via_flag();
         assert!(
             matches!(err, EstateRootError::NoEstate { .. }),
             "the check is identical: {err:?}"
@@ -2584,7 +2576,7 @@ mod tests {
         let inner = root.join("inner");
         std::fs::create_dir_all(&inner).expect("dirs");
         std::fs::write(
-            root.join(WORKSPACE_FILE),
+            root.join(MANIFEST_FILE),
             "[estate]\nname = \"w\"\ndata_dir = \"custom-data\"\n\n\
              [[repo]]\nname = \"solo\"\n\n\
              [[profile]]\nname = \"same\"\nbackend = \"fake\"\n\n\
@@ -2592,16 +2584,16 @@ mod tests {
         )
         .expect("write");
 
-        assert!(Workspace::is_estate_root(&root).expect("tolerant probe"));
+        assert!(Estate::is_estate_root(&root).expect("tolerant probe"));
         assert_eq!(
-            Workspace::root_data_dir_override(&root).expect("tolerant lookup"),
+            Estate::root_data_dir_override(&root).expect("tolerant lookup"),
             Some(root.join("custom-data")),
             "an unrelated structural defect must not stop the data-dir lookup"
         );
         // ...and it never looks up. A descendant is simply not an estate root.
-        assert!(!Workspace::is_estate_root(&inner).expect("tolerant probe"));
+        assert!(!Estate::is_estate_root(&inner).expect("tolerant probe"));
         assert_eq!(
-            Workspace::root_data_dir_override(&inner).expect("tolerant lookup"),
+            Estate::root_data_dir_override(&inner).expect("tolerant lookup"),
             None,
             "no ancestor search here either"
         );
@@ -2613,7 +2605,7 @@ mod tests {
     /// reintroducing the legacy vocabulary. This is that gate: every
     /// `sergeant.toml` actually checked into this tree outside `reference/`
     /// (frozen evidence, exempted — CLAUDE.md's own convention) must parse
-    /// without a top-level `workspace` or `repository` table.
+    /// without a top-level `estate` or `repository` table.
     ///
     /// Scoped to files literally named `sergeant.toml`, not a bare string
     /// grep across every doc and note: several already-committed notes
@@ -2640,7 +2632,7 @@ mod tests {
                         continue;
                     }
                     stack.push(path);
-                } else if name == WORKSPACE_FILE {
+                } else if name == MANIFEST_FILE {
                     let Ok(text) = std::fs::read_to_string(&path) else {
                         continue;
                     };

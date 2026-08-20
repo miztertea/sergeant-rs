@@ -42,6 +42,7 @@ use sergeant_rs::backend::{
     NativeState, Observation, ProbeReport, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
+use sergeant_rs::domain::estate::InstructionPolicy;
 use sergeant_rs::domain::event::{Event, EventDraft, EventSource};
 use sergeant_rs::domain::execution::KIND_EXECUTION_RECONCILED;
 use sergeant_rs::domain::work::{
@@ -51,7 +52,6 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
     KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use sergeant_rs::domain::workspace::InstructionPolicy;
 use sergeant_rs::runtime::engine::{Engine, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::{
@@ -129,7 +129,7 @@ fn estate_with_manifest(root: &Path, manifest: &str, repos: &[&str]) -> Vec<Stri
 
 /// Write a workflow into an **estate root**: `.sergeant/workflows/<name>/…`.
 ///
-/// estate-root §4.1/§5.2: workflows resolve against `workspace.root` — the
+/// estate-root §4.1/§5.2: workflows resolve against `estate.root` — the
 /// directory the manifest lives in — so a fixture written inside a mount is
 /// never found. Every caller here passes the estate root, not a checkout.
 fn write_workflow(root: &Path, name: &str, stages: &[(&str, &str)]) {
@@ -445,8 +445,8 @@ async fn t1_a_bound_estate_submit_materializes_a_real_worktree() {
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "active");
     // estate-root §7.1/§7.4: no scope was submitted at all, and a
-    // one-repository estate infers its sole repository — `Work.workspace`
-    // is never written for a new Work (`workflow.bound`'s own `workspace`
+    // one-repository estate infers its sole repository — `Work.estate`
+    // is never written for a new Work (`workflow.bound`'s own `estate`
     // field, journaled separately, is its replacement — see
     // `r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities`
     // below for that assertion).
@@ -557,7 +557,7 @@ async fn t2_multi_repo_workspace_binds_one_worktree_per_repository() {
     )
     .await;
     assert_eq!(status, 201, "submit failed: {body}");
-    // §7.4: `Work.workspace` is never written for a new Work; §7.3's
+    // §7.4: `Work.estate` is never written for a new Work; §7.3's
     // resolved-list replacement is asserted via `bindings` below.
     assert_eq!(body["work"]["workspace"], Value::Null);
 
@@ -852,7 +852,7 @@ async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities
             .map(|r| r["name"].as_str().expect("name"))
             .collect::<Vec<_>>(),
         ["api", "web"],
-        "workflow.bound must carry the resolved repository set, not just the workspace name"
+        "workflow.bound must carry the resolved repository set, not just the estate name"
     );
     let identities = payload["instruction_identities"]
         .as_array()
@@ -1555,6 +1555,9 @@ async fn t7_routing_precedence_and_structured_failure() {
             &configured,
             json!({"origin": {"client": "cli", "cwd": configured}}),
             "codex",
+            // §13.2's rename left this tier's *journaled* name alone — see
+            // `RouteSource::as_str`. One dated spelling beats two spellings
+            // of one tier in the same journal.
             "workspace_default",
         ),
         (
@@ -2076,7 +2079,7 @@ async fn t7f_a_bound_stage_whose_harness_left_the_daemon_blocks_rather_than_subs
     handle.shutdown().await;
 
     // Second daemon over the same journal, with `alt-harness` deregistered.
-    // Nothing in the workspace changed; the *daemon* did.
+    // Nothing in the estate changed; the *daemon* did.
     let (registry, fake2) = one_fake([FakeStep::complete()]);
     assert!(
         !registry.names().iter().any(|n| n == "alt-harness"),
@@ -2215,7 +2218,7 @@ async fn t7e_every_harness_a_run_will_use_is_probed_before_the_lock_is_taken() {
             ..SubmitContext::default()
         })
         .expect("plan")
-        .expect("a workspace");
+        .expect("a estate");
     assert!(
         alt.probe_count() >= 1,
         "§17.5's preflight must probe a harness only a stage names — otherwise \
@@ -4120,7 +4123,7 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
 /// and a model pin meant for a different harness). Nothing pinned it: the
 /// profile that exists in this suite agrees with its route, so the check
 /// could be deleted and every test would still pass. Routing here is the
-/// last tier — no explicit backend, no workspace default — because that is
+/// last tier — no explicit backend, no estate default — because that is
 /// the tier a user is least likely to have in mind when naming a profile.
 #[tokio::test]
 async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_routed() {
@@ -4558,7 +4561,7 @@ async fn a_malformed_workspace_file_fails_closed() {
 }
 
 // ------------------------------------------ #22: repository-topology edges
-// beyond R-MVP1-12's own fixtures (`src/domain/workspace.rs`'s `#22:`-tagged
+// beyond R-MVP1-12's own fixtures (`src/domain/estate.rs`'s `#22:`-tagged
 // tests). These were the "remaining edges" `docs/gauntlet/contracts/MVP-1.md`
 // named and deferred: one table-driven-in-spirit test per shape, through the
 // real daemon/API, asserting the issue's own three things — correct binding
@@ -4787,7 +4790,7 @@ async fn t9b_a_linked_worktree_as_a_repository_mount_is_refused_at_submit() {
 ///
 /// The *other* symlink — a mount that is itself a symlink to a checkout
 /// elsewhere — is the opposite ruling: §6.2 refuses it as an alias
-/// (`RepositoryMountAliased`, pinned in `src/domain/workspace.rs`), because
+/// (`RepositoryMountAliased`, pinned in `src/domain/estate.rs`), because
 /// two estates aliasing one checkout is the shared-mount hazard it exists to
 /// stop. Canonicalizing the root is not the same as following a mount.
 #[cfg(unix)]
@@ -4851,8 +4854,8 @@ async fn t9c_a_symlinked_estate_root_materializes_and_completes() {
 /// A path with a space (and a non-ASCII character) in the estate root's own
 /// directory name — and therefore in every mount derived beneath it —
 /// exercised through the real materialize/complete/teardown flow rather than
-/// only admission (`src/domain/workspace.rs`'s own `#22:`-tagged path-with-a-
-/// space fixture covers `Workspace::admit`; this is the same shape one level
+/// only admission (`src/domain/estate.rs`'s own `#22:`-tagged path-with-a-
+/// space fixture covers `Estate::admit`; this is the same shape one level
 /// further, through git worktree creation, a real backend execution `cwd`,
 /// and teardown).
 #[tokio::test]
@@ -5036,7 +5039,7 @@ fn cli_run_all_and_run_group_plus_repo_wire_shapes() {
     stop_daemon(data.path());
 }
 
-/// estate-root proposal §7.4: `--workspace` is gone from the CLI entirely —
+/// estate-root proposal §7.4: `--estate` is gone from the CLI entirely —
 /// clap refuses the flag itself, before any daemon could ever be asked
 /// about it.
 #[test]
@@ -5052,11 +5055,11 @@ fn cli_run_rejects_the_removed_workspace_flag() {
     let output = sgt(
         &estate,
         &data,
-        &["run", "--workspace", "payments", "do the thing"],
+        &["run", "--estate", "payments", "do the thing"],
     );
     assert!(
         !output.status.success(),
-        "--workspace must be rejected, not silently accepted"
+        "--estate must be rejected, not silently accepted"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

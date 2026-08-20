@@ -39,8 +39,8 @@ use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
+use crate::domain::estate::Estate;
 use crate::domain::event::{EventDraft, EventSource};
-use crate::domain::workspace::Workspace;
 use crate::platform::fs_locking::{self, Reliability};
 use crate::runtime::analytics::{Analytics, AnalyticsError};
 use crate::runtime::engine::{Engine, EngineError};
@@ -237,7 +237,7 @@ pub enum DaemonError {
     /// descriptor published — a daemon that cannot name its estate never
     /// comes up.
     #[error(transparent)]
-    EstateRoot(#[from] crate::domain::workspace::EstateRootError),
+    EstateRoot(#[from] crate::domain::estate::EstateRootError),
     /// The descriptor names a schema this build does not understand. Fail
     /// closed exactly as an unknown snapshot schema does: its fields may
     /// mean something else entirely, and acting on them could mean talking
@@ -359,7 +359,7 @@ pub struct DaemonConfig {
     /// §5.1: the estate root this daemon is bound to, for its whole life.
     ///
     /// [`start_with`] admits it (§4.1's exact-root check —
-    /// [`Workspace::admit`]) before the data dir is created, the journal
+    /// [`Estate::admit`]) before the data dir is created, the journal
     /// opened, or the descriptor published, so a daemon can never come up
     /// bound to something that is not an estate. The canonical form is
     /// pinned into the engine and published in the runtime descriptor, where
@@ -423,7 +423,7 @@ pub async fn start_with(
     // it does to a client's dispatch, and the canonical root admitted here
     // is what the descriptor publishes and every client verifies against.
     let estate = match &config.estate_root {
-        Some(root) => Some(Workspace::admit(root)?),
+        Some(root) => Some(Estate::admit(root)?),
         None => None,
     };
 
