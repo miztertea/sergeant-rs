@@ -60,6 +60,7 @@ use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
     KIND_CONVERSATION_USER, KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
+use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::projection::{
     Projection, ProjectionError, WorkRegistry, WorkRun, is_absorbing, rederive_run,
@@ -1473,7 +1474,34 @@ fn disposition_tag(disposition: &BindingDisposition) -> &'static str {
         BindingDisposition::RetainedDirty { .. } => "retained_dirty",
         BindingDisposition::Missing => "missing",
         BindingDisposition::RetainedError { .. } => "retained_error",
+        BindingDisposition::RetainedUnreferenced { .. } => "retained_unreferenced",
     }
+}
+
+/// §11's integrity axis as a sibling key of `work`, for the two views C5
+/// makes mandatory (`sgt work list`, `sgt work show`).
+///
+/// `None` — the key renders as `null` — is **not assessed**: a Work whose
+/// surface never tore down, and a `surface.torn_down` journaled before Phase
+/// A. It never means clean, which is why this reads `run.integrity` (recorded
+/// by the retirement that assessed it) rather than deriving a verdict here
+/// from a teardown report that may predate the assessment entirely.
+///
+/// The findings and drift travel with the disposition rather than in a third
+/// key: a Work is dirty *because of* something, and a client that has to
+/// join two keys to say why will not.
+fn integrity_view(run: &WorkRun) -> Option<Value> {
+    let disposition = run.integrity?;
+    let teardown = run.teardown.as_ref();
+    Some(json!({
+        "disposition": disposition,
+        "findings": teardown
+            .map(|t| t.findings().cloned().collect::<Vec<_>>())
+            .unwrap_or_default(),
+        // §11.4: reported beside the findings, never among them, and never
+        // part of the disposition.
+        "drift": teardown.map(|t| t.drift.clone()).unwrap_or_default(),
+    }))
 }
 
 /// ADR 0007(b): a closing stage that declares a commit as its durable
@@ -1517,7 +1545,24 @@ fn stranded_completion(work: &Work, run: &WorkRun) -> bool {
 /// every other state-machine consumer still see `Completed`; only the
 /// string an operator reads first changes.
 fn reported_state(work: &Work, run: Option<&WorkRun>) -> &'static str {
-    if run.is_some_and(|r| stranded_completion(work, r)) {
+    // §11.5: `completed_dirty` is the compact label for completed + dirty,
+    // and it is now reached two ways that union rather than compete. ADR
+    // 0007(b)'s `stranded_completion` infers dirtiness from the output
+    // pointer alone, which is all a pre-Phase-A journal can offer; §11's
+    // integrity disposition is the assessment retirement actually recorded.
+    // Either one is enough.
+    //
+    // `failed` and `canceled` keep their true state strings even when dirty
+    // (§11.5 adds no `failed_dirty` label and no transition target); the
+    // `integrity` sibling key carries that axis, and `sgt work list` renders
+    // it beside the state so C5's "distinguishable in default output" holds
+    // for all three terminal states.
+    let dirty_completion = run.is_some_and(|r| {
+        stranded_completion(work, r)
+            || (work.state == WorkState::Completed
+                && r.integrity == Some(IntegrityDisposition::Dirty))
+    });
+    if dirty_completion {
         "completed_dirty"
     } else {
         work.state.as_str()
@@ -1563,6 +1608,10 @@ fn work_view(core: &Core, engine: &Engine, work_id: &str) -> Value {
         "backend": run.as_ref().and_then(|r| r.backend.clone()),
         "route_source": run.as_ref().and_then(|r| r.route_source.clone()),
         "teardown": run.as_ref().and_then(|r| r.teardown.clone()),
+        // §11.5's orthogonal axis (C5, mandatory): the disposition retirement
+        // recorded, the §11.3 findings behind it, and §11.4's unattributed
+        // estate drift. `null` until a retirement assessed it.
+        "integrity": run.as_ref().and_then(integrity_view),
         // R-MVP1-2's sibling: named per repository once there is something to
         // point at.
         "output": work.and_then(|w| run.as_ref().and_then(|r| output_pointer(w, r))),
@@ -1650,6 +1699,15 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
                     run.as_ref()
                         .and_then(|r| r.backend.clone())
                         .map_or(Value::Null, Value::String),
+                );
+                // C5: `sgt work list` is the default output a terminal-dirty
+                // Work must be distinguishable in. `state` above already
+                // carries it for a dirty *completion* (`completed_dirty`);
+                // this is what carries it for a dirty `failed`/`canceled`,
+                // whose state strings §11.5 leaves alone.
+                object.insert(
+                    "integrity".to_string(),
+                    run.as_ref().and_then(integrity_view).unwrap_or(Value::Null),
                 );
                 // MVP-3's envelope-visibility item, folded onto the fleet
                 // view exactly the way `work_view` folds it onto a single
@@ -5064,6 +5122,179 @@ mod tests {
             "an evicted stranded completion must not silently revert to plain \
              completed in `sgt work list` just because its run cache entry \
              aged out: {row}"
+        );
+    }
+
+    /// Amendment C3, the whole of it: a `surface.torn_down` journaled before
+    /// Phase A existed replays unchanged, and its integrity reads as **not
+    /// assessed** — never defaulted to clean.
+    ///
+    /// The distinction is the entire point of the amendment. An absent
+    /// assessment defaulted to `clean` would be core inventing a fact about
+    /// a retirement that predates the machinery that could have established
+    /// it — the exact silent-clean-report failure §17 says must become
+    /// impossible. So the payload here is hand-built rather than serialized
+    /// from today's types (the same technique
+    /// `a_stranded_completion_survives_terminal_run_cache_eviction` above
+    /// uses): a struct that gains a field cannot prove anything about an
+    /// event that never had it, only a literal old-shape payload can.
+    ///
+    /// Three things are checked past the disposition itself: the report
+    /// still deserializes into a `TeardownReport` (so `run.teardown` is
+    /// `Some`, and `runtime::recovery`'s completion-tail sweep — keyed on
+    /// `teardown.is_none()` — does not suddenly consider this work stranded);
+    /// ADR 0007(b)'s `completed_dirty` still fires from the output pointer
+    /// alone, which is all a pre-Phase-A journal can offer; and a new-shape
+    /// payload beside it does report its assessment.
+    #[test]
+    fn an_old_shape_torn_down_payload_replays_as_integrity_not_assessed() {
+        use crate::runtime::testing;
+
+        fn surface(work_id: &str) -> Value {
+            json!({"surface": {
+                "work_id": work_id,
+                "root": "/data/surfaces/x",
+                "bindings": [{
+                    "repository": "solo",
+                    "source_path": "/repos/solo",
+                    "base_branch": "main",
+                    "base_sha": "0".repeat(40),
+                    "worktree_path": "/data/surfaces/x/solo",
+                    "work_branch": format!("sergeant/{work_id}"),
+                    "head_sha": "0".repeat(40),
+                }],
+            }})
+        }
+
+        // Exactly the shape `surface.torn_down` had before this phase: no
+        // `integrity` sibling key, no `findings`, no `observed_head`, no
+        // `drift`.
+        fn old_shape_teardown(work_id: &str, clean: bool, disposition: Value) -> Value {
+            let mut binding = json!({
+                "repository": "solo",
+                "worktree_path": "/data/surfaces/x/solo",
+                "work_branch": format!("sergeant/{work_id}"),
+                "final_sha": "0".repeat(40),
+            });
+            let object = binding.as_object_mut().expect("binding object");
+            for (key, value) in disposition.as_object().expect("disposition object") {
+                object.insert(key.clone(), value.clone());
+            }
+            json!({"report": {"work_id": work_id, "clean": clean, "bindings": [binding]}})
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+
+        // An ordinary old completion: clean removal, nothing to report.
+        let ordinary = "01OLDSHAPE0000000001";
+        testing::submit(&mut core, ordinary, "torn down before Phase A");
+        testing::commit(
+            &mut core,
+            ordinary,
+            KIND_SURFACE_MATERIALIZED,
+            surface(ordinary),
+        );
+        testing::commit(&mut core, ordinary, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            ordinary,
+            KIND_SURFACE_TORN_DOWN,
+            old_shape_teardown(ordinary, true, json!({"disposition": "removed"})),
+        );
+
+        // An old stranded completion: ADR 0007(b)'s inference is all the
+        // journal can offer, and it must keep working untouched.
+        let stranded = "01OLDSHAPE0000000002";
+        testing::submit(&mut core, stranded, "declares a commit, never makes one");
+        testing::commit(
+            &mut core,
+            stranded,
+            KIND_SURFACE_MATERIALIZED,
+            surface(stranded),
+        );
+        testing::commit(&mut core, stranded, KIND_WORK_COMPLETED, json!({}));
+        testing::commit(
+            &mut core,
+            stranded,
+            KIND_SURFACE_TORN_DOWN,
+            old_shape_teardown(
+                stranded,
+                false,
+                json!({"disposition": "retained_dirty", "changes": " M half-done.rs"}),
+            ),
+        );
+
+        for work_id in [ordinary, stranded] {
+            let registry = core.registry.state();
+            let run = registry.run_view(work_id).expect("run");
+            assert!(
+                run.teardown.is_some(),
+                "{work_id}: the old-shape report must still deserialize, or \
+                 recovery's completion-tail sweep would treat this work as \
+                 stranded on every restart"
+            );
+            assert_eq!(
+                run.integrity, None,
+                "{work_id}: an absent assessment is 'not assessed', never clean"
+            );
+        }
+
+        let backends = BackendRegistry::new().with(Arc::new(
+            crate::backend::fake::FakeBackend::new(crate::backend::fake::FAKE_BACKEND_NAME),
+        ));
+        let engine = Engine::new(
+            Arc::new(backends),
+            Some(crate::backend::fake::FAKE_BACKEND_NAME.to_string()),
+            dir.path(),
+        );
+
+        let ordinary_view = work_view(&core, &engine, ordinary);
+        assert!(
+            ordinary_view["integrity"].is_null(),
+            "not assessed renders as null, not as a clean disposition: {ordinary_view}"
+        );
+        assert_eq!(ordinary_view["work"]["state"], "completed");
+        assert_eq!(
+            work_view(&core, &engine, stranded)["work"]["state"],
+            "completed_dirty",
+            "ADR 0007(b)'s output-pointer inference is unchanged by §11"
+        );
+
+        // And the new shape does carry its assessment through the same fold.
+        let assessed = "01NEWSHAPE0000000001";
+        testing::submit(&mut core, assessed, "assessed at retirement");
+        testing::commit(
+            &mut core,
+            assessed,
+            KIND_SURFACE_MATERIALIZED,
+            surface(assessed),
+        );
+        testing::commit(&mut core, assessed, KIND_WORK_COMPLETED, json!({}));
+        let mut payload = old_shape_teardown(assessed, true, json!({"disposition": "removed"}));
+        payload["report"]["bindings"][0]["findings"] = json!([{
+            "finding": "assigned_branch_mismatch",
+            "repository": "solo",
+            "worktree_path": "/data/surfaces/x/solo",
+            "expected_branch": format!("sergeant/{assessed}"),
+            "expected_sha": "0".repeat(40),
+            "observed_branch": "renegade",
+            "observed_sha": "1".repeat(40),
+            "evidence": "ended on renegade",
+        }]);
+        payload["integrity"] = json!("dirty");
+        testing::commit(&mut core, assessed, KIND_SURFACE_TORN_DOWN, payload);
+
+        let view = work_view(&core, &engine, assessed);
+        assert_eq!(view["integrity"]["disposition"], "dirty");
+        assert_eq!(
+            view["integrity"]["findings"][0]["finding"],
+            "assigned_branch_mismatch"
+        );
+        assert_eq!(
+            view["work"]["state"], "completed_dirty",
+            "a dirty completion reports the §11.5 compact label even without \
+             ADR 0007(b)'s stranded inference"
         );
     }
 }

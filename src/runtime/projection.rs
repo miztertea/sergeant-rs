@@ -30,6 +30,7 @@ use crate::domain::workflow::{
 };
 use crate::domain::workspace::InstructionIdentity;
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
+use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError};
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN, SurfacePlan,
@@ -377,6 +378,17 @@ pub struct WorkRun {
     /// Teardown report, once the surface has been torn down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub teardown: Option<TeardownReport>,
+    /// §11.5's integrity axis, as the retirement that recorded the teardown
+    /// assessed it. Orthogonal to [`Work::state`](crate::domain::work::Work),
+    /// which this never touches (ADR 0007(b)'s pattern: journal and view
+    /// metadata, not a state-machine value).
+    ///
+    /// `None` is **not assessed**, never clean: a `surface.torn_down`
+    /// journaled before this phase carries no assessment, and neither does
+    /// the rollback teardown `materialize` runs on a partial failure. Both
+    /// replay to `None` and every view says so (C3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity: Option<IntegrityDisposition>,
     /// Every stage attempt, in the order they were entered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stages: Vec<StageRecord>,
@@ -710,6 +722,10 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 let run = state.runs.entry(work_id.clone()).or_default();
                 run.surface = Some(surface);
                 run.teardown = None;
+                // A rematerialized surface has not been assessed again yet;
+                // carrying the previous retirement's verdict forward would
+                // report a fact about a teardown this run has replaced.
+                run.integrity = None;
             }
         }
         KIND_SURFACE_TORN_DOWN => {
@@ -717,7 +733,14 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                 event.work_id.as_ref(),
                 serde_json::from_value::<TeardownReport>(event.payload["report"].clone()),
             ) {
-                state.runs.entry(work_id.clone()).or_default().teardown = Some(report);
+                let run = state.runs.entry(work_id.clone()).or_default();
+                run.teardown = Some(report);
+                // Additive (§20.5 / C3): a `surface.torn_down` from before
+                // this phase — and the rollback teardown `materialize`
+                // journals on a partial failure — carry no `integrity` key,
+                // and `from_value(Null)` is an error, so both read back as
+                // "not assessed" rather than being defaulted to clean.
+                run.integrity = serde_json::from_value(event.payload["integrity"].clone()).ok();
             }
         }
         KIND_STAGE_ENTERED => {

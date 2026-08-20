@@ -1,4 +1,5 @@
-//! Runtime: journal, projections, git, surfaces, routing, engine, recovery.
+//! Runtime: journal, projections, git, surfaces, integrity, routing, engine,
+//! recovery.
 
 pub mod analytics;
 pub mod blob;
@@ -6,6 +7,7 @@ pub mod engine;
 pub(crate) mod fsutil;
 pub mod git;
 pub mod graph;
+pub mod integrity;
 pub mod journal;
 pub mod projection;
 pub mod recovery;

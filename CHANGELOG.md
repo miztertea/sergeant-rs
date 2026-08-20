@@ -10,6 +10,45 @@ released before a release can proceed.
 
 ## [Unreleased]
 
+### Added
+
+- **Terminal Works now report an integrity disposition (#173).** At
+  retirement, teardown reconciles what a Work's worktree *actually* held
+  against what its binding claimed: the branch HEAD ended on and its tip,
+  whether HEAD was detached, and whether the worktree and its source
+  checkout still agree on one Git common directory. Divergences are
+  recorded as a closed vocabulary of findings
+  (`assigned_worktree_uncommitted`, `assigned_worktree_missing`,
+  `assigned_branch_mismatch`, `assigned_head_detached_or_unreferenced`,
+  `assigned_common_dir_mismatch`), and a terminal Work carries a
+  `clean`/`dirty` integrity disposition beside — never inside — its state.
+  A dirty completion reports as `completed_dirty`; `failed` and `canceled`
+  keep their own state strings and carry the axis in the new `integrity`
+  key, which `sgt work list`, `sgt work show`, and the TUI's work detail
+  all render. Work state, the state machine, and the transition table are
+  unchanged.
+
+  Before this, a worktree that checked out a different branch and committed
+  there was reported as a clean removal at the untouched base SHA —
+  indistinguishable from a surface nothing ever touched — while removing
+  the worktree destroyed the only record of where the output had gone.
+
+- **Teardown no longer removes a worktree holding unreferenced commits.** A
+  worktree whose HEAD is detached at a commit no named ref is proven to
+  reach is retained (`retained_unreferenced`) rather than removed, and `sgt
+  work reap` declines it with the remedy named. A removed worktree's HEAD
+  stops being a garbage-collection root; retaining it is how commits
+  nothing else points at survive.
+
+- **Estate drift is observed at retirement.** One `git rev-parse HEAD` per
+  bound repository mount, compared against the commit the Work was cut
+  from. Reported with `attribution: unknown` and never used to make a Work
+  dirty: a mount moving during the Work window is not evidence the Work
+  moved it.
+
+  Journal changes are additive. A `surface.torn_down` recorded before this
+  release replays unchanged and reads as *not assessed* — never as clean.
+
 ### Documentation
 
 - **Corrected: the shell installer does not verify downloads.** `dist`'s

@@ -2598,6 +2598,141 @@ async fn a_stranded_completion_is_not_reported_as_plain_completed() {
     handle.shutdown().await;
 }
 
+/// #173 / §11.7 end to end: a run whose worktree ends on a *different* branch
+/// completes, and says so.
+///
+/// The defect this closes was silent by construction. `final_sha` is read
+/// from `refs/heads/sergeant/<work-id>` and `git status --porcelain` only
+/// asks whether anything is uncommitted, so a worktree that checked out
+/// another branch and committed there was clean by both measures: teardown
+/// reported `removed` at the base SHA, `sgt work show` reported plain
+/// `completed`, and `git worktree remove` deleted the only record of where
+/// the output had actually gone. §17's acceptance line — a worktree ending on
+/// another branch can no longer be reported clean, nor represented as though
+/// the expected branch contains its output — is what these assertions are.
+///
+/// Driven through the real daemon rather than `surface::teardown` directly,
+/// because the claim is about what an operator is told: the finding has to
+/// survive the journal, the projection fold, and both read paths (`work show`
+/// and `work list`) to be worth anything.
+#[tokio::test]
+async fn a_run_that_ends_on_the_wrong_branch_completes_dirty_and_keeps_both_branches() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let repo = repos.path().join("solo");
+    let base_sha = init_repo(&repo);
+    write_two_stage_workflow(&repo);
+
+    let (registry, _fake) = one_fake([
+        FakeStep::waiting("parks so the fixture can move the worktree"),
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &repo,
+        "commits somewhere else entirely",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let work_branch = format!("sergeant/{work_id}");
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // What an actor that mis-drives git does: switch off the assigned branch
+    // and commit the run's output there instead.
+    git(&worktree, &["checkout", "-b", "renegade"]);
+    std::fs::write(worktree.join("output.rs"), "fn main() {}\n").expect("write output");
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-m", "output, on the wrong branch"]);
+    let renegade_sha = git(&worktree, &["rev-parse", "HEAD"]);
+
+    // Retry re-enters the parked stage and the scripted run completes every
+    // remaining stage, driving the whole run through teardown.
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+
+    // A clean worktree on the wrong branch is still removed — the content is
+    // committed and both branches are durable — but the report names where
+    // it actually was.
+    assert_eq!(
+        body["teardown"]["bindings"][0]["disposition"], "removed",
+        "{body}"
+    );
+    assert_eq!(
+        body["teardown"]["bindings"][0]["observed_head"],
+        json!({"head": "branch", "branch": "renegade", "sha": renegade_sha}),
+        "{body}"
+    );
+
+    // §11.5's axis, and the §11.3 finding behind it.
+    assert_eq!(body["integrity"]["disposition"], "dirty", "{body}");
+    let finding = &body["integrity"]["findings"][0];
+    assert_eq!(finding["finding"], "assigned_branch_mismatch", "{body}");
+    assert_eq!(finding["expected_branch"], work_branch, "{body}");
+    assert_eq!(finding["expected_sha"], base_sha, "{body}");
+    assert_eq!(finding["observed_branch"], "renegade", "{body}");
+    assert_eq!(finding["observed_sha"], renegade_sha, "{body}");
+
+    // Work state is untouched (§11.5: no new transition target); only the
+    // reported label carries the axis.
+    assert_eq!(body["work"]["state"], "completed_dirty", "{body}");
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "still `Completed` underneath — terminal, not retryable"
+    );
+
+    // C5: distinguishable from `sgt work list`, not only from `work show`.
+    let list = get(&client, &handle, "/v1/work").await;
+    let row = list["works"]
+        .as_array()
+        .expect("works")
+        .iter()
+        .find(|w| w["id"] == work_id)
+        .expect("the work is listed");
+    assert_eq!(row["state"], "completed_dirty", "{list}");
+    assert_eq!(row["integrity"]["disposition"], "dirty", "{list}");
+
+    // §11.7 / §12.1: both named branches survive in the source repository,
+    // so the commit the run actually made is still reachable by name.
+    assert!(
+        branch_exists(&repo, &work_branch),
+        "the expected branch is always retained, advanced or not"
+    );
+    assert!(
+        branch_exists(&repo, "renegade"),
+        "the branch the run actually used is never deleted either"
+    );
+    assert_eq!(
+        git(&repo, &["rev-parse", "refs/heads/renegade"]),
+        renegade_sha,
+        "and it still points at the run's output"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A multi-repository submission where a later repository cannot be
 /// materialized: the earlier ones already have a real branch and worktree in
 /// the user's own checkouts. Those are rolled back and the report is

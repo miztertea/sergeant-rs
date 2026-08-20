@@ -529,6 +529,121 @@ mod tests {
         );
     }
 
+    /// A temp git repository with one commit, run with a fixture identity so
+    /// nothing depends on the machine's own git config.
+    fn repo(path: &std::path::Path) -> crate::domain::workspace::RepositorySpec {
+        std::fs::create_dir_all(path).expect("repo dir");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["commit", "--allow-empty", "-m", "initial"],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(path)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        }
+        crate::domain::workspace::RepositorySpec {
+            name: "solo".to_string(),
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// §11 through the completion tail's crash window (issue #9): a teardown
+    /// a crash swallowed is re-run at startup and produces the *same*
+    /// integrity assessment it would have produced at retirement, marked
+    /// `recovered`.
+    ///
+    /// This is the property that makes the assessment trustworthy at all.
+    /// `reconcile_terminal_surface` reaches the identical `settle_surface`
+    /// arm every live terminal path does, so there is one computation point
+    /// and not two — a second implementation here is precisely how a
+    /// recovered Work would come to be reported clean while the same disk
+    /// state assessed at retirement read dirty.
+    #[test]
+    fn a_crash_recovered_teardown_records_the_same_integrity_assessment() {
+        use crate::domain::work::KIND_WORK_COMPLETED;
+        use crate::runtime::integrity::IntegrityDisposition;
+        use crate::runtime::surface::{
+            KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN, materialize,
+        };
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(data.path());
+        let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path());
+
+        let work_id = "01RECOVEREDTEARDOWN00";
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        testing::submit(&mut core, work_id, "crashed before its teardown landed");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            json!({"surface": surface}),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_COMPLETED, json!({}));
+
+        // The run ended on another branch, and the crash landed before
+        // teardown could say so.
+        let output = std::process::Command::new("git")
+            .args(["checkout", "-b", "renegade"])
+            .current_dir(&worktree)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "checkout: {output:?}");
+
+        let report = reconcile(&engine, &mut core).expect("recovery");
+        assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
+
+        let torn = events(&core, work_id, KIND_SURFACE_TORN_DOWN);
+        assert_eq!(torn.len(), 1, "exactly one teardown is recorded");
+        assert_eq!(
+            torn[0]["recovered"], true,
+            "the trail shows when the teardown was recorded, not that it \
+             landed with the completion: {}",
+            torn[0]
+        );
+        assert_eq!(
+            torn[0]["integrity"], "dirty",
+            "a recovered teardown carries the same assessment a live one \
+             would have: {}",
+            torn[0]
+        );
+        assert_eq!(
+            torn[0]["report"]["bindings"][0]["findings"][0]["finding"], "assigned_branch_mismatch",
+            "{}",
+            torn[0]
+        );
+        assert_eq!(
+            core.registry
+                .state()
+                .run_view(work_id)
+                .expect("run")
+                .integrity,
+            Some(IntegrityDisposition::Dirty),
+            "and the projection folds it the same way the live path's does"
+        );
+        assert_eq!(
+            core.registry.state().works[work_id].state,
+            WorkState::Completed,
+            "integrity never moves Work state (§11.5)"
+        );
+    }
+
     /// Payloads of one work's events of one kind, in journal order.
     fn events(core: &Core, work_id: &str, kind: &str) -> Vec<serde_json::Value> {
         core.journal

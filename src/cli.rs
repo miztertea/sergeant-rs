@@ -790,7 +790,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                                     println!(
                                         "{}  {}  {}",
                                         work["id"].as_str().unwrap_or("?"),
-                                        work["state"].as_str().unwrap_or("?"),
+                                        list_state_label(work),
                                         work["intent"].as_str().unwrap_or("?"),
                                     );
                                 }
@@ -828,6 +828,12 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                                 "backend",
                                 "output",
                                 "teardown",
+                                // §11 / C5: the integrity disposition and
+                                // the §11.3 findings behind it, folded the
+                                // same way `teardown` and `output` are —
+                                // "was my output where it should be" is
+                                // answerable from this one command.
+                                "integrity",
                                 // MVP-3's envelope-visibility item: turns
                                 // spent/capped and the effective ceiling,
                                 // folded in the same way every other key
@@ -1291,6 +1297,26 @@ fn render_transcript(result: &Value) -> String {
         out.push_str("\n\n");
     }
     out
+}
+
+/// The `state` column of `sgt work list`, with §11.5's integrity axis folded
+/// in — amendment C5's acceptance criterion, that a terminal-dirty Work is
+/// distinguishable in *default* output and not only in `--json`.
+///
+/// A dirty completion already reads `completed_dirty`: the API's own
+/// `reported_state` is where that compact label is minted, and re-appending
+/// anything to it here would say the same thing twice. `failed` and
+/// `canceled` keep their true state strings (§11.5 adds no label for them and
+/// no transition target), so the axis is appended to the column instead —
+/// `failed/dirty` — which is exactly how §11.5 writes the orthogonal pair.
+fn list_state_label(work: &Value) -> String {
+    let state = work["state"].as_str().unwrap_or("?");
+    let dirty = work["integrity"]["disposition"].as_str() == Some("dirty");
+    if dirty && !state.ends_with("_dirty") {
+        format!("{state}/dirty")
+    } else {
+        state.to_string()
+    }
 }
 
 /// #109's inspect verb (`GET /v1/retained`, `sgt work retained`): every
@@ -3120,5 +3146,53 @@ mod tests {
     fn render_transcript_reports_no_conversation_without_a_timestamp_line() {
         let rendered = render_transcript(&json!({"turns": []}));
         assert_eq!(rendered, "no conversation recorded for this work\n");
+    }
+
+    fn listed_work(state: &str, disposition: Option<&str>) -> Value {
+        let mut work = json!({"id": "w-1", "state": state, "intent": "do the thing"});
+        if let Some(disposition) = disposition {
+            work["integrity"] = json!({"disposition": disposition});
+        }
+        work
+    }
+
+    /// C5's acceptance criterion for the two terminal states §11.5 mints no
+    /// compact label for: a dirty `failed` or `canceled` Work has to be
+    /// distinguishable in `sgt work list`'s *default* output, not only under
+    /// `--json`. Garbling or inverting the suffix branch in
+    /// `list_state_label` fails here and nowhere else — every other
+    /// dirty-work assertion in the suite reads the `/v1/work` JSON body.
+    #[test]
+    fn list_state_label_appends_the_integrity_axis_to_failed_and_canceled() {
+        assert_eq!(
+            list_state_label(&listed_work("failed", Some("dirty"))),
+            "failed/dirty"
+        );
+        assert_eq!(
+            list_state_label(&listed_work("canceled", Some("dirty"))),
+            "canceled/dirty"
+        );
+    }
+
+    /// The other half of the branch: `completed_dirty` is minted by the API's
+    /// own `reported_state`, so the column must not say it twice.
+    #[test]
+    fn list_state_label_does_not_re_suffix_a_state_already_carrying_the_axis() {
+        assert_eq!(
+            list_state_label(&listed_work("completed_dirty", Some("dirty"))),
+            "completed_dirty"
+        );
+    }
+
+    /// A clean or not-assessed Work keeps its true state string — absent
+    /// integrity is "not assessed" (C3), never a dirty rendering.
+    #[test]
+    fn list_state_label_leaves_clean_and_unassessed_states_alone() {
+        assert_eq!(
+            list_state_label(&listed_work("completed", Some("clean"))),
+            "completed"
+        );
+        assert_eq!(list_state_label(&listed_work("failed", None)), "failed");
+        assert_eq!(list_state_label(&listed_work("running", None)), "running");
     }
 }

@@ -32,6 +32,9 @@ use serde::{Deserialize, Serialize};
 use crate::domain::workspace::RepositorySpec;
 use crate::runtime::fsutil::create_dir_all_durable;
 use crate::runtime::git::{GitError, git, git_submodule_update, git_succeeds};
+use crate::runtime::integrity::{
+    DriftAttribution, EstateDriftObservation, IntegrityDisposition, IntegrityFinding, ObservedHead,
+};
 
 /// Directory under the data dir holding all work surfaces.
 pub const SURFACES_DIR: &str = "surfaces";
@@ -252,6 +255,24 @@ pub enum BindingDisposition {
         /// Why removal failed.
         detail: String,
     },
+    /// §11.7: the worktree's HEAD was detached at a commit no named ref in
+    /// the source repository is *proven* to reach. Removing it would leave
+    /// that commit unreferenced — reachable from nothing, and so a candidate
+    /// for git's own garbage collection — so teardown retains the worktree
+    /// instead. A retained worktree's HEAD is itself a gc root, which is
+    /// precisely what makes retention the fail-closed answer here.
+    ///
+    /// Distinct from [`RetainedError`](Self::RetainedError) on purpose: no
+    /// git command refused anything: sergeant *chose* not to remove this,
+    /// and an operator resolving it gives the commit a branch rather than
+    /// debugging a git failure. Additive on replay in the direction that
+    /// matters (C3): no event journaled before this phase can carry it.
+    RetainedUnreferenced {
+        /// The commit HEAD was detached at.
+        head_sha: String,
+        /// What was checked, and why removal was refused.
+        evidence: String,
+    },
 }
 
 /// Teardown outcome for one binding.
@@ -277,6 +298,21 @@ pub struct BindingTeardown {
     /// commit; otherwise it is whatever the branch already pointed at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_sha: Option<String>,
+    /// §11.7: what the worktree's HEAD **actually** pointed at when teardown
+    /// looked, as opposed to the `work_branch` just above, which is only what
+    /// this binding was assigned. `None` means *not assessed* — a vanished
+    /// worktree, a git that could not answer, or a `surface.torn_down`
+    /// journaled before this field existed (C3: additive, and absence never
+    /// reads as agreement).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_head: Option<ObservedHead>,
+    /// §11.3's directly attributable findings for this binding, in the order
+    /// teardown observed them. Empty means teardown found nothing to
+    /// attribute — which is not the same as "not assessed"; that is what an
+    /// absent `observed_head` says. `#[serde(default)]` so an old event
+    /// replays with no findings and no integrity assessment at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<IntegrityFinding>,
     /// What happened.
     #[serde(flatten)]
     pub disposition: BindingDisposition,
@@ -292,6 +328,50 @@ pub struct TeardownReport {
     /// Whether every worktree was removed cleanly. `false` means something
     /// was retained and is described in `bindings` — never silently dropped.
     pub clean: bool,
+    /// §11.4 (bounded by amendment C6): every bound repository mount whose
+    /// committed HEAD moved between this Work's binding base and its
+    /// retirement. Reported, never attributed, and never part of
+    /// [`TeardownReport::integrity`] — a mount moving during the Work window
+    /// is not evidence the Work moved it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drift: Vec<EstateDriftObservation>,
+}
+
+impl TeardownReport {
+    /// §11.5's orthogonal axis for this teardown.
+    ///
+    /// Dirty when either half of "core can account for this surface" fails:
+    ///
+    /// - any binding carries a §11.3 finding (the attributable half), or
+    /// - any binding was not retired cleanly — `!clean` (the *retirement*
+    ///   half). Every §11.3-nameable cause already yields its own finding, so
+    ///   this second clause only ever fires alone for a retention §11.3 has
+    ///   no vocabulary for: a `RetainedError` where `git status` itself
+    ///   refused, so teardown could not establish anything at all. Reporting
+    ///   that as clean would be the one answer the closed enum must not force
+    ///   — fail closed instead.
+    ///
+    /// Estate drift is deliberately absent from both clauses (§11.4).
+    ///
+    /// Computed, never stored on the report: `teardown` also runs as
+    /// `materialize`'s partial-failure *rollback*, which is not a retirement
+    /// and must not be journaled as an integrity assessment at all. The one
+    /// caller that applies this is the retirement path in
+    /// `Engine::settle_surface`.
+    pub fn integrity(&self) -> IntegrityDisposition {
+        if self.clean && self.bindings.iter().all(|b| b.findings.is_empty()) {
+            IntegrityDisposition::Clean
+        } else {
+            IntegrityDisposition::Dirty
+        }
+    }
+
+    /// Every binding's findings, flattened in binding order — what a view
+    /// renders when it wants "what was found", not "what happened per
+    /// repository".
+    pub fn findings(&self) -> impl Iterator<Item = &IntegrityFinding> {
+        self.bindings.iter().flat_map(|b| b.findings.iter())
+    }
 }
 
 /// Failure materializing a surface.
@@ -787,14 +867,21 @@ fn attach_one(
 /// honest outcome is a recorded report, which is what the caller journals.
 pub fn teardown(surface: &WorkSurface) -> TeardownReport {
     let mut bindings = Vec::with_capacity(surface.bindings.len());
+    let mut drift = Vec::new();
     for binding in &surface.bindings {
-        let (disposition, final_sha) = teardown_binding(binding);
+        // §11.4/C6: read the mount before this binding's own teardown
+        // touches anything, so `observed` is the estate as the Work left it
+        // rather than as teardown left it.
+        drift.extend(observe_estate_drift(binding));
+        let outcome = teardown_binding(binding);
         bindings.push(BindingTeardown {
             repository: binding.repository.clone(),
             worktree_path: binding.worktree_path.clone(),
             work_branch: binding.work_branch.clone(),
-            final_sha,
-            disposition,
+            final_sha: outcome.final_sha,
+            observed_head: outcome.observed_head,
+            findings: outcome.findings,
+            disposition: outcome.disposition,
         });
     }
     // The worktrees live one level *below* the surface root, so removing them
@@ -809,6 +896,7 @@ pub fn teardown(surface: &WorkSurface) -> TeardownReport {
         work_id: surface.work_id.clone(),
         bindings,
         clean,
+        drift,
     }
 }
 
@@ -894,6 +982,18 @@ pub fn retained_bindings(teardown: &TeardownReport) -> Vec<RetainedBinding> {
                     path: b.worktree_path.clone(),
                     reason: "retained_error",
                     detail: detail.clone(),
+                    bytes: directory_size(&b.worktree_path),
+                })
+            }
+            BindingDisposition::RetainedUnreferenced { evidence, .. } => {
+                if !b.worktree_path.exists() {
+                    return None;
+                }
+                Some(RetainedBinding {
+                    repository: b.repository.clone(),
+                    path: b.worktree_path.clone(),
+                    reason: "retained_unreferenced",
+                    detail: evidence.clone(),
                     bytes: directory_size(&b.worktree_path),
                 })
             }
@@ -1031,6 +1131,18 @@ fn reap_binding(surface: &WorkSurface, binding: &BindingTeardown) -> ReapOutcome
             reason: format!(
                 "teardown could not establish this worktree was clean ({detail}); resolve the \
                  underlying git error and retry teardown instead of reaping"
+            ),
+        },
+        // §11.7: reaping this would do exactly what teardown refused to do —
+        // drop the last reference to commits no named ref reaches. `reap` is
+        // an explicit operator action, but it is a *disk reclamation* verb,
+        // not a "destroy possible output" one, so it stops here and names the
+        // one-line remedy that makes the worktree ordinary again.
+        BindingDisposition::RetainedUnreferenced { head_sha, .. } => ReapOutcome::Skipped {
+            reason: format!(
+                "this worktree holds a detached HEAD at {head_sha} that no named ref reaches; \
+                 give the commit a branch (`git branch <name> {head_sha}`) and retry teardown \
+                 instead of reaping"
             ),
         },
         BindingDisposition::Removed | BindingDisposition::Missing => ReapOutcome::NothingRetained,
@@ -1195,7 +1307,150 @@ pub fn directory_size(path: &Path) -> u64 {
         .sum()
 }
 
-fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<String>) {
+/// What teardown observed and did for one binding: the disposition, plus the
+/// §11 evidence [`teardown`] folds into the [`BindingTeardown`] record.
+struct BindingOutcome {
+    /// What happened to the worktree.
+    disposition: BindingDisposition,
+    /// The retained branch's tip.
+    final_sha: Option<String>,
+    /// Where the worktree's HEAD actually was, when it could be read.
+    observed_head: Option<ObservedHead>,
+    /// §11.3 findings attributable to this binding.
+    findings: Vec<IntegrityFinding>,
+}
+
+/// Read what a worktree's HEAD actually points at (§11.7's first question).
+///
+/// A resolvable branch name is an attached HEAD; otherwise a resolvable
+/// commit is a detached one. If *neither* resolves, this returns `None`
+/// rather than inventing a classification: a worktree whose git cannot answer
+/// either question is not "detached", it is unreadable, and teardown's own
+/// `git status --porcelain` check below already fails that closed as a
+/// `RetainedError` carrying git's diagnostic.
+fn observe_head(worktree: &Path) -> Option<ObservedHead> {
+    match git(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Ok(branch) if !branch.is_empty() => Some(ObservedHead::Branch {
+            branch,
+            sha: git(worktree, &["rev-parse", "HEAD"]).ok(),
+        }),
+        _ => git(worktree, &["rev-parse", "HEAD"])
+            .ok()
+            .map(|sha| ObservedHead::Detached { sha }),
+    }
+}
+
+/// Whether any named ref in the source repository is **proven** to reach
+/// `sha` (§11.7's detached-HEAD test).
+///
+/// `git branch --contains` answers it directly for local branches. The
+/// second check is the same question asked of this binding's own work branch,
+/// which `--contains` would also have answered — kept because it is the ref
+/// §11.7 names explicitly and because it still answers if the first call
+/// fails for a reason that has nothing to do with reachability.
+///
+/// Every failure path returns `false`. "Not proven reachable" is the
+/// fail-closed answer, and the caller's response to `false` is to *keep* the
+/// worktree, so an error here can only ever cost a retained directory —
+/// never a lost commit.
+fn reachable_from_a_named_ref(binding: &RepositoryBinding, sha: &str) -> bool {
+    if matches!(
+        git(&binding.source_path, &["branch", "--contains", sha]),
+        Ok(ref out) if !out.is_empty()
+    ) {
+        return true;
+    }
+    git_succeeds(
+        &binding.source_path,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            sha,
+            &format!("refs/heads/{}", binding.work_branch),
+        ],
+    )
+}
+
+/// `git rev-parse --path-format=absolute --git-common-dir`, canonicalized.
+///
+/// Canonicalized because the comparison this feeds is about *identity*, not
+/// spelling: a source path reached through a symlink (`/tmp` → `/private/tmp`
+/// on macOS, an estate mount behind a symlinked parent) would otherwise
+/// answer differently from the worktree that shares its object store, and
+/// report a mismatch where there is none.
+fn common_dir(dir: &Path) -> Option<PathBuf> {
+    let raw = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let path = PathBuf::from(raw);
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// §11.3's `assigned_common_dir_mismatch`: the worktree and the checkout it
+/// is journaled against must agree on the Git common directory — the identity
+/// §2.7 locks on and the one that says these two paths really do share an
+/// object store.
+///
+/// Phase A asks the question at teardown, from both sides, which needs no
+/// binding schema change. Phase B pins the canonical common dir at admission,
+/// at which point the expected side comes from the binding rather than from
+/// re-asking the source checkout.
+///
+/// A read that fails on either side yields no finding: this is the *identity*
+/// check, and an unanswerable git is a different failure, already handled
+/// fail-closed by the status/removal path below.
+fn common_dir_finding(binding: &RepositoryBinding) -> Option<IntegrityFinding> {
+    let expected = common_dir(&binding.source_path)?;
+    let observed = common_dir(&binding.worktree_path)?;
+    if expected == observed {
+        return None;
+    }
+    Some(IntegrityFinding::AssignedCommonDirMismatch {
+        repository: binding.repository.clone(),
+        evidence: format!(
+            "the assigned worktree reports git common directory {} while its journaled source \
+             checkout {} reports {}",
+            observed.display(),
+            binding.source_path.display(),
+            expected.display()
+        ),
+        expected_common_dir: expected,
+        observed_common_dir: observed,
+    })
+}
+
+/// §11.4, bounded by amendment C6: one `git rev-parse HEAD` against this
+/// binding's declared mount, compared with the commit the binding was cut
+/// from. One call per bound repository, at retirement only — no worktree
+/// walking, no `git status`, no unselected-repository reads, no polling.
+///
+/// Only `BindingOrigin::Cut` bindings are compared. For an `Attached`
+/// binding, `base_sha` is carried over from the *target* Work's binding
+/// (see [`BindingOrigin`]) and is therefore not this Work's own record of
+/// what the mount was at admission — reporting a `before` that was never
+/// this Work's base would be a worse answer than reporting nothing.
+///
+/// Drift in repositories this Work never selected is out of scope here by
+/// construction: it needs the estate-bound daemon, and is Phase D's work.
+fn observe_estate_drift(binding: &RepositoryBinding) -> Option<EstateDriftObservation> {
+    if binding.origin != BindingOrigin::Cut {
+        return None;
+    }
+    let observed = git(&binding.source_path, &["rev-parse", "HEAD"]).ok()?;
+    if observed == binding.base_sha {
+        return None;
+    }
+    Some(EstateDriftObservation {
+        repository: binding.repository.clone(),
+        before: binding.base_sha.clone(),
+        observed,
+        attribution: DriftAttribution::Unknown,
+    })
+}
+
+fn teardown_binding(binding: &RepositoryBinding) -> BindingOutcome {
     // Read the retained branch's tip **before** taking the per-repository lock.
     // This call reads from ref storage only — it does not access the worktree
     // registry (`.git/worktrees/`) that `with_repository` protects, so running
@@ -1212,6 +1467,8 @@ fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<
     )
     .ok();
 
+    let mut findings = Vec::new();
+
     if !binding.worktree_path.exists() {
         // The directory is gone, but the source repository still lists it;
         // unregister it now so a later rematerialize at the same path is
@@ -1219,7 +1476,92 @@ fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<
         with_repository(&binding.source_path, || {
             prune_stale_worktrees(&binding.source_path);
         });
-        return (BindingDisposition::Missing, final_sha);
+        findings.push(IntegrityFinding::AssignedWorktreeMissing {
+            repository: binding.repository.clone(),
+            worktree_path: binding.worktree_path.clone(),
+            evidence: format!(
+                "the assigned worktree {} did not exist when teardown ran",
+                binding.worktree_path.display()
+            ),
+        });
+        return BindingOutcome {
+            disposition: BindingDisposition::Missing,
+            final_sha,
+            // Nothing left to read a HEAD from: not assessed, not agreed.
+            observed_head: None,
+            findings,
+        };
+    }
+
+    // §11.7's actual-vs-expected reconciliation, **before** the dirty check
+    // below, because the dirty check cannot see any of it: `git status
+    // --porcelain` answers "is there uncommitted content here", never "is
+    // this still the branch the binding was assigned" (§2.6 / #173). Both
+    // reads run in the worktree and touch only `.git/HEAD` and ref storage,
+    // not the `.git/worktrees/` registry `with_repository` protects, so they
+    // stay outside the lock like every other read on this path.
+    let observed_head = observe_head(&binding.worktree_path);
+    findings.extend(common_dir_finding(binding));
+    match &observed_head {
+        // A clean worktree on the *wrong* named branch is recorded and then
+        // removed exactly like any other clean worktree (§11.7). Both named
+        // branches stay durable: teardown deletes neither the expected
+        // `sergeant/<work-id>` nor the one that was actually used, so the
+        // commits on the observed branch remain reachable after the worktree
+        // that pointed at them is gone — which is what makes recording the
+        // branch and its tip here the whole fix rather than half of one.
+        Some(ObservedHead::Branch { branch, sha }) if *branch != binding.work_branch => {
+            findings.push(IntegrityFinding::AssignedBranchMismatch {
+                repository: binding.repository.clone(),
+                worktree_path: binding.worktree_path.clone(),
+                expected_branch: binding.work_branch.clone(),
+                expected_sha: final_sha.clone(),
+                observed_branch: branch.clone(),
+                observed_sha: sha.clone(),
+                evidence: format!(
+                    "the assigned worktree ended on branch {branch} rather than {}; both \
+                     branches are retained",
+                    binding.work_branch
+                ),
+            });
+        }
+        Some(ObservedHead::Detached { sha }) => {
+            let reachable = reachable_from_a_named_ref(binding, sha);
+            let evidence = format!(
+                "the assigned worktree ended with HEAD detached at {sha}; \
+                 `git branch --contains` and `merge-base --is-ancestor {}` \
+                 {} a named ref that reaches it",
+                binding.work_branch,
+                if reachable { "found" } else { "found no" }
+            );
+            findings.push(IntegrityFinding::AssignedHeadDetachedOrUnreferenced {
+                repository: binding.repository.clone(),
+                worktree_path: binding.worktree_path.clone(),
+                expected_branch: binding.work_branch.clone(),
+                observed_sha: sha.clone(),
+                reachable,
+                evidence: evidence.clone(),
+            });
+            if !reachable {
+                // Fail closed, and *before* the dirty check on purpose: the
+                // dirty path removes the worktree with `--force` once its
+                // content is captured as a patch, and a patch captures
+                // uncommitted content, never commits. Removing this worktree
+                // would leave the detached commits reachable from nothing at
+                // all. Retaining it keeps its HEAD as a gc root, so nothing
+                // possible output is destroyed.
+                return BindingOutcome {
+                    disposition: BindingDisposition::RetainedUnreferenced {
+                        head_sha: sha.clone(),
+                        evidence,
+                    },
+                    final_sha,
+                    observed_head,
+                    findings,
+                };
+            }
+        }
+        _ => {}
     }
 
     // Check whether the worktree is clean **before** taking the per-repository
@@ -1237,19 +1579,40 @@ fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<
             // Dirty: `retain_dirty` captures a patch and calls `git worktree
             // remove --force`, which does touch the registry.  Hold the lock
             // for that entire path.
+            //
+            // The finding rides *alongside* the existing retention machinery
+            // rather than replacing any of it (§11.7's first bullet): the
+            // disposition still says what was done with the content, the
+            // finding says what it means for the Work.
+            findings.push(IntegrityFinding::AssignedWorktreeUncommitted {
+                repository: binding.repository.clone(),
+                worktree_path: binding.worktree_path.clone(),
+                evidence: changes.clone(),
+            });
             let disposition =
                 with_repository(&binding.source_path, || retain_dirty(binding, changes));
-            return (disposition, final_sha);
+            return BindingOutcome {
+                disposition,
+                final_sha,
+                observed_head,
+                findings,
+            };
         }
         Ok(_) => {} // clean — proceed to the removal below
         Err(e) => {
-            // Cannot establish that it is clean ⇒ must not remove it.
-            return (
-                BindingDisposition::RetainedError {
+            // Cannot establish that it is clean ⇒ must not remove it. No
+            // §11.3 finding: the closed vocabulary has no kind for "git
+            // could not answer", and inventing `assigned_worktree_uncommitted`
+            // here would report content nothing observed. `TeardownReport::
+            // integrity` still fails this closed through `clean`.
+            return BindingOutcome {
+                disposition: BindingDisposition::RetainedError {
                     detail: e.to_string(),
                 },
                 final_sha,
-            );
+                observed_head,
+                findings,
+            };
         }
     }
 
@@ -1289,7 +1652,12 @@ fn teardown_binding(binding: &RepositoryBinding) -> (BindingDisposition, Option<
             },
         }
     });
-    (disposition, final_sha)
+    BindingOutcome {
+        disposition,
+        final_sha,
+        observed_head,
+        findings,
+    }
 }
 
 /// Ensure the parent directory of `worktree` exists and return the path as a
@@ -1963,25 +2331,31 @@ mod tests {
         );
     }
 
-    /// #173: today, teardown is blind to a worktree that switched off its
-    /// own `work_branch` before it was torn down. `final_sha` is read from
-    /// `refs/heads/<work_branch>` — deliberately, so it resolves even for a
-    /// `Missing` binding (see
+    /// #173, closed: a worktree that switched off its own `work_branch`
+    /// before teardown is reconciled and reported, not silently absorbed.
+    ///
+    /// This was Phase 0's contract pin. Teardown used to read `final_sha`
+    /// from `refs/heads/<work_branch>` — deliberately, so it resolves even
+    /// for a `Missing` binding (see
     /// `teardown_captures_the_retained_branchs_tip_as_the_finalize_commit`
-    /// above) — and `git status --porcelain` only asks "is the worktree
-    /// dirty", not "is it still on the branch this binding claims". A
+    /// above) — and ask `git status --porcelain` only "is the worktree
+    /// dirty", never "is it still on the branch this binding claims". A
     /// worktree that checks out a different branch and commits there is
-    /// clean by that check (nothing uncommitted) and leaves `work_branch`
-    /// itself exactly where it started, so teardown reports the base SHA
-    /// and a clean `Removed` disposition — indistinguishable from a surface
-    /// nothing ever touched — while `git worktree remove` deletes the
-    /// worktree that was the only record of which branch it had actually
-    /// ended up on. Phase A adds actual-vs-expected branch/HEAD/status
-    /// reconciliation at teardown and a closed integrity-finding enum so
-    /// this divergence is reported instead of silently absorbed.
-    // CONTRACT PIN (estate-root Phase A): teardown reports actual-vs-expected branch/HEAD divergence instead of a clean disposition at the base SHA.
+    /// clean by that check and leaves `work_branch` exactly where it
+    /// started, so the report was a clean `Removed` at the base SHA:
+    /// indistinguishable from a surface nothing ever touched, while
+    /// `git worktree remove` deleted the only record of where the run had
+    /// actually ended up.
+    ///
+    /// §11.7's answer, asserted below: the removal still happens (a clean
+    /// worktree on the wrong branch is still clean), but the divergence is
+    /// recorded first — `observed_head` names the branch and its tip, an
+    /// `assigned_branch_mismatch` finding carries expected-vs-observed, and
+    /// the report's integrity disposition is `dirty`. Both named branches
+    /// survive (§12.1), which is what makes recording the observed one a
+    /// usable pointer rather than an epitaph.
     #[test]
-    fn contract_pin_teardown_is_blind_to_a_worktree_switched_off_its_work_branch() {
+    fn teardown_reports_a_worktree_that_switched_off_its_work_branch() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let data = tempfile::TempDir::new().expect("tempdir");
         let spec = repo(&dir.path().join("solo"));
@@ -2008,40 +2382,368 @@ mod tests {
         );
 
         let report = teardown(&surface);
+        let binding = &report.bindings[0];
 
-        // The defect, pinned: a clean `Removed` disposition and the base
-        // SHA, as if nothing had ever happened in this worktree.
+        // A clean worktree on the wrong branch is still removed (§11.7): the
+        // content is committed and both branches are durable, so there is
+        // nothing here to fail closed over.
+        assert_eq!(binding.disposition, BindingDisposition::Removed);
+        assert!(!worktree.exists(), "a clean worktree is still removed");
+
+        // What used to be lost with it: where HEAD actually was.
         assert_eq!(
-            report.bindings[0].disposition,
-            BindingDisposition::Removed,
-            "today, switching branches inside the worktree does not stop teardown from \
-             reporting a clean removal"
+            binding.observed_head,
+            Some(ObservedHead::Branch {
+                branch: "renegade".to_string(),
+                sha: Some(renegade_commit.clone()),
+            }),
+            "teardown must record the branch the worktree actually ended on, and its tip"
         );
+
+        // `final_sha` keeps its documented meaning — the *retained branch's*
+        // tip, still at the base SHA because nothing advanced it — and the
+        // finding is what carries the divergence rather than overloading it.
+        assert_eq!(binding.final_sha.as_deref(), Some(base_sha.as_str()));
+        let [
+            IntegrityFinding::AssignedBranchMismatch {
+                repository,
+                expected_branch,
+                expected_sha,
+                observed_branch,
+                observed_sha,
+                ..
+            },
+        ] = binding.findings.as_slice()
+        else {
+            panic!("expected exactly one branch-mismatch finding: {binding:?}");
+        };
+        assert_eq!(repository, "solo");
+        assert_eq!(expected_branch, &work_branch_name);
+        assert_eq!(expected_sha.as_deref(), Some(base_sha.as_str()));
+        assert_eq!(observed_branch, "renegade");
+        assert_eq!(observed_sha.as_deref(), Some(renegade_commit.as_str()));
+
         assert_eq!(
-            report.bindings[0].final_sha.as_deref(),
-            Some(base_sha.as_str()),
-            "today, final_sha is the untouched work_branch ref — still at the base SHA — \
-             not the divergent commit the worktree actually ended up on"
+            report.integrity(),
+            IntegrityDisposition::Dirty,
+            "a branch mismatch makes the Work terminal-dirty (§11.5)"
         );
-        assert!(
-            !worktree.exists(),
-            "today, the worktree (the only record of the renegade branch's checkout) is removed"
-        );
-        // The renegade branch itself survives in the source repository's
-        // refs (worktrees share one ref store) — the commit is not
-        // destroyed — but nothing in the teardown report names it, and the
-        // work_branch this binding is journaled against never pointed at
-        // it, so no reconciliation done today can connect the two.
-        assert!(
-            git_succeeds(
-                &spec.path,
-                &["rev-parse", "--verify", "refs/heads/renegade"]
-            ),
-            "the renegade commit itself survives, orphaned from anything teardown reported"
-        );
+
+        // §11.7/§12.1: both named branches remain durable. Teardown deletes
+        // neither the expected one nor the one that was actually used, so
+        // the commit stays reachable and the report names the ref it is on.
+        for branch in [work_branch_name.as_str(), "renegade"] {
+            assert!(
+                git_succeeds(
+                    &spec.path,
+                    &["rev-parse", "--verify", &format!("refs/heads/{branch}")]
+                ),
+                "{branch} must still exist in the source repository after teardown"
+            );
+        }
         assert_ne!(
             work_branch_name, "renegade",
             "sanity: the binding's own work_branch was never the one switched to"
+        );
+    }
+
+    /// The baseline the rest of §11 is measured against: a surface that did
+    /// what it was asked reports `clean`, no findings, and a HEAD sitting on
+    /// exactly the branch the binding named.
+    ///
+    /// Worth its own test because "clean" is now a *computed* claim rather
+    /// than the absence of one — a reconciliation that produced spurious
+    /// findings would make every ordinary Work terminal-dirty, which is the
+    /// failure mode that turns a signal into noise (#94's own lesson).
+    #[test]
+    fn an_ordinary_teardown_reports_clean_integrity_on_the_expected_branch() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01CLEAN", std::slice::from_ref(&spec)).expect("materialize");
+        let base_sha = surface.bindings[0].base_sha.clone();
+
+        let report = teardown(&surface);
+        let binding = &report.bindings[0];
+
+        assert_eq!(binding.disposition, BindingDisposition::Removed);
+        assert_eq!(
+            binding.observed_head,
+            Some(ObservedHead::Branch {
+                branch: work_branch("01CLEAN"),
+                sha: Some(base_sha),
+            })
+        );
+        assert!(
+            binding.findings.is_empty(),
+            "an untouched surface must produce no findings: {:?}",
+            binding.findings
+        );
+        assert!(report.drift.is_empty(), "the mount never moved");
+        assert_eq!(report.integrity(), IntegrityDisposition::Clean);
+    }
+
+    /// §11.7's fail-closed case: a detached HEAD carrying commits no named
+    /// ref reaches **retains** the worktree.
+    ///
+    /// Removing it would drop the last reference to those commits — a
+    /// worktree's HEAD is a gc root, a removed worktree's is not — and
+    /// teardown never destroys possible output. The patch capture the dirty
+    /// path uses is no substitute here: it captures uncommitted content, and
+    /// these commits are exactly the opposite. `sgt work reap` must decline
+    /// for the same reason, with the remedy named rather than a refusal an
+    /// operator has to decode.
+    #[test]
+    fn teardown_retains_a_worktree_whose_detached_head_no_named_ref_reaches() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(data.path(), "01DETACHED", std::slice::from_ref(&spec))
+            .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        // Detach, then commit: the commit belongs to no branch at all.
+        git_as_test_identity(&worktree, &["checkout", "--detach"]);
+        std::fs::write(worktree.join("orphan.txt"), "unreferenced output\n").expect("write orphan");
+        git_as_test_identity(&worktree, &["add", "."]);
+        git_as_test_identity(&worktree, &["commit", "-m", "committed off any branch"]);
+        let orphan = git(&worktree, &["rev-parse", "HEAD"]).expect("orphan commit");
+        assert!(
+            git(&spec.path, &["branch", "--contains", &orphan])
+                .expect("branch --contains")
+                .is_empty(),
+            "the fixture must actually produce a commit no branch contains"
+        );
+
+        let report = teardown(&surface);
+        let binding = &report.bindings[0];
+
+        assert!(
+            matches!(
+                &binding.disposition,
+                BindingDisposition::RetainedUnreferenced { head_sha, .. } if head_sha == &orphan
+            ),
+            "expected the worktree to be retained: {:?}",
+            binding.disposition
+        );
+        assert!(
+            worktree.exists(),
+            "the worktree must survive — its HEAD is the only thing referencing the commit"
+        );
+        assert!(
+            git_succeeds(&spec.path, &["cat-file", "-e", &orphan]),
+            "the orphaned commit must still be in the object store"
+        );
+        let [
+            IntegrityFinding::AssignedHeadDetachedOrUnreferenced {
+                observed_sha,
+                reachable,
+                ..
+            },
+        ] = binding.findings.as_slice()
+        else {
+            panic!("expected one detached-HEAD finding: {binding:?}");
+        };
+        assert_eq!(observed_sha, &orphan);
+        assert!(!reachable, "no named ref reaches it");
+        assert_eq!(report.integrity(), IntegrityDisposition::Dirty);
+
+        // #109's inspect verb sees it, and reap declines rather than doing
+        // the one thing teardown refused to do.
+        let retained = retained_bindings(&report);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].reason, "retained_unreferenced");
+        let reaped = reap(&surface, &report);
+        assert!(
+            matches!(
+                &reaped.bindings[0].outcome,
+                ReapOutcome::Skipped { reason } if reason.contains(&orphan)
+            ),
+            "reap must decline and name the commit: {:?}",
+            reaped.bindings[0].outcome
+        );
+        assert!(worktree.exists(), "reap must not have removed it either");
+    }
+
+    /// The other half of §11.7's detached-HEAD rule: detachment is always a
+    /// finding, but a commit a named ref still reaches is not at risk, so the
+    /// worktree is removed exactly as any other clean one is.
+    ///
+    /// Without this half the fail-closed rule would retain every worktree a
+    /// workflow happened to leave detached at its own branch tip — honest
+    /// but useless, and #109's 30 GB of retained surfaces all over again.
+    #[test]
+    fn teardown_removes_a_worktree_whose_detached_head_is_still_reachable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(data.path(), "01REACHABLE", std::slice::from_ref(&spec))
+            .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        // Detached, but at the work branch's own tip: nothing is at risk.
+        git_as_test_identity(&worktree, &["checkout", "--detach"]);
+
+        let report = teardown(&surface);
+        let binding = &report.bindings[0];
+
+        assert_eq!(binding.disposition, BindingDisposition::Removed);
+        assert!(!worktree.exists());
+        let [IntegrityFinding::AssignedHeadDetachedOrUnreferenced { reachable, .. }] =
+            binding.findings.as_slice()
+        else {
+            panic!("expected one detached-HEAD finding: {binding:?}");
+        };
+        assert!(reachable, "the work branch itself reaches this commit");
+        assert_eq!(
+            report.integrity(),
+            IntegrityDisposition::Dirty,
+            "a detached HEAD is still attributable, even when nothing was lost"
+        );
+    }
+
+    /// A worktree that vanished before teardown reached it keeps its
+    /// `Missing` disposition — and now maps to the §11.3 finding for it, so
+    /// "the surface was not where it was supposed to be" is reportable rather
+    /// than only inferable from a disposition tag.
+    #[test]
+    fn a_vanished_worktree_maps_to_the_missing_finding_and_reads_dirty() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(data.path(), "01VANISHED", std::slice::from_ref(&spec))
+            .expect("materialize");
+        std::fs::remove_dir_all(&surface.bindings[0].worktree_path).expect("simulate vanished");
+
+        let report = teardown(&surface);
+        let binding = &report.bindings[0];
+
+        assert_eq!(binding.disposition, BindingDisposition::Missing);
+        assert!(
+            binding.observed_head.is_none(),
+            "there is no HEAD left to read: not assessed, not agreed"
+        );
+        assert!(matches!(
+            binding.findings.as_slice(),
+            [IntegrityFinding::AssignedWorktreeMissing { .. }]
+        ));
+        assert_eq!(report.integrity(), IntegrityDisposition::Dirty);
+    }
+
+    /// #109's retention machinery is untouched by §11: an uncommitted
+    /// worktree still captures its patch and still reports `retained_dirty`.
+    /// The finding rides *alongside* it — the disposition says what was done
+    /// with the content, the finding says what it means for the Work.
+    #[test]
+    fn an_uncommitted_worktree_yields_the_finding_beside_the_existing_retention() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01DIRTY", std::slice::from_ref(&spec)).expect("materialize");
+        std::fs::write(surface.bindings[0].worktree_path.join("wip.rs"), "//\n").expect("dirty");
+
+        let report = teardown(&surface);
+        let binding = &report.bindings[0];
+
+        assert!(
+            matches!(
+                binding.disposition,
+                BindingDisposition::RetainedDirty { patch: Some(_), .. }
+            ),
+            "#109's patch capture must be unchanged: {:?}",
+            binding.disposition
+        );
+        let [IntegrityFinding::AssignedWorktreeUncommitted { evidence, .. }] =
+            binding.findings.as_slice()
+        else {
+            panic!("expected one uncommitted finding: {binding:?}");
+        };
+        assert!(
+            evidence.contains("wip.rs"),
+            "the finding carries git's own porcelain evidence: {evidence}"
+        );
+        assert_eq!(report.integrity(), IntegrityDisposition::Dirty);
+    }
+
+    /// §11.3's `assigned_common_dir_mismatch`: a worktree that answers with a
+    /// different canonical Git common directory than the checkout it is
+    /// journaled against is not the worktree the binding thinks it is — the
+    /// same identity §2.7/§9.4 needs the interprocess lock keyed on.
+    ///
+    /// Reproduced by handing teardown a binding whose `source_path` names a
+    /// *different* repository than the worktree actually belongs to, which is
+    /// exactly the shape a mis-journaled or aliased mount would have.
+    #[test]
+    fn a_worktree_whose_common_dir_disagrees_with_its_source_checkout_is_a_finding() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mine = repo(&dir.path().join("mine"));
+        let stranger = repo(&dir.path().join("stranger"));
+        let surface = materialize(data.path(), "01COMMONDIR", std::slice::from_ref(&mine))
+            .expect("materialize");
+
+        let mut misbound = surface.clone();
+        misbound.bindings[0].source_path = stranger.path.clone();
+
+        let report = teardown(&misbound);
+        let binding = &report.bindings[0];
+
+        assert!(
+            binding
+                .findings
+                .iter()
+                .any(|f| matches!(f, IntegrityFinding::AssignedCommonDirMismatch { .. })),
+            "expected a common-dir mismatch: {:?}",
+            binding.findings
+        );
+        assert_eq!(report.integrity(), IntegrityDisposition::Dirty);
+        // Fail closed all the way through: the worktree belongs to a
+        // repository this teardown was not pointed at, so nothing removed it.
+        assert!(surface.bindings[0].worktree_path.exists());
+    }
+
+    /// §11.4, bounded by amendment C6: a mount whose committed HEAD moved
+    /// during the Work window is *observed* — one `rev-parse` per bound
+    /// repository, at retirement — and attributed to nobody.
+    ///
+    /// The assertion that matters most is the negative one: drift does not
+    /// make the Work dirty. Captain, an editor, another Work, or an unrelated
+    /// process may have advanced that mount, and reporting a Work dirty for
+    /// something it cannot be shown to have done is exactly the false signal
+    /// §11.4 exists to prevent.
+    #[test]
+    fn estate_drift_is_observed_at_teardown_and_never_makes_the_work_dirty() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface =
+            materialize(data.path(), "01DRIFT", std::slice::from_ref(&spec)).expect("materialize");
+        let base_sha = surface.bindings[0].base_sha.clone();
+
+        // Somebody else advances the mount while the Work runs.
+        std::fs::write(spec.path.join("unrelated.txt"), "not this work\n").expect("write");
+        git_as_test_identity(&spec.path, &["add", "."]);
+        git_as_test_identity(&spec.path, &["commit", "-m", "somebody else's commit"]);
+        let moved = git(&spec.path, &["rev-parse", "HEAD"]).expect("moved head");
+
+        let report = teardown(&surface);
+
+        assert_eq!(
+            report.drift,
+            vec![EstateDriftObservation {
+                repository: "solo".to_string(),
+                before: base_sha,
+                observed: moved,
+                attribution: DriftAttribution::Unknown,
+            }]
+        );
+        assert!(report.bindings[0].findings.is_empty());
+        assert_eq!(
+            report.integrity(),
+            IntegrityDisposition::Clean,
+            "estate drift is reported, never attributed, and never dirty (§11.4)"
         );
     }
 
@@ -2925,6 +3627,8 @@ mod tests {
             worktree_path: dir.path().join("some-other-worktree"),
             work_branch: "sergeant/01INSPECT".to_string(),
             final_sha: None,
+            observed_head: None,
+            findings: Vec::new(),
             disposition: BindingDisposition::RetainedError {
                 detail: "fatal: could not read status".to_string(),
             },
@@ -3006,6 +3710,8 @@ mod tests {
             worktree_path: dir.path().join("untouched"),
             work_branch: "sergeant/01REAP".to_string(),
             final_sha: None,
+            observed_head: None,
+            findings: Vec::new(),
             disposition: BindingDisposition::RetainedError {
                 detail: "fatal: could not read status".to_string(),
             },
