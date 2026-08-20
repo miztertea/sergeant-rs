@@ -37,9 +37,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: reclaim runner disk (the stage scripts enforce a 10 GB floor)
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          components: llvm-tools
+      - name: rustup toolchain install (rust-toolchain.toml pins the version; -c adds llvm-tools for cargo-llvm-cov)
+        run: rustup toolchain install -c llvm-tools
       - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-llvm-cov
