@@ -3832,8 +3832,13 @@ fn a4_a_crash_between_completion_and_teardown_is_swept_on_restart() {
             path: repo.clone(),
         };
         // A real surface, materialized exactly as the engine materializes it.
-        let surface =
-            materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("materialize");
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            work_id,
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
         submit_work(&mut core, work_id, "completed just before the crash");
         commit(
             &mut core,
@@ -3976,7 +3981,13 @@ fn a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept(
         name: "dirty".to_string(),
         path: repo.clone(),
     };
-    let surface = materialize(data.path(), work_id, std::slice::from_ref(&spec)).expect("surface");
+    let surface = materialize(
+        data.path(),
+        data.path(),
+        work_id,
+        std::slice::from_ref(&spec),
+    )
+    .expect("surface");
     submit_work(&mut core, work_id, "canceled with work still in the tree");
     commit(
         &mut core,

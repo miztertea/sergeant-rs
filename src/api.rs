@@ -2546,7 +2546,11 @@ async fn reap_work(
     // its duration. Reap is rare and explicit, never on a hot path, so this
     // is accepted rather than plumbed through the async effect system the
     // way `teardown` itself is.
-    let report = blocking_sync(|| reap(&surface, &teardown));
+    // `state.data_dir` is this daemon's own storage — where §9.4's
+    // interprocess repository locks live. Reap's one guarded span (a `git
+    // worktree remove --force` on a retained-dirty binding) takes the same
+    // lock every other registry mutation in the surface module does.
+    let report = blocking_sync(|| reap(&state.data_dir, &surface, &teardown));
     let result = json!({"report": report});
     record_and_respond(
         &mut core,

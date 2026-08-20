@@ -548,6 +548,12 @@ pub struct InterruptOutcome {
 /// included, queueing behind someone else's checkout.
 pub struct PendingSurface {
     work_id: String,
+    /// The daemon's data dir, carried so [`Self::perform`] can locate the
+    /// interprocess repository locks (§9.4). Deliberately separate from
+    /// `SurfaceEffect::Materialize`'s `surfaces_root`, which R-MVP1-1 unbound
+    /// from the data dir: an estate may put its surfaces anywhere, and the
+    /// locks still live in the daemon's own storage.
+    data_dir: PathBuf,
     effect: SurfaceEffect,
 }
 
@@ -610,6 +616,7 @@ impl PendingSurface {
                 surfaces_root,
                 plan,
             } => SurfaceOutcome::Materialized(materialize(
+                &self.data_dir,
                 surfaces_root,
                 &self.work_id,
                 &plan.repositories,
@@ -621,9 +628,11 @@ impl PendingSurface {
                 if surface.bindings.iter().all(|b| b.worktree_path.exists()) {
                     return SurfaceOutcome::Rematerialized(Ok(None));
                 }
-                SurfaceOutcome::Rematerialized(rematerialize(surface).map(Some))
+                SurfaceOutcome::Rematerialized(rematerialize(&self.data_dir, surface).map(Some))
             }
-            SurfaceEffect::Teardown { surface, .. } => SurfaceOutcome::TornDown(teardown(surface)),
+            SurfaceEffect::Teardown { surface, .. } => {
+                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface))
+            }
         }
     }
 }
@@ -1520,6 +1529,7 @@ impl Engine {
         Ok(Step {
             next: Next::Surface(Box::new(PendingSurface {
                 work_id: work.id.clone(),
+                data_dir: self.data_dir.clone(),
                 effect: SurfaceEffect::Materialize {
                     surfaces_root: plan.surfaces_root.clone(),
                     plan: Box::new(plan.clone()),
@@ -1936,6 +1946,7 @@ impl Engine {
             return Ok(Step {
                 next: Next::Surface(Box::new(PendingSurface {
                     work_id: work_id.to_string(),
+                    data_dir: self.data_dir.clone(),
                     effect: SurfaceEffect::Rematerialize {
                         surface,
                         index: current.index,
@@ -3896,6 +3907,7 @@ impl Engine {
         }
         Next::Surface(Box::new(PendingSurface {
             work_id: work_id.to_string(),
+            data_dir: self.data_dir.clone(),
             effect: SurfaceEffect::Teardown { surface, recovered },
         }))
     }
@@ -4987,6 +4999,8 @@ mod tests {
                 work_branch: format!("sergeant/{work_id}"),
                 head_sha: "1".repeat(40),
                 origin: BindingOrigin::Cut,
+                canonical_top_level: Some(PathBuf::from("/repos/solo")),
+                canonical_common_dir: Some(PathBuf::from("/repos/solo/.git")),
             }
         }
 
