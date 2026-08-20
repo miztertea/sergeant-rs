@@ -24,7 +24,7 @@ is never rewritten and no gap is ever filled with invented content.
 
 ## Behavior contract
 
-- **The intent document under review is checked against exactly the eight dimensions AGENTS.md's `### INTENT — Captain's intent discipline` names (Objective, Required Invariants, Approved Tradeoffs, Out Of Scope, State Transitions, Failure Windows, Negative Test Matrix, Validation Evidence) — that section is the authoritative list; this stage does not maintain its own copy of it.**
+- **The intent document under review is checked against exactly the eight dimensions named in AGENTS.md's `### INTENT — Captain's intent discipline` — this stage reads that section as the authoritative list rather than maintaining its own copy of it, and if that section cannot be found, this stage reports that rather than inventing a dimension list to check against.**
   (trigger: an intent document is under review; outcome: the review's dimension set can never silently drift from AGENTS.md's own list)
 - **Each dimension is reported as exactly one of `covered`, `gap`, or `not-applicable`: `covered` cites where in the intent it is addressed; `gap` names specifically what is missing; `not-applicable` states the reason that dimension does not apply to this objective.**
   (trigger: the review reaches a dimension; outcome: every dimension has an unambiguous, checkable disposition — never a vague "mostly fine")

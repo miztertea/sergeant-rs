@@ -305,10 +305,11 @@ or state-transition territory (the same fixed keyword set `dispatch`'s
   is trusted done.
 
 This is Captain discipline, not engine validation. `sgt run --intent-file`
-transports the file's contents as the intent verbatim and validates only
-mechanics — the leaf must not be a symlink, must be a regular file, is
-capped at 1 MiB, and must be valid UTF-8 (`sgt run --help`'s own text for
-the flag) — never a section, a schema, or any other content shape. The
+transports the file's contents as the intent verbatim (`sgt run --help`'s
+own text for the flag) and validates only mechanics — the leaf must not be
+a symlink, must be a regular file, is capped at 1 MiB, and must be valid
+UTF-8 (`src/cli.rs`'s `read_intent_file`) — never a section, a schema, or
+any other content shape. The
 discipline of actually writing the eight dimensions lives here, applied by
 whoever composes the file; `sgt` itself cannot tell a covered dimension
 from an absent one.

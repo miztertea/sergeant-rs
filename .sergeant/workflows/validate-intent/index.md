@@ -17,13 +17,12 @@ tags:
 
 # Validate Intent
 
-Reviews an intent document — the Work's own intent text — against
-AGENTS.md's `### INTENT — Captain's intent discipline` eight dimensions
-(Objective, Required Invariants, Approved Tradeoffs, Out Of Scope, State
-Transitions, Failure Windows, Negative Test Matrix, Validation Evidence),
-reporting each dimension `covered`, `gap` (naming what's missing), or
-`not-applicable` (with a reason). Never rewrites the intent and never
-invents content to fill a gap — it reports, nothing more.
+Reviews an intent document — the Work's own intent text — against the
+eight dimensions named in AGENTS.md's `### INTENT — Captain's intent
+discipline` — the authoritative list — reporting each dimension
+`covered`, `gap` (naming what's missing), or `not-applicable` (with a
+reason). Never rewrites the intent and never invents content to fill a
+gap — it reports, nothing more.
 
 Filed as issue #201. Optional tooling: a Captain may run this before an
 expensive or dangerous dispatch to check an intent's own coverage before

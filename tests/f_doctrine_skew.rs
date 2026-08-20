@@ -494,11 +494,9 @@ fn classify_risk_states_the_real_intent_file_mechanics() {
     );
     assert!(
         context_md.contains(
-            "The eight-dimension risk brief (Objective, Required Invariants, Approved \
-             Tradeoffs, Out Of Scope, State Transitions, Failure Windows, Negative Test \
-             Matrix, Validation Evidence) is Captain's own discipline, stated once in \
-             AGENTS.md's `### INTENT — Captain's intent discipline` — the one home for that \
-             list; this stage points at it rather than restating it."
+            "The eight-dimension risk brief named in AGENTS.md's `### INTENT — Captain's \
+             intent discipline` — the authoritative list — is Captain's own discipline, \
+             stated once there; this stage points at it rather than restating it."
         ),
         "05-classify-risk/CONTEXT.md no longer points at AGENTS.md's INTENT section as the \
          one home for the eight dimensions — update this test and the doctrine text together"
