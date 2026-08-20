@@ -489,7 +489,7 @@ the earlier draft's.
   manifest. That does not bound growth; it relocates it. **Rejected.**
 - **Persist the command *keys*, not the outcomes.** The manifest carries the
   archived `command_id` set, plus the `command_id → work_id` mapping for
-  submits (two ULIDs, ~60 B/entry; ~10 MB at 250k commands — the same order
+  submits (two ULIDs plus JSON framing, ~90-100 B/entry for submits and ~60 B otherwise; ~15-20 MB at 250k commands — the same order
   as the index rows). A retried below-floor `command_id` is then **refused
   with a named error, never re-executed**, and for a submit the refusal
   names the Work that command already created. **Adopted.**
@@ -1472,7 +1472,7 @@ growth per turn and per Work against a real Claude backend and a real Docker
 execute stage — the term every existing baseline omits, because P1-PERF ran
 the fake backend throughout. Add a reduced-mark run on macOS and inside WSL2
 to replace the assumed 2× slow-platform penalty with a measurement. This is
-the gate the 2026-08-11 ruling set on Rule C and it blocks issue 4.
+the gate the 2026-08-11 ruling set on Rule C and it blocks issue 5.
 
 **4. `[journal] Give Replay an explicit floor and specify every below-floor read`**
 `Replay::new` hardcodes `expected = 1` and `Replay::after` only overrides it
