@@ -237,3 +237,32 @@ installer checksum verification, and a real `publish: true` dry run of
 `release.yml` itself — none of which is a condition-5 veto candidate, all
 of which are narrower follow-up measurements rather than reasons to
 reconsider the tool choice.
+
+## Amendment, 2026-08-19
+
+Condition 3's verdict above ("pass, with a precise caveat") measured that
+the generated installer's *mechanics* — download, unpack, install, PATH
+wiring — work and produce a runnable binary. It did not measure whether
+those mechanics *verify* what they install, and the verdict text does not
+claim that they do. This amendment narrows the record because the
+distinction was since found to matter in practice: v0.1.0 published a real
+release with real `.sha256` files, the "no checksums to verify" line this
+measurement's "What this does NOT show" section already flagged as
+unexercised reproduced exactly as installed from that release, and
+inspection of the installer script (`sergeant-rs-installer.sh`, the same
+artifact this measurement generated) shows why — `_checksum_style` and
+`_checksum_value` are declared as locals and tested (`if [ -n
+"${_checksum_style:-}" ]`) but never assigned anywhere in the script
+outside `verify_checksum()`'s own parameter binding, so the verification
+branch this measurement's local-server run happened not to exercise is not
+merely unexercised — it is unreachable, for every install, on every
+platform, not a config gap specific to that ad hoc test setup.
+
+Nothing above is rewritten: mechanics-correct and verification-absent are
+both true, and this measurement only ever established the first. The
+second was never measured here, and this amendment is the record of that
+narrowing, not a correction of a wrong conclusion. The documented,
+deliberate verification path (`sha256sum -c` plus `gh attestation verify`)
+is now in README.md; `.github/workflows/release.yml`'s `package-installer`
+job comment is corrected to match. See CHANGELOG.md's `[Unreleased]`
+entry.
