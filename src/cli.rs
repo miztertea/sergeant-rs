@@ -575,6 +575,42 @@ fn admit_root(dir: &Path, source: RootSource) -> Result<EstateRoot, CliError> {
     })
 }
 
+/// Which rung of [`resolve_data_dir`]'s ladder produced the path — owner
+/// ruling #80: `--data-dir` and `SGT_DATA_DIR` outrank a manifest
+/// declaration and the estate-local default unconditionally, which in turn
+/// outrank the pre-estate platform fallback. Naming free, kept private to
+/// this file: nothing outside `resolve_data_dir` and its two immediate
+/// callers needs to distinguish these by name today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataDirSource {
+    /// `--data-dir`.
+    Flag,
+    /// `SGT_DATA_DIR`.
+    Env,
+    /// The estate manifest's own `[estate] data_dir` (ADR 0008(b)).
+    Manifest,
+    /// `<estate_root>/.sergeant/data` — no manifest declaration, but `root`
+    /// is an estate root.
+    EstateDefault,
+    /// The pre-estate platform fallback ([`crate::platform::data_dir`]).
+    PlatformFallback,
+}
+
+impl DataDirSource {
+    /// ADR 0008: `$XDG_DATA_HOME` is set in the environment, but the
+    /// winning rung was one estate-first resolution reached *before* the
+    /// platform fallback tail — the one rung that would actually have
+    /// consulted it — was ever tried. `Flag`/`Env` also outrank it, but
+    /// deliberately, by design the operator invoked directly; this is
+    /// narrower, naming only the case where a declared or estate-local
+    /// default silently won a race the operator's environment suggests
+    /// they expected `$XDG_DATA_HOME` to run.
+    fn xdg_outranked(self) -> bool {
+        matches!(self, DataDirSource::Manifest | DataDirSource::EstateDefault)
+            && std::env::var_os("XDG_DATA_HOME").is_some()
+    }
+}
+
 /// Resolve the data dir: `--data-dir` flag, `SGT_DATA_DIR` — both unchanged,
 /// unconditional precedence — then (U-R2, MVP-3's estate-resolved default)
 /// the estate at `root`, when `root` is one. The default there is the
@@ -595,18 +631,31 @@ fn admit_root(dir: &Path, source: RootSource) -> Result<EstateRoot, CliError> {
 /// **Estate-root Phase D:** the "discovered estate" rung is now the *exact*
 /// root, never an upward walk. The flag/env rungs above it are untouched —
 /// they locate a data dir, and have never substituted for root validation.
-fn resolve_data_dir(flag: Option<PathBuf>, root: &Path) -> Result<PathBuf, CliError> {
+///
+/// Returns the winning rung alongside the path (#80) so a caller can surface
+/// *why* this path won, not just what it is.
+fn resolve_data_dir(
+    flag: Option<PathBuf>,
+    root: &Path,
+) -> Result<(PathBuf, DataDirSource), CliError> {
     if let Some(dir) = flag {
-        return Ok(dir);
+        return Ok((dir, DataDirSource::Flag));
     }
     if let Some(dir) = std::env::var_os("SGT_DATA_DIR") {
-        return Ok(PathBuf::from(dir));
+        return Ok((PathBuf::from(dir), DataDirSource::Env));
     }
     if Estate::is_estate_root(root)? {
-        return Ok(Estate::root_data_dir_override(root)?
-            .unwrap_or_else(|| root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR)));
+        return Ok(match Estate::root_data_dir_override(root)? {
+            Some(dir) => (dir, DataDirSource::Manifest),
+            None => (
+                root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR),
+                DataDirSource::EstateDefault,
+            ),
+        });
     }
-    crate::platform::data_dir::fallback_dir(|name| std::env::var_os(name)).map_err(CliError::new)
+    crate::platform::data_dir::fallback_dir(|name| std::env::var_os(name))
+        .map(|dir| (dir, DataDirSource::PlatformFallback))
+        .map_err(CliError::new)
 }
 
 /// §4.2: which commands require an exact estate root, and which are
@@ -641,7 +690,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
     } else {
         None
     };
-    let data_dir = resolve_data_dir(
+    let (data_dir, data_dir_source) = resolve_data_dir(
         sgt.data_dir,
         estate.as_ref().map(|e| e.path.as_path()).unwrap_or(&root),
     )?;
@@ -1030,7 +1079,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             crate::tui::run(client).await.map_err(CliError::from)
         }
         Command::Doctor => {
-            let report = doctor::run(&data_dir, &root).await;
+            let report = doctor::run(&data_dir, &root, data_dir_source.xdg_outranked()).await;
             if sgt.json {
                 print_json(&report.to_json());
             } else {
@@ -1060,8 +1109,8 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // fresh estate estate discovery had nothing to find yet and
             // this report would otherwise self-check the pre-estate
             // fallback and call it `[ok]` (#164).
-            let data_dir = resolve_data_dir(data_dir_flag, &cwd)?;
-            let report = doctor::run(&data_dir, &cwd).await;
+            let (data_dir, data_dir_source) = resolve_data_dir(data_dir_flag, &cwd)?;
+            let report = doctor::run(&data_dir, &cwd, data_dir_source.xdg_outranked()).await;
             if sgt.json {
                 print_json(&json!({
                     "outcome": {
@@ -2175,8 +2224,12 @@ pub(crate) mod doctor {
         }
     }
 
-    /// Run every check against `data_dir`.
-    pub async fn run(data_dir: &Path, root: &Path) -> Report {
+    /// Run every check against `data_dir`. `xdg_outranked` is #80's own
+    /// fact from `cli::resolve_data_dir`'s resolution — whether
+    /// `$XDG_DATA_HOME` was set but never reached because estate-first
+    /// resolution already won; threaded down to `data_dir_check` so its
+    /// `ok` detail can disclose the precedence, not just the outcome.
+    pub async fn run(data_dir: &Path, root: &Path, xdg_outranked: bool) -> Report {
         let mut checks = vec![git_check(), claude_check(data_dir), environment_check()];
         // #67: the data dir's own existence and writability is checked
         // before anything that lives *inside* it — the docker adapter's
@@ -2186,7 +2239,7 @@ pub(crate) mod doctor {
         // Threading `data_dir_ok` down mirrors `journal_ok` below: the
         // checks that depend on it decline by name instead of re-deriving
         // (and re-explaining) the same root cause.
-        let (data_dir_check, data_dir_ok) = data_dir_check(data_dir);
+        let (data_dir_check, data_dir_ok) = data_dir_check(data_dir, xdg_outranked);
         checks.push(data_dir_check);
         // #85, ADR 0003 D6: whether this data dir's filesystem supports
         // reliable advisory locking, independent of `data_dir_ok` — this
@@ -3055,7 +3108,12 @@ pub(crate) mod doctor {
     /// stalled. Walking up to the nearest ancestor that *does* exist and
     /// probing that instead turns "permission denied" on a path that was
     /// never created into one remedy row naming the actual offending parent.
-    fn data_dir_check(data_dir: &Path) -> (Check, bool) {
+    ///
+    /// #80/ADR 0008: `xdg_outranked` only ever adds a detail line to the
+    /// `ok` outcome — a set-but-outranked `$XDG_DATA_HOME` is disclosure,
+    /// not a fault; it never demotes this row to `warn` and never adds a
+    /// row of its own.
+    fn data_dir_check(data_dir: &Path, xdg_outranked: bool) -> (Check, bool) {
         let generic_remedy = format!(
             "create {} and make it writable by this user (or point --data-dir / SGT_DATA_DIR \
              somewhere that is)",
@@ -3097,10 +3155,14 @@ pub(crate) mod doctor {
         match std::fs::write(&probe, b"doctor") {
             Ok(()) => {
                 let _ = std::fs::remove_file(&probe);
-                (
-                    Check::ok("data_dir", format!("{} is writable", data_dir.display())),
-                    true,
-                )
+                let mut detail = format!("{} is writable", data_dir.display());
+                if xdg_outranked {
+                    detail.push_str(
+                        " (resolved via the estate root; $XDG_DATA_HOME is set but outranked \
+                         here — estate-first resolution, ADR 0008)",
+                    );
+                }
+                (Check::ok("data_dir", detail), true)
             }
             Err(e) => (
                 Check::fail(
