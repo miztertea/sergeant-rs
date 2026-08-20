@@ -69,7 +69,96 @@ released before a release can proceed.
   repository list, so a later manifest edit cannot rewrite what an
   already-journaled Work meant.
 
+- **`sgt -C <estate-root>`** names an estate explicitly instead of requiring
+  a `cd` (gauntlet finding C10, approved by the owner 2026-08-20). It is a
+  global flag on every verb, and it names an **exact** root: no search
+  happens from it, and it is validated by exactly the rule the current
+  directory is. The CLI is agent-first — an agent should not have to mutate
+  its own working directory to address an estate.
+
+- **`sgt doctor` gains an `estate_root` row.** It reports whether the
+  directory it was run from is an estate root at all — `ok` naming the root
+  when it is, `fail` carrying the remedy when it is not. `doctor` still
+  works outside an estate, still never searches upward, and still never
+  starts a daemon.
+
+### Changed
+
+- **An estate is now exactly the current directory (estate-root proposal
+  §4).** Every estate-scoped command — `run`, `status`, `work *`,
+  `respond`/`retry`/`extend`/`cancel`, `watch`, `analytics`, `tui`,
+  `daemon`, `repo *`, `group *`, `workflow *`, and the `claude`/`codex`/
+  `opencode`/`goose` harnesses — requires the working directory itself to
+  contain a `sergeant.toml` that parses, declares `[estate]`, and satisfies
+  the schema. **Sergeant no longer searches parent directories**, and no
+  longer infers an estate from Git. Running `sgt run` from
+  `repos/payments-api` used to find the estate above it; it now refuses,
+  names the path it expected, explains that parents are not searched, and
+  tells you to `cd` to the root (or `sgt init` here). Only bare `sgt`,
+  `--help`, `--version`, `sgt init` and `sgt doctor` work outside a root.
+
+  Validation happens before the data directory is resolved, before the
+  runtime descriptor is read, before any daemon is spawned or contacted,
+  before any repository is inspected, and before a harness is prepared or
+  exec'd — so a directory mistake cannot attach to, or spawn, the wrong
+  daemon.
+
+  **Upgrade note:** if you have been running `sgt` from inside a repository
+  mount, `cd` to the estate root or pass `-C <estate-root>`. If you relied
+  on the zero-configuration single-repository mode — a plain git checkout
+  with no `sergeant.toml` — run `sgt init` there once; a one-repository
+  installation is now an estate with one declared repository.
+
+- **A daemon belongs to one estate.** Daemon startup takes a canonical
+  estate root and refuses to come up if it is not one. The runtime
+  descriptor records `estate_root` and `manifest_path`, and every client
+  verifies that root against its own before using the endpoint: a daemon
+  bound to another estate is a named refusal listing both roots, never a
+  connection and never a second daemon over the same data dir. The engine
+  plans against that bound estate rather than rediscovering topology from
+  each request's working directory, which removes the recursion hazard
+  where a command launched from inside a Work surface rediscovered that
+  linked worktree as a new workspace. `origin.cwd` is still recorded, as
+  evidence only.
+
+  The descriptor schema is `sergeant.runtime/v2`. There is no compatibility
+  shim: a `v1` descriptor left by an older build carries no estate root, so
+  a client cannot verify the binding at all and fails closed with the
+  remedy — stop the old daemon and let a restarted one republish.
+
+- **Repository mounts are derived, not configured (§6).** `[[repo]] path`
+  is **removed** from `sergeant.toml`. Every repository is mounted at
+  `<estate-root>/repos/<name>`, and that is the only place it can be. A
+  manifest still declaring `path` is refused with a message naming the
+  removal, not a generic unknown-field error. Mounts are validated on load:
+  a missing mount, a symlinked or aliased one whose real Git top level is
+  elsewhere, and a linked worktree offered as a repository source are each
+  refused by name, reporting the expected derived path alongside the actual
+  top level or common directory. Separate estates use separate clones, even
+  for the same upstream repository.
+
+  **Upgrade note:** delete every `path = "..."` line from your
+  `sergeant.toml`'s `[[repo]]` entries. If a checkout is not already at
+  `repos/<name>`, move or re-clone it there. `sgt repo add` writes the new
+  shape and clones to exactly that path; `sgt repo remove` still undeclares
+  without deleting the checkout.
+
+- **`sgt <harness>` binds the estate explicitly.** It validates the exact
+  root first, then exports `SGT_ESTATE_ROOT`, `SGT_DATA_DIR` and
+  `SGT_ORIGIN_CLIENT` and starts the harness in the root. The environment
+  helps later invocations name the correct root; it never waives the
+  exact-root check — `cd` into a mount inside a bound session and `sgt run`
+  still refuses, naming both roots and how to return.
+
 ### Removed
+
+- **Upward estate discovery and the zero-configuration Git fallback are
+  gone.** `Workspace::discover`, `discover_scoped`, the `find_estate_upward`
+  ancestor walk and the `git rev-parse --show-toplevel` fallback beneath it
+  are deleted outright, not merely left uncalled. R-MVP1-12 is superseded;
+  ADR 0008 carries an amendment recording that the manifest keeps its
+  storage-path authority while the *discovery* of the manifest becomes
+  exact-root only.
 
 - **`--workspace` is gone, from the CLI and the wire.** The daemon is bound
   to exactly one estate; a client-supplied workspace label had no role left
