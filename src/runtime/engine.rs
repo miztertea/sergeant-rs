@@ -1555,7 +1555,24 @@ impl Engine {
                 SurfaceOutcome::Rematerialized(result),
             ) => self.settle_rematerialize(core, &work_id, &surface, index, attempt, result),
             (SurfaceEffect::Teardown { recovered, .. }, SurfaceOutcome::TornDown(report)) => {
-                let mut payload = json!({"report": report});
+                // §11.5's orthogonal axis, computed at the one point every
+                // terminal path converges on: cancel (`begin_retire_run`),
+                // failure and completion (`settle_stage`'s signal arms), and
+                // the crash-recovery re-run (`reconcile_terminal_surface`,
+                // which reaches here through this same arm and therefore
+                // records the same assessment, marked `recovered`).
+                //
+                // Deliberately *not* computed inside `teardown()`: the same
+                // function also runs as `materialize`'s partial-failure
+                // rollback, which is not a retirement and journals its report
+                // with no `integrity` key at all (see `settle_materialize`).
+                // An absent key means not assessed — never clean (C3).
+                //
+                // A sibling key rather than a field inside `report`: additive
+                // to the payload, so an old `surface.torn_down` deserializes
+                // into the same `TeardownReport` it always did.
+                let integrity = report.integrity();
+                let mut payload = json!({"report": report, "integrity": integrity});
                 if recovered {
                     payload["recovered"] = Value::Bool(true);
                 }
