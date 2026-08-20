@@ -54,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-26]
     runs-on: ${{ matrix.os }}
     # Cold DuckDB C++ build (~500 TUs, ~10 min) plus the real suites; wide
     # margin on purpose, matching coverage.yml's posture for the same build.
@@ -68,7 +68,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # macOS's plain `bash` here resolves to the system-frozen 3.2.57 (ADR
-      # 0004, D7) — GitHub's macos-latest image does not preinstall a newer
+      # 0004, D7) — GitHub's macos-26 image does not preinstall a newer
       # Homebrew bash ahead of it on PATH. `cargo test` includes
       # tests/m6_surfaces.rs t4, which spawns `scripts/demo.sh` via
       # `Command::new("bash")`, so this job's test run is what ADR 0004 means

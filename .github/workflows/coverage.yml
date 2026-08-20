@@ -28,7 +28,7 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Cold instrumented DuckDB (~500 C++ TUs) is unmeasured on 2-core
     # runners; the 4-core dev-container estimate was 15-25 min. Wide
     # margin on purpose (review finding 4).

@@ -103,7 +103,7 @@ jobs:
   # invariant before anything else runs. Failing here creates no tag and no
   # release — this job does nothing but check facts.
   gate-a-repo-state:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -192,7 +192,7 @@ jobs:
   # included, so a known RustSec advisory cannot silently enter a release.
   gate-e-cargo-deny:
     needs: gate-a-repo-state
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -217,7 +217,7 @@ jobs:
   # PR.
   gate-f-distro-validator:
     needs: gate-a-repo-state
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -233,15 +233,19 @@ jobs:
   # Only after A-F. Measured on real GitHub-hosted runners, both targets,
   # 2026-08-18 (docs/measure-dist-2026-08-18.md, proposal §10 condition 1):
   # `dist build` successfully builds sgt with bundled DuckDB and packages it
-  # on both ubuntu-latest (897s cold build) and macos-latest (1002s cold
+  # on both ubuntu-24.04 (897s cold build) and macos-26 (1002s cold
   # build), with no disk or cache pressure on either. Binary behavioral
   # equivalence and the generated installer's correctness (conditions 2-3)
-  # were additionally measured against a real archive on ubuntu-latest
+  # were additionally measured against a real archive on ubuntu-24.04
   # (docs/measure-dist-conditions-2026-08-18.md) and found identical to an
   # ordinary `cargo build --release` binary, including the embedded distro.
+  # (ubuntu-24.04/macos-26 are the exact images the prior floating-alias
+  # runner labels served on the 2026-08-18 measurement date — the runner
+  # below is now pinned to those images directly, so this measurement is
+  # not stale relative to the pin.)
   #
   # aarch64-apple-darwin per ADR 0001's measured-target set: the *build*
-  # succeeded on a real macos-latest runner (above), but binary equivalence
+  # succeeded on a real macos-26 runner (above), but binary equivalence
   # and installer correctness were not re-measured on macOS — see docs/adr/
   # 0018-measured-vocabulary-obligation-clean-build-not-full-validation.md,
   # which clarifies ADR 0001 D8's "measured" vocabulary. Per that ruling,
@@ -262,9 +266,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-26
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -333,7 +337,7 @@ jobs:
       - gate-d-coverage
       - gate-e-cargo-deny
       - gate-f-distro-validator
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -373,9 +377,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-26
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -414,9 +418,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-26
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -460,7 +464,7 @@ jobs:
       - smoke-test
       - sbom
       - package-installer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       id-token: write
@@ -639,7 +643,7 @@ jobs:
   publish:
     needs: draft-release
     if: ${{ inputs.mode == 'publish' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -663,7 +667,7 @@ jobs:
   verify-latest:
     needs: [draft-release, publish]
     if: ${{ inputs.mode == 'publish' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:

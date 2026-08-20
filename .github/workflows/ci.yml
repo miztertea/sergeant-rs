@@ -27,7 +27,7 @@ env:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -53,7 +53,7 @@ jobs:
     # target mode, so it cannot enforce the scripts/ floor. The macos-check
     # job below only runs `cargo check` (type-check, no test execution), so
     # it does NOT exercise scripts/demo.sh; the real enforcement of the
-    # bash-3.2 floor is matrix.yml's full-suite `cargo test` on macos-latest
+    # bash-3.2 floor is matrix.yml's full-suite `cargo test` on macos-26
     # (via tests/m6_surfaces.rs t4's scripts/demo.sh subprocess), which runs
     # on PR-to-main, nightly, and release — not on every push. Gated at
     # --severity=error only: a 2026-08-14 sweep of all 25 scripts/**/*.sh
@@ -63,7 +63,7 @@ jobs:
     # on intentionally-external vars). Triaging those individually is out of
     # scope here; this still gives every future change a real,
     # currently-clean gate against actual shell bugs.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck (errors only — see comment above for the warning backlog)
@@ -73,14 +73,14 @@ jobs:
     # ADR 0004 (D9) / ADR 0002 (D2): the macOS module is `#[cfg]`-selected and
     # not compiled at all on Linux, so breaking it is invisible locally — this
     # is the compensating lane, run per push. `cargo check` on an actual
-    # macos-latest runner rather than a literal Linux->macOS cross-compile:
+    # macos-26 runner rather than a literal Linux->macOS cross-compile:
     # the `duckdb` dependency's `bundled` feature compiles DuckDB's C++ from
     # source via its own build script, which needs a real Apple toolchain
     # (cross-compiling that from Linux needs an osxcross-style Apple SDK
     # extraction that hosted runners don't carry). Since this repo is public,
-    # a real macos-latest runner is free and unmetered (ADR 0004 D9), so it's
+    # a real macos-26 runner is free and unmetered (ADR 0004 D9), so it's
     # both cheaper and more faithful than fighting a cross C++ toolchain.
-    runs-on: macos-latest
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -102,7 +102,7 @@ jobs:
     # Cargo.toml's rust-version were added. Check only, no clippy — lint
     # policy belongs to the pinned dev compiler (rust-toolchain.toml), not
     # to this deliberately-older floor.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Single source of truth for this job's two 1.89.0 uses below. Keep in
       # sync with Cargo.toml's rust-version (see the comment there) — YAML
@@ -126,7 +126,7 @@ jobs:
     # unchanged Cargo.lock and turn an unrelated documentation PR red
     # overnight. Advisories are a release-time gate instead: release.yml's
     # Gate E runs the full `cargo deny check`, including advisories.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -146,7 +146,7 @@ jobs:
     # where there is no PR diff to review, so the job is scoped out there
     # rather than running meaninglessly or failing for lack of a base ref.
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
