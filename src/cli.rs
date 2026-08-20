@@ -790,7 +790,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                                     println!(
                                         "{}  {}  {}",
                                         work["id"].as_str().unwrap_or("?"),
-                                        work["state"].as_str().unwrap_or("?"),
+                                        list_state_label(work),
                                         work["intent"].as_str().unwrap_or("?"),
                                     );
                                 }
@@ -828,6 +828,12 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                                 "backend",
                                 "output",
                                 "teardown",
+                                // §11 / C5: the integrity disposition and
+                                // the §11.3 findings behind it, folded the
+                                // same way `teardown` and `output` are —
+                                // "was my output where it should be" is
+                                // answerable from this one command.
+                                "integrity",
                                 // MVP-3's envelope-visibility item: turns
                                 // spent/capped and the effective ceiling,
                                 // folded in the same way every other key
@@ -1291,6 +1297,26 @@ fn render_transcript(result: &Value) -> String {
         out.push_str("\n\n");
     }
     out
+}
+
+/// The `state` column of `sgt work list`, with §11.5's integrity axis folded
+/// in — amendment C5's acceptance criterion, that a terminal-dirty Work is
+/// distinguishable in *default* output and not only in `--json`.
+///
+/// A dirty completion already reads `completed_dirty`: the API's own
+/// `reported_state` is where that compact label is minted, and re-appending
+/// anything to it here would say the same thing twice. `failed` and
+/// `canceled` keep their true state strings (§11.5 adds no label for them and
+/// no transition target), so the axis is appended to the column instead —
+/// `failed/dirty` — which is exactly how §11.5 writes the orthogonal pair.
+fn list_state_label(work: &Value) -> String {
+    let state = work["state"].as_str().unwrap_or("?");
+    let dirty = work["integrity"]["disposition"].as_str() == Some("dirty");
+    if dirty && !state.ends_with("_dirty") {
+        format!("{state}/dirty")
+    } else {
+        state.to_string()
+    }
 }
 
 /// #109's inspect verb (`GET /v1/retained`, `sgt work retained`): every

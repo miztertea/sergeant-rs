@@ -732,6 +732,53 @@ impl WorkScreen {
         }
         blank(&mut lines);
 
+        // §11 (C5): the integrity axis is orthogonal to the reported state
+        // above, so it gets its own card rather than being folded into it.
+        // A null `integrity` key is *not assessed* — a Work whose surface
+        // never retired, or a teardown journaled before the axis existed —
+        // and says so rather than rendering "clean".
+        heading("Integrity (§11)", &mut lines);
+        let integrity = &self.work["integrity"];
+        if integrity.is_null() {
+            lines.push(kv("disposition", "not assessed"));
+        } else {
+            lines.push(kv("disposition", &field_text(&integrity["disposition"])));
+            match integrity["findings"].as_array() {
+                Some(findings) if !findings.is_empty() => {
+                    for finding in findings {
+                        lines.push(kv(
+                            &field_text(&finding["finding"]),
+                            &format!(
+                                "{}  {}",
+                                field_text(&finding["repository"]),
+                                field_text(&finding["evidence"]),
+                            ),
+                        ));
+                    }
+                }
+                _ => lines.push(kv("findings", "-")),
+            }
+            // §11.4: drift is reported, never attributed, and never part of
+            // the disposition above.
+            match integrity["drift"].as_array() {
+                Some(drift) if !drift.is_empty() => {
+                    for observation in drift {
+                        lines.push(kv(
+                            &format!("drift {}", field_text(&observation["repository"])),
+                            &format!(
+                                "{} -> {}  attribution {}",
+                                field_text(&observation["before"]),
+                                field_text(&observation["observed"]),
+                                field_text(&observation["attribution"]),
+                            ),
+                        ));
+                    }
+                }
+                _ => lines.push(kv("estate drift", "-")),
+            }
+        }
+        blank(&mut lines);
+
         heading("Output (§13.8)", &mut lines);
         match self.work["output"]["repositories"].as_array() {
             Some(repos) if !repos.is_empty() => {
@@ -1504,6 +1551,72 @@ mod tests {
         assert!(
             text.contains("respond"),
             "action matrix names respond: {text}"
+        );
+    }
+
+    /// §11 (C5): the integrity axis is visible in the Details pane, and an
+    /// unassessed Work says so rather than reading as clean.
+    ///
+    /// The negative half is the one worth pinning. A pane that rendered a
+    /// missing `integrity` key as "clean" would be the TUI inventing the
+    /// exact fact amendment C3 forbids the journal from inventing.
+    #[test]
+    fn the_details_pane_shows_the_integrity_axis_and_its_findings() {
+        let text = |screen: &WorkScreen| {
+            screen
+                .details_lines()
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let unassessed = text(&screen_with("completed", Vec::new()));
+        assert!(unassessed.contains("Integrity"), "{unassessed}");
+        assert!(
+            unassessed.contains("not assessed"),
+            "an absent assessment must not read as clean: {unassessed}"
+        );
+
+        let mut body = work_body("completed_dirty");
+        body["integrity"] = json!({
+            "disposition": "dirty",
+            "findings": [{
+                "finding": "assigned_branch_mismatch",
+                "repository": "svc-a",
+                "worktree_path": "/data/surfaces/01WORK/svc-a",
+                "expected_branch": "sergeant/01WORK",
+                "expected_sha": "abc123",
+                "observed_branch": "renegade",
+                "observed_sha": "def456",
+                "evidence": "the assigned worktree ended on branch renegade",
+            }],
+            "drift": [{
+                "repository": "svc-a",
+                "before": "abc123",
+                "observed": "999999",
+                "attribution": "unknown",
+            }],
+        });
+        let assessed = text(&WorkScreen::from_parts(
+            "01WORK".to_string(),
+            body,
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
+        assert!(assessed.contains("dirty"), "{assessed}");
+        assert!(
+            assessed.contains("assigned_branch_mismatch"),
+            "the finding kind is named: {assessed}"
+        );
+        assert!(
+            assessed.contains("renegade"),
+            "and its evidence with it: {assessed}"
+        );
+        assert!(
+            assessed.contains("unknown"),
+            "§11.4's drift keeps its unknown attribution on screen: {assessed}"
         );
     }
 
