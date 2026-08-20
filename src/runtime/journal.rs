@@ -92,6 +92,12 @@ pub enum JournalError {
         line: u64,
         /// Parse failure.
         source: serde_json::Error,
+        /// Whether this could be a live writer's torn in-progress append
+        /// rather than corruption — see [`JournalError::is_possible_torn_tail`].
+        /// Always `false` from [`first_seq`], which only ever reads a
+        /// segment's first line and has no "is this the end of everything"
+        /// context to classify with.
+        possible_torn_tail: bool,
     },
     /// Replay found a seq that is not exactly `expected` — a gap (found >
     /// expected) or a duplicate/regression (found <= previous). Fail closed.
@@ -137,6 +143,35 @@ pub enum JournalError {
         /// The largest index the file-name scheme can represent.
         max: u64,
     },
+}
+
+impl JournalError {
+    /// True iff this could be a live writer's torn in-progress append rather
+    /// than corruption (issue #169's L6 question, answered): the failing
+    /// line is the last line of the last segment, with nothing readable
+    /// after it — exactly the shape `append_event`'s single unbuffered
+    /// `write_all` can leave for a reader racing it, and the *only* shape
+    /// it can leave, since rotation always starts a fresh segment before
+    /// the writer appends to it. A concurrent reader of a live journal
+    /// (`Journal::replay_data_dir` included) may observe exactly this case
+    /// and must tolerate/retry it; every other `Malformed` — a torn or
+    /// invalid line with something well-formed after it, or one anywhere
+    /// but the last segment — is corruption, not a race, and must not be
+    /// retried away.
+    ///
+    /// `false` for every other error variant, and for a `Malformed` from
+    /// [`Journal::replay`]'s own tail-recovering `open` path (which never
+    /// leaves a torn line to see in the first place) or from `first_seq`
+    /// (which has no "is this the very end" context to classify with).
+    pub fn is_possible_torn_tail(&self) -> bool {
+        matches!(
+            self,
+            JournalError::Malformed {
+                possible_torn_tail: true,
+                ..
+            }
+        )
+    }
 }
 
 /// Single-writer handle to the segmented journal.
@@ -422,6 +457,19 @@ impl Journal {
 
     /// Replay a journal directory without opening a writer handle (and
     /// without tail recovery). Useful for read-only inspection and tests.
+    ///
+    /// Without a writer handle there is no exclusive lock stopping this from
+    /// running against a *live* journal a daemon is actively appending to
+    /// (`sgt doctor`'s own journal check is exactly that caller). A reader
+    /// racing `append_event`'s single unbuffered `write_all` can therefore
+    /// observe a torn partial line — always the last line of the last
+    /// segment, since rotation never leaves a torn write behind a later
+    /// segment. [`JournalError::is_possible_torn_tail`] names that one
+    /// case; a caller reading a journal it does not know to be quiescent
+    /// must tolerate or retry it rather than treating it as corruption.
+    /// Every other `Malformed` — anywhere else, or with something readable
+    /// after it — is corruption, not a race, and must fail closed exactly
+    /// as it does today.
     pub fn replay_data_dir(data_dir: impl AsRef<Path>) -> Result<Replay, JournalError> {
         Ok(Replay::new(list_segments(
             &data_dir.as_ref().join("journal"),
@@ -536,6 +584,7 @@ fn first_seq(path: &Path) -> Result<Option<u64>, JournalError> {
             .unwrap_or_default(),
         line: 1,
         source,
+        possible_torn_tail: false,
     })?;
     Ok(Some(event.seq))
 }
@@ -587,10 +636,24 @@ impl Iterator for Replay {
                         Ok(ev) => ev,
                         Err(source) => {
                             self.failed = true;
+                            // A live writer's `append_event` is a single
+                            // unbuffered `write_all` (issue #169): a reader
+                            // racing it can observe a torn partial line, but
+                            // only ever as the very last line of the very
+                            // last segment — rotation always creates a *new*
+                            // segment before the writer appends to it, so a
+                            // torn write can never leave a well-formed line
+                            // after it. Peeking one more line (safe: this
+                            // iterator is dead the instant `failed` is set)
+                            // tells that apart from real corruption, which
+                            // always has something readable following it.
+                            let nothing_after = lines.next().is_none();
+                            let is_last_segment = self.segments.len() == 0;
                             return Some(Err(JournalError::Malformed {
                                 segment: segment.clone(),
                                 line: self.line_no,
                                 source,
+                                possible_torn_tail: nothing_after && is_last_segment,
                             }));
                         }
                     };
@@ -1156,5 +1219,93 @@ pub(crate) mod tests {
         let segments = list_segments(dir.path()).expect("list");
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].0, MAX_SEGMENT_INDEX);
+    }
+
+    /// #169's L6 question, answered: a torn line — no trailing newline,
+    /// exactly the shape `append_event`'s single unbuffered `write_all` can
+    /// leave for a reader racing it — as the last content of the last
+    /// segment classifies as a possible torn tail. `replay_data_dir` is the
+    /// caller this matters for: unlike `Journal::open`, it deliberately
+    /// skips tail recovery, so it is the one path that can actually observe
+    /// the race rather than have it silently fixed up first.
+    #[test]
+    fn a_torn_final_line_is_a_possible_torn_tail() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut journal = Journal::open(dir.path()).expect("open");
+            journal.append(draft(1)).expect("append 1");
+        }
+        let seg = dir.path().join("journal").join(segment_file_name(1));
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("open segment");
+        // No trailing newline — a write_all caught mid-flight, never
+        // anything an append path or tail recovery would leave behind.
+        write!(f, r#"{{"schema":"sergeant.event/v1","seq":2"#).expect("write torn line");
+        drop(f);
+
+        let results: Vec<_> = Journal::replay_data_dir(dir.path())
+            .expect("replay")
+            .collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "the torn line is still yielded, as an error"
+        );
+        assert!(results[0].is_ok());
+        match &results[1] {
+            Err(e @ JournalError::Malformed { line: 2, .. }) => {
+                assert!(
+                    e.is_possible_torn_tail(),
+                    "a torn final line must classify as a possible torn tail: {e:?}"
+                );
+            }
+            other => panic!("expected a Malformed error at line 2, got {other:?}"),
+        }
+    }
+
+    /// The other half: a malformed line with something well-formed *after*
+    /// it is corruption, not a race. `append_event` can never leave a torn
+    /// write with more content behind it — rotation always starts a fresh
+    /// segment before the writer appends to it — so this shape can only
+    /// mean real corruption, and it must never be tolerated or retried.
+    /// Reuses the exact fixture `m1_event_core`'s
+    /// `seq_gap_or_duplicate_fails_closed` test already builds for
+    /// "malformed line mid-journal", classified from the other side.
+    #[test]
+    fn a_torn_middle_line_is_not_a_possible_torn_tail() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut journal = Journal::open(dir.path()).expect("open");
+            journal.append(draft(1)).expect("append 1");
+        }
+        let seg = dir.path().join("journal").join(segment_file_name(1));
+        let valid_line = serde_json::to_string(&draft(2).into_event(2)).expect("serialize");
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(&seg)
+            .expect("open segment");
+        // Newline-terminated garbage — not crash-truncated — with a
+        // well-formed line after it.
+        writeln!(f, "{{this is not an event}}").expect("write garbage line");
+        writeln!(f, "{valid_line}").expect("write valid line after garbage");
+        drop(f);
+
+        let results: Vec<_> = Journal::replay_data_dir(dir.path())
+            .expect("replay")
+            .collect();
+        assert_eq!(results.len(), 2, "replay stops at the malformed line");
+        assert!(results[0].is_ok());
+        match &results[1] {
+            Err(e @ JournalError::Malformed { line: 2, .. }) => {
+                assert!(
+                    !e.is_possible_torn_tail(),
+                    "a malformed line with something readable after it must never \
+                     read as a torn tail: {e:?}"
+                );
+            }
+            other => panic!("expected a Malformed error at line 2, got {other:?}"),
+        }
     }
 }
