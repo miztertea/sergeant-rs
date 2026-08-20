@@ -27,7 +27,7 @@
 //!
 //! # Reuse, not a second opinion
 //!
-//! Checks 1–4 are exactly what [`estate::validate_mount`] already decides
+//! Checks 1–4 are exactly what [`validate_mount`] already decides
 //! while resolving a manifest (Phase D); this calls that same function per
 //! *selected* repository and maps its three error variants onto the four
 //! checks, so there is one implementation of "is this mount really this
