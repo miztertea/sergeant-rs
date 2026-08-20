@@ -271,6 +271,45 @@ A violation is reported dirty (the integrity disposition riding beside
 `sgt work show`'s terminal state), never silently treated as ordinary
 output.
 
+### INTENT — Captain's intent discipline
+
+*What must the intent itself say before Work touches sensitive territory?*
+
+Before dispatching Work whose objective names auth, security, secrets,
+payments, databases, migrations, production, destructive, persistent-state,
+or state-transition territory (the same fixed keyword set `dispatch`'s
+`05-classify-risk` stage routes on), Captain composes the intent — via
+`sgt run --intent-file <path>` — covering eight dimensions:
+
+- **Objective** — what the Work is actually for.
+- **Required Invariants** — what must remain true throughout.
+- **Approved Tradeoffs** — what is knowingly given up, and why.
+- **Out Of Scope** — what this Work must not touch or attempt.
+- **State Transitions** — what durable state moves, and between which
+  states.
+- **Failure Windows** — where a partial failure could leave things, and how
+  that would be noticed.
+- **Negative Test Matrix** — what must be proven not to happen.
+- **Validation Evidence** — what will be checked, and how, before the Work
+  is trusted done.
+
+This is Captain discipline, not engine validation. `sgt run --intent-file`
+transports the file's contents as the intent verbatim and validates only
+mechanics — the leaf must not be a symlink, must be a regular file, is
+capped at 1 MiB, and must be valid UTF-8 (`sgt run --help`'s own text for
+the flag) — never a section, a schema, or any other content shape. The
+discipline of actually writing the eight dimensions lives here, applied by
+whoever composes the file; `sgt` itself cannot tell a covered dimension
+from an absent one.
+
+A routine objective — one that names none of the keywords above — uses a
+plain intent; the eight-dimension brief is reserved for the territory that
+earns it.
+
+This is the one home for these eight dimensions. Any other doctrine that
+needs them — a workflow stage's routing rule, a package's own review
+checklist — points here rather than restating the list.
+
 ### OBSERVATION — what counts as knowing
 
 *Do I actually know this, or do I only know a process exists?*
