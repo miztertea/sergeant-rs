@@ -3679,7 +3679,7 @@ async fn r_mvp1_6_all_five_intent_detail_fields_journal_and_display() {
             "command_id": ulid(),
             "intent": "free text stays primary",
             "workflow": "software-change",
-            "repositories": ["api", "web"],
+            "scope": {"repos": ["api", "web"]},
             "intent_detail": {
                 "objective": "ship the thing",
                 "repos": ["api", "web"],
@@ -3799,7 +3799,7 @@ async fn r_mvp1_6_a_disagreeing_repos_refuses_naming_both_sources() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "two answers to one question",
-            "repositories": ["api"],
+            "scope": {"repos": ["api"]},
             "intent_detail": {"repos": ["web"]},
         }))
         .send()
@@ -3815,7 +3815,7 @@ async fn r_mvp1_6_a_disagreeing_repos_refuses_naming_both_sources() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "same repos, different order",
-            "repositories": ["api", "web"],
+            "scope": {"repos": ["api", "web"]},
             "intent_detail": {"repos": ["web", "api"]},
         }))
         .send()
@@ -3860,7 +3860,7 @@ async fn r_mvp1_6_repos_named_only_in_intent_detail_is_inert_not_a_disagreement(
     assert_eq!(
         resp.status(),
         201,
-        "no `repositories` flag means nothing for intent_detail.repos to \
+        "no `scope.repos` means nothing for intent_detail.repos to \
          disagree with: {:?}",
         resp.text().await
     );

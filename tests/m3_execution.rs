@@ -398,7 +398,14 @@ async fn t1_zero_config_submit_materializes_a_real_worktree() {
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "active");
-    assert_eq!(body["work"]["workspace"], "solo");
+    // estate-root §7.1/§7.4: no scope was submitted at all, and a
+    // one-repository estate infers its sole repository — `Work.workspace`
+    // is never written for a new Work (`workflow.bound`'s own `workspace`
+    // field, journaled separately, is its replacement — see
+    // `r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities`
+    // below for that assertion).
+    assert_eq!(body["work"]["workspace"], Value::Null);
+    assert_eq!(body["work"]["repositories"], json!(["solo"]));
 
     // The binding records everything §11 asks for.
     let bindings = body["surface"]["bindings"]
@@ -499,9 +506,21 @@ path = "../payments-web"
     let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "multi repo", json!({})).await;
+    // estate-root §7.1: "payments" declares two repositories, so this test's
+    // whole point (one surface, two bindings) needs an explicit scope now —
+    // `--all` is the least-assuming choice that still selects both.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &api,
+        "multi repo",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
-    assert_eq!(body["work"]["workspace"], "payments");
+    // §7.4: `Work.workspace` is never written for a new Work; §7.3's
+    // resolved-list replacement is asserted via `bindings` below.
+    assert_eq!(body["work"]["workspace"], Value::Null);
 
     let bindings = body["surface"]["bindings"].as_array().expect("bindings");
     assert_eq!(bindings.len(), 2, "one binding per declared repository");
@@ -598,7 +617,17 @@ async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos(
     let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "mixed policy", json!({})).await;
+    // estate-root §7.1: an explicit `--all` selects both repositories, so
+    // this test still reaches the instruction-policy check it means to pin
+    // rather than tripping the (now separate) missing-scope refusal first.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &api,
+        "mixed policy",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
     assert_eq!(status, 422, "a mixed policy must refuse at submit: {body}");
     assert_eq!(body["error"]["code"], "instruction_policy_conflict");
     let message = body["error"]["message"].as_str().expect("message");
@@ -739,7 +768,18 @@ async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities
     let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "uniform policy", json!({})).await;
+    // estate-root §7.1: "payments" declares two repositories, so an empty
+    // scope is refused now — `--all` is this test's explicit request for
+    // both, which is what it actually wants to pin (uniform policy across a
+    // multi-repository bind), orthogonal to which scope form asked for it.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &api,
+        "uniform policy",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "active");
@@ -2798,7 +2838,17 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &api, "half a surface", json!({})).await;
+    // estate-root §7.1: "payments" declares two repositories; `--all`
+    // selects both so materialization is actually attempted against `web`
+    // and can fail the way this test means to pin.
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &api,
+        "half a surface",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(
@@ -3868,6 +3918,111 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     handle.shutdown().await;
 }
 
+/// estate-root proposal §7.1: a multi-repository estate refuses an empty
+/// scope with the full remedy body — repo count, declared repos, declared
+/// groups, and the three example invocations — rather than silently
+/// expanding to every repository.
+#[tokio::test]
+async fn a_multi_repo_estate_refuses_an_empty_scope_with_the_7_1_remedy() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let api = repos.path().join("payments-api");
+    let web = repos.path().join("payments-web");
+    init_repo(&api);
+    init_repo(&web);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\n\n\
+         [group.pair]\nrepos = [\"api\", \"web\"]\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(&client, &handle, &api, "no scope at all", json!({})).await;
+    assert_eq!(status, 422, "an empty scope must refuse: {body}");
+    assert_eq!(body["error"]["code"], "missing_scope");
+    assert_eq!(body["error"]["repo_count"], 2);
+    assert_eq!(body["error"]["repos"], json!(["api", "web"]));
+    assert_eq!(body["error"]["groups"], json!(["pair"]));
+    assert!(
+        body["error"]["examples"]["repo"].as_str().is_some(),
+        "must offer a --repo example: {body}"
+    );
+    assert!(
+        body["error"]["examples"]["group"]
+            .as_str()
+            .is_some_and(|s| s.contains("pair")),
+        "must offer a --group example naming a real declared group: {body}"
+    );
+    assert_eq!(
+        body["error"]["examples"]["all"],
+        "sgt run \"<intent>\" --all"
+    );
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("2 repositories"), "got: {message}");
+    assert!(
+        fake.starts().is_empty(),
+        "a missing-scope refusal must never reach a backend"
+    );
+
+    handle.shutdown().await;
+}
+
+/// estate-root proposal §7.1: `--all` is explicit and journaled as the
+/// request form even though it resolves to the same list every declared
+/// repository would — `scope_request.all` must be `true`, not merely a
+/// side effect inferred from `repositories` matching every declared name.
+#[tokio::test]
+async fn run_all_resolves_every_repository_and_journals_the_request_form() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let api = repos.path().join("payments-api");
+    let web = repos.path().join("payments-web");
+    init_repo(&api);
+    init_repo(&web);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\n",
+    )
+    .expect("sergeant.toml");
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &api,
+        "everything, explicitly",
+        json!({"scope": {"all": true}}),
+    )
+    .await;
+    assert_eq!(status, 201, "submit failed: {body}");
+    let mut repositories: Vec<String> = body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    repositories.sort();
+    assert_eq!(repositories, vec!["api", "web"]);
+    assert_eq!(
+        body["work"]["scope_request"],
+        json!({"all": true}),
+        "the request form (all: true) must be journaled, not just its resolution: {body}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// The submit crash window (§25's fail-closed rule applied to sergeant's own
 /// bookkeeping). Submitting is several fsynced appends, and a daemon that
 /// dies inside that sequence leaves a `pending` work no verb can move:
@@ -4369,6 +4524,181 @@ fn cli_respond_and_retry_through_the_binary() {
     );
 
     stop_daemon(data.path());
+}
+
+/// Write a `sergeant.toml` declaring three repositories (`api`, `web`,
+/// `docs`) and one group `pair` = `[api, web]`, at `root` (which must be
+/// `api`'s own checkout, `path = "."`).
+fn write_three_repo_estate_with_a_group(repos_dir: &Path) {
+    let api = repos_dir.join("payments-api");
+    let web = repos_dir.join("payments-web");
+    let docs = repos_dir.join("payments-docs");
+    init_repo(&api);
+    init_repo(&web);
+    init_repo(&docs);
+    std::fs::write(
+        api.join("sergeant.toml"),
+        "[estate]\nname = \"payments\"\n\n\
+         [[repo]]\nname = \"api\"\npath = \".\"\n\n\
+         [[repo]]\nname = \"web\"\npath = \"../payments-web\"\n\n\
+         [[repo]]\nname = \"docs\"\npath = \"../payments-docs\"\n\n\
+         [group.pair]\nrepos = [\"api\", \"web\"]\n",
+    )
+    .expect("sergeant.toml");
+}
+
+/// estate-root proposal §7.1/§7.2, through the real spawned binary: `--all`
+/// forwards `scope.all` verbatim and the daemon resolves it to every
+/// declared repository; `--group` combined with `--repo` forwards both and
+/// the daemon unions them (dedup) — the CLI performs no expansion of its
+/// own (§7.2's "a client surface adds usability, never functionality").
+#[test]
+fn cli_run_all_and_run_group_plus_repo_wire_shapes() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
+    write_three_repo_estate_with_a_group(repos.path());
+    let api = repos.path().join("payments-api");
+
+    let output = sgt(&api, &data, &["--json", "run", "--all", "everything"]);
+    assert!(
+        output.status.success(),
+        "sgt run --all failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("run --json");
+    let mut repositories: Vec<String> = body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    repositories.sort();
+    assert_eq!(repositories, vec!["api", "docs", "web"]);
+    assert_eq!(body["work"]["scope_request"], json!({"all": true}));
+
+    let output = sgt(
+        &api,
+        &data,
+        &[
+            "--json", "run", "--group", "pair", "--repo", "docs", "union",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "sgt run --group pair --repo docs failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).expect("run --json");
+    let mut repositories: Vec<String> = body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    repositories.sort();
+    assert_eq!(repositories, vec!["api", "docs", "web"]);
+    assert_eq!(
+        body["work"]["scope_request"],
+        json!({"repos": ["docs"], "group": "pair"}),
+        "the request form must carry --repo and --group exactly as submitted, not their union"
+    );
+
+    stop_daemon(data.path());
+}
+
+/// estate-root proposal §7.4: `--workspace` is gone from the CLI entirely —
+/// clap refuses the flag itself, before any daemon could ever be asked
+/// about it.
+#[test]
+fn cli_run_rejects_the_removed_workspace_flag() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = DataDir::new();
+    let repo = repos.path().join("solo");
+    init_repo(&repo);
+
+    let output = sgt(
+        &repo,
+        &data,
+        &["run", "--workspace", "payments", "do the thing"],
+    );
+    assert!(
+        !output.status.success(),
+        "--workspace must be rejected, not silently accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace") || stderr.to_lowercase().contains("unexpected argument"),
+        "clap's own diagnostic must name the flag: {stderr}"
+    );
+    assert!(
+        data.daemon_pids().is_empty(),
+        "a clap parse failure must never reach ensure_daemon: {stderr}"
+    );
+}
+
+/// estate-root proposal §7.2: scope resolution is core-owned, so a
+/// `scope.group` submitted straight to the API (bypassing the CLI entirely)
+/// and the equivalent `--group` submitted through the real spawned binary
+/// resolve to the identical repository list — proof that the CLI reaches
+/// the same resolution rather than reimplementing it.
+#[tokio::test]
+async fn scope_resolution_is_identical_across_the_cli_and_a_direct_api_submission() {
+    // Leg 1: a direct API submission, no CLI involved at all.
+    let api_repos = TempDir::new().expect("tempdir");
+    let api_data = TempDir::new().expect("tempdir");
+    write_three_repo_estate_with_a_group(api_repos.path());
+    let api_root = api_repos.path().join("payments-api");
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(api_data.path(), registry, Some(FAKE_BACKEND_NAME)).await;
+    let client = http();
+    let (status, api_body) = submit(
+        &client,
+        &handle,
+        &api_root,
+        "direct api scope.group",
+        json!({"scope": {"group": "pair"}}),
+    )
+    .await;
+    assert_eq!(status, 201, "direct API submit failed: {api_body}");
+    let mut api_repositories: Vec<String> = api_body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    api_repositories.sort();
+    handle.shutdown().await;
+
+    // Leg 2: the identical scope, through the real CLI binary.
+    let cli_repos = TempDir::new().expect("tempdir");
+    let cli_data = DataDir::new();
+    write_three_repo_estate_with_a_group(cli_repos.path());
+    let cli_root = cli_repos.path().join("payments-api");
+    let output = sgt(
+        &cli_root,
+        &cli_data,
+        &["--json", "run", "--group", "pair", "cli --group scope"],
+    );
+    assert!(
+        output.status.success(),
+        "sgt run --group pair failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cli_body: Value = serde_json::from_slice(&output.stdout).expect("run --json");
+    let mut cli_repositories: Vec<String> = cli_body["work"]["repositories"]
+        .as_array()
+        .expect("repositories")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    cli_repositories.sort();
+    stop_daemon(cli_data.path());
+
+    assert_eq!(
+        api_repositories, cli_repositories,
+        "the CLI's --group and a direct API scope.group submission must resolve identically"
+    );
+    assert_eq!(api_repositories, vec!["api", "web"]);
 }
 
 /// Run the sgt binary from `cwd` against `data_dir`.

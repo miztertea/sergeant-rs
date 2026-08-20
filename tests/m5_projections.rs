@@ -862,14 +862,27 @@ impl Provenance {
                         )
                     && to == submitted_work
             }
+            // estate-root Phase C, §7.4: `scoped_to` has two justifying
+            // shapes now — `work.submitted`'s `workspace` field (legacy
+            // journal replay only; a new Work never carries it) and
+            // `workflow.bound`'s own `workspace` field (the live source, the
+            // plan-time estate name — same field `analytics.rs`'s `WorkRow`
+            // already prefers).
             "scoped_to" => {
-                event.kind == "work.submitted"
+                (event.kind == "work.submitted"
                     && from == submitted_work
                     && to
                         == format!(
                             "workspace:{}",
                             payload["work"]["workspace"].as_str().unwrap_or_default()
-                        )
+                        ))
+                    || (event.kind == "workflow.bound"
+                        && from == work
+                        && to
+                            == format!(
+                                "workspace:{}",
+                                payload["workspace"].as_str().unwrap_or_default()
+                            ))
             }
             "targets" => {
                 event.kind == "surface.materialized"
