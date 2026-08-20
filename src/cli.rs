@@ -3147,4 +3147,52 @@ mod tests {
         let rendered = render_transcript(&json!({"turns": []}));
         assert_eq!(rendered, "no conversation recorded for this work\n");
     }
+
+    fn listed_work(state: &str, disposition: Option<&str>) -> Value {
+        let mut work = json!({"id": "w-1", "state": state, "intent": "do the thing"});
+        if let Some(disposition) = disposition {
+            work["integrity"] = json!({"disposition": disposition});
+        }
+        work
+    }
+
+    /// C5's acceptance criterion for the two terminal states §11.5 mints no
+    /// compact label for: a dirty `failed` or `canceled` Work has to be
+    /// distinguishable in `sgt work list`'s *default* output, not only under
+    /// `--json`. Garbling or inverting the suffix branch in
+    /// `list_state_label` fails here and nowhere else — every other
+    /// dirty-work assertion in the suite reads the `/v1/work` JSON body.
+    #[test]
+    fn list_state_label_appends_the_integrity_axis_to_failed_and_canceled() {
+        assert_eq!(
+            list_state_label(&listed_work("failed", Some("dirty"))),
+            "failed/dirty"
+        );
+        assert_eq!(
+            list_state_label(&listed_work("canceled", Some("dirty"))),
+            "canceled/dirty"
+        );
+    }
+
+    /// The other half of the branch: `completed_dirty` is minted by the API's
+    /// own `reported_state`, so the column must not say it twice.
+    #[test]
+    fn list_state_label_does_not_re_suffix_a_state_already_carrying_the_axis() {
+        assert_eq!(
+            list_state_label(&listed_work("completed_dirty", Some("dirty"))),
+            "completed_dirty"
+        );
+    }
+
+    /// A clean or not-assessed Work keeps its true state string — absent
+    /// integrity is "not assessed" (C3), never a dirty rendering.
+    #[test]
+    fn list_state_label_leaves_clean_and_unassessed_states_alone() {
+        assert_eq!(
+            list_state_label(&listed_work("completed", Some("clean"))),
+            "completed"
+        );
+        assert_eq!(list_state_label(&listed_work("failed", None)), "failed");
+        assert_eq!(list_state_label(&listed_work("running", None)), "running");
+    }
 }
