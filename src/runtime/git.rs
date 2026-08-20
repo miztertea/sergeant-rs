@@ -23,11 +23,17 @@ use std::process::{Command, Stdio};
 /// thing a test can neither control nor safely fake.
 ///
 /// Read fresh from the environment inside [`command`] on every invocation
-/// rather than cached in a config struct or a `OnceLock`: tests set and
-/// unset this per test, and a cached value (or a `OnceLock`, which would
-/// stay poisoned for the rest of a parallel test run) would let one test's
-/// override leak into, or block, another's. Tests point it at a scripted
-/// binary to observe — or deny — git invocations without touching `PATH`.
+/// rather than cached in a config struct or a `OnceLock`: a cached value (or
+/// a `OnceLock`, which would stay poisoned for the rest of a parallel test
+/// run) would let one test's override leak into, or block, another's. Tests
+/// point it at a scripted binary to observe — or deny — git invocations
+/// without touching `PATH`.
+///
+/// Setting it is nonetheless a *process-global* act, not a thread-scoped
+/// one, so a test that sets it must own its whole process rather than share
+/// the lib test binary with the many call sites that reach real Git through
+/// this module. `tests/c11_injectable_git.rs` is that process, and carries
+/// the reasoning.
 pub const GIT_BIN_ENV: &str = "SGT_GIT_BIN";
 
 /// Failure running the Git CLI.
@@ -182,39 +188,5 @@ mod tests {
             "git's diagnostic must survive into the error: {text}"
         );
         assert!(!git_succeeds(dir.path(), &["rev-parse", "--show-toplevel"]));
-    }
-
-    /// C11: [`GIT_BIN_ENV`] actually redirects every invocation this module
-    /// makes, not merely a hardcoded `"git"` literal somewhere upstream of
-    /// it — the one fact §18's scripted-git admission tests (no network, no
-    /// branch switch) all rest on.
-    #[test]
-    fn the_git_binary_is_overridable_via_env() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let script = dir.path().join("scripted-git");
-        std::fs::write(&script, "#!/bin/sh\necho ran: \"$@\"\n").expect("write script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&script, permissions).expect("chmod");
-        }
-
-        // SAFETY (test-only): the override is set immediately before the one
-        // invocation that reads it and removed immediately after, with no
-        // assertion — and so no possible panic — in between. Cached in a
-        // static or a `OnceLock` this would poison every other test in this
-        // binary; read fresh per invocation, the window is exactly one
-        // `command()` call.
-        unsafe { std::env::set_var(GIT_BIN_ENV, &script) };
-        let out = git(dir.path(), &["status"]);
-        unsafe { std::env::remove_var(GIT_BIN_ENV) };
-
-        let out = out.expect("the scripted binary must run in place of git and exit zero");
-        assert!(
-            out.contains("--no-pager") && out.contains("status"),
-            "expected the scripted binary to echo the real invocation, got {out:?}"
-        );
     }
 }
