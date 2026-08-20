@@ -398,7 +398,7 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
     for c in "submitted from the tui".chars() {
         app.on_key(ratatui::crossterm::event::KeyCode::Char(c));
     }
-    // Tab past workflow/backend/profile/workspace/repositories/turns/ceiling
+    // Tab past workflow/backend/profile/group/repositories/turns/ceiling
     // to the `[ Run Work ]` control, then submit.
     for _ in 0..8 {
         app.on_key(ratatui::crossterm::event::KeyCode::Tab);
@@ -429,6 +429,32 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
             .iter()
             .any(|w| w["intent"] == "submitted from the tui"),
         "the TUI's New Work form must actually reach the daemon: {fleet}"
+    );
+
+    // …and so does the scope the operator typed (estate-root proposal
+    // §13.3): a repository this estate never declared must come back as
+    // §15's refusal naming it, which can only happen if the Repositories
+    // field actually reaches `scope.repos` and the daemon's own
+    // `Engine::resolve_scope` — the same resolution `sgt run --repo` gets.
+    // A form that dropped the field would be accepted here instead, since a
+    // one-repository estate infers its sole repository on an empty scope.
+    app.home.intent.set_text("scoped from the tui");
+    app.home.repositories = "not-a-declared-repo".to_string();
+    let action = app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    let Action::Submit(scoped) = action else {
+        panic!("expected a submission, got {action:?}");
+    };
+    assert_eq!(scoped["scope"]["repos"], json!(["not-a-declared-repo"]));
+    let outcome = app.execute(&client, Action::Submit(scoped)).await;
+    assert_eq!(outcome, Action::Refresh);
+    let refused = app
+        .home
+        .last_error
+        .clone()
+        .expect("an undeclared repository must be refused");
+    assert!(
+        refused.contains("not-a-declared-repo"),
+        "the refusal must name what the form actually sent: {refused}"
     );
 
     handle.shutdown().await;

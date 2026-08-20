@@ -49,6 +49,38 @@ released before a release can proceed.
   Journal changes are additive. A `surface.torn_down` recorded before this
   release replays unchanged and reads as *not assessed* — never as clean.
 
+- **Explicit Work scope is now required for a multi-repository estate
+  (estate-root proposal §7).** Submitting `sgt run` with no `--repo`,
+  `--group`, or `--all` used to silently expand to every declared
+  repository; it is now refused with a structured 422 naming the repo
+  count, the declared repositories and groups, and the three ways to
+  select — `--repo <name>` (repeatable), `--group <name>`, or `--all`. A
+  one-repository estate is unaffected: it still infers its sole repository
+  on an empty scope. Group expansion is no longer CLI-side: the daemon
+  resolves `--group`/`--repo`/`--all` against its own bound manifest, so
+  every client submitting the same scope — CLI, TUI, or a direct API caller
+  — reaches the identical resolution. The TUI's New Work form submits that
+  same structured scope: its dead `workspace` field is replaced by a
+  `group` field, and both it and `repositories` are forwarded unexpanded,
+  so naming a group in the TUI resolves exactly as `sgt run --group` does.
+  `sgt run --all` is new — an explicit, journaled selection of
+  the whole estate. A submitted Work now records both the request form
+  (`scope_request`: repos/group/all as submitted) and the resolved
+  repository list, so a later manifest edit cannot rewrite what an
+  already-journaled Work meant.
+
+### Removed
+
+- **`--workspace` is gone, from the CLI and the wire.** The daemon is bound
+  to exactly one estate; a client-supplied workspace label had no role left
+  to play. `Work.workspace` is no longer written by any new submission —
+  `scope_request` and the resolved `repositories` list are its replacement
+  — but the field itself still deserializes so a pre-existing journal (the
+  live estate journals 150+ Works carrying it) keeps replaying unchanged.
+  Analytics and the provenance graph now read the estate label off the
+  plan-time `workflow.bound` event instead of the submission, and tolerate
+  its absence for a Work that never reached a workspace at all.
+
 ### Documentation
 
 - **Corrected: the shell installer does not verify downloads.** `dist`'s

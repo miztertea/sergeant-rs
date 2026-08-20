@@ -4,17 +4,22 @@
 //! `sgt init` (scaffold + idempotency) · `sgt repo add/remove/list`
 //! (populate-or-verify, atomic validated writes, group-membership refusal)
 //! · `sgt group add/remove/list` (mkdir-p union semantics, declared-member
-//! validation) · `sgt run --group` (R-MVP1-5(b): pure client-side expansion
-//! into the existing `--repo` selection, zero new engine surface) · the
-//! estate-resolved data-dir default (U-R2, R-MVP1-12's own walk reused for
-//! `--data-dir`/`SGT_DATA_DIR` precedence, unchanged).
+//! validation) · `sgt run --group` (estate-root proposal §7.2: the CLI
+//! forwards `--repo`/`--group`/`--all` verbatim as `scope.{repos,group,all}`
+//! and the *daemon* resolves group membership against its own bound
+//! manifest — superseding MVP-3's original R-MVP1-5(b) CLI-side expansion)
+//! · the estate-resolved data-dir default (U-R2, R-MVP1-12's own walk reused
+//! for `--data-dir`/`SGT_DATA_DIR` precedence, unchanged).
 //!
 //! Every non-daemon verb here (`init`, `repo *`, `group *`, `doctor`) is
 //! pure manifest/filesystem plumbing (§9: "sergeant.toml ... never stores
 //! transient work state") — no daemon is spawned, so these run against a
 //! bare `&Path`, matching `m6_surfaces.rs`'s own `doctor(...)` helper.
 //! `sgt run --group` is the one verb here that submits real work and so
-//! auto-spawns a daemon; that test alone goes through `support::DataDir`.
+//! auto-spawns a daemon; that test (and its "unrelated broken repo" sibling)
+//! alone go through `support::DataDir` — and, since Phase C, *always* spawn
+//! one, because scope resolution (including an undeclared group's refusal)
+//! now happens on the daemon side rather than before `ensure_daemon` runs.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -820,17 +825,18 @@ fn workflow_fork_refuses_to_overwrite_an_existing_local_package() {
 
 // --------------------------------------------------------- run --group
 
-/// guard-map: `sgt run --group <name>` expands client-side into the exact
-/// same `repositories` selection `--repo` (repeated) would produce —
-/// R-MVP1-5(b)'s ruling, pinned end to end through a real (fake-backend)
-/// submission. An undeclared group name is refused before any daemon is
-/// even spawned. Mutation this kills: `--group` sending the group *name*
-/// to the API instead of its expanded members (the engine has no group
-/// concept at all — `NORTH-STAR.md`'s R-NS-4 — so that would silently
-/// submit work bound to zero repositories, or fail server-side without
-/// naming the group like this test's second assertion does).
+/// guard-map: `sgt run --group <name>` submits `scope.group = <name>`
+/// verbatim, and the *daemon* resolves it into the exact same repository
+/// list `--repo` (repeated) would produce — estate-root §7.2's ruling,
+/// pinned end to end through a real (fake-backend) submission. An
+/// undeclared group name is refused by the daemon's own 422 (§15), naming
+/// it — no longer a client-side pre-check, so a real daemon spawns for this
+/// case too. Mutation this kills: `--group` sending the group *name* to the
+/// API but resolution silently expanding to zero repositories or the whole
+/// estate instead of the daemon's structured refusal/expansion this test
+/// pins on both sides of the undeclared-group boundary.
 #[test]
-fn run_group_expands_client_side_into_repositories() {
+fn run_group_resolves_server_side_into_repositories() {
     let data_dir = DataDir::new();
     let estate = tempfile::TempDir::new().expect("tempdir");
     run(estate.path(), Some(data_dir.path()), &[], &["init"]).assert_ok("init");
@@ -852,7 +858,9 @@ fn run_group_expands_client_side_into_repositories() {
     )
     .assert_ok("group add");
 
-    // An undeclared group is refused before any daemon spawns.
+    // An undeclared group is refused by the daemon's own scope resolution
+    // (§7.2) — the CLI no longer looks group membership up itself, so
+    // `ensure_daemon` runs and a real daemon answers this 422.
     let bad = run(
         estate.path(),
         Some(data_dir.path()),
@@ -862,8 +870,10 @@ fn run_group_expands_client_side_into_repositories() {
     bad.assert_fails("undeclared group");
     assert!(bad.stderr.contains("ghost"), "got: {}", bad.stderr);
     assert!(
-        data_dir.daemon_pids().is_empty(),
-        "an undeclared --group must be refused before ensure_daemon ever spawns one"
+        !data_dir.daemon_pids().is_empty(),
+        "server-side --group resolution means a daemon must actually spawn and reach its own \
+         scope resolution for the undeclared-group refusal to happen at all: {}",
+        bad.stderr
     );
 
     let submitted = run(
@@ -885,22 +895,26 @@ fn run_group_expands_client_side_into_repositories() {
     data_dir.reap();
 }
 
-/// MVP-3 invariants finding MVP3-C2: `--group`'s *client-side* expansion
-/// reads group membership through the on-disk-free structural parser, so an
-/// unrelated declared repository missing from disk no longer refuses the
-/// command before a daemon is even spawned — the same "wrongness scoped
-/// per-entry" contract `repo add`/`group add` already hold (MVP3-C1). The
-/// daemon's own submit-time estate resolution is a *separate*, pre-existing,
-/// accepted coupling (matches plain `--repo` too, per the B4 register entry
-/// C2's own basis cites) and is deliberately left alone here — so the
-/// command as a whole still fails once `ghost` is missing, but *how* it
-/// fails is the proof: client-side no longer refuses first.
+/// Historical note, MVP3-C2: before estate-root Phase C, `--group`'s
+/// *client-side* expansion read group membership through an on-disk-free
+/// structural parser specifically so an unrelated declared repository
+/// missing from disk would not refuse the command before a daemon was even
+/// spawned. Phase C retires that CLI-side lookup entirely (§7.2: resolution
+/// is core-owned), so this test's outcome is no longer "the client-side
+/// carve-out and the daemon's own strict bind disagree" — it is the plain
+/// consequence of `Engine::plan` unconditionally discovering the *whole*
+/// estate (`Workspace::discover_scoped`) before scope resolution ever runs,
+/// exactly the coupling a plain `--repo` submission has always had (matches
+/// the B4 register entry MVP3-C2's own basis cites). `ghost` being outside
+/// the requested group no longer matters: the command still fails, and the
+/// daemon's own 422 is what names `ghost` as the actual defect.
 ///
-/// guard-map: reverting the group lookup back to the strict
-/// `Workspace::discover_scoped` makes this fail identically to the
-/// "undeclared group" case above — refused before `ensure_daemon` ever
-/// spawns one — instead of a daemon actually starting and the *daemon's*
-/// preflight (a 422 naming `ghost`) being what rejects the submission.
+/// guard-map: a resolution path that somehow skipped or lightened workspace
+/// discovery for a `--group` submission (say, resolving groups against a
+/// separately-read, on-disk-free manifest instead of the same `workspace`
+/// `plan` already discovered) would make this pass with no daemon-side
+/// evidence of `ghost` at all — the `daemon_pids` assertion below is what
+/// catches that regression.
 #[test]
 fn run_group_expansion_itself_survives_an_unrelated_declared_repo_missing_from_disk() {
     let data_dir = DataDir::new();
@@ -942,9 +956,9 @@ fn run_group_expansion_itself_survives_an_unrelated_declared_repo_missing_from_d
     );
     assert!(
         !data_dir.daemon_pids().is_empty(),
-        "client-side --group expansion must not have refused first — a daemon must have \
-         actually spawned and reached its own bind-time preflight for this to be *that* \
-         refusal rather than the client-side one: {}",
+        "a daemon must have actually spawned and reached its own bind-time preflight for this \
+         to be the daemon's own full-estate discovery failing on ghost, not some earlier \
+         client-side check: {}",
         submitted.stderr
     );
 

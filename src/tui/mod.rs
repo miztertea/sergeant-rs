@@ -18,12 +18,16 @@
 //!
 //! > If the TUI needs a private shortcut, the API is incomplete.
 //!
-//! — and it is why `Home`'s New Work form takes explicit repository names
-//! rather than expanding a declared group the way `sgt run --group` does:
-//! that expansion reads the estate manifest from local disk
+//! — and it is why `Home`'s New Work form forwards its scope fields
+//! verbatim (`scope.repos`/`scope.group`) and expands nothing: group
+//! membership is resolved by the daemon against its own bound manifest
+//! (estate-root proposal §7.2), so the form reaches the identical
+//! resolution `sgt run --repo`/`--group` does without ever reading the
+//! estate from local disk
 //! (`crate::domain::workspace::Workspace::declared_groups_scoped`), which no
-//! module here may reach for, and the daemon does not expose declared
-//! groups over the API yet (T3's job, §20.4).
+//! module here may reach for. What is still missing is the *catalog*: the
+//! daemon does not expose declared repositories and groups over the API yet
+//! (T3's job, §20.4), so both fields are typed rather than chosen.
 //!
 //! Liveness is the same SSE tail every other client uses, resumed from the
 //! `journal_head` the first fetch reported, so attaching does not replay

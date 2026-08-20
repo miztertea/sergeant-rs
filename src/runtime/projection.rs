@@ -1438,3 +1438,109 @@ mod rule_a_eviction_tests {
         assert_eq!(rebuilt.state().works[work_id].state, WorkState::Completed);
     }
 }
+
+#[cfg(test)]
+mod estate_root_phase_c_scope_replay_tests {
+    //! estate-root proposal §7.4: `Work` gained `scope_request` and stopped
+    //! writing `workspace` in Phase C. Neither change may take back a
+    //! journal a pre-Phase-C daemon already wrote — the live dogfood estate
+    //! alone carries 150+ `work.submitted` events with a literal `workspace`
+    //! key and no `scope_request` key at all. This is that replay contract,
+    //! pinned through the real fold (`work_registry_reducer`, not just
+    //! `serde_json::from_value` in isolation) so a future change to either
+    //! field's `#[serde(default)]` discipline fails here first.
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::work::ScopeRequest;
+    use crate::runtime::testing;
+
+    /// A `work.submitted` payload in exactly the pre-Phase-C shape: a
+    /// `workspace` string, a `repositories` list, and no `scope_request`
+    /// key — must still fold into a valid, complete `Work`.
+    #[test]
+    fn a_pre_phase_c_work_submitted_event_replays_with_scope_request_defaulted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01LEGACYWORK0000000";
+
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORK_SUBMITTED,
+            json!({"work": {
+                "id": work_id,
+                "workspace": "payments",
+                "intent": "legacy submission from before Phase C",
+                "repositories": ["api", "web"],
+                "workflow": "software-change",
+                "backend": "claude",
+                "state": "pending",
+                "created_by": "cli",
+                "created_at": "2026-01-01T00:00:00Z",
+            }}),
+        );
+
+        let work = core
+            .registry
+            .state()
+            .works
+            .get(work_id)
+            .expect("a pre-Phase-C work.submitted event must still replay into a Work");
+        assert_eq!(
+            work.workspace.as_deref(),
+            Some("payments"),
+            "the legacy workspace key must still deserialize, even though nothing writes it \
+             anymore"
+        );
+        assert_eq!(work.repositories, vec!["api", "web"]);
+        assert_eq!(
+            work.scope_request,
+            ScopeRequest::default(),
+            "an event with no scope_request key must default, not fail to replay"
+        );
+    }
+
+    /// A `work.submitted` payload in the current (Phase C) shape — a real
+    /// `scope_request` and no `workspace` key at all — replays identically,
+    /// and the two shapes stay distinguishable (a legacy Work still reports
+    /// its `workspace` label; a new one reports `None`, per §7.4).
+    #[test]
+    fn a_current_shape_work_submitted_event_replays_with_no_workspace_label() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01CURRENTWORK000000";
+
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORK_SUBMITTED,
+            json!({"work": {
+                "id": work_id,
+                "intent": "current-shape submission",
+                "repositories": ["api", "web"],
+                "scope_request": {"repos": ["api", "web"], "group": null, "all": false},
+                "state": "pending",
+                "created_by": "cli",
+                "created_at": "2026-01-01T00:00:00Z",
+            }}),
+        );
+
+        let work = core
+            .registry
+            .state()
+            .works
+            .get(work_id)
+            .expect("a current-shape work.submitted event must replay");
+        assert_eq!(work.workspace, None, "§7.4: never written for a new Work");
+        assert_eq!(
+            work.scope_request,
+            ScopeRequest {
+                repos: vec!["api".to_string(), "web".to_string()],
+                group: None,
+                all: false,
+            }
+        );
+    }
+}

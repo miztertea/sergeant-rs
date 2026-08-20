@@ -75,8 +75,20 @@ pub struct SubmitContext<'a> {
     pub workflow: Option<&'a str>,
     /// Requested profile name (§14).
     pub profile: Option<&'a str>,
-    /// Requested repository subset; empty means the whole workspace.
-    pub repositories: &'a [String],
+    /// §7.1/§13.3's structured scope request, the CLI/API's `scope.repos` —
+    /// explicit repository names, as submitted. Combined with `group`
+    /// (union, dedup) by [`Engine::resolve_scope`]; never expanded by any
+    /// client, per §7.2's "a client surface adds usability, never
+    /// functionality".
+    pub repos: &'a [String],
+    /// `scope.group` — a declared `[group.<name>]` to expand, resolved
+    /// against *this* daemon's own bound manifest (§7.2), not by the caller.
+    pub group: Option<&'a str>,
+    /// `scope.all` — an explicit whole-estate selection (§7.1's third scope
+    /// form). Wins over `repos`/`group` when set: [`Engine::resolve_scope`]
+    /// resolves to every declared repository and does not also require
+    /// `repos`/`group` to be empty.
+    pub all: bool,
 }
 
 /// A resolved, side-effect-free plan for starting a run.
@@ -730,6 +742,34 @@ pub enum EngineError {
     /// The requested repository subset does not match the workspace.
     #[error("{0}")]
     RepositorySelection(String),
+    /// estate-root proposal §7.1: a multi-repository estate was submitted to
+    /// with no scope selected at all — Sergeant refuses rather than
+    /// silently expanding to every repository. `repo_count`/`repos`/`groups`
+    /// are exactly what the API's structured 422 body names as the remedy
+    /// (§15: "list declared repos/groups and show `--repo`, `--group`,
+    /// `--all`").
+    #[error(
+        "this estate contains {repo_count} repositories, but no Work scope was selected; \
+         select repositories with --repo, a declared group with --group, or the whole estate \
+         explicitly with --all (declared repos: {repos:?}; declared groups: {groups:?})"
+    )]
+    MissingScope {
+        /// How many repositories the estate declares.
+        repo_count: usize,
+        /// Every declared repository's name.
+        repos: Vec<String>,
+        /// Every declared group's name.
+        groups: Vec<String>,
+    },
+    /// §15: `scope.group`/`--group` named a group this estate has not
+    /// declared.
+    #[error("no group named {requested:?} in this estate (declared: {available:?})")]
+    UnknownGroup {
+        /// The group name that was requested.
+        requested: String,
+        /// Every group name the estate does declare.
+        available: Vec<String>,
+    },
     /// R-MVP1-4: the selected repositories disagree on `instructions`
     /// policy. One process, one `--setting-sources` — there is nowhere for
     /// two policies to both take effect, so the submission is refused
@@ -879,6 +919,8 @@ impl EngineError {
             EngineError::Backend(_) => "backend_error",
             EngineError::Core(_) => "internal",
             EngineError::RepositorySelection(_) => "unknown_repository",
+            EngineError::MissingScope { .. } => "missing_scope",
+            EngineError::UnknownGroup { .. } => "unknown_group",
             EngineError::InstructionPolicyConflict { .. } => "instruction_policy_conflict",
             EngineError::ProfileNotFound { .. } => "profile_not_found",
             EngineError::ProfileBackendMismatch { .. } => "profile_backend_mismatch",
@@ -1110,9 +1152,7 @@ impl Engine {
             self.check_selection_is_honourable(context)?;
             return Ok(None);
         };
-        let repositories = workspace
-            .select(context.repositories)
-            .map_err(EngineError::RepositorySelection)?;
+        let repositories = Self::resolve_scope(&workspace, context)?;
 
         // R-MVP1-4: one process, one policy. Resolved and refused here, at
         // submit, before a Work record or a worktree exists — the same
@@ -1175,6 +1215,92 @@ impl Engine {
             profile,
             stage_bindings,
         }))
+    }
+
+    /// estate-root proposal §7.2/§7.1: turn a submission's `{repos, group,
+    /// all}` scope request into the exact repository list to materialize,
+    /// resolved against *this daemon's own* already-discovered `workspace`
+    /// — never by a client. §7.2's whole point is that the CLI, the TUI, or
+    /// a direct API caller submitting the identical scope JSON all reach
+    /// this one function and get the identical answer; no client surface
+    /// reimplements group-membership or empty-scope semantics.
+    ///
+    /// Order of decisions, per §7.1:
+    ///
+    /// 1. `all` wins outright: every declared repository, regardless of
+    ///    whatever `repos`/`group` also said (§7.3 still journals the
+    ///    request form separately, so *why* it resolved to everything is
+    ///    never lost even though the resolved list alone couldn't say).
+    /// 2. Otherwise, the union of `repos` and — when `group` names a
+    ///    declared group — that group's members, `repos`-order first, new
+    ///    group members appended, duplicates dropped. An undeclared `group`
+    ///    is refused by name, listing the estate's declared groups (§15).
+    /// 3. An empty union is not "select everything" (§7.1 replaces that
+    ///    reading): a one-repository estate infers its sole repository; a
+    ///    multi-repository estate is refused with the full §7.1 remedy body
+    ///    (repo count, declared repos, declared groups).
+    /// 4. A nonempty selection still goes through [`Workspace::select`] for
+    ///    its own checks (unknown name, duplicate name) — this function only
+    ///    decides *what* the name list is, not whether every name in it is
+    ///    valid.
+    ///
+    /// Historical note (MVP3-C2): before this, `run --group`'s expansion was
+    /// pure CLI-side convenience that read group membership through an
+    /// on-disk-free structural parser (`Workspace::declared_groups_scoped`)
+    /// specifically so an unrelated broken repository elsewhere in the
+    /// estate could not block a group whose own members were all fine. That
+    /// carve-out does not survive moving resolution here: `workspace` above
+    /// is already the strictly-discovered estate (`Workspace::
+    /// discover_scoped`, the same call `plan` makes for routing and
+    /// instruction-policy regardless of scope), so a `--group` submission
+    /// now fails on an unrelated broken repository exactly the way a plain
+    /// `--repo` submission always has — discovery, not group lookup, is
+    /// what requires the whole estate to resolve. `declared_groups_scoped`
+    /// remains in use for the CLI's own local, non-submitting `sgt group
+    /// list` family, untouched by this change.
+    fn resolve_scope(
+        workspace: &Workspace,
+        context: &SubmitContext<'_>,
+    ) -> Result<Vec<RepositorySpec>, EngineError> {
+        if context.all {
+            return Ok(workspace.repositories.clone());
+        }
+
+        let mut names: Vec<String> = context.repos.to_vec();
+        if let Some(group_name) = context.group {
+            let group =
+                workspace
+                    .groups
+                    .get(group_name)
+                    .ok_or_else(|| EngineError::UnknownGroup {
+                        requested: group_name.to_string(),
+                        available: workspace.groups.keys().cloned().collect(),
+                    })?;
+            for repo in &group.repos {
+                if !names.contains(repo) {
+                    names.push(repo.clone());
+                }
+            }
+        }
+
+        if names.is_empty() {
+            if workspace.repositories.len() == 1 {
+                return Ok(workspace.repositories.clone());
+            }
+            return Err(EngineError::MissingScope {
+                repo_count: workspace.repositories.len(),
+                repos: workspace
+                    .repositories
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .collect(),
+                groups: workspace.groups.keys().cloned().collect(),
+            });
+        }
+
+        workspace
+            .select(&names)
+            .map_err(EngineError::RepositorySelection)
     }
 
     /// R-MVP1-4's submit-time policy check: every selected repository must
@@ -4173,6 +4299,173 @@ mod tests {
         );
     }
 
+    // ------------------------- estate-root Phase C: Engine::resolve_scope
+
+    /// A workspace fixture for exercising [`Engine::resolve_scope`] directly
+    /// — resolution never touches the filesystem, so `/nowhere` placeholders
+    /// are fine (mirrors `domain::workspace::tests`' own fixture pattern).
+    fn scope_fixture(repos: &[&str], groups: &[(&str, &[&str])]) -> Workspace {
+        Workspace {
+            name: "payments".to_string(),
+            root: PathBuf::from("/nowhere"),
+            repositories: repos
+                .iter()
+                .map(|name| RepositorySpec {
+                    name: name.to_string(),
+                    path: PathBuf::from(format!("/nowhere/{name}")),
+                })
+                .collect(),
+            default_backend: None,
+            default_workflow: None,
+            profiles: Vec::new(),
+            config_path: None,
+            surfaces_dir: None,
+            data_dir: None,
+            repository_policy: BTreeMap::new(),
+            groups: groups
+                .iter()
+                .map(|(name, members)| {
+                    (
+                        name.to_string(),
+                        crate::domain::workspace::GroupSpec {
+                            repos: members.iter().map(|m| m.to_string()).collect(),
+                            brief: None,
+                        },
+                    )
+                })
+                .collect(),
+            repository_origin: BTreeMap::new(),
+        }
+    }
+
+    /// §7.1: `--all` wins outright, regardless of whatever `repos`/`group`
+    /// also said.
+    #[test]
+    fn resolve_scope_all_selects_every_declared_repository_regardless_of_repos_or_group() {
+        let workspace = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let resolved = Engine::resolve_scope(
+            &workspace,
+            &SubmitContext {
+                repos: &["api".to_string()],
+                group: Some("pair"),
+                all: true,
+                ..SubmitContext::default()
+            },
+        )
+        .expect("all must resolve");
+        let mut names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["api", "web"]);
+    }
+
+    /// §7.1: a one-repository estate infers its sole repository on an empty
+    /// scope request.
+    #[test]
+    fn resolve_scope_infers_the_sole_repository_of_a_one_repository_estate_on_empty_scope() {
+        let workspace = scope_fixture(&["solo"], &[]);
+        let resolved = Engine::resolve_scope(&workspace, &SubmitContext::default())
+            .expect("a one-repository estate infers its sole repository");
+        assert_eq!(
+            resolved.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["solo"]
+        );
+    }
+
+    /// §7.1: a multi-repository estate refuses an empty scope, and the
+    /// refusal carries the full remedy body — repo count, declared repos,
+    /// declared groups.
+    #[test]
+    fn resolve_scope_refuses_an_empty_scope_on_a_multi_repository_estate() {
+        let workspace = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let err = Engine::resolve_scope(&workspace, &SubmitContext::default())
+            .expect_err("a multi-repository estate must refuse an empty scope");
+        match err {
+            EngineError::MissingScope {
+                repo_count,
+                repos,
+                groups,
+            } => {
+                assert_eq!(repo_count, 2);
+                assert_eq!(repos, vec!["api".to_string(), "web".to_string()]);
+                assert_eq!(groups, vec!["pair".to_string()]);
+            }
+            other => panic!("expected MissingScope, got {other}"),
+        }
+    }
+
+    /// §7.1: `--group` may combine with explicit `--repo` additions — union,
+    /// dedup, `repos` first in declaration order, new group members
+    /// appended.
+    #[test]
+    fn resolve_scope_unions_group_members_with_explicit_repos_and_dedups() {
+        let workspace = scope_fixture(&["api", "web", "docs"], &[("pair", &["api", "web"])]);
+        let resolved = Engine::resolve_scope(
+            &workspace,
+            &SubmitContext {
+                repos: &["web".to_string(), "docs".to_string()],
+                group: Some("pair"),
+                ..SubmitContext::default()
+            },
+        )
+        .expect("union must resolve");
+        assert_eq!(
+            resolved.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["web", "docs", "api"],
+            "explicit --repo first (declaration order), then new group members appended, with \
+             no duplicate for the repo already named by both"
+        );
+    }
+
+    /// §15: an undeclared `--group` is refused by name, listing the estate's
+    /// declared groups.
+    #[test]
+    fn resolve_scope_refuses_an_undeclared_group_naming_the_declared_ones() {
+        let workspace = scope_fixture(&["api", "web"], &[("pair", &["api", "web"])]);
+        let err = Engine::resolve_scope(
+            &workspace,
+            &SubmitContext {
+                group: Some("ghost"),
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("an undeclared group must refuse");
+        match err {
+            EngineError::UnknownGroup {
+                requested,
+                available,
+            } => {
+                assert_eq!(requested, "ghost");
+                assert_eq!(available, vec!["pair".to_string()]);
+            }
+            other => panic!("expected UnknownGroup, got {other}"),
+        }
+    }
+
+    /// §15: an unknown `--repo` name is refused by [`Workspace::select`],
+    /// naming the estate's declared repositories.
+    #[test]
+    fn resolve_scope_refuses_an_unknown_repository_naming_the_declared_ones() {
+        let workspace = scope_fixture(&["api", "web"], &[]);
+        let err = Engine::resolve_scope(
+            &workspace,
+            &SubmitContext {
+                repos: &["ghost".to_string()],
+                ..SubmitContext::default()
+            },
+        )
+        .expect_err("an unknown repository must refuse");
+        match err {
+            EngineError::RepositorySelection(message) => {
+                assert!(message.contains("ghost"), "got: {message}");
+                assert!(
+                    message.contains("api") && message.contains("web"),
+                    "got: {message}"
+                );
+            }
+            other => panic!("expected RepositorySelection, got {other}"),
+        }
+    }
+
     /// Every `EngineError`'s wire code, in one table.
     ///
     /// `code()` is the vocabulary `/v1` answers with and the thing a client
@@ -4307,6 +4600,21 @@ mod tests {
                     index: 9,
                 },
                 "no_such_stage",
+            ),
+            (
+                EngineError::MissingScope {
+                    repo_count: 2,
+                    repos: vec!["api".to_string(), "web".to_string()],
+                    groups: vec![],
+                },
+                "missing_scope",
+            ),
+            (
+                EngineError::UnknownGroup {
+                    requested: "ghost".to_string(),
+                    available: vec!["payments".to_string()],
+                },
+                "unknown_group",
             ),
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -4988,6 +5296,7 @@ mod tests {
                 workspace: None,
                 intent: "review this".to_string(),
                 repositories: Vec::new(),
+                scope_request: Default::default(),
                 workflow: None,
                 backend: None,
                 origin_client: None,

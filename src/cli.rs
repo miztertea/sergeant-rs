@@ -93,20 +93,24 @@ enum Command {
         /// Launch profile (§14).
         #[arg(long)]
         profile: Option<String>,
-        /// Targeted repository (repeatable).
+        /// Targeted repository (repeatable). §7.2: forwarded verbatim as
+        /// `scope.repos` — the daemon resolves scope against its own bound
+        /// estate; the CLI performs no expansion of its own.
         #[arg(long = "repo")]
         repositories: Vec<String>,
-        /// A declared `[group.<name>]`'s repositories, expanded client-side
-        /// into the same selection `--repo` builds (R-MVP1-5(b): group
-        /// membership gets no new engine surface — this is pure CLI-side
-        /// flag expansion over the existing `repositories` field). Combines
-        /// with any `--repo` flags given alongside it (union, declaration
-        /// order, duplicates dropped).
+        /// A declared `[group.<name>]`, forwarded verbatim as `scope.group`
+        /// (§7.2's core-owned resolution: the daemon expands group
+        /// membership against its own bound manifest, not the CLI — this
+        /// lets the TUI or a direct API caller submit the identical scope
+        /// JSON without reimplementing group semantics). May combine with
+        /// `--repo` (union, dedup, decided by the daemon).
         #[arg(long)]
         group: Option<String>,
-        /// Workspace to scope the work to.
+        /// Explicit whole-estate selection (§7.1's third scope form,
+        /// forwarded as `scope.all`) — required to target every repository
+        /// in a multi-repository estate; the daemon never infers it.
         #[arg(long)]
-        workspace: Option<String>,
+        all: bool,
         /// R-MVP1-7's turn envelope, overridden for this one Work
         /// (checkpoint-friction item — the daemon-wide `Engine::turn_cap`/
         /// `SGT_TURN_CAP` default applies otherwise). Journaled with the
@@ -616,51 +620,22 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             workflow,
             backend,
             profile,
-            mut repositories,
+            repositories,
             group,
-            workspace,
+            all,
             turns,
             ceiling_secs,
         } => {
-            // R-MVP1-5(b): group membership gets no new engine surface —
-            // `--group` is pure CLI-side expansion into the same
-            // `repositories` selection `--repo` already builds, over the
-            // estate discovered from the current directory (bounded at this
-            // daemon's own data dir, mirroring every other client-side
-            // workspace read in this binary).
-            //
-            // MVP-3 invariants finding MVP3-C2: this reads group membership
-            // through the on-disk-free structural parser
-            // (`declared_groups_scoped`), not the strict `discover_scoped`
-            // (which resolves every declared `[[repo]]` through git) — group
-            // membership is just declared names, so an unrelated missing
-            // repository must not block a group whose own members are all
-            // fine, the same coupling `domain::manifest`'s edit pens no
-            // longer have (MVP3-C1).
-            if let Some(group_name) = &group {
-                let cwd = std::env::current_dir()?;
-                let groups = crate::domain::workspace::Workspace::declared_groups_scoped(
-                    &cwd,
-                    Some(&data_dir),
-                )?;
-                let members = groups.get(group_name).ok_or_else(|| {
-                    let available: Vec<&str> = groups.keys().map(String::as_str).collect();
-                    CliError::new(format!(
-                        "no group {group_name:?} declared in this estate (declared: {}); \
-                         declare it first with `sgt group add {group_name} <repo>...`",
-                        if available.is_empty() {
-                            "none".to_string()
-                        } else {
-                            available.join(", ")
-                        }
-                    ))
-                })?;
-                for repo in &members.repos {
-                    if !repositories.contains(repo) {
-                        repositories.push(repo.clone());
-                    }
-                }
-            }
+            // estate-root proposal §7.2: scope resolution is core-owned. The
+            // CLI forwards `--repo`/`--group`/`--all` verbatim as
+            // `scope.{repos,group,all}` and does no expansion of its own —
+            // the daemon resolves them against its own bound manifest
+            // (`runtime::engine::Engine::resolve_scope`), the same function
+            // a direct API caller or the TUI submitting the identical scope
+            // JSON reaches. Before this, `--group` was pure CLI-side
+            // expansion (MVP-3 finding MVP3-C2, R-MVP1-5(b)); §7.2's own
+            // rule — "a client surface adds usability, never functionality"
+            // — is exactly what retires that.
             let client = ensure_daemon(&data_dir).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
@@ -673,8 +648,11 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 "workflow": workflow,
                 "backend": backend,
                 "profile": profile,
-                "repositories": repositories,
-                "workspace": workspace,
+                "scope": {
+                    "repos": repositories,
+                    "group": group,
+                    "all": all,
+                },
                 "envelope": envelope,
                 "created_by": "cli",
                 "origin": origin(),
