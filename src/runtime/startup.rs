@@ -60,7 +60,15 @@ use crate::runtime::projection::{
 /// File name of the startup cache inside `projections/`.
 pub const FLOOR_STATE_FILE: &str = "floor-state.json";
 /// Schema identifier for the startup cache.
-pub const FLOOR_STATE_SCHEMA: &str = "sergeant.floor-state.v1";
+///
+/// W3 bumps this to v2 (§9.1, ratify-at-review item 5): `FloorWorkRow` gains
+/// `first_seq` (without which pruning is inert on a cache-hit start — see
+/// its own doc) and drops `pruned_at` (a declared-but-permanently-`None`
+/// slot on a *retained* Work's row once W3's actual pruned Works get their
+/// own `FloorState::pruned_works` section). A v1 reader would be *wrong* to
+/// prune from a v1 cache, not merely incomplete, which is what licenses the
+/// bump rather than an additive-only extension within v1.
+pub const FLOOR_STATE_SCHEMA: &str = "sergeant.floor-state.v2";
 
 /// Q4: a **fixed** live window on every host — 16 segments or 128 MiB,
 /// whichever bounds first. Not configurable, not adaptive: the
@@ -341,6 +349,16 @@ pub struct HorizonSink {
     first_seq_by_work: BTreeMap<String, u64>,
 }
 
+impl HorizonSink {
+    /// W3 §2.5: the raw fold this pass produced, for a caller (`daemon::
+    /// start_with`) that merges it into the process-lifetime
+    /// `Core::first_seq_by_work` index the prune horizon reads. Read-only —
+    /// this sink's own fold is otherwise exactly W2's.
+    pub fn first_seq_by_work(&self) -> &BTreeMap<String, u64> {
+        &self.first_seq_by_work
+    }
+}
+
 impl ReplaySink for HorizonSink {
     fn push(&mut self, event: &Event) -> Result<(), StartupError> {
         if let Some(id) = &event.work_id {
@@ -497,10 +515,15 @@ pub struct FloorWorkRow {
     pub updated_at: String,
     /// Same as [`WorkIndexRow::last_seq`].
     pub last_seq: u64,
-    /// W3 slot: RFC3339 date this Work's segments were pruned. Always
-    /// `None` in W2 — nothing is deleted this wave.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pruned_at: Option<String>,
+    /// W3 §3.1: first seq this process has ever seen for this Work — the
+    /// field without which a cache-hit start cannot compute the prune
+    /// horizon's no-straddle predicate at all (see
+    /// [`crate::runtime::prune::FirstSeqIndex`]'s own doc for why a missing
+    /// value would make pruning permanently inert rather than merely
+    /// conservative). New in schema v2; a v1 cache never had it, which is
+    /// exactly why v1 is a named miss now rather than read as `0`.
+    #[serde(default)]
+    pub first_seq: u64,
 }
 
 /// Recorded outcome class of one below-window command — keys only, never the
@@ -547,6 +570,35 @@ pub struct FloorState {
     /// if any.
     #[serde(default)]
     pub capability_provenance: Option<AskWithdrawal>,
+    /// W3 §9.2: every Work this estate has ever pruned — the whole of
+    /// `WorkRegistry::pruned_works`, unconditionally (not filtered by this
+    /// start's own horizon: once pruned, a Work's row is a permanent fact
+    /// the journal can no longer reproduce on its own below whatever floor
+    /// this estate now has, so the cache must carry every one of them, not
+    /// just the ones this pass's own horizon happens to cover).
+    #[serde(default)]
+    pub pruned_works: Vec<crate::runtime::prune::PrunedWorkRow>,
+    /// W3 §9.2: the whole of `WorkRegistry::pruned_commands`, same reasoning.
+    #[serde(default)]
+    pub pruned_commands: Vec<crate::runtime::prune::PrunedCommandRow>,
+    /// W3 §6.5: the whole of `WorkRegistry::pending_prune`. Always `None` in
+    /// a *written* cache — an intent below the horizon can never be left
+    /// uncompleted — carried honestly rather than assumed.
+    #[serde(default)]
+    ///
+    /// Boxed: `PruneIntentRecord` carries two full `PruneResidue`s (each with
+    /// its own `Vec`s), which otherwise inlines into `FloorState` and, by
+    /// extension, `Plan::Windowed` — large enough to trip
+    /// `clippy::large_enum_variant` against `Plan::Full`'s few scalars. This
+    /// is always `None` in a written cache (§6.5); boxing costs nothing on
+    /// that path and only ever matters for the one CacheMiss-adjacent
+    /// diagnostic case that reads it back.
+    pub pending_prune: Option<Box<crate::runtime::prune::PruneIntentRecord>>,
+    /// W3 §5.2: the whole of `WorkRegistry::quarantined_blobs` — the next
+    /// prune cycle's deletion list; losing it would leak quarantined blobs
+    /// forever.
+    #[serde(default)]
+    pub quarantined_blobs: Vec<String>,
 }
 
 /// Why a start did not use the cache — logged, and reported on
@@ -813,6 +865,19 @@ impl Plan {
                         },
                     );
                 }
+                // W3: the cache's residue seeds the registry exactly like
+                // `work_index` does — a windowed start's own replay only
+                // covers events above the horizon, so a prune's residue
+                // recorded below it would otherwise be lost on a cache hit.
+                for row in &cache.pruned_works {
+                    seed.pruned_works.insert(row.id.clone(), row.clone());
+                }
+                for row in &cache.pruned_commands {
+                    seed.pruned_commands
+                        .insert(row.command_id.clone(), row.clone());
+                }
+                seed.pending_prune = cache.pending_prune.as_deref().cloned();
+                seed.quarantined_blobs = cache.quarantined_blobs.clone();
                 Projection::resumed(
                     seed,
                     cache.binding.summarized_through_seq,
@@ -893,6 +958,13 @@ impl Plan {
     /// sound (§2.6): a cache-hit start's window has moved forward since the
     /// cache was written, and everything the new cache needs is already in
     /// hand.
+    ///
+    /// `first_seq` is W3's addition: the process-lifetime index
+    /// (`Core::first_seq_by_work`, merged from the cache seed and every
+    /// `HorizonSink` this process has folded) each [`FloorWorkRow`] needs to
+    /// carry its own `first_seq` — kept a *separate* parameter from
+    /// `horizon_sink` rather than replacing it, so this cache's own horizon
+    /// computation (`horizon()`, above) is untouched.
     pub fn next_cache(
         &self,
         journal: &Journal,
@@ -900,10 +972,11 @@ impl Plan {
         ledger: &LedgerSink,
         capability: &CapabilitySink,
         horizon_sink: &HorizonSink,
+        first_seq: &BTreeMap<String, u64>,
     ) -> Result<Option<FloorState>, StartupError> {
         let bounds = journal.segment_bounds()?;
         let h = horizon(&bounds, self.window_seq(), registry, horizon_sink);
-        build_floor_state(&bounds, h, registry, ledger, capability)
+        build_floor_state(&bounds, h, registry, ledger, capability, first_seq)
     }
 }
 
@@ -943,6 +1016,7 @@ fn build_floor_state(
     registry: &WorkRegistry,
     ledger: &LedgerSink,
     capability: &CapabilitySink,
+    first_seq: &BTreeMap<String, u64>,
 ) -> Result<Option<FloorState>, StartupError> {
     if horizon == 0 {
         return Ok(None);
@@ -976,7 +1050,7 @@ fn build_floor_state(
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
             last_seq: row.last_seq,
-            pruned_at: None,
+            first_seq: first_seq.get(&row.id).copied().unwrap_or(0),
         })
         .collect();
     works.sort_unstable_by(|a, b| a.id.cmp(&b.id));
@@ -1018,6 +1092,13 @@ fn build_floor_state(
         works,
         commands,
         capability_provenance,
+        // W3 §9.2: unconditional copies of the registry's own residue — see
+        // this struct's own field docs for why these are never filtered by
+        // `horizon` the way `works`/`commands` are.
+        pruned_works: registry.pruned_works.values().cloned().collect(),
+        pruned_commands: registry.pruned_commands.values().cloned().collect(),
+        pending_prune: registry.pending_prune.clone().map(Box::new),
+        quarantined_blobs: registry.quarantined_blobs.clone(),
     }))
 }
 
@@ -1266,6 +1347,10 @@ mod tests {
             works: Vec::new(),
             commands: Vec::new(),
             capability_provenance: None,
+            pruned_works: Vec::new(),
+            pruned_commands: Vec::new(),
+            pending_prune: None,
+            quarantined_blobs: Vec::new(),
         };
         (journal, cache)
     }
@@ -1570,9 +1655,16 @@ mod tests {
 
         let registry = WorkRegistry::default();
         let ledger = LedgerSink::default();
-        let state = build_floor_state(&bounds, horizon, &registry, &ledger, &capability)
-            .expect("build_floor_state")
-            .expect("H > 0 must produce a cache");
+        let state = build_floor_state(
+            &bounds,
+            horizon,
+            &registry,
+            &ledger,
+            &capability,
+            &BTreeMap::new(),
+        )
+        .expect("build_floor_state")
+        .expect("H > 0 must produce a cache");
 
         assert_eq!(
             state.capability_provenance,
@@ -1606,9 +1698,16 @@ mod tests {
 
         let registry = WorkRegistry::default();
         let ledger = LedgerSink::default();
-        let state = build_floor_state(&bounds, horizon, &registry, &ledger, &capability)
-            .expect("build_floor_state")
-            .expect("H > 0 must produce a cache");
+        let state = build_floor_state(
+            &bounds,
+            horizon,
+            &registry,
+            &ledger,
+            &capability,
+            &BTreeMap::new(),
+        )
+        .expect("build_floor_state")
+        .expect("H > 0 must produce a cache");
 
         assert_eq!(
             state.capability_provenance,
