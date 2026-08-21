@@ -660,59 +660,66 @@ impl TurnAccumulator {
 
     fn ingest_item(&mut self, item: Option<&Value>, started: bool, out: &mut Vec<NativeEvent>) {
         let Some(item) = item else { return };
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        let item_id = item.get("id").cloned().unwrap_or(Value::Null);
-        match item_type {
-            "agent_message" => {
+        self.ingest_view(&exec_item_view(item), started, out);
+    }
+
+    /// The transport-agnostic half of item decoding (spec §1.6): everything
+    /// below reads only [`ItemView`], never a raw `Value` — so a second
+    /// transport needs nothing but its own `fn view(&Value) -> Option<
+    /// ItemView>` (here, always-`Some`; app-server's sibling in
+    /// `codex_appserver.rs` is the same shape) to reuse every line of this
+    /// function unchanged. This is the seam the W3 spec calls out by name:
+    /// "the event-producing code — which `NativeEvent` kinds, which payload
+    /// fields, the `is_error` rule, the `TOOL_OUTPUT_TAIL` truncation —
+    /// exists once."
+    fn ingest_view(&mut self, view: &ItemView, started: bool, out: &mut Vec<NativeEvent>) {
+        match &view.item_type {
+            ItemKind::AgentMessage => {
                 // No `item.started` for this type was ever observed on exec;
                 // emitting a partial assistant message on an unmeasured shape
-                // would double-count the completed one (§4.2).
+                // would double-count the completed one (§4.2). App-server
+                // *does* emit `item/started`/`item/agentMessage/delta` for
+                // this type, and §1.6 deliberately does not decode either —
+                // the caller (`ingest_appserver_notification`) never routes
+                // a started `agentMessage` or a delta line through this
+                // function at all, so `started` here is always `false` for
+                // this variant on both transports today; the guard stays as
+                // the structural invariant it always was.
                 if started {
                     return;
                 }
                 self.message_items += 1;
-                let text = item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let text = view.text.clone().unwrap_or_default();
                 self.last_agent_message = Some(text.clone());
                 out.push(NativeEvent {
                     kind: KIND_CONVERSATION_ASSISTANT_COMPLETED.to_string(),
-                    payload: json!({"thread_id": self.thread_id, "text": text, "item_id": item_id}),
+                    payload: json!({"thread_id": self.thread_id, "text": text, "item_id": view.item_id}),
                 });
             }
             // §4.3: the *only* code path that produces `tool.*` events.
             // Nothing anywhere else in this decoder reads `agent_message`
             // text as evidence that a command ran.
-            "command_execution" => {
+            ItemKind::CommandExecution => {
                 if started {
                     out.push(NativeEvent {
                         kind: KIND_TOOL_REQUESTED.to_string(),
                         payload: json!({
-                            "id": item_id,
+                            "id": view.item_id,
                             "name": "command_execution",
-                            "input": {"command": item.get("command").cloned().unwrap_or(Value::Null)},
+                            "input": {"command": view.command.clone().unwrap_or(Value::Null)},
                         }),
                     });
                     return;
                 }
                 self.tool_items += 1;
-                let exit_code = item.get("exit_code").cloned().unwrap_or(Value::Null);
-                let status = item
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let exit_code = view.exit_code.clone().unwrap_or(Value::Null);
+                let status = view.status.clone().unwrap_or_default();
                 let is_error = exit_code.as_i64() != Some(0) || status != "completed";
-                let output = item
-                    .get("aggregated_output")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let output = view.aggregated_output.as_deref().unwrap_or("");
                 out.push(NativeEvent {
                     kind: KIND_TOOL_COMPLETED.to_string(),
                     payload: json!({
-                        "tool_use_id": item_id,
+                        "tool_use_id": view.item_id,
                         "is_error": is_error,
                         "exit_code": exit_code,
                         "status": status,
@@ -720,25 +727,138 @@ impl TurnAccumulator {
                     }),
                 });
             }
-            "error" => {
+            ItemKind::Error => {
                 // Unobserved on `item.started`; the one measured instance was
                 // a warning on a turn that continued, never a terminal.
+                // App-server has no item-level `error` type at all (M9's 18
+                // variants do not include one) — this arm is exec-only in
+                // practice, kept on the shared type because nothing about it
+                // is exec-specific.
                 if !started {
-                    let message = item
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    let message = view.text.clone().unwrap_or_default();
                     out.push(NativeEvent {
                         kind: KIND_TURN_HARNESS_ERROR.to_string(),
-                        payload: json!({"phase": "item_error", "message": message, "item_id": item_id}),
+                        payload: json!({"phase": "item_error", "message": message, "item_id": view.item_id}),
                     });
                 }
             }
-            other => {
-                self.unknown_items.push(other.to_string());
+            ItemKind::Unknown(other) => {
+                self.unknown_items.push(other.clone());
             }
         }
+    }
+}
+
+/// Which of the decoder's four branches an item belongs to (spec §1.6). Every
+/// one of M9's other 14 app-server variants — `plan`, `reasoning`,
+/// `fileChange`, `mcpToolCall`, ... — lands in `Unknown`, named by its own
+/// wire string, and is counted, never decoded; so does every unrecognized
+/// exec item type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemKind {
+    AgentMessage,
+    CommandExecution,
+    /// Exec-only (§4.4): a bare `{"type":"error", ...}` item. App-server has
+    /// no item-level error variant among M9's 18.
+    Error,
+    /// Carries the item's own wire-level type string, for `unknown_items`.
+    Unknown(String),
+}
+
+/// One item, reduced to exactly the fields the decoder branches on (spec
+/// §1.6) — nothing here is transport-specific; each transport's own `fn
+/// view(&Value) -> ItemView` (`exec_item_view` below, `codex_appserver::
+/// appserver_item_view`) is the only place that ever reads a raw item's key
+/// spellings.
+#[derive(Debug, Clone)]
+struct ItemView {
+    item_type: ItemKind,
+    /// The item's own id, whatever shape it takes on the wire (always a
+    /// string on both transports, but carried as `Value` so a missing id
+    /// serializes as `null` rather than an invented string).
+    item_id: Value,
+    /// `agent_message.text` (exec) / `agentMessage.text` (app-server).
+    text: Option<String>,
+    /// `command_execution.command` (exec) / `commandExecution.command`
+    /// (app-server), carried as `Value` since a future shape could be
+    /// structured rather than a bare string and this decoder never
+    /// interprets it — only the event payload does.
+    command: Option<Value>,
+    /// `exit_code` (exec) / `exitCode` (app-server).
+    exit_code: Option<Value>,
+    /// `status` — same key on both transports.
+    status: Option<String>,
+    /// `aggregated_output` (exec) / `aggregatedOutput` (app-server).
+    aggregated_output: Option<String>,
+}
+
+impl ItemView {
+    fn unknown(kind: impl Into<String>, item_id: Value) -> Self {
+        Self {
+            item_type: ItemKind::Unknown(kind.into()),
+            item_id,
+            text: None,
+            command: None,
+            exit_code: None,
+            status: None,
+            aggregated_output: None,
+        }
+    }
+}
+
+/// Exec's own `fn view` (spec §1.6): `snake_case` keys, and an `"error"` item
+/// variant app-server does not have.
+fn exec_item_view(item: &Value) -> ItemView {
+    let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "agent_message" => ItemView {
+            item_type: ItemKind::AgentMessage,
+            item_id,
+            text: Some(
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            command: None,
+            exit_code: None,
+            status: None,
+            aggregated_output: None,
+        },
+        "command_execution" => ItemView {
+            item_type: ItemKind::CommandExecution,
+            item_id,
+            text: None,
+            command: Some(item.get("command").cloned().unwrap_or(Value::Null)),
+            exit_code: Some(item.get("exit_code").cloned().unwrap_or(Value::Null)),
+            status: Some(
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            aggregated_output: Some(
+                item.get("aggregated_output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+        },
+        "error" => ItemView {
+            item_type: ItemKind::Error,
+            item_id,
+            text: Some(
+                item.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            command: None,
+            exit_code: None,
+            status: None,
+            aggregated_output: None,
+        },
+        other => ItemView::unknown(other, item_id),
     }
 }
 
