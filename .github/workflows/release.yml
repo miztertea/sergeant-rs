@@ -361,8 +361,26 @@ jobs:
       - name: "cargo metadata --locked (guard: dist build has no native --locked/--frozen flag)"
         run: cargo metadata --locked --format-version 1 >/dev/null
 
+      # `--output-format=json` makes dist write this target's build manifest,
+      # which carries the archive's sha256. `package-installer` downloads it and
+      # `dist build --artifacts=global` reads the checksum straight out of it, so
+      # the generated installer ships real checksum values instead of the empty
+      # ones every release before 0.1.2 shipped (w3-recon.md §2a). The manifest
+      # is written OUTSIDE target/distrib and copied in afterwards, because
+      # `dist build` owns that directory while it runs — this is the exact order
+      # cargo-dist's own generated CI uses (templates/ci/github/release.yml.j2 @
+      # v0.32.0: `dist build … --output-format=json > dist-manifest.json` then
+      # `cp dist-manifest.json "$BUILD_MANIFEST_NAME"`, where BUILD_MANIFEST_NAME
+      # is target/distrib/<target>-dist-manifest.json). The <target>- filename
+      # prefix is that same convention and is what keeps the two matrix legs'
+      # manifests from colliding in the merged download.
       - name: dist build (packages the binary + LICENSE/README + checksum)
-        run: dist build --artifacts=local --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          dist build --artifacts=local --target ${{ matrix.target }} \
+            --output-format=json > "${RUNNER_TEMP}/local-dist-manifest.json"
+          cp "${RUNNER_TEMP}/local-dist-manifest.json" \
+            "target/distrib/${{ matrix.target }}-dist-manifest.json"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
