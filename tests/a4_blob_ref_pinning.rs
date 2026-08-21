@@ -60,6 +60,10 @@ const PUT_SITES: &[PutSite] = &[
         context: "impl TurnReader",
     },
     PutSite {
+        file: "src/backend/codex.rs",
+        context: "impl TurnReader",
+    },
+    PutSite {
         file: "src/backend/docker.rs",
         context: "fn stream_one",
     },
@@ -270,6 +274,143 @@ fn drive_one_recorded_claude_turn(data_dir: &Path) -> (Event, Event) {
 fn claude_arm_refs_in_event_recovers_the_archived_raw_ref() {
     let data = TempDir::new().expect("tempdir");
     let (ended, usage) = drive_one_recorded_claude_turn(data.path());
+
+    let ended_refs = refs_in_event(&ended);
+    assert_eq!(
+        ended_refs.len(),
+        1,
+        "expected exactly one ref in conversation.turn.ended"
+    );
+    let the_ref = ended_refs.iter().next().unwrap();
+
+    let path = data.path().join("blobs").join("b3").join(the_ref.hex());
+    assert!(
+        path.exists(),
+        "the ref's hex must name a real blob file: {path:?}"
+    );
+    let bytes = std::fs::read(&path).expect("read blob");
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().to_string(),
+        the_ref.hex(),
+        "the store's own contract, re-proved from the extractor's side"
+    );
+
+    let usage_refs = refs_in_event(&usage);
+    assert_eq!(
+        usage_refs.len(),
+        1,
+        "usage.updated must carry the same archived-raw ref as conversation.turn.ended"
+    );
+    assert_eq!(
+        usage_refs, ended_refs,
+        "refs_in_event must recover the same ref from both events"
+    );
+}
+
+// ------------------------------------------------------------------
+// Layer 2, codex arm: a real recorded turn, through the real adapter (W1)
+// ------------------------------------------------------------------
+
+const CODEX_RECORDED_TURN: &str = include_str!("fixtures/codex-0.149.0-agent-message-turn.jsonl");
+
+/// A minimal stub `codex`: answers the four probe gates, then replays the
+/// recorded transcript on every turn invocation. Deliberately smaller than
+/// `tests/codex_backend.rs`'s own `StubCodex` — this suite needs exactly one
+/// recorded turn through the real adapter, not the full launch-grammar
+/// contract surface.
+fn write_codex_stub(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("codex-stub-a4");
+    let replay = dir.join("codex-replay-a4.jsonl");
+    std::fs::write(&replay, CODEX_RECORDED_TURN).expect("write replay fixture");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.149.0\"; exit 0; fi\n\
+         if [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo \"Logged in using ChatGPT\"; exit 0; fi\n\
+         if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then echo \"Commands: resume --json --model --cd \
+         --skip-git-repo-check --profile --sandbox --ephemeral\"; exit 0; fi\n\
+         if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"resume\" ] && [ \"$3\" = \"--help\" ]; then echo \"--json --model \
+         --skip-git-repo-check --ephemeral\"; exit 0; fi\n\
+         cat \"{}\"\n",
+        replay.display()
+    );
+    std::fs::write(&path, script).expect("write stub");
+    let mut perm = std::fs::metadata(&path).expect("stat").permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&path, perm).expect("chmod");
+    support::wait_until_executable(&path);
+    path
+}
+
+/// Drive one recorded turn through the real `CodexBackend`, over the stub
+/// above, into a real journal + blob store under `data_dir`. Returns the
+/// journaled `conversation.turn.ended` and `usage.updated` events.
+fn drive_one_recorded_codex_turn(data_dir: &Path) -> (Event, Event) {
+    let stub_path = write_codex_stub(data_dir);
+    let mut config = sergeant_rs::backend::codex::CodexConfig::new(data_dir);
+    config.executable = stub_path;
+    config.codex_home = Some(data_dir.join("codex-home"));
+    let backend = sergeant_rs::backend::codex::CodexBackend::new(config);
+    let shared = Arc::new(tokio::sync::Mutex::new(core(data_dir)));
+    backend.set_event_sink(journaling_sink(shared.clone()));
+
+    let handle = backend
+        .start(&sergeant_rs::backend::StartRequest {
+            work_id: "work-a4-codex".to_string(),
+            execution_id: "e-a4-codex".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: data_dir.to_path_buf(),
+            intent: "a4 fixture replay".to_string(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
+            bindings: Vec::new(),
+        })
+        .expect("start");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let observation = backend.observe(&handle).expect("observe");
+        if observation.native != sergeant_rs::backend::NativeState::Running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn did not settle");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let core = shared.blocking_lock();
+        let events: Vec<Event> = core
+            .journal
+            .replay()
+            .expect("replay")
+            .collect::<Result<_, _>>()
+            .expect("events");
+        let ended = events
+            .iter()
+            .find(|e| e.kind == "conversation.turn.ended")
+            .cloned();
+        let usage = events.iter().find(|e| e.kind == "usage.updated").cloned();
+        if let (Some(ended), Some(usage)) = (ended, usage) {
+            return (ended, usage);
+        }
+        drop(core);
+        assert!(
+            Instant::now() < deadline,
+            "turn.ended/usage.updated never journaled"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn codex_arm_refs_in_event_recovers_the_archived_raw_ref() {
+    let data = TempDir::new().expect("tempdir");
+    let (ended, usage) = drive_one_recorded_codex_turn(data.path());
 
     let ended_refs = refs_in_event(&ended);
     assert_eq!(

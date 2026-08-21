@@ -89,3 +89,56 @@ to produce it is not kept in the tree (it duplicates `m7_docker_executor.rs`'s
 own `exit_zero_completes_and_nonzero_fails_with_captured_evidence` harness
 almost exactly); reproduce it by running that shape against any command and
 copying the resulting `summary` string.
+
+## Codex fixtures (W1, `src/backend/codex.rs`)
+
+All six recordings below are copied byte-for-byte from the H0 seats' own
+captured stdout/stderr under `/var/tmp/codex-probe/` (volatile scratch, never
+committed itself), against **codex-cli 0.149.0**, standalone musl build,
+Cerberus, 2026-08-21. Nothing here is authored — see `w1-spec.md`'s Appendix A
+for the same recordings inline, with the run that produced each one named.
+
+- `codex-0.149.0-agent-message-turn.jsonl` — source
+  `sgt-adapter-research/runA2.jsonl`. The plain 4-line turn: `thread.started`
+  → `turn.started` → `item.completed{agent_message}` → `turn.completed{usage}`.
+  Identical shape recorded independently in `run1.jsonl`/`runF/G/H/L.jsonl`.
+- `codex-0.149.0-command-execution-turn.jsonl` — source
+  `auth-sandbox-approvals/run4_bypass.jsonl`. The only recording containing
+  real tool evidence: `item.started` + `item.completed` for a
+  `command_execution` item, with `exit_code`/`status`/`aggregated_output`.
+  Required `--dangerously-bypass-approvals-and-sandbox` to produce (this
+  host's bwrap cannot initialize a sandbox at all).
+- `codex-0.149.0-turn-failed.jsonl` — source `sgt-adapter-research/runB.jsonl`,
+  `-m gpt-5.6-nonexistent-model`. An `item.completed{error}` model-metadata
+  *warning* (does not end the turn) → a stream `error` line → `turn.failed`,
+  carrying the API's 400 message. Pins that a stream `error` is journaled and
+  never a terminal, and that `turn.failed` is (§4.4).
+- `codex-0.149.0-uncorroborated-narration-turn.jsonl` — source
+  `auth-sandbox-approvals/run2_onrequest.jsonl`. §4.3's hazard: two
+  `agent_message` items narrating a specific low-level command failure
+  (`bwrap: loopback: Failed RTM_NEWADDR`) with **no** `command_execution` item
+  anywhere in the stream and exit 0. Same shape independently recorded in
+  `run3_wwrite.jsonl`, `runC.jsonl`, `runJ.jsonl`. This is the fixture
+  `narration_produces_no_tool_events` replays — the single most important test
+  in the wave (§4.3, §7.2 item 4).
+- `codex-0.149.0-untrusted-dir-refusal.stderr.txt` — source
+  `notgit/run5_notrust.stderr.log` (its paired `.jsonl` is 0 bytes, not kept
+  separately since an empty file carries nothing a test reads). The pre-turn
+  refusal shape: plain-text stderr (`Reading additional input from
+  stdin...\nNot inside a trusted directory and --skip-git-repo-check was not
+  specified.`), zero stdout JSON, nonzero exit — caught at LAUNCH and turned
+  into a `BackendError::Failed` before any turn is registered (§3.1, §5.2).
+- `codex-0.149.0-parse-error.stderr.txt` — source
+  `sgt-adapter-research/runA.stderr.log` (paired `runA.exitcode` = 2, recorded
+  here as the fact rather than a seventh file: `codex exec -a` is a clap parse
+  error, exit 2 — `-a`/any approval flag cannot be passed to this transport at
+  all, measured-negative).
+
+No derived fixture was needed for W1: unlike Claude's substitution envelope,
+every shape this adapter's decoder decides on was actually recorded on this
+build. `w1-spec.md` Appendix A also records two facts these fixtures do not
+carry a file for — the `--output-schema`/`-o` agreement
+(`sgt-adapter-research/runE.jsonl` + `last_message.txt`, both byte-identical
+`{"word":"ok"}`, which is why the adapter never passes `-o`) and the rollout
+directory layout (`~/.codex/sessions/<y>/<m>/<d>/rollout-…-<thread_id>.jsonl`)
+— neither is fixture-replayed by any test, so neither is copied here.

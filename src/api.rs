@@ -30,6 +30,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::Deferred;
+use crate::backend::codex::KIND_TURN_HARNESS_ERROR;
 use crate::cli::doctor;
 use crate::daemon::{
     KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
@@ -4071,6 +4072,11 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_TOOL_REQUESTED,
     KIND_TOOL_COMPLETED,
     KIND_USAGE_UPDATED,
+    // W1: the codex adapter's one module-local kind (§1.2 of the spec) — a
+    // `pub const KIND_*`, unlike claude.rs's bare string-literal
+    // "conversation.turn.grammar_unmeasured", so it is journaled and must be
+    // named here for t6's bidirectional check to hold.
+    KIND_TURN_HARNESS_ERROR,
     KIND_COMMAND_ACCEPTED,
     KIND_COMMAND_REJECTED,
     KIND_DAEMON_STARTED,
