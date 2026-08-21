@@ -119,9 +119,20 @@ fn assert_registry_pinned(
         terminal_work_order: _,
         work_index,
         admission_paused: _, // ALLOWLIST: force-cleared unconditionally at every
-                             // startup (daemon.rs) before anything is served —
-                             // its replayed value is never load-bearing. See
-                             // `the_admission_pause_force_clear_mechanism_is_pinned`.
+        // startup (daemon.rs) before anything is served —
+        // its replayed value is never load-bearing. See
+        // `the_admission_pause_force_clear_mechanism_is_pinned`.
+        pruned_works, // ASSERTED (W3, I-W3-7): the residue must reach a
+        // cacheless floor replay and a cache+window start
+        // identically.
+        pruned_commands, // ASSERTED (W3, I-W3-8): same reasoning.
+        pending_prune,   // ASSERTED (W3, §6.5): always `None` in a *written*
+        // cache — an intent below `H` can never be left
+        // uncompleted — and the assertion is what keeps that
+        // true rather than assumed.
+        quarantined_blobs, // ASSERTED (W3, §5.2): the next cycle's deletion
+                           // list; a cache that lost it would leak
+                           // quarantined blobs forever.
     } = full;
 
     // ASSERTED — the load-bearing equalities.
@@ -132,6 +143,39 @@ fn assert_registry_pinned(
     );
     assert_eq!(works, &windowed.works, "works must be byte-identical");
     assert_eq!(runs, &windowed.runs, "runs must be byte-identical");
+    assert_eq!(
+        pruned_works, &windowed.pruned_works,
+        "pruned_works must be byte-identical between a full replay and cache+window (I-W3-7)"
+    );
+    assert_eq!(
+        pruned_commands, &windowed.pruned_commands,
+        "pruned_commands must be byte-identical between a full replay and cache+window (I-W3-8)"
+    );
+    assert_eq!(
+        pending_prune, &windowed.pending_prune,
+        "pending_prune must agree between a full replay and cache+window"
+    );
+    assert_eq!(
+        quarantined_blobs, &windowed.quarantined_blobs,
+        "quarantined_blobs must be byte-identical between a full replay and cache+window"
+    );
+    // W3's strengthening of the work_index assertion: a Work is in exactly
+    // one of `work_index`/`pruned_works`, on both sides.
+    assert!(
+        work_index
+            .keys()
+            .collect::<BTreeSet<_>>()
+            .is_disjoint(&pruned_works.keys().collect::<BTreeSet<_>>()),
+        "a Work must never appear in both work_index and pruned_works (full)"
+    );
+    assert!(
+        windowed
+            .work_index
+            .keys()
+            .collect::<BTreeSet<_>>()
+            .is_disjoint(&windowed.pruned_works.keys().collect::<BTreeSet<_>>()),
+        "a Work must never appear in both work_index and pruned_works (windowed)"
+    );
 
     // ALLOWLIST: commands — Q8, the cache carries keys not `CommandOutcome`
     // bodies. (a) everything the window kept is unchanged; (b) everything it
@@ -248,6 +292,24 @@ fn assert_registry_pinned(
         "terminal_run_order's members must be exactly terminal_runs' keys"
     );
 
+    // W3's strengthening: a pruned id has a row in *neither* cache — the
+    // fold that inserts it into `pruned_works`/`pruned_commands` removes it
+    // from `terminal_works`/`terminal_runs` in the same step (§6.2 step 2),
+    // so the subset assertions above hold without exception rather than
+    // needing one for a pruned id.
+    for id in pruned_works.keys() {
+        assert!(
+            !terminal_works.contains_key(id) && !terminal_runs.contains_key(id),
+            "a pruned Work id must not linger in either terminal cache (full, id {id})"
+        );
+    }
+    for id in windowed.pruned_works.keys() {
+        assert!(
+            !windowed.terminal_works.contains_key(id) && !windowed.terminal_runs.contains_key(id),
+            "a pruned Work id must not linger in either terminal cache (windowed, id {id})"
+        );
+    }
+
     // Capability watermark (recon correction 3's live gap) — the cache seed
     // folded forward by the window must agree with the full pass.
     assert_eq!(
@@ -336,7 +398,14 @@ fn build_cache(
         miss: CacheMiss::Absent,
     };
     let cache = plan
-        .next_cache(journal, full, ledger, capability, horizon_sink)
+        .next_cache(
+            journal,
+            full,
+            ledger,
+            capability,
+            horizon_sink,
+            horizon_sink.first_seq_by_work(),
+        )
         .expect("next_cache")
         .unwrap_or_else(|| {
             panic!(
