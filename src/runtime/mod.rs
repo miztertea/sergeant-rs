@@ -11,6 +11,7 @@ pub mod integrity;
 pub mod journal;
 pub mod preflight;
 pub mod projection;
+pub mod prune;
 pub mod recovery;
 pub mod repolock;
 pub mod router;

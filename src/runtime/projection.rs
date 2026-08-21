@@ -370,6 +370,30 @@ pub struct WorkRegistry {
     /// to check first.
     #[serde(default)]
     pub admission_paused: bool,
+    /// W3/A3's residue: every Work this estate has pruned, keyed by id — the
+    /// pruned-by-name answer, folded from `prune.completed` (via the
+    /// `prune.intent` that precedes it) and therefore reproducible from a
+    /// floor replay with no cache at all.
+    ///
+    /// Disjoint from `work_index` by construction: a Work is in exactly one
+    /// of them, and the fold that inserts here removes there.
+    #[serde(default)]
+    pub pruned_works: std::collections::BTreeMap<String, crate::runtime::prune::PrunedWorkRow>,
+    /// W3 Q8's exemption made journal-durable: the §26 ledger keys of every
+    /// pruned command. Keys only — the `CommandOutcome` bodies died with
+    /// their events, exactly as the cache never carried them.
+    #[serde(default)]
+    pub pruned_commands:
+        std::collections::BTreeMap<String, crate::runtime::prune::PrunedCommandRow>,
+    /// W3: the prune cycle this journal has declared and not yet
+    /// acknowledged. `Some` only between a `prune.intent` and its
+    /// `prune.completed` — Q9's crash completion reads exactly this.
+    #[serde(default)]
+    pub pending_prune: Option<crate::runtime::prune::PruneIntentRecord>,
+    /// W3 §5.2: the hexes the most recent `prune.intent` moved into
+    /// quarantine — the deletion list the *next* cycle works from.
+    #[serde(default)]
+    pub quarantined_blobs: Vec<String>,
 }
 
 /// Bound on how many terminal runs [`WorkRegistry::terminal_runs`] holds at
@@ -699,8 +723,18 @@ pub fn is_absorbing(state: WorkState) -> bool {
 /// materialize, `Engine::plan`'s "no surface" case) never sets
 /// `surface_plan`, so this never blocks a genuinely surface-less Work.
 fn run_is_settled(work: &Work, run: &WorkRun) -> bool {
-    is_absorbing(work.state)
-        && (run.surface.is_none() || run.teardown.is_some())
+    is_absorbing(work.state) && run_is_retired(run)
+}
+
+/// The three run-shape clauses [`run_is_settled`] checks, factored out so W3's
+/// [`crate::runtime::prune::retired_whole`] can apply the identical rule
+/// under its own, broader terminality test (`Completed | Failed | Canceled`,
+/// not only the absorbing two): a run with a surface and no teardown, a
+/// `surface_plan` with no surface, or an unsettled reservation is not
+/// retired, whatever the Work's state says. One copy of the three clauses,
+/// two terminality tests over it.
+pub(crate) fn run_is_retired(run: &WorkRun) -> bool {
+    (run.surface.is_none() || run.teardown.is_some())
         && !(run.surface_plan.is_some() && run.surface.is_none())
         && run.unsettled_reservation().is_none()
 }
@@ -810,6 +844,43 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
         }
         KIND_ADMISSION_RESUMED => {
             state.admission_paused = false;
+            return;
+        }
+        crate::runtime::prune::KIND_PRUNE_INTENT => {
+            // W3 §6.2: record, apply nothing. A declaration is not an
+            // outcome — until the completion lands, the segments may still
+            // be there, and a replay that folded the residue here would
+            // report Works as pruned that a crash left retained.
+            if let Some(record) = crate::runtime::prune::PruneIntentRecord::from_event(event) {
+                state.quarantined_blobs = record.condemn.clone();
+                state.pending_prune = Some(record);
+            } else {
+                tracing::error!(seq = event.seq, "malformed prune.intent payload; ignored");
+            }
+            return;
+        }
+        crate::runtime::prune::KIND_PRUNE_COMPLETED => {
+            let Some(pending) = state.pending_prune.take() else {
+                tracing::error!(
+                    seq = event.seq,
+                    "prune.completed with no pending intent; ignored"
+                );
+                return;
+            };
+            let intent_seq_matches =
+                event.payload["intent_seq"].as_u64() == Some(pending.intent_seq);
+            if !intent_seq_matches {
+                tracing::error!(
+                    seq = event.seq,
+                    expected_intent_seq = pending.intent_seq,
+                    found = ?event.payload.get("intent_seq"),
+                    "prune.completed intent_seq mismatch; ignored"
+                );
+                state.pending_prune = Some(pending);
+                return;
+            }
+            let merged = pending.residue.merged_with(pending.carried_forward);
+            apply_residue(state, merged);
             return;
         }
         _ => {}
@@ -1153,6 +1224,36 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
     }
 }
 
+/// W3 §6.2: apply a `prune.completed`'s merged residue (its own plus the
+/// carried-forward from any condemned earlier intent) to the live registry.
+/// Every step here is unconditional — the reducer never fails
+/// (`Reducer<S>` returns `()`), so a row already absent (a `Completed`/
+/// `Canceled` Work's `works`/`runs` entries, already gone via `maybe_evict`)
+/// is simply a no-op remove, never asserted.
+fn apply_residue(state: &mut WorkRegistry, residue: crate::runtime::prune::PruneResidue) {
+    for row in residue.works {
+        let id = row.id.clone();
+        state.work_index.remove(&id);
+        state.terminal_works.remove(&id);
+        state.terminal_work_order.retain(|x| x != &id);
+        state.terminal_runs.remove(&id);
+        state.terminal_run_order.retain(|x| x != &id);
+        state.works.remove(&id);
+        state.runs.remove(&id);
+        state.pruned_works.insert(id, row);
+    }
+    for row in residue.commands {
+        let id = row.command_id.clone();
+        state.commands.remove(&id);
+        state.command_works.remove(&id);
+        state.pruned_commands.insert(id, row);
+    }
+    // `residue.capability_provenance` is not carried on `WorkRegistry` at
+    // all (I-W3-12): the watermark's only durable home is the prune events
+    // themselves (T12), read back by `startup::CapabilitySink` on a full
+    // replay or a cache rebuild — nothing here needs it live.
+}
+
 /// An empty [`WorkRegistry`] projection ready to fold the journal.
 pub fn work_registry_projection() -> Projection<WorkRegistry> {
     Projection::new(WorkRegistry::default(), work_registry_reducer)
@@ -1188,7 +1289,11 @@ pub fn rederive_run(journal: &Journal, work_id: &str) -> Result<Option<WorkRun>,
 /// to.
 fn rederive_registry_for(journal: &Journal, work_id: &str) -> Result<WorkRegistry, JournalError> {
     let mut scratch = WorkRegistry::default();
-    for event in journal.replay()? {
+    // W3 §11.2/A1: floor-aware, not `replay()` — a retained Work's events
+    // never sit below the floor (I-W3-1), but `replay()`'s hardcoded
+    // `expected = 1` would misreport ruled retention as `SeqDiscontinuity`
+    // on a journal that has ever been pruned.
+    for event in journal.replay_from_floor()? {
         let event = event?;
         if event.work_id.as_deref() == Some(work_id) {
             apply_registry_event(&mut scratch, &event, false);
