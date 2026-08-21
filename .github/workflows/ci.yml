@@ -1,17 +1,20 @@
 name: CI
 
-# ADR 0004 (D9): this is the cheap per-push tier — Linux fmt/clippy/test plus
-# a macOS lane, run on every push so wall-clock stays low (matrix jobs run
-# concurrently, so cost is max(job) not sum(job)). The full real-suite matrix
+# ADR 0004 (D9): this is the cheap per-PR tier — Linux fmt/clippy/test plus
+# a macOS lane, run on every pull request so wall-clock stays low (matrix
+# jobs run concurrently, so cost is max(job) not sum(job)). The full
+# real-suite matrix
 # across all measured targets (ADR 0001 D1) is a qualification capability, not
 # a routine trigger on this workflow — see matrix.yml (workflow_call /
 # workflow_dispatch, per ADR 0014 decision 9).
 on:
-  # `on: [push, pull_request]` ran this battery twice for every push to a PR
-  # branch — same commit, same result, twice the wait. Pushes are checked on
-  # `main` only; every other branch is checked through its pull request.
-  push:
-    branches: [main]
+  # No push trigger, deliberately. Every commit reaches main through a pull
+  # request whose head tree — for this repo's single-writer, up-to-date-merge
+  # flow — is byte-identical to the merge commit, so a post-merge re-run of
+  # this same battery proved nothing twice a day. Main's ongoing health is
+  # covered where it can actually change: the weekly canary (floating
+  # toolchain/runners) and release.yml's gates re-qualifying the exact SHA at
+  # dispatch. The README badge reads ?event=pull_request for the same reason.
   pull_request:
   # release.yml's Gate B calls this workflow rather than re-defining "tests
   # passed" (proposal §9.2 / §16 — release qualification never invents an
