@@ -1319,6 +1319,14 @@ mod tests {
     }
 
     #[test]
+    fn execution_schema_label_is_the_pinned_contract_string() {
+        assert_eq!(
+            format!("{LABEL_SCHEMA}={SCHEMA_VERSION}"),
+            "io.sergeant.schema=execution/v1"
+        );
+    }
+
+    #[test]
     fn container_name_is_deterministic_from_execution_id() {
         let (_dir, config) = config();
         let backend = DockerBackend::new(config).expect("backend");

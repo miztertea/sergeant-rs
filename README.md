@@ -60,7 +60,7 @@ catalog](#workflows) below for what a workflow actually is.
 `dist` (cargo-dist) publishes a prebuilt `sgt` for each [release](https://github.com/miztertea/sergeant-rs/releases), plus a `curl | sh` convenience installer:
 
 ```sh
-curl -fsSL https://github.com/miztertea/sergeant-rs/releases/download/v0.1.0/sergeant-rs-installer.sh | sh
+curl -fsSL https://github.com/miztertea/sergeant-rs/releases/latest/download/sergeant-rs-installer.sh | sh
 ```
 
 **As of v0.1.2 this one-liner verifies the archive it downloads.** The
@@ -87,7 +87,7 @@ extra commands, run once per release:
 ```sh
 # 1. Download the archive for your platform, its checksum file, and the installer.
 mkdir -p /tmp/sgt-install && cd /tmp/sgt-install
-gh release download v0.1.0 --repo miztertea/sergeant-rs \
+gh release download --repo miztertea/sergeant-rs \
   -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz' \
   -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz.sha256'
 
