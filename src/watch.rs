@@ -701,6 +701,25 @@ mod tests {
     // ---- §9.1/§9.2: JSON shape -------------------------------------------
 
     #[test]
+    fn a_literal_watch_notice_blob_deserializes_with_the_pinned_schema() {
+        // Unlike `notice_json_shape_matches_the_contract...` above (which
+        // serializes a Rust-constructed WatchNotice), this parses a
+        // hand-written JSON blob as real input data — mirroring event.rs's
+        // `explicit_null_known_field_reads_as_unset_and_unknown_nulls_survive`
+        // pattern for its own schema string.
+        let blob = concat!(
+            r#"{"schema":"sergeant.watch/v1","reason":"state_transition","#,
+            r#""trigger":{"seq":1,"id":"01EVT","timestamp":"2026-08-13T18:42:31.417Z","kind":"work.completed"},"#,
+            r#""snapshot":{"work":{"state":"completed"}}}"#
+        );
+        let value: Value = serde_json::from_str(blob).expect("parse literal watch notice");
+        assert_eq!(value["schema"], WATCH_SCHEMA);
+        assert_eq!(value["reason"], "state_transition");
+        assert_eq!(value["trigger"]["kind"], "work.completed");
+        assert_eq!(value["snapshot"]["work"]["state"], "completed");
+    }
+
+    #[test]
     fn notice_json_shape_matches_the_contract_and_excludes_the_raw_payload() {
         let notice = WatchNotice {
             schema: WATCH_SCHEMA,

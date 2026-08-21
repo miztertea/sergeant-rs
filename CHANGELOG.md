@@ -15,10 +15,47 @@ released before a release can proceed.
 ## [0.1.2] - 2026-08-20
 
 Maintenance release: one day of backlog close-out rationalizing the base
-feature set the estate-root contract (0.1.1) implied. Nothing here is a new
-direction — these are the verbs, declarations, and honest reports that
-should have always been there, plus the accumulated perf and hygiene debts
-paid down.
+feature set the estate-root contract (0.1.1) implied, followed by a CI/CD
+hardening pass adopting one rule — float to discover, pin to build. Nothing
+here is a new direction — these are the verbs, declarations, and honest
+reports that should have always been there, plus the accumulated perf,
+hygiene, and reproducibility debts paid down.
+
+### CI/CD and supply chain
+
+- The compiler is pinned: `rust-toolchain.toml` names 1.98.0 exactly (dev
+  boxes and CI resolve the same toolchain from the same file; the
+  dtolnay/rust-toolchain wrapper is gone), and MSRV is declared and
+  CI-checked at the measured floor 1.89.0 — set by this crate's own
+  `File::try_lock` usage, verified empirically, not inferred from metadata.
+- Every cargo invocation in CI runs `--locked`, with `cargo metadata
+  --locked` guards ahead of third-party subcommands and a
+  `git diff --exit-code` no-mutation gate; runners are numbered
+  (`ubuntu-24.04`, `macos-26`), helper tools exact-pinned
+  (`cargo-llvm-cov@0.9.0`, `cargo-deny@0.20.2`, `cargo-cyclonedx@0.5.9`),
+  and the one stray checkout v4.4.0 joined the repo-wide v7.0.1 SHA pin.
+- A weekly `canary.yml` builds against floating `stable` Rust on floating
+  `*-latest` runners — deliberately loud: no `continue-on-error`, and a red
+  run maintains an `upstream-drift` tracking issue. Required CI stays
+  deterministic; the canary is how the next upgrade PR gets discovered.
+- The release path verifies what it executes and ships: `dist` is
+  bootstrapped from its checksum-pinned, attestation-verified tarball
+  (`scripts/release/install-dist.sh`) instead of `curl | sh`, and the
+  generated shell installer now verifies archive SHA-256s before extraction
+  — dist's per-target build manifests are wired into the global build so
+  its own (previously starved) `verify_checksum()` path runs, gated in CI
+  by positive and corrupted-archive smoke tests
+  (`scripts/release/verify-installer-checksums.sh`). SBOM attestations
+  moved from the deprecated `actions/attest-sbom` to unified
+  `actions/attest` v4.2.2, keeping 1:1 target↔SBOM pairing. Each package
+  leg records a build-environment evidence file into the release assets.
+- The doctor probe image is minor-pinned (`alpine:3.24`), the direct
+  reqwest dependency moved 0.12→0.13.4 collapsing a duplicate HTTP/TLS
+  stack out of the binary, README install commands use the `/latest`
+  release alias guarded by a new docs-consistency CI step, internal
+  schema identifiers gained golden contract tests, and
+  `docs/version-policy.md` records the pinning policy — including what is
+  deliberately not pinned, and why.
 
 ### Fixed
 

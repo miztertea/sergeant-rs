@@ -1220,6 +1220,46 @@ mod tests {
         );
     }
 
+    /// Complements `a_v1_descriptor_fails_closed_with_a_restart_remedy` above:
+    /// the positive case for the *current* schema, going through the same
+    /// on-disk file-write → `read_descriptor` path (not the in-memory
+    /// `descriptor_bound_to()` helper, which never touches disk).
+    #[test]
+    fn a_v2_descriptor_round_trips_through_read_descriptor() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join(DESCRIPTOR_FILE),
+            serde_json::json!({
+                "schema": DESCRIPTOR_SCHEMA,
+                "endpoint": "http://127.0.0.1:1",
+                "pid": 1,
+                "api_revision": API_REVISION,
+                "token": "t",
+                "estate_root": "/estates/payments",
+                "manifest_path": "/estates/payments/sergeant.toml",
+            })
+            .to_string(),
+        )
+        .expect("write v2 descriptor");
+
+        let descriptor = read_descriptor(dir.path())
+            .expect("read must succeed")
+            .expect("descriptor must be present");
+        assert_eq!(descriptor.schema, DESCRIPTOR_SCHEMA);
+        assert_eq!(descriptor.endpoint, "http://127.0.0.1:1");
+        assert_eq!(descriptor.pid, 1);
+        assert_eq!(descriptor.api_revision, API_REVISION);
+        assert_eq!(descriptor.token, "t");
+        assert_eq!(
+            descriptor.estate_root.as_deref(),
+            Some(Path::new("/estates/payments"))
+        );
+        assert_eq!(
+            descriptor.manifest_path.as_deref(),
+            Some(Path::new("/estates/payments/sergeant.toml"))
+        );
+    }
+
     /// A minimal, directly-constructed [`Core`] over a fresh journal — no
     /// HTTP surface, no engine, just what the committer and the export loop
     /// actually touch.

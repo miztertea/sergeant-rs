@@ -18,19 +18,19 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/common.sh"
 
 cov_stage_begin c2-m1_event_core
-cov_run cargo llvm-cov --no-report --test m1_event_core || cov_fail "m1_event_core failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m1_event_core --locked || cov_fail "m1_event_core failed under instrumentation"
 cov_stage_end 1 "the m1 test binary must write its own profile"
 
 cov_stage_begin c2-m4_backends
-cov_run cargo llvm-cov --no-report --test m4_backends || cov_fail "m4_backends failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m4_backends --locked || cov_fail "m4_backends failed under instrumentation"
 cov_stage_end 1 "the m4 test binary must write its own profile"
 
 cov_stage_begin c2-m3_execution
-cov_run cargo llvm-cov --no-report --test m3_execution || cov_fail "m3_execution failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m3_execution --locked || cov_fail "m3_execution failed under instrumentation"
 cov_stage_end 1 "the m3 test binary must write its own profile"
 
 cov_stage_begin c2-m5_projections
-cov_run cargo llvm-cov --no-report --test m5_projections || cov_fail "m5_projections failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m5_projections --locked || cov_fail "m5_projections failed under instrumentation"
 cov_stage_end 1 "the m5 test binary must write its own profile"
 
 # Added 2026-08-19. These four suites existed in tests/ but were invoked by no
@@ -43,21 +43,21 @@ cov_stage_end 1 "the m5 test binary must write its own profile"
 # than spawning, so all four sit here rather than in C3, whose floor rule is
 # written for suites dominated by real `sgt` subprocesses.
 cov_stage_begin c2-m8_estate_cli
-cov_run cargo llvm-cov --no-report --test m8_estate_cli || cov_fail "m8_estate_cli failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m8_estate_cli --locked || cov_fail "m8_estate_cli failed under instrumentation"
 cov_stage_end 1 "the m8 test binary must write its own profile"
 
 cov_stage_begin c2-m9_watch
-cov_run cargo llvm-cov --no-report --test m9_watch || cov_fail "m9_watch failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m9_watch --locked || cov_fail "m9_watch failed under instrumentation"
 cov_stage_end 1 "the m9 test binary must write its own profile"
 
 cov_stage_begin c2-m10_harness
-cov_run cargo llvm-cov --no-report --test m10_harness || cov_fail "m10_harness failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test m10_harness --locked || cov_fail "m10_harness failed under instrumentation"
 cov_stage_end 1 "the m10 test binary must write its own profile"
 
 cov_stage_begin c2-estate_routes
-cov_run cargo llvm-cov --no-report --test estate_routes || cov_fail "estate_routes failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test estate_routes --locked || cov_fail "estate_routes failed under instrumentation"
 cov_stage_end 1 "the estate_routes test binary must write its own profile"
 
 cov_stage_begin c2-t2_workflow_catalog
-cov_run cargo llvm-cov --no-report --test t2_workflow_catalog || cov_fail "t2_workflow_catalog failed under instrumentation"
+cov_run cargo llvm-cov --no-report --test t2_workflow_catalog --locked || cov_fail "t2_workflow_catalog failed under instrumentation"
 cov_stage_end 1 "the t2_workflow_catalog test binary must write its own profile"

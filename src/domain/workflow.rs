@@ -1838,7 +1838,7 @@ mod tests {
                 "\n",
                 "[stage.\"00-validate\"]\n",
                 "kind = \"execute\"\n",
-                "image = \"alpine:3\"\n",
+                "image = \"alpine:3.24\"\n",
                 "command = [\"true\"]\n",
                 "workdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\n",
@@ -1877,7 +1877,7 @@ mod tests {
             (
                 "no-command",
                 concat!(
-                    "image = \"alpine:3\"\n",
+                    "image = \"alpine:3.24\"\n",
                     "workdir = \"/estate\"\n",
                     "workspace_access = \"read_only\"\n",
                     "network = \"none\"\n"
@@ -1886,7 +1886,7 @@ mod tests {
             (
                 "no-workdir",
                 concat!(
-                    "image = \"alpine:3\"\n",
+                    "image = \"alpine:3.24\"\n",
                     "command = [\"true\"]\n",
                     "workspace_access = \"read_only\"\n",
                     "network = \"none\"\n"
@@ -1895,7 +1895,7 @@ mod tests {
             (
                 "no-access",
                 concat!(
-                    "image = \"alpine:3\"\n",
+                    "image = \"alpine:3.24\"\n",
                     "command = [\"true\"]\n",
                     "workdir = \"/estate\"\n",
                     "network = \"none\"\n"
@@ -1904,7 +1904,7 @@ mod tests {
             (
                 "no-network",
                 concat!(
-                    "image = \"alpine:3\"\n",
+                    "image = \"alpine:3.24\"\n",
                     "command = [\"true\"]\n",
                     "workdir = \"/estate\"\n",
                     "workspace_access = \"read_only\"\n"
@@ -1946,7 +1946,7 @@ mod tests {
             wf.join(WORKFLOW_FILE),
             concat!(
                 "[workflow]\nname = \"bad-access\"\nversion = \"1\"\nstages = [\"00-only\"]\n\n",
-                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
+                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3.24\"\n",
                 "command = [\"true\"]\nworkdir = \"/estate\"\n",
                 "workspace_access = \"read_and_write_and_more\"\nnetwork = \"none\"\n",
             ),
@@ -1964,7 +1964,7 @@ mod tests {
             wf.join(WORKFLOW_FILE),
             concat!(
                 "[workflow]\nname = \"bad-network\"\nversion = \"1\"\nstages = [\"00-only\"]\n\n",
-                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
+                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3.24\"\n",
                 "command = [\"true\"]\nworkdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\nnetwork = \"bridge\"\n",
             ),
@@ -1991,7 +1991,7 @@ mod tests {
             concat!(
                 "[workflow]\nname = \"misplaced-actor-field\"\nversion = \"1\"\n",
                 "stages = [\"00-only\"]\n\n",
-                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3\"\n",
+                "[stage.\"00-only\"]\nkind = \"execute\"\nimage = \"alpine:3.24\"\n",
                 "command = [\"true\"]\nworkdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\nnetwork = \"none\"\nharness = \"claude\"\n",
             ),
@@ -2270,7 +2270,7 @@ mod tests {
                 "\n",
                 "[stage.\"20-x\"]\n",
                 "kind = \"execute\"\n",
-                "image = \"alpine:3\"\n",
+                "image = \"alpine:3.24\"\n",
                 "command = [\"true\"]\n",
                 "workdir = \"/estate\"\n",
                 "workspace_access = \"read_only\"\n",

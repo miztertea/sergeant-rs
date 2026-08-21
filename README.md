@@ -60,27 +60,34 @@ catalog](#workflows) below for what a workflow actually is.
 `dist` (cargo-dist) publishes a prebuilt `sgt` for each [release](https://github.com/miztertea/sergeant-rs/releases), plus a `curl | sh` convenience installer:
 
 ```sh
-curl -fsSL https://github.com/miztertea/sergeant-rs/releases/download/v0.1.0/sergeant-rs-installer.sh | sh
+curl -fsSL https://github.com/miztertea/sergeant-rs/releases/latest/download/sergeant-rs-installer.sh | sh
 ```
 
-**This one-liner does not verify anything.** It downloads the archive for
-your platform and installs it — it does not check a checksum, a signature,
-or an attestation. If you watch its output you'll see it say so plainly:
-`no checksums to verify`. That line isn't a warning about a missing file;
-`dist`'s generated installer declares the local variables it would use to
-verify a checksum but nothing in the script ever assigns them, so the
-verification branch is structurally unreachable — the installer always
-takes the "nothing to verify" path, for every release. Convenient, but it
-gives you no evidence the artifact you're running is the one this project
-published.
+**As of v0.1.2 this one-liner verifies the archive it downloads.** The
+generated installer carries the SHA-256 of every published archive and checks
+the download against it before extracting anything; a substituted or corrupted
+archive aborts the install with `checksum mismatch` and installs nothing. Every
+release run proves this on itself — the release workflow installs from a local
+origin and then re-runs the install against a deliberately substituted archive,
+and fails the release if that one is not rejected.
 
-If you want that evidence, verify by hand — it's a few extra commands, run
-once per release:
+Releases before v0.1.2 did **not** verify: `dist` fills those values in only
+when its global build can see the per-target build manifests, and this
+project's release workflow did not pass them forward until 0.1.2. Installing
+v0.1.1 or older with this one-liner prints `no checksums to verify` and installs
+unverified — for those, the manual steps below are the only evidence you get.
+
+Two things the one-liner still does not give you, at any version: it does not
+check **provenance** — that the archive came from *this* repository's release
+workflow rather than from anyone able to produce a matching hash — and its
+checksum arrives inside the very script that consumes it, from the same origin
+as the archive. To verify independently of the script, do it by hand — a few
+extra commands, run once per release:
 
 ```sh
 # 1. Download the archive for your platform, its checksum file, and the installer.
 mkdir -p /tmp/sgt-install && cd /tmp/sgt-install
-gh release download v0.1.0 --repo miztertea/sergeant-rs \
+gh release download --repo miztertea/sergeant-rs \
   -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz' \
   -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz.sha256'
 
@@ -97,12 +104,13 @@ install -m 755 sergeant-rs-x86_64-unknown-linux-gnu/sgt ~/.local/bin/sgt
 sgt --version
 ```
 
-Step 2 confirms the bytes weren't corrupted or swapped in transit; step 3
-confirms they came from a GitHub Actions run of *this* repository's
-`release.yml`, via Sigstore/GitHub's build-provenance attestation — the
-thing the convenience one-liner skips entirely. Swap the target triple
-(`aarch64-apple-darwin`) and `~/.local/bin` for your platform and preferred
-install location as needed.
+Step 2 confirms the bytes weren't corrupted or swapped in transit — the same
+property the installer now checks for itself, but against a checksum you fetched
+as its own release asset rather than one embedded in the script; step 3 confirms
+they came from a GitHub Actions run of *this* repository's `release.yml`, via
+Sigstore/GitHub's build-provenance attestation — which the convenience one-liner
+still does not check. Swap the target triple (`aarch64-apple-darwin`) and
+`~/.local/bin` for your platform and preferred install location as needed.
 
 Want to see the whole loop first, with no tokens spent and no estate to
 set up? `scripts/demo.sh` builds the debug binary itself and drives it end
