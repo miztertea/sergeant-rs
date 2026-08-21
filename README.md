@@ -4,7 +4,7 @@
 
 **Sergeant is an AgentOS distro: instructions, skills, and conventions that turn a general-purpose coding harness into an operator of your estate, carried by `sgt` — a durable intent-execution engine that runs to completion whether or not anyone is watching.**
 
-[![CI](https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Clone it, put `sgt` on `PATH`, point it at your repos, and open your coding
