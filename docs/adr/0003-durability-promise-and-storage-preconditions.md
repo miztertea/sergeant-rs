@@ -113,6 +113,74 @@ records the decision; it does not implement the refusal, the `sgt doctor`
 remedy row, or the `/proc/mounts` detection, all of which are separate,
 not-yet-filed implementation work.
 
+## Amendment (2026-08-21): the durability promise under bounded retention
+
+**D7 — durability while retained is total; durability forever is not the
+promise.** Issue #17's Q1–Q10 rulings record (2026-08-21) ruled bounded,
+count-based retention into existence: `[estate] retention` names how many
+terminal Works' worth of journal history this estate keeps, and older
+history — segments, and the blobs only their Works referenced — is deleted,
+under policy, journaled. D5 above already established that durability means
+*resumable*, not *the daemon survives forever*; D7 is the same discipline
+applied to disk rather than to process lifetime, and it answers the
+question D5 did not: what does "resumable" mean once some history is gone
+by design rather than by accident.
+
+The promise, precisely:
+
+1. **While a Work's history is retained, its full trajectory is
+   replayable — never a silent partial view.** A client reading a retained
+   Work's transcript, graph, or event history gets everything that Work
+   ever did, not a window into it. Nothing in this codebase serves a
+   retained Work's history with an undisclosed gap.
+2. **The Work is the atom of retention.** It is retired whole or not at
+   all — never bisected by a segment boundary, a time cut, or a partial
+   unlink. `src/runtime/prune.rs`'s horizon predicate (`I-W3-1`, the
+   no-straddle invariant) is this decision made mechanical: a prune may
+   never leave some of a Work's events and delete the rest.
+3. **Retention-for-all-time is explicitly not promised.** Disk is finite
+   and startup must stay fast (D5's own "the architecture rests on the
+   journal, and the journal must stay fast to read" concern, extended);
+   retiring old, already-terminal history under a declared policy is a
+   legitimate operation, not a degradation of the durability promise. A
+   `Failed` Work older than the newest `retention` becomes unretryable —
+   the retry edge needs history that policy has since retired — and that
+   is this decision working as intended, not a defect (`docs/adr/0019-*.md`
+   states the tradeoff in full).
+4. **The crime is silent deletion, never deletion itself.** Every discard
+   flows from one of exactly two sources — a declared policy in
+   `sergeant.toml`, or (for the surface-teardown case D5/D6 already cover)
+   explicit operator action — and leaves a journaled record naming what
+   went and under which authority. `sgt doctor`'s `journal_growth` check and
+   `work show`'s pruned-by-name answer exist specifically so that record is
+   never buried where an operator cannot find it (`docs/adr/0019-*.md`, §16
+   of `w3-spec.md`'s design).
+
+This does not touch D5 (durability ≠ daemon survival) or D6 (unsuitable
+filesystem is a hard failure) — both stand exactly as decided. D7 is a
+sibling decision about a question this ADR simply had not yet been asked.
+The retention mechanism itself — the knob, its default, the prune protocol,
+its measured basis, and every tradeoff it accepts — is `docs/adr/0019-bounded-retention.md`'s
+job, not this one's; D7 states only what the durability promise now means
+in light of that mechanism existing.
+
+**Alternatives considered.** Treating any pruning as a violation of D5
+(rejected by the owner during the #17 grilling session, per the rulings
+record's premise amendment A1 itself: "the promise becomes... retention-for-
+all-time is explicitly not promised"). Leaving the durability promise
+unamended and treating retention as an unrelated, undocumented exception
+(rejected: it would leave exactly the "is a discard ever silent" question
+this ADR exists to answer unanswered for the one case that most needs it).
+
+**Consequences.** A `Failed` Work past the cap is a real, accepted
+degradation (point 3): `sgt work retry` on one answers `work_not_found` or
+the pruned-by-name shape, not a special error naming the tradeoff — this is
+recorded here so a future reader does not mistake it for a bug. The
+residue that makes point 4 possible (`pruned_works`, `pruned_commands`)
+grows without bound in the journal itself, at roughly 0.016% of a Work's
+own footprint (measured, `w3-spec.md` §6.4) — a cost paid once, in
+exchange for never re-opening a silent-404 hole.
+
 ## Open questions
 
 - The macOS detection path for advisory-locking-unreliable filesystems is

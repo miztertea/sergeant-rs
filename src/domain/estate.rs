@@ -267,6 +267,47 @@ pub struct Estate {
     /// derives a forge, host or CLI from it — the URL is opaque.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repository_upstream: BTreeMap<String, String>,
+    /// `[estate] retention` (Q3/A2, W3): the declared Work-retention cap, or
+    /// `None` for the built-in [`DEFAULT_RETENTION`]. Read once by
+    /// `daemon::start_with` and pinned into the prune policy for the life of
+    /// the process — a manifest edited under a running daemon does not
+    /// re-arm it, exactly like `surfaces_dir` and `data_dir`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<u32>,
+}
+
+/// Q3/A2's ratified default: how many Works this estate retains when
+/// `[estate] retention` is absent. 1000 Works ≈ 1.8 GB bounded total on the
+/// measured 1.8 MB/Work basis (issue #17's rulings record, 2026-08-21).
+pub const DEFAULT_RETENTION: u32 = 1000;
+
+/// The validation floor for a declared `retention`.
+///
+/// Not a correctness bound — the prune predicate is sound at any N, because
+/// a non-terminal or unsettled Work is never prunable whatever the cap says.
+/// This exists to refuse an obviously destructive typo (`retention = 1`,
+/// `retention = 0`) at parse time rather than after the segments are gone,
+/// and it is set at 64 because below that the estate retains less history
+/// than its own in-memory terminal caches hold (`TERMINAL_RUN_CACHE_CAPACITY`
+/// = 512, `TERMINAL_WORK_CACHE_CAPACITY` = 1024) — a knob under its own
+/// working set is a mistake, not a choice. **Ratify-at-review item 3.**
+pub const MIN_RETENTION: u32 = 64;
+
+/// Refuse a declared retention below [`MIN_RETENTION`] by name, at parse
+/// time. `deny_unknown_fields` gives no help here — the key is known and the
+/// value is in range for `u32`; only a named refusal explains the floor.
+fn validate_retention(retention: Option<u32>, file: &str) -> Result<(), EstateError> {
+    if let Some(value) = retention
+        && value < MIN_RETENTION
+    {
+        return Err(EstateError::RetentionBelowFloor {
+            file: file.to_string(),
+            value,
+            floor: MIN_RETENTION,
+            default: DEFAULT_RETENTION,
+        });
+    }
+    Ok(())
 }
 
 /// An admitted estate root (§4.1): the canonical directory that *is* the
@@ -695,6 +736,24 @@ pub enum EstateError {
         /// Declared repository names, for the remedy.
         available: String,
     },
+    /// `[estate] retention` is below the floor a bounded-retention policy is
+    /// allowed to declare (W3).
+    #[error(
+        "{file} declares [estate] retention = {value}, below the minimum of {floor}. \
+         Retention is how many Works of history this estate keeps; a value below \
+         {floor} retains less than the daemon's own in-memory caches hold. \
+         Remove the key to use the default of {default}, or raise it to at least {floor}"
+    )]
+    RetentionBelowFloor {
+        /// Config file that declared it.
+        file: String,
+        /// The declared value.
+        value: u32,
+        /// The validation floor ([`MIN_RETENTION`]).
+        floor: u32,
+        /// The built-in default ([`DEFAULT_RETENTION`]).
+        default: u32,
+    },
 }
 
 /// The `sergeant.toml` file shape (§9, R-MVP1-3's estate vocabulary).
@@ -735,6 +794,10 @@ struct EstateSection {
     /// `surfaces_dir` above.
     #[serde(default)]
     data_dir: Option<PathBuf>,
+    /// Q3/A2: how many Works of history this estate retains. Absent is
+    /// [`DEFAULT_RETENTION`]. Validated against [`MIN_RETENTION`] at parse.
+    #[serde(default)]
+    retention: Option<u32>,
 }
 
 /// One `[[repo]]` entry.
@@ -1241,21 +1304,23 @@ impl Estate {
             );
         }
 
-        let (name, default_backend, default_workflow, surfaces_dir, data_dir) = match parsed.estate
-        {
-            Some(estate) => (
-                estate.name,
-                estate.default_backend,
-                estate.default_workflow,
-                estate
-                    .surfaces_dir
-                    .map(|d| if d.is_absolute() { d } else { root.join(d) }),
-                estate
-                    .data_dir
-                    .map(|d| if d.is_absolute() { d } else { root.join(d) }),
-            ),
-            None => (repo_name(&root), None, None, None, None),
-        };
+        let (name, default_backend, default_workflow, surfaces_dir, data_dir, retention) =
+            match parsed.estate {
+                Some(estate) => (
+                    estate.name,
+                    estate.default_backend,
+                    estate.default_workflow,
+                    estate
+                        .surfaces_dir
+                        .map(|d| if d.is_absolute() { d } else { root.join(d) }),
+                    estate
+                        .data_dir
+                        .map(|d| if d.is_absolute() { d } else { root.join(d) }),
+                    estate.retention,
+                ),
+                None => (repo_name(&root), None, None, None, None, None),
+            };
+        validate_retention(retention, &file)?;
 
         Ok(Self {
             name,
@@ -1271,6 +1336,7 @@ impl Estate {
             groups,
             repository_origin,
             repository_upstream,
+            retention,
         })
     }
 
@@ -1372,21 +1438,23 @@ impl Estate {
             );
         }
 
-        let (name, default_backend, default_workflow, surfaces_dir, data_dir) = match parsed.estate
-        {
-            Some(estate) => (
-                estate.name,
-                estate.default_backend,
-                estate.default_workflow,
-                estate
-                    .surfaces_dir
-                    .map(|d| if d.is_absolute() { d } else { root.join(d) }),
-                estate
-                    .data_dir
-                    .map(|d| if d.is_absolute() { d } else { root.join(d) }),
-            ),
-            None => (repo_name(&root), None, None, None, None),
-        };
+        let (name, default_backend, default_workflow, surfaces_dir, data_dir, retention) =
+            match parsed.estate {
+                Some(estate) => (
+                    estate.name,
+                    estate.default_backend,
+                    estate.default_workflow,
+                    estate
+                        .surfaces_dir
+                        .map(|d| if d.is_absolute() { d } else { root.join(d) }),
+                    estate
+                        .data_dir
+                        .map(|d| if d.is_absolute() { d } else { root.join(d) }),
+                    estate.retention,
+                ),
+                None => (repo_name(&root), None, None, None, None, None),
+            };
+        validate_retention(retention, &file)?;
 
         Ok(Self {
             name,
@@ -1402,6 +1470,7 @@ impl Estate {
             groups,
             repository_origin,
             repository_upstream,
+            retention,
         })
     }
 
@@ -1913,6 +1982,7 @@ mod tests {
             groups: BTreeMap::new(),
             repository_origin: BTreeMap::new(),
             repository_upstream: BTreeMap::new(),
+            retention: None,
         };
 
         let selected = estate
@@ -1966,6 +2036,7 @@ mod tests {
             groups: BTreeMap::new(),
             repository_origin: BTreeMap::new(),
             repository_upstream: BTreeMap::new(),
+            retention: None,
         };
 
         let err = estate
@@ -2742,5 +2813,84 @@ mod tests {
             "legacy [workspace]/[[repository]] vocabulary in committed sergeant.toml file(s) \
              outside reference/: {offenders:?}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // W3: `[estate] retention`
+    // -------------------------------------------------------------
+
+    /// An absent `retention` resolves to `None` on the parsed `Estate` — the
+    /// daemon-side default ([`DEFAULT_RETENTION`]) is applied at
+    /// `daemon::start_with`'s policy resolution, not here.
+    #[test]
+    fn retention_absent_resolves_to_the_default() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate = parse(
+            dir.path(),
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"a\"\n",
+        )
+        .expect("parse");
+        assert_eq!(estate.retention, None);
+    }
+
+    /// A declared retention at or above [`MIN_RETENTION`] is accepted and
+    /// carried onto `Estate::retention` verbatim.
+    #[test]
+    fn retention_at_or_above_the_floor_is_accepted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let estate = parse(
+            dir.path(),
+            "[estate]\nname = \"w\"\nretention = 64\n\n[[repo]]\nname = \"a\"\n",
+        )
+        .expect("parse");
+        assert_eq!(estate.retention, Some(64));
+    }
+
+    /// N22: a declared retention below [`MIN_RETENTION`] is refused by name,
+    /// at parse time — never silently clamped, never accepted and left for a
+    /// destructive prune cycle to discover later.
+    #[test]
+    fn a_manifest_declaring_retention_below_the_floor_is_refused_by_name() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let err = parse(
+            dir.path(),
+            "[estate]\nname = \"w\"\nretention = 10\n\n[[repo]]\nname = \"a\"\n",
+        )
+        .expect_err("a below-floor retention must be refused");
+        match &err {
+            EstateError::RetentionBelowFloor {
+                value,
+                floor,
+                default,
+                ..
+            } => {
+                assert_eq!(*value, 10);
+                assert_eq!(*floor, MIN_RETENTION);
+                assert_eq!(*default, DEFAULT_RETENTION);
+            }
+            other => panic!("expected RetentionBelowFloor, got {other}"),
+        }
+        assert!(err.to_string().contains("below the minimum of 64"), "{err}");
+    }
+
+    /// The same floor is enforced by the structural parser
+    /// (`from_config_structural`), which is what a pen edit's `validate`
+    /// reparses through — so `sgt repo add`/`group add`/`remove` refuse to
+    /// commit over a below-floor `retention` too (§1.4's pen-support claim).
+    #[test]
+    fn the_structural_parser_also_refuses_a_below_floor_retention() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = dir.path().join(MANIFEST_FILE);
+        std::fs::write(
+            &config,
+            "[estate]\nname = \"w\"\nretention = 1\n\n[[repo]]\nname = \"a\"\n",
+        )
+        .expect("write manifest");
+        let err = Estate::from_config_structural(&config)
+            .expect_err("structural parse must also refuse a below-floor retention");
+        assert!(matches!(
+            err,
+            EstateError::RetentionBelowFloor { value: 1, .. }
+        ));
     }
 }

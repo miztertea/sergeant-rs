@@ -4508,6 +4508,7 @@ mod tests {
                 .collect(),
             repository_origin: BTreeMap::new(),
             repository_upstream: BTreeMap::new(),
+            retention: None,
         }
     }
 
@@ -4913,6 +4914,7 @@ mod tests {
                 groups: std::collections::BTreeMap::new(),
                 repository_origin: std::collections::BTreeMap::new(),
                 repository_upstream: std::collections::BTreeMap::new(),
+                retention: None,
             },
             repositories: Vec::new(),
             surfaces_root: dir.path().join("surfaces"),
@@ -5795,6 +5797,7 @@ mod tests {
                     integrity: None,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
+                    last_seq: 1,
                 },
             );
             registry.terminal_runs.insert(

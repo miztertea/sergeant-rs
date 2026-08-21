@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -45,9 +45,10 @@ use crate::platform::fs_locking::{self, Reliability};
 use crate::runtime::analytics::{Analytics, AnalyticsError};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
-use crate::runtime::journal::{Journal, JournalError};
-use crate::runtime::projection::{ProjectionError, work_registry_projection};
+use crate::runtime::journal::{DEFAULT_SEGMENT_MAX_BYTES, Journal, JournalError};
+use crate::runtime::projection::ProjectionError;
 use crate::runtime::recovery;
+use crate::runtime::startup::{self, StartupError};
 use crate::telemetry::{Telemetry, TelemetryConfig, TelemetryError};
 
 /// Runtime descriptor file name inside the data dir.
@@ -229,9 +230,19 @@ pub enum DaemonError {
     /// The disposable analytical projection could not be rebuilt.
     #[error(transparent)]
     Analytics(#[from] AnalyticsError),
+    /// W2: the shared startup replay or its cache failed.
+    #[error(transparent)]
+    Startup(#[from] StartupError),
     /// The §28 export pipeline could not be built from its configuration.
     #[error(transparent)]
     Telemetry(#[from] TelemetryError),
+    /// W3 Q9: this daemon's predecessor declared a prune it did not
+    /// acknowledge, and completing it (from the intent's own recorded
+    /// targets and residue) failed. Refused rather than served over: an
+    /// unfinished destructive act on disk means answering reads from a
+    /// journal whose floor is in an undeclared state.
+    #[error(transparent)]
+    Prune(#[from] crate::runtime::prune::PruneError),
     /// §4.1: the estate root this daemon was started against is not one.
     /// Refused before the data dir is created, the journal opened, or the
     /// descriptor published — a daemon that cannot name its estate never
@@ -356,6 +367,21 @@ pub struct DaemonConfig {
     /// `Engine::extend_turn_envelope` is the per-Work door beneath this
     /// daemon-wide default.
     pub turn_cap: Option<u32>,
+    /// W2 (`sgt daemon --rebuild-cache`): ignore any existing
+    /// `projections/floor-state.json`, rebuild from a full floor-aware
+    /// replay, and write a fresh one. `false` — the default and every
+    /// auto-spawn — uses the cache when it verifies.
+    pub rebuild_cache: bool,
+    /// Segment rotation threshold for this daemon's journal. `None` is
+    /// [`DEFAULT_SEGMENT_MAX_BYTES`] (8 MiB) — production, always.
+    ///
+    /// Configurable for the same reason `completion_poll` and `turn_ceiling`
+    /// are: W2's I9 and floor-fallback tests need a journal with more than
+    /// [`crate::runtime::startup::STARTUP_WINDOW_SEGMENTS`] segments, which
+    /// at the production threshold is far outside a test budget. The
+    /// alternative — shrinking the window instead — would mean the tests
+    /// prove a window nothing ships.
+    pub segment_max_bytes: Option<u64>,
     /// §5.1: the estate root this daemon is bound to, for its whole life.
     ///
     /// [`start_with`] admits it (§4.1's exact-root check —
@@ -370,6 +396,18 @@ pub struct DaemonConfig {
     /// test rigs' shape — never a silent fallback to discovery, of which
     /// there is none left.
     pub estate_root: Option<PathBuf>,
+    /// W3: retention cap for this daemon's journal, overriding `[estate]
+    /// retention`. `None` — production, always — takes the manifest's value
+    /// or [`crate::domain::estate::DEFAULT_RETENTION`].
+    ///
+    /// Configurable for the same reason `segment_max_bytes`/`completion_poll`
+    /// are: a prune test has to stand on the far side of the cap, and
+    /// building `DEFAULT_RETENTION` real Works is far outside a test budget.
+    /// **[`crate::domain::estate::MIN_RETENTION`] deliberately does not apply
+    /// here** — it is a *manifest-schema* refusal protecting an operator
+    /// from a typo in a file, not a runtime bound; a test rig setting
+    /// `Some(4)` has not typed anything into a manifest.
+    pub retention: Option<u32>,
 }
 
 impl Default for DaemonConfig {
@@ -384,7 +422,10 @@ impl Default for DaemonConfig {
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
             surfaces_root: None,
             turn_cap: None,
+            rebuild_cache: false,
+            segment_max_bytes: None,
             estate_root: None,
+            retention: None,
         }
     }
 }
@@ -454,21 +495,20 @@ pub async fn start_with(
         return Err(DaemonError::Locked);
     }
 
-    // 2. Own the journal and rebuild current state by full replay (§24;
-    // snapshots are an optimization the M2 daemon does not need yet).
-    let mut journal = Journal::open(data_dir)?;
-    let mut registry = work_registry_projection();
-    registry.catch_up(journal.replay()?)?;
+    // 2. Own the journal (§24). Recovers a crashed tail and learns the next
+    // seq from the last non-empty segment alone (`Journal::open_with`'s own
+    // doc explains why that is still fully seq-validated).
+    let rebuild_started = Instant::now();
+    let mut journal = Journal::open_with(
+        data_dir,
+        config
+            .segment_max_bytes
+            .unwrap_or(DEFAULT_SEGMENT_MAX_BYTES),
+    )?;
 
-    // 2b. The disposable projections (§21–§23, §40). The DuckDB file is
-    // rebuilt from the journal on **every** start, so deleting it and
-    // restarting is indistinguishable from restarting: no code path can come
-    // to depend on state that only lives in there.
-    let analytics = Analytics::rebuild(data_dir, journal.replay()?)?;
-
-    // 2c. §28 export, when it is switched on. The journal's append timing is
-    // the one metric whose input exists nowhere else, so the observer is
-    // installed here — and only here, when export is on.
+    // §28 export, when it is switched on. The journal's append timing is the
+    // one metric whose input exists nowhere else, so the observer is
+    // installed here — before anything below can append through this handle.
     if let Some(telemetry) = &config.telemetry {
         let telemetry = telemetry.clone();
         journal.set_append_observer(Arc::new(move |elapsed| {
@@ -476,8 +516,187 @@ pub async fn start_with(
         }));
     }
 
+    // 2a-2b. W2's one shared startup pass: collapses what used to be four
+    // separate full replays (`next_seq`'s own scan above, the Work registry,
+    // the analytical projection, the claude capability watermark) into one
+    // `startup::drive` over one `Replay` iterator, windowed by a persisted,
+    // purely-derived cache of everything older than the window
+    // (`runtime::startup` owns the whole mechanism; see its module doc).
+    let plan = startup::Plan::resolve(data_dir, &journal, config.rebuild_cache)?;
+    let mut registry = plan.seed_registry();
+    // The disposable analytical projection (§21–§23, §40): rebuilt from the
+    // journal on every start (windowed exactly like every other sink), so
+    // deleting it and restarting is indistinguishable from restarting.
+    let mut analytics = Analytics::begin_rebuild(data_dir)?;
+    let mut capability_sink = startup::CapabilitySink::seeded(plan.capability_seed());
+    // Loaded once, never mutated by the pass (§26 Q8's below-window ledger) —
+    // a separate seed from the one `LedgerSink` folds forward, so `Core`'s
+    // copy always names exactly the below-window keys the cache carried in,
+    // never anything the pass itself re-derived.
+    let floor_ledger = plan.ledger_seed();
+    let mut ledger_sink = startup::LedgerSink::seeded(floor_ledger.clone());
+    let mut horizon_sink = startup::HorizonSink::default();
+    let mut report = {
+        let mut analytics_sink = startup::AnalyticsSink::new(analytics.fold()?, plan.window_seq());
+        let report = startup::drive(
+            plan.replay(&journal)?,
+            &mut [
+                &mut startup::RegistrySink(&mut registry),
+                &mut analytics_sink,
+                &mut capability_sink,
+                &mut ledger_sink,
+                &mut horizon_sink,
+            ],
+        )?;
+        // `analytics_sink`'s `finish()` already ran inside `drive` above;
+        // dropping it here ends its borrow of `analytics` before the cache
+        // write below (and `analytics`'s later move into `ApiState`) need
+        // one of their own.
+        drop(analytics_sink);
+        report
+    };
+    // `PassReport::from_seq`'s own doc explains why `drive` cannot recover
+    // this when it sees zero events (a cache-hit restart with nothing
+    // appended since the cache was written): the plan itself always knows.
+    report.from_seq = plan.from_seq();
+
+    // 2c (W3 §2.5): the process-lifetime FirstSeqIndex the prune horizon
+    // needs — seeded from the cache's own rows (once a v2 cache has really
+    // written `first_seq` honestly) union this pass's own `HorizonSink`
+    // fold, exactly the same "already <= H_old <= H, always a legal answer"
+    // reasoning `LedgerSink`'s cache seed already follows.
+    let mut first_seq_by_work: crate::runtime::prune::FirstSeqIndex = match &plan {
+        startup::Plan::Windowed { cache, .. } => cache
+            .works
+            .iter()
+            .map(|row| (row.id.clone(), row.first_seq))
+            .collect(),
+        startup::Plan::Full { .. } => Default::default(),
+    };
+    for (id, seq) in horizon_sink.first_seq_by_work() {
+        first_seq_by_work.entry(id.clone()).or_insert(*seq);
+    }
+
+    // 2d. §2.6: the cache this start should leave behind — hit or miss,
+    // extending it is always sound, since everything a new cache needs is
+    // already in hand from the pass just run. Written under the daemon lock,
+    // before the listener binds and before any event is appended, so it
+    // always describes a prefix of the journal as it stood before this
+    // process's first append.
+    let floor_state = plan.next_cache(
+        &journal,
+        registry.state(),
+        &ledger_sink,
+        &capability_sink,
+        &horizon_sink,
+        &first_seq_by_work,
+    )?;
+    startup::persist_or_remove(floor_state.as_ref(), data_dir)?;
+    let rebuild_ms = u64::try_from(rebuild_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let startup_cache = plan.startup_cache_tag();
+    // The oldest surviving seq (1 on every W2 production path — the floor
+    // only moves above 1 once W3's prune lands).
+    let replay_floor_seq = journal.floor_seq()?.unwrap_or(1);
+
     let (events_tx, _) = broadcast::channel(1024);
-    let mut core = Core::new(journal, registry, events_tx);
+    let mut core = Core::new(journal, registry, events_tx)
+        .with_floor_ledger(Arc::new(floor_ledger))
+        .with_first_seq_index(first_seq_by_work);
+
+    // W3 §1.2: resolve the retention policy once, for this process's whole
+    // life — `config.retention` (test rigs only) -> `[estate] retention` ->
+    // the built-in default. Journaled on every prune event so the record
+    // names the authorization, not just the number (A1).
+    //
+    // `estate` above is only an `EstateRoot` (path + manifest_path admitted
+    // by §4.1's exact-root check) — it never parsed `[estate] retention`, so
+    // it is re-read here through the *structural* parser: schema-level
+    // checks in full, no per-repository git validation (`Estate::admit`
+    // never did that either, so this cannot newly refuse a daemon start that
+    // used to succeed). A failure here — unreachable in practice, since
+    // `admit` already parsed the same file successfully — falls back to the
+    // default rather than turning a policy-resolution nicety into a new
+    // startup failure mode.
+    let estate_retention = estate.as_ref().and_then(|estate_root| {
+        match Estate::from_config_structural(&estate_root.manifest_path) {
+            Ok(full) => full.retention,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not re-read the estate manifest for [estate] retention; using the default"
+                );
+                None
+            }
+        }
+    });
+    let prune_policy = match config.retention {
+        Some(retention) => crate::runtime::prune::PrunePolicy {
+            retention,
+            source: crate::runtime::prune::PolicySource::Config,
+        },
+        None => match estate_retention {
+            Some(retention) => crate::runtime::prune::PrunePolicy {
+                retention,
+                source: crate::runtime::prune::PolicySource::Manifest,
+            },
+            None => crate::runtime::prune::PrunePolicy {
+                retention: crate::domain::estate::DEFAULT_RETENTION,
+                source: crate::runtime::prune::PolicySource::Default,
+            },
+        },
+    };
+
+    // 2e-2g (W3 §10.3, §6.6): Q9's crash completion — evidence-based, exactly
+    // as `recovery::reconcile_terminal_surface` is: the intent is a durable,
+    // fsynced record that a specific, enumerated deletion was authorized and
+    // begun. Nothing here is inferred, nothing is widened, and no deletion
+    // is ever started from suspicion — `recovery.rs`'s own refusal boundary
+    // ("recovery acts on evidence that something was left unfinished, and
+    // there is none here") is untouched: this acts only where an intent
+    // exists, and only on the targets that intent names. Runs *before*
+    // `recovery::reconcile` below: the completion's fold removes the pruned
+    // Works from `works`/`runs`, and every pruned Work is retired whole
+    // (I-W3-3) so reconcile would have found nothing to do for them either
+    // way — the ordering is for determinism, not correctness.
+    let prune_started = Instant::now();
+    let had_interrupted_prune = core.registry.state().pending_prune.is_some();
+    if had_interrupted_prune {
+        crate::runtime::prune::complete_interrupted(&mut core, data_dir)?;
+    }
+    let first_seq_snapshot = core.first_seq_by_work.clone();
+    let prune_outcome = match crate::runtime::prune::run_startup(
+        &mut core,
+        data_dir,
+        &prune_policy,
+        &first_seq_snapshot,
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "startup prune failed; serving anyway");
+            core.prune_pending = true;
+            crate::runtime::prune::PruneOutcome::default()
+        }
+    };
+    let prune_duration_ms = u64::try_from(prune_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let prune_outcome_tag = if had_interrupted_prune {
+        "completed-interrupted".to_string()
+    } else if prune_outcome.segments_unlinked > 0 {
+        format!("pruned:{}", prune_outcome.segments_unlinked)
+    } else {
+        let stalled = core.journal.segment_bounds().ok().map(|bounds| {
+            crate::runtime::prune::candidate_horizon(
+                &bounds,
+                core.registry.state(),
+                &core.first_seq_by_work,
+                &prune_policy,
+            )
+            .1
+        });
+        match stalled.and_then(|s| s.blocking_work_id) {
+            Some(work_id) => format!("stalled:{work_id}"),
+            None => "none".to_string(),
+        }
+    };
 
     // 3. Bind loopback on an ephemeral port before publishing anything.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -487,7 +706,23 @@ pub async fn start_with(
     core.commit(EventDraft::new(
         EventSource::new("daemon", "sergeant"),
         KIND_DAEMON_STARTED,
-        json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "endpoint": endpoint}),
+        json!({
+            "pid": std::process::id(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "endpoint": endpoint,
+            // W2 (Q1/Q4): what the one shared startup pass cost, so
+            // `sgt doctor` can re-argue the fixed window from evidence
+            // rather than adapting it silently.
+            "rebuild_duration_ms": rebuild_ms,
+            "replayed_events": report.replayed_events,
+            "startup_cache": startup_cache,
+            "replay_floor_seq": replay_floor_seq,
+            "replay_from_seq": report.from_seq,
+            // W3: additive keys (§10.3) — what the startup prune trigger did
+            // (or why it did nothing), so a slow start is explicable.
+            "prune_duration_ms": prune_duration_ms,
+            "prune_outcome": prune_outcome_tag,
+        }),
     ))?;
     // `core` is bare here — no `CoreGuard`, because nothing else can see it
     // yet — so nothing makes this durable but an explicit flush (invariants
@@ -520,11 +755,11 @@ pub async fn start_with(
         // the registration probe two steps below, first of all — so a
         // capability this exact CLI version already proved absent stays
         // withdrawn across a restart instead of re-defaulting to optimistic
-        // on every fresh process. A separate `replay_data_dir` read (rather
-        // than reusing `journal` above, already moved into `core`) is the
-        // same pattern step 2b's `Analytics::rebuild` already uses for a
-        // second, independent replay of the same validated chain.
-        adapter.seed_capability_provenance(Journal::replay_data_dir(data_dir)?)?;
+        // on every fresh process. W2 replaces this walk's own separate
+        // journal replay with the shared pass's own `CapabilitySink`: the
+        // *fold* moved to step 2b, above; the *application* stays here,
+        // still before the registration probe reads `capabilities()`.
+        adapter.seed_capability_provenance_from(capability_sink.latest.as_ref());
         backends = backends.with(adapter.clone());
         Some(adapter)
     } else {
@@ -666,6 +901,7 @@ pub async fn start_with(
         closing: closing_rx,
         engine,
         analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+        prune_policy,
     };
     // §28's export is a fold over the event stream, subscribed here and
     // nowhere else. With export off this task does not exist.
@@ -914,6 +1150,7 @@ async fn export_events(
 pub async fn run_until_signal(
     data_dir: &Path,
     estate_root: Option<&Path>,
+    rebuild_cache: bool,
 ) -> Result<(), DaemonError> {
     // **Handlers first, before anything makes this daemon reachable.**
     //
@@ -984,6 +1221,7 @@ pub async fn run_until_signal(
             // handed down from the invocation that already admitted it
             // (`sgt -C <root> daemon`, or `sgt daemon` from the root).
             estate_root: estate_root.map(Path::to_path_buf),
+            rebuild_cache,
             ..DaemonConfig::default()
         },
     )
@@ -1265,7 +1503,7 @@ mod tests {
     /// actually touch.
     fn test_core(data_dir: &Path) -> Core {
         let journal = Journal::open(data_dir).expect("open journal");
-        let mut registry = work_registry_projection();
+        let mut registry = crate::runtime::projection::work_registry_projection();
         registry
             .catch_up(journal.replay().expect("replay"))
             .expect("catch up");

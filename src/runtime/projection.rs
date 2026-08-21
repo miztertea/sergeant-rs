@@ -122,6 +122,22 @@ impl<S> Projection<S> {
         self.last_seq
     }
 
+    /// A projection over a state the caller reconstructed by other means,
+    /// declared as already reflecting every event through `last_seq`.
+    ///
+    /// The file-backed counterpart is [`Projection::load_snapshot`]; this is
+    /// for a caller that assembled the state itself (W2's startup cache) and
+    /// is asserting which prefix of the journal it stands for. [`Projection::
+    /// catch_up`]/[`Projection::apply`] then enforce contiguity from
+    /// `last_seq + 1` exactly as they do after a snapshot.
+    pub fn resumed(state: S, last_seq: u64, reducer: Reducer<S>) -> Self {
+        Self {
+            state,
+            last_seq,
+            reducer,
+        }
+    }
+
     /// Fold one event. The event must be exactly the next seq — a gap or
     /// duplicate is an error, never a silent skip.
     pub fn apply(&mut self, event: &Event) -> Result<(), ProjectionError> {
@@ -354,6 +370,30 @@ pub struct WorkRegistry {
     /// to check first.
     #[serde(default)]
     pub admission_paused: bool,
+    /// W3/A3's residue: every Work this estate has pruned, keyed by id — the
+    /// pruned-by-name answer, folded from `prune.completed` (via the
+    /// `prune.intent` that precedes it) and therefore reproducible from a
+    /// floor replay with no cache at all.
+    ///
+    /// Disjoint from `work_index` by construction: a Work is in exactly one
+    /// of them, and the fold that inserts here removes there.
+    #[serde(default)]
+    pub pruned_works: std::collections::BTreeMap<String, crate::runtime::prune::PrunedWorkRow>,
+    /// W3 Q8's exemption made journal-durable: the §26 ledger keys of every
+    /// pruned command. Keys only — the `CommandOutcome` bodies died with
+    /// their events, exactly as the cache never carried them.
+    #[serde(default)]
+    pub pruned_commands:
+        std::collections::BTreeMap<String, crate::runtime::prune::PrunedCommandRow>,
+    /// W3: the prune cycle this journal has declared and not yet
+    /// acknowledged. `Some` only between a `prune.intent` and its
+    /// `prune.completed` — Q9's crash completion reads exactly this.
+    #[serde(default)]
+    pub pending_prune: Option<crate::runtime::prune::PruneIntentRecord>,
+    /// W3 §5.2: the hexes the most recent `prune.intent` moved into
+    /// quarantine — the deletion list the *next* cycle works from.
+    #[serde(default)]
+    pub quarantined_blobs: Vec<String>,
 }
 
 /// Bound on how many terminal runs [`WorkRegistry::terminal_runs`] holds at
@@ -438,6 +478,18 @@ pub struct WorkIndexRow {
     /// `integrity` — the journal event's own `timestamp`, not a wall clock
     /// read at fold time, so replay reproduces it identically.
     pub updated_at: String,
+    /// Seq of the most recent journal event carrying this Work's id.
+    ///
+    /// W2's horizon predicate and W3's per-Work prune atom both need it: a
+    /// Work with `last_seq > H` pins every segment at or below `H`, which is
+    /// what makes "a prune may never bisect a Work" checkable rather than
+    /// hoped for. W2 computes and persists it; W3 predicates on it.
+    ///
+    /// `#[serde(default)]` so a snapshot written before this field existed
+    /// still loads (0 reads as "unknown, older than anything this build
+    /// wrote"), per §20's forward-compatibility stance.
+    #[serde(default)]
+    pub last_seq: u64,
 }
 
 /// Everything the journal says about one work's run: the workflow it pinned,
@@ -671,8 +723,18 @@ pub fn is_absorbing(state: WorkState) -> bool {
 /// materialize, `Engine::plan`'s "no surface" case) never sets
 /// `surface_plan`, so this never blocks a genuinely surface-less Work.
 fn run_is_settled(work: &Work, run: &WorkRun) -> bool {
-    is_absorbing(work.state)
-        && (run.surface.is_none() || run.teardown.is_some())
+    is_absorbing(work.state) && run_is_retired(run)
+}
+
+/// The three run-shape clauses [`run_is_settled`] checks, factored out so W3's
+/// [`crate::runtime::prune::retired_whole`] can apply the identical rule
+/// under its own, broader terminality test (`Completed | Failed | Canceled`,
+/// not only the absorbing two): a run with a surface and no teardown, a
+/// `surface_plan` with no surface, or an unsettled reservation is not
+/// retired, whatever the Work's state says. One copy of the three clauses,
+/// two terminality tests over it.
+pub(crate) fn run_is_retired(run: &WorkRun) -> bool {
+    (run.surface.is_none() || run.teardown.is_some())
         && !(run.surface_plan.is_some() && run.surface.is_none())
         && run.unsettled_reservation().is_none()
 }
@@ -754,6 +816,25 @@ fn maybe_evict(state: &mut WorkRegistry, work_id: Option<&str>) {
 /// fold, one flag, so the live registry and the read-time re-derivation can
 /// never drift into two different ideas of what a work's run looked like.
 fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
+    // Every event that names a Work advances that Work's `last_seq`. Placed
+    // above every early return in this function on purpose: an arm that
+    // returns before the per-kind dispatch below (the admission arms just
+    // below, the `WorkState::for_event_kind` arm further down) must not be
+    // able to leave the index row's high-water mark behind. Events are
+    // folded in ascending seq order by both callers — the live registry's
+    // replay and `rederive_registry_for`'s per-work filtered replay — so
+    // this is monotone by construction, never a regression.
+    //
+    // The admission kinds carry no `work_id`, so this is a no-op on that
+    // path; and `command.accepted`/`command.rejected` carry one only
+    // *sometimes* (a work-mutating command does, an admin one does not) —
+    // the `if let` classifies per-event, which is exactly what that carries,
+    // and is why this must not switch on kind here.
+    if let Some(work_id) = event.work_id.as_deref()
+        && let Some(row) = state.work_index.get_mut(work_id)
+    {
+        row.last_seq = event.seq;
+    }
     // MVP-3's admission drain flag: a plain fold, checked before the
     // per-work dispatch below since neither event carries a `work_id`.
     match event.kind.as_str() {
@@ -763,6 +844,43 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
         }
         KIND_ADMISSION_RESUMED => {
             state.admission_paused = false;
+            return;
+        }
+        crate::runtime::prune::KIND_PRUNE_INTENT => {
+            // W3 §6.2: record, apply nothing. A declaration is not an
+            // outcome — until the completion lands, the segments may still
+            // be there, and a replay that folded the residue here would
+            // report Works as pruned that a crash left retained.
+            if let Some(record) = crate::runtime::prune::PruneIntentRecord::from_event(event) {
+                state.quarantined_blobs = record.condemn.clone();
+                state.pending_prune = Some(record);
+            } else {
+                tracing::error!(seq = event.seq, "malformed prune.intent payload; ignored");
+            }
+            return;
+        }
+        crate::runtime::prune::KIND_PRUNE_COMPLETED => {
+            let Some(pending) = state.pending_prune.take() else {
+                tracing::error!(
+                    seq = event.seq,
+                    "prune.completed with no pending intent; ignored"
+                );
+                return;
+            };
+            let intent_seq_matches =
+                event.payload["intent_seq"].as_u64() == Some(pending.intent_seq);
+            if !intent_seq_matches {
+                tracing::error!(
+                    seq = event.seq,
+                    expected_intent_seq = pending.intent_seq,
+                    found = ?event.payload.get("intent_seq"),
+                    "prune.completed intent_seq mismatch; ignored"
+                );
+                state.pending_prune = Some(pending);
+                return;
+            }
+            let merged = pending.residue.merged_with(pending.carried_forward);
+            apply_residue(state, merged);
             return;
         }
         _ => {}
@@ -807,6 +925,7 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                         integrity: None,
                         created_at: work.created_at.clone(),
                         updated_at: work.created_at.clone(),
+                        last_seq: event.seq,
                     },
                 );
                 state.works.insert(work.id.clone(), work);
@@ -1105,6 +1224,36 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
     }
 }
 
+/// W3 §6.2: apply a `prune.completed`'s merged residue (its own plus the
+/// carried-forward from any condemned earlier intent) to the live registry.
+/// Every step here is unconditional — the reducer never fails
+/// (`Reducer<S>` returns `()`), so a row already absent (a `Completed`/
+/// `Canceled` Work's `works`/`runs` entries, already gone via `maybe_evict`)
+/// is simply a no-op remove, never asserted.
+fn apply_residue(state: &mut WorkRegistry, residue: crate::runtime::prune::PruneResidue) {
+    for row in residue.works {
+        let id = row.id.clone();
+        state.work_index.remove(&id);
+        state.terminal_works.remove(&id);
+        state.terminal_work_order.retain(|x| x != &id);
+        state.terminal_runs.remove(&id);
+        state.terminal_run_order.retain(|x| x != &id);
+        state.works.remove(&id);
+        state.runs.remove(&id);
+        state.pruned_works.insert(id, row);
+    }
+    for row in residue.commands {
+        let id = row.command_id.clone();
+        state.commands.remove(&id);
+        state.command_works.remove(&id);
+        state.pruned_commands.insert(id, row);
+    }
+    // `residue.capability_provenance` is not carried on `WorkRegistry` at
+    // all (I-W3-12): the watermark's only durable home is the prune events
+    // themselves (T12), read back by `startup::CapabilitySink` on a full
+    // replay or a cache rebuild — nothing here needs it live.
+}
+
 /// An empty [`WorkRegistry`] projection ready to fold the journal.
 pub fn work_registry_projection() -> Projection<WorkRegistry> {
     Projection::new(WorkRegistry::default(), work_registry_reducer)
@@ -1140,7 +1289,11 @@ pub fn rederive_run(journal: &Journal, work_id: &str) -> Result<Option<WorkRun>,
 /// to.
 fn rederive_registry_for(journal: &Journal, work_id: &str) -> Result<WorkRegistry, JournalError> {
     let mut scratch = WorkRegistry::default();
-    for event in journal.replay()? {
+    // W3 §11.2/A1: floor-aware, not `replay()` — a retained Work's events
+    // never sit below the floor (I-W3-1), but `replay()`'s hardcoded
+    // `expected = 1` would misreport ruled retention as `SeqDiscontinuity`
+    // on a journal that has ever been pruned.
+    for event in journal.replay_from_floor()? {
         let event = event?;
         if event.work_id.as_deref() == Some(work_id) {
             apply_registry_event(&mut scratch, &event, false);
@@ -1894,5 +2047,121 @@ mod estate_root_phase_c_scope_replay_tests {
                 all: false,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod w2_startup_cache_projection_tests {
+    //! W2 §9.1 step 2: `WorkIndexRow::last_seq`, its maintenance, and
+    //! `Projection::resumed`.
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::work::{KIND_COMMAND_ACCEPTED, KIND_WORK_STARTED};
+    use crate::runtime::testing;
+
+    /// `last_seq` tracks the highest seq for a Work across every kind that
+    /// names it, including a `command.accepted` that carries a `work_id`
+    /// (the conditional case — recon correction 4).
+    #[test]
+    fn last_seq_tracks_the_highest_seq_across_every_kind_including_command_accepted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01LASTSEQWORK000000";
+
+        testing::submit(&mut core, work_id, "track my last_seq");
+        let submitted_seq = core.registry.state().work_index[work_id].last_seq;
+        assert_eq!(submitted_seq, 1);
+
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+        assert_eq!(core.registry.state().work_index[work_id].last_seq, 2);
+
+        // A command.accepted that names this work_id (a work-mutating
+        // command) must still advance last_seq, even though the top-of-
+        // function fold runs before the per-kind match ever sees the kind.
+        core.commit(
+            crate::domain::event::EventDraft::new(
+                crate::domain::event::EventSource::new("daemon", "api"),
+                KIND_COMMAND_ACCEPTED,
+                json!({"command_id": "01CMD00000000000000", "operation": "work.cancel",
+                       "status": 200u16, "result": {}}),
+            )
+            .with_work_id(work_id),
+        )
+        .expect("commit");
+        assert_eq!(
+            core.registry.state().work_index[work_id].last_seq,
+            3,
+            "a command.accepted naming this work_id must advance last_seq too"
+        );
+
+        // An admission event carries no work_id, and must be a no-op on
+        // last_seq (not a panic, not a spurious advance).
+        core.commit(crate::domain::event::EventDraft::new(
+            crate::domain::event::EventSource::new("daemon", "sergeant"),
+            crate::daemon::KIND_ADMISSION_PAUSED,
+            json!({}),
+        ))
+        .expect("commit");
+        assert_eq!(core.registry.state().work_index[work_id].last_seq, 3);
+    }
+
+    /// `rederive_registry_for`'s per-work filtered replay produces the same
+    /// `last_seq` the live, evicting fold does — the two folds must never
+    /// drift.
+    #[test]
+    fn rederive_registry_for_produces_the_same_last_seq_as_the_live_fold() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01REDERIVEWORK00000";
+        testing::submit(&mut core, work_id, "rederive me");
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+        let live_last_seq = core.registry.state().work_index[work_id].last_seq;
+
+        let rederived = rederive_registry_for(&core.journal, work_id).expect("rederive");
+        let rederived_last_seq = rederived.work_index[work_id].last_seq;
+
+        assert_eq!(live_last_seq, rederived_last_seq);
+    }
+
+    /// A seeded `Projection::resumed` enforces contiguity exactly like a
+    /// loaded snapshot: an event that is not `last_seq + 1` is refused.
+    #[test]
+    fn resumed_refuses_a_non_contiguous_first_event() {
+        let mut projection =
+            Projection::resumed(WorkRegistry::default(), 10, work_registry_reducer);
+        assert_eq!(projection.last_seq(), 10);
+
+        let event = crate::domain::event::EventDraft::new(
+            crate::domain::event::EventSource::new("daemon", "sergeant"),
+            KIND_WORK_SUBMITTED,
+            json!({}),
+        )
+        .into_event(12); // skips 11 — not contiguous with last_seq 10
+
+        let err = projection
+            .apply(&event)
+            .expect_err("a gap past a resumed seed must be refused");
+        assert!(matches!(
+            err,
+            ProjectionError::SeqMismatch {
+                expected: 11,
+                found: 12
+            }
+        ));
+
+        // The contiguous seq is accepted.
+        let event = crate::domain::event::EventDraft::new(
+            crate::domain::event::EventSource::new("daemon", "sergeant"),
+            KIND_WORK_SUBMITTED,
+            json!({}),
+        )
+        .into_event(11);
+        projection
+            .apply(&event)
+            .expect("contiguous event must apply");
+        assert_eq!(projection.last_seq(), 11);
     }
 }

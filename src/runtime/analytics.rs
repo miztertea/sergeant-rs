@@ -709,14 +709,27 @@ impl Analytics {
     where
         I: IntoIterator<Item = Result<Event, JournalError>>,
     {
+        let mut analytics = Self::begin_rebuild(data_dir)?;
+        analytics.catch_up(events)?;
+        Ok(analytics)
+    }
+
+    /// [`Analytics::rebuild`] minus the fold: delete any existing file and
+    /// its WAL, open a fresh connection, apply the schema. W2's `start_with`
+    /// uses this then [`Analytics::fold`] so the shared startup pass can feed
+    /// this projection one event at a time, the same call that feeds every
+    /// other sink.
+    ///
+    /// Deletes only the DuckDB file and its WAL — never the `projections/`
+    /// directory itself — so a sibling file in that directory (W2's startup
+    /// cache) survives this rebuild.
+    pub fn begin_rebuild(data_dir: &Path) -> Result<Self, AnalyticsError> {
         let path = duckdb_path(data_dir);
         create_dir_all_durable(&projections_dir(data_dir))?;
         remove_if_present(&path)?;
         remove_if_present(&path.with_extension("duckdb.wal"))?;
         let conn = Connection::open(&path)?;
-        let mut analytics = Self::over(conn, path)?;
-        analytics.catch_up(events)?;
-        Ok(analytics)
+        Self::over(conn, path)
     }
 
     /// An in-memory projection over `events`, for callers that want the
@@ -766,48 +779,42 @@ impl Analytics {
     where
         I: IntoIterator<Item = Result<Event, JournalError>>,
     {
-        // A fold is not atomic: rows are buffered as events are applied and
-        // written in chunks, and `last_seq` advances per event so the skip
-        // above stays right. If a write then fails, those buffered rows are
-        // gone while `last_seq` says they landed — and because the skip is
-        // permanent, `events`/`messages`/`usage` would answer 200 with rows
-        // missing forever after (the mutable tables self-heal via
-        // `materialize`, the append-only ones cannot). That is precisely the
-        // "kept current == rebuilt from scratch" invariant this method
-        // exists to hold, so the failure is made structural instead: the
-        // flag is set before the attempt and cleared only on success, so no
-        // `?` in the body can escape it, and the next call re-folds from
-        // zero. Cost of a transient write failure is one 503 and one
-        // rebuild; it is never a silently short table.
+        let mut fold = self.fold()?;
+        for event in events {
+            fold.push(&event?)?;
+        }
+        fold.finish()
+    }
+
+    /// Begin a fold session. Resets if a previous fold failed, then arms
+    /// `needs_reset` — exactly [`Analytics::catch_up`]'s prologue, split out
+    /// so W2's shared startup pass can drive this fold one event at a time
+    /// alongside every other sink, instead of handing it a whole iterator of
+    /// its own.
+    ///
+    /// A fold is not atomic: rows are buffered as events are applied and
+    /// written in chunks, and `last_seq` advances per event so the skip in
+    /// [`AnalyticsFold::push`] stays right. If a write then fails, those
+    /// buffered rows are gone while `last_seq` says they landed — and because
+    /// the skip is permanent, `events`/`messages`/`usage` would answer 200
+    /// with rows missing forever after (the mutable tables self-heal via
+    /// `materialize`, the append-only ones cannot). That is precisely the
+    /// "kept current == rebuilt from scratch" invariant this method exists to
+    /// hold, so the failure is made structural instead: the flag is set
+    /// before the attempt and cleared only on [`AnalyticsFold::finish`]'s
+    /// success, so no `?` anywhere in between can escape it, and the next
+    /// fold re-folds from zero. Cost of a transient write failure is one 503
+    /// and one rebuild; it is never a silently short table.
+    pub fn fold(&mut self) -> Result<AnalyticsFold<'_>, AnalyticsError> {
         if self.needs_reset {
             self.reset()?;
         }
         self.needs_reset = true;
-        let applied = self.catch_up_folding(events)?;
-        self.needs_reset = false;
-        Ok(applied)
-    }
-
-    fn catch_up_folding<I>(&mut self, events: I) -> Result<u64, AnalyticsError>
-    where
-        I: IntoIterator<Item = Result<Event, JournalError>>,
-    {
-        let mut appended = Appended::default();
-        let mut applied = 0u64;
-        for event in events {
-            let event = event?;
-            if event.seq <= self.last_seq {
-                continue;
-            }
-            self.apply(&event, &mut appended);
-            self.last_seq = event.seq;
-            applied += 1;
-            if appended.len() >= APPEND_CHUNK {
-                self.flush(&mut appended)?;
-            }
-        }
-        self.flush(&mut appended)?;
-        Ok(applied)
+        Ok(AnalyticsFold {
+            analytics: self,
+            appended: Appended::default(),
+            applied: 0,
+        })
     }
 
     /// Empty every table and the in-memory fold, so the next catch-up is a
@@ -1393,6 +1400,53 @@ impl Analytics {
     }
 }
 
+/// A fold session opened by [`Analytics::fold`] — one iteration of what used
+/// to be `catch_up_folding`'s loop body, exposed so W2's shared startup pass
+/// can feed this projection one event at a time from the same drive that
+/// feeds every other sink.
+///
+/// The rebuild path and the incremental path are still this one method
+/// (`push`), so "rebuilt from scratch" and "kept current" cannot drift apart
+/// — [`Analytics::catch_up`] is now just a loop over `push` plus `finish`.
+pub struct AnalyticsFold<'a> {
+    analytics: &'a mut Analytics,
+    appended: Appended,
+    applied: u64,
+}
+
+impl AnalyticsFold<'_> {
+    /// Fold one event, skipping it if its seq is at or below what this
+    /// projection already has (so handing this every event a wider replay
+    /// yields, unfiltered, is always safe).
+    pub fn push(&mut self, event: &Event) -> Result<(), AnalyticsError> {
+        if event.seq <= self.analytics.last_seq {
+            return Ok(());
+        }
+        self.analytics.apply(event, &mut self.appended);
+        self.analytics.last_seq = event.seq;
+        self.applied += 1;
+        if self.appended.len() >= APPEND_CHUNK {
+            self.analytics.flush(&mut self.appended)?;
+        }
+        Ok(())
+    }
+
+    /// Today's `catch_up_folding` epilogue plus clearing `needs_reset` — the
+    /// only place that happens, so a fold whose `push` ever returned an error
+    /// (and was therefore abandoned rather than driven to `finish`) leaves
+    /// the flag armed for the next fold to see.
+    pub fn finish(self) -> Result<u64, AnalyticsError> {
+        let AnalyticsFold {
+            analytics,
+            mut appended,
+            applied,
+        } = self;
+        analytics.flush(&mut appended)?;
+        analytics.needs_reset = false;
+        Ok(applied)
+    }
+}
+
 /// Tables this projection creates, in a stable order. Crate-internal: the
 /// table list is an implementation detail of the projection, and callers get
 /// it as data from [`Analytics::table_counts`].
@@ -1548,6 +1602,39 @@ mod tests {
         let counts = analytics.table_counts().expect("counts");
         assert_eq!(counts[0], ("events".to_string(), 2));
         assert_eq!(counts[1], ("work".to_string(), 2));
+    }
+
+    /// W2 §9.1 step 3: a failed `push` (surfaced through `finish`, since the
+    /// append-only tables only flush at chunk boundaries or at `finish`)
+    /// leaves `needs_reset` armed — the invariant `catch_up`'s doc comment
+    /// protects, now split across `fold`/`push`/`finish`.
+    ///
+    /// Injection: drop the `events` table out from under a live connection,
+    /// so the buffered append at `finish` fails at the DB layer while
+    /// `last_seq` has already advanced past it.
+    #[test]
+    fn a_failed_push_leaves_needs_reset_armed() {
+        let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
+        analytics
+            .conn
+            .execute_batch("DROP TABLE events")
+            .expect("drop the events table to force the next append to fail");
+
+        let mut fold = analytics.fold().expect("fold");
+        fold.push(&submitted(1, "w1"))
+            .expect("push buffers, does not write yet");
+        let err = fold
+            .finish()
+            .expect_err("finish must surface the failed append");
+        assert!(matches!(err, AnalyticsError::Duck(_)));
+
+        // `last_seq()` reads 0 while `needs_reset` is armed — the one public
+        // proxy for the private flag, per its own doc comment.
+        assert_eq!(
+            analytics.last_seq(),
+            0,
+            "a failed fold must leave needs_reset armed, reported as last_seq() == 0"
+        );
     }
 
     #[test]

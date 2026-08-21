@@ -5,12 +5,16 @@
 //! content deduplicates to one file, and an existing blob is never rewritten.
 //! Reads re-hash the bytes and fail closed on mismatch.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use serde_json::Value;
+
+use crate::domain::event::Event;
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 
 /// Chunk size [`BlobStore::put_stream`] reads/hashes/writes at a time. Fixed
@@ -18,6 +22,13 @@ use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 /// writer exists instead of `put(&buffer_it_all_up_first)` — the RSS this
 /// path costs is bounded by this constant, not by the content length.
 const STREAM_CHUNK: usize = 64 * 1024;
+
+/// W3 §4.4: the quarantine directory name, inside `blobs/b3/`. A leading dot
+/// so it can never collide with a 64-hex content address, and inside `b3/`
+/// (not a sibling of it) so a `rename(2)` moving a blob in or out never
+/// crosses a filesystem boundary — the rename must be atomic, and that is
+/// only guaranteed within one filesystem. A5's shape, taken verbatim.
+const QUARANTINE_DIR: &str = ".pruned";
 
 /// Errors from the blob store.
 #[derive(Debug, thiserror::Error)]
@@ -42,7 +53,10 @@ pub enum BlobError {
 }
 
 /// A validated `b3:<blake3-hex>` content reference.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+// `PartialOrd, Ord` (A4): `BTreeSet<BlobRef>` is `refs_in_payload`/
+// `refs_in_event`'s return type, so the mark-and-sweep scan's result is a
+// stable, deduplicated, orderable set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlobRef {
     hex: String,
 }
@@ -110,6 +124,14 @@ impl BlobStore {
         if path.exists() {
             return Ok(blob_ref); // write-once: never rewrite existing content
         }
+        // W3 §5.2 (A5/A8): the live path is absent, but a quarantined copy
+        // of the same content may still be sitting in `.pruned/` — rescue it
+        // rather than writing a second copy, which would otherwise leave a
+        // live copy *and* a quarantined one of the same content, breaking
+        // the one-copy invariant §4.4's crash reasoning relies on.
+        if self.rescue(blob_ref.hex())? {
+            return Ok(blob_ref);
+        }
         write_atomic(&path, bytes)?;
         Ok(blob_ref)
     }
@@ -159,6 +181,11 @@ impl BlobStore {
             if path.exists() {
                 return Ok((blob_ref, total)); // write-once: identical content dedupes
             }
+            // W3 §5.2: same rescue-before-write rule as `put` — see its own
+            // comment for why.
+            if self.rescue(blob_ref.hex())? {
+                return Ok((blob_ref, total));
+            }
             fs::rename(&tmp, &path)?;
             if let Some(parent) = path.parent() {
                 fs::File::open(parent)?.sync_all()?;
@@ -176,12 +203,30 @@ impl BlobStore {
     }
 
     /// Fetch a blob's bytes, verifying they still hash to the reference.
+    ///
+    /// W3 §5.2: on `NotFound`, try a quarantine [`BlobStore::rescue`] before
+    /// giving up — a blob a live Work still references may have been
+    /// condemned by a prune's mark scan and then adopted again (A5/A8)
+    /// between the mark and the sweep. If the rescue moves something back,
+    /// the read is retried once; otherwise this reports `NotFound` exactly
+    /// as before. The hash verification below is unchanged and now doubles
+    /// as the rescue's own integrity check.
     pub fn get(&self, blob_ref: &BlobRef) -> Result<Vec<u8>, BlobError> {
         let path = self.root.join(blob_ref.hex());
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(BlobError::NotFound(blob_ref.clone()));
+                if self.rescue(blob_ref.hex())? {
+                    match fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(BlobError::NotFound(blob_ref.clone()));
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                } else {
+                    return Err(BlobError::NotFound(blob_ref.clone()));
+                }
             }
             Err(e) => return Err(e.into()),
         };
@@ -194,10 +239,166 @@ impl BlobStore {
         }
         Ok(bytes)
     }
+
+    /// The quarantine directory (`blobs/b3/.pruned/`), creating it lazily on
+    /// first use — most estates never prune, and most that do never
+    /// condemn a blob, so paying for this directory up front at every
+    /// `BlobStore::open` would be waste on the common path.
+    fn quarantine_dir(&self) -> Result<PathBuf, BlobError> {
+        let dir = self.root.join(QUARANTINE_DIR);
+        create_dir_all_durable(&dir)?;
+        Ok(dir)
+    }
+
+    /// W3 §5.2 (A5): move a condemned blob into quarantine. `Ok(false)` when
+    /// the live path is already absent — this cycle's own retry (F2), or an
+    /// earlier crashed cycle already having moved it — never an error.
+    ///
+    /// A `rename(2)` within `blobs/b3/`, so the move is atomic: at every
+    /// instant, for a given hex, exactly one of `b3/<hex>` and
+    /// `b3/.pruned/<hex>` exists — the property that makes F2 reasonable
+    /// about at all.
+    pub fn quarantine(&self, blob_ref: &BlobRef) -> Result<bool, BlobError> {
+        let live = self.root.join(blob_ref.hex());
+        if !live.exists() {
+            return Ok(false);
+        }
+        let quarantine_dir = self.quarantine_dir()?;
+        let condemned = quarantine_dir.join(blob_ref.hex());
+        match fs::rename(&live, &condemned) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        fs::File::open(&self.root)?.sync_all()?;
+        fs::File::open(&quarantine_dir)?.sync_all()?;
+        Ok(true)
+    }
+
+    /// W3 §5.2: delete a quarantined blob. `Ok(false)` when it is absent —
+    /// which is the *expected* outcome for a blob a live read or write
+    /// rescued since the last completion, and is exactly how "untouched
+    /// since the prior completion" is implemented: presence in `.pruned/`
+    /// is the untouched-ness.
+    pub fn drop_quarantined(&self, hex: &str) -> Result<bool, BlobError> {
+        let quarantine_dir = self.quarantine_dir()?;
+        let condemned = quarantine_dir.join(hex);
+        match fs::remove_file(&condemned) {
+            Ok(()) => {
+                fs::File::open(&quarantine_dir)?.sync_all()?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// W3 §5.2: move a quarantined blob back to its content address, if one
+    /// is there. `Ok(false)` (never an error) when nothing is quarantined
+    /// under `hex` — the ordinary case for every blob this store has never
+    /// condemned. Called from [`BlobStore::get`], [`BlobStore::put`] and
+    /// [`BlobStore::put_stream`]'s dedup checks; idempotent, since the
+    /// rescued path becoming live is exactly what makes a second call here
+    /// find nothing left to rescue.
+    /// `pub(crate)` sibling of [`BlobStore::rescue`], for a caller (W3's
+    /// prune engine) that needs to rescue a specific hex *proactively* —
+    /// not as a side effect of its own `get`/`put` — because the mark scan
+    /// found it referenced by a surviving event while it still sat in
+    /// quarantine from a previous cycle (I-W3-6). Same idempotent
+    /// `Ok(false)`-not-an-error shape.
+    pub(crate) fn rescue_quarantined_hex(&self, hex: &str) -> Result<bool, BlobError> {
+        self.rescue(hex)
+    }
+
+    fn rescue(&self, hex: &str) -> Result<bool, BlobError> {
+        let quarantine_dir = self.root.join(QUARANTINE_DIR);
+        let condemned = quarantine_dir.join(hex);
+        if !condemned.exists() {
+            return Ok(false);
+        }
+        let live = self.root.join(hex);
+        match fs::rename(&condemned, &live) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        fs::File::open(&self.root)?.sync_all()?;
+        Ok(true)
+    }
+}
+
+/// How deep the recursive walk follows nested JSON-in-string values.
+///
+/// Bounded because a string that parses as JSON can itself contain a string
+/// that parses as JSON: the depth is a property of the producer, and every
+/// real producer today is one level (docker's `detail` object, stringified
+/// into `stage.completed`'s `detail` field). 32 is far past anything that
+/// could be honest and far short of a stack problem.
+const MAX_SCAN_DEPTH: usize = 32;
+
+/// Every blob reference reachable from an event payload — A4's recursive
+/// walk.
+///
+/// A flat scan of top-level payload fields is **wrong**: docker's capture
+/// puts its `stdout`/`stderr` refs inside a `detail` object that is then
+/// *stringified* into `stage.completed`'s `detail` field, so a flat scan
+/// finds nothing there and a mark-and-sweep built on one would delete live
+/// blobs.
+///
+/// Rules:
+///   - objects and arrays: recurse into every value;
+///   - strings: if the string parses as a [`BlobRef`] (`^b3:[0-9a-f]{64}$` —
+///     [`BlobRef::from_str`], never a second regex), collect it; otherwise,
+///     if it parses as a JSON **object or array**, recurse into that;
+///   - numbers, booleans, nulls: ignored;
+///   - depth is capped at [`MAX_SCAN_DEPTH`].
+///
+/// Restricting the string-recursion arm to objects and arrays is deliberate:
+/// a string that parses to a bare JSON *string* would recurse on a shorter
+/// string forever-ish, and no producer emits a doubly-encoded bare ref.
+pub fn refs_in_payload(value: &Value, out: &mut BTreeSet<BlobRef>) {
+    refs_in_payload_at_depth(value, out, 0);
+}
+
+fn refs_in_payload_at_depth(value: &Value, out: &mut BTreeSet<BlobRef>, depth: usize) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for v in map.values() {
+                refs_in_payload_at_depth(v, out, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                refs_in_payload_at_depth(v, out, depth + 1);
+            }
+        }
+        Value::String(s) => {
+            if let Ok(blob_ref) = BlobRef::from_str(s) {
+                out.insert(blob_ref);
+            } else if let Ok(parsed @ (Value::Object(_) | Value::Array(_))) =
+                serde_json::from_str::<Value>(s)
+            {
+                refs_in_payload_at_depth(&parsed, out, depth + 1);
+            }
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
+}
+
+/// Every blob reference in one event's payload.
+pub fn refs_in_event(event: &Event) -> BTreeSet<BlobRef> {
+    let mut out = BTreeSet::new();
+    refs_in_payload(&event.payload, &mut out);
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// `put_stream` and `put` must land on the same content address for the
@@ -337,5 +538,355 @@ mod tests {
             matches!(err, BlobError::Io(_)),
             "expected the generic io-error branch, got {err:?}"
         );
+    }
+
+    fn hex_ref(byte: u8) -> String {
+        let mut hex = String::with_capacity(64);
+        for _ in 0..32 {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        format!("b3:{hex}")
+    }
+
+    /// A flat top-level scan of a docker-shaped payload finds nothing; the
+    /// nested walk recovers both refs from inside the stringified `detail`
+    /// object — A4's claim, proved structurally here (the fixture-driven
+    /// version lives in `tests/a4_blob_ref_pinning.rs`).
+    #[test]
+    fn refs_in_payload_recovers_a_nested_json_string_ref() {
+        let stdout_ref = hex_ref(0x11);
+        let stderr_ref = hex_ref(0x22);
+        let detail = json!({"stdout": stdout_ref, "stderr": stderr_ref}).to_string();
+        let payload = json!({"stage_id": "build", "detail": detail});
+
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&BlobRef::from_str(&stdout_ref).unwrap()));
+        assert!(out.contains(&BlobRef::from_str(&stderr_ref).unwrap()));
+
+        // The load-bearing negative half: a flat scan of the *top-level*
+        // string fields alone finds nothing, because `detail` parses to an
+        // object, not a bare ref.
+        assert!(BlobRef::from_str(payload["detail"].as_str().unwrap()).is_err());
+    }
+
+    /// A top-level ref (claude's shape: `raw` is a bare `"b3:…"` string) is
+    /// found with no nesting at all.
+    #[test]
+    fn refs_in_payload_recovers_a_top_level_ref() {
+        let raw_ref = hex_ref(0x33);
+        let payload = json!({"raw": raw_ref});
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert_eq!(out, BTreeSet::from([BlobRef::from_str(&raw_ref).unwrap()]));
+    }
+
+    /// The depth cap stops the walk rather than overflowing the stack on a
+    /// pathologically deep payload.
+    ///
+    /// Nests via plain array wrapping, not repeated `to_string()` —
+    /// re-stringifying a value that already contains a quoted string
+    /// multiplies its escaped-backslash count at every level (`"` becomes
+    /// `\"`, which becomes `\\\"`, ...), so a naive stringify-loop this deep
+    /// blows up exponentially rather than linearly. Array nesting costs one
+    /// `Value` per level and exercises the same depth-counting code path
+    /// (`refs_in_payload_at_depth` recurses into arrays exactly like
+    /// objects).
+    #[test]
+    fn refs_in_payload_is_bounded_by_max_scan_depth() {
+        let leaf_ref = hex_ref(0x44);
+        let mut value = json!({"r": leaf_ref});
+        for _ in 0..(MAX_SCAN_DEPTH + 5) {
+            value = json!([value]);
+        }
+        let payload = json!({"nested": value});
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert!(
+            out.is_empty(),
+            "a ref nested past MAX_SCAN_DEPTH must not be recovered: {out:?}"
+        );
+    }
+
+    /// Strings that look close to a ref but are not one must never be
+    /// collected: too short, uppercase hex, and non-hex characters are all
+    /// rejected by `BlobRef::from_str`'s own rule, which this extractor
+    /// reuses rather than a second regex.
+    #[test]
+    fn refs_in_payload_rejects_near_miss_strings() {
+        let too_short = format!("b3:{}", "a".repeat(63));
+        let uppercase = format!("b3:{}", "A".repeat(64));
+        let non_hex = format!("b3:{}", "g".repeat(64));
+        let payload = json!({
+            "too_short": too_short,
+            "uppercase": uppercase,
+            "non_hex": non_hex,
+        });
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert!(
+            out.is_empty(),
+            "near-miss strings must never be collected as refs: {out:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // W3 §5.2: quarantine, drop_quarantined, rescue
+    // -------------------------------------------------------------
+
+    /// `quarantine` moves the live blob into `.pruned/`, leaves exactly one
+    /// copy in existence, and a second call (F2's own idempotent retry) is a
+    /// no-op that reports `Ok(false)` rather than an error.
+    #[test]
+    fn quarantine_and_rescue_never_leave_two_copies() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"evidence").expect("put");
+        let live = store.root.join(blob_ref.hex());
+        let quarantined = store.root.join(QUARANTINE_DIR).join(blob_ref.hex());
+
+        assert!(live.exists());
+        assert!(!quarantined.exists());
+
+        assert!(store.quarantine(&blob_ref).expect("quarantine"));
+        assert!(!live.exists(), "the live copy must be gone");
+        assert!(
+            quarantined.exists(),
+            "exactly the quarantined copy must exist"
+        );
+
+        // F2: a second quarantine of the same (now-absent) live path is a
+        // tolerated no-op, not an error.
+        assert!(!store.quarantine(&blob_ref).expect("re-quarantine"));
+        assert!(quarantined.exists(), "the retry must not have lost it");
+
+        // Rescue moves it back — one copy, the live one, ever exists.
+        assert!(store.rescue(blob_ref.hex()).expect("rescue"));
+        assert!(live.exists());
+        assert!(!quarantined.exists());
+
+        // Rescuing again finds nothing to rescue.
+        assert!(!store.rescue(blob_ref.hex()).expect("re-rescue"));
+    }
+
+    /// `BlobStore::get` transparently rescues a quarantined blob a live Work
+    /// still references (A5/A8's rescue-on-read guard), and the hash
+    /// verification still applies on the way out.
+    #[test]
+    fn get_rescues_a_quarantined_blob() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"still referenced").expect("put");
+        assert!(store.quarantine(&blob_ref).expect("condemn it"));
+
+        let bytes = store
+            .get(&blob_ref)
+            .expect("get must rescue the quarantined blob rather than reporting NotFound");
+        assert_eq!(bytes, b"still referenced");
+        assert!(
+            store.root.join(blob_ref.hex()).exists(),
+            "the rescue must have left the blob live again"
+        );
+        assert!(
+            !store
+                .root
+                .join(QUARANTINE_DIR)
+                .join(blob_ref.hex())
+                .exists()
+        );
+    }
+
+    /// A genuinely missing blob (never quarantined either) still reports
+    /// `NotFound` — the rescue attempt must not paper over an actual loss.
+    #[test]
+    fn get_still_reports_not_found_when_nothing_is_quarantined() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let hex = "a".repeat(64);
+        let blob_ref: BlobRef = format!("b3:{hex}").parse().expect("valid ref");
+        let err = store.get(&blob_ref).expect_err("nothing exists at all");
+        assert!(matches!(err, BlobError::NotFound(_)));
+    }
+
+    /// `put`'s dedup check rescues a quarantined blob of the same content
+    /// instead of writing a second copy — the one-copy invariant §4.4's
+    /// crash reasoning depends on.
+    #[test]
+    fn put_rescues_instead_of_writing_a_second_copy() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let first = store.put(b"dedup me").expect("first put");
+        assert!(store.quarantine(&first).expect("condemn it"));
+        assert!(!store.root.join(first.hex()).exists());
+
+        let second = store.put(b"dedup me").expect("second put, same content");
+        assert_eq!(second.hex(), first.hex());
+        assert!(
+            store.root.join(first.hex()).exists(),
+            "put must have rescued the quarantined copy rather than leaving it condemned"
+        );
+        assert!(
+            !store.root.join(QUARANTINE_DIR).join(first.hex()).exists(),
+            "exactly one copy must exist after the rescue — not a live one and a quarantined one"
+        );
+    }
+
+    /// `put_stream`'s dedup check follows the identical rule.
+    #[test]
+    fn put_stream_rescues_instead_of_writing_a_second_copy() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let content = b"streamed dedup me".repeat(100);
+        let (first, _) = store
+            .put_stream(std::io::Cursor::new(content.clone()))
+            .expect("first stream");
+        assert!(store.quarantine(&first).expect("condemn it"));
+
+        let (second, _) = store
+            .put_stream(std::io::Cursor::new(content))
+            .expect("second stream, same content");
+        assert_eq!(second.hex(), first.hex());
+        assert!(store.root.join(first.hex()).exists());
+        assert!(!store.root.join(QUARANTINE_DIR).join(first.hex()).exists());
+    }
+
+    /// `drop_quarantined` deletes a quarantined blob and reports `Ok(false)`
+    /// — not an error — for one a live read already rescued: presence in
+    /// `.pruned/` *is* the untouched-ness §5.2 relies on.
+    #[test]
+    fn drop_quarantined_is_ok_false_for_a_rescued_blob() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"grace window").expect("put");
+        assert!(store.quarantine(&blob_ref).expect("condemn"));
+
+        // A live read rescues it before the deferred delete runs.
+        store.get(&blob_ref).expect("rescue via get");
+
+        assert!(
+            !store
+                .drop_quarantined(blob_ref.hex())
+                .expect("drop_quarantined must not error on an absent quarantine entry"),
+            "a rescued blob is no longer in .pruned/, so this must be Ok(false)"
+        );
+        assert!(
+            store.root.join(blob_ref.hex()).exists(),
+            "the rescued blob must survive"
+        );
+    }
+
+    /// The ordinary deferred-delete path: a blob nothing rescued is actually
+    /// removed, and `drop_quarantined` reports `Ok(true)`.
+    #[test]
+    fn drop_quarantined_removes_an_untouched_condemned_blob() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"nobody wanted this back").expect("put");
+        assert!(store.quarantine(&blob_ref).expect("condemn"));
+
+        assert!(store.drop_quarantined(blob_ref.hex()).expect("drop"));
+        assert!(
+            !store
+                .root
+                .join(QUARANTINE_DIR)
+                .join(blob_ref.hex())
+                .exists()
+        );
+        assert!(
+            !store.root.join(blob_ref.hex()).exists(),
+            "must not resurrect the live copy"
+        );
+    }
+
+    /// F2's idempotency half, stated directly on the primitive rather than
+    /// only through the crash-window tests that depend on it: quarantining a
+    /// blob that is *already* quarantined is tolerated, reports `Ok(false)`,
+    /// and leaves the quarantined content byte-for-byte intact — the
+    /// property that lets `prune::complete_interrupted` re-walk an intent's
+    /// whole `condemn` list without knowing how far the crashed cycle got.
+    #[test]
+    fn quarantine_tolerates_an_already_quarantined_blob_and_keeps_its_content() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"already condemned").expect("put");
+        let quarantined = store.root.join(QUARANTINE_DIR).join(blob_ref.hex());
+
+        assert!(store.quarantine(&blob_ref).expect("first quarantine"));
+
+        for attempt in 0..3 {
+            assert!(
+                !store
+                    .quarantine(&blob_ref)
+                    .unwrap_or_else(|e| panic!("re-quarantine {attempt} must not error: {e}")),
+                "a blob already in .pruned/ has no live path to move; this must be Ok(false)"
+            );
+            assert_eq!(
+                std::fs::read(&quarantined).expect("the quarantined copy must still be there"),
+                b"already condemned",
+                "re-quarantining must never disturb the content it already moved"
+            );
+            assert!(
+                !store.root.join(blob_ref.hex()).exists(),
+                "re-quarantining must never resurrect a live copy alongside the quarantined one"
+            );
+        }
+    }
+
+    /// F3's idempotency half, likewise stated on the primitive: deleting a
+    /// quarantined blob that is *already gone* — because the crashed cycle
+    /// got to it before dying, not because anything rescued it — is
+    /// tolerated and reports `Ok(false)`, as is a hex this store has never
+    /// seen at all. `drop_quarantined_is_ok_false_for_a_rescued_blob` covers
+    /// the rescued shape; this one covers the already-deleted and
+    /// never-existed shapes, which are what a re-run of a completion walks
+    /// into.
+    #[test]
+    fn drop_quarantined_tolerates_an_already_deleted_and_an_unknown_hex() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"deleted once, asked for twice").expect("put");
+        assert!(store.quarantine(&blob_ref).expect("condemn"));
+
+        assert!(
+            store.drop_quarantined(blob_ref.hex()).expect("first drop"),
+            "the first deferred delete actually removes it"
+        );
+        for attempt in 0..3 {
+            assert!(
+                !store
+                    .drop_quarantined(blob_ref.hex())
+                    .unwrap_or_else(|e| panic!("re-drop {attempt} must not error: {e}")),
+                "deleting what is already deleted must be Ok(false), never an error"
+            );
+        }
+        assert!(
+            !store.root.join(blob_ref.hex()).exists(),
+            "a repeated delete must never resurrect the live copy either"
+        );
+
+        let unknown = "b".repeat(64);
+        assert!(
+            !store
+                .drop_quarantined(&unknown)
+                .expect("an unknown hex must not error"),
+            "a hex this store has never held is Ok(false) too"
+        );
+    }
+
+    /// `refs_in_event` is the event-level entry point A4's pinning tests use.
+    #[test]
+    fn refs_in_event_reads_the_payload() {
+        use crate::domain::event::{EventDraft, EventSource};
+
+        let want = hex_ref(0x55);
+        let event = EventDraft::new(
+            EventSource::new("backend", "claude"),
+            "conversation.turn.ended",
+            json!({"raw": want}),
+        )
+        .into_event(1);
+        let refs = refs_in_event(&event);
+        assert_eq!(refs, BTreeSet::from([BlobRef::from_str(&want).unwrap()]));
     }
 }

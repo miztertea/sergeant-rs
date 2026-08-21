@@ -1,0 +1,5 @@
+{
+  "stage_id": "00-only",
+  "index": 0,
+  "detail": "{\"capture\":\"complete\",\"capture_error\":null,\"exit_code\":0,\"finished_at\":\"2026-08-21T06:54:42.402022794Z\",\"image_id\":\"sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b\",\"started_at\":\"2026-08-21T06:54:42.292751737Z\",\"stderr\":\"b3:9ca9d2d668724792be63a9eff1655b8f7f0709ff626366fb2f5e41d364beaeb9\",\"stderr_bytes\":24,\"stderr_tail\":\"hello-stderr-a4-fixture\\n\",\"stdout\":\"b3:bf730d4240204609d485accddfa61b2c4ad782227971db1f32d18dc5962c15c5\",\"stdout_bytes\":24,\"stdout_tail\":\"hello-stdout-a4-fixture\\n\"}"
+}

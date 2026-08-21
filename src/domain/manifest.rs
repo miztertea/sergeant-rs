@@ -399,6 +399,31 @@ pub fn init_estate(root: &Path, name: Option<&str>) -> Result<InitOutcome, Manif
             .unwrap_or_else(|| estate_default_name(root));
         table.insert("name", value(default_name));
         table.set_implicit(false);
+        // W3 §1.4: teach the retention knob where an operator will actually
+        // read it — in their own manifest, at the moment they are looking at
+        // it — but leave it *commented*.
+        //
+        // Explicit-and-uncommented was rejected for two reasons. (a) Recon
+        // correction 9: `EstateFile` is `deny_unknown_fields`, so a manifest
+        // carrying `retention` is refused outright by an 0.1.2 binary.
+        // Writing the key live would impose that incompatibility on every
+        // newly-initialized estate; writing it commented makes it something
+        // an operator opts into by uncommenting, which is the same shape
+        // every other optional key in this table already has. (b) The
+        // default belongs to the binary, not to a file scaffolded once: an
+        // estate created today would otherwise pin 1000 forever, and a
+        // future re-argument of the default would never reach it.
+        //
+        // A comment is invisible to serde, so this changes nothing about
+        // parsing, in this build or any other. Attached as the `name`
+        // value's trailing decor (rather than the table's own header decor,
+        // which renders *before* `name`) so it lands after the one key this
+        // freshly-scaffolded table has.
+        if let Some(value_mut) = table.get_mut("name").and_then(Item::as_value_mut) {
+            value_mut
+                .decor_mut()
+                .set_suffix(retention_scaffold_comment());
+        }
         doc.insert("estate", Item::Table(table));
         true
     };
@@ -428,6 +453,24 @@ pub fn init_estate(root: &Path, name: Option<&str>) -> Result<InitOutcome, Manif
         repos_dir_created,
         gitignore_updated,
     })
+}
+
+/// W3 §1.4's scaffolded, commented `retention` block, rendered as the `name`
+/// key's trailing decor: a blank line, three explanatory comment lines, and
+/// the key itself commented out. Built from
+/// [`crate::domain::estate::DEFAULT_RETENTION`] and
+/// [`crate::domain::estate::MIN_RETENTION`] rather than hand-copied numbers,
+/// so a future re-argument of either constant cannot silently drift out of
+/// sync with what new manifests say about it.
+fn retention_scaffold_comment() -> String {
+    use crate::domain::estate::{DEFAULT_RETENTION, MIN_RETENTION};
+    format!(
+        "\n\n\
+         # How many Works of history this estate keeps. Older terminal Works — and\n\
+         # the blobs only they referenced — are pruned automatically under this\n\
+         # policy, each prune journaled. Default when absent: {DEFAULT_RETENTION}. Minimum: {MIN_RETENTION}.\n\
+         # retention = {DEFAULT_RETENTION}"
+    )
 }
 
 /// The zero-config-style default estate name: the root directory's own name.
@@ -966,6 +1009,57 @@ mod tests {
         let estate = Estate::from_config_allow_empty(&root.join(MANIFEST_FILE))
             .expect("scaffolded manifest parses");
         assert_eq!(estate.name, "my-estate");
+    }
+
+    /// W3 §1.4: `sgt init` writes the `retention` knob **commented** —
+    /// invisible to the current parser (`retention == None`) and invisible
+    /// to recon correction 9's 0.1.2 `deny_unknown_fields` binary (the raw
+    /// text never contains a live `retention` key at all).
+    #[test]
+    fn init_scaffolds_retention_as_a_comment_that_an_older_parser_ignores() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        init_estate(dir.path(), Some("my-estate")).expect("init");
+
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_FILE)).expect("read manifest");
+        assert!(
+            text.contains("# retention = 1000"),
+            "the scaffold must leave a commented retention line: {text:?}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.trim() == "retention = 1000" || l.trim().starts_with("retention =")),
+            "the scaffold must never leave a *live* retention key: {text:?}"
+        );
+
+        let estate = Estate::from_config_allow_empty(&dir.path().join(MANIFEST_FILE))
+            .expect("scaffolded manifest still parses under the current schema");
+        assert_eq!(
+            estate.retention, None,
+            "a commented retention key must be invisible to serde"
+        );
+    }
+
+    /// The other half: uncommenting the scaffolded line produces a manifest
+    /// that parses to the declared value — the comment is a real, valid key
+    /// with a `#` in front of it, not decorative prose an operator would
+    /// have to rewrite from scratch.
+    #[test]
+    fn init_scaffolded_retention_uncomments_into_a_valid_manifest() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        init_estate(dir.path(), Some("my-estate")).expect("init");
+
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_FILE)).expect("read manifest");
+        let uncommented = text.replace("# retention = 1000", "retention = 1000");
+        assert_ne!(
+            uncommented, text,
+            "the fixture must actually find the line to uncomment"
+        );
+        std::fs::write(dir.path().join(MANIFEST_FILE), uncommented).expect("write");
+
+        let estate = Estate::from_config_allow_empty(&dir.path().join(MANIFEST_FILE))
+            .expect("an uncommented scaffold must still parse");
+        assert_eq!(estate.retention, Some(1000));
     }
 
     /// guard-map: `sgt init` scaffolds every `.gitignore` entry

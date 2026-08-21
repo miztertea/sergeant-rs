@@ -121,6 +121,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
@@ -383,24 +384,101 @@ fn latest_ask_withdrawal_version<I>(events: I) -> Result<Option<String>, Journal
 where
     I: IntoIterator<Item = Result<Event, JournalError>>,
 {
-    let mut latest: Option<(u64, String)> = None;
+    let mut latest: Option<AskWithdrawal> = None;
     for event in events {
-        let event = event?;
-        if event.source.source_type != "backend"
-            || event.source.name != CLAUDE_BACKEND_NAME
-            || event.kind != "conversation.turn.grammar_unmeasured"
-            || event.payload.get("capability").and_then(Value::as_str) != Some("ask")
-        {
-            continue;
-        }
-        let Some(version) = event.payload.get("version").and_then(Value::as_str) else {
+        note_ask_withdrawal(&mut latest, &event?);
+    }
+    Ok(latest.map(|w| w.version))
+}
+
+/// The journal's record of an ask-grammar withdrawal: which CLI version it
+/// was measured against, and the seq that recorded it (so a later record
+/// always wins, whichever pass sees it).
+///
+/// W2's startup cache carries this as its capability-provenance watermark —
+/// the piece recon correction 3 found missing from the original design's own
+/// enumeration of what the shared startup pass needs to carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskWithdrawal {
+    /// Seq of the event that recorded this withdrawal.
+    pub seq: u64,
+    /// The CLI version it was measured against.
+    pub version: String,
+}
+
+/// Fold one event into the running "latest withdrawal" watermark. Same
+/// predicate [`latest_ask_withdrawal_version`] always used: source_type ==
+/// `"backend"`, name == [`CLAUDE_BACKEND_NAME`], kind ==
+/// `"conversation.turn.grammar_unmeasured"`, `payload.capability == "ask"`,
+/// `payload.version` present; higher seq wins — "most recent" is by journal
+/// seq, not by payload timestamp or event order in the caller's iterator
+/// (see [`latest_ask_withdrawal_version`]'s own doc for why).
+pub fn note_ask_withdrawal(latest: &mut Option<AskWithdrawal>, event: &Event) {
+    if event.source.source_type != "backend"
+        || event.source.name != CLAUDE_BACKEND_NAME
+        || event.kind != "conversation.turn.grammar_unmeasured"
+        || event.payload.get("capability").and_then(Value::as_str) != Some("ask")
+    {
+        return;
+    }
+    let Some(version) = event.payload.get("version").and_then(Value::as_str) else {
+        return;
+    };
+    if latest.as_ref().is_none_or(|w| event.seq > w.seq) {
+        *latest = Some(AskWithdrawal {
+            seq: event.seq,
+            version: version.to_string(),
+        });
+    }
+}
+
+/// The read-side counterpart to [`note_ask_withdrawal`], for a journal that
+/// has had the withdrawal's *own* event pruned out from under it (W3 §8.3).
+///
+/// A `prune.intent` event's `source` is `daemon/sergeant`, not
+/// `backend/claude`, and its `kind` is `"prune.intent"` — so
+/// [`note_ask_withdrawal`] never matches it, by design (it folds only the
+/// backend's own live measurement events). When the Work that recorded a
+/// withdrawal is pruned, `prune::scan_condemned_range` carries the
+/// watermark forward onto the intent's own `residue.capability_provenance`
+/// (with its **original** seq preserved, not the intent event's), so a
+/// later replay that never sees the original event can still recover it —
+/// *if* something reads it back. Before this function existed, nothing did:
+/// the watermark was written faithfully and then never read, so a full
+/// replay after the recording Work was pruned silently re-raised
+/// `Capabilities::ask` on an installation that had already proved it
+/// absent.
+///
+/// Deliberately depends only on the wire shape (a plain JSON walk), not on
+/// `runtime::prune`'s types — `runtime::prune` already depends on this
+/// module (for [`AskWithdrawal`]/[`note_ask_withdrawal`] themselves), and
+/// this module keeping no dependency the other way is what the codebase's
+/// documented one-way dependency (prune -> backend, never back) means in
+/// practice.
+pub fn note_carried_ask_withdrawal(latest: &mut Option<AskWithdrawal>, event: &Event) {
+    if event.source.source_type != "daemon"
+        || event.source.name != "sergeant"
+        || event.kind != "prune.intent"
+    {
+        return;
+    }
+    for field in ["residue", "carried_forward"] {
+        let Some(candidate) = event
+            .payload
+            .get(field)
+            .and_then(|r| r.get("capability_provenance"))
+            .and_then(|cp| {
+                let seq = cp.get("seq")?.as_u64()?;
+                let version = cp.get("version")?.as_str()?.to_string();
+                Some(AskWithdrawal { seq, version })
+            })
+        else {
             continue;
         };
-        if latest.as_ref().is_none_or(|(seq, _)| event.seq > *seq) {
-            latest = Some((event.seq, version.to_string()));
+        if latest.as_ref().is_none_or(|w| candidate.seq > w.seq) {
+            *latest = Some(candidate);
         }
     }
-    Ok(latest.map(|(_, version)| version))
 }
 
 /// Launch configuration for the adapter.
@@ -850,6 +928,18 @@ impl ClaudeBackend {
         let latest = latest_ask_withdrawal_version(events)?;
         self.apply_capability_provenance(latest.as_deref());
         Ok(())
+    }
+
+    /// W2's pass-fed entry point: seed from a watermark the caller already
+    /// folded (the startup cache's seeded row, or the shared pass's own
+    /// `CapabilitySink`, or the two merged — higher seq wins, same as
+    /// [`note_ask_withdrawal`]). Replaces the fourth of the daemon's four
+    /// startup walks: [`Self::seed_capability_provenance`] stays for callers
+    /// that still hand it a raw event iterator (every existing claude test),
+    /// re-expressed as a loop over [`note_ask_withdrawal`] plus this method
+    /// so the two can never drift into different ideas of "most recent".
+    pub fn seed_capability_provenance_from(&self, latest: Option<&AskWithdrawal>) {
+        self.apply_capability_provenance(latest.map(|w| w.version.as_str()));
     }
 
     /// The pure half of [`Self::seed_capability_provenance`]: given the
