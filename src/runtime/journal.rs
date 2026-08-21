@@ -909,34 +909,82 @@ impl Iterator for Replay {
                     // then finds segment 2 gone is still exactly the shape a
                     // real prune produces, not corruption. Gating tolerance
                     // on `self.yielded == 0` alone would reject that case;
-                    // instead, re-list the directory now and ask the
-                    // question a prune's own invariant actually answers: is
-                    // every segment still on disk strictly *newer* than the
-                    // one that just vanished? That is only ever true when
-                    // the gap is a deleted leading prefix. A completely
-                    // empty listing is never tolerated — I-W3-4 also
-                    // guarantees the writer's own live segment is never
-                    // unlinked, so a real prune can never produce that
-                    // shape; treat it as corruption instead of silently
-                    // reporting an empty journal.
+                    // instead, re-list the directory now and ask whether
+                    // what is left is still a shape a prune could have
+                    // produced:
+                    //
+                    // - **Non-empty.** I-W3-4 also guarantees the writer's
+                    //   own live segment is never unlinked, so a real prune
+                    //   can never leave nothing behind; treat that as
+                    //   corruption rather than silently reporting an empty
+                    //   journal.
+                    // - **Every survivor strictly newer than the segment
+                    //   that vanished.** Only a deleted leading prefix has
+                    //   that shape; a survivor *older* than the gap means
+                    //   the hole is not a prefix at all.
+                    // - **The survivors are a contiguous index run.**
+                    //   Rotation only ever creates `index + 1`
+                    //   (`rotate_if_needed`), so the on-disk index set is
+                    //   always contiguous and a prefix delete keeps it that
+                    //   way. A gap *above* the vanished segment is
+                    //   therefore damage, not retention — refused here,
+                    //   immediately, instead of being laundered by a second
+                    //   tolerated skip further down the same list.
+                    //
+                    // **Disclosed margin — the compound fault.** These
+                    // checks read the directory, and the directory cannot
+                    // tell a prune of segments `1..=N` apart from a prune of
+                    // `1..=N-1` plus a damage-deletion of `N`: both leave
+                    // the identical, perfectly plausible listing. Seqs
+                    // cannot separate them either — a legitimate prune moves
+                    // the floor, so the jump in `expected` this arm
+                    // re-anchors is exactly what a legitimate prune looks
+                    // like. So a damage-deletion of segments that happen to
+                    // sit contiguously *below* the surviving floor is, and
+                    // remains, tolerated as retention. What was narrowed is
+                    // everything above that floor: the re-anchor below
+                    // resolves the whole gap in **one** decision against
+                    // **one** listing, so a hole between two surviving
+                    // segments now fails closed (the contiguity check, or
+                    // `SeqDiscontinuity` on the next event), where the
+                    // previous shape re-derived `expected` once per vanished
+                    // segment against a stale list and could absorb
+                    // arbitrarily many separate holes in a row.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let tolerated = match list_segments(&self.journal_dir) {
-                            Ok(live) => !live.is_empty() && live.iter().all(|(i, _)| *i > index),
-                            Err(_) => false,
+                        let live = match list_segments(&self.journal_dir) {
+                            Ok(live)
+                                if !live.is_empty()
+                                    && live.iter().all(|(i, _)| *i > index)
+                                    && live.windows(2).all(|w| w[1].0 == w[0].0 + 1) =>
+                            {
+                                live
+                            }
+                            _ => {
+                                self.failed = true;
+                                return Some(Err(e.into()));
+                            }
                         };
-                        if !tolerated {
-                            self.failed = true;
-                            return Some(Err(e.into()));
-                        }
-                        // Re-derive `expected` from whatever segment is next,
-                        // so the skip does not itself manufacture a false
-                        // `SeqDiscontinuity` against the deleted segment's
-                        // old bounds.
-                        if let Some((_, next_path)) = self.segments.as_slice().first()
-                            && let Ok(Some(first)) = first_seq(next_path)
+                        // Re-anchor onto that listing rather than carrying
+                        // on down the stale one. Two reasons, both real:
+                        // the stale list's own next entries may themselves
+                        // be gone (so re-deriving `expected` from them
+                        // silently leaves it pointing at the pre-prune
+                        // floor), and the stale list can be *shorter* than
+                        // reality — a prune that unlinks every segment this
+                        // reader still had listed, while the writer has
+                        // since rotated into a new one, used to run the
+                        // iterator off the end of its stale list and report
+                        // a complete replay that was missing the tail.
+                        // `expected` becomes the surviving floor's own first
+                        // seq, so the skip does not manufacture a false
+                        // `SeqDiscontinuity` against the deleted segments'
+                        // old bounds either.
+                        if let Some(first) =
+                            live.iter().find_map(|(_, p)| first_seq(p).ok().flatten())
                         {
                             self.expected = first;
                         }
+                        self.segments = live.into_iter();
                         continue;
                     }
                     Err(e) => {
@@ -2096,5 +2144,81 @@ pub(crate) mod tests {
             })
             .collect();
         assert_eq!(rest, vec![4]);
+    }
+
+    /// W3 §11.3, the tolerance's silent-truncation half: a prune can unlink
+    /// **every** segment this reader still had on its (already stale) list,
+    /// while the writer has since rotated into a new one the list has never
+    /// heard of. Tolerating the vanish and then walking off the end of the
+    /// stale list reports a clean, complete replay that is missing the
+    /// journal's whole tail — so the tolerated skip must re-anchor onto the
+    /// surviving listing and keep reading from the new floor.
+    #[test]
+    fn a_prune_of_the_whole_stale_list_re_anchors_onto_the_surviving_listing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=3 {
+            journal.append(draft(n)).expect("append");
+        }
+        let journal_dir = dir.path().join("journal");
+        let segments = list_segments(&journal_dir).expect("list segments (pre-race snapshot)");
+
+        let mut replay = Replay::new(segments, journal_dir.clone());
+        assert_eq!(replay.next().expect("first event").expect("ok").seq, 1);
+
+        // The writer rotates into segment 4 *after* the reader's snapshot...
+        journal
+            .append(draft(4))
+            .expect("append into a fourth segment");
+        // ...and a prune then unlinks the whole 1..=3 prefix, which is every
+        // segment the reader's stale list knows about.
+        for index in 1..=3 {
+            std::fs::remove_file(journal_dir.join(segment_file_name(index)))
+                .expect("simulate the prune of the reader's whole stale list");
+        }
+
+        let rest: Vec<u64> = replay
+            .map(|e| {
+                e.expect("event — the surviving segment must still be replayed")
+                    .seq
+            })
+            .collect();
+        assert_eq!(
+            rest,
+            vec![4],
+            "a replay that tolerates the vanish must re-anchor on the surviving floor, \
+             never silently end at the tail of its own stale list"
+        );
+    }
+
+    /// The contiguity half of the same guard: rotation only ever creates
+    /// `index + 1`, so a *hole* between two surviving segments is damage and
+    /// never a prune's leading-prefix delete. It must fail closed at the
+    /// first vanish, before any event of the damaged journal is yielded —
+    /// not be tolerated once and caught only when the reader walks into the
+    /// hole itself.
+    #[test]
+    fn a_hole_in_the_surviving_listing_is_never_tolerated() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+            for n in 1..=4 {
+                journal.append(draft(n)).expect("append");
+            }
+        }
+        let journal_dir = dir.path().join("journal");
+        let segments = list_segments(&journal_dir).expect("list segments");
+
+        // Segment 1: a plausible prune. Segment 3: damage, leaving a hole
+        // between the two survivors.
+        std::fs::remove_file(journal_dir.join(segment_file_name(1))).expect("prune segment 1");
+        std::fs::remove_file(journal_dir.join(segment_file_name(3))).expect("damage segment 3");
+
+        let mut replay = Replay::new(segments, journal_dir.clone());
+        let err = replay
+            .next()
+            .expect("an item")
+            .expect_err("a non-contiguous surviving listing must fail closed");
+        assert!(matches!(err, JournalError::Io(_)), "got {err:?}");
     }
 }
