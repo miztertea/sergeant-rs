@@ -142,3 +142,110 @@ carry a file for — the `--output-schema`/`-o` agreement
 `{"word":"ok"}`, which is why the adapter never passes `-o`) and the rollout
 directory layout (`~/.codex/sessions/<y>/<m>/<d>/rollout-…-<thread_id>.jsonl`)
 — neither is fixture-replayed by any test, so neither is copied here.
+
+## App-server fixtures (W3, `src/backend/codex_appserver.rs`)
+
+Captured token-free where noted, live otherwise, against **codex-cli
+0.149.0**, `~/.local/bin/codex`, Cerberus, 2026-08-21, while writing the W3
+spec's own re-measurement (§0.3) and again while implementing it — the
+scratch driver lived under `/var/tmp/codex-w3-probe/` (volatile, never
+committed itself). Nothing here is authored except the two files marked
+`.derived.`, and each of those states exactly what was changed and why.
+
+- `codex-appserver-0.149.0-handshake-and-thread-start.jsonl` — recorded,
+  token-free (no `turn/start` ever sent): three requests
+  (`initialize`/`initialized`/`thread/start`) driven over `--listen
+  stdio://`, the seven lines the child wrote back. Pins the wire rules §1.5.1
+  claims: no `jsonrpc` field on anything received, `configWarning` and
+  `remoteControl/status/changed` arriving unsolicited and *before* the
+  `thread/start` result they have nothing to do with, and the sandbox/policy
+  echo on `thread/start`'s result.
+- `codex-appserver-0.149.0-experimental-api-required.json` — recorded,
+  token-free: the same session without `capabilities.experimentalApi`,
+  `thread/start`'s `-32600` refusal verbatim.
+- `codex-appserver-0.149.0-server-request-methods.txt` — the 11
+  `ServerRequest` method names, `[schema-claimed]`, dumped from
+  `generate-json-schema`'s `ServerRequest.json`.
+- `codex-appserver-0.149.0-thread-item-types.txt` — the 18 `ThreadItem`
+  variant names, `[schema-claimed]`, from the same schema dump.
+- `codex-appserver-0.149.0-schema-fingerprint.txt` — the pinned 14-file list,
+  the digest rule, and both the SHA-256 the spec quotes (re-measured
+  identical: `91d5ac1…`) and the BLAKE3 this codebase actually pins as
+  `MEASURED_PROTOCOL_FINGERPRINT` (`d0fbf8d…`) — blake3 is already an in-tree
+  dependency, sha256 is not (§2.5's own instruction: "the implementer
+  re-computes the constant with blake3 and pins that").
+- `codex-appserver-0.149.0-completed-turn.jsonl` — recorded, one real live
+  turn (`gpt-5.6-luna`, "Reply with exactly the word ok and nothing else."):
+  the full item stream including `reasoning` items, `item/agentMessage/delta`
+  (counted, never decoded), two `thread/tokenUsage/updated` pushes *before*
+  `turn/completed`, and the terminal itself (`status: "completed"`, no
+  `usage` on the turn object — confirming §2.3's "usage arrives on its own
+  notification, not on the terminal" claim measured, not assumed).
+- `codex-appserver-0.149.0-turn-failed.jsonl` — recorded, one real live turn,
+  `-m gpt-5.6-nonexistent-model`: a `warning` notification (model metadata not
+  found, turn continues), then a bare `error` notification and `turn/completed
+  {status:"failed"}` carrying the same message, `codexErrorInfo: "other"`
+  (measured — not one of the arms the spec's prose lists by name, which is
+  itself a finding: the taxonomy's schema `oneOf` does include `"other"`
+  alongside `"unauthorized"`/`"badRequest"`/etc., confirmed by reading
+  `CodexErrorInfo` out of the schema dump directly).
+- `codex-appserver-0.149.0-interrupted-turn.jsonl` — recorded, one real live
+  turn interrupted mid-flight (`turn/interrupt` sent after the first
+  `item/started`), **the single most load-bearing capture in this wave**: it
+  shows `turn/interrupt`'s `{"result":{}}`, the `turn/completed
+  {status:"interrupted"}` that follows, and then a **second** `turn/start` on
+  the *same* thread completing normally — live proof of §2.2's whole claim
+  (a distinct terminal, and the conversation stays resumable) driven through
+  this adapter's own per-execution stdio child, not just the daemon control
+  socket the spec's own M10 row cites.
+- `codex-appserver-0.149.0-command-execution-item.derived.jsonl` — **derived,
+  not recorded.** A live `commandExecution` item could not be captured on
+  this host: every attempt (`auth-sandbox-approvals` capture for W1, and a
+  fresh attempt for W3) hits the same measured wall — bubblewrap cannot
+  initialize a network namespace here (`bwrap: loopback: Failed RTM_NEWADDR:
+  Operation not permitted`), and unlike the exec transport there is no
+  `--dangerously-bypass-approvals-and-sandbox` escape hatch on `thread/start`
+  that was tried; the model narrated the sandbox failure in prose instead of
+  ever producing a `commandExecution` item at all. So this file is the
+  W1 exec-transport recording (`codex-0.149.0-command-execution-turn.jsonl`)
+  translated key-for-key into app-server's measured shapes: the envelope
+  (`{"method":"item/completed","params":{"item":…,"threadId":…,"turnId":…}}`),
+  the item type (`command_execution` → `commandExecution`), and every field
+  M9 measured (`exit_code`→`exitCode`, `aggregated_output`→`aggregatedOutput`,
+  plus the app-server-only `cwd`/`durationMs`/`processId`/`source`/
+  `scriptPath`/`commandActions`/`pluginId` fields, populated with plausible
+  values since W1's recording never had them to translate). Every value that
+  *was* measured (the command string, the output text, the exit code) is
+  unchanged from the recording; every field that only app-server has is new
+  and is exactly what this note says it is.
+- `codex-appserver-0.149.0-unauthorized-turn-failed.derived.json` —
+  **derived, not recorded.** §2.8's test needs `codexErrorInfo: "unauthorized"`
+  and this account is authenticated, so it cannot be provoked. Derived from
+  the real `turn-failed.jsonl` recording above by exactly two edits: the
+  `error.message`'s embedded JSON string and `codexErrorInfo` changed from the
+  measured `400`/`"other"` (bad model) shape to a `401`/`"unauthorized"` shape
+  — both real arms of the same `CodexErrorInfo` schema enum, confirmed present
+  in the schema dump; nothing else in the envelope moved.
+- `codex-appserver-0.149.0-request-user-input.derived.json` — **derived, not
+  recorded.** §2.4's five-step admission test never got past step 3 on this
+  build (below): this is `item/tool/requestUserInput`'s params built strictly
+  from `ToolRequestUserInputParams`'s own schema-required fields
+  (`isBlocking`, `itemId`, `questions`, `threadId`, `turnId`, and each
+  question's required `id`/`header`/`question`), with the thread/turn ids
+  reused from the real `interrupted-turn.jsonl` capture above so the fixture
+  at least names a thread that really existed.
+
+**§2.4's `ask` measurement, done live and recorded here rather than as a
+sixth fixture** (its outcome is a negative, which is why nothing above
+carries it): two prompt formulations were tried against `gpt-5.6-luna`,
+`approvalPolicy: "never"`, on a fresh thread each. Formulation 1 ("ask me
+what topic before doing anything else") produced the question as
+plain-text `agentMessage` prose, never a tool call. Formulation 2 ("you
+must call the request_user_input tool") produced an `agentMessage` reading
+*"I can't call `request_user_input` because this session isn't in Plan
+mode."* — a new, measured, and more specific reason than "the model didn't
+feel like it": the tool itself may be gated behind a thread mode this
+adapter's `thread/start` params never request. Per §2.4's own outcome
+table this is exactly the first bullet ("step 3 never fires after both
+prompts → `evidence: Unmeasured`") with an even more specific note than the
+spec anticipated, and `ask` stays `false` for the app-server transport too.

@@ -1,0 +1,1 @@
+{"id":7,"method":"item/tool/requestUserInput","params":{"threadId":"01a02605-81d8-7382-9b2e-04ccf099e171","turnId":"01a02605-871a-7b93-bb6a-5f93c84297ec","itemId":"item_derived_ask_0","isBlocking":true,"questions":[{"id":"q0","header":"Topic","question":"What topic should the poem be about?","isOther":false,"isSecret":false,"options":null}]}}
