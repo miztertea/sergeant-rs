@@ -122,6 +122,22 @@ impl<S> Projection<S> {
         self.last_seq
     }
 
+    /// A projection over a state the caller reconstructed by other means,
+    /// declared as already reflecting every event through `last_seq`.
+    ///
+    /// The file-backed counterpart is [`Projection::load_snapshot`]; this is
+    /// for a caller that assembled the state itself (W2's startup cache) and
+    /// is asserting which prefix of the journal it stands for. [`Projection::
+    /// catch_up`]/[`Projection::apply`] then enforce contiguity from
+    /// `last_seq + 1` exactly as they do after a snapshot.
+    pub fn resumed(state: S, last_seq: u64, reducer: Reducer<S>) -> Self {
+        Self {
+            state,
+            last_seq,
+            reducer,
+        }
+    }
+
     /// Fold one event. The event must be exactly the next seq — a gap or
     /// duplicate is an error, never a silent skip.
     pub fn apply(&mut self, event: &Event) -> Result<(), ProjectionError> {
@@ -438,6 +454,18 @@ pub struct WorkIndexRow {
     /// `integrity` — the journal event's own `timestamp`, not a wall clock
     /// read at fold time, so replay reproduces it identically.
     pub updated_at: String,
+    /// Seq of the most recent journal event carrying this Work's id.
+    ///
+    /// W2's horizon predicate and W3's per-Work prune atom both need it: a
+    /// Work with `last_seq > H` pins every segment at or below `H`, which is
+    /// what makes "a prune may never bisect a Work" checkable rather than
+    /// hoped for. W2 computes and persists it; W3 predicates on it.
+    ///
+    /// `#[serde(default)]` so a snapshot written before this field existed
+    /// still loads (0 reads as "unknown, older than anything this build
+    /// wrote"), per §20's forward-compatibility stance.
+    #[serde(default)]
+    pub last_seq: u64,
 }
 
 /// Everything the journal says about one work's run: the workflow it pinned,
@@ -754,6 +782,25 @@ fn maybe_evict(state: &mut WorkRegistry, work_id: Option<&str>) {
 /// fold, one flag, so the live registry and the read-time re-derivation can
 /// never drift into two different ideas of what a work's run looked like.
 fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
+    // Every event that names a Work advances that Work's `last_seq`. Placed
+    // above every early return in this function on purpose: an arm that
+    // returns before the per-kind dispatch below (the admission arms just
+    // below, the `WorkState::for_event_kind` arm further down) must not be
+    // able to leave the index row's high-water mark behind. Events are
+    // folded in ascending seq order by both callers — the live registry's
+    // replay and `rederive_registry_for`'s per-work filtered replay — so
+    // this is monotone by construction, never a regression.
+    //
+    // The admission kinds carry no `work_id`, so this is a no-op on that
+    // path; and `command.accepted`/`command.rejected` carry one only
+    // *sometimes* (a work-mutating command does, an admin one does not) —
+    // the `if let` classifies per-event, which is exactly what that carries,
+    // and is why this must not switch on kind here.
+    if let Some(work_id) = event.work_id.as_deref()
+        && let Some(row) = state.work_index.get_mut(work_id)
+    {
+        row.last_seq = event.seq;
+    }
     // MVP-3's admission drain flag: a plain fold, checked before the
     // per-work dispatch below since neither event carries a `work_id`.
     match event.kind.as_str() {
@@ -807,6 +854,7 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                         integrity: None,
                         created_at: work.created_at.clone(),
                         updated_at: work.created_at.clone(),
+                        last_seq: event.seq,
                     },
                 );
                 state.works.insert(work.id.clone(), work);
@@ -1894,5 +1942,121 @@ mod estate_root_phase_c_scope_replay_tests {
                 all: false,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod w2_startup_cache_projection_tests {
+    //! W2 §9.1 step 2: `WorkIndexRow::last_seq`, its maintenance, and
+    //! `Projection::resumed`.
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::domain::work::{KIND_COMMAND_ACCEPTED, KIND_WORK_STARTED};
+    use crate::runtime::testing;
+
+    /// `last_seq` tracks the highest seq for a Work across every kind that
+    /// names it, including a `command.accepted` that carries a `work_id`
+    /// (the conditional case — recon correction 4).
+    #[test]
+    fn last_seq_tracks_the_highest_seq_across_every_kind_including_command_accepted() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01LASTSEQWORK000000";
+
+        testing::submit(&mut core, work_id, "track my last_seq");
+        let submitted_seq = core.registry.state().work_index[work_id].last_seq;
+        assert_eq!(submitted_seq, 1);
+
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+        assert_eq!(core.registry.state().work_index[work_id].last_seq, 2);
+
+        // A command.accepted that names this work_id (a work-mutating
+        // command) must still advance last_seq, even though the top-of-
+        // function fold runs before the per-kind match ever sees the kind.
+        core.commit(
+            crate::domain::event::EventDraft::new(
+                crate::domain::event::EventSource::new("daemon", "api"),
+                KIND_COMMAND_ACCEPTED,
+                json!({"command_id": "01CMD00000000000000", "operation": "work.cancel",
+                       "status": 200u16, "result": {}}),
+            )
+            .with_work_id(work_id),
+        )
+        .expect("commit");
+        assert_eq!(
+            core.registry.state().work_index[work_id].last_seq,
+            3,
+            "a command.accepted naming this work_id must advance last_seq too"
+        );
+
+        // An admission event carries no work_id, and must be a no-op on
+        // last_seq (not a panic, not a spurious advance).
+        core.commit(crate::domain::event::EventDraft::new(
+            crate::domain::event::EventSource::new("daemon", "sergeant"),
+            crate::daemon::KIND_ADMISSION_PAUSED,
+            json!({}),
+        ))
+        .expect("commit");
+        assert_eq!(core.registry.state().work_index[work_id].last_seq, 3);
+    }
+
+    /// `rederive_registry_for`'s per-work filtered replay produces the same
+    /// `last_seq` the live, evicting fold does — the two folds must never
+    /// drift.
+    #[test]
+    fn rederive_registry_for_produces_the_same_last_seq_as_the_live_fold() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let work_id = "01REDERIVEWORK00000";
+        testing::submit(&mut core, work_id, "rederive me");
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+        let live_last_seq = core.registry.state().work_index[work_id].last_seq;
+
+        let rederived = rederive_registry_for(&core.journal, work_id).expect("rederive");
+        let rederived_last_seq = rederived.work_index[work_id].last_seq;
+
+        assert_eq!(live_last_seq, rederived_last_seq);
+    }
+
+    /// A seeded `Projection::resumed` enforces contiguity exactly like a
+    /// loaded snapshot: an event that is not `last_seq + 1` is refused.
+    #[test]
+    fn resumed_refuses_a_non_contiguous_first_event() {
+        let mut projection =
+            Projection::resumed(WorkRegistry::default(), 10, work_registry_reducer);
+        assert_eq!(projection.last_seq(), 10);
+
+        let event = crate::domain::event::EventDraft::new(
+            crate::domain::event::EventSource::new("daemon", "sergeant"),
+            KIND_WORK_SUBMITTED,
+            json!({}),
+        )
+        .into_event(12); // skips 11 — not contiguous with last_seq 10
+
+        let err = projection
+            .apply(&event)
+            .expect_err("a gap past a resumed seed must be refused");
+        assert!(matches!(
+            err,
+            ProjectionError::SeqMismatch {
+                expected: 11,
+                found: 12
+            }
+        ));
+
+        // The contiguous seq is accepted.
+        let event = crate::domain::event::EventDraft::new(
+            crate::domain::event::EventSource::new("daemon", "sergeant"),
+            KIND_WORK_SUBMITTED,
+            json!({}),
+        )
+        .into_event(11);
+        projection
+            .apply(&event)
+            .expect("contiguous event must apply");
+        assert_eq!(projection.last_seq(), 11);
     }
 }
