@@ -1,6 +1,20 @@
 # Rule C — Journal Segment Archival, Blob Liveness, and Derived-Store Growth
 
-Status: Proposed — awaiting owner ratification
+> **Disposition (2026-08-21): superseded.** Issue #17's Q1–Q10 rulings
+> record (2026-08-21 grilling session) and `docs/adr/0003-durability-promise-and-storage-preconditions.md`'s
+> D7 amendment + `docs/adr/0019-bounded-retention.md` supersede this
+> proposal's own recommendations wherever they conflict — most importantly,
+> the compressed-archive design below (§§3–6: the `archive/` tier,
+> per-segment manifests, the `sgt journal archive` preview verb) was
+> replaced wholesale by simple count-based retention (rulings record,
+> premise amendment A2). This document is kept as **analysis and evidence**
+> — the floor-mechanics reasoning, the I9-shaped pinning-test argument, and
+> the error taxonomy it worked out are cited by `w2-spec.md` and
+> `w3-spec.md` as mechanism detail the rulings do not contradict — not as a
+> live design. Do not read anything below this notice as current behavior;
+> read the rulings record and the two ADRs above instead.
+
+Status: **Superseded**, 2026-08-21 — see disposition header above.
 Date: 2026-08-20 (revised the same day after evaluation-gauntlet findings)
 Audit basis: `miztertea/sergeant-rs` `backlog/w5-archival-design` @ `a730983c`
 (integration branch carrying waves 1–2 of the backlog close-out sprint)
