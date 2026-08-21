@@ -783,23 +783,44 @@ fn replay_after_surfaces_malformed_first_line_of_second_segment() {
 /// io error must surface through `next()` — never a panic, never a silent
 /// empty result — and the iterator must latch failed so every subsequent
 /// call returns `None`, never retrying or yielding a phantom item.
+///
+/// **W3 update (recon correction 7, N18):** this held for *any* vanished
+/// segment before W3; it now holds only once the iterator has yielded at
+/// least one event (`I-W3-4`: a prune can only ever delete a leading,
+/// oldest-contiguous prefix, so a segment disappearing before anything has
+/// been yielded is a floor moving under a lock-free reader, not corruption —
+/// see `runtime::journal::tests::replay_data_dir_tolerates_a_segment_pruned_between_list_and_open`
+/// for that half). This fixture now deletes the *second* segment after the
+/// first event has already been yielded, which stays a hard failure on
+/// every build old or new — the leading-prefix case is covered separately.
 #[test]
 fn replay_next_surfaces_io_error_for_segment_deleted_after_listing() {
     let dir = TempDir::new().expect("tempdir");
-    let mut journal = Journal::open(dir.path()).expect("open");
-    journal.append(draft("tick", None)).expect("append 1");
+    let mut journal = Journal::open_with(dir.path(), 1).expect("open, one segment per append");
+    journal
+        .append(draft("tick", None))
+        .expect("append 1 (segment 1)");
+    journal
+        .append(draft("tick", None))
+        .expect("append 2 (segment 2)");
 
     let mut replay = journal.replay().expect("replay (lists segments)");
-    // Delete the segment after it was listed but before the iterator has
-    // opened it — `next()` has not been called yet.
-    fs::remove_file(segment_path(dir.path(), 1)).expect("delete segment after listing");
+    assert_eq!(
+        replay.next().expect("first event").expect("ok").seq,
+        1,
+        "must yield the first event before the race below"
+    );
+    // Delete the *next* segment after it was listed but before the iterator
+    // has opened it — this is not a shape a prune can produce (I-W3-4), so
+    // it must still fail closed.
+    fs::remove_file(segment_path(dir.path(), 2)).expect("delete segment after listing");
 
-    let first = replay
+    let second = replay
         .next()
         .expect("the io error must surface, not a silent end of iteration");
     assert!(
-        matches!(&first, Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
-        "got {first:?}"
+        matches!(&second, Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound),
+        "got {second:?}"
     );
 
     // The iterator is now failed and must stay that way.
