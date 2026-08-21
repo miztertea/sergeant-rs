@@ -100,6 +100,16 @@ pub struct Core {
     /// because then the registry already holds every command the journal
     /// knows.
     pub floor_ledger: Arc<BTreeMap<String, FloorCommandRow>>,
+    /// W3 §2.5: first seq this process has seen for each retained Work — the
+    /// `first_seq(id)` half of the prune horizon's no-straddle predicate.
+    /// Seeded once at start (cache rows ∪ the startup pass's `HorizonSink`),
+    /// advanced by [`Core::commit`] (`entry().or_insert(event.seq)`), and
+    /// pruned ids removed when a `prune.completed` is folded.
+    pub first_seq_by_work: crate::runtime::prune::FirstSeqIndex,
+    /// W3 §2.5 / §10.2: a prune cycle the last tick or start could not
+    /// finish — because a re-validation aborted it, or because it failed.
+    /// Re-arms the next tick's attempt without waiting for a rotation.
+    pub prune_pending: bool,
     /// The **open group**: events written and folded during the current lock
     /// hold, awaiting the hold's single fsync (#44).
     ///
@@ -137,6 +147,8 @@ impl Core {
             registry,
             events_tx,
             floor_ledger: Arc::new(std::collections::BTreeMap::new()),
+            first_seq_by_work: std::collections::BTreeMap::new(),
+            prune_pending: false,
             open_group: Vec::new(),
         }
     }
@@ -154,6 +166,19 @@ impl Core {
         self
     }
 
+    /// W3 §2.5: seed `first_seq_by_work` from the merged cache-rows ∪
+    /// startup-pass index a fresh start computed. A separate builder for the
+    /// same reason `with_floor_ledger` is one — the existing test
+    /// constructors stay untouched, since an empty index (no Work has been
+    /// seen yet) is exactly right for them.
+    pub fn with_first_seq_index(
+        mut self,
+        first_seq_by_work: crate::runtime::prune::FirstSeqIndex,
+    ) -> Self {
+        self.first_seq_by_work = first_seq_by_work;
+        self
+    }
+
     /// Append one event to the journal, fold it into the registry, and add it
     /// to the lock hold's open group. The only mutation path.
     ///
@@ -167,6 +192,22 @@ impl Core {
     pub fn commit(&mut self, draft: EventDraft) -> Result<Event, CoreError> {
         let event = self.journal.append(draft)?;
         self.registry.apply(&event)?;
+        // W3 §2.5: the first seq this process has ever seen for `work_id`.
+        // `or_insert` — once set, a Work's own `first_seq` never moves,
+        // exactly like `HorizonSink`'s startup-time fold this seeds from.
+        if let Some(work_id) = &event.work_id {
+            self.first_seq_by_work
+                .entry(work_id.clone())
+                .or_insert(event.seq);
+        }
+        // A completed prune removes the pruned ids: nothing about them can
+        // be asked of this index again (the events that would answer are
+        // gone), and leaving stale entries here would grow it without bound
+        // across the estate's life.
+        if event.kind == crate::runtime::prune::KIND_PRUNE_COMPLETED {
+            let live = &self.registry.state().work_index;
+            self.first_seq_by_work.retain(|id, _| live.contains_key(id));
+        }
         self.open_group.push(event.clone());
         Ok(event)
     }
@@ -408,6 +449,10 @@ pub struct ApiState {
     /// up from the journal at query time (see [`with_analytics`]), so a
     /// failure anywhere in here costs an answer, never a fact.
     pub analytics: Arc<tokio::sync::Mutex<Analytics>>,
+    /// W3: the retention policy this daemon resolved once at start, pinned
+    /// for its whole life (§1.2) — read by [`drive_completions`]'s rotation
+    /// trigger (§10.4).
+    pub prune_policy: crate::runtime::prune::PrunePolicy,
 }
 
 /// Build the axum router for the full v1 surface.
@@ -745,6 +790,90 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
             )
             .await;
         }
+        if *closing.borrow() {
+            return;
+        }
+        maybe_run_rotation_triggered_prune(&state).await;
+    }
+}
+
+/// W3 §10.4: the rotation-triggered prune maintenance step, run once per
+/// tick after the observe/interrupt work above. A failure anywhere here is
+/// logged and the tick continues — a daemon that cannot prune must keep
+/// serving; [`crate::runtime::prune::stall_report`] is how that becomes
+/// visible, not a blocked tick.
+///
+/// Phase A ([`crate::runtime::prune::candidate_horizon`]) and the cheap
+/// `take_rotation_signal`/`segment_bounds` reads run under the guard (they
+/// are in-memory and fast); Phase B
+/// ([`crate::runtime::prune::plan`], the mark scan) runs on a blocking
+/// thread with the guard released, since it is the unbounded part (§10.1's
+/// own split); [`crate::runtime::prune::run`] re-acquires the guard to
+/// re-validate and commit.
+async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
+    let snapshot = {
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let rotated = core.journal.take_rotation_signal();
+        if !rotated && !core.prune_pending {
+            return;
+        }
+        let bounds = match core.journal.segment_bounds() {
+            Ok(bounds) => bounds,
+            Err(e) => {
+                tracing::error!(error = %e, "prune tick: segment_bounds failed");
+                return;
+            }
+        };
+        let (candidate, _stall) = crate::runtime::prune::candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &state.prune_policy,
+        );
+        let eligible_segments = bounds.iter().filter(|b| b.last_seq <= candidate).count();
+        if candidate == 0 || eligible_segments < crate::runtime::prune::PRUNE_BATCH_MIN_SEGMENTS {
+            return;
+        }
+        (
+            bounds,
+            candidate,
+            core.registry.state().clone(),
+            core.first_seq_by_work.clone(),
+        )
+    };
+    let (bounds, candidate, registry_snapshot, first_seq_snapshot) = snapshot;
+
+    let data_dir = state.data_dir.clone();
+    let policy = state.prune_policy;
+    let planned = tokio::task::spawn_blocking(move || {
+        crate::runtime::prune::plan(
+            &data_dir,
+            &bounds,
+            candidate,
+            &registry_snapshot,
+            &first_seq_snapshot,
+            &policy,
+        )
+    })
+    .await;
+
+    match planned {
+        Ok(Ok(Some(plan))) => {
+            let mut core = CoreGuard::acquire(&state.core).await;
+            if let Err(e) = crate::runtime::prune::run(&mut core, &state.data_dir, plan, false) {
+                tracing::error!(error = %e, "rotation-triggered prune failed");
+                core.prune_pending = true;
+            }
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "rotation-triggered prune planning failed");
+            let mut core = CoreGuard::acquire(&state.core).await;
+            core.prune_pending = true;
+        }
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "rotation-triggered prune planning task panicked");
+        }
     }
 }
 
@@ -1066,6 +1195,14 @@ fn replay_command(core: &Core, command_id: &str) -> Option<Response> {
         let status =
             StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         return Some((status, Json(outcome.result.clone())).into_response());
+    }
+    // W3 §6.3: a command pruned along with its Work's segments — Q8's
+    // exemption. Same 409, same `command_below_replay_window` code, same
+    // "refused by name, not re-executed" shape as the below-window arm just
+    // below: W3 reuses it verbatim rather than inventing a new response
+    // shape (§4 of the brief).
+    if let Some(row) = core.registry.state().pruned_commands.get(command_id) {
+        return Some(below_floor_refusal(&row.as_floor_row()));
     }
     core.floor_ledger.get(command_id).map(below_floor_refusal)
 }
@@ -1603,6 +1740,13 @@ fn resolve_work(core: &Core, work_id: &str) -> Option<Work> {
     }
     if let Some(work) = registry.terminal_works.get(work_id) {
         return Some(work.clone());
+    }
+    // W3 §11.2: a pruned id short-circuits to `None` here rather than
+    // paying a replay that is guaranteed to find nothing — its events are
+    // gone. `pruned_works` and `work_index` are disjoint by construction
+    // (§6.2), so this check is conclusive without touching the journal.
+    if registry.pruned_works.contains_key(work_id) {
+        return None;
     }
     registry.work_index.get(work_id)?;
     match blocking_sync(|| rederive_work(&core.journal, work_id)) {
@@ -3837,6 +3981,8 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_BACKEND_PROBED,
     KIND_ADMISSION_PAUSED,
     KIND_ADMISSION_RESUMED,
+    crate::runtime::prune::KIND_PRUNE_INTENT,
+    crate::runtime::prune::KIND_PRUNE_COMPLETED,
 ];
 
 /// Encode one journal event as an SSE frame (`id` = seq for resume).
@@ -4819,6 +4965,10 @@ mod tests {
                 data_dir,
             )),
             analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+            prune_policy: crate::runtime::prune::PrunePolicy {
+                retention: crate::domain::estate::DEFAULT_RETENTION,
+                source: crate::runtime::prune::PolicySource::Default,
+            },
         }
     }
 
