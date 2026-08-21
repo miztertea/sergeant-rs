@@ -740,6 +740,11 @@ jobs:
             release-assets/SHA256SUMS.txt \
             release-assets/build-environment-*.txt
 
+      # R7 (checked R5, failed): gh release list --json has no id/databaseId
+      # field and gh release view resolves via a tag lookup that does not
+      # return drafts — no porcelain verb reaches an unpublished, possibly
+      # tag-colliding release by ID. Verified against installed gh (Q1,
+      # recon-results.json).
       # A tag is not a unique key for a draft — GitHub lets multiple drafts
       # share one tag_name, which is exactly what let a stale dry-run draft
       # get published instead of this run's draft (see git history on this
@@ -770,6 +775,10 @@ jobs:
       # the job being cancelled mid-run — because `if: always()` steps still
       # execute after a cancellation signal (GitHub Actions runs them like a
       # `finally` block, within the runner's cancellation grace period).
+      # R7 (checked R5, failed): same reason as capture-release-id above — no
+      # porcelain verb deletes-or-finds a draft by ID; gh release delete takes
+      # a tag, which is exactly the ambiguous key this fallback exists to
+      # avoid trusting.
       # Primary lookup is $RELEASE_ID from the capture step above; the
       # fallback re-derives it by tag_name for the one case that step can't
       # cover — the job was cancelled (or `gh release create` itself failed
@@ -814,6 +823,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # R7 (checked R5, failed): gh release edit takes a tag, not an ID, and a
+      # tag can still name more than one draft at this point in the run — only
+      # after this flip does by-tag porcelain become safe, which is exactly
+      # what the very next step (mark-as-latest, PR #215) uses.
       - name: publish the release this run created, by ID (this is what makes the tag/assets durable)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -851,6 +864,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # R7 (checked R5, failed) for both reads: `gh release view` resolves by
+      # tag (the one field this step must NOT trust yet — that's what it's
+      # verifying), and there is no porcelain verb for "the release GitHub
+      # currently calls latest" other than the plain `/releases/latest`
+      # endpoint gh api reads here directly.
       - name: assert the published release is reported as latest
         env:
           GH_TOKEN: ${{ github.token }}
