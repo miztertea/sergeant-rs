@@ -383,15 +383,7 @@ async fn journal_growth_survives_a_real_prune_with_no_cache_at_all() {
     // per its own completion (`prune::run`'s step 6, "remove any existing
     // [cache]... the next clean start's own write point rebuilds a fresh v2
     // cache"), *deletes* whatever cache life 2's own start point had just
-    // written. This test never takes a "life 3": a further restart on an
-    // already-pruned, cache-less journal hits a pre-existing `Plan::Full`
-    // cache-miss gap in `runtime::startup.rs` (`Projection::new`, seq-1
-    // seeded, applied to `replay_from_floor`'s floor-seeded events —
-    // `SeqMismatch`) that is `runtime::startup`/W2-W3 machinery this wave's
-    // non-goals (§6.5) forbid touching; `journal_growth_check`'s own
-    // `rebuild_registry` avoids exactly this trap by seeding
-    // `Projection::resumed` from the floor rather than `Projection::new`
-    // (§2.3) — which is the property this test actually exists to prove.
+    // written.
     let handle =
         start_with_retention(data.path(), root.path(), RETENTION, Vec::<FakeStep>::new()).await;
     handle.shutdown().await;
@@ -418,5 +410,38 @@ async fn journal_growth_survives_a_real_prune_with_no_cache_at_all() {
     assert!(
         !detail.contains("floor seq 1,"),
         "a real prune must have moved the floor: {detail}"
+    );
+
+    // Life 3 — the real sequence this test used to dodge.
+    //
+    // It originally stopped at life 2 and said so in a comment: a further
+    // restart on an already-pruned, cache-less journal hit a `Plan::Full`
+    // cache-miss gap in `runtime::startup` (a seq-1-seeded `Projection::new`
+    // fed `replay_from_floor`'s floor-seeded events — `SeqMismatch`), which
+    // W4's non-goals put out of reach at the time. That gap is now closed
+    // (`Plan::seed_registry`'s `Full` arm resumes from `floor_seq - 1`, the
+    // same floor-aware seeding `rebuild_registry` below already used), and
+    // this is the *ordinary* next start of any estate that has ever pruned,
+    // so the fixture takes it rather than documenting the dodge.
+    //
+    // The live-daemon half of this — that life 3 comes up and serves —
+    // belongs to `tests/w3_prune_engine.rs`'s
+    // `a_start_after_a_prune_with_no_cache_still_serves`. What is doctor's
+    // own to prove is that the row stays honest *across* that restart.
+    let handle =
+        start_with_retention(data.path(), root.path(), RETENTION, Vec::<FakeStep>::new()).await;
+    handle.shutdown().await;
+
+    let report = doctor_json(root.path(), data.path());
+    let row = journal_growth_row(&report);
+    assert_eq!(row["status"], "ok", "after a post-prune restart: {row}");
+    let detail = row["detail"].as_str().expect("detail string");
+    assert!(
+        detail.contains(&format!("{RETENTION}/1000 works retained")),
+        "a restart over the pruned journal must not change the retained count: {detail}"
+    );
+    assert!(
+        !detail.contains("floor seq 1,"),
+        "the floor must still be above 1 after the restart: {detail}"
     );
 }
