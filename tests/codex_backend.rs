@@ -58,16 +58,45 @@ fn fresh_thread_id() -> String {
     )
 }
 
-/// Whether a pid is still alive, via `kill -0` (POSIX-portable; no `libc`
-/// dependency for one signal check — the same reason the adapter itself
-/// shells out to `kill(1)` rather than taking one, per `kill_process_group`).
+/// Whether a pid is still alive — genuinely running, not merely present in
+/// the process table. A bare `kill -0` reports "alive" for an unreaped
+/// ZOMBIE too, which is exactly the codebase's own precedent:
+/// `tests/m9_watch.rs`'s `spawn_bare_daemon` comment documents a zombie as
+/// "invisible to `kill -0` as gone but not actually gone", the *measured*
+/// cause of a real timeout failure in
+/// `w7_stream_closure_is_honest_and_never_restarts_the_daemon` before that
+/// fix. That fix reaps a *direct* child with a background `wait()` thread;
+/// it doesn't apply here, because the grandchild this test tracks is never
+/// this process's own child — it is forked deep inside the stub's shell
+/// script and reparented to init the instant that shell dies, so nothing
+/// in this process tree can `wait()` it away. Only the process's state
+/// tells a killed-but-unreaped zombie apart from one still genuinely
+/// running: `ps -o state=` (POSIX-portable; the one Linux/macOS-shared
+/// keyword for it, so no platform split is needed, unlike
+/// `platform::process`'s `/proc`-vs-`ps` liveness split) reports `Z` for a
+/// zombie on both procps and BSD `ps`. State `Z` means the kernel has
+/// already delivered the fatal signal and the process is doing nothing
+/// further; that init hasn't reaped its entry yet is not evidence that
+/// INTERRUPT failed to kill it, so this reports it as dead.
 fn pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
+    match std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    {
+        Ok(out) if out.status.success() => {
+            !String::from_utf8_lossy(&out.stdout).trim().starts_with('Z')
+        }
+        // `ps` itself reports no such pid at all (nonzero exit) — gone.
+        Ok(_) => false,
+        // Couldn't gather the fact (`ps` missing?): fall back to plain
+        // existence rather than silently declaring victory.
+        Err(_) => std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false),
+    }
 }
 
 /// `exec --help` text carrying every [`REQUIRED_EXEC_FLAGS`] entry and the
