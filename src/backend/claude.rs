@@ -141,8 +141,10 @@ pub const CLAUDE_BACKEND_NAME: &str = "claude";
 
 /// Minimum CLI version the M4 contract tests trust. The spike measured
 /// 2.1.220; this milestone re-measured everything on 2.1.226, so 2.1.226 is
-/// what "measured" means here. Older versions are refused, not assumed
-/// compatible (L1: differences are findings, not surprises).
+/// what "measured" means here. As of R1 (2026-08-21) an older version is not
+/// refused — it is honest, unmeasured provenance: the probe reports it
+/// usable and says plainly that nothing below this floor was re-measured
+/// (L1: differences are findings, not surprises).
 pub const MIN_TRUSTED_VERSION: (u64, u64, u64) = (2, 1, 226);
 
 /// Flags the capability probe requires to appear in `claude --help`.
@@ -1001,10 +1003,11 @@ impl ClaudeBackend {
     /// Run the capability/version probe once and cache the outcome.
     ///
     /// Both probes are offline and token-free: `--version` and `--help`.
-    /// Gates, in order: the binary runs; the version parses; the version is
-    /// at least [`MIN_TRUSTED_VERSION`]; every [`REQUIRED_FLAGS`] entry
-    /// appears in `--help`. Any failure names itself — a refusal an
-    /// operator cannot act on is not a refusal, it is an outage.
+    /// Gates, in order: the binary runs; the version parses; every
+    /// [`REQUIRED_FLAGS`] entry appears in `--help`. A version below
+    /// [`MIN_TRUSTED_VERSION`] is not a gate (R1) — it reports available,
+    /// with unmeasured-provenance detail. Any failure names itself — a
+    /// refusal an operator cannot act on is not a refusal, it is an outage.
     fn probe_outcome(&self) -> &ProbeOutcome {
         self.probe_outcome.get_or_init(|| self.run_probe())
     }
@@ -1039,17 +1042,30 @@ impl ClaudeBackend {
         };
         let canonical_version = format!("{}.{}.{}", version.0, version.1, version.2);
         if version < MIN_TRUSTED_VERSION {
+            // R1 (2026-08-21): below the measured floor is provenance, not a
+            // gate. Report the CLI usable and name the floor it fell below;
+            // do not fall through to the `--help` gate below with a
+            // synthesized "ok" — a below-floor build's grammar is also
+            // unmeasured, so this early `return` short-circuits that check
+            // exactly as the refusal did before.
             return ProbeOutcome {
-                available: false,
+                available: true,
                 detail: format!(
-                    "capability probe: version {}.{}.{} is below the minimum trusted \
-                     {}.{}.{} (the version these contract tests measured)",
-                    version.0,
-                    version.1,
-                    version.2,
+                    "claude {version_text}; usable, but BELOW the measured floor {}.{}.{} — \
+                     every behavioural claim this adapter's contract tests pinned \
+                     (stream-json event grammar, resume, model-pin verification, \
+                     tool/permission mapping) was measured at {}.{}.{} and has not been \
+                     re-measured here. Capabilities carry unmeasured provenance; upgrade to \
+                     >= {}.{}.{} or expect surprises to be findings, not failures.",
                     MIN_TRUSTED_VERSION.0,
                     MIN_TRUSTED_VERSION.1,
-                    MIN_TRUSTED_VERSION.2
+                    MIN_TRUSTED_VERSION.2,
+                    MIN_TRUSTED_VERSION.0,
+                    MIN_TRUSTED_VERSION.1,
+                    MIN_TRUSTED_VERSION.2,
+                    MIN_TRUSTED_VERSION.0,
+                    MIN_TRUSTED_VERSION.1,
+                    MIN_TRUSTED_VERSION.2,
                 ),
                 version: Some(canonical_version),
             };

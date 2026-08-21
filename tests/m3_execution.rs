@@ -1630,12 +1630,12 @@ async fn t7_routing_precedence_and_structured_failure() {
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
     // The scripted fake occupies the "claude" slot, so the daemon adds
-    // nothing there — but it still adds the real docker adapter (N4, nothing
-    // here is named "docker"). Codex is descoped (D6) and never registered,
-    // and a backend that is not registered is not offered.
+    // nothing there — but it still adds the real docker and codex adapters
+    // (N4/W2, nothing here is named "docker" or "codex"): codex is now the
+    // third real adapter the daemon registers by default, same as docker.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "docker"])
+        json!(["claude", "codex", "docker"])
     );
     assert!(
         body["error"]["message"]
@@ -1842,13 +1842,19 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     );
     handle.shutdown().await;
 
-    // Row 4, second shape: a harness no daemon here registers.
+    // Row 4, second shape: a harness no daemon here registers. Since W2 the
+    // daemon registers a real Codex adapter by default, so naming "codex"
+    // here would no longer demonstrate an unregistered harness (it would be
+    // host-dependent: `backend_unavailable` with no codex on `PATH`, or an
+    // actual routing success on a host with a real logged-in one) — use
+    // "opencode" instead, the name already used elsewhere in this file for
+    // exactly this meaning (an unregistered backend/harness name).
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
     let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
         &estate,
-        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"codex\"\n",
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"opencode\"\n",
     );
     let (registry, fake) = one_fake([]);
     let handle = start_with(
@@ -1868,12 +1874,13 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     .await;
     assert_eq!(status, 422, "must be refused: {body}");
     assert_eq!(body["error"]["code"], "backend_not_found");
-    // The daemon registers the real Claude and Docker adapters alongside the
-    // scripted fake, so the options list names all three; Codex is descoped
-    // (D6) and never registered, which is exactly why naming it fails.
+    // The daemon registers the real Claude, Codex, and Docker adapters
+    // alongside the scripted fake, so the options list names all four;
+    // "opencode" is still never registered, which is exactly why naming it
+    // fails.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "docker", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
     );
     assert!(fake.starts().is_empty(), "no silent provider substitution");
     let list = get(&client, &handle, "/v1/work").await;
@@ -4284,12 +4291,12 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     );
     assert_eq!(body["error"]["code"], "backend_not_found");
     // Since M4 the daemon registers the real claude adapter alongside the
-    // scripted fake, and since N4 the docker adapter too (registered names
-    // sort: claude, docker, fake). Codex is descoped (D6): not registered,
-    // not offered.
+    // scripted fake, since N4 the docker adapter too, and since W2 the
+    // codex adapter as well (registered names sort: claude, codex, docker,
+    // fake).
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "docker", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
     );
 
     // Only two works exist: the refusal created none.

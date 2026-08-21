@@ -13,9 +13,14 @@
 //!   logged-in `codex`. Every live turn pins `-m gpt-5.6-luna` and a bounded,
 //!   one-word-answer prompt.
 //!
-//! No daemon is spawned by any test here (`CodexBackend::new` is constructed
-//! directly, the way the claude stub tests do), so `tests/support::DataDir`'s
-//! reaper is not required.
+//! Two daemon-level tests (W2, §1.4) prove registration itself — that
+//! `daemon::start_with` puts a "codex" entry in the registry with no
+//! test-supplied stand-in — via in-process `daemon::start_with` +
+//! `handle.shutdown().await`, the same rig `tests/m3_execution.rs`/
+//! `tests/estate_routes.rs` use, so `tests/support::DataDir`'s reaper does
+//! not apply to them either (no subprocess is spawned). Every other test in
+//! this file constructs `CodexBackend::new` directly, the way the claude
+//! stub tests do.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -31,8 +36,10 @@ use sergeant_rs::backend::{
     Backend, BackendError, BindingSummary, ExecutionHandle, NativeState, ProbeReport,
     ResumeRequest, StartRequest,
 };
+use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::estate::InstructionPolicy;
 use sergeant_rs::domain::event::EventDraft;
+use sergeant_rs::runtime::journal::Journal;
 
 mod support;
 
@@ -1874,4 +1881,104 @@ fn live_codex_thread_survives_turns_and_a_restart() {
     );
     assert_eq!(handle.native_id.as_deref(), Some(thread_id.as_str()));
     fresh.stop(&handle).expect("stop").wait();
+}
+
+// ------------------------------------------------------- W2 §1.4: registration
+
+/// A probeable codex registers for real: `daemon::start_with`, with no
+/// test-supplied stand-in for the name "codex", puts a real `CodexBackend`
+/// in its registry and journals its own probe evidence at registration —
+/// the direct proof of W2's registration change, not a repeat of any unit
+/// test on `CodexBackend` itself.
+#[tokio::test]
+async fn daemon_start_registers_codex_and_journals_its_own_probe() {
+    let data = TempDir::new().expect("tempdir");
+    let home = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(data.path());
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            codex: Some(config_for(&stub, data.path(), home.path())),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start with an unmeasured-nothing codex must still start");
+    handle.shutdown().await;
+
+    let probed: Vec<_> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
+        .collect();
+    let codex_probed = probed
+        .iter()
+        .find(|e| e.payload["backend"] == CODEX_BACKEND_NAME)
+        .expect("a backend.probed record for codex");
+    assert_eq!(codex_probed.payload["available"], true);
+    assert_eq!(codex_probed.payload["runtime_scope"], "per_execution");
+    assert_eq!(codex_probed.payload["capabilities"]["ask"], false);
+    assert_eq!(
+        codex_probed.payload["capabilities"]["persistent_sessions"],
+        true
+    );
+    assert_eq!(
+        codex_probed.payload["capabilities"]["native_background"],
+        false
+    );
+    assert_eq!(codex_probed.payload["capabilities"]["streaming"], true);
+    assert_eq!(codex_probed.payload["capabilities"]["history"], false);
+    assert_eq!(codex_probed.payload["capabilities"]["resume"], true);
+    assert_eq!(codex_probed.payload["capabilities"]["interrupt"], true);
+    assert_eq!(
+        codex_probed.payload["capabilities"]["model_selection"],
+        true
+    );
+    assert_eq!(codex_probed.payload["capabilities"]["profiles"], true);
+    assert_eq!(codex_probed.payload["capabilities"]["approval_flow"], false);
+    assert_eq!(codex_probed.payload["capabilities"]["human_attach"], false);
+    assert_eq!(codex_probed.payload["capabilities"]["usage"], true);
+    assert_eq!(
+        codex_probed.payload["capabilities"]["native_subagents"],
+        false
+    );
+}
+
+/// Codex missing must not break daemon startup, and must be distinguishable
+/// from "unregistered": it registers anyway and journals honest, `available:
+/// false` evidence naming why it cannot run — the same posture Docker
+/// already takes for a host with no Docker installed.
+#[tokio::test]
+async fn daemon_start_with_no_codex_installed_still_starts_and_says_why() {
+    let data = TempDir::new().expect("tempdir");
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            codex: Some(CodexConfig {
+                executable: PathBuf::from("/nonexistent/definitely-not-codex"),
+                ..CodexConfig::new(data.path())
+            }),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("a host with no codex binary must still start a daemon");
+    handle.shutdown().await;
+
+    let codex_probed = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .find(|e| {
+            e.kind == daemon::KIND_BACKEND_PROBED && e.payload["backend"] == CODEX_BACKEND_NAME
+        })
+        .expect("codex is registered — and probed — even though it cannot run");
+    assert_eq!(codex_probed.payload["available"], false);
+    let detail = codex_probed.payload["detail"]
+        .as_str()
+        .expect("probe detail recorded");
+    assert!(detail.contains("cannot run"), "{detail}");
 }

@@ -36,6 +36,7 @@ use crate::api::{
     drive_completions, router,
 };
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
+use crate::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
 use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::{BackendRegistry, EventSink};
@@ -331,6 +332,10 @@ pub struct DaemonConfig {
     /// tests point it at a scripted `docker_bin` to drive the real adapter's
     /// request path without a real Docker Engine.
     pub docker: Option<DockerConfig>,
+    /// Launch configuration for the Codex adapter this daemon registers
+    /// itself. `None` is the system `codex`, adapter state under this data
+    /// dir — mirrors `claude`/`docker` above for the same reason.
+    pub codex: Option<CodexConfig>,
     /// §28 OpenTelemetry export. `None` is **off**, and off is the default:
     /// with no pipeline here the daemon builds no provider, spawns no
     /// exporter task, and subscribes nothing to the event stream.
@@ -417,6 +422,7 @@ impl Default for DaemonConfig {
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
             docker: None,
+            codex: None,
             telemetry: None,
             completion_poll: COMPLETION_POLL_INTERVAL,
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
@@ -734,14 +740,23 @@ pub async fn start_with(
     // observed" property `CoreGuard` gives every other path.
     core.flush()?;
 
-    // 4b. Register the real adapter alongside whatever the config supplied
-    // (tests hand in scripted fakes; they keep them). It is added here, not
-    // in `default_registry`, because the Claude adapter needs this data dir
-    // for its raw-transcript archive and an event sink that only exists once
-    // the core does. A config that already registered the name wins — that
-    // is how tests substitute stubs. Codex is not registered at all: it is
-    // descoped by deviation D6, and a backend nothing has measured must not
-    // appear in routing output as something a user could ask for.
+    // 4b. Register the real adapters alongside whatever the config supplied
+    // (tests hand in scripted stubs/fakes; they keep them). Added here, not
+    // in `default_registry`, because each needs this data dir (raw-
+    // transcript/blob archive) and an event sink that only exists once the
+    // core does. A config that already registered the name wins — that is
+    // how tests substitute stubs.
+    //
+    // Codex is registered the same way as Claude and Docker as of the
+    // 2026-08-21 codex-adapter sprint (W2, closing the registration half of
+    // deviation D6 — `knowledge/rulings/deviations/d6-codex-descoped.md`):
+    // W1 landed `CodexBackend` measured against codex-cli 0.149.0 (H0
+    // evidence packet). An unavailable build (binary missing, unmeasured
+    // grammar) still registers and reports its own probe evidence at
+    // `backend.probed` — the same posture Docker already takes for a host
+    // with no Docker installed (§17.5's "degraded daemon, strict work
+    // admission"): routing *to* it is what fails, at submission time, not
+    // daemon startup.
     let mut backends = (*config.backends).clone();
     let claude = if config.backends.get(CLAUDE_BACKEND_NAME).is_none() {
         let claude_config = config
@@ -780,6 +795,22 @@ pub async fn start_with(
             .clone()
             .unwrap_or_else(|| DockerConfig::new(data_dir));
         let adapter = Arc::new(DockerBackend::new(docker_config)?);
+        backends = backends.with(adapter.clone());
+        Some(adapter)
+    } else {
+        None
+    };
+    // W2: the Codex executor, registered the same way and for the same
+    // reason as Claude/Docker above. No `seed_capability_provenance_from`
+    // call here — that method exists only on `ClaudeBackend`, seeding a
+    // journaled `ask`-withdrawal claim Codex's `Capabilities::ask` does not
+    // have (Codex's `ask` is `false` unconditionally, per W1's module doc).
+    let codex = if config.backends.get(CODEX_BACKEND_NAME).is_none() {
+        let codex_config = config
+            .codex
+            .clone()
+            .unwrap_or_else(|| CodexConfig::new(data_dir));
+        let adapter = Arc::new(CodexBackend::new(codex_config));
         backends = backends.with(adapter.clone());
         Some(adapter)
     } else {
@@ -919,6 +950,11 @@ pub async fn start_with(
     // above).
     if let Some(docker) = docker {
         docker.set_event_sink(journaling_sink(state.core.clone()));
+    }
+    // The Codex adapter's normalized events flow through the identical sink
+    // (same reasoning as Claude's/Docker's, directly above).
+    if let Some(codex) = codex {
+        codex.set_event_sink(journaling_sink(state.core.clone()));
     }
     let app = router(state.clone());
 
