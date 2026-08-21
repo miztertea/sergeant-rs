@@ -135,7 +135,7 @@ const WORKSPACE_MOUNT: &str = "/estate";
 /// The small, always-pullable image [`DockerBackend::lifecycle_probe`] uses
 /// in production (`sgt doctor`) — see its own doc for why a test may need a
 /// different one (the environments matrix, §22.7's probe-gating rule).
-pub const PROD_PROBE_IMAGE: &str = "alpine:3";
+pub const PROD_PROBE_IMAGE: &str = "alpine:3.24";
 
 /// The `--user uid:gid` value to run a container as, so its writes into a
 /// `read_write` mount come out owned by whoever already owns the mounted
@@ -695,7 +695,7 @@ impl DockerBackend {
     /// the module docs). Mounts a scratch directory, verifies a write is
     /// visible on the host, and cleans up its own labeled container.
     /// `probe_image` should be a small image sergeant can rely on
-    /// (`alpine:3` in production; a test may point this at a locally-built
+    /// (`alpine:3.24` in production; a test may point this at a locally-built
     /// probe image instead, per the environments matrix — §22.7's
     /// probe-gating rule).
     pub fn lifecycle_probe(&self, probe_image: &str) -> DockerLifecycleProbe {
@@ -1347,7 +1347,7 @@ mod tests {
             model: None,
             profile: None,
             execute: Some(ExecuteSpec {
-                image: "alpine:3".into(),
+                image: "alpine:3.24".into(),
                 command: vec!["true".into()],
                 workdir: "/estate".into(),
                 workspace_access: WorkspaceAccess::ReadOnly,
@@ -1472,7 +1472,7 @@ mod tests {
                 bindings: Vec::new(),
             };
             let spec = ExecuteSpec {
-                image: "alpine:3".into(),
+                image: "alpine:3.24".into(),
                 command: vec!["true".into()],
                 workdir: "/estate".into(),
                 workspace_access: WorkspaceAccess::ReadOnly,
@@ -1518,7 +1518,7 @@ mod tests {
         let backend = DockerBackend::new(config).expect("backend");
         assert!(backend.read_pin("w1", "s1").is_none());
         let image = ResolvedImage {
-            image_requested: "alpine:3".into(),
+            image_requested: "alpine:3.24".into(),
             image_id: "sha256:deadbeef".into(),
             repo_digests: vec!["alpine@sha256:deadbeef".into()],
             platform: "linux/amd64".into(),

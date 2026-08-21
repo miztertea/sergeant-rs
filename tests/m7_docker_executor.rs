@@ -44,7 +44,7 @@ use sergeant_rs::domain::workflow::{ExecuteSpec, NetworkPolicy, WorkspaceAccess}
 /// already has (`docs/environments/cerberus.md`'s Docker probes use
 /// `alpine`). Kept as one named constant so a future environment that needs
 /// a different probe image changes one line.
-const PROBE_IMAGE: &str = "alpine:3";
+const PROBE_IMAGE: &str = "alpine:3.24";
 
 /// Whether the local Docker Engine answers at all. Every test in this file
 /// calls this first and returns early (with a loud, named skip) when it does
@@ -1162,7 +1162,7 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
             "\n",
             "[stage.\"10-execute\"]\n",
             "kind = \"execute\"\n",
-            "image = \"alpine:3\"\n",
+            "image = \"alpine:3.24\"\n",
             "command = [\"true\"]\n",
             "workdir = \"/estate\"\n",
             "workspace_access = \"read_only\"\n",
@@ -1398,7 +1398,7 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
             "\n",
             "[stage.\"10-validate\"]\n",
             "kind = \"execute\"\n",
-            "image = \"alpine:3\"\n",
+            "image = \"alpine:3.24\"\n",
             "command = [\"sh\", \"-c\", \"echo container-produced-evidence > /estate/validated.txt\"]\n",
             "workdir = \"/estate\"\n",
             "workspace_access = \"read_write\"\n",
