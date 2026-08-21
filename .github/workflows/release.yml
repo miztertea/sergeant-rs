@@ -402,25 +402,35 @@ jobs:
   # topology — it does not create or depend on the release tag existing in
   # the repository, only on being told what tag string to embed.
   #
-  # This job produces the installer script and, separately, the per-archive
-  # `.sha256` files (via `dist build --artifacts=local` in `package`,
-  # above). Nothing wires the two together: the generated
-  # `sergeant-rs-installer.sh` declares the local variables it would use to
-  # verify a downloaded archive's checksum but never assigns them, so its
-  # verification branch is unreachable and every install via this script
-  # prints "no checksums to verify" and installs unverified — confirmed by
-  # running the installer against a published release
-  # (`docs/measure-dist-conditions-2026-08-18.md`'s own "no checksums to
-  # verify" observation, condition 3, generalizes past the ad hoc local-server
-  # setup that first surfaced it — see that file's 2026-08-19 amendment).
-  # The documented, deliberate verification path is manual: README.md's
-  # "Installing a released binary instead of building from source" section
-  # walks `sha256sum -c` against the `.sha256` this job's sibling produces,
-  # plus `gh attestation verify` against the build-provenance attestation
-  # `draft-release` (below) creates. This job does not attempt to fix that
-  # gap — patching or post-processing `dist`'s generated installer to wire
-  # in checksum verification is a larger change with its own supply-chain
-  # risk surface, and is the owner's call, not a packaging-job comment's.
+  # This job produces the installer script; `package` (above) produces the
+  # per-archive `.sha256` files and, since 0.1.2, a per-target
+  # `<target>-dist-manifest.json`. Those manifests are what wire the two
+  # together: `dist build --artifacts=global` reads each archive's sha256 out
+  # of them and renders it into the installer's per-artifact case arms, so the
+  # generated `sergeant-rs-installer.sh` now verifies what it downloads before
+  # extracting it. This is cargo-dist's own mechanism — its generated CI
+  # downloads the local jobs' artifacts into target/distrib/ before the global
+  # build for exactly this reason — not a patch on its output; nothing here
+  # post-processes the generated script.
+  #
+  # Before 0.1.2 the manifests were never passed forward, so the installer's
+  # verification branch was unreachable and every install printed "no checksums
+  # to verify" (docs/measure-dist-conditions-2026-08-18.md, condition 3, and its
+  # 2026-08-19 amendment — an accurate record of the behavior on that date, not
+  # of the behavior now). The two steps after the global build below are what
+  # keep that from silently regressing: one asserts every released target's arm
+  # carries a real sha256, the other installs from a local origin and then
+  # proves a substituted archive is actually rejected.
+  #
+  # `needs: package` exists for the manifests only — a global artifact is still
+  # built once per app rather than once per target, and this job still never
+  # needs any target's binary. It costs nothing downstream: `draft-release`
+  # already waits on `smoke-test` and `sbom`, which already wait on `package`.
+  #
+  # Checksums are not the whole story and the README says so: they prove the
+  # archive matches what the release published, not that the release came from
+  # this repository. Provenance is `gh attestation verify` against the
+  # build-provenance attestation `draft-release` (below) creates.
   package-installer:
     needs:
       - gate-b-ci
@@ -428,6 +438,7 @@ jobs:
       - gate-d-coverage
       - gate-e-cargo-deny
       - gate-f-distro-validator
+      - package
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -496,12 +507,51 @@ jobs:
       - name: "cargo metadata --locked (guard: dist build has no native --locked/--frozen flag)"
         run: cargo metadata --locked --format-version 1 >/dev/null
 
+      # Get the per-target build manifests `package` produced (and, harmlessly,
+      # the archives beside them) so `dist build --artifacts=global` can read
+      # each archive's sha256 out of them and render it into the installer's
+      # per-artifact case arms. This is cargo-dist's own mechanism, not a patch
+      # on its output: its generated CI performs the same download into
+      # target/distrib/ before the global build, under the comment "Get all the
+      # local artifacts for the global tasks to use (for e.g. checksums)".
+      # This job still does not need any target's *binary* — only the manifest
+      # JSON — so the reason this is a separate job from `package` (a global
+      # artifact is built once per app, not once per target) is unchanged.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: "dist-*"
+          path: target/distrib
+          merge-multiple: true
+
       - name: dist build --artifacts=global (shell installer only)
         run: |
           dist build --artifacts=global \
             --target x86_64-unknown-linux-gnu \
             --target aarch64-apple-darwin \
             --tag "$RELEASE_TAG"
+
+      - name: assert the generated installer carries a checksum for every released target
+        run: |
+          set -euo pipefail
+          installer=target/distrib/sergeant-rs-installer.sh
+          populated=$(grep -c '^[[:space:]]*_checksum_value="[0-9a-f]\{64\}"$' "$installer" || true)
+          if [ "$populated" -ne 2 ]; then
+            echo "::error::generated installer has $populated populated checksum value(s), expected 2 (one per released target) — dist did not see a per-target build manifest for every target" >&2
+            grep -n '_checksum_style\|_checksum_value\|\.tar\.xz")' "$installer" >&2 || true
+            exit 1
+          fi
+          echo "::notice::generated installer carries $populated per-artifact sha256 values"
+
+      # Proves the property, rather than asserting it: a good archive installs,
+      # a substituted one is rejected with a non-zero exit and nothing installed.
+      # Lives in scripts/ so ci.yml's shellcheck job lints it and so it can be
+      # re-run by hand against any published release's assets.
+      - name: installer smoke test — accepts a good archive, rejects a substituted one
+        run: |
+          scripts/release/verify-installer-checksums.sh \
+            target/distrib/sergeant-rs-installer.sh \
+            target/distrib \
+            "$RELEASE_TAG"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
