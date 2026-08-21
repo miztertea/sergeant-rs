@@ -63,7 +63,11 @@
 //! - `codex exec` spawns shell commands as its own children
 //!   (`/bin/bash -lc '…'` [measured, Appendix A.2]), so INTERRUPT kills the
 //!   turn's whole **process group**, not just the direct child (§5.5) —
-//!   otherwise a background grandchild survives the kill.
+//!   otherwise a background grandchild survives the kill. The group id is
+//!   recorded at spawn and signalled unconditionally, because the group
+//!   outlives its leader: a backgrounded command is still running after the
+//!   codex process has exited and been reaped, which is exactly when every
+//!   liveness check says there is nothing left to kill.
 //! - There is no approval or ask channel on this transport at all
 //!   [measured-negative: no `-a`/`--ask-for-approval` flag, exit 2 if passed;
 //!   binary-string: `"command execution approval is not supported in exec
@@ -952,6 +956,21 @@ struct CodexExecution {
     bindings_outside_cwd: Vec<PathBuf>,
     turns: u32,
     turn: TurnState,
+    /// The process group id of the most recent turn, recorded at **spawn**
+    /// (§5.5). `process_group(0)` makes the turn's direct child its own group
+    /// leader, so this is that child's pid — but it is kept here, on the
+    /// execution, rather than read back out of [`TurnState::InFlight`] at
+    /// kill time, because the group outlives the leader: a command the turn
+    /// started in the background stays in this group after the codex process
+    /// itself has exited and been reaped, and that is precisely the case
+    /// INTERRUPT exists to clean up. Deriving the group from a live child
+    /// instead makes the kill unreachable exactly when it is needed.
+    ///
+    /// It stays valid to signal for as long as it is worth signalling:
+    /// Linux keeps a pid number allocated while any process still uses it as
+    /// its process-group id, so either this still names *our* group or the
+    /// group is empty and the kill is a no-op (`ESRCH`).
+    turn_pgid: Option<u32>,
     stopped: bool,
     interrupt_requested: bool,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -1568,6 +1587,11 @@ impl CodexBackend {
             rx
         });
 
+        // §5.5: recorded here, at spawn, never derived from the child at kill
+        // time — `process_group(0)` above made this child its own group
+        // leader, so its pid *is* the group's id, and that id stays the right
+        // thing to signal after the child itself has exited.
+        let turn_pgid = child.id();
         let child = Arc::new(Mutex::new(child));
         {
             let mut state = self.lock();
@@ -1576,6 +1600,7 @@ impl CodexBackend {
                 .get_mut(execution_id)
                 .ok_or_else(|| self.err_unknown(execution_id))?;
             execution.turn = TurnState::InFlight(Arc::clone(&child));
+            execution.turn_pgid = Some(turn_pgid);
             execution.turns += 1;
             execution.interrupt_requested = false;
         }
@@ -1631,9 +1656,8 @@ impl CodexBackend {
                 raw_blob.unwrap_or_else(|| "unarchived (the turn streamed nothing)".to_string()),
             ))),
             Err(_) => {
-                if let Some(child) = self.inflight_child(execution_id) {
-                    kill_process_group(&child);
-                }
+                let (pgid, child) = self.inflight_turn(execution_id);
+                kill_turn(pgid, child.as_ref());
                 Err(self.err_failed(format!(
                     "codex exec did not announce thread.started within {budget:?}; the process \
                      group was killed"
@@ -1642,43 +1666,72 @@ impl CodexBackend {
         }
     }
 
-    fn inflight_child(&self, execution_id: &str) -> Option<Arc<Mutex<Child>>> {
+    /// This execution's turn process group (recorded at spawn, present
+    /// whether or not the turn is still running) and its direct child (only
+    /// while one is in flight). The two are returned separately on purpose:
+    /// see [`kill_process_group`] for why the group must not be reached
+    /// through the child.
+    fn inflight_turn(&self, execution_id: &str) -> (Option<u32>, Option<Arc<Mutex<Child>>>) {
         let state = self.lock();
-        match state
-            .executions
-            .get(execution_id)
-            .map(|execution| &execution.turn)
-        {
-            Some(TurnState::InFlight(child)) => Some(Arc::clone(child)),
+        let Some(execution) = state.executions.get(execution_id) else {
+            return (None, None);
+        };
+        let child = match &execution.turn {
+            TurnState::InFlight(child) => Some(Arc::clone(child)),
             _ => None,
-        }
+        };
+        (execution.turn_pgid, child)
     }
 }
 
-/// Kill a turn's whole process group (§5.5): `SIGKILL` to the negated pid
-/// (the group leader, since `process_group(0)` at spawn made the child its
-/// own leader), via the external `kill(1)` — the same reason
+/// Kill a turn's whole process group (§5.5): `SIGKILL` to the negated group
+/// id recorded at spawn, via the external `kill(1)` — the same reason
 /// `tests/support/mod.rs` gives for not taking a `libc`/`nix` dependency for
-/// one signal (R5). Then `Child::kill()` as a belt.
-fn kill_process_group(child: &Arc<Mutex<Child>>) {
-    let pid = child.lock().expect("codex turn child lock").id();
+/// one signal (R5).
+///
+/// **Nothing gates this on the leader being alive**, and that is the whole
+/// point. The group is what INTERRUPT promises to kill, and the group
+/// routinely outlives its leader: a command the turn started in the
+/// background survives the codex process, and once that process has exited
+/// and the reader has reaped it, every liveness test one could run — the
+/// turn's `TurnState`, `try_wait`, the child handle at all — says "nothing to
+/// kill" about a group that is still very much running. So the group id is
+/// signalled unconditionally and `ESRCH` (an already-empty group) is success,
+/// not an error to report: `kill(1)`'s status is deliberately not consulted,
+/// because "no such group" and "killed the group" are the same outcome here.
+///
+/// Signalling a recorded id after its leader is gone is safe as well as
+/// necessary: Linux keeps a pid number allocated for as long as any process
+/// still uses it as a process-group id, so while there is anything in this
+/// group to kill, this id cannot have come to mean another one.
+fn kill_process_group(pgid: Option<u32>) {
+    let Some(pgid) = pgid else { return };
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
             .arg("-KILL")
-            .arg(format!("-{pid}"))
+            .arg(format!("-{pgid}"))
             .output();
     }
     #[cfg(not(unix))]
     {
         tracing::warn!(
-            pid,
+            pgid,
             "no process-group signal mechanism on this platform; killing only the direct \
              child — any commands it spawned may still be running"
         );
     }
-    let mut guard = child.lock().expect("codex turn child lock");
-    let _ = guard.kill();
+}
+
+/// The group kill above plus `Child::kill()` on the direct child as a belt,
+/// for the callers that still hold a live child handle. The group goes first:
+/// the child's own death must never be what decides whether the group is
+/// signalled.
+fn kill_turn(pgid: Option<u32>, child: Option<&Arc<Mutex<Child>>>) {
+    kill_process_group(pgid);
+    if let Some(child) = child {
+        let _ = child.lock().expect("codex turn child lock").kill();
+    }
 }
 
 /// Everything the per-turn stdout reader thread needs. Owns ingestion end to
@@ -1947,6 +2000,7 @@ impl Backend for CodexBackend {
                     bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
                     turns: 0,
                     turn: TurnState::Unlaunched,
+                    turn_pgid: None,
                     stopped: false,
                     interrupt_requested: false,
                     reader: None,
@@ -2014,24 +2068,30 @@ impl Backend for CodexBackend {
     /// §5.5: kill the turn's whole process group. The durable thread
     /// survives; the turn's evidence is STOP's promise, not this one.
     fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
-        let child = {
+        let (pgid, child) = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = state
                 .executions
                 .get_mut(&handle.execution_id)
                 .expect("presence checked above");
-            match &execution.turn {
+            // The group id is taken whatever the turn state says. A turn that
+            // has already ended can still have left a background command
+            // running in its group — the exact thing §5.5 kills — so the
+            // group kill is never gated on the direct child being alive.
+            // Only the `interrupt_requested` bit, which is a claim about a
+            // *running* turn's outcome, is still the in-flight turn's alone.
+            let pgid = execution.turn_pgid;
+            let child = match &execution.turn {
                 TurnState::InFlight(child) => {
                     execution.interrupt_requested = true;
                     Some(Arc::clone(child))
                 }
                 TurnState::Finished(_) | TurnState::Unlaunched | TurnState::Adopted => None,
-            }
+            };
+            (pgid, child)
         };
-        if let Some(child) = child {
-            kill_process_group(&child);
-        }
+        kill_turn(pgid, child.as_ref());
         Ok(Completion::immediate())
     }
 
@@ -2115,6 +2175,10 @@ impl Backend for CodexBackend {
                 bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
                 turns: 1,
                 turn: TurnState::Adopted,
+                // A re-adopted thread's turn was spawned by a previous
+                // daemon: this one never learned that group, and inventing
+                // one would aim a SIGKILL at a pid it cannot account for.
+                turn_pgid: None,
                 stopped: false,
                 interrupt_requested: false,
                 reader: None,

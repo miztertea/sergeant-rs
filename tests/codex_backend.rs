@@ -130,6 +130,7 @@ struct StubCodex {
     exit_code: PathBuf,
     grandchild: PathBuf,
     grandchild_pid: PathBuf,
+    detach: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -164,6 +165,7 @@ impl StubCodex {
         let exit_code = dir.join("codex-exit-code");
         let grandchild = dir.join("codex-grandchild");
         let grandchild_pid = dir.join("codex-grandchild-pid");
+        let detach = dir.join("codex-grandchild-detach");
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
@@ -183,7 +185,12 @@ impl StubCodex {
              if [ -f \"{replay}\" ]; then cat \"{replay}\"; fi\n\
              if [ -f \"{stderr}\" ]; then cat \"{stderr}\" >&2; fi\n\
              if [ -f \"{grandchild}\" ]; then\n  \
-               ( i=0; while [ \"$i\" -lt 300 ]; do sleep 0.1; i=$((i+1)); done ) &\n  \
+               if [ -f \"{detach}\" ]; then\n    \
+                 ( i=0; while [ \"$i\" -lt 300 ]; do sleep 0.1; i=$((i+1)); done ) \
+                   </dev/null >/dev/null 2>&1 &\n  \
+               else\n    \
+                 ( i=0; while [ \"$i\" -lt 300 ]; do sleep 0.1; i=$((i+1)); done ) &\n  \
+               fi\n  \
                echo $! > \"{grandchild_pid}\"\n\
              fi\n\
              if [ -f \"{hang}\" ]; then exec sleep 30; fi\n\
@@ -200,6 +207,7 @@ impl StubCodex {
             stderr = stderr.display(),
             grandchild = grandchild.display(),
             grandchild_pid = grandchild_pid.display(),
+            detach = detach.display(),
             hang = hang.display(),
             exit_code = exit_code.display(),
         );
@@ -219,6 +227,7 @@ impl StubCodex {
             exit_code,
             grandchild,
             grandchild_pid,
+            detach,
         }
     }
 
@@ -268,6 +277,20 @@ impl StubCodex {
     /// reason INTERRUPT kills the turn's process *group* instead (§5.5).
     fn spawns_a_grandchild(&self) -> &Self {
         std::fs::write(&self.grandchild, b"go\n").expect("write grandchild marker");
+        self
+    }
+
+    /// Marks the grandchild to be forked with its own `/dev/null` standard
+    /// streams instead of the turn's inherited pipes. That single difference
+    /// is what makes the leader-exit race deterministic: with the pipes
+    /// inherited (the default above) the grandchild holds the turn's stdout
+    /// open, so the adapter's reader never sees EOF and the turn stays
+    /// `InFlight` no matter when the leader dies. Detached, the leader's exit
+    /// *is* EOF, the reader reaps and files the turn's outcome, and INTERRUPT
+    /// arrives at an execution whose leader is already gone — while the
+    /// grandchild it was supposed to kill is still running.
+    fn detaches_its_grandchild(&self) -> &Self {
+        std::fs::write(&self.detach, b"go\n").expect("write detach marker");
         self
     }
 
@@ -931,24 +954,183 @@ fn codex_interrupt_kills_the_process_group() {
         pid_alive(grandchild_pid),
         "the grandchild must be running before INTERRUPT, or this test proves nothing"
     );
+    // Recorded, not asserted, and deliberately so. This test owns the
+    // leader-*alive* ordering and the one below owns the leader-exited one,
+    // but which ordering a given host actually produced is a *fact about the
+    // failure*, not a precondition worth failing on: a host that ends the
+    // turn earlier than this one does should still see INTERRUPT kill the
+    // group, and if it doesn't, this line is what says which of the two
+    // orderings was really under test.
+    let before = format!(
+        "turn state at INTERRUPT: {:?}\n  {}",
+        backend.observe(&handle).expect("observe").native,
+        interrupt_diagnosis("before", grandchild_pid),
+    );
 
     backend.interrupt(&handle).expect("interrupt").wait();
 
-    // SIGKILL is sent synchronously by `kill_process_group`, but the kernel
-    // reaping it is not instant from this test's vantage point — bounded
-    // poll, same shape as every other `wait_for_*` helper in this file.
+    assert_group_died(
+        grandchild_pid,
+        "the leader was still running (`exec sleep 30`)",
+        &before,
+    );
+}
+
+/// The same §5.5 promise, in the ordering the leader-alive test above cannot
+/// reach: the turn's **leader exits first**, and INTERRUPT arrives after.
+///
+/// This is the shape a real codex turn takes every time it finishes normally
+/// while a command it started keeps running detached (`… &>/dev/null &`) —
+/// and it is a *different code path* through the adapter, not a faster
+/// version of the same one. The leader's exit closes the turn's stdout, the
+/// reader thread reaps and files the outcome, and the execution's turn state
+/// leaves `InFlight` — so an INTERRUPT that reaches the process group only by
+/// way of a live direct child reaches nothing at all, and the grandchild the
+/// group kill exists to kill outlives the interrupt entirely.
+///
+/// The `detaches_its_grandchild` stub mode is what makes that ordering
+/// deterministic rather than a race; `wait_for_kind` then pins the reap as
+/// having *already happened* before INTERRUPT is called. Both halves stay:
+/// the leader-alive path and the leader-exited path are each one real
+/// ordering of §5.5, and only keeping both keeps either from regressing.
+#[test]
+fn codex_interrupt_kills_the_process_group_after_the_leader_exited() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN)
+        .spawns_a_grandchild()
+        .detaches_its_grandchild();
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let grandchild_pid = stub.wait_for_grandchild_pid();
+    // The turn is over — this is the whole point of this test's ordering.
+    // `conversation.turn.ended` is emitted only after the reader has reaped
+    // the leader and filed the turn's outcome, so once it has arrived the
+    // leader is provably gone *before* INTERRUPT is called.
+    let _ended = wait_for_kind(&events, "conversation.turn.ended");
+    assert_eq!(
+        backend.observe(&handle).expect("observe").native,
+        NativeState::Exited,
+        "the leader must already have exited before INTERRUPT, or this test proves nothing"
+    );
+    assert!(
+        pid_alive(grandchild_pid),
+        "the grandchild must outlive its leader before INTERRUPT, or this test proves nothing"
+    );
+    let before = format!(
+        "turn state at INTERRUPT: {:?}\n  {}",
+        NativeState::Exited,
+        interrupt_diagnosis("before", grandchild_pid),
+    );
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+
+    assert_group_died(
+        grandchild_pid,
+        "the leader had already exited and been reaped",
+        &before,
+    );
+}
+
+/// The bounded poll both INTERRUPT tests end with. SIGKILL is sent
+/// synchronously by `kill_process_group`, but the kernel reaping it is not
+/// instant from this test's vantage point — same shape as every other
+/// `wait_for_*` helper in this file.
+///
+/// On failure it carries the whole diagnosis rather than a verdict: the
+/// grandchild's process facts as they stood *before* INTERRUPT (whose `pgid`
+/// field is the one the group kill had to hit) and as they stand now. A CI
+/// run that fails here is meant to be readable without a second run.
+fn assert_group_died(grandchild_pid: u32, ordering: &str, before: &str) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if !pid_alive(grandchild_pid) {
-            break;
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "grandchild pid {grandchild_pid} survived INTERRUPT: only the direct child was \
-             killed, not the whole process group"
+            "grandchild pid {grandchild_pid} survived INTERRUPT ({ordering}): the whole turn \
+             process group should have been killed, not just the direct child.\n  {before}\n  \
+             {after}",
+            after = interrupt_diagnosis("after", grandchild_pid),
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The whole picture around a grandchild, for a failure message that
+/// diagnoses itself rather than just reporting a verdict: the grandchild, the
+/// process that forked it (the turn's leader, while it is still alive), and
+/// this test process.
+///
+/// The one field that settles what went wrong is `pgid`. If the grandchild's
+/// `pgid` is the leader's pid, `process_group(0)` did its job and the group
+/// was there to be killed — a survivor then means the SIGKILL never reached
+/// it. If instead it is *this* process's `pgid`, the turn never got a process
+/// group of its own and the negated-pid kill named a group that was never
+/// the turn's.
+fn interrupt_diagnosis(when: &str, grandchild_pid: u32) -> String {
+    let mut out = process_facts(&format!("grandchild {when} INTERRUPT"), grandchild_pid);
+    if let Some(parent) = ppid_of(grandchild_pid).filter(|parent| *parent > 1) {
+        out.push_str("\n  ");
+        out.push_str(&process_facts(
+            &format!("its parent {when} INTERRUPT"),
+            parent,
+        ));
+    }
+    out.push_str("\n  ");
+    out.push_str(&process_facts("this test process", std::process::id()));
+    out
+}
+
+/// The pid that forked `pid`, as this host reports it — `1` (or nothing) once
+/// the real parent has exited and init has adopted it.
+fn ppid_of(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Everything this host will say about a pid. `/proc/<pid>/stat` verbatim
+/// where there is a `/proc` (its fields 3, 4 and 5 are state, ppid and
+/// **pgid** — the group the kill had to name); the POSIX `ps` columns
+/// everywhere, since `matrix.yml` runs this same suite on macOS.
+fn process_facts(label: &str, pid: u32) -> String {
+    let ps = match std::process::Command::new("ps")
+        .args([
+            "-o",
+            "pid=,ppid=,pgid=,state=,comm=",
+            "-p",
+            &pid.to_string(),
+        ])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            format!("{:?}", String::from_utf8_lossy(&out.stdout).trim())
+        }
+        Ok(_) => "<ps reports no such pid>".to_string(),
+        Err(e) => format!("<ps failed: {e}>"),
+    };
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(text) => format!("{:?}", text.trim()),
+        Err(e) => format!("<unreadable: {e}>"),
+    };
+    format!("{label}: ps[pid ppid pgid state comm]={ps}; /proc/{pid}/stat={stat}")
 }
 
 #[test]
