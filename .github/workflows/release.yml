@@ -201,7 +201,7 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - name: cargo deny check (full — advisories, bans, licenses, sources)
-        run: cargo deny check --locked
+        run: cargo deny --locked check
 
   # ── Gate F — distro structural validator ───────────────────────────────
   # Does not execute here — see the top-of-file comment for why (workspace
