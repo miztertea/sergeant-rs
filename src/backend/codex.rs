@@ -298,6 +298,23 @@ pub struct CodexConfig {
     /// process-global mutable state, no `--test-threads` ordering hazard, no
     /// `unsafe { std::env::set_var }` to serialize.
     pub thread_id_budget: Option<Duration>,
+    /// Which transport this registration resolves to (W3 spec §5.2), default
+    /// [`TransportChoice::Auto`]. Resolved **once**, at probe time, and
+    /// journaled; never re-resolved per execution (§5.3).
+    pub transport: TransportChoice,
+    /// Sandbox policy for sergeant-launched turns (W3 spec §3.3), default
+    /// [`SandboxChoice::WorkspaceWrite`].
+    pub sandbox: SandboxChoice,
+    /// A JSON Schema constraining the final assistant message of every turn
+    /// in executions launched from this config (W3 spec §4.2). Adapter-local
+    /// until a contract revision gives native structured output a home in
+    /// `Capabilities`; unused unless a profile or this field sets it.
+    pub output_schema: Option<Value>,
+    /// Overrides for the app-server child's own budgets (spec §1.5.4),
+    /// `(handshake, thread_start, turn_start, interrupt)`. `None` in every
+    /// production path — the same per-instance-not-global posture as
+    /// `thread_id_budget` above, and for the same reason.
+    pub appserver_budgets: Option<(Duration, Duration, Duration, Duration)>,
 }
 
 impl CodexConfig {
@@ -311,6 +328,90 @@ impl CodexConfig {
             codex_home: None,
             env: BTreeMap::new(),
             thread_id_budget: None,
+            transport: TransportChoice::Auto,
+            sandbox: SandboxChoice::WorkspaceWrite,
+            output_schema: None,
+            appserver_budgets: None,
+        }
+    }
+}
+
+/// Which transport a `CodexBackend` registration resolves to (W3 spec §5.2).
+/// `CodexConfig`'s own field, default [`TransportChoice::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportChoice {
+    /// App-server if every gate passes (§5.2 rule 3), else exec — the
+    /// honest fallback named in the probe detail.
+    #[default]
+    Auto,
+    /// Always exec, regardless of what the app-server gates would say.
+    ExecOnly,
+    /// App-server or refuse: if the gates fail, `PROBE` reports
+    /// `available: false` naming the failed gate, rather than silently
+    /// giving the operator a different transport with a different
+    /// capability row (§5.2 rule 2).
+    AppServerOnly,
+}
+
+/// The transport actually resolved for one registration (§5.2) — internal;
+/// `TransportChoice` is the operator-facing configuration, this is the
+/// outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Exec,
+    AppServer,
+}
+
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Transport::Exec => "exec",
+            Transport::AppServer => "app-server (stdio)",
+        }
+    }
+}
+
+/// Sandbox policy for sergeant-launched turns (W3 spec §3.3). Layered
+/// exactly as every other §14 axis: this is `CodexConfig`'s own default,
+/// applied uniformly to every execution this backend launches — a
+/// per-execution override is not a surface this wave adds (nothing in
+/// `StartRequest` names one, and R3 forbids inventing a core field for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxChoice {
+    /// `-s read-only` / `sandbox: "readOnly"`. Never sergeant's own default —
+    /// a Work exists to change its worktree.
+    ReadOnly,
+    /// `-s workspace-write` / `sandbox: "workspaceWrite"`, scoped to the
+    /// Work's declared surfaces. The default: enforcement the owner
+    /// welcomed (R4), never wider than the Work's own bindings.
+    #[default]
+    WorkspaceWrite,
+    /// Send no sandbox parameter at all — the operator's own
+    /// `~/.codex/config.toml` decides. The escape hatch for an operator with
+    /// a considered policy of their own; never the default, because a
+    /// default that silently defers is a default nobody chose.
+    Inherit,
+}
+
+impl SandboxChoice {
+    /// The app-server `thread/start.sandbox` string, or `None` for
+    /// [`SandboxChoice::Inherit`] (send no `sandbox` param at all).
+    fn appserver_value(self) -> Option<&'static str> {
+        match self {
+            SandboxChoice::ReadOnly => Some("readOnly"),
+            SandboxChoice::WorkspaceWrite => Some("workspaceWrite"),
+            SandboxChoice::Inherit => None,
+        }
+    }
+
+    /// The exec `-s`/`--sandbox` value, or `None` for
+    /// [`SandboxChoice::Inherit`] (compose no `--sandbox`/`--add-dir` at all
+    /// — §3.2's turn-1-only asymmetry, unchanged by this choice).
+    fn exec_value(self) -> Option<&'static str> {
+        match self {
+            SandboxChoice::ReadOnly => Some("read-only"),
+            SandboxChoice::WorkspaceWrite => Some("workspace-write"),
+            SandboxChoice::Inherit => None,
         }
     }
 }
@@ -429,10 +530,23 @@ struct LaunchConfig {
     codex_home: Option<PathBuf>,
 }
 
-/// Turn 1's argv, after `<executable>` (spec §3.2): `exec --json
-/// --skip-git-repo-check -C <cwd> [-m <model>]`. Prompt travels on stdin, no
-/// positional argument — see the module docs for why.
-fn first_turn_argv(cwd: &Path, model: Option<&str>) -> Vec<String> {
+/// Turn 1's argv, after `<executable>` (spec §3.2, updated by W3 §3.2/§3.6):
+/// `exec --json --skip-git-repo-check -C <cwd> [-m <model>] [--sandbox
+/// <value>] [--add-dir <path> ...]`. Prompt travels on stdin, no positional
+/// argument — see the module docs for why.
+///
+/// `sandbox`/`extra_dirs` are **turn-1-only** — `exec resume` has neither
+/// flag on this build (`resume_turn_argv` below), so enforcement lapses on
+/// turn 2 of an exec-transport conversation. That asymmetry is recorded, not
+/// routed around (W3 spec §3.2): a first turn is where a Work does most of
+/// its damage, and it is itself an argument for app-server as the resolved
+/// transport, where the policy is thread-scoped and holds for every turn.
+fn first_turn_argv(
+    cwd: &Path,
+    model: Option<&str>,
+    sandbox: SandboxChoice,
+    extra_dirs: &[PathBuf],
+) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
         "--json".to_string(),
@@ -443,6 +557,14 @@ fn first_turn_argv(cwd: &Path, model: Option<&str>) -> Vec<String> {
     if let Some(model) = model {
         argv.push("-m".to_string());
         argv.push(model.to_string());
+    }
+    if let Some(value) = sandbox.exec_value() {
+        argv.push("--sandbox".to_string());
+        argv.push(value.to_string());
+    }
+    for dir in extra_dirs {
+        argv.push("--add-dir".to_string());
+        argv.push(dir.to_string_lossy().into_owned());
     }
     argv
 }
@@ -1122,6 +1244,12 @@ struct CodexExecution {
     /// since `--add-dir` is never composed and this is the signal a future
     /// enforcement mapping (W3) would need.
     bindings_outside_cwd: Vec<PathBuf>,
+    /// W3 §3.3: the sandbox policy this execution's turns compose. Resolved
+    /// once at LAUNCH/RESUME from `CodexConfig.sandbox` and carried here so
+    /// SEND's later turns compose the same policy the first one did (never
+    /// re-read from a config that might have changed under a long-lived
+    /// daemon).
+    sandbox: SandboxChoice,
     turns: u32,
     turn: TurnState,
     /// The process group id of the most recent turn, recorded at **spawn**
@@ -1679,6 +1807,7 @@ impl CodexBackend {
             first_turn,
             work_id,
             bindings_outside_cwd,
+            sandbox,
         ) = {
             let state = self.lock();
             let execution = state
@@ -1695,12 +1824,18 @@ impl CodexBackend {
                 execution.turns == 0,
                 execution.work_id.clone(),
                 execution.bindings_outside_cwd.clone(),
+                execution.sandbox,
             )
         };
 
         let mut command = Command::new(&executable);
         if first_turn {
-            command.args(first_turn_argv(&cwd, model.as_deref()));
+            command.args(first_turn_argv(
+                &cwd,
+                model.as_deref(),
+                sandbox,
+                &bindings_outside_cwd,
+            ));
         } else {
             let thread_id = thread_id.clone().ok_or_else(|| {
                 self.err_failed("cannot send: no thread id recorded for this execution")
@@ -2184,6 +2319,7 @@ impl Backend for CodexBackend {
                     env,
                     codex_home,
                     bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
+                    sandbox: self.config.sandbox,
                     turns: 0,
                     turn: TurnState::Unlaunched,
                     turn_pgid: None,
@@ -2359,6 +2495,7 @@ impl Backend for CodexBackend {
                 env,
                 codex_home,
                 bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
+                sandbox: self.config.sandbox,
                 turns: 1,
                 turn: TurnState::Adopted,
                 // A re-adopted thread's turn was spawned by a previous
@@ -2604,8 +2741,12 @@ mod tests {
 
     #[test]
     fn first_turn_argv_carries_the_measured_shape() {
+        // W3 §3.2/§3.6, deliberately inverted from W1's own tripwire: turn 1
+        // now composes `--sandbox`/`--add-dir` by default. `Inherit` +
+        // `sandbox_choice_inherit_sends_no_sandbox_param` below is what
+        // proves the *absence* path still works.
         let cwd = PathBuf::from("/work/surface");
-        let argv = first_turn_argv(&cwd, None);
+        let argv = first_turn_argv(&cwd, None, SandboxChoice::WorkspaceWrite, &[]);
         assert_eq!(
             argv,
             vec![
@@ -2613,24 +2754,28 @@ mod tests {
                 "--json",
                 "--skip-git-repo-check",
                 "-C",
-                "/work/surface"
+                "/work/surface",
+                "--sandbox",
+                "workspace-write",
             ]
         );
         assert!(!argv.contains(&"-m".to_string()), "no model, no -m flag");
 
-        let pinned = first_turn_argv(&cwd, Some("gpt-5.6-luna"));
-        assert_eq!(pinned.last().unwrap(), "gpt-5.6-luna");
-        assert_eq!(pinned[pinned.len() - 2], "-m");
+        let pinned = first_turn_argv(&cwd, Some("gpt-5.6-luna"), SandboxChoice::WorkspaceWrite, &[]);
+        assert!(pinned.contains(&"-m".to_string()));
+        let m_idx = pinned.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(pinned[m_idx + 1], "gpt-5.6-luna");
 
-        for absent in [
-            "--add-dir",
-            "-s",
-            "--sandbox",
-            "-p",
-            "--profile",
-            "--ignore-user-config",
-            "--ephemeral",
-        ] {
+        let with_extra_dir = first_turn_argv(
+            &cwd,
+            None,
+            SandboxChoice::WorkspaceWrite,
+            &[PathBuf::from("/other/repo")],
+        );
+        assert_eq!(with_extra_dir.last().unwrap(), "/other/repo");
+        assert_eq!(with_extra_dir[with_extra_dir.len() - 2], "--add-dir");
+
+        for absent in ["-p", "--profile", "--ignore-user-config", "--ephemeral"] {
             assert!(
                 !argv.contains(&absent.to_string()),
                 "{absent} must never appear on turn 1"
@@ -2639,6 +2784,17 @@ mod tests {
         // No positional prompt: the exact-equality assertion above already
         // pins every element, and none of them is the prompt text — the
         // prompt travels on stdin (module docs).
+    }
+
+    #[test]
+    fn sandbox_choice_inherit_sends_no_sandbox_param() {
+        let cwd = PathBuf::from("/work/surface");
+        let argv = first_turn_argv(&cwd, None, SandboxChoice::Inherit, &[]);
+        assert!(!argv.contains(&"--sandbox".to_string()));
+        assert!(!argv.contains(&"-s".to_string()));
+        assert_eq!(SandboxChoice::Inherit.appserver_value(), None);
+        assert_eq!(SandboxChoice::ReadOnly.exec_value(), Some("read-only"));
+        assert_eq!(SandboxChoice::ReadOnly.appserver_value(), Some("readOnly"));
     }
 
     #[test]
