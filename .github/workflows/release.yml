@@ -802,10 +802,23 @@ jobs:
             echo "::error::draft-release did not emit a release-id output — refusing to guess which draft to publish" >&2
             exit 1
           fi
-          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -f draft=false -f make_latest=true
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -f draft=false
+
+      # Separate step, by tag, via porcelain — measured on v0.1.2
+      # (2026-08-21): `make_latest=true` riding in the same PATCH as the
+      # draft flip is silently dropped (the release is still a draft when
+      # the flag is validated, and drafts cannot be latest), which left
+      # /releases/latest on the prior tag until `gh release edit --latest`
+      # fixed it by hand. By-tag is safe here where it isn't above: only
+      # one *published* release can carry a tag, so the draft-collision
+      # rationale for by-ID doesn't apply post-publish.
+      - name: mark the published release as latest (must be its own step — see comment)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --latest
 
   # ── Verify latest ──────────────────────────────────────────────────────
-  # `make_latest=true` above is a request, not a guarantee — GitHub's
+  # `--latest` above is a request, not a guarantee — GitHub's
   # "latest" resolution is eventually consistent. Confirm this run's own
   # tag is what /releases/latest actually reports before we call the
   # publish durable, retrying to ride out the lag rather than racing it.
