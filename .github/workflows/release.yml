@@ -7,6 +7,20 @@
 # the default `mode` so an accidental "Run workflow" click cannot publish
 # anything.
 #
+# BRANCH POSTURE (J4/J5; ratify-at-review item 1, foundation-2026-08-21.md):
+# `publish` may only be dispatched against main at origin's current HEAD —
+# Gate A's first step enforces both checks exactly as it always has.
+# `dry-run` may be dispatched from any ref: it creates nothing durable (no
+# git tag, no publish; its draft release is deleted on always()), so the
+# authority question that matters — who may make a release durable — is
+# untouched. J4: the owner's commission ("autonomously build end to end the
+# completed release pipeline that will work") requires proving the full
+# gates+packaging+draft+delete chain pre-merge, from an integration branch,
+# which the prior main-only-in-both-modes posture made structurally
+# impossible. J5: this does not relax the release-authority governing
+# constraint below (human-dispatch-only, no tag watcher/push/cron) — it
+# only widens which ref a *provably non-durable* dry-run may run from.
+#
 # CO-VERSIONING CONSTRAINT (ADR 0014 decision 2, NORTH-STAR "Not true yet"
 # note): v0.x.y is supposed to name ONE artifact identity — the `sgt` binary
 # AND the embedded distro it writes via `sgt init`. That embedding does not
@@ -102,6 +116,10 @@ jobs:
   # Proposal §9.1 / §8: confirm the exact revision and every version
   # invariant before anything else runs. Failing here creates no tag and no
   # release — this job does nothing but check facts.
+  # Since the branch-posture change below: "confirm the exact revision" is
+  # itself mode-gated now — publish still requires main at origin's current
+  # HEAD; dry-run's revision check is that it ran from *some* named ref/SHA,
+  # logged, not that ref/SHA being main.
   gate-a-repo-state:
     runs-on: ubuntu-24.04
     steps:
@@ -109,16 +127,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: running against main, HEAD is current main HEAD
+      - name: publish requires main at origin HEAD; dry-run permitted from any ref
         run: |
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "::error::release.yml must be dispatched against main, was dispatched against ${{ github.ref }}" >&2
-            exit 1
-          fi
-          remote_head=$(git rev-parse origin/main)
-          if [ "$GITHUB_SHA" != "$remote_head" ]; then
-            echo "::error::dispatched commit $GITHUB_SHA is not origin/main's HEAD ($remote_head) — main moved since dispatch" >&2
-            exit 1
+          if [ "${{ inputs.mode }}" = "dry-run" ]; then
+            echo "::notice::dry-run dispatched from ${{ github.ref }} (commit $GITHUB_SHA) — main/origin-HEAD assertion skipped: dry-run creates no tag and publishes nothing durable (J4/J5, see top-of-file header)"
+          else
+            if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+              echo "::error::release.yml must be dispatched against main, was dispatched against ${{ github.ref }}" >&2
+              exit 1
+            fi
+            remote_head=$(git rev-parse origin/main)
+            if [ "$GITHUB_SHA" != "$remote_head" ]; then
+              echo "::error::dispatched commit $GITHUB_SHA is not origin/main's HEAD ($remote_head) — main moved since dispatch" >&2
+              exit 1
+            fi
           fi
 
       - name: requested version == Cargo.toml version
