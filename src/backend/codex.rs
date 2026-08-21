@@ -466,6 +466,28 @@ struct ProbeOutcome {
     auth: Option<AuthState>,
 }
 
+/// Outcome of W3's four app-server admission gates (§5.2), memoized
+/// alongside [`ProbeOutcome`].
+#[derive(Debug, Clone)]
+struct AppServerGates {
+    /// `Ok(())` when G1, G2 and G4 all passed. `Err` names the gate and why
+    /// (each message is prefixed `"G1: "`/`"G2: "`/`"G4: "`).
+    result: Result<(), String>,
+    /// G3: whether the installed protocol's scoped fingerprint disagreed
+    /// with [`codex_appserver::MEASURED_PROTOCOL_FINGERPRINT`] — provenance,
+    /// never a gate failure (R1). Only meaningful when `result` reached G3
+    /// (i.e. is not a G1 failure); `false` on a G1 failure, harmlessly.
+    stale: bool,
+}
+
+/// §5.2's resolved outcome for one registration — computed once, journaled,
+/// never revisited per execution (§5.3).
+#[derive(Debug, Clone)]
+struct TransportResolution {
+    transport: Transport,
+    detail: String,
+}
+
 /// Parse `"codex-cli 0.149.0"` into a comparable triple. The vendor token,
 /// when present, is skipped by taking the *last* whitespace-separated token;
 /// a bare `"0.149.0"` (no vendor token at all) is accepted the same way. The
@@ -546,6 +568,7 @@ fn first_turn_argv(
     model: Option<&str>,
     sandbox: SandboxChoice,
     extra_dirs: &[PathBuf],
+    output_schema_path: Option<&Path>,
 ) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
@@ -566,6 +589,10 @@ fn first_turn_argv(
         argv.push("--add-dir".to_string());
         argv.push(dir.to_string_lossy().into_owned());
     }
+    if let Some(path) = output_schema_path {
+        argv.push("--output-schema".to_string());
+        argv.push(path.to_string_lossy().into_owned());
+    }
     argv
 }
 
@@ -576,7 +603,17 @@ fn first_turn_argv(
 /// passed here: `exec resume` has no such flag on this build
 /// [measured-negative]; `Command::current_dir` is the only mechanism left,
 /// and is set on every spawn regardless of turn number.
-fn resume_turn_argv(thread_id: &str, model: Option<&str>) -> Vec<String> {
+///
+/// `output_schema_path` **does** re-apply here, unlike `sandbox`/`extra_dirs`
+/// above: `exec resume --help` on 0.149.0 lists `--output-schema` (and
+/// `-o`/`--output-last-message`) — re-measured while implementing W3, and a
+/// correction to W1's own "verify at implementation time" placeholder
+/// (spec §4.2). So `structured_output`'s exec row is **not** turn-1-only.
+fn resume_turn_argv(
+    thread_id: &str,
+    model: Option<&str>,
+    output_schema_path: Option<&Path>,
+) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
         "resume".to_string(),
@@ -587,6 +624,10 @@ fn resume_turn_argv(thread_id: &str, model: Option<&str>) -> Vec<String> {
     if let Some(model) = model {
         argv.push("-m".to_string());
         argv.push(model.to_string());
+    }
+    if let Some(path) = output_schema_path {
+        argv.push("--output-schema".to_string());
+        argv.push(path.to_string_lossy().into_owned());
     }
     argv
 }
@@ -1306,6 +1347,18 @@ enum FirstTurnSignal {
 pub struct CodexBackend {
     config: CodexConfig,
     probe_outcome: OnceLock<ProbeOutcome>,
+    /// The four app-server admission gates (W3 spec §5.2), memoized exactly
+    /// as `probe_outcome` is: G4 spawns a real (bounded, token-free) process,
+    /// so this happens once per daemon lifetime, not once per PROBE call.
+    appserver_gates: OnceLock<AppServerGates>,
+    /// Which transport this registration resolved to (§5.2/§5.3) — computed
+    /// once, journaled, and never revisited per execution.
+    transport_resolution: OnceLock<TransportResolution>,
+    /// `CodexConfig.output_schema`, materialized to a file under `data_dir`
+    /// once (§4.2) — every execution this backend launches on the exec
+    /// transport shares the one file, since the schema is backend-config-
+    /// level, not per-execution.
+    output_schema_path: OnceLock<Option<PathBuf>>,
     state: Arc<Mutex<AdapterState>>,
     sink: Mutex<Option<EventSink>>,
 }
@@ -1325,6 +1378,9 @@ impl CodexBackend {
         Self {
             config,
             probe_outcome: OnceLock::new(),
+            appserver_gates: OnceLock::new(),
+            transport_resolution: OnceLock::new(),
+            output_schema_path: OnceLock::new(),
             state: Arc::new(Mutex::new(AdapterState::default())),
             sink: Mutex::new(None),
         }
@@ -1352,6 +1408,25 @@ impl CodexBackend {
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
         PathBuf::from(home).join(".codex")
+    }
+
+    /// The exec transport's own materialization of `CodexConfig.output_
+    /// schema` (spec §4.2): written once to `<data_dir>/codex-output-schema.
+    /// json`, `None` when no schema is configured. A write failure is
+    /// treated as "no schema" rather than a launch failure — this feature is
+    /// adapter-local evidence with no contract row (§4.1), so a filesystem
+    /// problem here must not turn into a refused Work.
+    fn output_schema_path(&self) -> Option<&Path> {
+        self.output_schema_path
+            .get_or_init(|| {
+                let schema = self.config.output_schema.as_ref()?;
+                let path = self.config.data_dir.join("codex-output-schema.json");
+                match serde_json::to_vec(schema).map(|bytes| std::fs::write(&path, bytes)) {
+                    Ok(Ok(())) => Some(path),
+                    _ => None,
+                }
+            })
+            .as_deref()
     }
 
     /// A bounded, depth-capped walk of `<codex_home>/sessions/**` for a file
@@ -1593,6 +1668,187 @@ impl CodexBackend {
         }
     }
 
+    // ---------------------------------------------- W3 §5.2: transport gates
+
+    /// The four app-server admission gates, run once and cached.
+    fn appserver_gates(&self) -> &AppServerGates {
+        self.appserver_gates.get_or_init(|| self.run_appserver_gates())
+    }
+
+    fn run_appserver_gates(&self) -> AppServerGates {
+        if let Err(reason) = self.gate_g1_help() {
+            return AppServerGates {
+                result: Err(reason),
+                stale: false,
+            };
+        }
+        let stale = match self.gate_g2_g3_fingerprint() {
+            Ok(stale) => stale,
+            Err(reason) => {
+                return AppServerGates {
+                    result: Err(reason),
+                    stale: false,
+                };
+            }
+        };
+        if let Err(reason) = self.gate_g4_handshake() {
+            return AppServerGates {
+                result: Err(reason),
+                stale,
+            };
+        }
+        AppServerGates {
+            result: Ok(()),
+            stale,
+        }
+    }
+
+    /// G1: `codex app-server --help` exits 0 and its `--listen` line offers
+    /// `stdio://`. Token-free.
+    fn gate_g1_help(&self) -> Result<(), String> {
+        let exe = &self.config.executable;
+        let out = Command::new(exe)
+            .args(["app-server", "--help"])
+            .output()
+            .map_err(|e| format!("G1: cannot run {exe:?} app-server --help: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "G1: {exe:?} app-server --help exited {:?}",
+                out.status.code()
+            ));
+        }
+        let help = String::from_utf8_lossy(&out.stdout);
+        if !help.contains("stdio://") {
+            return Err(
+                "G1: app-server --help does not offer a stdio:// transport".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// G2/G3: `generate-json-schema` succeeds, every pinned file exists, and
+    /// the scoped fingerprint is computed. Returns whether it is *stale*
+    /// (mismatched against [`codex_appserver::MEASURED_PROTOCOL_FINGERPRINT`])
+    /// — never a gate failure by itself (R1): staleness is provenance,
+    /// folded into the probe detail, not a refusal. Token-free, ~50ms
+    /// (M7/re-measured while authoring this wave).
+    fn gate_g2_g3_fingerprint(&self) -> Result<bool, String> {
+        let exe = &self.config.executable;
+        let scratch = self.config.data_dir.join(".codex-appserver-schema-probe");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let out = Command::new(exe)
+            .args(["app-server", "generate-json-schema", "--out"])
+            .arg(&scratch)
+            .arg("--experimental")
+            .output()
+            .map_err(|e| format!("G2: cannot run {exe:?} app-server generate-json-schema: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "G2: generate-json-schema exited {:?}",
+                out.status.code()
+            ));
+        }
+        for file in codex_appserver::PINNED_SCHEMA_FILES {
+            if !scratch.join(file).exists() {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Err(format!(
+                    "G2: pinned schema file {file} is missing from the generated dump"
+                ));
+            }
+        }
+        let fingerprint = codex_appserver::compute_fingerprint(&scratch).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&scratch);
+            format!("G2: {e}")
+        })?;
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(fingerprint != codex_appserver::MEASURED_PROTOCOL_FINGERPRINT)
+    }
+
+    /// G4: spawn `--listen stdio://`, round-trip `initialize` within budget,
+    /// kill the child. Token-free — no `turn/start` is ever sent.
+    fn gate_g4_handshake(&self) -> Result<(), String> {
+        let budget = self
+            .config
+            .appserver_budgets
+            .map(|b| b.0)
+            .unwrap_or_else(|| codex_appserver::Budgets::default().handshake);
+        let mut child = codex_appserver::AppServerChild::spawn(
+            &self.config.executable,
+            &self.config.data_dir,
+            &self.config.env,
+            self.config.codex_home.as_deref(),
+            |_handle, _line| {},
+        )
+        .map_err(|e| format!("G4: {e}"))?;
+        let result = child.handle().call(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "sergeant", "title": "sergeant",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {"experimentalApi": true},
+            }),
+            budget,
+        );
+        child.kill(Duration::from_secs(1));
+        result.map(|_| ()).map_err(|e| format!("G4: {e}"))
+    }
+
+    /// §5.2's resolution rule, memoized.
+    fn transport_resolution(&self) -> &TransportResolution {
+        self.transport_resolution
+            .get_or_init(|| self.resolve_transport())
+    }
+
+    fn resolve_transport(&self) -> TransportResolution {
+        match self.config.transport {
+            TransportChoice::ExecOnly => TransportResolution {
+                transport: Transport::Exec,
+                detail: "transport: exec (ExecOnly configured)".to_string(),
+            },
+            TransportChoice::AppServerOnly => match &self.appserver_gates().result {
+                Ok(()) => TransportResolution {
+                    transport: Transport::AppServer,
+                    detail: self.appserver_detail("AppServerOnly configured"),
+                },
+                Err(reason) => TransportResolution {
+                    // Irrelevant: `probe()` reports `available: false` for
+                    // this exact case (§5.2 rule 2) before this value is
+                    // ever read for a launch decision.
+                    transport: Transport::Exec,
+                    detail: format!(
+                        "transport: app-server requested (AppServerOnly) but refused: {reason}"
+                    ),
+                },
+            },
+            TransportChoice::Auto => match &self.appserver_gates().result {
+                Ok(()) => TransportResolution {
+                    transport: Transport::AppServer,
+                    detail: self.appserver_detail("Auto"),
+                },
+                Err(reason) => TransportResolution {
+                    transport: Transport::Exec,
+                    detail: format!("transport: exec (Auto: app-server gate failed: {reason})"),
+                },
+            },
+        }
+    }
+
+    fn appserver_detail(&self, why: &str) -> String {
+        let gates = self.appserver_gates();
+        let mut detail = format!("transport: app-server (stdio) ({why})");
+        if gates.stale {
+            detail.push_str(&format!(
+                "; protocol: stale (fingerprint != measured {})",
+                codex_appserver::MEASURED_PROTOCOL_FINGERPRINT
+            ));
+        } else {
+            detail.push_str("; protocol: fresh");
+        }
+        detail
+    }
+
     /// Resolve one execution's launch configuration from adapter config plus
     /// the profile (§14, §3.5). One function, used by PREPARE, LAUNCH and
     /// RESUME alike — the same rule `claude.rs::launch_config` follows.
@@ -1828,6 +2084,7 @@ impl CodexBackend {
             )
         };
 
+        let output_schema_path = self.output_schema_path();
         let mut command = Command::new(&executable);
         if first_turn {
             command.args(first_turn_argv(
@@ -1835,12 +2092,17 @@ impl CodexBackend {
                 model.as_deref(),
                 sandbox,
                 &bindings_outside_cwd,
+                output_schema_path,
             ));
         } else {
             let thread_id = thread_id.clone().ok_or_else(|| {
                 self.err_failed("cannot send: no thread id recorded for this execution")
             })?;
-            command.args(resume_turn_argv(&thread_id, model.as_deref()));
+            command.args(resume_turn_argv(
+                &thread_id,
+                model.as_deref(),
+                output_schema_path,
+            ));
         }
         command
             .current_dir(&cwd)
@@ -2262,9 +2524,33 @@ impl Backend for CodexBackend {
 
     fn probe(&self) -> ProbeReport {
         let outcome = self.probe_outcome();
+        if !outcome.available {
+            return ProbeReport {
+                available: false,
+                detail: Some(outcome.detail.clone()),
+            };
+        }
+        // §5.2 rule 2: `AppServerOnly` + a failed gate is the one place a
+        // refusal is right — the operator asked for exactly this transport,
+        // and silently giving them exec (a different capability row) is the
+        // dishonesty this rule exists to prevent. Not an R1 violation: this
+        // refuses a *configuration* that cannot be satisfied here, not a
+        // version.
+        if self.config.transport == TransportChoice::AppServerOnly
+            && let Err(reason) = &self.appserver_gates().result
+        {
+            return ProbeReport {
+                available: false,
+                detail: Some(format!(
+                    "{}; app-server requested (AppServerOnly) but refused: {reason}",
+                    outcome.detail
+                )),
+            };
+        }
+        let resolution = self.transport_resolution();
         ProbeReport {
-            available: outcome.available,
-            detail: Some(outcome.detail.clone()),
+            available: true,
+            detail: Some(format!("{}; {}", outcome.detail, resolution.detail)),
         }
     }
 
@@ -2746,7 +3032,7 @@ mod tests {
         // `sandbox_choice_inherit_sends_no_sandbox_param` below is what
         // proves the *absence* path still works.
         let cwd = PathBuf::from("/work/surface");
-        let argv = first_turn_argv(&cwd, None, SandboxChoice::WorkspaceWrite, &[]);
+        let argv = first_turn_argv(&cwd, None, SandboxChoice::WorkspaceWrite, &[], None);
         assert_eq!(
             argv,
             vec![
@@ -2761,7 +3047,7 @@ mod tests {
         );
         assert!(!argv.contains(&"-m".to_string()), "no model, no -m flag");
 
-        let pinned = first_turn_argv(&cwd, Some("gpt-5.6-luna"), SandboxChoice::WorkspaceWrite, &[]);
+        let pinned = first_turn_argv(&cwd, Some("gpt-5.6-luna"), SandboxChoice::WorkspaceWrite, &[], None);
         assert!(pinned.contains(&"-m".to_string()));
         let m_idx = pinned.iter().position(|a| a == "-m").unwrap();
         assert_eq!(pinned[m_idx + 1], "gpt-5.6-luna");
@@ -2771,9 +3057,36 @@ mod tests {
             None,
             SandboxChoice::WorkspaceWrite,
             &[PathBuf::from("/other/repo")],
+            None,
         );
         assert_eq!(with_extra_dir.last().unwrap(), "/other/repo");
         assert_eq!(with_extra_dir[with_extra_dir.len() - 2], "--add-dir");
+
+        let with_schema = first_turn_argv(
+            &cwd,
+            None,
+            SandboxChoice::WorkspaceWrite,
+            &[],
+            Some(Path::new("/data/codex-output-schema.json")),
+        );
+        assert_eq!(with_schema.last().unwrap(), "/data/codex-output-schema.json");
+        assert_eq!(with_schema[with_schema.len() - 2], "--output-schema");
+
+        // §4.2's own correction to W1's placeholder: --output-schema DOES
+        // re-apply on resume, unlike --sandbox/--add-dir.
+        let resume_with_schema = resume_turn_argv(
+            "thread-y",
+            None,
+            Some(Path::new("/data/codex-output-schema.json")),
+        );
+        assert_eq!(
+            resume_with_schema.last().unwrap(),
+            "/data/codex-output-schema.json"
+        );
+        assert_eq!(
+            resume_with_schema[resume_with_schema.len() - 2],
+            "--output-schema"
+        );
 
         for absent in ["-p", "--profile", "--ignore-user-config", "--ephemeral"] {
             assert!(
@@ -2789,7 +3102,7 @@ mod tests {
     #[test]
     fn sandbox_choice_inherit_sends_no_sandbox_param() {
         let cwd = PathBuf::from("/work/surface");
-        let argv = first_turn_argv(&cwd, None, SandboxChoice::Inherit, &[]);
+        let argv = first_turn_argv(&cwd, None, SandboxChoice::Inherit, &[], None);
         assert!(!argv.contains(&"--sandbox".to_string()));
         assert!(!argv.contains(&"-s".to_string()));
         assert_eq!(SandboxChoice::Inherit.appserver_value(), None);
@@ -2799,7 +3112,7 @@ mod tests {
 
     #[test]
     fn resume_turn_argv_omits_cd_and_places_the_thread_id_right_after_resume() {
-        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None);
+        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None, None);
         assert_eq!(
             argv,
             vec![
@@ -2817,7 +3130,7 @@ mod tests {
         let resume_idx = argv.iter().position(|a| a == "resume").unwrap();
         assert_eq!(argv[resume_idx + 1], "01a02508-5880-7980-95b7-1d8bc22d5139");
 
-        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"));
+        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"), None);
         assert!(pinned.contains(&"-m".to_string()));
         assert_eq!(pinned.last().unwrap(), "gpt-5.6-luna");
 

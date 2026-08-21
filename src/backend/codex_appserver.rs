@@ -498,6 +498,75 @@ impl Default for Budgets {
 /// deliver whatever comes back.
 type PendingMap = Arc<Mutex<BTreeMap<u64, SyncSender<Result<Value, JsonRpcErrorInfo>>>>>;
 
+/// The JSON-RPC bookkeeping half of one app-server child: cheap to clone
+/// (an `Arc` around its stdin lock, its shared id counter, its pending-
+/// response map), so the reader thread's own `on_line` callback can hold one
+/// and answer a server request (§3.4) **inline, from the same thread that
+/// decoded it** — no second channel needed to get the answer back to
+/// whoever owns the write side. [`AppServerChild`] (below) is this plus the
+/// process lifecycle (spawn/kill/pgid); nothing here talks to the process
+/// directly.
+#[derive(Clone)]
+pub(super) struct AppServerHandle {
+    stdin: Arc<Mutex<std::process::ChildStdin>>,
+    next_id: Arc<AtomicU64>,
+    pending: PendingMap,
+}
+
+impl AppServerHandle {
+    fn write_line(&self, value: &Value) -> std::io::Result<()> {
+        let mut stdin = self.stdin.lock().expect("stdin lock");
+        stdin.write_all(value.to_string().as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()
+    }
+
+    /// Send one JSON-RPC request and block, bounded, for its response.
+    /// `"jsonrpc":"2.0"` is stamped on everything sent (spec §1.5.1); nothing
+    /// this client receives is required to carry it.
+    pub(super) fn call(&self, method: &str, params: Value, budget: Duration) -> Result<Value, String> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.pending.lock().expect("pending lock").insert(id, tx);
+        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        if let Err(e) = self.write_line(&line) {
+            self.pending.lock().expect("pending lock").remove(&id);
+            return Err(format!("cannot write {method}: {e}"));
+        }
+        match rx.recv_timeout(budget) {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(format!(
+                "{method} refused: {} (code {})",
+                error.message, error.code
+            )),
+            Err(_) => {
+                self.pending.lock().expect("pending lock").remove(&id);
+                Err(format!("{method} did not respond within {budget:?}"))
+            }
+        }
+    }
+
+    /// Send a notification (no id, no response expected — `initialized`).
+    pub(super) fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+        let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        self.write_line(&line).map_err(|e| e.to_string())
+    }
+
+    /// Answer a server request the caller decided how to answer (via
+    /// [`answer_for_request`] or its own logic for `item/tool/requestUserInput`
+    /// when `ask` is ever admitted). Never optional to call: an unanswered
+    /// blocking request is a hung turn (§3.4).
+    pub(super) fn answer(&self, id: &Value, answer: RequestAnswer) -> Result<(), String> {
+        let line = match answer {
+            RequestAnswer::Result(result) => json!({"id": id, "result": result}),
+            RequestAnswer::Error { code, message } => {
+                json!({"id": id, "error": {"code": code, "message": message}})
+            }
+        };
+        self.write_line(&line).map_err(|e| e.to_string())
+    }
+}
+
 /// One `codex app-server --listen stdio://` child, owned for the whole
 /// execution (spec §1.4: one per `CodexExecution`, never per turn). Spawns
 /// the process, drives the handshake, and hands back a handle whose
@@ -506,16 +575,14 @@ type PendingMap = Arc<Mutex<BTreeMap<u64, SyncSender<Result<Value, JsonRpcErrorI
 /// through it and owns everything transport-specific (sandbox composition,
 /// prompts, the event sink).
 pub(super) struct AppServerChild {
+    handle: AppServerHandle,
     child: Arc<Mutex<Child>>,
-    stdin: Arc<Mutex<std::process::ChildStdin>>,
-    next_id: AtomicU64,
-    pending: PendingMap,
     pgid: u32,
     reader: Option<std::thread::JoinHandle<()>>,
 }
 
 /// One line the reader thread hands to whatever is consuming this child's
-/// output — a response/error already matched against `pending` is not
+/// output — a response/error already matched against the pending map is not
 /// re-delivered here; only notifications and server requests are.
 #[derive(Debug, Clone)]
 pub(super) enum InboundLine {
@@ -528,14 +595,16 @@ pub(super) enum InboundLine {
 impl AppServerChild {
     /// Spawn the child and start its reader thread. Every notification and
     /// server request the child ever writes is sent to `on_line`, called
-    /// from the reader thread — the caller must not block long in it, the
-    /// same rule exec's `TurnReader` follows.
+    /// from the reader thread with the same [`AppServerHandle`] this child
+    /// holds — so `on_line` can answer a server request inline, without a
+    /// second round trip through this struct. The caller must not block long
+    /// in `on_line`, the same rule exec's `TurnReader` follows.
     pub(super) fn spawn(
         executable: &Path,
         cwd: &Path,
         env: &BTreeMap<String, String>,
         codex_home: Option<&Path>,
-        on_line: impl Fn(InboundLine) + Send + 'static,
+        on_line: impl Fn(&AppServerHandle, InboundLine) + Send + 'static,
     ) -> Result<Self, String> {
         let mut command = Command::new(executable);
         command
@@ -584,33 +653,42 @@ impl AppServerChild {
             });
         }
 
-        let pending: PendingMap = Arc::new(Mutex::new(BTreeMap::new()));
-        let reader_pending = Arc::clone(&pending);
+        let handle = AppServerHandle {
+            stdin: Arc::new(Mutex::new(stdin)),
+            next_id: Arc::new(AtomicU64::new(1)),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let reader_handle = handle.clone();
         let reader = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                    on_line(InboundLine::Unparsed);
+                    on_line(&reader_handle, InboundLine::Unparsed);
                     continue;
                 };
                 match classify_line(&value) {
                     LineShape::Response { id, result } => {
-                        if let Some(tx) = reader_pending.lock().expect("pending lock").remove(&id)
+                        if let Some(tx) =
+                            reader_handle.pending.lock().expect("pending lock").remove(&id)
                         {
                             let _ = tx.send(Ok(result));
                         }
                     }
                     LineShape::ErrorResponse { id, error } => {
-                        if let Some(tx) = reader_pending.lock().expect("pending lock").remove(&id)
+                        if let Some(tx) =
+                            reader_handle.pending.lock().expect("pending lock").remove(&id)
                         {
                             let _ = tx.send(Err(error));
                         }
                     }
                     LineShape::Notification { method, params } => {
-                        on_line(InboundLine::Notification { method, params });
+                        on_line(&reader_handle, InboundLine::Notification { method, params });
                     }
                     LineShape::ServerRequest { id, method, params } => {
-                        on_line(InboundLine::ServerRequest { id, method, params });
+                        on_line(
+                            &reader_handle,
+                            InboundLine::ServerRequest { id, method, params },
+                        );
                     }
                     LineShape::Unrecognized => {}
                 }
@@ -618,70 +696,17 @@ impl AppServerChild {
         });
 
         Ok(Self {
+            handle,
             child: Arc::new(Mutex::new(child)),
-            stdin: Arc::new(Mutex::new(stdin)),
-            next_id: AtomicU64::new(1),
-            pending,
             pgid,
             reader: Some(reader),
         })
     }
 
-    /// Send one JSON-RPC request and block, bounded, for its response.
-    /// `"jsonrpc":"2.0"` is stamped on everything sent (spec §1.5.1); nothing
-    /// this client receives is required to carry it.
-    pub(super) fn call(
-        &self,
-        method: &str,
-        params: Value,
-        budget: Duration,
-    ) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.pending.lock().expect("pending lock").insert(id, tx);
-        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if let Err(e) = self.write_line(&line) {
-            self.pending.lock().expect("pending lock").remove(&id);
-            return Err(format!("cannot write {method}: {e}"));
-        }
-        match rx.recv_timeout(budget) {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(format!(
-                "{method} refused: {} (code {})",
-                error.message, error.code
-            )),
-            Err(_) => {
-                self.pending.lock().expect("pending lock").remove(&id);
-                Err(format!("{method} did not respond within {budget:?}"))
-            }
-        }
-    }
-
-    /// Send a notification (no id, no response expected — `initialized`).
-    pub(super) fn notify(&self, method: &str, params: Value) -> Result<(), String> {
-        let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.write_line(&line).map_err(|e| e.to_string())
-    }
-
-    /// Answer a server request the caller decided how to answer (via
-    /// [`answer_for_request`] or its own logic for `item/tool/requestUserInput`
-    /// when `ask` is ever admitted). Never optional to call: an unanswered
-    /// blocking request is a hung turn (§3.4).
-    pub(super) fn answer(&self, id: &Value, answer: RequestAnswer) -> Result<(), String> {
-        let line = match answer {
-            RequestAnswer::Result(result) => json!({"id": id, "result": result}),
-            RequestAnswer::Error { code, message } => {
-                json!({"id": id, "error": {"code": code, "message": message}})
-            }
-        };
-        self.write_line(&line).map_err(|e| e.to_string())
-    }
-
-    fn write_line(&self, value: &Value) -> std::io::Result<()> {
-        let mut stdin = self.stdin.lock().expect("stdin lock");
-        stdin.write_all(value.to_string().as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()
+    /// A cloneable handle for issuing requests/notifications from outside
+    /// the reader thread (`thread/start`, `turn/start`, `turn/interrupt`).
+    pub(super) fn handle(&self) -> AppServerHandle {
+        self.handle.clone()
     }
 
     /// This child's process-group id, recorded at spawn (§1.5.5) — never
