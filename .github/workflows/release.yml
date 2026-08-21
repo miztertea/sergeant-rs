@@ -7,6 +7,20 @@
 # the default `mode` so an accidental "Run workflow" click cannot publish
 # anything.
 #
+# BRANCH POSTURE (J4/J5; ratify-at-review item 1, foundation-2026-08-21.md):
+# `publish` may only be dispatched against main at origin's current HEAD —
+# Gate A's first step enforces both checks exactly as it always has.
+# `dry-run` may be dispatched from any ref: it creates nothing durable (no
+# git tag, no publish; its draft release is deleted on always()), so the
+# authority question that matters — who may make a release durable — is
+# untouched. J4: the owner's commission ("autonomously build end to end the
+# completed release pipeline that will work") requires proving the full
+# gates+packaging+draft+delete chain pre-merge, from an integration branch,
+# which the prior main-only-in-both-modes posture made structurally
+# impossible. J5: this does not relax the release-authority governing
+# constraint below (human-dispatch-only, no tag watcher/push/cron) — it
+# only widens which ref a *provably non-durable* dry-run may run from.
+#
 # CO-VERSIONING CONSTRAINT (ADR 0014 decision 2, NORTH-STAR "Not true yet"
 # note): v0.x.y is supposed to name ONE artifact identity — the `sgt` binary
 # AND the embedded distro it writes via `sgt init`. That embedding does not
@@ -102,6 +116,10 @@ jobs:
   # Proposal §9.1 / §8: confirm the exact revision and every version
   # invariant before anything else runs. Failing here creates no tag and no
   # release — this job does nothing but check facts.
+  # Since the branch-posture change below: "confirm the exact revision" is
+  # itself mode-gated now — publish still requires main at origin's current
+  # HEAD; dry-run's revision check is that it ran from *some* named ref/SHA,
+  # logged, not that ref/SHA being main.
   gate-a-repo-state:
     runs-on: ubuntu-24.04
     steps:
@@ -109,16 +127,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: running against main, HEAD is current main HEAD
+      - name: publish requires main at origin HEAD; dry-run permitted from any ref
         run: |
-          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "::error::release.yml must be dispatched against main, was dispatched against ${{ github.ref }}" >&2
-            exit 1
-          fi
-          remote_head=$(git rev-parse origin/main)
-          if [ "$GITHUB_SHA" != "$remote_head" ]; then
-            echo "::error::dispatched commit $GITHUB_SHA is not origin/main's HEAD ($remote_head) — main moved since dispatch" >&2
-            exit 1
+          if [ "${{ inputs.mode }}" = "dry-run" ]; then
+            echo "::notice::dry-run dispatched from ${{ github.ref }} (commit $GITHUB_SHA) — main/origin-HEAD assertion skipped: dry-run creates no tag and publishes nothing durable (J4/J5, see top-of-file header)"
+          else
+            if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+              echo "::error::release.yml must be dispatched against main, was dispatched against ${{ github.ref }}" >&2
+              exit 1
+            fi
+            remote_head=$(git rev-parse origin/main)
+            if [ "$GITHUB_SHA" != "$remote_head" ]; then
+              echo "::error::dispatched commit $GITHUB_SHA is not origin/main's HEAD ($remote_head) — main moved since dispatch" >&2
+              exit 1
+            fi
           fi
 
       - name: requested version == Cargo.toml version
@@ -718,6 +740,11 @@ jobs:
             release-assets/SHA256SUMS.txt \
             release-assets/build-environment-*.txt
 
+      # R7 (checked R5, failed): gh release list --json has no id/databaseId
+      # field and gh release view resolves via a tag lookup that does not
+      # return drafts — no porcelain verb reaches an unpublished, possibly
+      # tag-colliding release by ID. Verified against installed gh (Q1,
+      # recon-results.json).
       # A tag is not a unique key for a draft — GitHub lets multiple drafts
       # share one tag_name, which is exactly what let a stale dry-run draft
       # get published instead of this run's draft (see git history on this
@@ -748,6 +775,10 @@ jobs:
       # the job being cancelled mid-run — because `if: always()` steps still
       # execute after a cancellation signal (GitHub Actions runs them like a
       # `finally` block, within the runner's cancellation grace period).
+      # R7 (checked R5, failed): same reason as capture-release-id above — no
+      # porcelain verb deletes-or-finds a draft by ID; gh release delete takes
+      # a tag, which is exactly the ambiguous key this fallback exists to
+      # avoid trusting.
       # Primary lookup is $RELEASE_ID from the capture step above; the
       # fallback re-derives it by tag_name for the one case that step can't
       # cover — the job was cancelled (or `gh release create` itself failed
@@ -792,6 +823,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # R7 (checked R5, failed): gh release edit takes a tag, not an ID, and a
+      # tag can still name more than one draft at this point in the run — only
+      # after this flip does by-tag porcelain become safe, which is exactly
+      # what the very next step (mark-as-latest, PR #215) uses.
       - name: publish the release this run created, by ID (this is what makes the tag/assets durable)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -802,10 +837,23 @@ jobs:
             echo "::error::draft-release did not emit a release-id output — refusing to guess which draft to publish" >&2
             exit 1
           fi
-          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -f draft=false -f make_latest=true
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$RELEASE_ID" -f draft=false
+
+      # Separate step, by tag, via porcelain — measured on v0.1.2
+      # (2026-08-21): `make_latest=true` riding in the same PATCH as the
+      # draft flip is silently dropped (the release is still a draft when
+      # the flag is validated, and drafts cannot be latest), which left
+      # /releases/latest on the prior tag until `gh release edit --latest`
+      # fixed it by hand. By-tag is safe here where it isn't above: only
+      # one *published* release can carry a tag, so the draft-collision
+      # rationale for by-ID doesn't apply post-publish.
+      - name: mark the published release as latest (must be its own step — see comment)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --repo "${{ github.repository }}" --latest
 
   # ── Verify latest ──────────────────────────────────────────────────────
-  # `make_latest=true` above is a request, not a guarantee — GitHub's
+  # `--latest` above is a request, not a guarantee — GitHub's
   # "latest" resolution is eventually consistent. Confirm this run's own
   # tag is what /releases/latest actually reports before we call the
   # publish durable, retrying to ride out the lag rather than racing it.
@@ -816,6 +864,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      # R7 (checked R5, failed) for both reads: `gh release view` resolves by
+      # tag (the one field this step must NOT trust yet — that's what it's
+      # verifying), and there is no porcelain verb for "the release GitHub
+      # currently calls latest" other than the plain `/releases/latest`
+      # endpoint gh api reads here directly.
       - name: assert the published release is reported as latest
         env:
           GH_TOKEN: ${{ github.token }}
