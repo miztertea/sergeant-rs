@@ -298,6 +298,14 @@ pub struct PruneIntentRecord {
     pub condemn: Vec<String>,
     /// Hexes the *previous* cycle quarantined, to delete now (§5.2).
     pub delete_quarantined: Vec<String>,
+    /// Hexes the *previous* cycle quarantined that a surviving or
+    /// since-committed event has referenced again — moved back to their
+    /// live content address instead of deleted (I-W3-6's other half: a
+    /// dedup adoption that lands between one cycle's mark scan and the
+    /// *next* cycle's deferred delete, with nobody having called
+    /// `BlobStore::get`/`put` in between to trigger the ordinary rescue).
+    #[serde(default)]
+    pub rescue_quarantined: Vec<String>,
     /// Whether this cycle was triggered at daemon start (§10.3) rather than
     /// by rotation (§10.4).
     pub started_at_startup: bool,
@@ -316,6 +324,12 @@ struct IntentPayload {
     carried_forward: PruneResidue,
     condemn: Vec<String>,
     delete_quarantined: Vec<String>,
+    /// Absent from any intent committed before this field existed —
+    /// defaults to empty, which is always a safe (if slightly stale)
+    /// answer for a record this old (§6.2's "record, apply nothing" applies
+    /// symmetrically to a field that is simply missing).
+    #[serde(default)]
+    rescue_quarantined: Vec<String>,
     started_at_startup: bool,
 }
 
@@ -338,6 +352,7 @@ impl PruneIntentRecord {
             carried_forward: payload.carried_forward,
             condemn: payload.condemn,
             delete_quarantined: payload.delete_quarantined,
+            rescue_quarantined: payload.rescue_quarantined,
             started_at_startup: payload.started_at_startup,
         })
     }
@@ -354,6 +369,7 @@ impl PruneIntentRecord {
             carried_forward: self.carried_forward.clone(),
             condemn: self.condemn.clone(),
             delete_quarantined: self.delete_quarantined.clone(),
+            rescue_quarantined: self.rescue_quarantined.clone(),
             started_at_startup: self.started_at_startup,
         })
         .expect("PruneIntentRecord's payload shape always serializes")
@@ -375,11 +391,22 @@ pub struct PrunePlan {
     pub carried_forward: PruneResidue,
     /// Blobs to quarantine this cycle.
     pub condemn: BTreeSet<BlobRef>,
-    /// Blobs the previous cycle quarantined, to delete now.
+    /// Blobs the previous cycle quarantined, to delete now — already
+    /// excluded from anything the surviving-side scan found still
+    /// referenced (I-W3-6; see [`PrunePlan::rescue_quarantined`]).
     pub delete_quarantined: Vec<String>,
-    /// The highest seq the surviving-side mark scan actually reached —
-    /// `run`'s top-up reads events after this before quarantining, closing
-    /// the window between this plan and the guard that commits it.
+    /// Blobs the previous cycle quarantined that the surviving-side scan
+    /// found referenced by a retained event — a dedup adoption that landed
+    /// between that cycle's mark scan and this one's, with no live
+    /// `get`/`put` in between to trigger the ordinary rescue. `run` moves
+    /// these back to their live content address instead of deleting them.
+    pub rescue_quarantined: Vec<String>,
+    /// The highest seq the surviving-side scan actually reached when it ran
+    /// (`horizon` when nothing needed that scan at all) — `run`'s top-up
+    /// reads events after this before quarantining/deleting, closing the
+    /// window between this plan and the guard that commits it. Bounded by
+    /// the answer the off-guard scan already reached, not by the whole
+    /// retained journal (§5.1).
     pub scan_through: u64,
     /// Why pruning did not advance further than it did.
     pub stall: PruneStall,
@@ -406,10 +433,19 @@ pub struct PruneOutcome {
     /// `delete_quarantined.len() - blobs_deleted - blobs_missing`: rescued
     /// by a live read or write before this cycle's deferred delete ran.
     pub blobs_rescued_before_delete: usize,
+    /// Blobs moved back to their live content address because the
+    /// surviving-side scan (or the guard-held top-up) found them
+    /// referenced by a retained event — [`PruneIntentRecord::rescue_quarantined`]'s
+    /// count, distinct from `blobs_rescued_before_delete` (which counts an
+    /// *ordinary* `get`/`put` rescue that already happened by the time this
+    /// cycle looked).
+    #[serde(default)]
+    pub blobs_rescued_by_reference: usize,
     /// The floor after this cycle.
     pub floor_seq_after: u64,
-    /// More was eligible than [`PRUNE_MAX_WORKS_PER_CYCLE`] allowed; the
-    /// caller should re-arm `prune_pending`.
+    /// More was eligible than [`PRUNE_MAX_WORKS_PER_CYCLE`] allowed; [`run`]
+    /// re-arms `prune_pending` from this so the next tick continues the
+    /// backlog drain rather than waiting on an unrelated rotation (§7.4).
     pub truncated_by_cap: bool,
 }
 
@@ -535,11 +571,46 @@ fn blocking_work(registry: &WorkRegistry) -> Option<(&WorkIndexRow, WorkState)> 
 /// Phase A — in memory, from the registry alone. Cheap enough to run on
 /// every rotation tick. See [`plan`] for the segment-content-aware Phase B
 /// that can only ever *lower* this answer.
+///
+/// **Known simplicity debt, not a correctness gap (spec-fidelity R2):**
+/// [`crate::runtime::startup::horizon`]'s own doc comment says this sweep
+/// (nostraddle + retired, evaluated over the same sorted-by-first-seq
+/// running-max shape) is "the same predicate W3's prune horizon needs...
+/// land the shape here so W3 cites it rather than writing a second one."
+/// This function narrows that shape further — the retention cap
+/// (`cap_seq`) and the batch cap (`PRUNE_MAX_WORKS_PER_CYCLE`) have no
+/// counterpart in `startup::horizon` at all — and the two sweeps are
+/// maintained today as two independently-evolving copies rather than one
+/// shared helper the way the doc comment asks. Not reused directly:
+/// `startup::horizon` is exercised by every W2 cache test in production
+/// today, and reshaping it to accept the two extra predicates this module
+/// needs is real, separate surgery on already-shipped, load-bearing code —
+/// risk this landing did not take on. [`sweep_horizon`], directly below, is
+/// this module's own sole copy of the shape; a future wave that wants the
+/// citation to be literal should factor a shared sweep both call, not
+/// merely note the debt again here.
 pub fn candidate_horizon(
     bounds: &[SegmentBound],
     registry: &WorkRegistry,
     first_seq: &FirstSeqIndex,
     policy: &PrunePolicy,
+) -> (u64, PruneStall) {
+    sweep_horizon(bounds, registry, first_seq, policy, u64::MAX)
+}
+
+/// The sweep [`candidate_horizon`] runs, factored out so [`plan`]'s
+/// allowlist/pair pin (§6.5) can re-run the *same* `nostraddle`/`retired`/
+/// `capped`/batch-cap predicates restricted to `b <= ceiling`, rather than
+/// merely taking the largest segment boundary below the pin and trusting
+/// the residue cross-check to catch a straddling Work the sweep itself
+/// would have refused. `ceiling = u64::MAX` (via [`candidate_horizon`])
+/// changes nothing versus every candidate being eligible on its own terms.
+fn sweep_horizon(
+    bounds: &[SegmentBound],
+    registry: &WorkRegistry,
+    first_seq: &FirstSeqIndex,
+    policy: &PrunePolicy,
+    ceiling: u64,
 ) -> (u64, PruneStall) {
     let n = policy.retention as usize;
     let cap = cap_seq(&registry.work_index, n);
@@ -555,6 +626,7 @@ pub fn candidate_horizon(
     let mut candidates: Vec<u64> = bounds[..bounds.len().saturating_sub(1)]
         .iter()
         .map(|s| s.last_seq)
+        .filter(|&last| last <= ceiling)
         .collect();
     candidates.push(0);
     candidates.sort_unstable();
@@ -662,7 +734,6 @@ struct CondemnedScan {
     condemn_refs: BTreeSet<BlobRef>,
     work_ids_seen: BTreeSet<String>,
     lowest_pin_seq: Option<u64>,
-    max_seq_seen: u64,
 }
 
 fn scan_condemned_range(
@@ -677,14 +748,12 @@ fn scan_condemned_range(
     let mut open_intents: BTreeMap<u64, ()> = BTreeMap::new();
     let mut lowest_pin_seq: Option<u64> = None;
     let mut carried_ask_withdrawal: Option<AskWithdrawal> = None;
-    let mut max_seq_seen = 0u64;
 
     for event in crate::runtime::journal::Journal::replay_data_dir_from_floor(data_dir)? {
         let event = event?;
         if event.seq > ceiling {
             break;
         }
-        max_seq_seen = event.seq;
 
         if let Some(id) = &event.work_id {
             work_ids_seen.insert(id.clone());
@@ -757,7 +826,6 @@ fn scan_condemned_range(
         condemn_refs,
         work_ids_seen,
         lowest_pin_seq,
-        max_seq_seen,
     })
 }
 
@@ -795,13 +863,23 @@ pub fn plan(
             .find(|b| b.first_seq <= pin_seq && pin_seq <= b.last_seq)
             .map(|b| b.first_seq)
             .unwrap_or(pin_seq);
-        horizon = bounds
-            .iter()
-            .map(|b| b.last_seq)
-            .filter(|&last| last < pin_first_seq)
-            .max()
-            .unwrap_or(0)
-            .min(candidate);
+        // §7.1: "the largest *admissible* candidate below the pin" — not
+        // merely the largest segment boundary below it. A lower horizon is
+        // not automatically admissible: `nostraddle` is not monotone in
+        // `b`, so a Work straddling this new, smaller boundary can make a
+        // candidate that looked fine at `candidate`'s height inadmissible
+        // down here. Re-running the same sweep restricted to
+        // `b < pin_first_seq` is what actually re-checks
+        // `nostraddle`/`retired`/`capped` at the lowered height, rather
+        // than relying on the residue cross-check below to reject a
+        // straddling plan after the fact (that check still runs — belt and
+        // braces — but this is what keeps a straddling pin from producing a
+        // permanent, misdiagnosed `ResidueMismatch` stall every cycle
+        // instead of a correctly-computed, possibly-smaller-but-legal
+        // horizon).
+        let ceiling = pin_first_seq.saturating_sub(1);
+        let (admissible, _) = sweep_horizon(bounds, registry, first_seq, policy, ceiling);
+        horizon = admissible.min(candidate);
     }
     if horizon == 0 {
         return Ok(None);
@@ -858,13 +936,26 @@ pub fn plan(
         });
     }
 
+    // The surviving-side scan: needed whenever there is something a live
+    // reference could save — either a fresh condemn candidate (the
+    // long-standing check) or a hex the *previous* cycle already
+    // quarantined and this cycle would otherwise delete (I-W3-6's other
+    // half, §7.1's deferred-delete step). Tracks the highest seq it
+    // actually reached, which becomes `scan_through`: bounded by the answer
+    // this off-guard pass reached, not by the whole retained journal (§5.1)
+    // — `run`'s guard-held top-up only has to re-read from here forward,
+    // not from `horizon` forward.
     let mut surviving_refs: BTreeSet<BlobRef> = BTreeSet::new();
-    if !scan.condemn_refs.is_empty() {
+    let mut surviving_scan_through = horizon;
+    let needs_surviving_scan =
+        !scan.condemn_refs.is_empty() || !registry.quarantined_blobs.is_empty();
+    if needs_surviving_scan {
         for event in crate::runtime::journal::Journal::replay_data_dir_from_floor(data_dir)? {
             let event = event?;
             if event.seq <= horizon {
                 continue;
             }
+            surviving_scan_through = surviving_scan_through.max(event.seq);
             for r in blob::refs_in_event(&event) {
                 surviving_refs.insert(r);
             }
@@ -875,6 +966,23 @@ pub fn plan(
         .difference(&surviving_refs)
         .cloned()
         .collect();
+
+    // §5.2/I-W3-6: a hex the previous cycle quarantined must not be deleted
+    // this cycle if a surviving event now references it — a dedup adoption
+    // that landed between that cycle's mark scan and this one's, with no
+    // live `get`/`put` in between to have rescued it the ordinary way.
+    // Split rather than merely filter: the excluded hexes are moved back to
+    // their live content address (`run`'s `rescue_quarantined` step) rather
+    // than silently left in quarantine forever — the next cycle's own
+    // `registry.quarantined_blobs` is about to be replaced wholesale by
+    // *this* cycle's fresh `condemn` set, so anything not resolved to
+    // "delete" or "rescue" now would never be revisited again.
+    let surviving_hexes: BTreeSet<&str> = surviving_refs.iter().map(BlobRef::hex).collect();
+    let (delete_quarantined, rescue_quarantined): (Vec<String>, Vec<String>) = registry
+        .quarantined_blobs
+        .iter()
+        .cloned()
+        .partition(|hex| !surviving_hexes.contains(hex.as_str()));
 
     let (_, mut stall) = candidate_horizon(bounds, registry, first_seq, policy);
     stall.horizon_seq = horizon;
@@ -901,8 +1009,9 @@ pub fn plan(
         residue,
         carried_forward: scan.carried_forward,
         condemn,
-        delete_quarantined: registry.quarantined_blobs.clone(),
-        scan_through: scan.max_seq_seen.max(horizon),
+        delete_quarantined,
+        rescue_quarantined,
+        scan_through: surviving_scan_through,
         stall,
     }))
 }
@@ -965,12 +1074,22 @@ pub fn run(
     }
 
     // §5.1's top-up, under the guard: an append between the plan's mark
-    // scan and this hold could have referenced a blob the plan condemned.
+    // scan and this hold could have referenced a blob the plan condemned,
+    // or re-referenced a hex the *previous* cycle already quarantined
+    // (I-W3-6's other half — the same window, on the deferred-delete side).
     // Closing this window is what makes quarantine+rescue a second line of
-    // defence rather than the only one (I-W3-6).
-    for event in core.events_after(plan.scan_through)? {
-        for r in blob::refs_in_event(&event) {
-            plan.condemn.remove(&r);
+    // defence rather than the only one. Skipped entirely when there is
+    // nothing either list could still be wrong about, so a plan with no
+    // blobs in play never pays for a read here at all.
+    if !plan.condemn.is_empty() || !plan.delete_quarantined.is_empty() {
+        for event in core.events_after(plan.scan_through)? {
+            for r in blob::refs_in_event(&event) {
+                plan.condemn.remove(&r);
+                if let Some(pos) = plan.delete_quarantined.iter().position(|h| h == r.hex()) {
+                    plan.rescue_quarantined
+                        .push(plan.delete_quarantined.remove(pos));
+                }
+            }
         }
     }
 
@@ -1000,6 +1119,7 @@ pub fn run(
         carried_forward: plan.carried_forward.clone(),
         condemn: plan.condemn.iter().map(|r| r.hex().to_string()).collect(),
         delete_quarantined: plan.delete_quarantined.clone(),
+        rescue_quarantined: plan.rescue_quarantined.clone(),
         started_at_startup,
     };
 
@@ -1023,7 +1143,20 @@ pub fn run(
         }
     }
 
-    // Step 3 (T5): the previous cycle's deferred delete.
+    // Step 3a (T5's live half, I-W3-6): rescue back to the live content
+    // address any hex the mark scan or this guard's own top-up found
+    // referenced by a surviving event since the previous cycle quarantined
+    // it — before the deferred delete below, from the disjoint partition
+    // `plan` already computed, so together the two steps account for every
+    // hex the previous cycle quarantined exactly once.
+    let mut blobs_rescued_by_reference = 0usize;
+    for hex in &record.rescue_quarantined {
+        if blobs.rescue_quarantined_hex(hex)? {
+            blobs_rescued_by_reference += 1;
+        }
+    }
+
+    // Step 3b (T5): the previous cycle's deferred delete.
     let mut blobs_deleted = 0usize;
     for hex in &record.delete_quarantined {
         if blobs.drop_quarantined(hex)? {
@@ -1048,6 +1181,7 @@ pub fn run(
         blobs_deleted,
         blobs_missing: 0,
         blobs_rescued_before_delete,
+        blobs_rescued_by_reference,
         floor_seq_after: record.floor_seq_after,
         truncated_by_cap: plan.stall.truncated_by_cap,
     };
@@ -1064,7 +1198,12 @@ pub fn run(
         }),
     ))?;
     core.flush()?;
-    core.prune_pending = false;
+    // §7.4: when the batch cap truncated this cycle's target set, the
+    // remainder is left for the next cycle and `prune_pending` is re-armed
+    // so the next tick continues rather than waiting for an unrelated
+    // rotation — `outcome.truncated_by_cap` is exactly the signal `plan`
+    // already computed for this.
+    core.prune_pending = outcome.truncated_by_cap;
 
     // Step 6, deviated (see this module's top doc comment): rather than
     // rewrite the cache from the live capability watermark (not reachable
@@ -1132,6 +1271,12 @@ pub fn complete_interrupted(
             blobs_quarantined += 1;
         }
     }
+    let mut blobs_rescued_by_reference = 0usize;
+    for hex in &pending.rescue_quarantined {
+        if blobs.rescue_quarantined_hex(hex)? {
+            blobs_rescued_by_reference += 1;
+        }
+    }
     let mut blobs_deleted = 0usize;
     for hex in &pending.delete_quarantined {
         if blobs.drop_quarantined(hex)? {
@@ -1155,6 +1300,7 @@ pub fn complete_interrupted(
         blobs_deleted,
         blobs_missing: 0,
         blobs_rescued_before_delete,
+        blobs_rescued_by_reference,
         floor_seq_after: pending.floor_seq_after,
         truncated_by_cap: false,
     };
@@ -1592,6 +1738,7 @@ mod tests {
             carried_forward: plan.carried_forward.clone(),
             condemn: plan.condemn.iter().map(|r| r.hex().to_string()).collect(),
             delete_quarantined: plan.delete_quarantined.clone(),
+            rescue_quarantined: plan.rescue_quarantined.clone(),
             started_at_startup: false,
         };
         core.commit(EventDraft::new(
@@ -1606,6 +1753,109 @@ mod tests {
             "the intent must be pending — nothing has completed it yet"
         );
         plan
+    }
+
+    /// Like [`build_and_commit_intent`], but `w1`'s completion references a
+    /// real, previously-written blob — so the intent's own `condemn` is
+    /// non-empty and F2/F3 (the blob-side crash windows) have something to
+    /// crash mid-way through.
+    fn build_and_commit_intent_with_blob(
+        core: &mut crate::api::Core,
+        dir: &std::path::Path,
+    ) -> (PrunePlan, BlobRef) {
+        let blob_ref = BlobStore::open(dir)
+            .expect("open blob store")
+            .put(b"crash window fixture blob")
+            .expect("put");
+        let hex = blob_ref.hex().to_string();
+
+        commit(
+            core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w1"),
+            serde_json::json!({"work": {
+                "id": "w1", "intent": "crash window blob fixture", "state": "pending",
+                "created_by": "test", "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        commit(
+            core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w1"),
+            serde_json::json!({"result_blob": format!("b3:{hex}")}),
+        );
+        commit(
+            core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off w1's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan = plan(
+            dir,
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("something must be prunable");
+        assert!(
+            plan.condemn.iter().any(|r| r.hex() == hex),
+            "the fixture's blob must actually be a condemn candidate"
+        );
+
+        let record = PruneIntentRecord {
+            intent_seq: 0,
+            policy: plan.policy,
+            horizon_seq: plan.horizon_seq,
+            floor_seq_before: 1,
+            floor_seq_after: plan.horizon_seq + 1,
+            segments: plan
+                .segments
+                .iter()
+                .map(|b| PruneSegment {
+                    index: b.index,
+                    first_seq: b.first_seq,
+                    last_seq: b.last_seq,
+                    bytes: b.bytes,
+                })
+                .collect(),
+            residue: plan.residue.clone(),
+            carried_forward: plan.carried_forward.clone(),
+            condemn: plan.condemn.iter().map(|r| r.hex().to_string()).collect(),
+            delete_quarantined: plan.delete_quarantined.clone(),
+            rescue_quarantined: plan.rescue_quarantined.clone(),
+            started_at_startup: false,
+        };
+        core.commit(EventDraft::new(
+            EventSource::new("daemon", "sergeant"),
+            KIND_PRUNE_INTENT,
+            record.to_payload(),
+        ))
+        .expect("commit intent");
+        core.flush().expect("flush intent");
+        (plan, blob_ref)
     }
 
     /// N7 / F1: a crash after `prune.intent` is fsynced, before any rename or
@@ -1650,6 +1900,194 @@ mod tests {
             next_seq_after_intent + 1,
             "a completion with no pending intent must append nothing"
         );
+    }
+
+    /// N8 / F2: a crash after the intent's blob has already been moved into
+    /// quarantine, before `prune.completed` is appended, is completed in
+    /// full at the next start — `BlobStore::quarantine`'s own idempotent
+    /// `Ok(false)` on an already-moved blob is what makes re-running the
+    /// whole loop from the intent's record safe regardless of whether the
+    /// crashed cycle got to the rename or not, and never leaves two copies
+    /// of the same content.
+    #[test]
+    fn crash_window_f2_mid_quarantine_completes_idempotently() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        let (plan, blob_ref) = build_and_commit_intent_with_blob(&mut core, dir.path());
+
+        // Simulate the crash landing *after* the rename: the blob is
+        // already sitting in quarantine when the next start begins.
+        let blobs = BlobStore::open(dir.path()).expect("open blob store");
+        assert!(
+            blobs
+                .quarantine(&blob_ref)
+                .expect("simulate the completed quarantine step"),
+            "the fixture's blob must actually still be live to quarantine"
+        );
+
+        complete_interrupted(&mut core, dir.path()).expect("complete_interrupted");
+        assert!(core.registry.state().pending_prune.is_none());
+        assert!(core.registry.state().pruned_works.contains_key("w1"));
+        let bounds_after = core.journal.segment_bounds().expect("bounds");
+        assert!(
+            bounds_after
+                .iter()
+                .all(|b| !plan.segments.iter().any(|s| s.index == b.index)),
+            "every planned segment must still be gone"
+        );
+
+        // Idempotency: completing an already-finished cycle again touches
+        // nothing further and never fails re-quarantining what is already
+        // quarantined.
+        complete_interrupted(&mut core, dir.path()).expect("second complete_interrupted");
+
+        // Exactly one copy of the content exists, in quarantine — never a
+        // live copy alongside it.
+        let quarantine_path = dir
+            .path()
+            .join("blobs")
+            .join("b3")
+            .join(".pruned")
+            .join(blob_ref.hex());
+        let live_path = dir.path().join("blobs").join("b3").join(blob_ref.hex());
+        assert!(
+            quarantine_path.exists(),
+            "the blob must still be quarantined"
+        );
+        assert!(!live_path.exists(), "the blob must never also exist live");
+    }
+
+    /// N8 continued / F3: a crash after a *second* cycle's intent is
+    /// committed, before its deferred delete of the *first* cycle's
+    /// quarantined blob runs, is completed in full at the next start —
+    /// `BlobStore::drop_quarantined`'s own idempotent `Ok(false)` on an
+    /// already-gone quarantined file is what makes re-running the deferred
+    /// delete safe regardless of whether the crashed cycle got to it.
+    #[test]
+    fn crash_window_f3_mid_deferred_delete_completes_idempotently() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+
+        // Cycle 1, run to completion: quarantines the blob.
+        let (plan1, blob_ref) = build_and_commit_intent_with_blob(&mut core, dir.path());
+        complete_interrupted(&mut core, dir.path()).expect("complete cycle 1");
+        assert_eq!(
+            core.registry.state().quarantined_blobs,
+            vec![blob_ref.hex().to_string()],
+            "cycle 1 must have recorded the blob as quarantined"
+        );
+        drop(plan1);
+
+        // `anchor` (from `build_and_commit_intent_with_blob`) has done its
+        // job and must stop being the horizon's perpetual blocker.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("anchor"),
+            serde_json::json!({}),
+        );
+
+        // New activity, prunable on its own, whose cycle's own
+        // `delete_quarantined` inherits cycle 1's quarantined hex.
+        submit_and_complete(&mut core, "w_mid");
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor2"),
+            serde_json::json!({"work": {
+                "id": "anchor2", "intent": "keep the writer off w_mid's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan2 = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_mid must be prunable");
+        assert_eq!(
+            plan2.delete_quarantined,
+            vec![blob_ref.hex().to_string()],
+            "cycle 2 must inherit cycle 1's quarantined hex to delete"
+        );
+
+        // Commit only cycle 2's intent (step 1) — simulating a crash
+        // before the deferred delete (step 3) ever runs.
+        let record = PruneIntentRecord {
+            intent_seq: 0,
+            policy: plan2.policy,
+            horizon_seq: plan2.horizon_seq,
+            floor_seq_before: core.journal.floor_seq().expect("floor").unwrap_or(1),
+            floor_seq_after: plan2.horizon_seq + 1,
+            segments: plan2
+                .segments
+                .iter()
+                .map(|b| PruneSegment {
+                    index: b.index,
+                    first_seq: b.first_seq,
+                    last_seq: b.last_seq,
+                    bytes: b.bytes,
+                })
+                .collect(),
+            residue: plan2.residue.clone(),
+            carried_forward: plan2.carried_forward.clone(),
+            condemn: plan2.condemn.iter().map(|r| r.hex().to_string()).collect(),
+            delete_quarantined: plan2.delete_quarantined.clone(),
+            rescue_quarantined: plan2.rescue_quarantined.clone(),
+            started_at_startup: false,
+        };
+        core.commit(EventDraft::new(
+            EventSource::new("daemon", "sergeant"),
+            KIND_PRUNE_INTENT,
+            record.to_payload(),
+        ))
+        .expect("commit cycle 2's intent");
+        core.flush().expect("flush cycle 2's intent");
+
+        let quarantine_path = dir
+            .path()
+            .join("blobs")
+            .join("b3")
+            .join(".pruned")
+            .join(blob_ref.hex());
+        assert!(
+            quarantine_path.exists(),
+            "the blob must still be sitting in quarantine before the crash-recovery completes it"
+        );
+
+        complete_interrupted(&mut core, dir.path()).expect("complete cycle 2");
+        assert!(core.registry.state().pending_prune.is_none());
+        assert!(core.registry.state().pruned_works.contains_key("w_mid"));
+        assert!(
+            !quarantine_path.exists(),
+            "the deferred delete must actually have run"
+        );
+
+        // Idempotency: completing an already-finished cycle again is a
+        // true no-op, including `drop_quarantined`'s own tolerated
+        // already-gone case.
+        complete_interrupted(&mut core, dir.path()).expect("second complete_interrupted");
+        assert!(!quarantine_path.exists());
     }
 
     /// N9 / F4: a crash mid-unlink (only the first of the two target
@@ -1805,6 +2243,620 @@ mod tests {
         );
     }
 
+    /// §8.3's read side: the residue's whole point is that a *later* replay
+    /// — one that never sees `w1`'s own now-deleted
+    /// `conversation.turn.grammar_unmeasured` event — must still recover the
+    /// withdrawal from the surviving `prune.intent`. Without
+    /// `note_carried_ask_withdrawal` wired into `CapabilitySink::push`, a
+    /// fresh no-cache replay would silently answer `None`, re-raising
+    /// `Capabilities::ask` on an installation that had already proved it
+    /// absent — exactly the gap §8.3 exists to close.
+    #[test]
+    fn a_fresh_floor_replay_recovers_the_ask_withdrawal_from_the_prune_residue_alone() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w1"),
+            serde_json::json!({"work": {
+                "id": "w1", "intent": "ask fixture", "state": "pending",
+                "created_by": "test", "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        let withdrawal_event = commit(
+            &mut core,
+            EventSource::new("backend", "claude"),
+            "conversation.turn.grammar_unmeasured",
+            Some("w1"),
+            serde_json::json!({"capability": "ask", "version": "2.1.226"}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w1"),
+            serde_json::json!({}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off w1's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("something must be prunable");
+        run(&mut core, dir.path(), plan, false).expect("run");
+
+        // The scenario §8.3 is written against: a replay from the floor
+        // that never sees `withdrawal_event` at all (it was unlinked with
+        // its segment) — driven through the same `CapabilitySink` a real
+        // no-cache daemon start uses, seeded from nothing.
+        let mut capability = startup::CapabilitySink::seeded(None);
+        let events = crate::runtime::journal::Journal::replay_data_dir_from_floor(dir.path())
+            .expect("replay_data_dir_from_floor");
+        startup::drive(events, &mut [&mut capability]).expect("drive");
+
+        let recovered = capability
+            .latest
+            .as_ref()
+            .expect("the withdrawal must survive a fresh floor replay with no cache");
+        assert_eq!(
+            recovered.seq, withdrawal_event.seq,
+            "the carried watermark must keep its *original* seq, not the intent's"
+        );
+        assert_eq!(recovered.version, "2.1.226");
+    }
+
+    /// N5: a blob referenced by both a to-be-pruned Work and a retained one
+    /// must never be condemned — the surviving-side scan's whole purpose.
+    #[test]
+    fn a_blob_shared_with_a_retained_work_is_never_condemned() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        let blob_ref = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .put(b"shared content")
+            .expect("put");
+        let hex = blob_ref.hex().to_string();
+
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_old"),
+            serde_json::json!({"work": {
+                "id": "w_old", "intent": "prunable, references the shared blob",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w_old"),
+            serde_json::json!({"result_blob": format!("b3:{hex}")}),
+        );
+        // `w_keep` stays active forever (never retired_whole), so it is
+        // always the horizon's blocker — which guarantees its own
+        // referencing event's seq is always strictly *above* whatever
+        // horizon this cycle computes, i.e. always in the surviving range.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_keep"),
+            serde_json::json!({"work": {
+                "id": "w_keep", "intent": "retained, references the same blob",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+                "ref": format!("b3:{hex}"),
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_old must still be prunable even though w_keep pins the horizon below it");
+
+        assert_eq!(
+            plan.residue
+                .works
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["w_old"]),
+            "only w_old — the Work entirely before w_keep's pin — may be pruned"
+        );
+        assert!(
+            !plan.condemn.iter().any(|r| r.hex() == hex),
+            "the shared blob must never be condemned while w_keep still references it live"
+        );
+
+        let outcome = run(&mut core, dir.path(), plan, false).expect("run");
+        assert_eq!(outcome.blobs_quarantined, 0);
+        let bytes = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .get(&blob_ref)
+            .expect("the shared blob must still be live and intact");
+        assert_eq!(bytes, b"shared content");
+    }
+
+    /// N6: a blob one cycle quarantines, that a *live* event adopts again
+    /// before the next cycle's deferred delete runs, must be rescued back
+    /// to its content address rather than deleted — the two-phase
+    /// quarantine's whole reason to exist (A5). Exercises the fix directly:
+    /// before it, `delete_quarantined` was `registry.quarantined_blobs`
+    /// verbatim, with no check against what the surviving journal now
+    /// references.
+    #[test]
+    fn a_dedup_adoption_between_mark_and_sweep_is_rescued_from_quarantine() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        let blob_ref = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .put(b"adopted content")
+            .expect("put");
+        let hex = blob_ref.hex().to_string();
+
+        // Cycle 1: w_old is the only reference to the blob — it gets
+        // quarantined.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_old"),
+            serde_json::json!({"work": {
+                "id": "w_old", "intent": "prunable, references the blob first",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w_old"),
+            serde_json::json!({"result_blob": format!("b3:{hex}")}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor1"),
+            serde_json::json!({"work": {
+                "id": "anchor1", "intent": "keep the writer off w_old's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan1 = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_old must be prunable");
+        let outcome1 = run(&mut core, dir.path(), plan1, false).expect("run cycle 1");
+        assert_eq!(outcome1.blobs_quarantined, 1);
+        assert_eq!(
+            core.registry.state().quarantined_blobs,
+            vec![hex.clone()],
+            "the blob must be quarantined, recorded on the registry"
+        );
+
+        // Between cycle 1's completion and cycle 2, a live event adopts the
+        // same content again (a dedup hit this test asserts directly,
+        // rather than through `BlobStore::put`'s own internal rescue, to
+        // isolate `plan`'s mark-scan-side handling of it). `anchor1` is
+        // completed so it stops blocking; `anchor2` — carrying the
+        // reference — takes over as the perpetual blocker, so its own
+        // event's seq is always in the surviving range for cycle 2.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("anchor1"),
+            serde_json::json!({}),
+        );
+        submit_and_complete(&mut core, "w_mid");
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor2"),
+            serde_json::json!({"work": {
+                "id": "anchor2", "intent": "adopts the quarantined blob again",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+                "ref": format!("b3:{hex}"),
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan2 = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_mid must be prunable in cycle 2");
+
+        assert!(
+            plan2.delete_quarantined.is_empty(),
+            "the adopted hex must not be scheduled for deletion"
+        );
+        assert_eq!(
+            plan2.rescue_quarantined,
+            vec![hex.clone()],
+            "the adopted hex must be scheduled for rescue instead"
+        );
+
+        let outcome2 = run(&mut core, dir.path(), plan2, false).expect("run cycle 2");
+        assert_eq!(outcome2.blobs_deleted, 0);
+        assert_eq!(outcome2.blobs_rescued_by_reference, 1);
+
+        let bytes = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .get(&blob_ref)
+            .expect("the adopted blob must be live again, not deleted");
+        assert_eq!(bytes, b"adopted content");
+    }
+
+    /// §3.5's stated invariant, checked directly against a real fixture
+    /// rather than only inferred from `nostraddle`'s own definition: every
+    /// retained (still-in-`work_index`) Work's `first_seq` is at or above
+    /// the journal's floor after a real prune — nothing retained can start
+    /// underneath the segments a cycle just unlinked.
+    #[test]
+    fn every_retained_work_starts_at_or_above_the_floor() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        let plan = build_and_commit_intent(&mut core, dir.path());
+        complete_interrupted(&mut core, dir.path()).expect("complete_interrupted");
+        assert!(core.registry.state().pruned_works.contains_key("w1"));
+        drop(plan);
+
+        let floor = core.journal.floor_seq().expect("floor_seq").unwrap_or(1);
+        for (id, first) in &core.first_seq_by_work {
+            if core.registry.state().work_index.contains_key(id) {
+                assert!(
+                    *first >= floor,
+                    "retained Work {id} starts at seq {first}, below the floor {floor}"
+                );
+            }
+        }
+        assert!(
+            !core.registry.state().work_index.is_empty(),
+            "the fixture must actually retain something (anchor) for this to check anything"
+        );
+    }
+
+    /// §6.4: residue must keep surviving no matter how many *further*
+    /// cycles run after the Work that originally recorded it is gone —
+    /// carried forward from `prune.intent` to `prune.intent` indefinitely,
+    /// not just across the one cycle that first pruned it. Three
+    /// generations: cycle 1 prunes `w1` itself; cycles 2 and 3 prune
+    /// unrelated later Works, each carrying `w1`'s row forward without ever
+    /// touching it again.
+    #[test]
+    fn a_carried_forward_residue_survives_three_generations_of_prune() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let run_one_cycle = |core: &mut crate::api::Core, work_id: &str, anchor: &str| {
+            submit_and_complete(core, work_id);
+            commit(
+                core,
+                daemon_source(),
+                crate::domain::work::KIND_WORK_SUBMITTED,
+                Some(anchor),
+                serde_json::json!({"work": {
+                    "id": anchor, "intent": "keep the writer off this cycle's segments",
+                    "state": "pending", "created_by": "test",
+                    "created_at": "2026-01-01T00:00:00.000Z",
+                }}),
+            );
+            core.flush().expect("flush");
+            let bounds = core.journal.segment_bounds().expect("bounds");
+            let (candidate, _) = candidate_horizon(
+                &bounds,
+                core.registry.state(),
+                &core.first_seq_by_work,
+                &policy,
+            );
+            let plan = plan(
+                dir.path(),
+                &bounds,
+                candidate,
+                core.registry.state(),
+                &core.first_seq_by_work,
+                &policy,
+            )
+            .expect("plan")
+            .expect("something must be prunable");
+            run(core, dir.path(), plan, false).expect("run")
+        };
+
+        // Cycle 1: prunes w1 directly.
+        run_one_cycle(&mut core, "w1", "anchor1");
+        assert!(core.registry.state().pruned_works.contains_key("w1"));
+        // `anchor1` must stop blocking before the next cycle.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("anchor1"),
+            serde_json::json!({}),
+        );
+
+        // Cycle 2: prunes w2; must carry w1's row forward untouched.
+        run_one_cycle(&mut core, "w2", "anchor2");
+        assert!(core.registry.state().pruned_works.contains_key("w1"));
+        assert!(core.registry.state().pruned_works.contains_key("w2"));
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("anchor2"),
+            serde_json::json!({}),
+        );
+
+        // Cycle 3: prunes w3; both w1 and w2's rows must still be present,
+        // carried across two further generations neither of them was
+        // touched in again.
+        run_one_cycle(&mut core, "w3", "anchor3");
+        let registry = core.registry.state();
+        assert!(
+            registry.pruned_works.contains_key("w1"),
+            "w1's residue must survive two further generations of prune"
+        );
+        assert!(registry.pruned_works.contains_key("w2"));
+        assert!(registry.pruned_works.contains_key("w3"));
+    }
+
+    /// The ordering half of §8.3: a withdrawal *carried* forward from a
+    /// pruned Work must never outrank a **newer** withdrawal recorded by a
+    /// still-live, retained event — "higher seq wins" must keep meaning
+    /// what it means regardless of which side (carried residue, or a
+    /// surviving event `note_ask_withdrawal` matches directly) a replay
+    /// happens to see first.
+    #[test]
+    fn a_carried_withdrawal_never_outranks_a_newer_retained_one() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_old"),
+            serde_json::json!({"work": {
+                "id": "w_old", "intent": "records the older withdrawal", "state": "pending",
+                "created_by": "test", "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        let older = commit(
+            &mut core,
+            EventSource::new("backend", "claude"),
+            "conversation.turn.grammar_unmeasured",
+            Some("w_old"),
+            serde_json::json!({"capability": "ask", "version": "2.1.226"}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w_old"),
+            serde_json::json!({}),
+        );
+        // `w_new` stays active forever (never retired_whole), so it is
+        // always the horizon's blocker — guaranteeing its own withdrawal
+        // event's seq is always in the surviving range, never condemned.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_new"),
+            serde_json::json!({"work": {
+                "id": "w_new", "intent": "records the newer withdrawal", "state": "pending",
+                "created_by": "test", "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        let newer = commit(
+            &mut core,
+            EventSource::new("backend", "claude"),
+            "conversation.turn.grammar_unmeasured",
+            Some("w_new"),
+            serde_json::json!({"capability": "ask", "version": "2.1.226"}),
+        );
+        assert!(
+            newer.seq > older.seq,
+            "the fixture's whole point is a newer, surviving withdrawal"
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_old must be prunable even though w_new pins the horizon below it");
+
+        // The carried residue only ever holds `older` — `newer`'s event is
+        // in the surviving range, never scanned into the condemned side.
+        assert_eq!(
+            plan.residue.capability_provenance.as_ref().map(|w| w.seq),
+            Some(older.seq),
+        );
+        run(&mut core, dir.path(), plan, false).expect("run");
+
+        // A fresh floor replay must fold *both* sources and land on the
+        // newer, still-live withdrawal — never regress to the carried,
+        // older one.
+        let mut capability = startup::CapabilitySink::seeded(None);
+        let events = crate::runtime::journal::Journal::replay_data_dir_from_floor(dir.path())
+            .expect("replay_data_dir_from_floor");
+        startup::drive(events, &mut [&mut capability]).expect("drive");
+        let recovered = capability
+            .latest
+            .as_ref()
+            .expect("a withdrawal must be recoverable");
+        assert_eq!(
+            recovered.seq, newer.seq,
+            "the newer, still-live withdrawal must win over the older, carried-forward one"
+        );
+    }
+
+    /// §7.4: when the batch cap truncates a cycle's target set, the
+    /// remainder must not wait for an unrelated rotation — `run` must
+    /// re-arm `prune_pending` from `PruneOutcome::truncated_by_cap` rather
+    /// than unconditionally clearing it on every successful commit.
+    #[test]
+    fn a_batch_cap_truncated_cycle_re_arms_prune_pending() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        submit_and_complete(&mut core, "w1");
+        // I-W3-4: push the writer's live segment off of w1's own.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off w1's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let mut plan = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("something must be prunable");
+        // Simulate what `candidate_horizon` would have set had this cycle's
+        // eligible set actually exceeded `PRUNE_MAX_WORKS_PER_CYCLE` — the
+        // trigger itself belongs to `candidate_horizon`'s own tests; this
+        // isolates `run`'s handling of the flag it is handed.
+        plan.stall.truncated_by_cap = true;
+
+        let outcome = run(&mut core, dir.path(), plan, false).expect("run");
+        assert!(outcome.truncated_by_cap);
+        assert!(
+            core.prune_pending,
+            "a batch-capped cycle must re-arm prune_pending so the next tick \
+             continues the drain rather than waiting for an unrelated rotation"
+        );
+    }
+
     /// N4: an unknown non-work-scoped event kind pins its segment — Q5's
     /// allowlist as a mechanism, not a comment. A later, otherwise-eligible
     /// Work stays retained because the pin lowers the horizon back below
@@ -1878,6 +2930,260 @@ mod tests {
             plan.stall.pinning_kind.as_deref(),
             Some("mystery.event"),
             "the stall report must name the pinning kind"
+        );
+    }
+
+    /// N19 (§6.5): an unpaired `prune.intent` — its own `prune.completed`
+    /// not (yet) anywhere in the journal, exactly the shape a crash between
+    /// steps 1 and 5 leaves behind — must pin its own segment, exactly like
+    /// an unknown non-work-scoped kind (N4). Without this, a later cycle's
+    /// mark scan could condemn the segment holding a still-open intent,
+    /// after which the eventual crash-recovery completion would have
+    /// nothing left to finish it from consistently — "a pruned id has a
+    /// row in neither... or, worse, an intent whose completion was
+    /// deleted, leaving `pending_prune` permanently `Some`" (§6.5).
+    #[test]
+    fn a_prune_pair_straddling_the_horizon_pins_its_segment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+
+        // An ordinary Work, already eligible for its own cycle.
+        submit_and_complete(&mut core, "w_prior");
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor0"),
+            serde_json::json!({"work": {
+                "id": "anchor0", "intent": "keep the writer off w_prior's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate0, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan0 = plan(
+            dir.path(),
+            &bounds,
+            candidate0,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_prior must be prunable on its own");
+
+        // Commit *only* the intent (step 1) — simulating a crash before
+        // `prune.completed` (F1's window) — and deliberately never run
+        // `complete_interrupted`, so the intent stays genuinely unpaired in
+        // the journal for the rest of this test, exactly the shape §6.5
+        // describes.
+        let record = PruneIntentRecord {
+            intent_seq: 0,
+            policy: plan0.policy,
+            horizon_seq: plan0.horizon_seq,
+            floor_seq_before: 1,
+            floor_seq_after: plan0.horizon_seq + 1,
+            segments: plan0
+                .segments
+                .iter()
+                .map(|b| PruneSegment {
+                    index: b.index,
+                    first_seq: b.first_seq,
+                    last_seq: b.last_seq,
+                    bytes: b.bytes,
+                })
+                .collect(),
+            residue: plan0.residue.clone(),
+            carried_forward: plan0.carried_forward.clone(),
+            condemn: plan0.condemn.iter().map(|r| r.hex().to_string()).collect(),
+            delete_quarantined: plan0.delete_quarantined.clone(),
+            rescue_quarantined: plan0.rescue_quarantined.clone(),
+            started_at_startup: false,
+        };
+        let intent_event = core
+            .commit(EventDraft::new(
+                EventSource::new("daemon", "sergeant"),
+                KIND_PRUNE_INTENT,
+                record.to_payload(),
+            ))
+            .expect("commit the stuck intent");
+        core.flush().expect("flush the stuck intent");
+        let intent_seq = intent_event.seq;
+        assert!(
+            core.registry.state().pending_prune.is_some(),
+            "the intent must be pending — nothing has completed it"
+        );
+
+        // `anchor0` has done its job (kept the writer off `w_prior`'s
+        // segments) and must stop being the horizon's blocker, or it would
+        // mask the very thing this test is checking.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("anchor0"),
+            serde_json::json!({}),
+        );
+
+        // New activity after the stuck intent: another Work, fully retired
+        // and past the cap entirely on its own.
+        submit_and_complete(&mut core, "w_after");
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor1"),
+            serde_json::json!({"work": {
+                "id": "anchor1", "intent": "keep the writer off w_after's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let (candidate1, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        // Phase A alone does not know about the stuck intent either — both
+        // w_prior and w_after look fully eligible to it.
+        assert!(candidate1 > intent_seq, "Phase A must not see the pin yet");
+
+        let plan1 = plan(
+            dir.path(),
+            &bounds,
+            candidate1,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_prior must still be prunable even though the stuck intent pins the rest");
+
+        assert_eq!(
+            plan1.stall.pinning_seq,
+            Some(intent_seq),
+            "the stall report must name the stuck intent's own seq as the pin"
+        );
+        assert!(
+            plan1.horizon_seq < intent_seq,
+            "the horizon must never reach or pass the segment holding the unpaired intent"
+        );
+        let pruned_ids: BTreeSet<&str> =
+            plan1.residue.works.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            pruned_ids,
+            BTreeSet::from(["w_prior"]),
+            "only w_prior, entirely before the stuck intent, may be pruned this cycle"
+        );
+    }
+
+    /// §7.1: a pin that lands *inside* the span of a Work straddling the
+    /// pin's own segment boundary must not select "the largest segment
+    /// boundary below the pin" as the horizon — `nostraddle` is not
+    /// monotone in `b`, so a boundary that looked fine to Phase A can be
+    /// inadmissible once the pin lowers the ceiling below the straddling
+    /// Work's own span. `plan` must re-check `nostraddle`/`retired`/`capped`
+    /// at the lowered height and correctly find nothing prunable, rather
+    /// than mis-selecting an inadmissible horizon that would either
+    /// straddle a live Work or (as this same bug did before the fix) rely
+    /// on the residue cross-check to reject it as a `ResidueMismatch` —
+    /// which would then recur identically on every subsequent cycle, since
+    /// nothing about the pin or the Work ever changes.
+    #[test]
+    fn a_pin_inside_a_straddling_works_span_never_selects_an_inadmissible_horizon() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_straddle"),
+            serde_json::json!({"work": {
+                "id": "w_straddle", "intent": "straddles the pin's own segment",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        // The pin: a non-work-scoped, non-allowlisted event landing
+        // *inside* w_straddle's own span (between its submit and its
+        // completion), each in its own segment (`tiny_core` rotates every
+        // event).
+        commit(
+            &mut core,
+            daemon_source(),
+            "mystery.event",
+            None,
+            serde_json::json!({}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w_straddle"),
+            serde_json::json!({}),
+        );
+        // I-W3-4: push the writer off w_straddle's own segments — and,
+        // being active, `anchor` is also what makes w_straddle look fully
+        // retired and past-the-cap to Phase A once the writer moves past it.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off w_straddle's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        // Phase A alone (registry-only) does not see the pin: w_straddle is
+        // fully retired and past the cap by the time the writer has moved
+        // on to `anchor`'s own segment.
+        assert!(candidate > 0, "Phase A must not see the pin yet");
+
+        let result = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        assert!(
+            matches!(result, Ok(None)),
+            "a pin inside a straddling Work's span must correctly find \
+             nothing prunable rather than mis-select an inadmissible \
+             horizon: got {result:?}"
         );
     }
 

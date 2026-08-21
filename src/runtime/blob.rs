@@ -300,6 +300,16 @@ impl BlobStore {
     /// [`BlobStore::put_stream`]'s dedup checks; idempotent, since the
     /// rescued path becoming live is exactly what makes a second call here
     /// find nothing left to rescue.
+    /// `pub(crate)` sibling of [`BlobStore::rescue`], for a caller (W3's
+    /// prune engine) that needs to rescue a specific hex *proactively* —
+    /// not as a side effect of its own `get`/`put` — because the mark scan
+    /// found it referenced by a surviving event while it still sat in
+    /// quarantine from a previous cycle (I-W3-6). Same idempotent
+    /// `Ok(false)`-not-an-error shape.
+    pub(crate) fn rescue_quarantined_hex(&self, hex: &str) -> Result<bool, BlobError> {
+        self.rescue(hex)
+    }
+
     fn rescue(&self, hex: &str) -> Result<bool, BlobError> {
         let quarantine_dir = self.root.join(QUARANTINE_DIR);
         let condemned = quarantine_dir.join(hex);

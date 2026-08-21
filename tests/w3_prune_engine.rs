@@ -332,6 +332,119 @@ async fn a_start_on_an_over_cap_journal_prunes_before_serving() {
     );
 }
 
+/// §10.4's own path, distinct from the sibling test above (which is
+/// deliberately built to avoid it, per its own comment, so it can observe
+/// the "before" state undisturbed): a daemon that is never restarted still
+/// prunes, live, once a segment rotation crosses the cap and at least
+/// `PRUNE_BATCH_MIN_SEGMENTS` whole segments are eligible —
+/// `maybe_run_rotation_triggered_prune` (§10.4) is exercised by no other
+/// test in this suite. Polls `GET /v1/doctor`'s lock-free journal check
+/// (never a second `Journal::open` against a data dir the daemon still
+/// holds) so this can observe the floor moving without ever shutting the
+/// daemon down.
+#[tokio::test]
+async fn a_rotation_crossing_the_cap_arms_a_prune_within_one_tick() {
+    let data = DataDir::new();
+    let root = TempDir::new().expect("tempdir");
+    let (_mount, _head) = support::scaffold_solo_estate(root.path(), "solo");
+    write_one_stage_workflow(root.path());
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .expect("client");
+
+    const RETENTION: u32 = 3;
+    const TOTAL_WORKS: usize = 12;
+
+    let script: Vec<FakeStep> = (0..TOTAL_WORKS).map(|_| FakeStep::complete()).collect();
+    let (handle, _fake) = start_with_retention(data.path(), root.path(), RETENTION, script).await;
+
+    let mut command_ids = Vec::new();
+    for n in 0..TOTAL_WORKS {
+        let cmd = ulid();
+        submit(
+            &http,
+            &handle.endpoint,
+            &handle.token,
+            root.path(),
+            &cmd,
+            &format!("rotation-triggered prune fixture {n}"),
+        )
+        .await;
+        command_ids.push(cmd);
+    }
+    wait_until_all_settled(&http, &handle.endpoint, &handle.token).await;
+
+    // No restart anywhere in this test: poll the lock-free doctor journal
+    // check until the floor has actually moved above 1 — proof the
+    // *rotation*-triggered path pruned live, within a handful of the
+    // driver's own 200 ms ticks, never waiting on a restart to do it.
+    let mut floor_seq = 1u64;
+    for _ in 0..100 {
+        let report: serde_json::Value = http
+            .get(format!("{}/v1/doctor", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .send()
+            .await
+            .expect("doctor")
+            .json()
+            .await
+            .expect("json");
+        let detail = report["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .find(|c| c["name"] == "journal")
+            .expect("a journal check")["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if let Some(idx) = detail.find("from seq ") {
+            let digits: String = detail[idx + "from seq ".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(seq) = digits.parse::<u64>() {
+                floor_seq = seq;
+                if floor_seq > 1 {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        floor_seq > 1,
+        "the rotation-triggered prune (§10.4) must have moved the floor within a handful \
+         of ticks with no restart — the floor is still {floor_seq}"
+    );
+
+    // The oldest command must already be refused by name, live, before any
+    // shutdown — the same N12 proof as the startup-triggered sibling test,
+    // here demonstrating the rotation-triggered path reached the same
+    // observable state without one.
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": command_ids[0],
+            "intent": "must be refused by name, live, no restart",
+            "origin": {"client": "cli", "cwd": root.path()},
+        }))
+        .send()
+        .await
+        .expect("retry a pruned command_id");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a pruned command_id retry must be refused with 409, live: {:?}",
+        resp.text().await
+    );
+
+    handle.shutdown().await;
+}
+
 // ------------------------------------------------------------------
 // N21: no configuration or flag can lower the prune predicate (Q7/I-W3-11)
 // ------------------------------------------------------------------
@@ -378,4 +491,104 @@ fn no_configuration_or_flag_can_lower_the_prune_predicate() {
              authorization surface"
         );
     }
+}
+
+// ------------------------------------------------------------------
+// N23: a prune runs only under the core guard (§10.1)
+// ------------------------------------------------------------------
+
+/// The end of the `{ … }` block that starts at or after `from` (mirrors
+/// `tests/m6_surfaces.rs`'s own helper of the same name).
+fn block_end(source: &str, from: usize) -> usize {
+    let open = source[from..].find('{').expect("a block") + from;
+    let mut depth = 0usize;
+    for (offset, c) in source[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open + offset;
+                }
+            }
+            _ => {}
+        }
+    }
+    source.len()
+}
+
+/// The smallest `{ … }` block that textually contains `at` — the backward
+/// counterpart to `block_end`, used here to find "the block this
+/// `CoreGuard::acquire` call's binding is scoped to".
+fn enclosing_block(source: &str, at: usize) -> (usize, usize) {
+    let bytes = source.as_bytes();
+    let mut depth: i64 = 0;
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'}' => depth += 1,
+            b'{' => {
+                if depth == 0 {
+                    return (i, block_end(source, i));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    (0, source.len())
+}
+
+/// t11c (`tests/m6_surfaces.rs`) proves every core-lock hold goes through
+/// `CoreGuard`. This is the narrower, prune-specific proof §10.1 and the
+/// Negative Test Matrix (N23) separately require: that `prune::run` — which
+/// takes `&mut Core`, not a `CoreGuard`, so nothing about its own type stops
+/// a future caller from handing it a `Core` reached some other way — is only
+/// ever called from a lexical scope that also acquired the guard. Holding
+/// the guard for the whole cycle is what makes "intent → deletion →
+/// completion" atomic with respect to appends: no event can land between
+/// the intent and the completion.
+///
+/// Structural, in the `t11c`/N21 style: every occurrence of
+/// `crate::runtime::prune::run(` (the live-cycle entry point — deliberately
+/// not `run_startup`/`complete_interrupted`, which run during daemon start
+/// before any listener binds or any `CoreGuard` is needed at all, per §10.3)
+/// in `src/api.rs` must fall inside the same `{ … }` block as a preceding
+/// `CoreGuard::acquire(` call. A future call site reached without first
+/// acquiring the guard in the same block fails here with nothing to catch
+/// it structurally otherwise, since `prune::run`'s own signature cannot
+/// enforce it.
+#[test]
+fn prune_runs_only_under_the_core_guard() {
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api.rs");
+    let text = std::fs::read_to_string(&src).expect("read api.rs");
+
+    let guarded_ranges: Vec<(usize, usize)> = text
+        .match_indices("CoreGuard::acquire(")
+        .map(|(index, _)| enclosing_block(&text, index))
+        .collect();
+    assert!(
+        !guarded_ranges.is_empty(),
+        "api.rs must declare at least one `CoreGuard::acquire` call for this test to mean anything"
+    );
+
+    let mut checked_a_call_site = false;
+    for (index, _) in text.match_indices("crate::runtime::prune::run(") {
+        checked_a_call_site = true;
+        assert!(
+            guarded_ranges
+                .iter()
+                .any(|(start, end)| index > *start && index < *end),
+            "a `prune::run` call at byte {index} in api.rs is not lexically inside a block \
+             that also acquired `CoreGuard` — N23/§10.1 requires the whole cycle to run under \
+             the guard, near: {:?}",
+            &text[index.saturating_sub(160)..index]
+        );
+    }
+    assert!(
+        checked_a_call_site,
+        "api.rs must call `crate::runtime::prune::run` at least once for this test to mean \
+         anything — if the call site moved or was renamed, update this scan to find it"
+    );
 }

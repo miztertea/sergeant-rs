@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::backend::claude::{AskWithdrawal, note_ask_withdrawal};
+use crate::backend::claude::{AskWithdrawal, note_ask_withdrawal, note_carried_ask_withdrawal};
 use crate::domain::event::Event;
 use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_SUBMITTED, WorkState,
@@ -253,6 +253,13 @@ impl CapabilitySink {
 impl ReplaySink for CapabilitySink {
     fn push(&mut self, event: &Event) -> Result<(), StartupError> {
         note_ask_withdrawal(&mut self.latest, event);
+        // W3 §8.3: the same watermark can also survive as residue carried
+        // on a `prune.intent`, once the event `note_ask_withdrawal` itself
+        // would have matched has been pruned away. Both folds apply the
+        // same higher-seq-wins rule to the same `latest`, so whichever
+        // source is still in the replay window (or both, agreeing) wins
+        // correctly.
+        note_carried_ask_withdrawal(&mut self.latest, event);
         Ok(())
     }
 }
