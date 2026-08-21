@@ -45,6 +45,17 @@ jobs:
       - name: cargo test
         run: cargo test --locked
 
+      - name: docs-consistency (README release literals match the current version)
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version')
+          stale=$(grep -noE 'releases/(download|tag)/v[0-9]+\.[0-9]+\.[0-9]+|release download v[0-9]+\.[0-9]+\.[0-9]+' README.md \
+            | grep -v "v${version}\b" || true)
+          if [ -n "$stale" ]; then
+            echo "::error::README.md references a release version other than the current v${version}:"
+            echo "$stale"
+            exit 1
+          fi
+
       - name: git diff --exit-code (no step above should have mutated a tracked file)
         run: git diff --exit-code
 
@@ -55,7 +66,8 @@ jobs:
     # it does NOT exercise scripts/demo.sh; the real enforcement of the
     # bash-3.2 floor is matrix.yml's full-suite `cargo test` on macos-26
     # (via tests/m6_surfaces.rs t4's scripts/demo.sh subprocess), which runs
-    # on PR-to-main, nightly, and release — not on every push. Gated at
+    # via workflow_call from release.yml's Gate C, or by manual
+    # workflow_dispatch — never on a routine push. Gated at
     # --severity=error only: a 2026-08-14 sweep of all 25 scripts/**/*.sh
     # found the tree clean at that threshold but carrying ~84 pre-existing
     # warning/note/style findings (mostly SC2154 false positives from the
