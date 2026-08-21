@@ -853,11 +853,34 @@ pub fn plan(
         return Ok(None);
     }
 
-    let first_pass = scan_condemned_range(data_dir, candidate, registry)?;
-    let first_pass_pin_seq = first_pass.lowest_pin_seq;
-
+    // Lower the horizon until the range this cycle would actually condemn
+    // is pin-free *on its own terms*, re-scanning at each lowered height.
+    //
+    // One pass is not enough, because the pin predicate is not monotone in
+    // the ceiling: `scan_condemned_range`'s `open_intents` arm is
+    // ceiling-*dependent* by construction. A `prune.intent` at seq `S`
+    // whose matching `prune.completed` sits at seq `C` reads as a closed
+    // pair at a ceiling of `candidate` (both in range) and as an unpaired,
+    // segment-pinning intent at a lowered ceiling `h` with `S <= h < C`.
+    // Consulting only the first pass's answer would therefore unlink the
+    // segment holding a still-open intent — exactly what §6.5 forbids, and
+    // exactly what leaves `pending_prune` permanently `Some` with nothing
+    // left to complete it from.
+    //
+    // Terminates: an iteration only runs when the current scan found a pin
+    // at or below the current horizon, and it sets the next horizon
+    // strictly below that pin's own segment — so `horizon` strictly
+    // decreases, bounded below by the `0` that returns `None`. Each
+    // iteration costs one pass over a range strictly smaller than the last,
+    // and iterating at all requires a pin — the uncommon case; the ordinary
+    // cycle still pays exactly one condemned-range pass, as before.
     let mut horizon = candidate;
-    if let Some(pin_seq) = first_pass_pin_seq {
+    let mut scan = scan_condemned_range(data_dir, candidate, registry)?;
+    // The pin that actually bound the final horizon — the last one
+    // consulted, which is the one a stall report should name.
+    let mut effective_pin_seq: Option<u64> = None;
+    while let Some(pin_seq) = scan.lowest_pin_seq {
+        effective_pin_seq = Some(pin_seq);
         let pin_first_seq = bounds
             .iter()
             .find(|b| b.first_seq <= pin_seq && pin_seq <= b.last_seq)
@@ -879,21 +902,15 @@ pub fn plan(
         // horizon).
         let ceiling = pin_first_seq.saturating_sub(1);
         let (admissible, _) = sweep_horizon(bounds, registry, first_seq, policy, ceiling);
-        horizon = admissible.min(candidate);
+        horizon = admissible.min(horizon);
+        if horizon == 0 {
+            return Ok(None);
+        }
+        // Everything the previous pass collected may include events above
+        // the new, smaller ceiling — rescan exactly the (smaller) range
+        // this cycle would now condemn, and consult *its* pin next.
+        scan = scan_condemned_range(data_dir, horizon, registry)?;
     }
-    if horizon == 0 {
-        return Ok(None);
-    }
-
-    // If the pin lowered the horizon, everything the first pass collected
-    // may include events above the new, smaller ceiling — rescan exactly
-    // that (smaller, guaranteed pin-free — the first pass already proved no
-    // pin exists below it) range.
-    let scan = if horizon == candidate {
-        first_pass
-    } else {
-        scan_condemned_range(data_dir, horizon, registry)?
-    };
 
     let segments: Vec<SegmentBound> = bounds
         .iter()
@@ -986,8 +1003,8 @@ pub fn plan(
 
     let (_, mut stall) = candidate_horizon(bounds, registry, first_seq, policy);
     stall.horizon_seq = horizon;
-    stall.pinning_seq = first_pass_pin_seq;
-    if let Some(pin_seq) = first_pass_pin_seq {
+    stall.pinning_seq = effective_pin_seq;
+    if let Some(pin_seq) = effective_pin_seq {
         // The kind is only knowable if the pin was an allowlist violation
         // (an unpaired `prune.intent` has no single "kind" worth naming
         // beyond itself); re-derive it with one more read of that one event
@@ -3090,6 +3107,158 @@ mod tests {
             pruned_ids,
             BTreeSet::from(["w_prior"]),
             "only w_prior, entirely before the stuck intent, may be pruned this cycle"
+        );
+    }
+
+    /// §6.5, the pin the *rescan* finds: the pin predicate is not monotone
+    /// in the ceiling, so lowering the horizon can **reveal** a pin the
+    /// higher pass could not see. `scan_condemned_range`'s `open_intents`
+    /// arm is the ceiling-dependent one: a `prune.intent` at `S` whose
+    /// `prune.completed` sits at `C` reads as a closed, unremarkable pair
+    /// when both are in range, and as an unpaired, segment-pinning intent
+    /// the moment an unrelated pin lowers the horizon to somewhere in
+    /// `[S, C)`. A plan that consults only the first pass's answer therefore
+    /// unlinks the segment holding a still-open intent — leaving
+    /// `pending_prune` permanently `Some` with nothing left to complete it
+    /// from, which is exactly what §6.5 forbids.
+    ///
+    /// Fixture (one event per segment, so seq == segment index):
+    ///
+    /// ```text
+    ///   1  w1 submitted        2  w1 completed
+    ///   3  prune.intent  <---------------------------- the straddling pair
+    ///   4  mystery.event  (the first pass's own pin)
+    ///   5  prune.completed(intent_seq = 3)  <---------- ...closes above 3
+    ///   6  w2 submitted        7  w2 completed
+    ///   8  anchor submitted    (the perpetual blocker)
+    /// ```
+    ///
+    /// Phase A proposes 7. The first pass (ceiling 7) sees the pair closed
+    /// and pins only on `mystery.event`, lowering the horizon to 3 — which
+    /// is precisely the segment holding the intent. Only the rescan at 3
+    /// can see that intent unpaired, and it must lower the horizon again,
+    /// to 2.
+    #[test]
+    fn a_pair_that_only_straddles_the_lowered_horizon_still_pins_its_segment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+
+        submit_and_complete(&mut core, "w1");
+
+        let empty_intent = PruneIntentRecord {
+            intent_seq: 0,
+            policy,
+            horizon_seq: 0,
+            floor_seq_before: 1,
+            floor_seq_after: 1,
+            segments: Vec::new(),
+            residue: PruneResidue::default(),
+            carried_forward: PruneResidue::default(),
+            condemn: Vec::new(),
+            delete_quarantined: Vec::new(),
+            rescue_quarantined: Vec::new(),
+            started_at_startup: false,
+        };
+        let intent_event = core
+            .commit(EventDraft::new(
+                EventSource::new("daemon", "sergeant"),
+                KIND_PRUNE_INTENT,
+                empty_intent.to_payload(),
+            ))
+            .expect("commit the intent");
+        let intent_seq = intent_event.seq;
+
+        // The pin the *first* pass will find, sitting between the intent
+        // and its completion — not in `NON_WORK_ALLOWLIST`, no `work_id`.
+        commit(
+            &mut core,
+            daemon_source(),
+            "mystery.event",
+            None,
+            serde_json::json!({}),
+        );
+        let completion_seq = commit(
+            &mut core,
+            daemon_source(),
+            KIND_PRUNE_COMPLETED,
+            None,
+            serde_json::json!({
+                "intent_seq": intent_seq,
+                "outcome": PruneOutcome::default(),
+                "floor_seq_after": 1,
+                "completed_at_startup": false,
+            }),
+        )
+        .seq;
+        assert!(
+            core.registry.state().pending_prune.is_none(),
+            "the pair must be closed as far as the registry is concerned"
+        );
+
+        submit_and_complete(&mut core, "w2");
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off w2's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        assert!(
+            candidate > completion_seq,
+            "Phase A must propose a horizon above the whole pair — otherwise the pair never \
+             straddles anything and this test proves nothing"
+        );
+
+        let plan = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w1 must still be prunable below the intent");
+
+        assert!(
+            plan.horizon_seq < intent_seq,
+            "the horizon must stop below the segment holding the intent that the *lowered* \
+             range leaves unpaired (got {}, intent at {intent_seq})",
+            plan.horizon_seq
+        );
+        assert!(
+            plan.segments.iter().all(|s| s.last_seq < intent_seq),
+            "and no planned segment may contain it"
+        );
+        assert_eq!(
+            plan.stall.pinning_seq,
+            Some(intent_seq),
+            "the stall report must name the pin that actually bound the final horizon — the \
+             intent found by the rescan, not the `mystery.event` the first pass stopped at"
+        );
+        assert_eq!(plan.stall.pinning_kind.as_deref(), Some(KIND_PRUNE_INTENT));
+        let pruned_ids: BTreeSet<&str> = plan.residue.works.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            pruned_ids,
+            BTreeSet::from(["w1"]),
+            "only w1, entirely below the intent, may be pruned this cycle"
         );
     }
 
