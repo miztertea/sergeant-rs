@@ -14,6 +14,7 @@ pub mod projection;
 pub mod recovery;
 pub mod repolock;
 pub mod router;
+pub mod startup;
 pub mod surface;
 pub mod sweep;
 
