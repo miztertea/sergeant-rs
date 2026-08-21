@@ -227,25 +227,32 @@ committed itself). Nothing here is authored except the two files marked
   — both real arms of the same `CodexErrorInfo` schema enum, confirmed present
   in the schema dump; nothing else in the envelope moved.
 - `codex-appserver-0.149.0-request-user-input.derived.json` — **derived, not
-  recorded.** §2.4's five-step admission test never got past step 3 on this
-  build (below): this is `item/tool/requestUserInput`'s params built strictly
+  recorded.** No live run has reliably caught a real
+  `item/tool/requestUserInput` on this build to capture instead (see the
+  note on the live `ask` measurement below, and re-run
+  `live_appserver_actor_authored_question_is_typed` for this build's current
+  answer): this is `item/tool/requestUserInput`'s params built strictly
   from `ToolRequestUserInputParams`'s own schema-required fields
   (`isBlocking`, `itemId`, `questions`, `threadId`, `turnId`, and each
   question's required `id`/`header`/`question`), with the thread/turn ids
   reused from the real `interrupted-turn.jsonl` capture above so the fixture
   at least names a thread that really existed.
 
-**§2.4's `ask` measurement, done live and recorded here rather than as a
-sixth fixture** (its outcome is a negative, which is why nothing above
-carries it): two prompt formulations were tried against `gpt-5.6-luna`,
-`approvalPolicy: "never"`, on a fresh thread each. Formulation 1 ("ask me
-what topic before doing anything else") produced the question as
-plain-text `agentMessage` prose, never a tool call. Formulation 2 ("you
-must call the request_user_input tool") produced an `agentMessage` reading
-*"I can't call `request_user_input` because this session isn't in Plan
-mode."* — a new, measured, and more specific reason than "the model didn't
-feel like it": the tool itself may be gated behind a thread mode this
-adapter's `thread/start` params never request. Per §2.4's own outcome
-table this is exactly the first bullet ("step 3 never fires after both
-prompts → `evidence: Unmeasured`") with an even more specific note than the
-spec anticipated, and `ask` stays `false` for the app-server transport too.
+**§2.4's `ask` measurement is not recorded here as prose any more.** An
+earlier revision of this note described a specific two-formulation live run
+and quoted the model's own refusal text, but the scratch driver that
+measurement came from lived under `/var/tmp/codex-w3-probe/` and was never
+committed — a specific, falsifiable claim about live harness behaviour that
+nobody could reproduce or re-verify without re-deriving it from scratch,
+exactly what §2.7's outcome 2 exists to prevent ("the test stays in the
+suite as an `#[ignore]`d live probe so the next person re-runs it instead of
+re-deriving it"). `tests/codex_backend.rs`'s
+`live_appserver_actor_authored_question_is_typed` is that test now: run it
+(`SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored
+live_appserver_actor_authored_question_is_typed`) to get this build's
+current, reproducible measurement, whatever it is on the day. Both outcomes
+in §2.4's own outcome table are legitimate — "a negative here is a likely
+and perfectly good outcome" — and `ask` stays `false` for the app-server
+transport either way in this build, since no `NeedsInput` mapping or
+answering path (§2.4 steps 4-5) exists yet regardless of what the probe
+measures.

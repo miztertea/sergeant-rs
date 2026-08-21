@@ -475,7 +475,7 @@ pub(super) fn answer_for_request(method: &str, ask_admitted: bool) -> AnsweredRe
 
 /// Budgets (spec §1.5.4), each overridable per-instance — never a global.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Budgets {
+pub struct Budgets {
     pub handshake: Duration,
     pub thread_start: Duration,
     pub turn_start: Duration,
@@ -597,12 +597,12 @@ pub(super) enum InboundLine {
         method: String,
         params: Value,
     },
-    /// `params` is carried but not yet read by `appserver_on_line` (only
-    /// `id`/`method` decide the answer) — kept rather than dropped because
-    /// it is exactly what an admitted `ask` path would need
-    /// (`params.questions`) and dropping real protocol data here would be
-    /// throwing away the one piece of evidence that decision needs.
-    #[allow(dead_code)]
+    /// `params` is read by `appserver_on_line` for `item/tool/
+    /// requestUserInput` specifically (`params.questions`/`params.turnId`
+    /// are journaled alongside the decline, §2.4's step-3 evidence) even
+    /// though `ask` stays structurally `false` in this deployment — the one
+    /// piece of real protocol data an admitted `ask` path would also need,
+    /// so it is carried through rather than dropped.
     ServerRequest {
         id: Value,
         method: String,
@@ -610,6 +610,14 @@ pub(super) enum InboundLine {
     },
     /// A line that did not parse as JSON at all (§4.6's policy, unchanged).
     Unparsed,
+    /// The child's stdout closed — end of stream, whether from a clean exit,
+    /// a crash, or a signal (§3.4 point 3 / §15's fail-closed invariant).
+    /// Emitted exactly once, after the reader's own read loop ends, however
+    /// it ended: `appserver_on_line`'s job with this variant is to make sure
+    /// a turn left `InFlight` by a dead child is never silently forgotten —
+    /// the same guarantee exec's own `TurnReader` gets for free from a
+    /// per-turn process, recreated here for app-server's long-lived child.
+    Eof,
 }
 
 impl AppServerChild {
@@ -719,6 +727,11 @@ impl AppServerChild {
                     LineShape::Unrecognized => {}
                 }
             }
+            // The loop above ends however the stream ended -- a clean EOF or
+            // a read error alike (§3.4 point 3 / §15): either way, the child
+            // is done talking, and whoever owns the turn state needs to know
+            // once, so a turn left `InFlight` is never silently forgotten.
+            on_line(&reader_handle, InboundLine::Eof);
         });
 
         Ok(Self {

@@ -147,6 +147,26 @@ struct StubCodex {
     /// record — `supports_appserver()` is the opt-in for the tests that
     /// need the opposite.
     appserver_supported: PathBuf,
+    /// W3 §6.2's fourth `StubCodex` mode: every request line the `--listen
+    /// stdio://` handler reads is appended here verbatim, so a test can
+    /// assert on exactly what this adapter sent (`appserver_requests`).
+    appserver_requests: PathBuf,
+    /// W3 §6.2's "scripted reply table": a directory of `<method_with_
+    /// underscores>.jsonl` files, one per method a test wants answered
+    /// beyond the built-in bare `initialize` responder. Each line is emitted
+    /// verbatim except `__ID__`, substituted with the incoming request's own
+    /// id (`appserver_scripts_reply`); a sibling `<file>.exit_after` marker
+    /// makes the stub close its stdout right after replying (deterministic
+    /// child death mid-turn, or the aftermath of an RPC-failure fallback —
+    /// `appserver_exits_after`).
+    appserver_scripts_dir: PathBuf,
+}
+
+/// The filename stem the stub's own shell script computes for one JSON-RPC
+/// method (`tr '/' '_'`) — kept as one function so the Rust side that writes
+/// a scripted reply and the shell side that looks it up can never drift.
+fn appserver_script_stem(method: &str) -> String {
+    method.replace('/', "_")
 }
 
 #[derive(Debug, Default)]
@@ -183,6 +203,8 @@ impl StubCodex {
         let grandchild_pid = dir.join("codex-grandchild-pid");
         let detach = dir.join("codex-grandchild-detach");
         let appserver_supported = dir.join("codex-appserver-supported");
+        let appserver_requests = dir.join("codex-appserver-requests.jsonl");
+        let appserver_scripts_dir = dir.join("codex-appserver-scripts");
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
@@ -219,11 +241,25 @@ impl StubCodex {
              if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--listen\" ]; then\n  \
                if [ -f \"{appserver_supported}\" ]; then\n    \
                  while IFS= read -r line; do\n      \
-                   case \"$line\" in\n        \
-                     *'\"method\":\"initialize\"'*) printf '%s\\n' \
-                     '{{\"id\":1,\"result\":{{\"userAgent\":\"stub/0.0.0\",\"codexHome\":\"/stub\",\
-\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}}}' ;;\n      \
-                   esac\n    \
+                   printf '%s\\n' \"$line\" >> \"{appserver_requests}\"\n      \
+                   method=$(printf '%s' \"$line\" | sed -n 's/.*\"method\":\"\\([^\"]*\\)\".*/\\1/p')\n      \
+                   id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n      \
+                   if [ \"$method\" = \"initialize\" ]; then\n        \
+                     printf '%s\\n' '{{\"id\":__ID__,\"result\":{{\"userAgent\":\"stub/0.0.0\",\
+\"codexHome\":\"/stub\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}}}' \
+| sed \"s/__ID__/$id/\"\n      \
+                   else\n        \
+                     safe=$(printf '%s' \"$method\" | tr '/' '_')\n        \
+                     script_file=\"{appserver_scripts_dir}/$safe.jsonl\"\n        \
+                     if [ -f \"$script_file\" ]; then\n          \
+                       while IFS= read -r out; do\n            \
+                         printf '%s\\n' \"$out\" | sed \"s/__ID__/$id/g\"\n          \
+                       done < \"$script_file\"\n        \
+                     fi\n        \
+                     if [ -f \"$script_file.exit_after\" ]; then\n          \
+                       exit 0\n        \
+                     fi\n      \
+                   fi\n    \
                  done\n    \
                  exit 0\n  \
                else\n    \
@@ -269,6 +305,8 @@ impl StubCodex {
             hang = hang.display(),
             exit_code = exit_code.display(),
             appserver_supported = appserver_supported.display(),
+            appserver_requests = appserver_requests.display(),
+            appserver_scripts_dir = appserver_scripts_dir.display(),
         );
         std::fs::write(&path, script).expect("write stub");
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
@@ -288,6 +326,8 @@ impl StubCodex {
             grandchild_pid,
             detach,
             appserver_supported,
+            appserver_requests,
+            appserver_scripts_dir,
         }
     }
 
@@ -336,12 +376,61 @@ impl StubCodex {
     /// `generate-json-schema` writes the 14 pinned files (stub content —
     /// this is what makes G2's file-presence check pass, never a claim the
     /// bytes are real schemas), and `--listen stdio://` answers a bare
-    /// `initialize` request. Nothing else on this transport is emulated —
-    /// `thread/start`/`turn/start`/`turn/interrupt` are out of this stub's
-    /// scope; the live suite is this wave's proof for those.
+    /// `initialize` request out of the box. Every other method
+    /// (`thread/start`/`turn/start`/`turn/interrupt`/…) is answered only if
+    /// a test scripts a reply for it (`appserver_scripts_reply`) — the
+    /// process-bound half of the protocol suite (§6.2: "spawn, handshake
+    /// timing, budgets, interrupt, process-group kill, stderr drain, child
+    /// death mid-turn") is this stub's scope; the live suite remains this
+    /// wave's proof of the real harness's own behaviour.
     fn supports_appserver(&self) -> &Self {
         std::fs::write(&self.appserver_supported, b"go\n").expect("write appserver marker");
         self
+    }
+
+    /// W3 §6.2's "scripted reply table": write the literal output lines this
+    /// stub's `--listen stdio://` handler emits the moment it reads a
+    /// request whose `"method"` is exactly `method` — one block per method,
+    /// a generic table the dispatch loop consults by filename, never a
+    /// per-method special case hardcoded into the stub itself. `__ID__` in
+    /// any line is replaced with the request's own numeric id at emission
+    /// time, so a canned reply can echo whichever id this run's client
+    /// happened to mint.
+    fn appserver_scripts_reply(&self, method: &str, lines: &[&str]) -> &Self {
+        std::fs::create_dir_all(&self.appserver_scripts_dir).expect("scripts dir");
+        let path = self
+            .appserver_scripts_dir
+            .join(format!("{}.jsonl", appserver_script_stem(method)));
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write scripted reply");
+        self
+    }
+
+    /// Mark this stub to close its stdout (the adapter reader thread's own
+    /// EOF) immediately after it finishes answering one request for
+    /// `method` — deterministic child death mid-turn (test 21) and the
+    /// aftermath of an interrupt-RPC-failure fallback (test 22), neither of
+    /// which should be a race against a real process's own timing.
+    fn appserver_exits_after(&self, method: &str) -> &Self {
+        std::fs::create_dir_all(&self.appserver_scripts_dir).expect("scripts dir");
+        let marker = self.appserver_scripts_dir.join(format!(
+            "{}.jsonl.exit_after",
+            appserver_script_stem(method)
+        ));
+        std::fs::write(&marker, b"go\n").expect("write exit-after marker");
+        self
+    }
+
+    /// Every request line this stub's `--listen stdio://` handler has read
+    /// so far, parsed as JSON, in arrival order — the captured wire evidence
+    /// a deterministic test asserts on (§3.6 test 4: "the captured
+    /// `thread/start` params").
+    fn appserver_requests(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.appserver_requests)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("captured request line is valid JSON"))
+            .collect()
     }
 
     /// Marks the stub to fork a background grandchild (a detached loop, not
@@ -1667,6 +1756,192 @@ fn codex_never_reports_an_actor_authored_question_end_to_end() {
     );
 }
 
+// ------------------------------------------- W3 §6.2: app-server, stub-driven
+
+/// A `thread/start` + `turn/start` scripted reply pair good enough to make
+/// LAUNCH succeed on the app-server transport with no real `codex` binary —
+/// the shared setup every test below builds on.
+fn script_appserver_launch(stub: &StubCodex) {
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#],
+    );
+}
+
+/// §3.6 test 4: the captured `thread/start` params carry exactly `cwd`,
+/// `sandbox`, `approvalPolicy`, and `runtimeWorkspaceRoots` naming cwd plus
+/// the one binding outside it — never the inside-cwd binding (already
+/// covered by cwd), never anything fabricated.
+#[test]
+fn appserver_thread_start_names_exactly_the_works_surfaces() {
+    let dir = TempDir::new().expect("tempdir");
+    let outside = TempDir::new().expect("tempdir outside");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let mut request = start_request(dir.path());
+    request.bindings = vec![
+        BindingSummary {
+            repository: "inside".to_string(),
+            worktree_path: dir.path().join("inside-binding"),
+            work_branch: "b1".to_string(),
+            base_branch: None,
+            base_sha: "0".repeat(40),
+        },
+        BindingSummary {
+            repository: "outside".to_string(),
+            worktree_path: outside.path().to_path_buf(),
+            work_branch: "b2".to_string(),
+            base_branch: None,
+            base_sha: "0".repeat(40),
+        },
+    ];
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let requests = stub.appserver_requests();
+    let thread_start = requests
+        .iter()
+        .find(|r| r["method"] == "thread/start")
+        .expect("thread/start was sent");
+    let params = &thread_start["params"];
+    assert_eq!(params["cwd"], dir.path().to_string_lossy().as_ref());
+    assert_eq!(params["sandbox"], "workspace-write");
+    assert_eq!(params["approvalPolicy"], "never");
+    let roots: Vec<String> = params["runtimeWorkspaceRoots"]
+        .as_array()
+        .expect("runtimeWorkspaceRoots is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        roots,
+        vec![
+            dir.path().to_string_lossy().to_string(),
+            outside.path().to_string_lossy().to_string(),
+        ],
+        "exactly cwd + the one outside binding, nothing else -- not the inside binding \
+         (already covered by cwd), not the estate root, not repos/"
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// Test 21: a child that dies mid-turn (closes its stdout with no
+/// `turn/completed` ever sent) must resolve to a terminal, fail-closed
+/// `AmbiguousUnknown` observation — never leave the turn `InFlight` forever
+/// (§3.4 point 3 / §15's invariant).
+#[test]
+fn appserver_child_death_mid_turn_is_ambiguous_not_completed() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_exits_after("turn/start");
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let observation = loop {
+        let observation = backend.observe(&handle).expect("observe");
+        if observation.native == NativeState::Unknown {
+            break observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the turn never resolved out of InFlight after the child's stdout closed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (fail-closed, no stage verdict), got {other:?}"),
+    }
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains("no turn/completed observed"),
+        "expected the ambiguous-terminal evidence, got: {evidence}"
+    );
+}
+
+/// Test 22: when `turn/interrupt` itself fails, the adapter's own documented
+/// fallback (§2.2) kills the process group and journals
+/// `phase:"interrupt_downgraded"` — and, per §15/§3.4 point 3, must also
+/// resolve the turn out of `InFlight` rather than leave OBSERVE reporting a
+/// hung turn forever just because the RPC that would have confirmed the
+/// interrupt never came back clean.
+#[test]
+fn appserver_interrupt_kills_the_process_group_when_the_rpc_fails() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply(
+        "turn/interrupt",
+        &[r#"{"id":__ID__,"error":{"code":-32000,"message":"stub-forced interrupt failure"}}"#],
+    );
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let downgraded = loop {
+        if let Some(found) = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.payload["phase"] == "interrupt_downgraded")
+            .cloned()
+        {
+            break found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interrupt_downgraded was never journaled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(downgraded.kind, "conversation.turn.harness_error");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let observation = loop {
+        let observation = backend.observe(&handle).expect("observe");
+        let evidence = observation.evidence.clone().unwrap_or_default();
+        if !evidence.contains("in flight on thread") {
+            break observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the turn stayed InFlight forever after the interrupt downgrade"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------- §7.3 live suite
 
 /// Gate mirroring `tests/m4_backends.rs`'s `LiveGate`/`claude_live_enabled`
@@ -2171,18 +2446,47 @@ fn live_appserver_thread_start_echoes_the_requested_policy() {
     // Token-free (§3.6): the probe itself already drove `thread/start`
     // during PROBE (G4's handshake uses `initialize` only, not
     // `thread/start` — so this LAUNCH is the first `thread/start` this test
-    // sends), and the shape assertion below reads only what came back
-    // synchronously.
+    // sends).
+    let outside = live_workdir("appserver-policy-outside");
     let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
+    // A binding outside cwd, so `sandbox.writableRoots` has something to
+    // discriminate on beyond cwd alone (§3.6's own test 4 shape).
+    request.bindings = vec![BindingSummary {
+        repository: "outside".to_string(),
+        worktree_path: outside.path().to_path_buf(),
+        work_branch: "b".to_string(),
+        base_branch: None,
+        base_sha: "0".repeat(40),
+    }];
     let prepared = backend.prepare(&request).expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");
-    // The policy shape is asserted indirectly: LAUNCH would have failed had
-    // thread/start refused `sandbox`/`approvalPolicy`/`runtimeWorkspaceRoots`
-    // (M6: `-32600` without `experimentalApi`), so a successful LAUNCH here
-    // is itself evidence the policy handshake succeeded end to end. STOP
-    // immediately: no turn/start content is asserted on.
+    // §3.6's own five assertions, on the wire itself: a successful LAUNCH
+    // only proves the handshake *accepted* the policy (M6's `-32600` gate
+    // without `experimentalApi`) — it proves nothing about what came back.
+    // `appserver_policy_echo` is `thread/start`'s own result, captured at
+    // LAUNCH and otherwise unreachable from outside this crate.
+    let echo = backend
+        .appserver_policy_echo(&handle)
+        .expect("an app-server execution must have a captured policy echo");
+    assert_eq!(
+        echo["sandbox"]["type"], "workspaceWrite",
+        "thread/start's result: {echo}"
+    );
+    let writable_roots: Vec<&str> = echo["sandbox"]["writableRoots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sandbox.writableRoots must be an array: {echo}"))
+        .iter()
+        .map(|v| v.as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        writable_roots.contains(&outside.path().to_string_lossy().as_ref()),
+        "sandbox.writableRoots must name the out-of-cwd binding: {writable_roots:?}"
+    );
+    assert_eq!(echo["cwd"], data_dir.path().to_string_lossy().as_ref());
+    assert_eq!(echo["approvalPolicy"], "never");
+    assert_eq!(echo["model"], "gpt-5.6-luna");
     backend.stop(&handle).expect("stop").wait();
 }
 
@@ -2303,6 +2607,116 @@ fn live_appserver_interrupt_yields_an_interrupted_terminal() {
         other => panic!("expected the conversation to still work after interrupt, got {other:?}"),
     }
     backend.stop(&handle).expect("stop").wait();
+}
+
+/// §2.4's five-step admission test — "the highest-value single test in this
+/// wave". `ask` stays `false` in this build (`ADMISSION_ROWS`): the adapter
+/// always declines `item/tool/requestUserInput` (no `NeedsInput` mapping or
+/// answering path exists yet), so steps 4/5 cannot pass here regardless of
+/// what the model does — that is §2.4's own "only if admitted" scope, not
+/// this test's gap. This test's job is steps 1-3, run for real: does the
+/// actor's own `item/tool/requestUserInput` ever arrive, cleanly (no
+/// `*/requestApproval` contamination)? Both outcomes in §2.4's own outcome
+/// table are a pass here — "a negative here is a likely and perfectly good
+/// outcome" — what §2.7 forbids is deleting this test or re-deriving its
+/// measurement from prose instead of re-running it.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_actor_authored_question_is_typed() {
+    let data_dir = live_workdir("appserver-ask");
+    if !codex_appserver_live_enabled(
+        "live_appserver_actor_authored_question_is_typed",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    // Two prompt formulations, tried in order, each once (§2.4 step 2): a
+    // model-behaviour probe, so one formulation failing is not the same as
+    // the capability being absent. `approvalPolicy: "never"` is already
+    // this adapter's unconditional default (§3.3) on every `thread/start`,
+    // so step 1 needs no extra wiring here.
+    const FORMULATIONS: [&str; 2] = [
+        "I want you to write a short poem for a friend. Before you write it, \
+         ask me one clarifying question about what kind of poem they'd like -- \
+         do not guess or assume, use the request_user_input tool to ask.",
+        "Rename the one file in this directory to a clearer name, but the \
+         correct new name is genuinely ambiguous from what's here -- use the \
+         request_user_input tool to ask me what name I want before you act.",
+    ];
+
+    let mut actor_asked = false;
+    let mut contaminated = false;
+    let mut questions_seen = Value::Null;
+    let mut turn_id_seen = Value::Null;
+
+    for prompt in FORMULATIONS {
+        let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+        let (sink_fn, events) = sink();
+        backend.set_event_sink(sink_fn);
+        let mut request = start_request(data_dir.path());
+        request.model = Some("gpt-5.6-luna".to_string());
+        request.intent = prompt.to_string();
+        request.context = String::new();
+        let prepared = backend.prepare(&request).expect("prepare");
+        let handle = backend.launch(&prepared).expect("launch");
+        wait_for_appserver_settled(&backend, &handle, &events, 0);
+        backend.stop(&handle).expect("stop").wait();
+
+        let harness_events: Vec<EventDraft> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "conversation.turn.harness_error")
+            .cloned()
+            .collect();
+        let asked = harness_events
+            .iter()
+            .find(|e| e.payload["method"] == "item/tool/requestUserInput");
+        if let Some(asked) = asked {
+            actor_asked = true;
+            // Step 3's own contamination check: a policy gate's own request
+            // firing alongside the actor's means the record caught is not
+            // cleanly attributable to the actor alone.
+            contaminated = harness_events
+                .iter()
+                .any(|e| e.payload["phase"] == "approval_denied_unattended");
+            questions_seen = asked.payload["questions"].clone();
+            turn_id_seen = asked.payload["turn_id"].clone();
+            break;
+        }
+    }
+
+    if !actor_asked {
+        // §2.4's own outcome table, first bullet: "absence of a probe
+        // result is not a measured negative" -- a legitimate, recorded
+        // outcome on this run, not a test failure. Re-run to re-measure.
+        eprintln!(
+            "live_appserver_actor_authored_question_is_typed: the actor never invoked \
+             item/tool/requestUserInput under either formulation on this run (evidence: \
+             Unmeasured) -- consistent with ADMISSION_ROWS' recorded ask/AppServer negative; \
+             this is a model-behaviour probe, not a build regression."
+        );
+        return;
+    }
+
+    assert!(
+        !contaminated,
+        "a */requestApproval also fired alongside item/tool/requestUserInput -- the record is \
+         not cleanly attributable to the actor (§2.4 step 3's contamination check)"
+    );
+    assert!(
+        questions_seen.as_array().is_some_and(|a| !a.is_empty()),
+        "params.questions must be non-empty on the caught request: {questions_seen}"
+    );
+    assert!(
+        !turn_id_seen.is_null(),
+        "params.turnId must be present on the caught request: {turn_id_seen}"
+    );
+    // Steps 4/5 (mapping to `NeedsInput`, answering the request) are §2.4's
+    // "only if admitted" work: `ask` stays `false` in this build (no such
+    // mapping or answer path exists), so they are not attempted here — the
+    // wave's own recorded, honest outcome (§2.6/§2.7), not a gap this test
+    // is responsible for closing.
 }
 
 #[test]

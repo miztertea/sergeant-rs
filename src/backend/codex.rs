@@ -146,6 +146,14 @@ use crate::runtime::graph::{
 #[path = "codex_appserver.rs"]
 mod codex_appserver;
 
+/// Re-exported so [`CodexConfig::appserver_budgets`] can name it in a public
+/// field: `codex_appserver` itself stays a private child module (the spec's
+/// own visibility rule, above), but a `pub use` of one item out of a private
+/// module is the standard way to give that one item a public path without
+/// making the whole module public — exactly the seam `docs/DEVELOPMENT.md`'s
+/// "narrowest visibility that works" rule asks for.
+pub use codex_appserver::Budgets;
+
 // ------------------------------------------------------------------ consts
 
 /// Name this backend registers under.
@@ -310,11 +318,13 @@ pub struct CodexConfig {
     /// until a contract revision gives native structured output a home in
     /// `Capabilities`; unused unless a profile or this field sets it.
     pub output_schema: Option<Value>,
-    /// Overrides for the app-server child's own budgets (spec §1.5.4),
-    /// `(handshake, thread_start, turn_start, interrupt)`. `None` in every
-    /// production path — the same per-instance-not-global posture as
-    /// `thread_id_budget` above, and for the same reason.
-    pub appserver_budgets: Option<(Duration, Duration, Duration, Duration)>,
+    /// Overrides for the app-server child's own budgets (spec §1.5.4). `None`
+    /// in every production path — the same per-instance-not-global posture as
+    /// `thread_id_budget` above, and for the same reason. A named
+    /// [`codex_appserver::Budgets`] rather than a positional tuple: every
+    /// field is a `Duration`, so a tuple would let two same-typed slots swap
+    /// silently and still type-check.
+    pub appserver_budgets: Option<codex_appserver::Budgets>,
 }
 
 impl CodexConfig {
@@ -487,7 +497,12 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         transport: Transport::Exec,
         claimed: true,
         tier: "-",
-        evidence: Evidence::LiveMeasured,
+        // `launch_binds_the_thread_id_from_thread_started` is a plain
+        // `#[test]` driven by `StubCodex` -- no `#[ignore]`, no
+        // SERGEANT_CODEX_TESTS gate, never touches the installed binary.
+        // `LiveMeasured` here would misstate its provenance (`Evidence`'s own
+        // doc comment reserves that tier for a real, installed-harness run).
+        evidence: Evidence::LocallyMeasured,
         stability: Stability::Stable,
         admission_test: "launch_binds_the_thread_id_from_thread_started",
         note: "the rollout jsonl under <codex_home>/sessions/**",
@@ -593,7 +608,12 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         transport: Transport::Exec,
         claimed: true,
         tier: "ProcessTreeTermination",
-        evidence: Evidence::LiveMeasured,
+        // `codex_interrupt_kills_the_process_group` is StubCodex-driven and
+        // deterministic -- its own doc comment names the live half as a
+        // *different* test (`live_codex_interrupt_leaves_the_conversation_
+        // resumable`). Tagging this row `LiveMeasured` would credit the
+        // wrong test with a live run it never performs.
+        evidence: Evidence::LocallyMeasured,
         stability: Stability::Stable,
         admission_test: "codex_interrupt_kills_the_process_group",
         note: "kills the turn's process group; no terminal — InterruptedRunning is inferred",
@@ -669,7 +689,11 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         transport: Transport::AppServer,
         claimed: false,
         tier: "-",
-        evidence: Evidence::LiveMeasured,
+        // `appserver_answers_every_server_request_including_unknown_ones` is
+        // a pure unit test against `answer_for_request()` -- no process
+        // spawned, no live app-server touched. `LiveMeasured` would overstate
+        // it; this is exactly the deterministic tier the enum defines.
+        evidence: Evidence::LocallyMeasured,
         stability: Stability::Experimental,
         admission_test: "appserver_answers_every_server_request_including_unknown_ones",
         note: "false by policy, deliberately: approvalPolicy is always \"never\", so no \
@@ -757,14 +781,19 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         tier: "-",
         evidence: Evidence::Unmeasured,
         stability: Stability::Experimental,
-        admission_test: "",
-        note: "§2.4's five-step admission test run live, twice, gpt-5.6-luna, approvalPolicy: \
-               never: formulation 1 produced the question as agentMessage prose, never a tool \
-               call; formulation 2 produced the model self-reporting it cannot call \
-               request_user_input because \"this session isn't in Plan mode\" -- a more \
-               specific measured negative than the spec anticipated (a structural gate on a \
-               thread option this adapter's thread/start never requests), not a capability \
-               this build lacks outright. Recorded here rather than promoted: absence of a \
+        // §2.7 outcome 2: "the test stays in the suite as an #[ignore]d live
+        // probe so the next person re-runs it instead of re-deriving it."
+        // The prose this row previously carried in place of that test
+        // (specific prompt formulations, an exact quoted model refusal) was
+        // never backed by a committed, re-runnable test -- fixed by adding
+        // one rather than by trusting the prose.
+        admission_test: "live_appserver_actor_authored_question_is_typed",
+        note: "§2.4's five-step admission test: step 1 (approvalPolicy: never) always holds by \
+               construction (§3.3); steps 2-3 are a live, gpt-5.6-luna, two-formulation model- \
+               behaviour probe -- re-run it to see this build's current measurement. Steps 4-5 \
+               are not attempted regardless of what the probe measures: no NeedsInput mapping or \
+               answering path exists in this build, so ask stays false either way (§2.4's \
+               \"only if admitted\" scope). Recorded here rather than promoted: absence of a \
                probe result under this launch grammar is not a measured negative of the tool's \
                existence (§2.4's own outcome table, first bullet)",
     },
@@ -798,7 +827,13 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         tier: "NativeOsSandbox(workspace-write)",
         evidence: Evidence::LocallyMeasured,
         stability: Stability::Stable,
-        admission_test: "exec_first_turn_argv_carries_the_sandbox_and_extra_dirs",
+        // Spec §3.6 proposed `exec_first_turn_argv_carries_the_sandbox_and_
+        // extra_dirs` as this test's name; the implementation folded the
+        // same coverage into the pre-existing, extended
+        // `first_turn_argv_carries_the_measured_shape` instead of adding a
+        // second function under the spec's literal name. Naming the real
+        // function here keeps this citation resolvable.
+        admission_test: "first_turn_argv_carries_the_measured_shape",
         note: "turn-1-only: exec resume has neither -s nor --add-dir on this build -- the \
                composed-flags handshake is proven, enforcement itself is not (bwrap cannot \
                initialize a network namespace on Cerberus, H0 §C.3 finding 4)",
@@ -1539,6 +1574,46 @@ fn classify_terminal(acc: &TurnAccumulator, interrupted: bool) -> TerminalOutcom
     }
 }
 
+/// Fail closed (§3.4 point 3 / §15's invariant): if a turn is `InFlight` with
+/// no confirmation it ever reached a terminal, replace it with a `Finished`
+/// state — built the same way the `turn/completed` handler above does,
+/// through the same [`classify_terminal`], so a turn that was interrupted
+/// (even by the process-group-kill fallback when `turn/interrupt` itself
+/// failed) still resolves to `InterruptedRunning` rather than
+/// `AmbiguousUnknown`, exactly the distinction exec's own decoder draws.
+/// Returns the outcome it resolved to, or `None` if there was no in-flight
+/// turn to close — idempotent, so it is safe to call from more than one
+/// place without double-finalizing: the reader thread's own EOF handling and
+/// `interrupt_appserver`'s RPC-failure fallback both call this, because
+/// killing the child's process group ends its stdout on its own accord too,
+/// and the two must not race each other into two different outcomes.
+fn fail_closed_appserver_turn(turn_cell: &Mutex<AppServerTurnState>) -> Option<TerminalOutcome> {
+    let mut state = turn_cell.lock().expect("appserver turn lock");
+    let AppServerTurnState::InFlight {
+        interrupt_requested,
+        ..
+    } = &*state
+    else {
+        return None;
+    };
+    let interrupted = *interrupt_requested;
+    let taken = std::mem::replace(&mut *state, AppServerTurnState::Idle);
+    let AppServerTurnState::InFlight { acc, .. } = taken else {
+        unreachable!("just matched InFlight above");
+    };
+    let outcome = classify_terminal(&acc, interrupted);
+    *state = AppServerTurnState::Finished {
+        outcome: outcome.clone(),
+        last_agent_message: acc.last_agent_message.clone(),
+        message_items: acc.message_items,
+        tool_items: acc.tool_items,
+        unknown_items: acc.unknown_items.clone(),
+        unknown_methods: acc.unknown_methods.clone(),
+        last_codex_error_info: acc.last_codex_error_info.clone(),
+    };
+    Some(outcome)
+}
+
 // ----------------------------------------------------------------- liveness
 
 /// Positive identity (spec §5.4): some argv element is exactly `resume` and
@@ -1724,6 +1799,12 @@ struct AppServerRuntime {
     /// callback is what constructs the very first `AppServerTurnState`, one
     /// step before `AppServerRuntime` itself is assembled.
     turn: Arc<Mutex<AppServerTurnState>>,
+    /// `thread/start`'s own result, verbatim (§3.1/§3.6) — set once at
+    /// LAUNCH and never mutated again, so no lock is needed to read it.
+    /// Exists so a test can assert the wire evidence a `claimed: true`
+    /// `sandbox_enforcement`/`model_selection` row is credited with, the
+    /// same diagnostic-seam posture as [`CodexBackend::tracked_executions`].
+    policy_echo: Value,
 }
 
 /// One execution's current-or-last turn on the app-server transport.
@@ -1853,24 +1934,40 @@ fn appserver_on_line(
                 }
             }
         }
-        codex_appserver::InboundLine::ServerRequest {
-            id,
-            method,
-            params: _,
-        } => {
+        codex_appserver::InboundLine::ServerRequest { id, method, params } => {
             // §3.4: every server request is answered, without exception —
             // `ask` stays structurally `false` (see `ADMISSION_ROWS`), so
             // this is always the "otherwise" branch of §2.4's conditional.
             let answered = codex_appserver::answer_for_request(&method, false);
             let _ = handle.answer(&id, answered.answer);
             if let Some(phase) = answered.journal_phase {
-                ctx.emit(
-                    KIND_TURN_HARNESS_ERROR,
-                    json!({"phase": phase, "method": method}),
-                );
+                let mut payload = json!({"phase": phase, "method": method});
+                if method == "item/tool/requestUserInput" {
+                    // §2.4 step 3's own wire evidence, carried into the
+                    // journal even though `ask` stays declined here: the
+                    // live admission probe (`live_appserver_actor_authored_
+                    // question_is_typed`) reads these back to prove the
+                    // request it caught actually named a non-empty question
+                    // set for the in-flight turn, not just that *a* request
+                    // arrived.
+                    payload["questions"] = params.get("questions").cloned().unwrap_or(Value::Null);
+                    payload["turn_id"] = params.get("turnId").cloned().unwrap_or(Value::Null);
+                }
+                ctx.emit(KIND_TURN_HARNESS_ERROR, payload);
             }
         }
         codex_appserver::InboundLine::Unparsed => {}
+        codex_appserver::InboundLine::Eof => {
+            if let Some(outcome) = fail_closed_appserver_turn(turn_cell) {
+                ctx.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({
+                        "phase": "child_exited_mid_turn",
+                        "outcome": format!("{outcome:?}"),
+                    }),
+                );
+            }
+        }
     }
 }
 
@@ -2009,6 +2106,25 @@ impl CodexBackend {
     /// answer to "did a refused LAUNCH leave a phantom execution behind?".
     pub fn tracked_executions(&self) -> Vec<String> {
         self.lock().executions.keys().cloned().collect()
+    }
+
+    /// `thread/start`'s own result, verbatim, for an execution running (or
+    /// that ran) on the app-server transport — `None` on exec, where no such
+    /// echo exists, and `None` for an execution id this adapter does not
+    /// hold. The diagnostic seam spec §3.6's live admission test needs: the
+    /// wire evidence a `sandbox_enforcement`/`model_selection` row is
+    /// credited with (`result.sandbox.type`, `.writableRoots`, `.cwd`,
+    /// `.approvalPolicy`, `.model`) is otherwise unreachable from outside
+    /// this module, since `codex_appserver::AppServerChild` stays
+    /// `pub(super)` (§1.5's own visibility rule) rather than being widened
+    /// just so a test could hold one directly.
+    pub fn appserver_policy_echo(&self, handle: &ExecutionHandle) -> Option<Value> {
+        let state = self.lock();
+        let execution = state.executions.get(&handle.execution_id)?;
+        match &execution.transport_state {
+            CodexTransportState::AppServer(runtime) => Some(runtime.policy_echo.clone()),
+            CodexTransportState::Exec => None,
+        }
     }
 
     /// `$CODEX_HOME`: config override, else the environment variable, else
@@ -2383,7 +2499,7 @@ impl CodexBackend {
         let budget = self
             .config
             .appserver_budgets
-            .map(|b| b.0)
+            .map(|b| b.handshake)
             .unwrap_or_else(|| codex_appserver::Budgets::default().handshake);
         let mut child = codex_appserver::AppServerChild::spawn(
             &self.config.executable,
@@ -2935,11 +3051,9 @@ impl CodexBackend {
             env,
             codex_home,
         } = self.launch_config(request.profile.as_ref())?;
-        let (handshake_budget, thread_start_budget, turn_start_budget, _interrupt_budget) =
-            self.config.appserver_budgets.unwrap_or_else(|| {
-                let d = codex_appserver::Budgets::default();
-                (d.handshake, d.thread_start, d.turn_start, d.interrupt)
-            });
+        let budgets = self.config.appserver_budgets.unwrap_or_default();
+        let (handshake_budget, thread_start_budget, turn_start_budget) =
+            (budgets.handshake, budgets.thread_start, budgets.turn_start);
 
         let turn_cell: Arc<Mutex<AppServerTurnState>> =
             Arc::new(Mutex::new(AppServerTurnState::Idle));
@@ -3017,6 +3131,7 @@ impl CodexBackend {
         let runtime = Arc::new(AppServerRuntime {
             child: Mutex::new(child),
             turn: turn_cell,
+            policy_echo: thread_start_result.clone(),
         });
         {
             let mut state = self.lock();
@@ -3172,6 +3287,25 @@ impl CodexBackend {
                 KIND_TURN_HARNESS_ERROR,
                 json!({"phase": "interrupt_downgraded", "detail": e}),
             );
+            // §15 / §3.4 point 3: a downgrade that nobody can see is the
+            // dishonesty this wave exists to avoid, and a downgrade OBSERVE
+            // can never resolve is the same dishonesty one step further —
+            // `interrupt_requested` was already set to `true` above, so this
+            // resolves through the same `classify_terminal` the reader
+            // thread's own EOF handling uses, landing on
+            // `InterruptedRunning` (never `AmbiguousUnknown`): sergeant did
+            // ask for the kill, even though the RPC that would have
+            // confirmed it failed. Without this, the turn stays `InFlight`
+            // forever and OBSERVE reports `Running` with no way to learn the
+            // stage ended.
+            if fail_closed_appserver_turn(&runtime.turn).is_some() {
+                self.emit(
+                    execution_id,
+                    &work_id,
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": "turn_closed_after_interrupt_downgrade"}),
+                );
+            }
         }
         Completion::immediate()
     }
@@ -3560,7 +3694,7 @@ impl Backend for CodexBackend {
                 let turn_start_budget = self
                     .config
                     .appserver_budgets
-                    .map(|b| b.2)
+                    .map(|b| b.turn_start)
                     .unwrap_or_else(|| codex_appserver::Budgets::default().turn_start);
                 self.appserver_send_turn(&runtime, &thread_id, input, turn_start_budget)?;
                 self.emit(
@@ -3617,7 +3751,7 @@ impl Backend for CodexBackend {
             let interrupt_budget = self
                 .config
                 .appserver_budgets
-                .map(|b| b.3)
+                .map(|b| b.interrupt)
                 .unwrap_or_else(|| codex_appserver::Budgets::default().interrupt);
             return Ok(self.interrupt_appserver(
                 &handle.execution_id,
@@ -3902,12 +4036,28 @@ fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> 
             // §2.2: a first-class, harness-confirmed terminal — the
             // conversation stays resumable, exactly as exec's inferred
             // `InterruptedRunning` reports, but never inferred here.
-            TerminalOutcome::Interrupted | TerminalOutcome::InterruptedRunning => Observation {
+            TerminalOutcome::Interrupted => Observation {
                 native,
                 signal: BackendSignal::Running,
                 evidence: Some(format!(
                     "turn interrupted; thread {thread_ref} resumable (app-server: \
                      harness-confirmed)"
+                )),
+            },
+            // Reached only via `fail_closed_appserver_turn`'s own use of
+            // `classify_terminal` (§15/§3.4 point 3): `turn/interrupt` itself
+            // failed and the adapter fell back to the process-group kill
+            // (§2.2's "downgrade" path) or the child's stdout simply closed
+            // after an interrupt had already been requested. Sergeant did
+            // ask for the kill, but nothing confirmed it the way a real
+            // `turn/completed{status:"interrupted"}` would — never claim
+            // `harness-confirmed` for this arm.
+            TerminalOutcome::InterruptedRunning => Observation {
+                native,
+                signal: BackendSignal::Running,
+                evidence: Some(format!(
+                    "turn interrupted; thread {thread_ref} resumable (app-server: inferred, \
+                     not harness-confirmed -- turn/interrupt's own RPC never confirmed it)"
                 )),
             },
             TerminalOutcome::AmbiguousUnknown => Observation {
