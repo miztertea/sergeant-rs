@@ -1,0 +1,81 @@
+name: canary
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly, Monday 06:00 UTC — matches coverage.yml's
+                            # existing weekly-Monday pattern (coverage.yml:24)
+                            # for one predictable non-blocking-lane cadence
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]   # deliberately the FLOATING
+                                              # aliases, not the pinned
+                                              # ubuntu-24.04/macos-26 used
+                                              # everywhere else — this job's
+                                              # whole point is to notice the
+                                              # runner image moving too, not
+                                              # just Rust. Pinning it here
+                                              # would defeat it.
+    runs-on: ${{ matrix.os }}
+    # NO continue-on-error: this is a standalone scheduled workflow, not a
+    # required PR check, so a red run blocks nothing and GitHub's own
+    # default scheduled-workflow-failure notification already fires;
+    # continue-on-error would only muffle the redness this job exists to
+    # produce.
+    env:
+      RUSTUP_TOOLCHAIN: stable   # rank 2 in rustup's override precedence —
+                                  # bypasses rust-toolchain.toml (rank 4)
+                                  # deliberately, so this job canaries the
+                                  # upstream `stable` channel, not the
+                                  # repo's own pin.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: rustup update stable (install/refresh the floating toolchain the env var selects)
+        run: rustup update stable
+
+      - name: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets
+
+      - name: cargo clippy --locked --all-targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test --locked
+        run: cargo test --locked
+
+  on-drift:
+    needs: canary
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write   # the ONLY new permission this sprint introduces
+                        # anywhere in the four+one workflows — everything
+                        # else stays at existing contents: read. gh issue
+                        # create/edit/comment all require it; nothing else
+                        # in this job's path touches repo state.
+    steps:
+      - name: open-or-update the upstream-drift tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          existing=$(gh issue list --repo "${{ github.repository }}" \
+            --label upstream-drift --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "${{ github.repository }}" \
+              --body "Canary failed again: $run_url"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "upstream drift: canary red" \
+              --label upstream-drift \
+              --body "The weekly canary tripped: $run_url"
+          fi
