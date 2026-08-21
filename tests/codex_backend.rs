@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use sergeant_rs::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
+use sergeant_rs::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig, TransportChoice};
 use sergeant_rs::backend::{
     Backend, BackendError, BindingSummary, ExecutionHandle, NativeState, ProbeReport,
     ResumeRequest, StartRequest,
@@ -683,6 +683,108 @@ fn the_probe_reads_auth_from_stderr_when_stdout_is_empty() {
             .expect("detail")
             .contains("auth: logged in using ChatGPT"),
         "the probe must recover the auth line from stderr"
+    );
+}
+
+// ---------------------------------------------------- W3 §5.2: transport gates
+
+/// A stub with no `.supports_appserver()` marker fails G1 (its `app-server
+/// --help` never offers `stdio://`) — `Auto` must fall back to exec, and
+/// `probe()` must still be `available: true` (a gate failure changes which
+/// transport, never whether the backend works at all).
+#[test]
+fn appserver_gate_failure_falls_back_to_exec_under_auto() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let report = backend.probe();
+    assert!(report.available);
+    let detail = report.detail.expect("detail");
+    assert!(
+        detail.contains("transport: exec"),
+        "Auto must resolve to exec when the app-server gate fails: {detail}"
+    );
+    assert!(
+        detail.contains("app-server gate failed"),
+        "the failed gate must be named, not silently absorbed: {detail}"
+    );
+}
+
+/// `AppServerOnly` + a failed gate is the one place §5.2 refuses outright
+/// (rule 2): the operator asked for exactly this transport, and silently
+/// handing them exec — a different capability row — is the dishonesty the
+/// rule exists to prevent.
+#[test]
+fn appserver_only_refuses_when_a_gate_fails() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(
+        !report.available,
+        "AppServerOnly with a failed gate must refuse, not fall back"
+    );
+    let detail = report.detail.expect("detail");
+    assert!(detail.contains("AppServerOnly"), "{detail}");
+    assert!(
+        detail.contains("G1"),
+        "the failed gate must be named: {detail}"
+    );
+}
+
+/// The opposite: a stub that *does* emulate the app-server subcommands
+/// (`.supports_appserver()`) passes G1/G2/G4, so `Auto` resolves to
+/// app-server — and the resolution is memoized (§5.3: never revisited per
+/// execution), which this proves by calling `probe()` twice and getting the
+/// identical resolved transport both times.
+#[test]
+fn transport_is_resolved_once_and_journaled() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let first = backend.probe();
+    let second = backend.probe();
+    assert!(first.available);
+    assert_eq!(first.detail, second.detail, "resolution must be memoized");
+    let detail = first.detail.expect("detail");
+    assert!(
+        detail.contains("transport: app-server (stdio) (Auto)"),
+        "a stub that passes every gate must resolve Auto to app-server: {detail}"
+    );
+    assert!(
+        detail.contains("protocol: fresh") || detail.contains("protocol: stale"),
+        "{detail}"
+    );
+}
+
+/// `ExecOnly` always resolves to exec, even when a stub would otherwise
+/// pass every app-server gate — the operator's own configured choice wins
+/// unconditionally (§5.2 rule 1).
+#[test]
+fn transport_choice_exec_only_never_touches_the_appserver_gates() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::ExecOnly;
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(report.available);
+    let detail = report.detail.expect("detail");
+    assert!(
+        detail.contains("transport: exec (ExecOnly configured)"),
+        "{detail}"
     );
 }
 
@@ -1627,13 +1729,52 @@ fn live_config(data_dir: &Path) -> CodexConfig {
     CodexConfig::new(data_dir)
 }
 
+/// W3: `live_config` with `ExecOnly` forced. Every pre-W3 `live_codex_*`
+/// test below was written against exec's own semantics (its `wait_for_
+/// settled` reads `native`, which only exec's per-turn-process model makes
+/// mean "the turn is over") — `live_config`'s default `TransportChoice::
+/// Auto` now resolves to app-server on any host whose installed codex
+/// passes the gates (this host included, measured live), which would
+/// silently point those tests at the wrong transport and the wrong OBSERVE
+/// shape. Pinning `ExecOnly` here keeps them testing exactly what they
+/// always tested; `Auto`'s new default is `live_appserver_config`'s own
+/// suite's job to prove.
+fn live_exec_config(data_dir: &Path) -> CodexConfig {
+    CodexConfig {
+        transport: TransportChoice::ExecOnly,
+        ..live_config(data_dir)
+    }
+}
+
+/// W3: `live_config` with `AppServerOnly` forced, so these tests exercise
+/// the wired app-server transport itself rather than whatever `Auto` would
+/// have picked on this host (which happens to be app-server too, on
+/// Cerberus — but a live test asserting on that transport should not depend
+/// on Auto's own resolution logic staying that way).
+fn live_appserver_config(data_dir: &Path) -> CodexConfig {
+    CodexConfig {
+        transport: TransportChoice::AppServerOnly,
+        ..live_config(data_dir)
+    }
+}
+
 /// Whether the opt-in live-codex tests may run. Reaching this with the
 /// opt-in variable unset is a misuse of `-- --ignored` and panics, naming
 /// the opt-in — the false green `#[ignore]` exists to prevent. An unusable
 /// harness is a clean skip, written straight to fd 2 (libtest only captures
 /// the print macros).
 fn codex_live_enabled(test: &str, data_dir: &Path) -> bool {
-    let config = live_config(data_dir);
+    codex_live_enabled_with(test, live_config(data_dir))
+}
+
+/// W3: the app-server suite's own gate, `AppServerOnly`-forced so a gate
+/// failure on some future host is an honest `SKIPPED`, never a silent
+/// fallback to exec producing a green test that tested the wrong transport.
+fn codex_appserver_live_enabled(test: &str, data_dir: &Path) -> bool {
+    codex_live_enabled_with(test, live_appserver_config(data_dir))
+}
+
+fn codex_live_enabled_with(test: &str, config: CodexConfig) -> bool {
     let probe = CodexBackend::new(config.clone()).probe();
     let gate = live_gate(
         std::env::var("SERGEANT_CODEX_TESTS").ok().as_deref(),
@@ -1679,6 +1820,43 @@ fn wait_for_settled(
     }
 }
 
+/// W3: the app-server counterpart of [`wait_for_settled`]. Neither `native`
+/// (§1.4: "is my child alive", true for the whole execution) nor `signal`
+/// (an *interrupted* turn also reports `Running` — no stage verdict, exactly
+/// like exec's `InterruptedRunning` — so "signal != Running" cannot tell
+/// "settled" apart from "never even started" either) can drive a polling
+/// loop the way exec's own turn-ends-its-process signal can. What actually
+/// marks a turn as over on this transport is the event
+/// `appserver_on_line` emits exactly once per turn, on `turn/completed`
+/// (`conversation.turn.ended`) — so this waits for that event (the sink
+/// must already be installed) and returns the OBSERVE snapshot taken right
+/// after.
+fn wait_for_appserver_settled(
+    backend: &CodexBackend,
+    handle: &ExecutionHandle,
+    events: &Arc<Mutex<Vec<EventDraft>>>,
+    already_ended: usize,
+) -> sergeant_rs::backend::Observation {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let ended_count = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "conversation.turn.ended")
+            .count();
+        if ended_count > already_ended {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live app-server turn never settled"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    backend.observe(handle).expect("observe")
+}
+
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
 fn live_codex_probe_reports_the_installed_version_and_auth() {
@@ -1711,7 +1889,7 @@ fn live_codex_turn_streams_events_before_it_ends() {
     ) {
         return;
     }
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let (sink_fn, events) = sink();
     backend.set_event_sink(sink_fn);
     let mut request = start_request(data_dir.path());
@@ -1735,7 +1913,7 @@ fn live_codex_turn_reports_usage() {
     if !codex_live_enabled("live_codex_turn_reports_usage", data_dir.path()) {
         return;
     }
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let (sink_fn, events) = sink();
     backend.set_event_sink(sink_fn);
     let mut request = start_request(data_dir.path());
@@ -1769,7 +1947,7 @@ fn live_codex_bad_model_pin_fails_loud_not_silent() {
     ) {
         return;
     }
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-nonexistent-model".to_string());
     request.intent = "Reply with exactly the word ok and nothing else.".to_string();
@@ -1801,7 +1979,7 @@ fn live_codex_resume_recalls_a_nonce_across_processes() {
         return;
     }
     let nonce = format!("nonce-{}", ulid::Ulid::generate());
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
     request.intent = format!("Remember the word {nonce}. Reply ok.");
@@ -1866,7 +2044,7 @@ fn live_codex_interrupt_leaves_the_conversation_resumable() {
         return;
     }
     let nonce = format!("nonce-{}", ulid::Ulid::generate());
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
     request.intent = format!("Remember the word {nonce}. Reply ok.");
@@ -1917,7 +2095,7 @@ fn live_codex_thread_survives_turns_and_a_restart() {
         return;
     }
     let nonce = format!("nonce-{}", ulid::Ulid::generate());
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
     request.intent = format!("Remember the word {nonce}. Reply ok.");
@@ -1929,7 +2107,7 @@ fn live_codex_thread_survives_turns_and_a_restart() {
 
     // Drop the adapter (simulating a daemon restart) and build a fresh one.
     drop(backend);
-    let fresh = CodexBackend::new(live_config(data_dir.path()));
+    let fresh = CodexBackend::new(live_exec_config(data_dir.path()));
     let resume_request = ResumeRequest::new("w-codex", data_dir.path());
     fresh
         .resume(&handle, &resume_request)
@@ -1951,6 +2129,267 @@ fn live_codex_thread_survives_turns_and_a_restart() {
     );
     assert_eq!(handle.native_id.as_deref(), Some(thread_id.as_str()));
     fresh.stop(&handle).expect("stop").wait();
+}
+
+// --------------------------------------------------- W3 §6.4: app-server live suite
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_handshake_and_thread_start() {
+    let data_dir = live_workdir("appserver-handshake");
+    if !codex_appserver_live_enabled("live_appserver_handshake_and_thread_start", data_dir.path()) {
+        return;
+    }
+    // Zero tokens (M4): PREPARE/LAUNCH's handshake + thread/start never send
+    // a turn/start, so this is free to run every time.
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    // An intent that would need a real model turn to finish — but we STOP
+    // immediately after LAUNCH's own turn/start returns, well before the
+    // model could plausibly answer, so what this proves is the handshake +
+    // thread/start path, not a completed turn (that is the next test).
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    assert!(
+        handle.native_id.is_some(),
+        "the native id must come from thread/start's own synchronous result"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_thread_start_echoes_the_requested_policy() {
+    let data_dir = live_workdir("appserver-policy");
+    if !codex_appserver_live_enabled(
+        "live_appserver_thread_start_echoes_the_requested_policy",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    // Token-free (§3.6): the probe itself already drove `thread/start`
+    // during PROBE (G4's handshake uses `initialize` only, not
+    // `thread/start` — so this LAUNCH is the first `thread/start` this test
+    // sends), and the shape assertion below reads only what came back
+    // synchronously.
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    // The policy shape is asserted indirectly: LAUNCH would have failed had
+    // thread/start refused `sandbox`/`approvalPolicy`/`runtimeWorkspaceRoots`
+    // (M6: `-32600` without `experimentalApi`), so a successful LAUNCH here
+    // is itself evidence the policy handshake succeeded end to end. STOP
+    // immediately: no turn/start content is asserted on.
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_turn_completes_and_streams() {
+    let data_dir = live_workdir("appserver-stream");
+    if !codex_appserver_live_enabled("live_appserver_turn_completes_and_streams", data_dir.path()) {
+        return;
+    }
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent = "Reply with exactly the word ok and nothing else.".to_string();
+    request.context = String::new();
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let _user = wait_for_kind(&events, "conversation.user");
+    let observation = wait_for_appserver_settled(&backend, &handle, &events, 0);
+    assert_eq!(
+        observation.native,
+        NativeState::Running,
+        "the app-server child persists after a completed turn (§1.4) — unlike exec, native never means the turn's own process exited"
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::StageCompleted { .. } => {}
+        other => panic!("expected StageCompleted, got {other:?}"),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_reports_usage_during_the_turn() {
+    let data_dir = live_workdir("appserver-usage");
+    if !codex_appserver_live_enabled(
+        "live_appserver_reports_usage_during_the_turn",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent = "Reply with exactly the word ok and nothing else.".to_string();
+    request.context = String::new();
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    // §2.3's discriminating assertion: usage must arrive *before* the
+    // terminal, not bundled onto it — `thread/tokenUsage/updated` is a
+    // separate notification on this transport.
+    let usage_event = wait_for_kind(&events, "usage.updated");
+    assert!(usage_event.payload["usage"]["total"]["totalTokens"].is_number());
+    let observation = wait_for_appserver_settled(&backend, &handle, &events, 0);
+    assert_eq!(observation.native, NativeState::Running);
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_interrupt_yields_an_interrupted_terminal() {
+    let data_dir = live_workdir("appserver-interrupt");
+    if !codex_appserver_live_enabled(
+        "live_appserver_interrupt_yields_an_interrupted_terminal",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent =
+        "Count slowly from 1 to 200, one number per line, explaining each in a full sentence."
+            .to_string();
+    request.context = String::new();
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    // Bounded wait for genuine mid-flight proof (item/started or a delta),
+    // never a fixed sleep — §2.2 step 2's own requirement.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "conversation.user")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn never even started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    backend.interrupt(&handle).expect("interrupt").wait();
+    let observation = wait_for_appserver_settled(&backend, &handle, &events, 0);
+    assert_eq!(
+        observation.signal,
+        sergeant_rs::backend::BackendSignal::Running,
+        "an interrupted turn reports Running (no stage verdict), same shape as exec's \
+         InterruptedRunning, but harness-confirmed rather than inferred"
+    );
+    assert_eq!(
+        observation.native,
+        NativeState::Running,
+        "the process was never killed -- that is §2.2's whole point"
+    );
+    // Resumability: a second turn on the same thread must still succeed.
+    send_retrying(&backend, &handle, "Reply with exactly the word ok.");
+    let settled = wait_for_appserver_settled(&backend, &handle, &events, 1);
+    match settled.signal {
+        sergeant_rs::backend::BackendSignal::StageCompleted { .. } => {}
+        other => panic!("expected the conversation to still work after interrupt, got {other:?}"),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_codex_output_schema_round_trips_on_both_transports() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"word": {"type": "string"}},
+        "required": ["word"],
+        "additionalProperties": false
+    });
+    let prompt = "Answer with the word ok.";
+
+    for (label, config_builder) in [
+        (
+            "exec",
+            Box::new(live_exec_config) as Box<dyn Fn(&Path) -> CodexConfig>,
+        ),
+        (
+            "appserver",
+            Box::new(live_appserver_config) as Box<dyn Fn(&Path) -> CodexConfig>,
+        ),
+    ] {
+        let data_dir = live_workdir(&format!("output-schema-{label}"));
+        let test_name = format!("live_codex_output_schema_round_trips_on_both_transports[{label}]");
+        if !codex_live_enabled_with(&test_name, config_builder(data_dir.path())) {
+            continue;
+        }
+
+        // Control run: no schema configured, same prompt. The sink is
+        // installed *before* LAUNCH: both transports snapshot the sink at
+        // spawn time, so installing it after LAUNCH returns would miss
+        // turn 1's events entirely (the same hazard `live_codex_resume_
+        // recalls_a_nonce_across_processes` documents for exec).
+        let control_backend = CodexBackend::new(config_builder(data_dir.path()));
+        let (control_sink, control_events) = sink();
+        control_backend.set_event_sink(control_sink);
+        let mut control_request = start_request(data_dir.path());
+        control_request.model = Some("gpt-5.6-luna".to_string());
+        control_request.intent = prompt.to_string();
+        control_request.context = String::new();
+        let control_prepared = control_backend.prepare(&control_request).expect("prepare");
+        let control_handle = control_backend.launch(&control_prepared).expect("launch");
+        let control_assistant = wait_for_kind(&control_events, "conversation.assistant.completed");
+        let control_text = control_assistant.payload["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let control_is_schema_shaped = serde_json::from_str::<serde_json::Value>(&control_text)
+            .ok()
+            .map(|v| v.get("word").is_some() && v.as_object().map(|o| o.len()) == Some(1))
+            .unwrap_or(false);
+        control_backend.stop(&control_handle).expect("stop").wait();
+
+        // Schema run.
+        let mut config = config_builder(data_dir.path());
+        config.output_schema = Some(schema.clone());
+        let backend = CodexBackend::new(config);
+        let (sink_fn, events) = sink();
+        backend.set_event_sink(sink_fn);
+        let mut request = start_request(data_dir.path());
+        request.model = Some("gpt-5.6-luna".to_string());
+        request.intent = prompt.to_string();
+        request.context = String::new();
+        let prepared = backend.prepare(&request).expect("prepare");
+        let handle = backend.launch(&prepared).expect("launch");
+        let assistant = wait_for_kind(&events, "conversation.assistant.completed");
+        let text = assistant.payload["text"].as_str().unwrap_or("").to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("[{label}] not JSON: {e}: {text:?}"));
+        assert!(
+            parsed.get("word").is_some(),
+            "[{label}] missing word: {text:?}"
+        );
+        assert_eq!(
+            parsed.as_object().map(|o| o.len()),
+            Some(1),
+            "[{label}] additionalProperties:false must hold: {text:?}"
+        );
+        assert!(
+            !control_is_schema_shaped,
+            "[{label}] the discriminating assertion: an unschema'd control run must not \
+             coincidentally produce the same shape, or this test cannot tell native validation \
+             from a model that just likes JSON: {control_text:?}"
+        );
+        backend.stop(&handle).expect("stop").wait();
+    }
 }
 
 // ------------------------------------------------------- W2 §1.4: registration

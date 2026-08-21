@@ -398,8 +398,14 @@ impl SandboxChoice {
     /// [`SandboxChoice::Inherit`] (send no `sandbox` param at all).
     fn appserver_value(self) -> Option<&'static str> {
         match self {
-            SandboxChoice::ReadOnly => Some("readOnly"),
-            SandboxChoice::WorkspaceWrite => Some("workspaceWrite"),
+            // Re-measured while wiring LAUNCH (a live -32600 caught this):
+            // `thread/start.sandbox` takes the same kebab-case request
+            // values as exec's own `-s`/`--sandbox` (`read-only` /
+            // `workspace-write` / `danger-full-access`) — the camelCase
+            // spelling (`workspaceWrite`) is only what the *response*
+            // echoes back in `sandbox.type`, a different field entirely.
+            SandboxChoice::ReadOnly => Some("read-only"),
+            SandboxChoice::WorkspaceWrite => Some("workspace-write"),
             SandboxChoice::Inherit => None,
         }
     }
@@ -414,6 +420,433 @@ impl SandboxChoice {
             SandboxChoice::Inherit => None,
         }
     }
+}
+
+// ---------------------------------------------------------- admission rows
+
+/// How a capability's `true`/`false` was established (W3 spec §0.2/§2.1).
+/// A schema entry is a doc claim; it proves the protocol *names* a thing,
+/// never that it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// Driven against the real, installed harness (a `#[ignore]`d live test,
+    /// gated behind `SERGEANT_CODEX_TESTS=1`).
+    LiveMeasured,
+    /// Proven deterministically (a fixture, a stub) without a live run —
+    /// still a real assertion, just not against the installed binary today.
+    LocallyMeasured,
+    /// Named by `generate-json-schema`'s own dump; never promoted to
+    /// `claimed: true` on this evidence alone (§0.2's promotion rule).
+    SchemaClaimed,
+    /// Looked for and not found — a probe ran, no assertion could be made.
+    Unmeasured,
+}
+
+/// Protocol stability, as the app-server subcommand's own header names it
+/// (`[experimental] Run the app server or related tooling`, M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stability {
+    Stable,
+    Experimental,
+}
+
+/// One row of the wave's own capability ledger (W3 spec §2.1): the v1
+/// boolean `capabilities()` returns is the contract; this is the *evidence*
+/// behind it, adapter-local until a contract revision gives it a home.
+/// Rendered into `ProbeReport::detail` and the wave PR body (§2.7).
+#[derive(Debug, Clone, Copy)]
+struct AdmissionRow {
+    /// The v1 flag name, or a name v1 has no row for at all
+    /// (`structured_output`, `sandbox_enforcement`).
+    capability: &'static str,
+    transport: Transport,
+    /// What `capabilities()` claims for this transport (always the same
+    /// value on both transports today — see the row's own note when that
+    /// is itself the interesting fact).
+    claimed: bool,
+    /// The typed tier this row's evidence actually supports
+    /// (`ProcessTreeTermination`, `NativeTurnInterrupt`, `NativeSchema`,
+    /// `NativeOsSandbox(workspace-write)`, or `"-"` when the flag is a
+    /// plain boolean with no tier of its own).
+    tier: &'static str,
+    evidence: Evidence,
+    stability: Stability,
+    /// The exact test name backing a `claimed: true`, or `""` when
+    /// `claimed` is `false` (the structural reason lives in `note`).
+    admission_test: &'static str,
+    note: &'static str,
+}
+
+/// The wave's own ledger (§2.6's table, plus §4.1/§3.1's two rows with no
+/// v1 boolean). [`admission_rows_agree_with_capabilities`] is the
+/// structural check that keeps this honest: a `claimed: true` with no
+/// `admission_test` fails the build.
+const ADMISSION_ROWS: &[AdmissionRow] = &[
+    AdmissionRow {
+        capability: "persistent_sessions",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "launch_binds_the_thread_id_from_thread_started",
+        note: "the rollout jsonl under <codex_home>/sessions/**",
+    },
+    AdmissionRow {
+        capability: "persistent_sessions",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_handshake_and_thread_start",
+        note: "thread/start's own result.thread.path names the rollout file directly (M4)",
+    },
+    AdmissionRow {
+        capability: "native_background",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no measured mechanism for a turn to survive client disconnect",
+    },
+    AdmissionRow {
+        capability: "native_background",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "our child dies with the execution by construction (§1.4); not even meaningful \
+               to ask on a per-execution child",
+    },
+    AdmissionRow {
+        capability: "streaming",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_turn_streams_events_before_it_ends",
+        note: "item.started/item.completed",
+    },
+    AdmissionRow {
+        capability: "streaming",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_turn_completes_and_streams",
+        note: "finer-grained: item + delta notifications; deltas counted, never decoded",
+    },
+    AdmissionRow {
+        capability: "history",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "the only complete native record is the rollout jsonl, an unmeasured on-disk \
+               format this milestone never reads for content",
+    },
+    AdmissionRow {
+        capability: "history",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::SchemaClaimed,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "thread/read / thread/items/list / thread/turns/list exist [schema-claimed] and \
+               are never called (§1.5.3) — proving completeness against the rollout is the \
+               largest named gap this wave leaves, handed to a future wave",
+    },
+    AdmissionRow {
+        capability: "resume",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_thread_survives_turns_and_a_restart",
+        note: "codex exec resume <thread_id>, measured across fresh OS processes",
+    },
+    AdmissionRow {
+        capability: "resume",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_codex_thread_survives_turns_and_a_restart",
+        note: "served by the exec transport across a daemon restart (§5.4); thread/resume is \
+               never called — a re-adopted execution journals a transport_withdrawn_on_readopt \
+               capability withdrawal",
+    },
+    AdmissionRow {
+        capability: "interrupt",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "ProcessTreeTermination",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "codex_interrupt_kills_the_process_group",
+        note: "kills the turn's process group; no terminal — InterruptedRunning is inferred",
+    },
+    AdmissionRow {
+        capability: "interrupt",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "NativeTurnInterrupt",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_interrupt_yields_an_interrupted_terminal",
+        note: "turn/interrupt -> turn/completed{status:\"interrupted\"}, a first-class \
+               harness-confirmed terminal (§2.2) -- measured live end to end, including a \
+               second turn on the same thread proving resumability. On any turn/interrupt \
+               failure the adapter falls back to the process-group kill and journals \
+               phase:\"interrupt_downgraded\"",
+    },
+    AdmissionRow {
+        capability: "model_selection",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_bad_model_pin_fails_loud_not_silent",
+        note: "substitution undetectable: turn.completed.usage carries no model field",
+    },
+    AdmissionRow {
+        capability: "model_selection",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_thread_start_echoes_the_requested_policy",
+        note: "detectable here: thread/start echoes \"model\":\"<pin>\", and model/rerouted is a \
+               live notification method [schema-claimed] -- a verification layer exec never had",
+    },
+    AdmissionRow {
+        capability: "profiles",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Stable,
+        admission_test: "a_profile_config_home_sets_codex_home_on_every_turn",
+        note: "codex-native -p/--profile refused: cannot re-apply on exec resume",
+    },
+    AdmissionRow {
+        capability: "profiles",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Experimental,
+        admission_test: "a_profile_config_home_sets_codex_home_on_every_turn",
+        note: "same axis, same refusal -- thread/start.permissions [schema-claimed] cannot be \
+               combined with sandbox, which §3 needs, so the codex-native layer stays refused",
+    },
+    AdmissionRow {
+        capability: "approval_flow",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "structural: no approval channel exists on this transport at all",
+    },
+    AdmissionRow {
+        capability: "approval_flow",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "appserver_answers_every_server_request_including_unknown_ones",
+        note: "false by policy, deliberately: approvalPolicy is always \"never\", so no \
+               approval-gate request should ever fire; the five approval methods are answered \
+               denied if one ever does (J5 safety), never advertised as a real flow",
+    },
+    AdmissionRow {
+        capability: "human_attach",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no attach mechanism on print-mode turns",
+    },
+    AdmissionRow {
+        capability: "human_attach",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "a scope decision (§1.4), not an unlooked-for absence: codex --remote / codex \
+               agents attach to the shared daemon, which this wave refuses on ladder grounds \
+               (R1/R5) -- our child is per-execution and adapter-owned",
+    },
+    AdmissionRow {
+        capability: "usage",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_turn_reports_usage",
+        note: "known only at turn.completed",
+    },
+    AdmissionRow {
+        capability: "usage",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_reports_usage_during_the_turn",
+        note: "thread/tokenUsage/updated pushed mid-turn, turn-attributed, and measured live to \
+               arrive before the terminal -- known earlier and more precisely than exec",
+    },
+    AdmissionRow {
+        capability: "native_subagents",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no subagent mechanism on this transport",
+    },
+    AdmissionRow {
+        capability: "native_subagents",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::SchemaClaimed,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "collabAgentToolCall / subAgentActivity item types exist [schema-claimed]; no \
+               subagent was ever run -- documented is not supported (§15)",
+    },
+    AdmissionRow {
+        capability: "ask",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no ask channel on this transport at all [measured-negative]",
+    },
+    AdmissionRow {
+        capability: "ask",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "§2.4's five-step admission test run live, twice, gpt-5.6-luna, approvalPolicy: \
+               never: formulation 1 produced the question as agentMessage prose, never a tool \
+               call; formulation 2 produced the model self-reporting it cannot call \
+               request_user_input because \"this session isn't in Plan mode\" -- a more \
+               specific measured negative than the spec anticipated (a structural gate on a \
+               thread option this adapter's thread/start never requests), not a capability \
+               this build lacks outright. Recorded here rather than promoted: absence of a \
+               probe result under this launch grammar is not a measured negative of the tool's \
+               existence (§2.4's own outcome table, first bullet)",
+    },
+    AdmissionRow {
+        capability: "structured_output",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "NativeSchema",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_output_schema_round_trips_on_both_transports",
+        note: "--output-schema <path>; re-measured for W3: DOES re-apply on `exec resume` \
+               (present in --help), correcting W1's own turn-1-only placeholder -- not a v1 \
+               flag; recorded here as adapter evidence only (§4.1)",
+    },
+    AdmissionRow {
+        capability: "structured_output",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "NativeSchema",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_codex_output_schema_round_trips_on_both_transports",
+        note: "turn/start.outputSchema, every turn -- measured live with the spec's own \
+               discriminating control (an unschema'd run must not coincidentally match)",
+    },
+    AdmissionRow {
+        capability: "sandbox_enforcement",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "NativeOsSandbox(workspace-write)",
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Stable,
+        admission_test: "exec_first_turn_argv_carries_the_sandbox_and_extra_dirs",
+        note: "turn-1-only: exec resume has neither -s nor --add-dir on this build -- the \
+               composed-flags handshake is proven, enforcement itself is not (bwrap cannot \
+               initialize a network namespace on Cerberus, H0 §C.3 finding 4)",
+    },
+    AdmissionRow {
+        capability: "sandbox_enforcement",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "NativeOsSandbox(workspace-write)",
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_thread_start_echoes_the_requested_policy",
+        note: "thread-scoped, holds for every turn (unlike exec's turn-1-only lapse) -- the \
+               harness accepts and echoes the requested policy naming exactly this Work's \
+               surfaces as writable roots; whether the OS sandbox actually denies an \
+               out-of-surface write could not be proven on this host for the same reason exec's \
+               row could not. Enforcement-claimed, not locally proven -- sergeant's own \
+               observation layer remains the source of truth for what a Work actually changed",
+    },
+];
+
+/// Render [`ADMISSION_ROWS`] into the plain-text table the wave PR body
+/// pastes verbatim (§2.7's three-outcome labelling) and the probe's own
+/// journaled detail carries. One line per row: capability, transport,
+/// claimed, tier, evidence, stability, the admission test (or a dash), then
+/// the note.
+fn render_admission_rows() -> String {
+    let mut out = String::from(
+        "capability | transport | claimed | tier | evidence | stability | admission_test | note\n",
+    );
+    for row in ADMISSION_ROWS {
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {:?} | {:?} | {} | {}\n",
+            row.capability,
+            row.transport.as_str(),
+            row.claimed,
+            row.tier,
+            row.evidence,
+            row.stability,
+            if row.admission_test.is_empty() {
+                "-"
+            } else {
+                row.admission_test
+            },
+            row.note,
+        ));
+    }
+    out
 }
 
 // ------------------------------------------------------------------- probe
@@ -1420,7 +1853,11 @@ fn appserver_on_line(
                 }
             }
         }
-        codex_appserver::InboundLine::ServerRequest { id, method, params: _ } => {
+        codex_appserver::InboundLine::ServerRequest {
+            id,
+            method,
+            params: _,
+        } => {
             // §3.4: every server request is answered, without exception —
             // `ask` stays structurally `false` (see `ADMISSION_ROWS`), so
             // this is always the "otherwise" branch of §2.4's conditional.
@@ -1849,7 +2286,8 @@ impl CodexBackend {
 
     /// The four app-server admission gates, run once and cached.
     fn appserver_gates(&self) -> &AppServerGates {
-        self.appserver_gates.get_or_init(|| self.run_appserver_gates())
+        self.appserver_gates
+            .get_or_init(|| self.run_appserver_gates())
     }
 
     fn run_appserver_gates(&self) -> AppServerGates {
@@ -1896,9 +2334,7 @@ impl CodexBackend {
         }
         let help = String::from_utf8_lossy(&out.stdout);
         if !help.contains("stdio://") {
-            return Err(
-                "G1: app-server --help does not offer a stdio:// transport".to_string(),
-            );
+            return Err("G1: app-server --help does not offer a stdio:// transport".to_string());
         }
         Ok(())
     }
@@ -1982,7 +2418,10 @@ impl CodexBackend {
         match self.config.transport {
             TransportChoice::ExecOnly => TransportResolution {
                 transport: Transport::Exec,
-                detail: format!("transport: {} (ExecOnly configured)", Transport::Exec.as_str()),
+                detail: format!(
+                    "transport: {} (ExecOnly configured)",
+                    Transport::Exec.as_str()
+                ),
             },
             TransportChoice::AppServerOnly => match &self.appserver_gates().result {
                 Ok(()) => TransportResolution {
@@ -2486,22 +2925,24 @@ impl CodexBackend {
     /// **synchronous RPC response**, before any turn exists — the crash
     /// window exec's own module docs name is closed on this transport by
     /// construction.
-    fn launch_appserver(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+    fn launch_appserver(
+        &self,
+        prepared: &PreparedExecution,
+    ) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
         let LaunchConfig {
             executable,
             env,
             codex_home,
         } = self.launch_config(request.profile.as_ref())?;
-        let (handshake_budget, thread_start_budget, turn_start_budget, _interrupt_budget) = self
-            .config
-            .appserver_budgets
-            .unwrap_or_else(|| {
+        let (handshake_budget, thread_start_budget, turn_start_budget, _interrupt_budget) =
+            self.config.appserver_budgets.unwrap_or_else(|| {
                 let d = codex_appserver::Budgets::default();
                 (d.handshake, d.thread_start, d.turn_start, d.interrupt)
             });
 
-        let turn_cell: Arc<Mutex<AppServerTurnState>> = Arc::new(Mutex::new(AppServerTurnState::Idle));
+        let turn_cell: Arc<Mutex<AppServerTurnState>> =
+            Arc::new(Mutex::new(AppServerTurnState::Idle));
         let ctx = AppServerLineContext {
             sink: self.sink.lock().expect("codex sink lock").clone(),
             execution_id: request.execution_id.clone(),
@@ -2642,8 +3083,7 @@ impl CodexBackend {
             let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
             if let AppServerTurnState::InFlight { .. } = &*turn_state {
                 return Err(self.err_failed(
-                    "a turn is already in flight on this app-server thread; a codex thread runs \
-                     one turn at a time",
+                    "already has a turn in flight; a codex thread runs one turn at a time",
                 ));
             }
             *turn_state = AppServerTurnState::InFlight {
@@ -2976,7 +3416,6 @@ impl TurnReader {
     }
 }
 
-
 impl Backend for CodexBackend {
     fn name(&self) -> &str {
         CODEX_BACKEND_NAME
@@ -3039,7 +3478,12 @@ impl Backend for CodexBackend {
         let resolution = self.transport_resolution();
         ProbeReport {
             available: true,
-            detail: Some(format!("{}; {}", outcome.detail, resolution.detail)),
+            detail: Some(format!(
+                "{}; {}\nadmission rows:\n{}",
+                outcome.detail,
+                resolution.detail,
+                render_admission_rows()
+            )),
         }
     }
 
@@ -3080,7 +3524,6 @@ impl Backend for CodexBackend {
             Transport::AppServer => self.launch_appserver(prepared),
         }
     }
-
 
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
         let appserver = {
@@ -3209,7 +3652,6 @@ impl Backend for CodexBackend {
         kill_turn(pgid, child.as_ref());
         Ok(Completion::immediate())
     }
-
 
     /// RESUME (§5.6): mirrors `claude.rs::resume`'s shape with codex's own
     /// evidence — liveness plus rollout existence, never the durable
@@ -3685,7 +4127,13 @@ mod tests {
         );
         assert!(!argv.contains(&"-m".to_string()), "no model, no -m flag");
 
-        let pinned = first_turn_argv(&cwd, Some("gpt-5.6-luna"), SandboxChoice::WorkspaceWrite, &[], None);
+        let pinned = first_turn_argv(
+            &cwd,
+            Some("gpt-5.6-luna"),
+            SandboxChoice::WorkspaceWrite,
+            &[],
+            None,
+        );
         assert!(pinned.contains(&"-m".to_string()));
         let m_idx = pinned.iter().position(|a| a == "-m").unwrap();
         assert_eq!(pinned[m_idx + 1], "gpt-5.6-luna");
@@ -3707,7 +4155,10 @@ mod tests {
             &[],
             Some(Path::new("/data/codex-output-schema.json")),
         );
-        assert_eq!(with_schema.last().unwrap(), "/data/codex-output-schema.json");
+        assert_eq!(
+            with_schema.last().unwrap(),
+            "/data/codex-output-schema.json"
+        );
         assert_eq!(with_schema[with_schema.len() - 2], "--output-schema");
 
         // §4.2's own correction to W1's placeholder: --output-schema DOES
@@ -3745,7 +4196,7 @@ mod tests {
         assert!(!argv.contains(&"-s".to_string()));
         assert_eq!(SandboxChoice::Inherit.appserver_value(), None);
         assert_eq!(SandboxChoice::ReadOnly.exec_value(), Some("read-only"));
-        assert_eq!(SandboxChoice::ReadOnly.appserver_value(), Some("readOnly"));
+        assert_eq!(SandboxChoice::ReadOnly.appserver_value(), Some("read-only"));
     }
 
     #[test]
@@ -4389,5 +4840,98 @@ mod tests {
         let backend = CodexBackend::new(config);
         assert_eq!(backend.runtime_scope(), RuntimeScope::PerExecution);
         assert_eq!(backend.name(), CODEX_BACKEND_NAME);
+    }
+
+    // ------------------------------------------------------- W3 admission rows
+
+    /// L8, made structural (spec §2.1): every `claimed: true` names a real
+    /// (non-empty) admission test, and every v1 flag `capabilities()`
+    /// reports `true` has a matching, claimed row on *both* transports —
+    /// `capabilities()` takes no transport argument (§5.3), so the two
+    /// transports must agree on every boolean or the contract itself would
+    /// be a lie for whichever transport a registration resolves to.
+    #[test]
+    fn admission_rows_agree_with_capabilities() {
+        let config = CodexConfig::new(Path::new("/nonexistent"));
+        let backend = CodexBackend::new(config);
+        let caps = backend.capabilities();
+
+        let flags: &[(&str, bool)] = &[
+            ("persistent_sessions", caps.persistent_sessions),
+            ("native_background", caps.native_background),
+            ("streaming", caps.streaming),
+            ("history", caps.history),
+            ("resume", caps.resume),
+            ("interrupt", caps.interrupt),
+            ("model_selection", caps.model_selection),
+            ("profiles", caps.profiles),
+            ("approval_flow", caps.approval_flow),
+            ("human_attach", caps.human_attach),
+            ("usage", caps.usage),
+            ("native_subagents", caps.native_subagents),
+            ("ask", caps.ask),
+        ];
+
+        for &(flag, claimed_by_contract) in flags {
+            for transport in [Transport::Exec, Transport::AppServer] {
+                let row = ADMISSION_ROWS
+                    .iter()
+                    .find(|r| r.capability == flag && r.transport == transport)
+                    .unwrap_or_else(|| {
+                        panic!("no ADMISSION_ROWS entry for {flag} on {transport:?}")
+                    });
+                assert_eq!(
+                    row.claimed, claimed_by_contract,
+                    "{flag} on {transport:?}: capabilities() says {claimed_by_contract}, the row \
+                     says {}",
+                    row.claimed
+                );
+                // §2.1's structural rule is one-directional: a `claimed:
+                // true` MUST name a real test (L8, made structural). A
+                // `claimed: false` row MAY still name one — a deterministic
+                // test proving a negative deliberately (e.g. `approval_flow`
+                // on app-server: "every server request answered, the five
+                // approval methods always denied") is real evidence too,
+                // just not evidence *for* the flag.
+                if row.claimed {
+                    assert!(
+                        !row.admission_test.is_empty(),
+                        "{flag} on {transport:?}: claimed true with no admission_test named"
+                    );
+                }
+            }
+        }
+
+        // The two non-v1-flag rows (§4.1's structured_output, §3.1's
+        // sandbox_enforcement) hold the same invariant even though no
+        // `Capabilities` field checks them.
+        for capability in ["structured_output", "sandbox_enforcement"] {
+            for transport in [Transport::Exec, Transport::AppServer] {
+                let row = ADMISSION_ROWS
+                    .iter()
+                    .find(|r| r.capability == capability && r.transport == transport)
+                    .unwrap_or_else(|| {
+                        panic!("no ADMISSION_ROWS entry for {capability} on {transport:?}")
+                    });
+                if row.claimed {
+                    assert!(!row.admission_test.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_admission_rows_names_every_row_and_every_test() {
+        let rendered = render_admission_rows();
+        for row in ADMISSION_ROWS {
+            assert!(rendered.contains(row.capability));
+            if row.claimed {
+                assert!(
+                    rendered.contains(row.admission_test),
+                    "rendered table must name {}'s admission test",
+                    row.capability
+                );
+            }
+        }
     }
 }

@@ -108,7 +108,11 @@ pub(super) enum LineShape {
     ErrorResponse { id: u64, error: JsonRpcErrorInfo },
     /// `method` + `id`: the server is asking *us* something, and it **must
     /// be answered** (§3.4) — this is the shape 11 methods take (M8).
-    ServerRequest { id: Value, method: String, params: Value },
+    ServerRequest {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     /// `method`, no `id`: fire-and-forget.
     Notification { method: String, params: Value },
     /// Parsed as JSON but matches none of the above shapes.
@@ -521,7 +525,12 @@ impl AppServerHandle {
     /// Send one JSON-RPC request and block, bounded, for its response.
     /// `"jsonrpc":"2.0"` is stamped on everything sent (spec §1.5.1); nothing
     /// this client receives is required to carry it.
-    pub(super) fn call(&self, method: &str, params: Value, budget: Duration) -> Result<Value, String> {
+    pub(super) fn call(
+        &self,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.pending.lock().expect("pending lock").insert(id, tx);
@@ -584,7 +593,10 @@ pub(super) struct AppServerChild {
 /// re-delivered here; only notifications and server requests are.
 #[derive(Debug, Clone)]
 pub(super) enum InboundLine {
-    Notification { method: String, params: Value },
+    Notification {
+        method: String,
+        params: Value,
+    },
     /// `params` is carried but not yet read by `appserver_on_line` (only
     /// `id`/`method` decide the answer) — kept rather than dropped because
     /// it is exactly what an admitted `ask` path would need
@@ -676,15 +688,21 @@ impl AppServerChild {
                 };
                 match classify_line(&value) {
                     LineShape::Response { id, result } => {
-                        if let Some(tx) =
-                            reader_handle.pending.lock().expect("pending lock").remove(&id)
+                        if let Some(tx) = reader_handle
+                            .pending
+                            .lock()
+                            .expect("pending lock")
+                            .remove(&id)
                         {
                             let _ = tx.send(Ok(result));
                         }
                     }
                     LineShape::ErrorResponse { id, error } => {
-                        if let Some(tx) =
-                            reader_handle.pending.lock().expect("pending lock").remove(&id)
+                        if let Some(tx) = reader_handle
+                            .pending
+                            .lock()
+                            .expect("pending lock")
+                            .remove(&id)
                         {
                             let _ = tx.send(Err(error));
                         }
@@ -817,7 +835,10 @@ mod tests {
             },
             "a method+id line is a server request regardless of a jsonrpc field"
         );
-        assert_eq!(classify_line(&json!({"foo": "bar"})), LineShape::Unrecognized);
+        assert_eq!(
+            classify_line(&json!({"foo": "bar"})),
+            LineShape::Unrecognized
+        );
     }
 
     // --------------------------------------------- ordering (test 2)
@@ -904,7 +925,10 @@ mod tests {
         // §2.3: usage arrives on its own notification, never duplicated onto
         // the terminal — the fixture's own turn/completed carries no usage
         // key at all, and this decoder never reads one from there.
-        assert!(acc.usage.is_some(), "usage was captured from the separate notification");
+        assert!(
+            acc.usage.is_some(),
+            "usage was captured from the separate notification"
+        );
         assert!(
             acc.usage.as_ref().unwrap().get("total").is_some(),
             "the real shape has a total/last split, not a flat usage object"
@@ -1024,7 +1048,10 @@ mod tests {
             }
         }
         let outcome = super::super::classify_terminal(&acc, false);
-        assert!(matches!(outcome, super::super::TerminalOutcome::Interrupted));
+        assert!(matches!(
+            outcome,
+            super::super::TerminalOutcome::Interrupted
+        ));
         assert!(
             !matches!(outcome, super::super::TerminalOutcome::InterruptedRunning),
             "harness-confirmed interrupt must not collapse into the exec-only inferred arm"
@@ -1076,12 +1103,11 @@ mod tests {
 
     #[test]
     fn appserver_answers_every_server_request_including_unknown_ones() {
-        let methods: Vec<&str> = include_str!(
-            "../../tests/fixtures/codex-appserver-0.149.0-server-request-methods.txt"
-        )
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+        let methods: Vec<&str> =
+            include_str!("../../tests/fixtures/codex-appserver-0.149.0-server-request-methods.txt")
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
         assert_eq!(methods.len(), 11, "M8's own count");
         for method in &methods {
             let answered = answer_for_request(method, false);
@@ -1119,7 +1145,11 @@ mod tests {
                 "decision",
                 vec!["decline"],
             ),
-            ("item/fileChange/requestApproval", "decision", vec!["decline"]),
+            (
+                "item/fileChange/requestApproval",
+                "decision",
+                vec!["decline"],
+            ),
             ("applyPatchApproval", "decision", vec!["abort"]),
             ("execCommandApproval", "decision", vec!["abort"]),
         ] {
@@ -1160,10 +1190,12 @@ mod tests {
     #[test]
     fn appserver_unknown_methods_are_counted_never_decoded() {
         let mut acc = TurnAccumulator::new();
-        let events =
-            acc.ingest_appserver_notification("remoteControl/status/changed", &json!({}));
+        let events = acc.ingest_appserver_notification("remoteControl/status/changed", &json!({}));
         assert!(events.is_empty());
-        assert_eq!(acc.unknown_methods, vec!["remoteControl/status/changed".to_string()]);
+        assert_eq!(
+            acc.unknown_methods,
+            vec!["remoteControl/status/changed".to_string()]
+        );
     }
 
     // ------------------------------------------------- malformed line (14)
