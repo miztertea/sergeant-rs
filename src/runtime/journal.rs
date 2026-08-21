@@ -1062,7 +1062,7 @@ fn segment_file_name(index: u64) -> String {
 }
 
 /// Segment files in the journal dir, sorted ascending by index.
-fn list_segments(journal_dir: &Path) -> Result<Vec<(u64, PathBuf)>, JournalError> {
+pub(crate) fn list_segments(journal_dir: &Path) -> Result<Vec<(u64, PathBuf)>, JournalError> {
     let mut segments = Vec::new();
     for entry in fs::read_dir(journal_dir)? {
         let entry = entry?;
@@ -1080,6 +1080,60 @@ fn list_segments(journal_dir: &Path) -> Result<Vec<(u64, PathBuf)>, JournalError
     }
     segments.sort_unstable_by_key(|(index, _)| *index);
     Ok(segments)
+}
+
+/// [`Journal::segment_bounds`]'s lock-free sibling: extents of every segment
+/// that holds at least one event, for a caller with no open writer handle —
+/// `sgt doctor`, running in a separate process while the daemon may hold the
+/// journal's exclusive lock (recon correction 7). Takes the tail seq
+/// explicitly rather than reading a live `next_seq`, because a lock-free
+/// reader has no such field: the caller already knows it from its own
+/// floor-to-head replay (`Journal::replay_data_dir_from_floor`'s last yielded
+/// seq), and supplying it here costs nothing the caller has not already paid
+/// for.
+///
+/// Same cost as `segment_bounds`: one line read per segment ([`first_seq`])
+/// plus one `metadata()` call. Tolerates the identical torn-tail race
+/// `replay_data_dir`'s own doc comment names — a segment rotated away
+/// between the `list_segments` call and this function's `metadata()` read is
+/// treated as absent (`NotFound` skips that entry) rather than as an error,
+/// matching W3 §10.5's lock-free-reader tolerance.
+pub fn segment_bounds_for_dir(
+    journal_dir: &Path,
+    tail_seq: u64,
+) -> Result<Vec<SegmentBound>, JournalError> {
+    let segments = list_segments(journal_dir)?;
+    let mut bounds: Vec<SegmentBound> = Vec::new();
+    for (index, path) in segments {
+        let first = match first_seq(&path) {
+            Ok(Some(f)) => f,
+            Ok(None) => continue,
+            Err(e) if e.is_possible_torn_tail() => continue,
+            Err(JournalError::Io(io)) if io.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let bytes = match fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        bounds.push(SegmentBound {
+            index,
+            path,
+            first_seq: first,
+            last_seq: 0,
+            bytes,
+        });
+    }
+    let len = bounds.len();
+    for i in 0..len {
+        bounds[i].last_seq = if i + 1 < len {
+            bounds[i + 1].first_seq - 1
+        } else {
+            tail_seq
+        };
+    }
+    Ok(bounds)
 }
 
 fn create_segment(journal_dir: &Path, index: u64) -> Result<(u64, PathBuf), JournalError> {
@@ -1744,6 +1798,48 @@ pub(crate) mod tests {
             bounds.iter().map(|b| b.first_seq).collect::<Vec<_>>(),
             [1, 2]
         );
+    }
+
+    /// The pinning test that keeps `segment_bounds_for_dir` from drifting
+    /// apart from `segment_bounds`: on the same journal, the lock-free
+    /// function (fed the writer's own `next_seq - 1` as `tail_seq`) must
+    /// agree with the locked one apart from ordering.
+    #[test]
+    fn segment_bounds_for_dir_agrees_with_segment_bounds_on_the_same_journal() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=3 {
+            journal.append(draft(n)).expect("append");
+        }
+        let locked = journal.segment_bounds().expect("segment_bounds");
+        let tail_seq = journal.next_seq().saturating_sub(1);
+        let journal_dir = dir.path().join("journal");
+        let unlocked =
+            segment_bounds_for_dir(&journal_dir, tail_seq).expect("segment_bounds_for_dir");
+        assert_eq!(locked, unlocked);
+    }
+
+    /// W3 §10.5's lock-free-reader tolerance, exercised on the new function
+    /// specifically: a segment that vanishes between `list_segments` and
+    /// this function's own `metadata()` read is skipped, not an error.
+    #[test]
+    fn segment_bounds_for_dir_tolerates_a_segment_pruned_between_list_and_stat() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=2 {
+            journal.append(draft(n)).expect("append");
+        }
+        let journal_dir = dir.path().join("journal");
+        let tail_seq = journal.next_seq().saturating_sub(1);
+        // Simulate a prune racing the scan: unlink the oldest segment after
+        // `list_segments` would have seen it, before `first_seq`/`metadata`
+        // gets to it. There is no seam to interrupt the function mid-flight,
+        // so this proves the *tolerance path* directly: deleting a segment
+        // and re-running must not error, and the survivor is still bounded.
+        std::fs::remove_file(journal_dir.join(segment_file_name(1))).expect("remove segment 1");
+        let bounds =
+            segment_bounds_for_dir(&journal_dir, tail_seq).expect("segment_bounds_for_dir");
+        assert_eq!(bounds.iter().map(|b| b.first_seq).collect::<Vec<_>>(), [2]);
     }
 
     #[test]
