@@ -508,9 +508,7 @@ pub async fn start_with(
     // journal on every start (windowed exactly like every other sink), so
     // deleting it and restarting is indistinguishable from restarting.
     let mut analytics = Analytics::begin_rebuild(data_dir)?;
-    let mut capability_sink = startup::CapabilitySink {
-        latest: plan.capability_seed(),
-    };
+    let mut capability_sink = startup::CapabilitySink::seeded(plan.capability_seed());
     // Loaded once, never mutated by the pass (§26 Q8's below-window ledger) —
     // a separate seed from the one `LedgerSink` folds forward, so `Core`'s
     // copy always names exactly the below-window keys the cache carried in,

@@ -19,11 +19,14 @@
 mod support;
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::Path;
 
+use http_body_util::BodyExt;
 use serde_json::json;
 use tempfile::TempDir;
 
+use sergeant_rs::api::{Core, below_floor_refusal};
 use sergeant_rs::backend::BackendRegistry;
 use sergeant_rs::backend::claude::AskWithdrawal;
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
@@ -54,6 +57,37 @@ fn ulid() -> String {
     ulid::Ulid::generate().to_string()
 }
 
+/// Synchronously decode an axum `Response`'s status and JSON body.
+///
+/// `assert_registry_pinned` runs from both plain `#[test]`s and
+/// `#[tokio::test]`s (some of the latter via a `std::panic::catch_unwind`
+/// closure that cannot itself be `async`), so this deliberately does not
+/// require a Tokio runtime: `below_floor_refusal`'s body is always a single,
+/// already-serialized `Bytes` buffer (`Json::into_response` — never a
+/// stream), so a body future built over it resolves on its very first poll.
+/// A noop waker is therefore exactly right — if that ever stops being true,
+/// this panics loudly instead of hanging.
+fn response_body_json(
+    response: axum::response::Response,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    let status = response.status();
+    let mut collect = std::pin::pin!(response.into_body().collect());
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let collected = match collect.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(result) => {
+            result.expect("below_floor_refusal's body must not itself error")
+        }
+        std::task::Poll::Pending => panic!(
+            "below_floor_refusal's response body was not immediately ready — it must be a \
+             fully-buffered Json body, never a stream"
+        ),
+    };
+    let bytes = collected.to_bytes();
+    let json = serde_json::from_slice(&bytes).expect("below_floor_refusal's body must be JSON");
+    (status, json)
+}
+
 // ------------------------------------------------------------------
 // The compile-time gate (§6.3)
 // ------------------------------------------------------------------
@@ -71,6 +105,8 @@ fn assert_registry_pinned(
     cache: &FloorState,
     full_capability: Option<&AskWithdrawal>,
     windowed_capability: Option<&AskWithdrawal>,
+    full_last_seq: u64,
+    windowed_last_seq: u64,
 ) {
     let WorkRegistry {
         works,
@@ -114,11 +150,42 @@ fn assert_registry_pinned(
         .collect();
     for id in commands.keys() {
         if !windowed.commands.contains_key(id) {
-            assert!(
-                cache_commands.contains_key(id.as_str()),
-                "command {id} is below the window but missing from the cache's ledger — \
-                 §26 could no longer refuse it by name"
+            let row = *cache_commands.get(id.as_str()).unwrap_or_else(|| {
+                panic!(
+                    "command {id} is below the window but missing from the cache's ledger — \
+                     §26 could no longer refuse it by name"
+                )
+            });
+
+            // (c) the refusal itself: the real `below_floor_refusal`, not a
+            // re-implementation, must answer 409 with the right code — and,
+            // for a submit, the right Work, checked against `full`'s own
+            // ground-truth `command_works` index rather than merely echoed
+            // back from the same row already checked above.
+            let (status, body) = response_body_json(below_floor_refusal(row));
+            assert_eq!(
+                status,
+                axum::http::StatusCode::CONFLICT,
+                "below_floor_refusal for below-window command {id} must answer 409, not {status}"
             );
+            assert_eq!(
+                body["error"]["code"],
+                json!("command_below_replay_window"),
+                "below_floor_refusal for {id} must use §4.3's error code"
+            );
+            assert_eq!(
+                body["error"]["command_id"],
+                json!(id),
+                "below_floor_refusal's body must name the command it refused"
+            );
+            if let Some(expected_work_id) = command_works.get(id) {
+                assert_eq!(
+                    body["error"]["work_id"],
+                    json!(expected_work_id),
+                    "a below-window submit's refusal must name the same Work `full`'s own \
+                     command_works index (the ground truth, not the cache) says it created"
+                );
+            }
         }
     }
 
@@ -189,6 +256,14 @@ fn assert_registry_pinned(
          cache-seed-plus-window"
     );
 
+    // §6.3, outside the destructuring: the projections' own high-water-mark
+    // seq (`Projection::last_seq()`, distinct from `work_index`'s per-row
+    // `last_seq` already asserted above) must agree too.
+    assert_eq!(
+        full_last_seq, windowed_last_seq,
+        "Projection::last_seq() must match between a full replay and cache+window"
+    );
+
     // Cache round-trip.
     let bytes = serde_json::to_vec(cache).expect("serialize FloorState");
     let back: FloorState = serde_json::from_slice(&bytes).expect("deserialize FloorState");
@@ -209,7 +284,7 @@ fn assert_registry_pinned(
 fn run_full_pass(
     journal: &Journal,
     analytics_scratch: &Path,
-) -> (WorkRegistry, CapabilitySink, LedgerSink, HorizonSink) {
+) -> (WorkRegistry, u64, CapabilitySink, LedgerSink, HorizonSink) {
     let mut registry = work_registry_projection();
     let mut analytics = Analytics::begin_rebuild(analytics_scratch).expect("analytics scratch");
     let mut capability = CapabilitySink::default();
@@ -229,7 +304,18 @@ fn run_full_pass(
         )
         .expect("drive (full pass)");
     }
-    (registry.state().clone(), capability, ledger, horizon_sink)
+    // §6.3, outside the destructuring: `last_seq()` is read from the
+    // `Projection` wrapper itself, before `.state()` discards it — a
+    // full-replay's own high-water mark, compared against the windowed
+    // pass's in `run_i9`.
+    let last_seq = registry.last_seq();
+    (
+        registry.state().clone(),
+        last_seq,
+        capability,
+        ledger,
+        horizon_sink,
+    )
 }
 
 /// Build the `FloorState` a start over `journal` would leave behind, using
@@ -267,38 +353,76 @@ fn run_windowed_pass(
     journal: &Journal,
     cache: &FloorState,
     window_seq: u64,
-) -> (WorkRegistry, Option<AskWithdrawal>) {
+) -> (WorkRegistry, u64, Option<AskWithdrawal>) {
     let plan = Plan::Windowed {
         cache: cache.clone(),
         window_seq,
     };
     let mut registry = plan.seed_registry();
-    let mut capability = CapabilitySink {
-        latest: cache.capability_provenance.clone(),
-    };
+    let mut capability = CapabilitySink::seeded(cache.capability_provenance.clone());
     startup::drive(
         plan.replay(journal).expect("replay"),
         &mut [&mut RegistrySink(&mut registry), &mut capability],
     )
     .expect("drive (windowed pass)");
-    (registry.state().clone(), capability.latest)
+    let last_seq = registry.last_seq();
+    (registry.state().clone(), last_seq, capability.latest)
 }
 
 /// Run both passes over `journal` and assert they pin, per
 /// `assert_registry_pinned`. Returns the built cache, for callers that want
 /// to mutate it and prove the gate fails (§6.4).
 fn run_i9(journal: &Journal, analytics_scratch: &Path) -> FloorState {
-    let (full, capability, ledger, horizon_sink) = run_full_pass(journal, analytics_scratch);
+    let (full, full_last_seq, capability, ledger, horizon_sink) =
+        run_full_pass(journal, analytics_scratch);
     let (cache, window_seq) = build_cache(journal, &full, &ledger, &capability, &horizon_sink);
-    let (windowed, windowed_capability) = run_windowed_pass(journal, &cache, window_seq);
+    let (windowed, windowed_last_seq, windowed_capability) =
+        run_windowed_pass(journal, &cache, window_seq);
     assert_registry_pinned(
         &full,
         &windowed,
         &cache,
         capability.latest.as_ref(),
         windowed_capability.as_ref(),
+        full_last_seq,
+        windowed_last_seq,
     );
     cache
+}
+
+// ------------------------------------------------------------------
+// §6.3, outside the destructuring: `Plan::Full` starts leave
+// `Core::floor_ledger` empty
+// ------------------------------------------------------------------
+
+/// §4.1's own construction argument, pinned at runtime rather than left as
+/// only a doc comment: "`floor_ledger` is empty on a `Plan::Full` start *by
+/// construction* … Assert it in the I9 suite." A full replay already put
+/// every command the journal has into `registry.commands`, so
+/// `Plan::ledger_seed()` is empty, and the `Core` a `Plan::Full` start builds
+/// never receives anything else.
+#[test]
+fn plan_full_leaves_core_floor_ledger_empty() {
+    let dir = TempDir::new().expect("tempdir");
+    let journal = Journal::open(dir.path()).expect("open a fresh journal");
+    let plan = Plan::Full {
+        floor_seq: 1,
+        window_seq: 0,
+        miss: CacheMiss::Absent,
+    };
+    assert!(
+        plan.ledger_seed().is_empty(),
+        "Plan::Full's ledger_seed must be empty by construction"
+    );
+
+    let registry = plan.seed_registry();
+    let (events_tx, _rx) = tokio::sync::broadcast::channel(1);
+    let core = Core::new(journal, registry, events_tx)
+        .with_floor_ledger(std::sync::Arc::new(plan.ledger_seed()));
+    assert!(
+        core.floor_ledger.is_empty(),
+        "a Plan::Full start must leave Core::floor_ledger empty"
+    );
 }
 
 // ------------------------------------------------------------------
@@ -411,6 +535,146 @@ async fn the_real_daemon_journal_pins() {
 
     let scratch = TempDir::new().expect("scratch");
     run_i9(&journal, scratch.path());
+}
+
+/// §26's live end: a below-window `command_id` retried against a *running*
+/// daemon must come back as a real HTTP 409, not an in-process function
+/// call — the half of the wave's acceptance case no test before this one
+/// drove through an actual server. Three daemon lives over the same data
+/// dir: the first submits the command that will end up below the window and
+/// enough padding to push the journal past it; the second has no cache yet
+/// (`Plan::Full`, `miss:absent`) and, per §2.6, is the start whose end-of-
+/// fold write leaves behind the cache the third loads (`Plan::Windowed`,
+/// `hit`) — only on the third does the retry actually reach
+/// `Core::floor_ledger`.
+#[tokio::test]
+async fn a_below_window_command_id_is_refused_by_name_through_a_real_http_retry() {
+    let data = DataDir::new();
+    let root = TempDir::new().expect("tempdir");
+    let (_mount, _head) = support::scaffold_solo_estate(root.path(), "solo");
+    write_one_stage_workflow(root.path());
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .expect("client");
+
+    let early_command_id = ulid();
+    let submit_body = json!({
+        "command_id": early_command_id,
+        "intent": "below-window refusal fixture",
+        "origin": {"client": "cli", "cwd": root.path()},
+    });
+    let early_work_id;
+
+    // Life 1: the command that will end up below the window, plus enough
+    // padding works to push the journal past STARTUP_WINDOW_SEGMENTS at a
+    // 256-byte threshold.
+    {
+        let script: Vec<FakeStep> = (0..14).map(|_| FakeStep::complete()).collect();
+        let (handle, _fake) = start_fake_tiny_segments(data.path(), root.path(), script).await;
+
+        let resp = http
+            .post(format!("{}/v1/work", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&submit_body)
+            .send()
+            .await
+            .expect("submit the early command");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::CREATED,
+            "{:?}",
+            resp.text().await
+        );
+        let body: serde_json::Value = resp.json().await.expect("json");
+        early_work_id = body["work"]["id"]
+            .as_str()
+            .expect("submit response must carry the Work id")
+            .to_string();
+
+        for _ in 0..12 {
+            let resp = http
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&json!({
+                    "command_id": ulid(),
+                    "intent": "padding work",
+                    "origin": {"client": "cli", "cwd": root.path()},
+                }))
+                .send()
+                .await
+                .expect("submit padding");
+            assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        }
+        for _ in 0..50 {
+            let system: serde_json::Value = http
+                .get(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("list")
+                .json()
+                .await
+                .expect("json");
+            let all_done = system
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .all(|w| w["state"] == "completed" || w["state"] == "failed")
+                })
+                .unwrap_or(false);
+            if all_done {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        handle.shutdown().await;
+    }
+
+    // Sanity: the fixture must actually exceed the window, or nothing below
+    // proves anything.
+    {
+        let journal = Journal::open(data.path()).expect("reopen journal");
+        let bounds = journal.segment_bounds().expect("bounds");
+        assert!(
+            bounds.len() > 16,
+            "fixture must actually exceed the window (got {} segments)",
+            bounds.len()
+        );
+    }
+
+    // Life 2: no cache exists yet (`Plan::Full`, `miss:absent`) — this start
+    // is the one whose end-of-fold write (§2.6) leaves the cache life 3
+    // will load.
+    {
+        let (handle, _fake) =
+            start_fake_tiny_segments(data.path(), root.path(), Vec::<FakeStep>::new()).await;
+        handle.shutdown().await;
+    }
+
+    // Life 3: loads life 2's cache (`Plan::Windowed`, `hit`) — the early
+    // command_id is now below the window, served from `Core::floor_ledger`.
+    let (handle, _fake) =
+        start_fake_tiny_segments(data.path(), root.path(), Vec::<FakeStep>::new()).await;
+    let resp = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&submit_body)
+        .send()
+        .await
+        .expect("retry the below-window command");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a below-window command_id retry must be refused with 409, not replayed or \
+         re-executed: {:?}",
+        resp.text().await
+    );
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "command_below_replay_window");
+    assert_eq!(body["error"]["work_id"], json!(early_work_id));
+    handle.shutdown().await;
 }
 
 // ------------------------------------------------------------------
@@ -695,7 +959,8 @@ fn the_gate_fails_when_the_cache_drops_the_capability_watermark() {
     let dir = TempDir::new().expect("tempdir");
     let journal = build_kind_exhaustive_journal(dir.path());
     let scratch = TempDir::new().expect("scratch");
-    let (full, capability, ledger, horizon_sink) = run_full_pass(&journal, scratch.path());
+    let (full, full_last_seq, capability, ledger, horizon_sink) =
+        run_full_pass(&journal, scratch.path());
     let (mut cache, window_seq) = build_cache(&journal, &full, &ledger, &capability, &horizon_sink);
     assert!(
         cache.capability_provenance.is_some(),
@@ -703,7 +968,8 @@ fn the_gate_fails_when_the_cache_drops_the_capability_watermark() {
     );
     cache.capability_provenance = None; // the mutation this test exists to catch
 
-    let (windowed, windowed_capability) = run_windowed_pass(&journal, &cache, window_seq);
+    let (windowed, windowed_last_seq, windowed_capability) =
+        run_windowed_pass(&journal, &cache, window_seq);
     let result = std::panic::catch_unwind(|| {
         assert_registry_pinned(
             &full,
@@ -711,6 +977,8 @@ fn the_gate_fails_when_the_cache_drops_the_capability_watermark() {
             &cache,
             capability.latest.as_ref(),
             windowed_capability.as_ref(),
+            full_last_seq,
+            windowed_last_seq,
         );
     });
     assert!(
@@ -724,7 +992,8 @@ fn the_gate_fails_when_the_cache_drops_a_settled_works_row() {
     let dir = TempDir::new().expect("tempdir");
     let journal = build_kind_exhaustive_journal(dir.path());
     let scratch = TempDir::new().expect("scratch");
-    let (full, capability, ledger, horizon_sink) = run_full_pass(&journal, scratch.path());
+    let (full, full_last_seq, capability, ledger, horizon_sink) =
+        run_full_pass(&journal, scratch.path());
     let (mut cache, window_seq) = build_cache(&journal, &full, &ledger, &capability, &horizon_sink);
     assert!(
         !cache.works.is_empty(),
@@ -732,7 +1001,8 @@ fn the_gate_fails_when_the_cache_drops_a_settled_works_row() {
     );
     cache.works.pop(); // the mutation this test exists to catch
 
-    let (windowed, windowed_capability) = run_windowed_pass(&journal, &cache, window_seq);
+    let (windowed, windowed_last_seq, windowed_capability) =
+        run_windowed_pass(&journal, &cache, window_seq);
     let result = std::panic::catch_unwind(|| {
         assert_registry_pinned(
             &full,
@@ -740,6 +1010,8 @@ fn the_gate_fails_when_the_cache_drops_a_settled_works_row() {
             &cache,
             capability.latest.as_ref(),
             windowed_capability.as_ref(),
+            full_last_seq,
+            windowed_last_seq,
         );
     });
     assert!(
@@ -753,7 +1025,8 @@ fn the_gate_fails_when_the_cache_drops_a_command_row() {
     let dir = TempDir::new().expect("tempdir");
     let journal = build_kind_exhaustive_journal(dir.path());
     let scratch = TempDir::new().expect("scratch");
-    let (full, capability, ledger, horizon_sink) = run_full_pass(&journal, scratch.path());
+    let (full, full_last_seq, capability, ledger, horizon_sink) =
+        run_full_pass(&journal, scratch.path());
     let (mut cache, window_seq) = build_cache(&journal, &full, &ledger, &capability, &horizon_sink);
     assert!(
         !cache.commands.is_empty(),
@@ -761,7 +1034,8 @@ fn the_gate_fails_when_the_cache_drops_a_command_row() {
     );
     cache.commands.pop(); // the mutation this test exists to catch
 
-    let (windowed, windowed_capability) = run_windowed_pass(&journal, &cache, window_seq);
+    let (windowed, windowed_last_seq, windowed_capability) =
+        run_windowed_pass(&journal, &cache, window_seq);
     let result = std::panic::catch_unwind(|| {
         assert_registry_pinned(
             &full,
@@ -769,6 +1043,8 @@ fn the_gate_fails_when_the_cache_drops_a_command_row() {
             &cache,
             capability.latest.as_ref(),
             windowed_capability.as_ref(),
+            full_last_seq,
+            windowed_last_seq,
         );
     });
     assert!(

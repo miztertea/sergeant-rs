@@ -216,8 +216,30 @@ impl ReplaySink for AnalyticsSink<'_> {
 /// the live instance of the fourth startup walk this wave collapses.
 #[derive(Debug, Default)]
 pub struct CapabilitySink {
-    /// The highest-seq withdrawal this sink has seen.
+    /// The highest-seq withdrawal this sink has seen. Seeded from the prior
+    /// cache's `capability_provenance` and then folded forward in place by
+    /// every in-window event — `note_ask_withdrawal`'s "highest seq always
+    /// wins" rule means a newer in-window withdrawal overwrites the seed
+    /// here even when that new seq lands *above* this same start's horizon.
     pub latest: Option<AskWithdrawal>,
+    /// What `latest` was seeded with, before this pass touched it. Kept
+    /// separately — never folded — so `build_floor_state` can fall back to
+    /// it when `latest` has been carried past the horizon: the seed is
+    /// always `seq <= H_old <= H` (§2.5), so it is always a legal answer,
+    /// while `latest` folding past `H` is exactly the case the fallback
+    /// exists for.
+    seed: Option<AskWithdrawal>,
+}
+
+impl CapabilitySink {
+    /// Seed from a prior cache's `capability_provenance`, mirroring
+    /// `LedgerSink::seeded`.
+    pub fn seeded(seed: Option<AskWithdrawal>) -> Self {
+        Self {
+            latest: seed.clone(),
+            seed,
+        }
+    }
 }
 
 impl ReplaySink for CapabilitySink {
@@ -972,7 +994,19 @@ fn build_floor_state(
         .collect();
     commands.sort_unstable_by(|a, b| a.command_id.cmp(&b.command_id));
 
-    let capability_provenance = capability.latest.clone().filter(|w| w.seq <= horizon);
+    // capability_provenance = the watermark if its seq <= H, else the
+    // seeded one (this fn's own doc comment) — `capability.latest` can be
+    // carried, by `note_ask_withdrawal`'s single-scalar "highest seq wins"
+    // fold, past this same start's horizon (an open Work can hold H back
+    // across restarts while a capability withdrawal keeps recurring
+    // in-window); falling back to `capability.seed` is what keeps the
+    // written cache's watermark honestly `<= H` instead of dropping to
+    // `null` and discarding a still-valid, previously cached value.
+    let capability_provenance = capability
+        .latest
+        .clone()
+        .filter(|w| w.seq <= horizon)
+        .or_else(|| capability.seed.clone());
 
     Ok(Some(FloorState {
         schema: FLOOR_STATE_SCHEMA.to_string(),
@@ -1437,6 +1471,150 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// §9.1 step 5's own corruption list includes "rename a segment", and
+    /// deleting the leading one is the only way W2 ever reaches a floor > 1
+    /// (§2.4 step 6's own comment: "this branch is exercised only by tests
+    /// that delete a leading segment in a test DataDir"). Two of the nine
+    /// `CacheMiss` variants a corruption can produce had no dedicated test
+    /// before this: this one is `FloorMoved`.
+    #[test]
+    fn resolve_reports_floor_moved_when_the_leading_segment_is_deleted() {
+        let dir = TempDir::new().expect("tempdir");
+        let (journal, cache) = build_journal_and_cache(dir.path());
+        write_cache(dir.path(), &cache);
+        let leading = journal.segment_bounds().expect("bounds")[0].path.clone();
+        std::fs::remove_file(&leading).expect("remove leading segment");
+
+        let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");
+        assert!(
+            matches!(
+                plan,
+                Plan::Full {
+                    miss: CacheMiss::FloorMoved { .. },
+                    ..
+                }
+            ),
+            "deleting the leading segment must report the *specific* FloorMoved variant, \
+             not merely rebuild: {plan:?}"
+        );
+    }
+
+    /// The sibling of the test above: deleting a non-leading summarized
+    /// segment leaves the prefix's first index untouched (so this must not
+    /// report `FloorMoved`) but desynchronizes every summarized bound from
+    /// that point on — `SegmentSetChanged`, the other of the two `CacheMiss`
+    /// variants §9.1 step 5 required and neither had before this.
+    #[test]
+    fn resolve_reports_segment_set_changed_when_a_middle_segment_is_deleted() {
+        let dir = TempDir::new().expect("tempdir");
+        let (journal, cache) = build_journal_and_cache(dir.path());
+        write_cache(dir.path(), &cache);
+        let bounds = journal.segment_bounds().expect("bounds");
+        assert!(
+            cache.binding.segments.len() > 2,
+            "fixture needs at least 3 summarized segments so the deleted one is neither \
+             the leading one nor the whole summarized set"
+        );
+        // Segment index 2 (position 1): not the leading segment, so this
+        // must not trip `FloorMoved`.
+        std::fs::remove_file(&bounds[1].path).expect("remove a middle segment");
+
+        let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");
+        assert!(
+            matches!(
+                plan,
+                Plan::Full {
+                    miss: CacheMiss::SegmentSetChanged { .. },
+                    ..
+                }
+            ),
+            "deleting a middle segment must report the *specific* SegmentSetChanged variant, \
+             not merely rebuild and not FloorMoved: {plan:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // build_floor_state — capability_provenance's seed fallback
+    // -------------------------------------------------------------
+
+    /// Regression pin (invariants finding): `build_floor_state`'s own doc
+    /// comment states "capability_provenance = the watermark if its seq
+    /// `<= H`, else the seeded one". `capability.latest` is folded in place
+    /// by `note_ask_withdrawal`'s single-scalar "highest seq wins" rule, so
+    /// a recurring in-window withdrawal can carry it *past* this same call's
+    /// horizon while the seed (always `seq <= H_old <= H`, §2.5) is still a
+    /// legal answer. Before this fix the function had no `else` at all and
+    /// wrote `null`, silently discarding a still-valid, previously cached
+    /// watermark.
+    #[test]
+    fn build_floor_state_falls_back_to_the_seeded_capability_watermark_past_the_horizon() {
+        let dir = TempDir::new().expect("tempdir");
+        let (journal, cache) = build_journal_and_cache(dir.path());
+        let bounds = journal.segment_bounds().expect("segment_bounds");
+        let horizon = cache.binding.summarized_through_seq;
+        assert!(horizon > 0, "fixture must summarize something");
+
+        let seed = AskWithdrawal {
+            seq: 1,
+            version: "2.1.100".to_string(),
+        };
+        let mut capability = CapabilitySink::seeded(Some(seed.clone()));
+        // A later in-window event supersedes the seed in the running fold,
+        // landing past this start's own horizon.
+        capability.latest = Some(AskWithdrawal {
+            seq: horizon + 1,
+            version: "2.1.200".to_string(),
+        });
+
+        let registry = WorkRegistry::default();
+        let ledger = LedgerSink::default();
+        let state = build_floor_state(&bounds, horizon, &registry, &ledger, &capability)
+            .expect("build_floor_state")
+            .expect("H > 0 must produce a cache");
+
+        assert_eq!(
+            state.capability_provenance,
+            Some(seed),
+            "capability_provenance must fall back to the seeded watermark rather than \
+             dropping to null when the running fold's `latest` has been carried past H"
+        );
+    }
+
+    /// The ordinary case, alongside the fallback above: when `latest` is
+    /// still `<= H`, it is used as-is (the seed is not preferred just for
+    /// existing).
+    #[test]
+    fn build_floor_state_uses_latest_capability_watermark_when_still_within_the_horizon() {
+        let dir = TempDir::new().expect("tempdir");
+        let (journal, cache) = build_journal_and_cache(dir.path());
+        let bounds = journal.segment_bounds().expect("segment_bounds");
+        let horizon = cache.binding.summarized_through_seq;
+        assert!(horizon > 0, "fixture must summarize something");
+
+        let seed = AskWithdrawal {
+            seq: 1,
+            version: "2.1.100".to_string(),
+        };
+        let latest = AskWithdrawal {
+            seq: horizon,
+            version: "2.1.150".to_string(),
+        };
+        let mut capability = CapabilitySink::seeded(Some(seed));
+        capability.latest = Some(latest.clone());
+
+        let registry = WorkRegistry::default();
+        let ledger = LedgerSink::default();
+        let state = build_floor_state(&bounds, horizon, &registry, &ledger, &capability)
+            .expect("build_floor_state")
+            .expect("H > 0 must produce a cache");
+
+        assert_eq!(
+            state.capability_provenance,
+            Some(latest),
+            "an in-window watermark still <= H must win over the seed"
+        );
     }
 
     // -------------------------------------------------------------

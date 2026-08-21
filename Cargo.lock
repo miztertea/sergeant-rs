@@ -2928,6 +2928,7 @@ dependencies = [
  "blake3",
  "clap",
  "duckdb",
+ "http-body-util",
  "include_dir",
  "opentelemetry",
  "opentelemetry-otlp",
