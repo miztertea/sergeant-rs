@@ -718,3 +718,102 @@ async fn work_transcript_replay_is_bounded_to_the_works_own_first_seq() {
         "the bound must never drop any of the recent Work's own events"
     );
 }
+
+/// §1.3 continued: the test above proves the bound against `Core::events_after`
+/// directly, but never calls `work_transcript` itself, so it would still
+/// pass even if the handler's own `from` computation (src/api.rs, the
+/// `first_seq_by_work` lookup) were reverted to a bare `0` — the finding
+/// this test answers. Its own doc comment (and this file's copy above)
+/// explains why the HTTP *response body* cannot distinguish a correct bound
+/// from `from=0`: `transcript_turns` filters by `work_id` internally, so an
+/// unbounded replay's extra events never surface in the JSON either way.
+///
+/// The *status code* can, though: with a tiny `segment_max_bytes` (as
+/// `start_with_retention` sets), enough old Works rotate the journal into
+/// several segments before the recent one that a correctly-bounded replay
+/// (`Replay::after`'s segment-skip, unchanged by this wave) never opens the
+/// oldest segment at all. Corrupting that oldest segment — proven, not
+/// merely assumed, to hold none of the recent Work's own events — leaves a
+/// correct bound untouched (200) while a replay from the floor or from `0`
+/// would hit the corruption immediately and 500. This drives the real
+/// `GET /v1/work/{id}/transcript` handler over HTTP, the same daemon the
+/// other transcript tests in this file use.
+#[tokio::test]
+async fn work_transcript_over_http_skips_a_corrupted_segment_before_the_works_own_first_seq() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = TempDir::new().expect("tempdir");
+    support::scaffold_solo_estate(root.path(), "solo");
+    write_one_stage_workflow(root.path());
+    let http = client();
+
+    const OLD_WORKS: usize = 8;
+    let script: Vec<FakeStep> = (0..OLD_WORKS + 1).map(|_| FakeStep::complete()).collect();
+    let handle = start_with_retention(dir.path(), root.path(), 1_000_000, script).await;
+    for n in 0..OLD_WORKS {
+        submit(
+            &http,
+            &handle,
+            root.path(),
+            &ulid(),
+            &format!("old junk {n}"),
+        )
+        .await;
+    }
+    let body = submit(&http, &handle, root.path(), &ulid(), "the recent one").await;
+    let recent_id = body["work"]["id"].as_str().expect("id").to_string();
+    wait_until_all_settled(&http, &handle).await;
+
+    // The daemon is still running and still holds the journal's exclusive
+    // lock, so this mutates the segment file on disk directly, exactly as
+    // `sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure`
+    // above does — every read of it (`events_after`, unlike the daemon's own
+    // writer) opens the file fresh.
+    let journal_dir = dir.path().join("journal");
+    let mut segments: Vec<_> = std::fs::read_dir(&journal_dir)
+        .expect("journal dir")
+        .filter_map(|entry| {
+            let path = entry.expect("entry").path();
+            (path.extension().is_some_and(|ext| ext == "ndjson")).then_some(path)
+        })
+        .collect();
+    segments.sort();
+    assert!(
+        segments.len() > 1,
+        "the tiny segment_max_bytes fixture must actually rotate the journal \
+         into more than one segment, or this test proves nothing: {segments:?}"
+    );
+    let oldest = segments.first().expect("at least one segment").clone();
+    let oldest_text = std::fs::read_to_string(&oldest).expect("read oldest segment");
+    assert!(
+        !oldest_text.contains(&recent_id),
+        "the oldest segment must not already hold any of the recent Work's \
+         own events, or corrupting it would not prove the bound: {oldest:?}"
+    );
+    std::fs::write(
+        &oldest,
+        format!("{oldest_text}{{ \"not\": \"an event\" }}\n"),
+    )
+    .expect("append malformed line to the oldest segment");
+
+    let resp = http
+        .get(format!(
+            "{}/v1/work/{recent_id}/transcript",
+            handle.endpoint
+        ))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("transcript over http");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a correctly-bounded replay never opens the corrupted oldest segment; \
+         a 500 here means the handler replayed from the floor (or from 0) \
+         again, the exact regression this test exists to catch"
+    );
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["work_id"], recent_id);
+    assert!(body["turns"].is_array());
+
+    handle.shutdown().await;
+}

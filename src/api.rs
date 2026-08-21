@@ -5351,6 +5351,129 @@ mod tests {
         pump.abort();
     }
 
+    /// w4-spec.md §1.1.3 (A6) names two tests for the SSE error-frame fix:
+    /// one for the initial history-replay `Err` arm
+    /// (`sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure`,
+    /// `tests/w4_read_surfaces.rs`) and one for the `Lagged` refill arm —
+    /// this one. Both arms call the same `send_sse_error`, but only the
+    /// first had a dedicated test; the refill arm shipped with no coverage
+    /// anywhere in the suite (a revert of its `send_sse_error` call would
+    /// have passed every test that existed at the time).
+    ///
+    /// Lag cannot be provoked deterministically through the real HTTP
+    /// surface without pushing past the daemon's 1024-slot broadcast, so
+    /// this drives `forward_events` directly — the same wedge
+    /// `a_lag_refill_resumes_from_the_last_history_frame_the_pump_actually_sent`
+    /// above uses to force the subscriber's first `recv()` to be `Lagged` by
+    /// the channel's own overwrite contract. The journal corruption is the
+    /// same fault-injection seam
+    /// `sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure`
+    /// uses (a malformed line appended straight to the segment file),
+    /// applied here *after* the initial history fetch has already happened
+    /// (it happens synchronously, before the floor frame is even sent, so
+    /// receiving the floor frame proves it is already in memory) — so it
+    /// cannot affect history replay, only the later refill.
+    #[tokio::test]
+    async fn sse_lag_refill_failure_also_sends_the_error_frame() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        const HISTORY: u32 = 5;
+        const LIVE: u32 = 20; // > the 16-slot broadcast `test_state` builds
+        {
+            let mut core = CoreGuard::acquire(&state.core).await;
+            for n in 1..=HISTORY {
+                core.commit(seeded(n)).expect("commit history");
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+
+        let floor = rx
+            .recv()
+            .await
+            .expect("the floor frame")
+            .expect("not an error");
+        assert!(
+            format!("{floor:?}").contains(&format!("event: {SSE_FLOOR_FRAME}")),
+            "the first frame must be the floor control frame: {floor:?}"
+        );
+
+        let first = rx.recv().await.expect("the first history frame");
+        assert!(
+            first.is_ok(),
+            "history replay itself must not error before any corruption"
+        );
+
+        // From here on the on-disk journal is corrupted. The `history` Vec
+        // the pump is still draining was already fetched (before the floor
+        // frame above was sent), so this cannot touch it — only the later
+        // refill, which reads the journal fresh, sees the damage.
+        let journal_dir = dir.path().join("journal");
+        let mut segments: Vec<_> = std::fs::read_dir(&journal_dir)
+            .expect("journal dir")
+            .filter_map(|entry| {
+                let path = entry.expect("entry").path();
+                (path.extension().is_some_and(|ext| ext == "ndjson")).then_some(path)
+            })
+            .collect();
+        segments.sort();
+        let segment = segments.last().expect("a segment exists").clone();
+        let mut text = std::fs::read_to_string(&segment).expect("read segment");
+        text.push_str("{ \"not\": \"an event\" }\n");
+        std::fs::write(&segment, text).expect("append malformed line");
+
+        // Commit past the broadcast's 16-slot capacity while the sink still
+        // holds only one frame's room — everything committed here piles up
+        // unread in the broadcast ring, exactly as in
+        // `a_lag_refill_resumes_...` above.
+        {
+            let mut core = CoreGuard::acquire(&state.core).await;
+            for n in HISTORY + 1..=HISTORY + LIVE {
+                core.commit(seeded(n)).expect("commit live");
+            }
+        }
+
+        // Drain the remaining history frames — none of them error, since
+        // they were already fetched before the corruption above.
+        for _ in 0..(HISTORY - 1) {
+            let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("history frame")
+                .expect("channel still open");
+            assert!(
+                frame.is_ok(),
+                "history replay itself must not error: {frame:?}"
+            );
+        }
+
+        // The live loop now makes its first `recv()` — which lags, by the
+        // broadcast's own overwrite contract, since nothing drained it while
+        // 20 events piled up. The refill that follows hits the corrupted
+        // journal: the stream must end with the named error frame, not hang
+        // or close silently.
+        let error_frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an error frame must arrive, not hang")
+            .expect("channel still open")
+            .expect("SseEvent frames are never Err — the channel item type is Infallible");
+        assert!(
+            format!("{error_frame:?}").contains(&format!("event: {SSE_STREAM_ERROR_FRAME}")),
+            "a lag refill's journal failure must be named, not silent: {error_frame:?}"
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the channel must close promptly after the error frame, not hang");
+        assert!(
+            closed.is_none(),
+            "the stream must end after the error frame, not keep sending"
+        );
+
+        pump.await.expect("the pump task must not panic");
+    }
+
     /// The TOCTOU this test provokes: `with_analytics` reads `last_seq`,
     /// releases the analytics lock to fetch the journal tail, then
     /// re-acquires the lock to fold it. A concurrent request's `catch_up`
