@@ -5,12 +5,16 @@
 //! content deduplicates to one file, and an existing blob is never rewritten.
 //! Reads re-hash the bytes and fail closed on mismatch.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use serde_json::Value;
+
+use crate::domain::event::Event;
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 
 /// Chunk size [`BlobStore::put_stream`] reads/hashes/writes at a time. Fixed
@@ -42,7 +46,10 @@ pub enum BlobError {
 }
 
 /// A validated `b3:<blake3-hex>` content reference.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+// `PartialOrd, Ord` (A4): `BTreeSet<BlobRef>` is `refs_in_payload`/
+// `refs_in_event`'s return type, so the mark-and-sweep scan's result is a
+// stable, deduplicated, orderable set.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlobRef {
     hex: String,
 }
@@ -196,8 +203,78 @@ impl BlobStore {
     }
 }
 
+/// How deep the recursive walk follows nested JSON-in-string values.
+///
+/// Bounded because a string that parses as JSON can itself contain a string
+/// that parses as JSON: the depth is a property of the producer, and every
+/// real producer today is one level (docker's `detail` object, stringified
+/// into `stage.completed`'s `detail` field). 32 is far past anything that
+/// could be honest and far short of a stack problem.
+const MAX_SCAN_DEPTH: usize = 32;
+
+/// Every blob reference reachable from an event payload — A4's recursive
+/// walk.
+///
+/// A flat scan of top-level payload fields is **wrong**: docker's capture
+/// puts its `stdout`/`stderr` refs inside a `detail` object that is then
+/// *stringified* into `stage.completed`'s `detail` field, so a flat scan
+/// finds nothing there and a mark-and-sweep built on one would delete live
+/// blobs.
+///
+/// Rules:
+///   - objects and arrays: recurse into every value;
+///   - strings: if the string parses as a [`BlobRef`] (`^b3:[0-9a-f]{64}$` —
+///     [`BlobRef::from_str`], never a second regex), collect it; otherwise,
+///     if it parses as a JSON **object or array**, recurse into that;
+///   - numbers, booleans, nulls: ignored;
+///   - depth is capped at [`MAX_SCAN_DEPTH`].
+///
+/// Restricting the string-recursion arm to objects and arrays is deliberate:
+/// a string that parses to a bare JSON *string* would recurse on a shorter
+/// string forever-ish, and no producer emits a doubly-encoded bare ref.
+pub fn refs_in_payload(value: &Value, out: &mut BTreeSet<BlobRef>) {
+    refs_in_payload_at_depth(value, out, 0);
+}
+
+fn refs_in_payload_at_depth(value: &Value, out: &mut BTreeSet<BlobRef>, depth: usize) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    match value {
+        Value::Object(map) => {
+            for v in map.values() {
+                refs_in_payload_at_depth(v, out, depth + 1);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                refs_in_payload_at_depth(v, out, depth + 1);
+            }
+        }
+        Value::String(s) => {
+            if let Ok(blob_ref) = BlobRef::from_str(s) {
+                out.insert(blob_ref);
+            } else if let Ok(parsed @ (Value::Object(_) | Value::Array(_))) =
+                serde_json::from_str::<Value>(s)
+            {
+                refs_in_payload_at_depth(&parsed, out, depth + 1);
+            }
+        }
+        Value::Number(_) | Value::Bool(_) | Value::Null => {}
+    }
+}
+
+/// Every blob reference in one event's payload.
+pub fn refs_in_event(event: &Event) -> BTreeSet<BlobRef> {
+    let mut out = BTreeSet::new();
+    refs_in_payload(&event.payload, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// `put_stream` and `put` must land on the same content address for the
@@ -337,5 +414,112 @@ mod tests {
             matches!(err, BlobError::Io(_)),
             "expected the generic io-error branch, got {err:?}"
         );
+    }
+
+    fn hex_ref(byte: u8) -> String {
+        let mut hex = String::with_capacity(64);
+        for _ in 0..32 {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        format!("b3:{hex}")
+    }
+
+    /// A flat top-level scan of a docker-shaped payload finds nothing; the
+    /// nested walk recovers both refs from inside the stringified `detail`
+    /// object — A4's claim, proved structurally here (the fixture-driven
+    /// version lives in `tests/a4_blob_ref_pinning.rs`).
+    #[test]
+    fn refs_in_payload_recovers_a_nested_json_string_ref() {
+        let stdout_ref = hex_ref(0x11);
+        let stderr_ref = hex_ref(0x22);
+        let detail = json!({"stdout": stdout_ref, "stderr": stderr_ref}).to_string();
+        let payload = json!({"stage_id": "build", "detail": detail});
+
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&BlobRef::from_str(&stdout_ref).unwrap()));
+        assert!(out.contains(&BlobRef::from_str(&stderr_ref).unwrap()));
+
+        // The load-bearing negative half: a flat scan of the *top-level*
+        // string fields alone finds nothing, because `detail` parses to an
+        // object, not a bare ref.
+        assert!(BlobRef::from_str(payload["detail"].as_str().unwrap()).is_err());
+    }
+
+    /// A top-level ref (claude's shape: `raw` is a bare `"b3:…"` string) is
+    /// found with no nesting at all.
+    #[test]
+    fn refs_in_payload_recovers_a_top_level_ref() {
+        let raw_ref = hex_ref(0x33);
+        let payload = json!({"raw": raw_ref});
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert_eq!(out, BTreeSet::from([BlobRef::from_str(&raw_ref).unwrap()]));
+    }
+
+    /// The depth cap stops the walk rather than overflowing the stack on a
+    /// pathologically deep payload.
+    ///
+    /// Nests via plain array wrapping, not repeated `to_string()` —
+    /// re-stringifying a value that already contains a quoted string
+    /// multiplies its escaped-backslash count at every level (`"` becomes
+    /// `\"`, which becomes `\\\"`, ...), so a naive stringify-loop this deep
+    /// blows up exponentially rather than linearly. Array nesting costs one
+    /// `Value` per level and exercises the same depth-counting code path
+    /// (`refs_in_payload_at_depth` recurses into arrays exactly like
+    /// objects).
+    #[test]
+    fn refs_in_payload_is_bounded_by_max_scan_depth() {
+        let leaf_ref = hex_ref(0x44);
+        let mut value = json!({"r": leaf_ref});
+        for _ in 0..(MAX_SCAN_DEPTH + 5) {
+            value = json!([value]);
+        }
+        let payload = json!({"nested": value});
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert!(
+            out.is_empty(),
+            "a ref nested past MAX_SCAN_DEPTH must not be recovered: {out:?}"
+        );
+    }
+
+    /// Strings that look close to a ref but are not one must never be
+    /// collected: too short, uppercase hex, and non-hex characters are all
+    /// rejected by `BlobRef::from_str`'s own rule, which this extractor
+    /// reuses rather than a second regex.
+    #[test]
+    fn refs_in_payload_rejects_near_miss_strings() {
+        let too_short = format!("b3:{}", "a".repeat(63));
+        let uppercase = format!("b3:{}", "A".repeat(64));
+        let non_hex = format!("b3:{}", "g".repeat(64));
+        let payload = json!({
+            "too_short": too_short,
+            "uppercase": uppercase,
+            "non_hex": non_hex,
+        });
+        let mut out = BTreeSet::new();
+        refs_in_payload(&payload, &mut out);
+        assert!(
+            out.is_empty(),
+            "near-miss strings must never be collected as refs: {out:?}"
+        );
+    }
+
+    /// `refs_in_event` is the event-level entry point A4's pinning tests use.
+    #[test]
+    fn refs_in_event_reads_the_payload() {
+        use crate::domain::event::{EventDraft, EventSource};
+
+        let want = hex_ref(0x55);
+        let event = EventDraft::new(
+            EventSource::new("backend", "claude"),
+            "conversation.turn.ended",
+            json!({"raw": want}),
+        )
+        .into_event(1);
+        let refs = refs_in_event(&event);
+        assert_eq!(refs, BTreeSet::from([BlobRef::from_str(&want).unwrap()]));
     }
 }
