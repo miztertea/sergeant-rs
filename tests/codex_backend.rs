@@ -1090,7 +1090,72 @@ fn interrupt_diagnosis(when: &str, grandchild_pid: u32) -> String {
     }
     out.push_str("\n  ");
     out.push_str(&process_facts("this test process", std::process::id()));
+    out.push_str("\n  ");
+    out.push_str(&external_kill_status());
     out
+}
+
+/// Whether this host has `kill` as an **executable on `PATH`**, as distinct
+/// from the shell builtin of the same name that every POSIX shell has.
+///
+/// This is the fact that named the cause here, and it is worth the two lines
+/// it costs to keep. A host without the executable answers `Command::new
+/// ("kill")` with `ENOENT`, so a group kill spawned that way never happens at
+/// all — while every other piece of evidence (the group is right, the members
+/// are alive, `ps` works) looks exactly like a group kill that was sent and
+/// ignored. `kill_process_group` goes through `/bin/sh -c` for that reason;
+/// this line is how a future failure says whether that still holds.
+fn external_kill_status() -> String {
+    match std::process::Command::new("kill")
+        .arg("-0")
+        .arg(std::process::id().to_string())
+        .output()
+    {
+        Ok(out) => format!(
+            "kill(1) as an executable on PATH: spawned, exit {:?}",
+            out.status.code()
+        ),
+        Err(e) => format!(
+            "kill(1) as an executable on PATH: NOT SPAWNABLE ({e}) — only the shell builtin \
+             exists on this host"
+        ),
+    }
+}
+
+/// The regression that neither INTERRUPT test above can catch on a host that
+/// *has* `kill(1)` installed — which is every host this suite ran green on
+/// while CI failed on the one that doesn't.
+///
+/// `kill_process_group` must reach the signal through a shell, whose `kill`
+/// is a POSIX-mandated builtin, and never by spawning `kill` as a program off
+/// `PATH`. The failure mode of the latter is the worst kind: `ENOENT` at spawn
+/// on a host without the executable, no signal sent, and — because the group
+/// itself is perfectly well formed — evidence indistinguishable from a
+/// SIGKILL that was delivered and ignored. Asserting on the source is crude,
+/// but it is the only way to pin a host property this suite cannot vary
+/// safely from inside a parallel test process (`set_var` on `PATH` is
+/// process-global and would race every other test here).
+#[test]
+fn the_group_kill_never_depends_on_a_kill_executable_being_installed() {
+    // Comment lines are stripped first: the prose right above
+    // `kill_process_group` names the very construct being banned, in order to
+    // explain why it is banned, and a check that cannot tell code from the
+    // comment documenting it would forbid saying so.
+    let source: String = include_str!("../src/backend/codex.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !source.contains("Command::new(\"kill\")"),
+        "the process-group kill must not spawn a bare `kill` executable: it is a package a \
+         host need not install, and `Command` reports its absence as an ENOENT that a dropped \
+         result silently turns into 'INTERRUPT killed nothing'. Go through a shell builtin."
+    );
+    assert!(
+        source.contains("kill -KILL -{pgid}"),
+        "the process-group kill must still SIGKILL the negated group id (§5.5)"
+    );
 }
 
 /// The pid that forked `pid`, as this host reports it — `1` (or nothing) once

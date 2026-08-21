@@ -1685,9 +1685,18 @@ impl CodexBackend {
 }
 
 /// Kill a turn's whole process group (§5.5): `SIGKILL` to the negated group
-/// id recorded at spawn, via the external `kill(1)` — the same reason
-/// `tests/support/mod.rs` gives for not taking a `libc`/`nix` dependency for
-/// one signal (R5).
+/// id recorded at spawn, through a shell rather than a `libc`/`nix`
+/// dependency for one signal — the reason `tests/support/mod.rs` gives (R5).
+///
+/// Through `/bin/sh -c` specifically, and not by spawning `kill` as a program.
+/// `kill` is a **shell builtin** that every POSIX shell is required to have,
+/// while `kill(1)` as an executable on `PATH` is a package that a host need
+/// not install — and `Command::new("kill")` fails with `ENOENT` on such a
+/// host, which is a silent no-op when the caller drops the result. That is
+/// not hypothetical: it is measured, and it is why this call reports a spawn
+/// failure instead of discarding it. `/bin/sh` is an absolute path for the
+/// same reason, so a `PATH` this process never chose cannot decide whether
+/// INTERRUPT works.
 ///
 /// **Nothing gates this on the leader being alive**, and that is the whole
 /// point. The group is what INTERRUPT promises to kill, and the group
@@ -1697,8 +1706,9 @@ impl CodexBackend {
 /// turn's `TurnState`, `try_wait`, the child handle at all — says "nothing to
 /// kill" about a group that is still very much running. So the group id is
 /// signalled unconditionally and `ESRCH` (an already-empty group) is success,
-/// not an error to report: `kill(1)`'s status is deliberately not consulted,
-/// because "no such group" and "killed the group" are the same outcome here.
+/// not an error to report: the shell's *exit status* is deliberately not
+/// consulted, because "no such group" and "killed the group" are the same
+/// outcome here. Failing to run the kill at all is not — that one is logged.
 ///
 /// Signalling a recorded id after its leader is gone is safe as well as
 /// necessary: Linux keeps a pid number allocated for as long as any process
@@ -1708,10 +1718,18 @@ fn kill_process_group(pgid: Option<u32>) {
     let Some(pgid) = pgid else { return };
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pgid}"))
-            .output();
+        if let Err(e) = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -{pgid}"))
+            .output()
+        {
+            tracing::warn!(
+                pgid,
+                error = %e,
+                "could not run the process-group kill; the turn's direct child is all that \
+                 INTERRUPT reached — any commands it spawned may still be running"
+            );
+        }
     }
     #[cfg(not(unix))]
     {
