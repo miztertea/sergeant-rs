@@ -77,7 +77,7 @@ question has an answer here instead of becoming a fresh investigation.
 - **Surfaced by the same migration, understood, not a conflict**: `ring
   0.17.14` (via `ureq 3.4.0`, a **build-dependency** of `libduckdb-sys`'s
   `bundled` feature — compiled and run only inside that crate's `build.rs`,
-  never linked into the `sgt` binary) coexists with `aws-lc-rs 1.16.2` (via
+  never linked into the `sgt` binary) coexists with `aws-lc-rs 1.18.0` (via
   reqwest 0.13.4's `rustls` feature, sergeant's actual runtime TLS
   provider — reqwest 0.13's `rustls` feature is defined as
   `__rustls-aws-lc-rs + rustls-platform-verifier + __rustls`, i.e. enabling
