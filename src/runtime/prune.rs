@@ -393,8 +393,29 @@ pub struct PrunePlan {
     pub condemn: BTreeSet<BlobRef>,
     /// Blobs the previous cycle quarantined, to delete now — already
     /// excluded from anything the surviving-side scan found still
-    /// referenced (I-W3-6; see [`PrunePlan::rescue_quarantined`]).
+    /// referenced (I-W3-6; see [`PrunePlan::rescue_quarantined`]) and from
+    /// anything *this* cycle condemns afresh (see
+    /// [`PrunePlan::defer_quarantined`]).
     pub delete_quarantined: Vec<String>,
+    /// Blobs the previous cycle quarantined that this cycle's own mark scan
+    /// condemns **again** — deleted by neither this cycle nor rescued by it,
+    /// but re-marked and deferred to the next one (A5's two-phase
+    /// quarantine).
+    ///
+    /// Condemning and deleting the same hex in one cycle collapses the
+    /// deferral window to nothing, which is the only thing standing between
+    /// an in-flight `BlobStore::put` dedup-hit — one that has already
+    /// rescued the content back to its live address but whose referencing
+    /// event has not been committed yet, so neither the mark scan nor the
+    /// guard-held top-up can see it — and a destroyed live blob with a
+    /// dangling `b3:` reference pointing at it.
+    ///
+    /// Not carried on [`PruneIntentRecord`] and not needed there: every hex
+    /// here is by construction a member of `condemn`, which *is* recorded,
+    /// and which is what the registry installs as the next cycle's
+    /// `quarantined_blobs` — so the deferral survives a crash without a
+    /// field of its own.
+    pub defer_quarantined: Vec<String>,
     /// Blobs the previous cycle quarantined that the surviving-side scan
     /// found referenced by a retained event — a dedup adoption that landed
     /// between that cycle's mark scan and this one's, with no live
@@ -984,22 +1005,48 @@ pub fn plan(
         .cloned()
         .collect();
 
-    // §5.2/I-W3-6: a hex the previous cycle quarantined must not be deleted
-    // this cycle if a surviving event now references it — a dedup adoption
-    // that landed between that cycle's mark scan and this one's, with no
-    // live `get`/`put` in between to have rescued it the ordinary way.
-    // Split rather than merely filter: the excluded hexes are moved back to
-    // their live content address (`run`'s `rescue_quarantined` step) rather
-    // than silently left in quarantine forever — the next cycle's own
-    // `registry.quarantined_blobs` is about to be replaced wholesale by
-    // *this* cycle's fresh `condemn` set, so anything not resolved to
-    // "delete" or "rescue" now would never be revisited again.
+    // §5.2/I-W3-6 and A5's two-phase quarantine: every hex the *previous*
+    // cycle quarantined is resolved here to exactly one of three outcomes,
+    // because the next cycle's `registry.quarantined_blobs` is about to be
+    // replaced wholesale by *this* cycle's `condemn` set — anything left
+    // unresolved would never be revisited again.
+    //
+    // 1. **Rescue** — a surviving event references it. A dedup adoption
+    //    landed between that cycle's mark scan and this one's, with no live
+    //    `get`/`put` in between to have rescued it the ordinary way; `run`
+    //    moves it back to its live content address.
+    // 2. **Defer** — *this* cycle's own mark scan condemns it again. It is
+    //    being re-marked right now (step 2 finds it already in `.pruned/`
+    //    and reports `Ok(false)`), it rides into the next cycle's
+    //    `quarantined_blobs` on `condemn`, and *that* cycle decides its
+    //    fate. Deleting it here instead would collapse the two-phase
+    //    quarantine to a single phase for this hex: mark and sweep in one
+    //    guard hold, with no window at all for a concurrent
+    //    `BlobStore::put` dedup-hit — whose referencing event is not
+    //    committed yet, and so is invisible to both the mark scan and
+    //    `run`'s guard-held top-up — to have its content survive. That is a
+    //    destroyed live blob and a dangling `b3:` ref, which is precisely
+    //    the failure the deferral exists to prevent.
+    // 3. **Delete** — neither of the above: untouched since the previous
+    //    cycle marked it, which is what a full deferral window having
+    //    elapsed with nobody claiming it looks like.
+    //
+    // (1) and (2) cannot both apply: `condemn` already has every
+    // surviving-side reference subtracted from it just above.
     let surviving_hexes: BTreeSet<&str> = surviving_refs.iter().map(BlobRef::hex).collect();
-    let (delete_quarantined, rescue_quarantined): (Vec<String>, Vec<String>) = registry
-        .quarantined_blobs
-        .iter()
-        .cloned()
-        .partition(|hex| !surviving_hexes.contains(hex.as_str()));
+    let condemned_hexes: BTreeSet<&str> = condemn.iter().map(BlobRef::hex).collect();
+    let mut rescue_quarantined: Vec<String> = Vec::new();
+    let mut defer_quarantined: Vec<String> = Vec::new();
+    let mut delete_quarantined: Vec<String> = Vec::new();
+    for hex in &registry.quarantined_blobs {
+        if surviving_hexes.contains(hex.as_str()) {
+            rescue_quarantined.push(hex.clone());
+        } else if condemned_hexes.contains(hex.as_str()) {
+            defer_quarantined.push(hex.clone());
+        } else {
+            delete_quarantined.push(hex.clone());
+        }
+    }
 
     let (_, mut stall) = candidate_horizon(bounds, registry, first_seq, policy);
     stall.horizon_seq = horizon;
@@ -1027,6 +1074,7 @@ pub fn plan(
         carried_forward: scan.carried_forward,
         condemn,
         delete_quarantined,
+        defer_quarantined,
         rescue_quarantined,
         scan_through: surviving_scan_through,
         stall,
@@ -1106,6 +1154,16 @@ pub fn run(
                     plan.rescue_quarantined
                         .push(plan.delete_quarantined.remove(pos));
                 }
+                // A deferred hex rides into the next cycle's quarantined
+                // set only *because* it is in `condemn` — which the line
+                // above may have just removed it from. Left in neither
+                // list it would sit in `.pruned/` with nothing scheduled to
+                // revisit it, so resolve it the way the new reference asks:
+                // rescue it back to its live address now.
+                if let Some(pos) = plan.defer_quarantined.iter().position(|h| h == r.hex()) {
+                    plan.rescue_quarantined
+                        .push(plan.defer_quarantined.remove(pos));
+                }
             }
         }
     }
@@ -1151,7 +1209,13 @@ pub fn run(
 
     let blobs = BlobStore::open(data_dir)?;
 
-    // Step 2 (T3): quarantine.
+    // Step 2 (T3): quarantine. Includes `plan.defer_quarantined` by
+    // construction (it is a subset of `condemn`); for those, the live path
+    // is normally already absent and `quarantine` reports its idempotent
+    // `Ok(false)` — unless a `put` dedup-hit rescued the content back to
+    // its live address since the previous cycle, which is exactly the case
+    // the deferral is protecting and exactly the case that re-marks it here
+    // for the *next* cycle to sweep.
     let mut blobs_quarantined = 0usize;
     for hex in &record.condemn {
         let blob_ref: BlobRef = format!("b3:{hex}").parse()?;
@@ -2590,6 +2654,227 @@ mod tests {
             .get(&blob_ref)
             .expect("the adopted blob must be live again, not deleted");
         assert_eq!(bytes, b"adopted content");
+    }
+
+    /// N6's other half — the same-cycle collapse. A hex this cycle's own
+    /// mark scan condemns **again** must never also be deleted from
+    /// quarantine in the same cycle: `condemn` re-marks it now, and the
+    /// deferred delete of it belongs to the *next* cycle. Quarantining and
+    /// deleting one hex inside a single guard hold leaves a deferral window
+    /// of exactly zero — and that window is the only thing standing between
+    /// an in-flight `BlobStore::put` dedup-hit (its referencing event not
+    /// yet committed, so invisible to both the mark scan and `run`'s
+    /// guard-held top-up) and a destroyed live blob with a dangling `b3:`
+    /// reference to it.
+    ///
+    /// `a_dedup_adoption_between_mark_and_sweep_is_rescued_from_quarantine`
+    /// deliberately keeps its adoption event in the *surviving* range,
+    /// which is the rescue path. This one puts the adoption **inside cycle
+    /// 2's own condemned range**, which is what lands the hex in `condemn`
+    /// and `delete_quarantined` at the same time — the overlap the two-set
+    /// partition used to ignore entirely.
+    #[test]
+    fn a_hex_condemned_again_this_cycle_is_never_deleted_in_the_same_cycle() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+        let blob_ref = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .put(b"re-adopted content")
+            .expect("put");
+        let hex = blob_ref.hex().to_string();
+        let quarantine_path = dir
+            .path()
+            .join("blobs")
+            .join("b3")
+            .join(".pruned")
+            .join(&hex);
+        let live_path = dir.path().join("blobs").join("b3").join(&hex);
+
+        let policy = PrunePolicy {
+            retention: 0,
+            source: PolicySource::Config,
+        };
+        let run_a_cycle = |core: &mut crate::api::Core| -> PruneOutcome {
+            let bounds = core.journal.segment_bounds().expect("bounds");
+            let (candidate, _) = candidate_horizon(
+                &bounds,
+                core.registry.state(),
+                &core.first_seq_by_work,
+                &policy,
+            );
+            let plan = plan(
+                dir.path(),
+                &bounds,
+                candidate,
+                core.registry.state(),
+                &core.first_seq_by_work,
+                &policy,
+            )
+            .expect("plan")
+            .expect("something must be prunable");
+            assert!(
+                plan.delete_quarantined
+                    .iter()
+                    .all(|h| !plan.condemn.iter().any(|r| r.hex() == h)),
+                "no hex may be scheduled for both a fresh condemn and this cycle's delete"
+            );
+            run(core, dir.path(), plan, false).expect("run")
+        };
+
+        // Cycle 1: w_old is the only reference — the blob is quarantined.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_old"),
+            serde_json::json!({"work": {
+                "id": "w_old", "intent": "prunable, references the blob first",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w_old"),
+            serde_json::json!({"result_blob": format!("b3:{hex}")}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor1"),
+            serde_json::json!({"work": {
+                "id": "anchor1", "intent": "keep the writer off w_old's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+        assert_eq!(run_a_cycle(&mut core).blobs_quarantined, 1);
+        assert_eq!(core.registry.state().quarantined_blobs, vec![hex.clone()]);
+        assert!(quarantine_path.exists() && !live_path.exists());
+
+        // A real `put` of the same content between the cycles: its dedup
+        // check rescues the quarantined copy back to its live address
+        // (`put_rescues_instead_of_writing_a_second_copy`). This is the
+        // in-flight writer whose own event has not been committed yet.
+        let readopted = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .put(b"re-adopted content")
+            .expect("put the same content again");
+        assert_eq!(readopted.hex(), hex);
+        assert!(
+            live_path.exists() && !quarantine_path.exists(),
+            "the dedup-hit put must have rescued the blob back to its live address"
+        );
+
+        // `anchor1` stops blocking; `w_mid` carries the new reference and
+        // is itself fully retired *below* cycle 2's horizon, so its event —
+        // unlike N6's — sits inside the range cycle 2 condemns.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("anchor1"),
+            serde_json::json!({}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("w_mid"),
+            serde_json::json!({"work": {
+                "id": "w_mid", "intent": "re-adopts the same content",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+                "ref": format!("b3:{hex}"),
+            }}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("w_mid"),
+            serde_json::json!({}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor2"),
+            serde_json::json!({"work": {
+                "id": "anchor2", "intent": "keep the writer off w_mid's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        // Cycle 2: the hex is condemned afresh *and* is last cycle's
+        // quarantined hex. It must be re-marked, not swept.
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        let (candidate, _) = candidate_horizon(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        );
+        let plan2 = plan(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policy,
+        )
+        .expect("plan")
+        .expect("w_mid must be prunable in cycle 2");
+        assert!(
+            plan2.condemn.iter().any(|r| r.hex() == hex),
+            "the fixture must actually put the hex back in this cycle's fresh condemn set"
+        );
+        assert!(
+            plan2.delete_quarantined.is_empty(),
+            "a hex this cycle re-condemns must not also be swept this cycle"
+        );
+        assert!(
+            plan2.rescue_quarantined.is_empty(),
+            "nor rescued — no *surviving* event references it"
+        );
+        assert_eq!(
+            plan2.defer_quarantined,
+            vec![hex.clone()],
+            "it belongs to the deferred set: re-marked now, re-evaluated next cycle"
+        );
+
+        let outcome2 = run(&mut core, dir.path(), plan2, false).expect("run cycle 2");
+        assert_eq!(
+            outcome2.blobs_quarantined, 1,
+            "the re-adopted (live again) blob must be quarantined by this cycle"
+        );
+        assert_eq!(
+            outcome2.blobs_deleted, 0,
+            "and must not be deleted by the same cycle that just marked it"
+        );
+        assert_eq!(
+            std::fs::read(&quarantine_path).expect("the content must still exist, in quarantine"),
+            b"re-adopted content"
+        );
+        assert!(
+            core.registry.state().quarantined_blobs.contains(&hex),
+            "the deferral must be armed for the next cycle via the intent's own condemn list"
+        );
+
+        // The window is real: a writer that dedup-hits this content in the
+        // interval still gets it back intact, which is the entire point of
+        // deferring the delete by a cycle.
+        let bytes = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .get(&blob_ref)
+            .expect("the deferred blob must still be recoverable");
+        assert_eq!(bytes, b"re-adopted content");
     }
 
     /// §3.5's stated invariant, checked directly against a real fixture
