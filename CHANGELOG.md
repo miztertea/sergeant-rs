@@ -12,6 +12,63 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.1.3] - 2026-08-21
+
+Foundation close-out: the release pipeline proven end-to-end via a
+from-branch dry run, and bounded retention — the daemon now prunes
+terminal history past a declared cap so disk stays bounded and startup
+stays fast, with every discard journaled and named, never silent.
+
+### Release pipeline
+
+- Gate A permits `mode=dry-run` dispatch from any ref, skipping the
+  SHA-equals-`origin/main` assertion that mode alone needs; `publish`
+  keeps the unchanged main-only + HEAD-current check — release authority
+  is unaffected, only the pre-merge proof surface is (issue #17's owner
+  commission: "the completed release pipeline that will work" needed
+  proving before this release, not only after it).
+- `gh release edit --latest` now runs as its own post-publish, by-tag
+  step, superseding #215: `make_latest=true` riding the same PATCH as
+  `draft=false` was silently dropped by GitHub because the release was
+  still a draft at validation time — measured live on v0.1.2.
+- R7 citations added at the four `gh api` sites with no by-ID or by-tag
+  porcelain equivalent (comment-only; no behavior change).
+
+### Retention
+
+- **`[estate] retention = N` in `sergeant.toml`** (issue #17's Q1–Q10
+  rulings record): how many terminal Works of history this estate keeps.
+  Default 1000 (≈1.8 GB bounded total on this estate's own measured
+  1.8 MB/Work basis), minimum 64. Older Works — and the blobs only they
+  referenced — are pruned automatically, journaled, whole segments at a
+  time; nothing is ever deleted silently. `sgt init` scaffolds the key
+  **commented**, so an 0.1.2 binary is never handed a manifest it cannot
+  parse.
+- Startup replays only the newest 16 segments / 128 MiB plus a persisted
+  summary cache, instead of walking the whole journal four times from
+  scratch on every start — roughly 30% faster on this estate's own dogfood
+  journal (1.30s → 0.89s; a journal with real retained depth wins more).
+  `sgt daemon --rebuild-cache` forces a full rebuild on demand.
+- `GET /v1/events` and the SSE stream now carry the journal's actual replay
+  floor (`floor_seq`) instead of letting a client infer one of `1`; a
+  `from=` below the floor is served from the floor, never an error.
+  `sgt work show`/`sgt work transcript` answer a pruned Work by name
+  ("pruned on `<date>` under policy") instead of a 404 indistinguishable
+  from a Work that never existed.
+- `sgt doctor` gains `journal_growth`: live segment count and bytes, the
+  replay floor, retained-Work count against the cap, a stalled prune's
+  blocking Work and age (reported, never overridden — Q7), and the last
+  startup rebuild's duration (warn at 10s, fail at 30s, the owner-ruled
+  trigger made mechanical).
+- `docs/adr/0003-durability-promise-and-storage-preconditions.md` amended:
+  durability while retained is total; durability forever was never the
+  promise. New `docs/adr/0019-bounded-retention.md` records the mechanism.
+  `docs/proposals/journal-archival-rule-c.md`'s compressed-archive design is
+  superseded by the simpler count-based model above.
+- A manual `sgt journal prune` verb is deliberately deferred (pruning must
+  run inside the daemon process; the declared policy is already the whole
+  authorization — a manual trigger would add no capability, only ceremony).
+
 ## [0.1.2] - 2026-08-20
 
 Maintenance release: one day of backlog close-out rationalizing the base
