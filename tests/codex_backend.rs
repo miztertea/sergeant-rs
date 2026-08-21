@@ -58,6 +58,18 @@ fn fresh_thread_id() -> String {
     )
 }
 
+/// Whether a pid is still alive, via `kill -0` (POSIX-portable; no `libc`
+/// dependency for one signal check — the same reason the adapter itself
+/// shells out to `kill(1)` rather than taking one, per `kill_process_group`).
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// `exec --help` text carrying every [`REQUIRED_EXEC_FLAGS`] entry and the
 /// `resume` subcommand — a passing probe's exec-help surface.
 const ALL_EXEC_HELP: &str = "\
@@ -87,6 +99,8 @@ struct StubCodex {
     release: PathBuf,
     stderr: PathBuf,
     exit_code: PathBuf,
+    grandchild: PathBuf,
+    grandchild_pid: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -119,6 +133,8 @@ impl StubCodex {
         let release = dir.join("codex-release");
         let stderr = dir.join("codex-stderr");
         let exit_code = dir.join("codex-exit-code");
+        let grandchild = dir.join("codex-grandchild");
+        let grandchild_pid = dir.join("codex-grandchild-pid");
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
@@ -137,6 +153,10 @@ impl StubCodex {
              fi\n\
              if [ -f \"{replay}\" ]; then cat \"{replay}\"; fi\n\
              if [ -f \"{stderr}\" ]; then cat \"{stderr}\" >&2; fi\n\
+             if [ -f \"{grandchild}\" ]; then\n  \
+               ( i=0; while [ \"$i\" -lt 300 ]; do sleep 0.1; i=$((i+1)); done ) &\n  \
+               echo $! > \"{grandchild_pid}\"\n\
+             fi\n\
              if [ -f \"{hang}\" ]; then exec sleep 30; fi\n\
              if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n\
              exit 0\n",
@@ -149,6 +169,8 @@ impl StubCodex {
             release = release.display(),
             replay = replay.display(),
             stderr = stderr.display(),
+            grandchild = grandchild.display(),
+            grandchild_pid = grandchild_pid.display(),
             hang = hang.display(),
             exit_code = exit_code.display(),
         );
@@ -166,6 +188,8 @@ impl StubCodex {
             release,
             stderr,
             exit_code,
+            grandchild,
+            grandchild_pid,
         }
     }
 
@@ -207,6 +231,35 @@ impl StubCodex {
     fn exits_with(&self, code: i32) -> &Self {
         std::fs::write(&self.exit_code, code.to_string()).expect("write exit code");
         self
+    }
+
+    /// Marks the stub to fork a background grandchild (a detached loop, not
+    /// a `setsid`) right after replay, and record that grandchild's own pid —
+    /// the process a single `child.kill()` would never reach, and the whole
+    /// reason INTERRUPT kills the turn's process *group* instead (§5.5).
+    fn spawns_a_grandchild(&self) -> &Self {
+        std::fs::write(&self.grandchild, b"go\n").expect("write grandchild marker");
+        self
+    }
+
+    fn grandchild_pid(&self) -> Option<u32> {
+        std::fs::read_to_string(&self.grandchild_pid)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    }
+
+    fn wait_for_grandchild_pid(&self) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = self.grandchild_pid() {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild pid was never recorded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn launches(&self) -> Vec<Launch> {
@@ -571,16 +624,16 @@ fn launch_fails_closed_when_the_process_dies_before_thread_started() {
 
 #[test]
 fn launch_fails_closed_when_thread_started_never_arrives() {
-    // SAFETY: this test's own env var, restored below; no other test reads it.
-    unsafe { std::env::set_var("SGT_CODEX_TEST_THREAD_ID_BUDGET_MS", "300") };
     let dir = TempDir::new().expect("tempdir");
     let stub = StubCodex::passing(dir.path());
     stub.stalls_until_released(); // parks before emitting anything, never released
-    let backend = CodexBackend::new(config_for(
-        &stub,
-        dir.path(),
-        &dir.path().join("codex-home"),
-    ));
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    // This test's own instance shrinks the budget to milliseconds instead of
+    // the production 30s; `thread_id_budget` lives on this `CodexConfig`
+    // value alone, so no other test's `launch()` (running concurrently on
+    // another thread) can ever observe it.
+    config.thread_id_budget = Some(Duration::from_millis(300));
+    let backend = CodexBackend::new(config);
     let prepared = backend
         .prepare(&start_request(dir.path()))
         .expect("prepare");
@@ -596,7 +649,6 @@ fn launch_fails_closed_when_thread_started_never_arrives() {
         other => panic!("expected Failed, got {other:?}"),
     }
     assert!(backend.tracked_executions().is_empty());
-    unsafe { std::env::remove_var("SGT_CODEX_TEST_THREAD_ID_BUDGET_MS") };
 }
 
 /// The budget's own complement: a turn that parks before emitting anything
@@ -606,15 +658,12 @@ fn launch_fails_closed_when_thread_started_never_arrives() {
 /// finishes on its own).
 #[test]
 fn launch_succeeds_once_a_parked_turn_is_released_within_budget() {
-    unsafe { std::env::set_var("SGT_CODEX_TEST_THREAD_ID_BUDGET_MS", "5000") };
     let dir = TempDir::new().expect("tempdir");
     let stub = StubCodex::passing(dir.path());
     stub.replays(AGENT_MESSAGE_TURN).stalls_until_released();
-    let backend = CodexBackend::new(config_for(
-        &stub,
-        dir.path(),
-        &dir.path().join("codex-home"),
-    ));
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.thread_id_budget = Some(Duration::from_millis(5000));
+    let backend = CodexBackend::new(config);
     let prepared = backend
         .prepare(&start_request(dir.path()))
         .expect("prepare");
@@ -629,7 +678,6 @@ fn launch_succeeds_once_a_parked_turn_is_released_within_budget() {
             .expect("launch must succeed once released in time");
         assert!(handle.native_id.is_some());
     });
-    unsafe { std::env::remove_var("SGT_CODEX_TEST_THREAD_ID_BUDGET_MS") };
 }
 
 #[test]
@@ -724,6 +772,55 @@ fn the_raw_stream_is_archived_before_any_conclusion_is_drawn() {
     assert!(observation.evidence.expect("evidence").contains(raw_ref));
 }
 
+/// §15's fail-closed invariant, end-to-end through the real
+/// `CodexBackend`/`TurnReader`/`StubCodex` machinery — not just the pure
+/// `classify_terminal` unit test (`a_stream_with_no_terminal_classifies_
+/// unknown_and_carries_exit_and_stderr`). The stub's process dies (a
+/// non-zero exit, unrequested) after `thread.started`/`turn.started` but
+/// before any `turn.completed`/`turn.failed` line ever arrives — the same
+/// fail-closed row issue #46 was filed about on Claude. Ambiguity must
+/// surface as `NativeState::Unknown` with the raw evidence attached, never
+/// an invented verdict.
+#[test]
+fn codex_a_turn_that_dies_without_a_terminal_is_ambiguous_not_a_verdict() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let thread_id = fresh_thread_id();
+    stub.replays(&format!(
+        "{{\"type\":\"thread.started\",\"thread_id\":\"{thread_id}\"}}\n\
+         {{\"type\":\"turn.started\"}}\n"
+    ))
+    .exits_with(1);
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let observation = wait_for_settled(&backend, &handle);
+    assert_eq!(
+        observation.native,
+        NativeState::Unknown,
+        "no terminal line + no interrupt requested = ambiguity: {observation:?}"
+    );
+    assert_eq!(
+        observation.signal,
+        sergeant_rs::backend::BackendSignal::Running,
+        "no verdict is invented"
+    );
+    let evidence = observation.evidence.expect("evidence must be present");
+    assert!(evidence.contains("exit_code"), "{evidence}");
+    assert!(
+        evidence.contains("raw="),
+        "the raw stream must be archived even when no conclusion could be drawn from it: \
+         {evidence}"
+    );
+}
+
 #[test]
 fn a_second_concurrent_turn_is_refused() {
     let dir = TempDir::new().expect("tempdir");
@@ -773,6 +870,56 @@ fn stop_waits_for_the_turns_evidence_outside_the_lock() {
         "",
         "some evidence must already be recorded"
     );
+}
+
+/// The deterministic half of §5.5's `interrupt: true` claim (the live test
+/// is `live_codex_interrupt_leaves_the_conversation_resumable`): a turn's
+/// shell commands run as *children of the codex process*, so a plain
+/// `child.kill()` on just the direct child would leave any grandchild
+/// (exactly what `/bin/bash -lc '…'` spawns) running. INTERRUPT's whole
+/// justification is that it kills the turn's process *group* instead
+/// (`kill_process_group`, §5.5) — this proves that mechanism, not just that
+/// `interrupt()` returns `Ok`.
+#[test]
+fn codex_interrupt_kills_the_process_group() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN)
+        .hangs_after_replay()
+        .spawns_a_grandchild();
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let grandchild_pid = stub.wait_for_grandchild_pid();
+    assert!(
+        pid_alive(grandchild_pid),
+        "the grandchild must be running before INTERRUPT, or this test proves nothing"
+    );
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+
+    // SIGKILL is sent synchronously by `kill_process_group`, but the kernel
+    // reaping it is not instant from this test's vantage point — bounded
+    // poll, same shape as every other `wait_for_*` helper in this file.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !pid_alive(grandchild_pid) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild pid {grandchild_pid} survived INTERRUPT: only the direct child was \
+             killed, not the whole process group"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -1018,11 +1165,27 @@ fn a_profile_config_home_sets_codex_home_on_every_turn() {
     let mut request = start_request(dir.path());
     request.profile = Some(profile);
     let prepared = backend.prepare(&request).expect("prepare");
-    backend.launch(&prepared).expect("launch");
+    let handle = backend.launch(&prepared).expect("launch");
     let launches = stub.wait_for_launches(1);
     assert_eq!(
         launches[0].env.get("CODEX_HOME").map(String::as_str),
         Some(profile_home.to_str().unwrap())
+    );
+
+    // §3.5's whole point: the profile's CODEX_HOME must not lapse on a
+    // *resume* turn — the exact axis `-p/--profile` is refused over, since
+    // `exec resume` has no such flag to re-apply it. Turn 1 alone (above)
+    // cannot prove this; drive a second, resume-grammar turn and check its
+    // env too.
+    let thread_id = handle.native_id.clone().expect("thread id from turn 1");
+    wait_for_settled(&backend, &handle);
+    stub.replays(&plain_turn_naming(&thread_id));
+    backend.send(&handle, "turn two").expect("send");
+    let launches = stub.wait_for_launches(2);
+    assert_eq!(
+        launches[1].env.get("CODEX_HOME").map(String::as_str),
+        Some(profile_home.to_str().unwrap()),
+        "the profile's CODEX_HOME must re-apply on the resume turn too, not just turn 1"
     );
 }
 

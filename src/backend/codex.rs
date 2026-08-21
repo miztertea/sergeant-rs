@@ -227,22 +227,6 @@ commit:";
 /// in the one recorded failing run it preceded the model-metadata error.
 const THREAD_ID_BUDGET: Duration = Duration::from_secs(30);
 
-/// Environment variable letting the contract-test suite shrink
-/// [`THREAD_ID_BUDGET`] so the budget-expiry path can be exercised in
-/// milliseconds instead of thirty real seconds. Read only by
-/// [`thread_id_budget`]; unset in every production path, so the daemon
-/// always waits the full, deliberately generous budget.
-const THREAD_ID_BUDGET_OVERRIDE_ENV: &str = "SGT_CODEX_TEST_THREAD_ID_BUDGET_MS";
-
-/// [`THREAD_ID_BUDGET`], or the test-only override when one is set.
-fn thread_id_budget() -> Duration {
-    std::env::var(THREAD_ID_BUDGET_OVERRIDE_ENV)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(THREAD_ID_BUDGET)
-}
-
 /// How long the turn reader waits for stderr after the turn's process has
 /// been reaped — `claude.rs`'s identical fix for the same race (both pipes
 /// reach EOF at the same instant; a reader that snapshots a shared buffer the
@@ -289,6 +273,13 @@ pub struct CodexConfig {
     pub codex_home: Option<PathBuf>,
     /// Extra environment for every spawned turn.
     pub env: BTreeMap<String, String>,
+    /// Override for [`THREAD_ID_BUDGET`], `None` in every production path.
+    /// A per-instance field rather than an environment variable: each test
+    /// builds its own `CodexConfig`, so a shrunk budget in one test's
+    /// `CodexBackend` can never leak into another test's `launch()` — no
+    /// process-global mutable state, no `--test-threads` ordering hazard, no
+    /// `unsafe { std::env::set_var }` to serialize.
+    pub thread_id_budget: Option<Duration>,
 }
 
 impl CodexConfig {
@@ -301,6 +292,7 @@ impl CodexConfig {
             data_dir: data_dir.to_path_buf(),
             codex_home: None,
             env: BTreeMap::new(),
+            thread_id_budget: None,
         }
     }
 }
@@ -1162,13 +1154,20 @@ impl CodexBackend {
             }
         };
 
-        let mut missing_clauses = Vec::new();
+        // §2.5: the primary surface (`exec --help`) is already named by the
+        // sentence this builds into, so its own gap is stated bare (just the
+        // items) — every other gap names its own surface in an "and" clause.
+        // Avoids the doubled "is missing required flag(s): exec --help is
+        // missing ..." a naive per-clause template would produce.
+        let mut missing_clauses: Vec<String> = Vec::new();
         let missing_exec = missing_flags(&exec_help, REQUIRED_EXEC_FLAGS);
         if !missing_exec.is_empty() {
-            missing_clauses.push(format!(
-                "exec --help is missing {}",
-                missing_exec.join(", ")
-            ));
+            let items = missing_exec.join(", ");
+            missing_clauses.push(if missing_clauses.is_empty() {
+                format!("required flag(s) {items}")
+            } else {
+                format!("and exec --help is missing required flag(s) {items}")
+            });
         }
         let missing_subcommands: Vec<&str> = REQUIRED_EXEC_SUBCOMMANDS
             .iter()
@@ -1176,25 +1175,29 @@ impl CodexBackend {
             .filter(|c| !exec_help.contains(c))
             .collect();
         if !missing_subcommands.is_empty() {
-            missing_clauses.push(format!(
-                "exec --help is missing subcommand(s) {}",
-                missing_subcommands.join(", ")
-            ));
+            let items = missing_subcommands.join(", ");
+            missing_clauses.push(if missing_clauses.is_empty() {
+                format!("required subcommand(s) {items}")
+            } else {
+                format!("and exec --help is missing subcommand(s) {items}")
+            });
         }
         let missing_resume = missing_flags(&resume_help, REQUIRED_RESUME_FLAGS);
         if !missing_resume.is_empty() {
-            missing_clauses.push(format!(
-                "exec resume --help is missing {}",
-                missing_resume.join(", ")
-            ));
+            let items = missing_resume.join(", ");
+            missing_clauses.push(if missing_clauses.is_empty() {
+                items
+            } else {
+                format!("and exec resume --help is missing {items}")
+            });
         }
         if !missing_clauses.is_empty() {
             return ProbeOutcome {
                 available: false,
                 detail: format!(
                     "capability probe: {exe:?} exec --help (version {version_text}) is missing \
-                     required flag(s): {}; this launch grammar was never measured against it",
-                    missing_clauses.join("; and ")
+                     {}; this launch grammar was never measured against it",
+                    missing_clauses.join("; ")
                 ),
                 version: Some(canonical),
                 provenance: Some(provenance),
@@ -1614,7 +1617,7 @@ impl CodexBackend {
     fn spawn_first_turn(&self, execution_id: &str, prompt: String) -> Result<String, BackendError> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<FirstTurnSignal>(1);
         self.spawn_turn(execution_id, prompt, Some(tx))?;
-        let budget = thread_id_budget();
+        let budget = self.config.thread_id_budget.unwrap_or(THREAD_ID_BUDGET);
         match rx.recv_timeout(budget) {
             Ok(FirstTurnSignal::ThreadStarted(thread_id)) => Ok(thread_id),
             Ok(FirstTurnSignal::ExitedWithoutThread {
