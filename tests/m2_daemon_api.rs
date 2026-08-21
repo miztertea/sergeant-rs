@@ -2344,10 +2344,20 @@ async fn retry_reenters_the_stage_and_fails_closed_when_the_backend_cannot_start
 /// the stream, not deliver a truncated tail and pretend it was complete —
 /// `Core::events_after`'s `?` inside its collection loop discards whatever it
 /// had already gathered, so `forward_events` sees a bare `Err` and must send
-/// nothing at all. `Journal::replay_after` re-lists segments from disk on
-/// every call, so a line appended straight to the segment file (bypassing
-/// the daemon entirely) is visible on the very next request — no restart
-/// needed to reach it, unlike the M1 corruption fixtures this mirrors.
+/// no *event* frames at all. `Journal::replay_after` re-lists segments from
+/// disk on every call, so a line appended straight to the segment file
+/// (bypassing the daemon entirely) is visible on the very next request — no
+/// restart needed to reach it, unlike the M1 corruption fixtures this
+/// mirrors.
+///
+/// **Updated for W4 §1.1.2/§1.1.3.** Before this wave the stream closed
+/// with nothing sent at all past the handshake — indistinguishable from the
+/// client hanging up. Two control frames now precede that silence: the
+/// floor frame (sent before history is even attempted, so it survives this
+/// failure untouched) and the stream-error frame A6 adds specifically for
+/// this path (a real `JournalError` disclosed by name instead of a silent
+/// close). Neither is one of `send_sse`'s per-event frames, so "no *event*
+/// frames" — this test's actual claim — still holds exactly as before.
 #[tokio::test]
 async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_damage() {
     let dir = TempDir::new().expect("tempdir");
@@ -2375,7 +2385,10 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
     std::fs::write(&segment, text).expect("append malformed line");
 
     // A subscriber asking for the tail now hits the malformed line mid-way
-    // through replay: the handshake still succeeds, but no frames follow.
+    // through replay: the handshake still succeeds, the floor and
+    // stream-error control frames arrive, and then the stream closes — no
+    // *event* frame (`send_sse`'s own per-journaled-kind vocabulary) ever
+    // follows.
     let mut stream = http
         .get(format!("{}/v1/events/stream?from=0", handle.endpoint))
         .bearer_auth(&handle.token)
@@ -2387,12 +2400,36 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
         200,
         "the SSE handshake itself still succeeds"
     );
-    let closed = tokio::time::timeout(Duration::from_secs(5), stream.chunk())
-        .await
-        .expect("a broken history replay must close the stream promptly, not hang");
+    let mut buffer = String::new();
+    let mut saw_error_frame = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let closed = loop {
+        if std::time::Instant::now() >= deadline {
+            panic!("a broken history replay must close the stream promptly, not hang");
+        }
+        match tokio::time::timeout(Duration::from_secs(5), stream.chunk())
+            .await
+            .expect("chunk timeout")
+        {
+            Ok(Some(chunk)) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                assert!(
+                    !buffer.contains("event: test.seeded") && !buffer.contains("event: work."),
+                    "no *event* frame may ever follow the failed replay: {buffer:?}"
+                );
+                if buffer.contains("event: sergeant.stream_error") {
+                    saw_error_frame = true;
+                }
+            }
+            Ok(None) => break true,
+            Err(_) => break true,
+        }
+    };
+    assert!(closed, "the stream must eventually close");
     assert!(
-        matches!(closed, Ok(None) | Err(_)),
-        "no frames must be delivered once the replay itself failed: {closed:?}"
+        saw_error_frame,
+        "the journal failure must be disclosed as a stream_error control frame \
+         (W4 §1.1.3, A6) rather than a silent close: {buffer:?}"
     );
 
     // The daemon itself is undamaged: the core lock is released around the

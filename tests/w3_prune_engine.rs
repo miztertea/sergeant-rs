@@ -231,17 +231,24 @@ async fn a_start_on_an_over_cap_journal_prunes_before_serving() {
     assert_eq!(body["error"]["code"], "command_below_replay_window");
     assert_eq!(body["error"]["work_id"], json!(work_ids[0]));
 
-    // N13 / I-W3-7's live half: a pruned Work's own id 404s over HTTP (W3
-    // ships no pruned-by-name response shape — W4 owns that surface — but
-    // it must be the *same* honest 404 an unknown id gets, never a stale
-    // stranded read of evicted-but-still-cached data).
+    // N13 / I-W3-7's live half, updated for W4 §1.2: a pruned Work's own id
+    // no longer 404s — it answers the named pruned shape (`state: "pruned"`,
+    // `work: null`), Q10's own "show what we have" — never a stale stranded
+    // read of evicted-but-still-cached data, and never conflated with an id
+    // that never existed at all (`show_work_on_a_never_existing_id_still_404s`
+    // in `tests/w4_read_surfaces.rs` is the test that proves the two stay
+    // distinguished).
     let resp = http
         .get(format!("{}/v1/work/{}", handle2.endpoint, work_ids[0]))
         .bearer_auth(&handle2.token)
         .send()
         .await
         .expect("show a pruned work");
-    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["state"], "pruned");
+    assert!(body["work"].is_null());
+    assert_eq!(body["id"], work_ids[0]);
 
     handle2.shutdown().await;
 
