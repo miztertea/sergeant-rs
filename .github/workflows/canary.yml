@@ -41,6 +41,12 @@ jobs:
       - name: rustup update stable (install/refresh the floating toolchain the env var selects)
         run: rustup update stable
 
+      # RUSTUP_TOOLCHAIN=stable scopes this to the floating toolchain. The
+      # runner image usually preinstalls these with stable, but this job's
+      # clippy step must not depend on image packaging staying that way.
+      - name: rustup component add clippy rustfmt (against floating stable)
+        run: rustup component add clippy rustfmt
+
       - name: cargo check --locked --all-targets
         run: cargo check --locked --all-targets
 

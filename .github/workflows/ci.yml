@@ -31,8 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: rustup toolchain install (rust-toolchain.toml pins the version; -c adds clippy+rustfmt)
-        run: rustup toolchain install -c clippy,rustfmt
+      # Two steps, deliberately: bare file-driven `rustup toolchain install`
+      # ignores `-c` flags on the runner's rustup (proven on this repo's
+      # first pinned CI run — it installed the minimal profile's 3
+      # components and cargo fmt then failed), while `rustup component add`
+      # always targets the active toolchain rust-toolchain.toml selects.
+      - name: rustup toolchain install (rust-toolchain.toml pins the version)
+        run: rustup toolchain install
+      - name: rustup component add clippy rustfmt (file-selected toolchain)
+        run: rustup component add clippy rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 

@@ -276,8 +276,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: rustup toolchain install (rust-toolchain.toml pins the version; -t adds the cross target)
-        run: rustup toolchain install -t ${{ matrix.target }}
+      # Bare file-driven install ignores side flags like `-t` (see ci.yml's
+      # note on `-c`); add the target explicitly. Today both matrix legs are
+      # host-native so this is belt-and-braces, but it stops being a no-op
+      # the day a non-native target joins the matrix.
+      - name: rustup toolchain install (rust-toolchain.toml pins the version)
+        run: rustup toolchain install
+      - name: rustup target add ${{ matrix.target }}
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
@@ -556,8 +562,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: rustup toolchain install (rust-toolchain.toml pins the version; -t adds the cross target)
-        run: rustup toolchain install -t ${{ matrix.target }}
+      # Bare file-driven install ignores side flags like `-t` (see ci.yml's
+      # note on `-c`); add the target explicitly. Today both matrix legs are
+      # host-native so this is belt-and-braces, but it stops being a no-op
+      # the day a non-native target joins the matrix.
+      - name: rustup toolchain install (rust-toolchain.toml pins the version)
+        run: rustup toolchain install
+      - name: rustup target add ${{ matrix.target }}
+        run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
         with:
