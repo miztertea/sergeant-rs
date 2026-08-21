@@ -132,6 +132,20 @@ use crate::runtime::graph::{
     KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
 
+/// The app-server JSON-RPC client (W3 spec, `knowledge/evidence/resources/
+/// h-series/w3-spec.md` §1.5). `#[path]` because this file is a non-`mod.rs`
+/// module (`codex.rs` itself): the spec names the file
+/// `src/backend/codex_appserver.rs`, a sibling of this one, and this
+/// attribute is what makes `mod codex_appserver;` look there instead of
+/// `src/backend/codex/codex_appserver.rs`. Declared here rather than in
+/// `backend/mod.rs` is the visibility the spec asks for ("pub(crate) to
+/// src/backend/codex.rs"): a private child of *this* module can see every
+/// private item this module defines or imports (`ItemView`, `ItemKind`,
+/// `TurnAccumulator`, the `KIND_*` constants above), which is exactly how it
+/// reuses the one decoder rather than owning a second copy of it (§1.6).
+#[path = "codex_appserver.rs"]
+mod codex_appserver;
+
 // ------------------------------------------------------------------ consts
 
 /// Name this backend registers under.
@@ -569,6 +583,10 @@ enum Terminal {
         /// `error.message`, verbatim.
         message: String,
     },
+    /// **App-server only** (W3 spec §2.2): `turn/completed` itself carried
+    /// `turn.status == "interrupted"` — never constructed by exec's own
+    /// `ingest_line` (exec's stream has no wire shape that means this).
+    Interrupted,
 }
 
 /// The whole decoder: folds one turn's line-delimited JSON stream into
@@ -594,10 +612,26 @@ struct TurnAccumulator {
     /// The most recent bare stream `error` line's message (§4.4) — evidence
     /// for the ambiguous-unknown case, never a terminal by itself.
     last_error: Option<String>,
-    /// `turn.completed`'s usage object, verbatim, when seen.
+    /// `turn.completed`'s usage object, verbatim, when seen. On app-server
+    /// this is populated from `thread/tokenUsage/updated` instead (§2.3) —
+    /// same field, two producers, one reader (OBSERVE's evidence string).
     usage: Option<Value>,
     /// This turn's terminal, if any.
     terminal: Terminal,
+    /// **App-server only**: method names archived-but-not-decoded at the
+    /// envelope level (`remoteControl/status/changed`,
+    /// `mcpServer/startupStatus/updated`, and the remaining ~60) — the same
+    /// "counted, never decoded" posture `unknown_items` gives exec's
+    /// unrecognized item types, just keyed by method instead of item type
+    /// since these notifications carry no item at all.
+    unknown_methods: Vec<String>,
+    /// **App-server only**: the most recent `turn.error.codexErrorInfo` (or
+    /// the standalone `error` notification's), when the harness supplied
+    /// one (§2.8). Kept separate from [`Terminal::Failed`]'s `message` field
+    /// rather than added to it, so exec's identical-looking `Failed{message}`
+    /// match arms elsewhere in this module need no change for a fact only
+    /// this transport can ever populate.
+    last_codex_error_info: Option<String>,
 }
 
 impl TurnAccumulator {
@@ -877,8 +911,18 @@ enum TerminalOutcome {
         message: String,
     },
     /// No terminal arrived, but sergeant requested the kill: no conclusion
-    /// about the stage, the conversation stays resumable.
+    /// about the stage, the conversation stays resumable. Exec-only — this
+    /// transport has no native interrupt terminal, so this is *inferred*
+    /// from "we asked and nothing else arrived", never confirmed.
     InterruptedRunning,
+    /// **App-server only** (W3 spec §2.2): `turn/completed` itself carried
+    /// `turn.status == "interrupted"` — the harness *told* sergeant the turn
+    /// was interrupted, a first-class, harness-confirmed terminal, distinct
+    /// from [`TerminalOutcome::InterruptedRunning`]'s inference. Exec's
+    /// decoder never produces this arm: `Terminal` (exec's own accumulator
+    /// field) has no `Interrupted` variant, because exec's stream has no
+    /// wire shape that means it.
+    Interrupted,
     /// No terminal arrived and nobody asked for that: §5.2's ambiguity,
     /// fails closed.
     AmbiguousUnknown,
@@ -890,6 +934,10 @@ fn classify_terminal(acc: &TurnAccumulator, interrupted: bool) -> TerminalOutcom
         Terminal::Failed { message } => TerminalOutcome::Failed {
             message: message.clone(),
         },
+        // App-server only (§2.2): the harness itself said the turn ended
+        // interrupted, whether or not sergeant asked — a first-class
+        // terminal, never inferred the way `InterruptedRunning` below is.
+        Terminal::Interrupted => TerminalOutcome::Interrupted,
         Terminal::None if interrupted => TerminalOutcome::InterruptedRunning,
         Terminal::None => TerminalOutcome::AmbiguousUnknown,
     }
@@ -2441,6 +2489,25 @@ fn observe_in_memory(execution: &CodexExecution) -> Observation {
                     signal: BackendSignal::Running,
                     evidence: Some(format!(
                         "turn interrupted by request; conversation {thread_ref} resumable; raw={}",
+                        outcome.raw_evidence()
+                    )),
+                },
+                // Exec's own `TurnOutcome` never actually carries this arm
+                // (its `classify_terminal` only ever builds `Completed`,
+                // `Failed`, `InterruptedRunning` or `AmbiguousUnknown` from
+                // exec's own `Terminal` type) — kept here so the shared
+                // `TerminalOutcome` enum stays exhaustively matched, and
+                // because the *meaning* is identical to `InterruptedRunning`
+                // from OBSERVE's point of view: no stage verdict, the
+                // conversation stays resumable. The app-server path
+                // (`codex_appserver.rs`) reports this distinctly in its own
+                // evidence rather than through this exec-only function.
+                TerminalOutcome::Interrupted => Observation {
+                    native: NativeState::Exited,
+                    signal: BackendSignal::Running,
+                    evidence: Some(format!(
+                        "turn interrupted (harness-confirmed); conversation {thread_ref} \
+                         resumable; raw={}",
                         outcome.raw_evidence()
                     )),
                 },
