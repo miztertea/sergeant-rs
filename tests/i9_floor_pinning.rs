@@ -44,7 +44,9 @@ use sergeant_rs::domain::workflow::{
 };
 use sergeant_rs::runtime::analytics::Analytics;
 use sergeant_rs::runtime::journal::Journal;
-use sergeant_rs::runtime::projection::{WorkRegistry, work_registry_projection};
+use sergeant_rs::runtime::projection::{
+    Projection, WorkRegistry, work_registry_projection, work_registry_reducer,
+};
 use sergeant_rs::runtime::startup::{
     self, AnalyticsSink, CacheMiss, CapabilitySink, FloorCommandRow, FloorState, HorizonSink,
     LedgerSink, Plan, RegistrySink,
@@ -119,9 +121,20 @@ fn assert_registry_pinned(
         terminal_work_order: _,
         work_index,
         admission_paused: _, // ALLOWLIST: force-cleared unconditionally at every
-                             // startup (daemon.rs) before anything is served —
-                             // its replayed value is never load-bearing. See
-                             // `the_admission_pause_force_clear_mechanism_is_pinned`.
+        // startup (daemon.rs) before anything is served —
+        // its replayed value is never load-bearing. See
+        // `the_admission_pause_force_clear_mechanism_is_pinned`.
+        pruned_works, // ASSERTED (W3, I-W3-7): the residue must reach a
+        // cacheless floor replay and a cache+window start
+        // identically.
+        pruned_commands, // ASSERTED (W3, I-W3-8): same reasoning.
+        pending_prune,   // ASSERTED (W3, §6.5): always `None` in a *written*
+        // cache — an intent below `H` can never be left
+        // uncompleted — and the assertion is what keeps that
+        // true rather than assumed.
+        quarantined_blobs, // ASSERTED (W3, §5.2): the next cycle's deletion
+                           // list; a cache that lost it would leak
+                           // quarantined blobs forever.
     } = full;
 
     // ASSERTED — the load-bearing equalities.
@@ -132,6 +145,39 @@ fn assert_registry_pinned(
     );
     assert_eq!(works, &windowed.works, "works must be byte-identical");
     assert_eq!(runs, &windowed.runs, "runs must be byte-identical");
+    assert_eq!(
+        pruned_works, &windowed.pruned_works,
+        "pruned_works must be byte-identical between a full replay and cache+window (I-W3-7)"
+    );
+    assert_eq!(
+        pruned_commands, &windowed.pruned_commands,
+        "pruned_commands must be byte-identical between a full replay and cache+window (I-W3-8)"
+    );
+    assert_eq!(
+        pending_prune, &windowed.pending_prune,
+        "pending_prune must agree between a full replay and cache+window"
+    );
+    assert_eq!(
+        quarantined_blobs, &windowed.quarantined_blobs,
+        "quarantined_blobs must be byte-identical between a full replay and cache+window"
+    );
+    // W3's strengthening of the work_index assertion: a Work is in exactly
+    // one of `work_index`/`pruned_works`, on both sides.
+    assert!(
+        work_index
+            .keys()
+            .collect::<BTreeSet<_>>()
+            .is_disjoint(&pruned_works.keys().collect::<BTreeSet<_>>()),
+        "a Work must never appear in both work_index and pruned_works (full)"
+    );
+    assert!(
+        windowed
+            .work_index
+            .keys()
+            .collect::<BTreeSet<_>>()
+            .is_disjoint(&windowed.pruned_works.keys().collect::<BTreeSet<_>>()),
+        "a Work must never appear in both work_index and pruned_works (windowed)"
+    );
 
     // ALLOWLIST: commands — Q8, the cache carries keys not `CommandOutcome`
     // bodies. (a) everything the window kept is unchanged; (b) everything it
@@ -248,6 +294,24 @@ fn assert_registry_pinned(
         "terminal_run_order's members must be exactly terminal_runs' keys"
     );
 
+    // W3's strengthening: a pruned id has a row in *neither* cache — the
+    // fold that inserts it into `pruned_works`/`pruned_commands` removes it
+    // from `terminal_works`/`terminal_runs` in the same step (§6.2 step 2),
+    // so the subset assertions above hold without exception rather than
+    // needing one for a pruned id.
+    for id in pruned_works.keys() {
+        assert!(
+            !terminal_works.contains_key(id) && !terminal_runs.contains_key(id),
+            "a pruned Work id must not linger in either terminal cache (full, id {id})"
+        );
+    }
+    for id in windowed.pruned_works.keys() {
+        assert!(
+            !windowed.terminal_works.contains_key(id) && !windowed.terminal_runs.contains_key(id),
+            "a pruned Work id must not linger in either terminal cache (windowed, id {id})"
+        );
+    }
+
     // Capability watermark (recon correction 3's live gap) — the cache seed
     // folded forward by the window must agree with the full pass.
     assert_eq!(
@@ -285,7 +349,17 @@ fn run_full_pass(
     journal: &Journal,
     analytics_scratch: &Path,
 ) -> (WorkRegistry, u64, CapabilitySink, LedgerSink, HorizonSink) {
-    let mut registry = work_registry_projection();
+    // A1: `replay_from_floor()` below already starts yielding at the floor,
+    // not at 1 — the `Projection` wrapper must agree, or a genuinely pruned
+    // journal (floor > 1) reports a spurious `SeqMismatch` here instead of
+    // folding cleanly. Every fixture in this file before the real-prune case
+    // (§13.3) has floor == 1, where this is exactly `work_registry_projection()`.
+    let floor_seq = journal.floor_seq().expect("floor_seq").unwrap_or(1);
+    let mut registry = Projection::resumed(
+        WorkRegistry::default(),
+        floor_seq.saturating_sub(1),
+        work_registry_reducer,
+    );
     let mut analytics = Analytics::begin_rebuild(analytics_scratch).expect("analytics scratch");
     let mut capability = CapabilitySink::default();
     let mut ledger = LedgerSink::default();
@@ -336,7 +410,14 @@ fn build_cache(
         miss: CacheMiss::Absent,
     };
     let cache = plan
-        .next_cache(journal, full, ledger, capability, horizon_sink)
+        .next_cache(
+            journal,
+            full,
+            ledger,
+            capability,
+            horizon_sink,
+            horizon_sink.first_seq_by_work(),
+        )
         .expect("next_cache")
         .unwrap_or_else(|| {
             panic!(
@@ -535,6 +616,245 @@ async fn the_real_daemon_journal_pins() {
 
     let scratch = TempDir::new().expect("scratch");
     run_i9(&journal, scratch.path());
+}
+
+// ------------------------------------------------------------------
+// Case 3 (§13.3): a journal really pruned by `prune::run` — the wave's
+// acceptance gate, exactly as it was W2's — plus §8's negative proof.
+// ------------------------------------------------------------------
+
+/// A journal that has really been pruned by `prune::run` (not by
+/// hand-deleting segments) — §13.3's own words. Built directly over a
+/// `Core` (no daemon/HTTP needed to prove this): `w1` records an
+/// ask-grammar withdrawal and an accepted command before completing, so
+/// `pruned_works`, `pruned_commands` and `capability_provenance` are all
+/// non-empty in the residue this cycle carries. Everything else is a plain
+/// non-work-scoped, allowlisted event (`admission.paused`/`admission.
+/// resumed` — the same shape `build_kind_exhaustive_journal`'s own padding
+/// uses) rather than another Work: with no Work left in `work_index` at
+/// all once `w1` is pruned, W2's own startup-cache horizon
+/// (`startup::horizon`, gated on every retained Work being *settled* —
+/// a different predicate from the prune engine's `retired_whole`) has
+/// nothing left to block it, so it can advance across all of the padding.
+fn build_a_really_pruned_journal(dir: &Path) -> Journal {
+    use sergeant_rs::runtime::prune::{self, PolicySource, PrunePolicy};
+
+    let journal = Journal::open_with(dir, 1).expect("open");
+    let registry = work_registry_projection();
+    let (events_tx, _rx) = tokio::sync::broadcast::channel::<Event>(16);
+    let mut core = Core::new(journal, registry, events_tx);
+
+    core.commit(draft(
+        KIND_WORK_SUBMITTED,
+        Some("w1"),
+        submit_payload("w1", "pending"),
+    ))
+    .expect("commit w1 submitted");
+    core.commit(draft(
+        KIND_COMMAND_ACCEPTED,
+        Some("w1"),
+        json!({"command_id": "cmd-1", "operation": "work.submit", "status": 201u16,
+               "result": {"id": "w1"}}),
+    ))
+    .expect("commit cmd-1 accepted");
+    core.commit(draft(
+        "conversation.turn.grammar_unmeasured",
+        Some("w1"),
+        json!({"capability": "ask", "version": "2.1.226"}),
+    ))
+    .expect("commit the ask withdrawal");
+    core.commit(draft(KIND_WORK_COMPLETED, Some("w1"), json!({})))
+        .expect("commit w1 completed");
+    // I-W3-4: one non-work-scoped event pushes the writer off w1's own
+    // segments — no second Work needed for that.
+    core.commit(draft("admission.paused", None, json!({})))
+        .expect("commit admission.paused");
+    core.flush().expect("flush");
+
+    let bounds = core.journal.segment_bounds().expect("bounds");
+    let policy = PrunePolicy {
+        retention: 0,
+        source: PolicySource::Config,
+    };
+    let (candidate, _) = prune::candidate_horizon(
+        &bounds,
+        core.registry.state(),
+        &core.first_seq_by_work,
+        &policy,
+    );
+    let plan = prune::plan(
+        dir,
+        &bounds,
+        candidate,
+        core.registry.state(),
+        &core.first_seq_by_work,
+        &policy,
+    )
+    .expect("plan")
+    .expect("w1 must be prunable");
+    prune::run(&mut core, dir, plan, false).expect("run");
+
+    // Everything from here on is *after* the cycle already committed and
+    // unlinked — it cannot change what got pruned, only give
+    // `startup::window_seq`/`startup::horizon` enough surviving segments to
+    // advance past zero (with `work_index` now empty, nothing blocks it —
+    // only the segment/window bookkeeping does).
+    for i in 0..(startup::STARTUP_WINDOW_SEGMENTS + 4) {
+        core.commit(draft(
+            if i % 2 == 0 {
+                "admission.paused"
+            } else {
+                "admission.resumed"
+            },
+            None,
+            json!({}),
+        ))
+        .expect("commit padding");
+    }
+    core.flush().expect("flush");
+
+    core.journal
+}
+
+/// §8's Validation Evidence item 3 in full: "The I9 gate, extended to a
+/// real prune... a full floor replay of a pruned journal must equal
+/// cache+window, field by field." Every earlier case in this file builds
+/// its journal by hand-appended events or the daemon's ordinary event
+/// stream; this is the one that actually runs `prune::run` before
+/// comparing.
+#[test]
+fn i9_pinning_holds_across_a_real_prune() {
+    let dir = TempDir::new().expect("tempdir");
+    let journal = build_a_really_pruned_journal(dir.path());
+    let floor = journal.floor_seq().expect("floor_seq");
+    assert!(
+        floor.unwrap_or(1) > 1,
+        "the fixture must actually have been pruned (floor still 1) for this to prove anything"
+    );
+
+    let scratch = TempDir::new().expect("scratch");
+    let cache = run_i9(&journal, scratch.path());
+    assert!(
+        !cache.pruned_works.is_empty(),
+        "the fixture must actually carry pruned-work residue for the negative proofs beside \
+         this test to mean anything"
+    );
+    assert!(
+        !cache.pruned_commands.is_empty(),
+        "the fixture must actually carry pruned-command residue"
+    );
+    assert!(
+        cache.capability_provenance.is_some(),
+        "the fixture must actually carry a capability watermark in the real residue"
+    );
+}
+
+/// §8's negative proof, first mutation: dropping a `PrunedWorkRow` from the
+/// prune residue must fail the gate — a cache that silently lost one would
+/// let a cacheless floor replay and a cache+window start disagree about
+/// whether a Work was ever pruned at all.
+#[test]
+fn the_gate_fails_when_the_prune_residue_drops_a_pruned_work_row() {
+    let dir = TempDir::new().expect("tempdir");
+    let journal = build_a_really_pruned_journal(dir.path());
+    let scratch = TempDir::new().expect("scratch");
+    let (full, full_last_seq, capability, ledger, horizon_sink) =
+        run_full_pass(&journal, scratch.path());
+    let (mut cache, window_seq) = build_cache(&journal, &full, &ledger, &capability, &horizon_sink);
+    assert!(
+        !cache.pruned_works.is_empty(),
+        "the fixture must actually carry pruned-work residue for this proof to mean anything"
+    );
+    cache.pruned_works.pop(); // the mutation this test exists to catch
+
+    let (windowed, windowed_last_seq, windowed_capability) =
+        run_windowed_pass(&journal, &cache, window_seq);
+    let result = std::panic::catch_unwind(|| {
+        assert_registry_pinned(
+            &full,
+            &windowed,
+            &cache,
+            capability.latest.as_ref(),
+            windowed_capability.as_ref(),
+            full_last_seq,
+            windowed_last_seq,
+        );
+    });
+    assert!(
+        result.is_err(),
+        "dropping a PrunedWorkRow from a real prune's residue must fail the pinning gate"
+    );
+}
+
+/// §8's negative proof, second mutation: dropping a `PrunedCommandRow`.
+#[test]
+fn the_gate_fails_when_the_prune_residue_drops_a_pruned_command_row() {
+    let dir = TempDir::new().expect("tempdir");
+    let journal = build_a_really_pruned_journal(dir.path());
+    let scratch = TempDir::new().expect("scratch");
+    let (full, full_last_seq, capability, ledger, horizon_sink) =
+        run_full_pass(&journal, scratch.path());
+    let (mut cache, window_seq) = build_cache(&journal, &full, &ledger, &capability, &horizon_sink);
+    assert!(
+        !cache.pruned_commands.is_empty(),
+        "the fixture must actually carry pruned-command residue for this proof to mean anything"
+    );
+    cache.pruned_commands.pop(); // the mutation this test exists to catch
+
+    let (windowed, windowed_last_seq, windowed_capability) =
+        run_windowed_pass(&journal, &cache, window_seq);
+    let result = std::panic::catch_unwind(|| {
+        assert_registry_pinned(
+            &full,
+            &windowed,
+            &cache,
+            capability.latest.as_ref(),
+            windowed_capability.as_ref(),
+            full_last_seq,
+            windowed_last_seq,
+        );
+    });
+    assert!(
+        result.is_err(),
+        "dropping a PrunedCommandRow from a real prune's residue must fail the pinning gate"
+    );
+}
+
+/// §8's negative proof, third mutation — "the one that matters most,
+/// because §8.3 is the gap this spec found by reading rather than by
+/// testing": dropping the capability-provenance watermark carried on a
+/// *real* prune's residue (not a hand-built one) must fail the gate.
+#[test]
+fn the_gate_fails_when_the_prune_residue_drops_the_capability_watermark() {
+    let dir = TempDir::new().expect("tempdir");
+    let journal = build_a_really_pruned_journal(dir.path());
+    let scratch = TempDir::new().expect("scratch");
+    let (full, full_last_seq, capability, ledger, horizon_sink) =
+        run_full_pass(&journal, scratch.path());
+    let (mut cache, window_seq) = build_cache(&journal, &full, &ledger, &capability, &horizon_sink);
+    assert!(
+        cache.capability_provenance.is_some(),
+        "the fixture must actually carry a capability watermark for this proof to mean anything"
+    );
+    cache.capability_provenance = None; // the mutation this test exists to catch
+
+    let (windowed, windowed_last_seq, windowed_capability) =
+        run_windowed_pass(&journal, &cache, window_seq);
+    let result = std::panic::catch_unwind(|| {
+        assert_registry_pinned(
+            &full,
+            &windowed,
+            &cache,
+            capability.latest.as_ref(),
+            windowed_capability.as_ref(),
+            full_last_seq,
+            windowed_last_seq,
+        );
+    });
+    assert!(
+        result.is_err(),
+        "dropping the capability watermark from a real prune's residue must fail the gate"
+    );
 }
 
 /// §26's live end: a below-window `command_id` retried against a *running*

@@ -543,6 +543,7 @@ mod tests {
             groups: BTreeMap::new(),
             repository_origin: BTreeMap::new(),
             repository_upstream: BTreeMap::new(),
+            retention: None,
         }
     }
 

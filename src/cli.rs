@@ -3713,7 +3713,11 @@ pub(crate) mod doctor {
                 None,
             );
         }
-        let replay = match Journal::replay_data_dir(data_dir) {
+        // W3 §11.2: floor-aware, not `replay_data_dir` — a pruned journal's
+        // surviving events legitimately start above seq 1, and the strict
+        // primitive would misreport that as `SeqDiscontinuity` rather than
+        // the healthy, ruled-retention outcome it is.
+        let replay = match Journal::replay_data_dir_from_floor(data_dir) {
             Ok(replay) => replay,
             Err(e) => {
                 return (
@@ -3744,11 +3748,15 @@ pub(crate) mod doctor {
                 }
             }
         }
+        // W3 §11.2: name the floor this replay actually started from — `1`
+        // on every journal this build has never pruned, and honest evidence
+        // of ruled retention (not corruption) on one that has.
+        let floor_seq = events.first().map(|e| e.seq).unwrap_or(1);
         (
             Check::ok(
                 "journal",
                 format!(
-                    "{} events replay cleanly (head seq {last_seq})",
+                    "{} events replay cleanly from seq {floor_seq} (head seq {last_seq})",
                     events.len()
                 ),
             ),

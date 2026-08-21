@@ -143,6 +143,24 @@ pub enum JournalError {
         /// The largest index the file-name scheme can represent.
         max: u64,
     },
+    /// W3: a prune target was not an oldest-contiguous prefix of the live
+    /// segment set (I-W3-4). Refused before anything is touched.
+    #[error(
+        "refusing to unlink segments {attempted:?}: not an oldest-contiguous prefix of {live:?}"
+    )]
+    UnlinkNotAPrefix {
+        /// The indices the caller asked to unlink.
+        attempted: Vec<u64>,
+        /// The indices actually live on disk, oldest first.
+        live: Vec<u64>,
+    },
+    /// W3: a prune target named the segment this writer holds open — the
+    /// segment `append_event` still writes to (I-W3-4, N15).
+    #[error("refusing to unlink segment {index}: it is the live append target")]
+    UnlinkLiveSegment {
+        /// The offending segment index.
+        index: u64,
+    },
 }
 
 impl JournalError {
@@ -194,6 +212,11 @@ pub struct Journal {
     /// a dependency on the telemetry module, and the only place this timing
     /// exists is here.
     append_observer: Option<AppendObserver>,
+    /// W3 §10.4: whether a rotation has happened since the last
+    /// [`Journal::take_rotation_signal`] call. Set by `rotate_if_needed`,
+    /// cleared by the read. A one-shot flag rather than an observer callback
+    /// — see that method's own doc for why.
+    rotation_signal: bool,
     /// Exclusive advisory lock on the journal dir, held for the lifetime of
     /// the handle. The OS releases it when the handle drops — including on
     /// crash — so a stale lock can never wedge reopen.
@@ -215,6 +238,7 @@ impl std::fmt::Debug for Journal {
             .field("dirty", &self.dirty)
             .field("poisoned", &self.poisoned)
             .field("append_observer", &self.append_observer.is_some())
+            .field("rotation_signal", &self.rotation_signal)
             .finish()
     }
 }
@@ -290,6 +314,7 @@ impl Journal {
             dirty: false,
             poisoned: false,
             append_observer: None,
+            rotation_signal: false,
             _lock: lock,
         })
     }
@@ -433,7 +458,10 @@ impl Journal {
     /// Yields an error (and then stops) on malformed lines or seq
     /// discontinuities — fail closed, never silently skip.
     pub fn replay(&self) -> Result<Replay, JournalError> {
-        Ok(Replay::new(list_segments(&self.journal_dir)?))
+        Ok(Replay::new(
+            list_segments(&self.journal_dir)?,
+            self.journal_dir.clone(),
+        ))
     }
 
     /// Iterate every committed event with `seq > after`, skipping whole
@@ -457,7 +485,11 @@ impl Journal {
     /// matters: every daemon start replays from 1 through [`Journal::open`]
     /// and the projection rebuild.
     pub fn replay_after(&self, after: u64) -> Result<Replay, JournalError> {
-        Replay::after(list_segments(&self.journal_dir)?, after)
+        Replay::after(
+            list_segments(&self.journal_dir)?,
+            after,
+            self.journal_dir.clone(),
+        )
     }
 
     /// Replay a journal directory without opening a writer handle (and
@@ -476,9 +508,8 @@ impl Journal {
     /// after it — is corruption, not a race, and must fail closed exactly
     /// as it does today.
     pub fn replay_data_dir(data_dir: impl AsRef<Path>) -> Result<Replay, JournalError> {
-        Ok(Replay::new(list_segments(
-            &data_dir.as_ref().join("journal"),
-        )?))
+        let journal_dir = data_dir.as_ref().join("journal");
+        Ok(Replay::new(list_segments(&journal_dir)?, journal_dir))
     }
 
     /// Extents of every segment that holds at least one event, oldest first.
@@ -546,13 +577,22 @@ impl Journal {
         let segments = list_segments(&journal_dir)?;
         let mut floor = None;
         for (_, path) in &segments {
-            if let Some(first) = first_seq(path)? {
-                floor = Some(first);
-                break;
+            match first_seq(path) {
+                Ok(Some(first)) => {
+                    floor = Some(first);
+                    break;
+                }
+                Ok(None) => continue,
+                // W3 §11.3 (recon correction 7): this segment went away
+                // during the skip-scan itself — a prune raced this
+                // lock-free read. Skip it; the next surviving segment names
+                // the floor instead.
+                Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
             }
         }
         let after = floor.map_or(0, |f| f - 1);
-        Replay::after(segments, after)
+        Replay::after(segments, after, journal_dir)
     }
 
     fn rotate_if_needed(&mut self) -> Result<(), JournalError> {
@@ -571,7 +611,93 @@ impl Journal {
         self.segment_len = 0;
         // create_segment fsyncs the directory; deliberately not counted in
         // fsync_count, which tracks only per-append segment-data syncs.
+        // W3 §10.4: a real rotation happened — arm the one-shot signal the
+        // daemon's tick asks about at a group boundary.
+        self.rotation_signal = true;
         Ok(())
+    }
+
+    /// W3 §10.4: whether a rotation has happened since the last call.
+    /// Reading clears it.
+    ///
+    /// A flag rather than a callback because the prune it arms must not run
+    /// *inside* `append_event` — that call is mid-group, mid-fold, and
+    /// holding the writer's own file handle. The daemon asks this at a tick
+    /// boundary, where a failure is reportable and the group is closed.
+    pub fn take_rotation_signal(&mut self) -> bool {
+        std::mem::replace(&mut self.rotation_signal, false)
+    }
+
+    /// W3: unlink whole segment files, oldest-first — the only deletion door
+    /// this type has, and deliberately narrow.
+    ///
+    /// Refuses, before touching anything:
+    ///   - a target naming [`Journal::segment_index`](Self)'s current
+    ///     segment — the one this writer holds open (I-W3-4, N15);
+    ///   - a target whose still-live members are not an oldest-contiguous
+    ///     prefix of [`Journal::segment_bounds`]'s current segment list
+    ///     (I-W3-4, N16).
+    ///
+    /// An **empty** target is a no-op, `Ok(0)`, never an error. A target
+    /// member **already absent** from disk is tolerated rather than refused
+    /// — F4's idempotent retry: because deletion below only ever proceeds
+    /// oldest-first, a target's still-present members can never have a hole
+    /// in the middle relative to what is live now, only a shorter shared
+    /// prefix — so this is still exactly as strict about a genuinely wrong
+    /// target as an all-or-nothing check would be.
+    ///
+    /// Unlinks in ascending index order and fsyncs the journal directory
+    /// once at the end, so a crash partway leaves a shorter *valid* journal
+    /// with a higher floor rather than a hole (F4). The handle's own
+    /// `next_seq`, `segment_index`, `segment_file` and `segment_len` all
+    /// describe the newest segment and are untouched by construction.
+    ///
+    /// Returns the number of bytes actually reclaimed (already-absent
+    /// members contribute 0).
+    pub fn unlink_segments(&mut self, indices: &[u64]) -> Result<u64, JournalError> {
+        if indices.is_empty() {
+            return Ok(0);
+        }
+        if indices.contains(&self.segment_index) {
+            return Err(JournalError::UnlinkLiveSegment {
+                index: self.segment_index,
+            });
+        }
+        let live = list_segments(&self.journal_dir)?;
+        let live_indices: Vec<u64> = live.iter().map(|(index, _)| *index).collect();
+
+        // Tolerate members an earlier, interrupted unlink already removed:
+        // filter the target down to what is still actually there.
+        let present: Vec<u64> = indices
+            .iter()
+            .copied()
+            .filter(|index| live_indices.contains(index))
+            .collect();
+        if present.is_empty() {
+            return Ok(0);
+        }
+        let n = present.len();
+        if n >= live_indices.len() || present != live_indices[..n] {
+            return Err(JournalError::UnlinkNotAPrefix {
+                attempted: indices.to_vec(),
+                live: live_indices,
+            });
+        }
+
+        let mut reclaimed = 0u64;
+        for (_, path) in &live[..n] {
+            let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            match fs::remove_file(path) {
+                Ok(()) => reclaimed += bytes,
+                // Tolerated: an earlier interrupted cycle already got this
+                // one (F4); `present` above already proved it was live a
+                // moment ago, so this is the crash window, not corruption.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        sync_dir(&self.journal_dir)?;
+        Ok(reclaimed)
     }
 }
 
@@ -630,7 +756,8 @@ fn tail_next_seq(segments: &[(u64, PathBuf)]) -> Result<u64, JournalError> {
             continue;
         };
         let mut next = first;
-        for event in Replay::after(vec![(*index, path.clone())], first - 1)? {
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        for event in Replay::after(vec![(*index, path.clone())], first - 1, dir)? {
             next = event?.seq + 1;
         }
         return Ok(next);
@@ -646,16 +773,29 @@ pub struct Replay {
     line_no: u64,
     expected: u64,
     failed: bool,
+    /// W3 §11.3 (recon correction 7): events this iterator has yielded so
+    /// far. No longer gates the `NotFound`-tolerance decision on its own
+    /// (see [`Replay::next`]'s doc) — kept for diagnostics and because
+    /// several tests assert on it via the segment-vanishing behavior it used
+    /// to gate.
+    yielded: u64,
+    /// Directory to re-list when a segment vanishes out from under an open
+    /// call, so the tolerance decision can ask "is this still the shape a
+    /// real prune produces" instead of "has this iterator yielded yet" — see
+    /// [`Replay::next`].
+    journal_dir: PathBuf,
 }
 
 impl Replay {
-    fn new(segments: Vec<(u64, PathBuf)>) -> Self {
+    fn new(segments: Vec<(u64, PathBuf)>, journal_dir: PathBuf) -> Self {
         Self {
             segments: segments.into_iter(),
             current: None,
             line_no: 0,
             expected: 1,
             failed: false,
+            yielded: 0,
+            journal_dir,
         }
     }
 
@@ -665,24 +805,58 @@ impl Replay {
     /// of each is read off its first line. The kept prefix boundary is the
     /// *last* segment starting at or before `after + 1`: that segment may
     /// still contain wanted events, everything before it provably cannot.
-    fn after(segments: Vec<(u64, PathBuf)>, after: u64) -> Result<Self, JournalError> {
+    ///
+    /// **A1 (W3 §11.1).** When *no* segment starts at or below `after + 1` —
+    /// every surviving segment starts strictly above the requested point,
+    /// which after a prune is the ordinary case rather than a gap — this
+    /// expects the oldest survivor's own `first_seq` (the floor), not the
+    /// hardcoded `1` a fresh [`Replay::new`] carries. On an unpruned journal
+    /// the floor is always 1, so nothing here changes for any journal this
+    /// build has ever produced by itself; it only matters once a floor above
+    /// 1 exists. This is what makes `replay_after(0) ≡ replay_from_floor()`
+    /// (see [`Journal::replay_from_floor`]).
+    ///
+    /// A `NotFound` reading a candidate segment's first line (recon
+    /// correction 7) means a lock-free reader raced a prune's unlink during
+    /// this very scan — tolerated as "cannot rule anything out", the same
+    /// answer an empty rotated segment already gets, rather than propagated
+    /// as an error.
+    fn after(
+        segments: Vec<(u64, PathBuf)>,
+        after: u64,
+        journal_dir: PathBuf,
+    ) -> Result<Self, JournalError> {
         let mut keep = 0usize;
-        let mut expected = 1u64;
+        let mut matched: Option<u64> = None;
+        let mut floor: Option<u64> = None;
         for (index, (_, path)) in segments.iter().enumerate() {
-            match first_seq(path)? {
+            let first = match first_seq(path) {
+                Ok(first) => first,
+                // A segment listed a moment ago but gone now: a prune raced
+                // this scan. It cannot rule anything out either way.
+                Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+            };
+            match first {
                 // A segment created by rotation but not yet appended to has
                 // no first seq to compare; it cannot rule anything out.
                 None => continue,
-                Some(first) if first <= after.saturating_add(1) => {
-                    keep = index;
-                    expected = first;
+                Some(first) => {
+                    if floor.is_none() {
+                        floor = Some(first);
+                    }
+                    if first <= after.saturating_add(1) {
+                        keep = index;
+                        matched = Some(first);
+                    } else {
+                        break;
+                    }
                 }
-                Some(_) => break,
             }
         }
         let mut segments = segments;
-        let mut replay = Self::new(segments.split_off(keep));
-        replay.expected = expected;
+        let mut replay = Self::new(segments.split_off(keep), journal_dir);
+        replay.expected = matched.or(floor).unwrap_or(1);
         Ok(replay)
     }
 }
@@ -718,13 +892,101 @@ impl Iterator for Replay {
         }
         loop {
             if self.current.is_none() {
-                let (_, path) = self.segments.next()?;
+                let (index, path) = self.segments.next()?;
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let file = match File::open(&path) {
                     Ok(f) => f,
+                    // W3 §11.3 / N18 (recon correction 7): a segment that
+                    // vanishes before it is opened is a floor that moved
+                    // under a lock-free reader. `I-W3-4` guarantees a real
+                    // prune only ever unlinks an oldest-*contiguous prefix*
+                    // — which can be more than one segment at a time
+                    // (`PRUNE_BATCH_MIN_SEGMENTS`'s whole point) — so a
+                    // reader that has already yielded from segment 1 and
+                    // then finds segment 2 gone is still exactly the shape a
+                    // real prune produces, not corruption. Gating tolerance
+                    // on `self.yielded == 0` alone would reject that case;
+                    // instead, re-list the directory now and ask whether
+                    // what is left is still a shape a prune could have
+                    // produced:
+                    //
+                    // - **Non-empty.** I-W3-4 also guarantees the writer's
+                    //   own live segment is never unlinked, so a real prune
+                    //   can never leave nothing behind; treat that as
+                    //   corruption rather than silently reporting an empty
+                    //   journal.
+                    // - **Every survivor strictly newer than the segment
+                    //   that vanished.** Only a deleted leading prefix has
+                    //   that shape; a survivor *older* than the gap means
+                    //   the hole is not a prefix at all.
+                    // - **The survivors are a contiguous index run.**
+                    //   Rotation only ever creates `index + 1`
+                    //   (`rotate_if_needed`), so the on-disk index set is
+                    //   always contiguous and a prefix delete keeps it that
+                    //   way. A gap *above* the vanished segment is
+                    //   therefore damage, not retention — refused here,
+                    //   immediately, instead of being laundered by a second
+                    //   tolerated skip further down the same list.
+                    //
+                    // **Disclosed margin — the compound fault.** These
+                    // checks read the directory, and the directory cannot
+                    // tell a prune of segments `1..=N` apart from a prune of
+                    // `1..=N-1` plus a damage-deletion of `N`: both leave
+                    // the identical, perfectly plausible listing. Seqs
+                    // cannot separate them either — a legitimate prune moves
+                    // the floor, so the jump in `expected` this arm
+                    // re-anchors is exactly what a legitimate prune looks
+                    // like. So a damage-deletion of segments that happen to
+                    // sit contiguously *below* the surviving floor is, and
+                    // remains, tolerated as retention. What was narrowed is
+                    // everything above that floor: the re-anchor below
+                    // resolves the whole gap in **one** decision against
+                    // **one** listing, so a hole between two surviving
+                    // segments now fails closed (the contiguity check, or
+                    // `SeqDiscontinuity` on the next event), where the
+                    // previous shape re-derived `expected` once per vanished
+                    // segment against a stale list and could absorb
+                    // arbitrarily many separate holes in a row.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let live = match list_segments(&self.journal_dir) {
+                            Ok(live)
+                                if !live.is_empty()
+                                    && live.iter().all(|(i, _)| *i > index)
+                                    && live.windows(2).all(|w| w[1].0 == w[0].0 + 1) =>
+                            {
+                                live
+                            }
+                            _ => {
+                                self.failed = true;
+                                return Some(Err(e.into()));
+                            }
+                        };
+                        // Re-anchor onto that listing rather than carrying
+                        // on down the stale one. Two reasons, both real:
+                        // the stale list's own next entries may themselves
+                        // be gone (so re-deriving `expected` from them
+                        // silently leaves it pointing at the pre-prune
+                        // floor), and the stale list can be *shorter* than
+                        // reality — a prune that unlinks every segment this
+                        // reader still had listed, while the writer has
+                        // since rotated into a new one, used to run the
+                        // iterator off the end of its stale list and report
+                        // a complete replay that was missing the tail.
+                        // `expected` becomes the surviving floor's own first
+                        // seq, so the skip does not manufacture a false
+                        // `SeqDiscontinuity` against the deleted segments'
+                        // old bounds either.
+                        if let Some(first) =
+                            live.iter().find_map(|(_, p)| first_seq(p).ok().flatten())
+                        {
+                            self.expected = first;
+                        }
+                        self.segments = live.into_iter();
+                        continue;
+                    }
                     Err(e) => {
                         self.failed = true;
                         return Some(Err(e.into()));
@@ -787,6 +1049,7 @@ impl Iterator for Replay {
                         }));
                     }
                     self.expected += 1;
+                    self.yielded += 1;
                     return Some(Ok(event));
                 }
             }
@@ -1562,7 +1825,7 @@ pub(crate) mod tests {
         let segments = list_segments(&dir.path().join("journal")).expect("list_segments");
         let full_scan_next = {
             let mut next = 1u64;
-            for event in Replay::new(segments.clone()) {
+            for event in Replay::new(segments.clone(), dir.path().join("journal")) {
                 next = event.expect("event").seq + 1;
             }
             next
@@ -1575,5 +1838,387 @@ pub(crate) mod tests {
         // own next_seq agrees too.
         let journal = Journal::open(dir.path()).expect("reopen");
         assert_eq!(journal.next_seq(), 5);
+    }
+
+    // -------------------------------------------------------------
+    // W3: unlink_segments
+    // -------------------------------------------------------------
+
+    /// N15: the segment this writer holds open is never unlinked, even when
+    /// named explicitly.
+    #[test]
+    fn unlink_segments_refuses_the_live_segment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=3 {
+            journal.append(draft(n)).expect("append");
+        }
+        assert_eq!(
+            journal.segment_index, 3,
+            "one segment per append at this threshold"
+        );
+
+        let err = journal
+            .unlink_segments(&[1, 2, 3])
+            .expect_err("the live segment must never be unlinked");
+        assert!(matches!(err, JournalError::UnlinkLiveSegment { index: 3 }));
+        // Nothing touched.
+        assert_eq!(list_segments(&dir.path().join("journal")).unwrap().len(), 3);
+    }
+
+    /// N16: a target that skips a segment, or names one out of order, is
+    /// refused rather than silently reordered or partially honored.
+    #[test]
+    fn unlink_segments_refuses_a_non_contiguous_target_set() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=4 {
+            journal.append(draft(n)).expect("append");
+        }
+        assert_eq!(journal.segment_index, 4);
+
+        // Skips segment 2 — not a prefix at all.
+        let err = journal
+            .unlink_segments(&[1, 3])
+            .expect_err("a non-contiguous target must be refused");
+        assert!(matches!(err, JournalError::UnlinkNotAPrefix { .. }));
+
+        // Names segment 2 as if it were the oldest — not oldest-first.
+        let err = journal
+            .unlink_segments(&[2])
+            .expect_err("a target that is not the oldest-contiguous prefix must be refused");
+        assert!(matches!(err, JournalError::UnlinkNotAPrefix { .. }));
+
+        // Nothing touched by either refusal.
+        assert_eq!(list_segments(&dir.path().join("journal")).unwrap().len(), 4);
+    }
+
+    /// The ordinary case: an oldest-contiguous prefix unlinks cleanly, the
+    /// writer's own tail is untouched, and the reclaimed byte count matches
+    /// what was actually removed.
+    #[test]
+    fn unlink_segments_removes_an_oldest_contiguous_prefix_and_reports_bytes_reclaimed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=4 {
+            journal.append(draft(n)).expect("append");
+        }
+        let bounds_before = journal.segment_bounds().expect("bounds");
+        let expected_bytes: u64 = bounds_before[..2].iter().map(|b| b.bytes).sum();
+
+        let reclaimed = journal.unlink_segments(&[1, 2]).expect("unlink");
+        assert_eq!(reclaimed, expected_bytes);
+
+        let remaining = list_segments(&dir.path().join("journal")).expect("list");
+        assert_eq!(
+            remaining.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        // The writer's own tail is untouched: next_seq keeps counting from
+        // where it was, and a further append still succeeds.
+        assert_eq!(journal.next_seq(), 5);
+        journal.append(draft(5)).expect("append after unlink");
+        assert_eq!(journal.next_seq(), 6);
+    }
+
+    /// An empty target is a no-op — `Ok(0)`, never an error.
+    #[test]
+    fn unlink_segments_with_an_empty_target_is_a_no_op() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        journal.append(draft(1)).expect("append");
+        assert_eq!(journal.unlink_segments(&[]).expect("no-op"), 0);
+        assert_eq!(list_segments(&dir.path().join("journal")).unwrap().len(), 1);
+    }
+
+    /// F4's idempotent retry: a target whose oldest member was already
+    /// unlinked by an earlier, interrupted attempt is tolerated — the
+    /// still-present remainder is unlinked, and the already-gone member
+    /// contributes nothing to the byte count.
+    #[test]
+    fn unlink_segments_tolerates_a_target_member_already_removed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=4 {
+            journal.append(draft(n)).expect("append");
+        }
+        // Simulate an interrupted first attempt at unlinking [1, 2]: segment
+        // 1 is already gone, segment 2 is not.
+        std::fs::remove_file(dir.path().join("journal").join(segment_file_name(1)))
+            .expect("simulate a partially completed unlink");
+
+        let reclaimed = journal
+            .unlink_segments(&[1, 2])
+            .expect("a retry over a partially-completed unlink must succeed");
+        assert!(reclaimed > 0, "segment 2's bytes must still be counted");
+        let remaining = list_segments(&dir.path().join("journal")).expect("list");
+        assert_eq!(
+            remaining.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    // -------------------------------------------------------------
+    // W3: take_rotation_signal
+    // -------------------------------------------------------------
+
+    /// One shot: a rotation arms it, reading it clears it, and a second read
+    /// with nothing new is `false`.
+    #[test]
+    fn rotation_signal_is_one_shot() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        assert!(
+            !journal.take_rotation_signal(),
+            "a fresh journal has not rotated"
+        );
+
+        journal.append(draft(1)).expect("append 1 (segment 1)");
+        assert!(
+            !journal.take_rotation_signal(),
+            "the very first append never rotates — there is nothing to rotate away from"
+        );
+
+        journal
+            .append(draft(2))
+            .expect("append 2 (rotates to segment 2)");
+        assert!(
+            journal.take_rotation_signal(),
+            "the second append must have rotated at this threshold"
+        );
+        assert!(
+            !journal.take_rotation_signal(),
+            "reading the signal must clear it"
+        );
+
+        journal
+            .append(draft(3))
+            .expect("append 3 (rotates to segment 3)");
+        assert!(
+            journal.take_rotation_signal(),
+            "a later rotation re-arms it"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // W3 §11.1: Replay::after's floor clamp
+    // -------------------------------------------------------------
+
+    /// A1's fix, exercised directly through `replay_after` (not only through
+    /// the dedicated `replay_from_floor` wrapper): once the leading segment
+    /// is gone, `replay_after(0)` must expect the survivor's own floor, not
+    /// the hardcoded `1` that would misreport ruled retention as
+    /// `SeqDiscontinuity`.
+    #[test]
+    fn replay_after_on_a_pruned_journal_expects_the_floor_not_one() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let journal_dir;
+        {
+            let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+            for n in 1..=3 {
+                journal.append(draft(n)).expect("append");
+            }
+            journal_dir = dir.path().join("journal");
+        }
+        std::fs::remove_file(journal_dir.join(segment_file_name(1)))
+            .expect("simulate a prune: remove the leading segment");
+
+        let journal = Journal::open(dir.path()).expect("reopen over the survivors");
+        let replayed: Vec<u64> = journal
+            .replay_after(0)
+            .expect("replay_after")
+            .map(|e| e.expect("event — must not be SeqDiscontinuity").seq)
+            .collect();
+        assert_eq!(
+            replayed,
+            vec![2, 3],
+            "replay_after(0) must equal replay_from_floor() once the floor has moved"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // W3 §11.3 / N18: Replay tolerates a segment pruned between list and open
+    // -------------------------------------------------------------
+
+    /// A lock-free reader that lists segments and then has the leading one
+    /// vanish before it opens it (a prune racing it) must skip that segment
+    /// rather than fail — as long as nothing has been yielded yet.
+    #[test]
+    fn replay_data_dir_tolerates_a_segment_pruned_between_list_and_open() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+            for n in 1..=3 {
+                journal.append(draft(n)).expect("append");
+            }
+        }
+        let journal_dir = dir.path().join("journal");
+        let segments = list_segments(&journal_dir).expect("list segments (pre-race snapshot)");
+        // Simulate the race directly: the caller already has the segment
+        // list in hand (as `replay_data_dir` would after its own
+        // `list_segments` call), and *then* segment 1 disappears before
+        // `Replay` opens it.
+        std::fs::remove_file(journal_dir.join(segment_file_name(1)))
+            .expect("simulate the race: unlink after listing");
+
+        let replayed: Vec<u64> = Replay::new(segments, journal_dir.clone())
+            .map(|e| e.expect("event — must tolerate the raced deletion").seq)
+            .collect();
+        assert_eq!(replayed, vec![2, 3]);
+    }
+
+    /// The other half (F7's boundary): once this iterator has yielded at
+    /// least one event, a segment vanishing is no longer a race a prune can
+    /// cause (I-W3-4: prunes only ever touch a leading, oldest-contiguous
+    /// prefix) — it stays a hard failure.
+    #[test]
+    fn a_segment_vanishing_after_the_first_event_still_fails_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+            for n in 1..=3 {
+                journal.append(draft(n)).expect("append");
+            }
+        }
+        let journal_dir = dir.path().join("journal");
+        let segments = list_segments(&journal_dir).expect("list segments");
+
+        let mut replay = Replay::new(segments, journal_dir.clone());
+        assert_eq!(replay.next().expect("first event").expect("ok").seq, 1);
+
+        // Now remove the *next* segment out from under the still-live
+        // iterator — this is not a shape a prune can produce (I-W3-4), so it
+        // must fail closed rather than being tolerated.
+        std::fs::remove_file(journal_dir.join(segment_file_name(2)))
+            .expect("remove the segment the iterator is about to open");
+
+        let err = replay
+            .next()
+            .expect("an item")
+            .expect_err("a mid-stream vanish must fail closed");
+        assert!(matches!(err, JournalError::Io(_)));
+    }
+
+    /// A real prune batches its unlink across several whole segments at once
+    /// (`PRUNE_BATCH_MIN_SEGMENTS`) — not one at a time. A lock-free reader
+    /// that has already yielded events from segment 1 and then finds
+    /// segments 2 *and* 3 gone together, with only segment 4 (and beyond)
+    /// still live, must still tolerate it: gating tolerance on
+    /// `self.yielded == 0` alone would wrongly fail this closed, exactly
+    /// because a real multi-segment batch delete produces `yielded > 0` by
+    /// the time the reader reaches the second missing segment. This is the
+    /// case `a_segment_vanishing_after_the_first_event_still_fails_closed`
+    /// deliberately does not cover (it removes one segment from the middle,
+    /// leaving an *earlier* one live — not a shape any prune can produce).
+    #[test]
+    fn a_multi_segment_prefix_pruned_after_the_first_event_is_still_tolerated() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+            for n in 1..=4 {
+                journal.append(draft(n)).expect("append");
+            }
+        }
+        let journal_dir = dir.path().join("journal");
+        let segments = list_segments(&journal_dir).expect("list segments");
+
+        let mut replay = Replay::new(segments, journal_dir.clone());
+        assert_eq!(replay.next().expect("first event").expect("ok").seq, 1);
+
+        // Simulate a real oldest-contiguous-prefix prune landing mid-stream:
+        // segments 1, 2 and 3 unlinked together (in one `unlink_segments`
+        // call's shape — the reader's own already-open fd on segment 1
+        // keeps working per POSIX even though its dirent is gone), leaving
+        // only segment 4 (the writer's own live segment) on disk.
+        std::fs::remove_file(journal_dir.join(segment_file_name(1)))
+            .expect("simulate the batch prune: segment 1");
+        std::fs::remove_file(journal_dir.join(segment_file_name(2)))
+            .expect("simulate the batch prune: segment 2");
+        std::fs::remove_file(journal_dir.join(segment_file_name(3)))
+            .expect("simulate the batch prune: segment 3");
+
+        let rest: Vec<u64> = replay
+            .map(|e| {
+                e.expect("event — a real batch prune must still be tolerated")
+                    .seq
+            })
+            .collect();
+        assert_eq!(rest, vec![4]);
+    }
+
+    /// W3 §11.3, the tolerance's silent-truncation half: a prune can unlink
+    /// **every** segment this reader still had on its (already stale) list,
+    /// while the writer has since rotated into a new one the list has never
+    /// heard of. Tolerating the vanish and then walking off the end of the
+    /// stale list reports a clean, complete replay that is missing the
+    /// journal's whole tail — so the tolerated skip must re-anchor onto the
+    /// surviving listing and keep reading from the new floor.
+    #[test]
+    fn a_prune_of_the_whole_stale_list_re_anchors_onto_the_surviving_listing() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=3 {
+            journal.append(draft(n)).expect("append");
+        }
+        let journal_dir = dir.path().join("journal");
+        let segments = list_segments(&journal_dir).expect("list segments (pre-race snapshot)");
+
+        let mut replay = Replay::new(segments, journal_dir.clone());
+        assert_eq!(replay.next().expect("first event").expect("ok").seq, 1);
+
+        // The writer rotates into segment 4 *after* the reader's snapshot...
+        journal
+            .append(draft(4))
+            .expect("append into a fourth segment");
+        // ...and a prune then unlinks the whole 1..=3 prefix, which is every
+        // segment the reader's stale list knows about.
+        for index in 1..=3 {
+            std::fs::remove_file(journal_dir.join(segment_file_name(index)))
+                .expect("simulate the prune of the reader's whole stale list");
+        }
+
+        let rest: Vec<u64> = replay
+            .map(|e| {
+                e.expect("event — the surviving segment must still be replayed")
+                    .seq
+            })
+            .collect();
+        assert_eq!(
+            rest,
+            vec![4],
+            "a replay that tolerates the vanish must re-anchor on the surviving floor, \
+             never silently end at the tail of its own stale list"
+        );
+    }
+
+    /// The contiguity half of the same guard: rotation only ever creates
+    /// `index + 1`, so a *hole* between two surviving segments is damage and
+    /// never a prune's leading-prefix delete. It must fail closed at the
+    /// first vanish, before any event of the damaged journal is yielded —
+    /// not be tolerated once and caught only when the reader walks into the
+    /// hole itself.
+    #[test]
+    fn a_hole_in_the_surviving_listing_is_never_tolerated() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        {
+            let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+            for n in 1..=4 {
+                journal.append(draft(n)).expect("append");
+            }
+        }
+        let journal_dir = dir.path().join("journal");
+        let segments = list_segments(&journal_dir).expect("list segments");
+
+        // Segment 1: a plausible prune. Segment 3: damage, leaving a hole
+        // between the two survivors.
+        std::fs::remove_file(journal_dir.join(segment_file_name(1))).expect("prune segment 1");
+        std::fs::remove_file(journal_dir.join(segment_file_name(3))).expect("damage segment 3");
+
+        let mut replay = Replay::new(segments, journal_dir.clone());
+        let err = replay
+            .next()
+            .expect("an item")
+            .expect_err("a non-contiguous surviving listing must fail closed");
+        assert!(matches!(err, JournalError::Io(_)), "got {err:?}");
     }
 }

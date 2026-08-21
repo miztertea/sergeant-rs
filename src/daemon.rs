@@ -236,6 +236,13 @@ pub enum DaemonError {
     /// The §28 export pipeline could not be built from its configuration.
     #[error(transparent)]
     Telemetry(#[from] TelemetryError),
+    /// W3 Q9: this daemon's predecessor declared a prune it did not
+    /// acknowledge, and completing it (from the intent's own recorded
+    /// targets and residue) failed. Refused rather than served over: an
+    /// unfinished destructive act on disk means answering reads from a
+    /// journal whose floor is in an undeclared state.
+    #[error(transparent)]
+    Prune(#[from] crate::runtime::prune::PruneError),
     /// §4.1: the estate root this daemon was started against is not one.
     /// Refused before the data dir is created, the journal opened, or the
     /// descriptor published — a daemon that cannot name its estate never
@@ -389,6 +396,18 @@ pub struct DaemonConfig {
     /// test rigs' shape — never a silent fallback to discovery, of which
     /// there is none left.
     pub estate_root: Option<PathBuf>,
+    /// W3: retention cap for this daemon's journal, overriding `[estate]
+    /// retention`. `None` — production, always — takes the manifest's value
+    /// or [`crate::domain::estate::DEFAULT_RETENTION`].
+    ///
+    /// Configurable for the same reason `segment_max_bytes`/`completion_poll`
+    /// are: a prune test has to stand on the far side of the cap, and
+    /// building `DEFAULT_RETENTION` real Works is far outside a test budget.
+    /// **[`crate::domain::estate::MIN_RETENTION`] deliberately does not apply
+    /// here** — it is a *manifest-schema* refusal protecting an operator
+    /// from a typo in a file, not a runtime bound; a test rig setting
+    /// `Some(4)` has not typed anything into a manifest.
+    pub retention: Option<u32>,
 }
 
 impl Default for DaemonConfig {
@@ -406,6 +425,7 @@ impl Default for DaemonConfig {
             rebuild_cache: false,
             segment_max_bytes: None,
             estate_root: None,
+            retention: None,
         }
     }
 }
@@ -540,7 +560,24 @@ pub async fn start_with(
     // appended since the cache was written): the plan itself always knows.
     report.from_seq = plan.from_seq();
 
-    // 2c. §2.6: the cache this start should leave behind — hit or miss,
+    // 2c (W3 §2.5): the process-lifetime FirstSeqIndex the prune horizon
+    // needs — seeded from the cache's own rows (once a v2 cache has really
+    // written `first_seq` honestly) union this pass's own `HorizonSink`
+    // fold, exactly the same "already <= H_old <= H, always a legal answer"
+    // reasoning `LedgerSink`'s cache seed already follows.
+    let mut first_seq_by_work: crate::runtime::prune::FirstSeqIndex = match &plan {
+        startup::Plan::Windowed { cache, .. } => cache
+            .works
+            .iter()
+            .map(|row| (row.id.clone(), row.first_seq))
+            .collect(),
+        startup::Plan::Full { .. } => Default::default(),
+    };
+    for (id, seq) in horizon_sink.first_seq_by_work() {
+        first_seq_by_work.entry(id.clone()).or_insert(*seq);
+    }
+
+    // 2d. §2.6: the cache this start should leave behind — hit or miss,
     // extending it is always sound, since everything a new cache needs is
     // already in hand from the pass just run. Written under the daemon lock,
     // before the listener binds and before any event is appended, so it
@@ -552,6 +589,7 @@ pub async fn start_with(
         &ledger_sink,
         &capability_sink,
         &horizon_sink,
+        &first_seq_by_work,
     )?;
     startup::persist_or_remove(floor_state.as_ref(), data_dir)?;
     let rebuild_ms = u64::try_from(rebuild_started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -561,8 +599,104 @@ pub async fn start_with(
     let replay_floor_seq = journal.floor_seq()?.unwrap_or(1);
 
     let (events_tx, _) = broadcast::channel(1024);
-    let mut core =
-        Core::new(journal, registry, events_tx).with_floor_ledger(Arc::new(floor_ledger));
+    let mut core = Core::new(journal, registry, events_tx)
+        .with_floor_ledger(Arc::new(floor_ledger))
+        .with_first_seq_index(first_seq_by_work);
+
+    // W3 §1.2: resolve the retention policy once, for this process's whole
+    // life — `config.retention` (test rigs only) -> `[estate] retention` ->
+    // the built-in default. Journaled on every prune event so the record
+    // names the authorization, not just the number (A1).
+    //
+    // `estate` above is only an `EstateRoot` (path + manifest_path admitted
+    // by §4.1's exact-root check) — it never parsed `[estate] retention`, so
+    // it is re-read here through the *structural* parser: schema-level
+    // checks in full, no per-repository git validation (`Estate::admit`
+    // never did that either, so this cannot newly refuse a daemon start that
+    // used to succeed). A failure here — unreachable in practice, since
+    // `admit` already parsed the same file successfully — falls back to the
+    // default rather than turning a policy-resolution nicety into a new
+    // startup failure mode.
+    let estate_retention = estate.as_ref().and_then(|estate_root| {
+        match Estate::from_config_structural(&estate_root.manifest_path) {
+            Ok(full) => full.retention,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not re-read the estate manifest for [estate] retention; using the default"
+                );
+                None
+            }
+        }
+    });
+    let prune_policy = match config.retention {
+        Some(retention) => crate::runtime::prune::PrunePolicy {
+            retention,
+            source: crate::runtime::prune::PolicySource::Config,
+        },
+        None => match estate_retention {
+            Some(retention) => crate::runtime::prune::PrunePolicy {
+                retention,
+                source: crate::runtime::prune::PolicySource::Manifest,
+            },
+            None => crate::runtime::prune::PrunePolicy {
+                retention: crate::domain::estate::DEFAULT_RETENTION,
+                source: crate::runtime::prune::PolicySource::Default,
+            },
+        },
+    };
+
+    // 2e-2g (W3 §10.3, §6.6): Q9's crash completion — evidence-based, exactly
+    // as `recovery::reconcile_terminal_surface` is: the intent is a durable,
+    // fsynced record that a specific, enumerated deletion was authorized and
+    // begun. Nothing here is inferred, nothing is widened, and no deletion
+    // is ever started from suspicion — `recovery.rs`'s own refusal boundary
+    // ("recovery acts on evidence that something was left unfinished, and
+    // there is none here") is untouched: this acts only where an intent
+    // exists, and only on the targets that intent names. Runs *before*
+    // `recovery::reconcile` below: the completion's fold removes the pruned
+    // Works from `works`/`runs`, and every pruned Work is retired whole
+    // (I-W3-3) so reconcile would have found nothing to do for them either
+    // way — the ordering is for determinism, not correctness.
+    let prune_started = Instant::now();
+    let had_interrupted_prune = core.registry.state().pending_prune.is_some();
+    if had_interrupted_prune {
+        crate::runtime::prune::complete_interrupted(&mut core, data_dir)?;
+    }
+    let first_seq_snapshot = core.first_seq_by_work.clone();
+    let prune_outcome = match crate::runtime::prune::run_startup(
+        &mut core,
+        data_dir,
+        &prune_policy,
+        &first_seq_snapshot,
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "startup prune failed; serving anyway");
+            core.prune_pending = true;
+            crate::runtime::prune::PruneOutcome::default()
+        }
+    };
+    let prune_duration_ms = u64::try_from(prune_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let prune_outcome_tag = if had_interrupted_prune {
+        "completed-interrupted".to_string()
+    } else if prune_outcome.segments_unlinked > 0 {
+        format!("pruned:{}", prune_outcome.segments_unlinked)
+    } else {
+        let stalled = core.journal.segment_bounds().ok().map(|bounds| {
+            crate::runtime::prune::candidate_horizon(
+                &bounds,
+                core.registry.state(),
+                &core.first_seq_by_work,
+                &prune_policy,
+            )
+            .1
+        });
+        match stalled.and_then(|s| s.blocking_work_id) {
+            Some(work_id) => format!("stalled:{work_id}"),
+            None => "none".to_string(),
+        }
+    };
 
     // 3. Bind loopback on an ephemeral port before publishing anything.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -584,6 +718,10 @@ pub async fn start_with(
             "startup_cache": startup_cache,
             "replay_floor_seq": replay_floor_seq,
             "replay_from_seq": report.from_seq,
+            // W3: additive keys (§10.3) — what the startup prune trigger did
+            // (or why it did nothing), so a slow start is explicable.
+            "prune_duration_ms": prune_duration_ms,
+            "prune_outcome": prune_outcome_tag,
         }),
     ))?;
     // `core` is bare here — no `CoreGuard`, because nothing else can see it
@@ -763,6 +901,7 @@ pub async fn start_with(
         closing: closing_rx,
         engine,
         analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+        prune_policy,
     };
     // §28's export is a fold over the event stream, subscribed here and
     // nowhere else. With export off this task does not exist.

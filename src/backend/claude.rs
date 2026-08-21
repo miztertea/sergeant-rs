@@ -432,6 +432,55 @@ pub fn note_ask_withdrawal(latest: &mut Option<AskWithdrawal>, event: &Event) {
     }
 }
 
+/// The read-side counterpart to [`note_ask_withdrawal`], for a journal that
+/// has had the withdrawal's *own* event pruned out from under it (W3 §8.3).
+///
+/// A `prune.intent` event's `source` is `daemon/sergeant`, not
+/// `backend/claude`, and its `kind` is `"prune.intent"` — so
+/// [`note_ask_withdrawal`] never matches it, by design (it folds only the
+/// backend's own live measurement events). When the Work that recorded a
+/// withdrawal is pruned, `prune::scan_condemned_range` carries the
+/// watermark forward onto the intent's own `residue.capability_provenance`
+/// (with its **original** seq preserved, not the intent event's), so a
+/// later replay that never sees the original event can still recover it —
+/// *if* something reads it back. Before this function existed, nothing did:
+/// the watermark was written faithfully and then never read, so a full
+/// replay after the recording Work was pruned silently re-raised
+/// `Capabilities::ask` on an installation that had already proved it
+/// absent.
+///
+/// Deliberately depends only on the wire shape (a plain JSON walk), not on
+/// `runtime::prune`'s types — `runtime::prune` already depends on this
+/// module (for [`AskWithdrawal`]/[`note_ask_withdrawal`] themselves), and
+/// this module keeping no dependency the other way is what the codebase's
+/// documented one-way dependency (prune -> backend, never back) means in
+/// practice.
+pub fn note_carried_ask_withdrawal(latest: &mut Option<AskWithdrawal>, event: &Event) {
+    if event.source.source_type != "daemon"
+        || event.source.name != "sergeant"
+        || event.kind != "prune.intent"
+    {
+        return;
+    }
+    for field in ["residue", "carried_forward"] {
+        let Some(candidate) = event
+            .payload
+            .get(field)
+            .and_then(|r| r.get("capability_provenance"))
+            .and_then(|cp| {
+                let seq = cp.get("seq")?.as_u64()?;
+                let version = cp.get("version")?.as_str()?.to_string();
+                Some(AskWithdrawal { seq, version })
+            })
+        else {
+            continue;
+        };
+        if latest.as_ref().is_none_or(|w| candidate.seq > w.seq) {
+            *latest = Some(candidate);
+        }
+    }
+}
+
 /// Launch configuration for the adapter.
 #[derive(Debug, Clone)]
 pub struct ClaudeConfig {
