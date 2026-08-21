@@ -1266,6 +1266,177 @@ enum TurnState {
     Finished(Box<TurnOutcome>),
 }
 
+/// Which transport one execution runs on, and that transport's own runtime
+/// (W3 spec §1.4/§5). `Exec`-transport executions keep using
+/// [`CodexExecution`]'s own `turn`/`turn_pgid`/`reader` fields exactly as
+/// before this wave; app-server executions carry their entire runtime here
+/// instead, because the two transports' lifecycles do not share a shape
+/// (one process per turn vs. one child for the whole execution).
+#[derive(Debug)]
+enum CodexTransportState {
+    Exec,
+    AppServer(Arc<AppServerRuntime>),
+}
+
+/// One app-server execution's runtime: the long-lived child (§1.4) plus its
+/// current-or-last turn, mutated by the reader thread's own callback
+/// ([`appserver_on_line`]) and read from OBSERVE/SEND/INTERRUPT on any
+/// thread.
+#[derive(Debug)]
+struct AppServerRuntime {
+    child: Mutex<codex_appserver::AppServerChild>,
+    /// `Arc`-wrapped rather than a bare `Mutex` because the reader thread's
+    /// own callback (`appserver_on_line`, `'static`, spawned before this
+    /// struct exists) holds an independent clone of the same cell — the
+    /// callback is what constructs the very first `AppServerTurnState`, one
+    /// step before `AppServerRuntime` itself is assembled.
+    turn: Arc<Mutex<AppServerTurnState>>,
+}
+
+/// One execution's current-or-last turn on the app-server transport.
+#[derive(Debug)]
+enum AppServerTurnState {
+    /// No turn has ever been sent. Transient in practice — LAUNCH always
+    /// sends turn 1 as part of the same call that registers the execution —
+    /// kept as a real variant rather than assumed away, the same posture
+    /// `TurnState::Unlaunched` takes on the exec side.
+    Idle,
+    /// A turn is in flight. `turn_id` is briefly empty (spec's own ordering
+    /// caveat, §1.5.1: a notification may race ahead of `turn/start`'s own
+    /// response) — the accumulator exists and accepts notifications from the
+    /// moment this variant is set, *before* `turn/start` is even written, so
+    /// nothing racing ahead of the id is ever silently dropped.
+    InFlight {
+        turn_id: String,
+        acc: TurnAccumulator,
+        interrupt_requested: bool,
+    },
+    /// The last turn's terminal, plus the evidence OBSERVE reports.
+    Finished {
+        outcome: TerminalOutcome,
+        last_agent_message: Option<String>,
+        message_items: u32,
+        tool_items: u32,
+        unknown_items: Vec<String>,
+        unknown_methods: Vec<String>,
+        last_codex_error_info: Option<String>,
+    },
+}
+
+/// Owned context for the app-server reader-thread callback (spec §1.4):
+/// exactly what `TurnReader` owns for the exec transport, minus everything
+/// that lives on `AppServerRuntime` instead (the callback is `'static` and
+/// cannot borrow `&CodexBackend`).
+struct AppServerLineContext {
+    sink: Option<EventSink>,
+    execution_id: String,
+    work_id: String,
+    model: Option<String>,
+}
+
+impl AppServerLineContext {
+    fn emit(&self, kind: &str, payload: Value) {
+        if let Some(sink) = &self.sink {
+            sink(EventDraft {
+                source: EventSource::new("backend", CODEX_BACKEND_NAME),
+                workspace_id: None,
+                work_id: Some(self.work_id.clone()),
+                execution_id: Some(self.execution_id.clone()),
+                correlation_id: Some(self.execution_id.clone()),
+                causation_id: None,
+                kind: kind.to_string(),
+                payload,
+            });
+        }
+    }
+}
+
+/// The reader-thread callback every app-server child runs (spec §1.4/§3.4):
+/// decodes notifications through the shared [`TurnAccumulator`], emits their
+/// events immediately, finalizes the turn on `turn/completed`, and answers
+/// every server request — the non-hang guarantee, kept alive on the same
+/// thread that saw the request, never deferred to a second round trip.
+fn appserver_on_line(
+    ctx: &AppServerLineContext,
+    turn_cell: &Mutex<AppServerTurnState>,
+    handle: &codex_appserver::AppServerHandle,
+    line: codex_appserver::InboundLine,
+) {
+    match line {
+        codex_appserver::InboundLine::Notification { method, params } => {
+            let mut state = turn_cell.lock().expect("appserver turn lock");
+            let events = match &mut *state {
+                AppServerTurnState::InFlight { acc, .. } => {
+                    acc.ingest_appserver_notification(&method, &params)
+                }
+                AppServerTurnState::Idle | AppServerTurnState::Finished { .. } => Vec::new(),
+            };
+            for event in &events {
+                ctx.emit(&event.kind, event.payload.clone());
+            }
+            if method == "turn/completed"
+                && let AppServerTurnState::InFlight {
+                    interrupt_requested,
+                    ..
+                } = &*state
+            {
+                let interrupted = *interrupt_requested;
+                let taken = std::mem::replace(&mut *state, AppServerTurnState::Idle);
+                let AppServerTurnState::InFlight { acc, .. } = taken else {
+                    unreachable!("just matched InFlight above");
+                };
+                let outcome = classify_terminal(&acc, interrupted);
+                let thread_id_for_event = acc.thread_id.clone();
+                *state = AppServerTurnState::Finished {
+                    outcome: outcome.clone(),
+                    last_agent_message: acc.last_agent_message.clone(),
+                    message_items: acc.message_items,
+                    tool_items: acc.tool_items,
+                    unknown_items: acc.unknown_items.clone(),
+                    unknown_methods: acc.unknown_methods.clone(),
+                    last_codex_error_info: acc.last_codex_error_info.clone(),
+                };
+                drop(state);
+                ctx.emit(
+                    KIND_CONVERSATION_TURN_ENDED,
+                    json!({
+                        "thread_id": thread_id_for_event,
+                        "interrupted": interrupted,
+                        "message_items": acc.message_items,
+                        "tool_items": acc.tool_items,
+                        "unknown_items": acc.unknown_items,
+                        "unknown_methods": acc.unknown_methods,
+                    }),
+                );
+                if let Some(usage) = &acc.usage {
+                    ctx.emit(
+                        KIND_USAGE_UPDATED,
+                        json!({
+                            "thread_id": thread_id_for_event,
+                            "usage": usage,
+                            "model_pin": model_pin_evidence(ctx.model.as_deref()),
+                        }),
+                    );
+                }
+            }
+        }
+        codex_appserver::InboundLine::ServerRequest { id, method, params: _ } => {
+            // §3.4: every server request is answered, without exception —
+            // `ask` stays structurally `false` (see `ADMISSION_ROWS`), so
+            // this is always the "otherwise" branch of §2.4's conditional.
+            let answered = codex_appserver::answer_for_request(&method, false);
+            let _ = handle.answer(&id, answered.answer);
+            if let Some(phase) = answered.journal_phase {
+                ctx.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": phase, "method": method}),
+                );
+            }
+        }
+        codex_appserver::InboundLine::Unparsed => {}
+    }
+}
+
 /// Adapter-side record of one execution (one durable codex thread).
 #[derive(Debug)]
 struct CodexExecution {
@@ -1311,6 +1482,12 @@ struct CodexExecution {
     stopped: bool,
     interrupt_requested: bool,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Which transport this execution runs on (W3 §5). `Exec` for every
+    /// execution this wave's predecessor could produce; `AppServer` only
+    /// when this registration resolved to that transport (§5.2/§5.3) — a
+    /// re-adopted execution (RESUME) is always `Exec`, even if it was
+    /// originally launched on app-server (§5.4).
+    transport_state: CodexTransportState,
 }
 
 #[derive(Debug, Default)]
@@ -1805,7 +1982,7 @@ impl CodexBackend {
         match self.config.transport {
             TransportChoice::ExecOnly => TransportResolution {
                 transport: Transport::Exec,
-                detail: "transport: exec (ExecOnly configured)".to_string(),
+                detail: format!("transport: {} (ExecOnly configured)", Transport::Exec.as_str()),
             },
             TransportChoice::AppServerOnly => match &self.appserver_gates().result {
                 Ok(()) => TransportResolution {
@@ -1829,7 +2006,10 @@ impl CodexBackend {
                 },
                 Err(reason) => TransportResolution {
                     transport: Transport::Exec,
-                    detail: format!("transport: exec (Auto: app-server gate failed: {reason})"),
+                    detail: format!(
+                        "transport: {} (Auto: app-server gate failed: {reason})",
+                        Transport::Exec.as_str()
+                    ),
                 },
             },
         }
@@ -1837,14 +2017,18 @@ impl CodexBackend {
 
     fn appserver_detail(&self, why: &str) -> String {
         let gates = self.appserver_gates();
-        let mut detail = format!("transport: app-server (stdio) ({why})");
+        let mut detail = format!("transport: {} ({why})", Transport::AppServer.as_str());
         if gates.stale {
             detail.push_str(&format!(
-                "; protocol: stale (fingerprint != measured {})",
+                "; protocol: stale (fingerprint [{}] != measured {})",
+                codex_appserver::FINGERPRINT_ALGORITHM,
                 codex_appserver::MEASURED_PROTOCOL_FINGERPRINT
             ));
         } else {
-            detail.push_str("; protocol: fresh");
+            detail.push_str(&format!(
+                "; protocol: fresh (fingerprint [{}] matches measured)",
+                codex_appserver::FINGERPRINT_ALGORITHM
+            ));
         }
         detail
     }
@@ -2247,6 +2431,310 @@ impl CodexBackend {
         };
         (execution.turn_pgid, child)
     }
+
+    /// LAUNCH over `codex exec` (§3.1): register the execution, spawn turn
+    /// 1, and wait bounded for `thread.started` before returning a handle at
+    /// all. A failed launch leaves no phantom: adapter state is removed on
+    /// every error path.
+    fn launch_exec(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let LaunchConfig {
+            executable,
+            env,
+            codex_home,
+        } = self.launch_config(request.profile.as_ref())?;
+        {
+            let mut state = self.lock();
+            state.executions.insert(
+                request.execution_id.clone(),
+                CodexExecution {
+                    thread_id: None,
+                    work_id: request.work_id.clone(),
+                    cwd: request.cwd.clone(),
+                    model: request.model.clone(),
+                    executable,
+                    env,
+                    codex_home,
+                    bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
+                    sandbox: self.config.sandbox,
+                    turns: 0,
+                    turn: TurnState::Unlaunched,
+                    turn_pgid: None,
+                    stopped: false,
+                    interrupt_requested: false,
+                    reader: None,
+                    transport_state: CodexTransportState::Exec,
+                },
+            );
+        }
+        match self.spawn_first_turn(&request.execution_id, compose_launch_prompt(request)) {
+            Ok(thread_id) => Ok(ExecutionHandle {
+                execution_id: request.execution_id.clone(),
+                native_id: Some(thread_id),
+            }),
+            Err(e) => {
+                self.lock().executions.remove(&request.execution_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// LAUNCH over `codex app-server --listen stdio://` (W3 spec §1.4/§3.2):
+    /// spawn the child, handshake, `thread/start` (identity + policy, token-
+    /// free — M4/M5), register the execution, then `turn/start` for turn 1.
+    /// Unlike exec, the native id (`thread.id`) comes back from a
+    /// **synchronous RPC response**, before any turn exists — the crash
+    /// window exec's own module docs name is closed on this transport by
+    /// construction.
+    fn launch_appserver(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let LaunchConfig {
+            executable,
+            env,
+            codex_home,
+        } = self.launch_config(request.profile.as_ref())?;
+        let (handshake_budget, thread_start_budget, turn_start_budget, _interrupt_budget) = self
+            .config
+            .appserver_budgets
+            .unwrap_or_else(|| {
+                let d = codex_appserver::Budgets::default();
+                (d.handshake, d.thread_start, d.turn_start, d.interrupt)
+            });
+
+        let turn_cell: Arc<Mutex<AppServerTurnState>> = Arc::new(Mutex::new(AppServerTurnState::Idle));
+        let ctx = AppServerLineContext {
+            sink: self.sink.lock().expect("codex sink lock").clone(),
+            execution_id: request.execution_id.clone(),
+            work_id: request.work_id.clone(),
+            model: request.model.clone(),
+        };
+        let cb_cell = Arc::clone(&turn_cell);
+        let mut child = codex_appserver::AppServerChild::spawn(
+            &executable,
+            &request.cwd,
+            &env,
+            codex_home.as_deref(),
+            move |handle, line| appserver_on_line(&ctx, &cb_cell, handle, line),
+        )
+        .map_err(|e| self.err_failed(format!("cannot spawn app-server child: {e}")))?;
+
+        let handshake = child.handle().call(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "sergeant", "title": "sergeant",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {"experimentalApi": true},
+            }),
+            handshake_budget,
+        );
+        if let Err(e) = handshake {
+            child.kill(Duration::from_secs(5));
+            return Err(self.err_failed(format!("app-server handshake failed: {e}")));
+        }
+        if let Err(e) = child.handle().notify("initialized", json!({})) {
+            child.kill(Duration::from_secs(5));
+            return Err(self.err_failed(format!("app-server handshake failed: {e}")));
+        }
+
+        let extra_roots = bindings_outside_cwd(&request.cwd, &request.bindings);
+        let mut roots = vec![request.cwd.to_string_lossy().into_owned()];
+        roots.extend(extra_roots.iter().map(|p| p.to_string_lossy().into_owned()));
+        let mut thread_start_params = json!({
+            "model": request.model,
+            "cwd": request.cwd.to_string_lossy(),
+            "approvalPolicy": "never",
+            "runtimeWorkspaceRoots": roots,
+            "ephemeral": false,
+        });
+        if let Some(value) = self.config.sandbox.appserver_value() {
+            thread_start_params["sandbox"] = json!(value);
+        }
+        let thread_start_result =
+            match child
+                .handle()
+                .call("thread/start", thread_start_params, thread_start_budget)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    child.kill(Duration::from_secs(5));
+                    return Err(self.err_failed(format!("thread/start failed: {e}")));
+                }
+            };
+        let Some(thread_id) = thread_start_result
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            child.kill(Duration::from_secs(5));
+            return Err(self.err_failed(
+                "thread/start's result carried no thread.id (spec §1.5.2 expects one)",
+            ));
+        };
+
+        let runtime = Arc::new(AppServerRuntime {
+            child: Mutex::new(child),
+            turn: turn_cell,
+        });
+        {
+            let mut state = self.lock();
+            state.executions.insert(
+                request.execution_id.clone(),
+                CodexExecution {
+                    thread_id: Some(thread_id.clone()),
+                    work_id: request.work_id.clone(),
+                    cwd: request.cwd.clone(),
+                    model: request.model.clone(),
+                    executable,
+                    env,
+                    codex_home,
+                    bindings_outside_cwd: extra_roots,
+                    sandbox: self.config.sandbox,
+                    turns: 0,
+                    turn: TurnState::Unlaunched,
+                    turn_pgid: None,
+                    stopped: false,
+                    interrupt_requested: false,
+                    reader: None,
+                    transport_state: CodexTransportState::AppServer(Arc::clone(&runtime)),
+                },
+            );
+        }
+
+        let prompt = compose_launch_prompt(request);
+        match self.appserver_send_turn(&runtime, &thread_id, &prompt, turn_start_budget) {
+            Ok(()) => {
+                self.emit(
+                    &request.execution_id,
+                    &request.work_id,
+                    KIND_CONVERSATION_USER,
+                    json!({
+                        "text": prompt,
+                        "thread_id": thread_id,
+                        "bindings_outside_cwd": bindings_outside_cwd(&request.cwd, &request.bindings),
+                    }),
+                );
+                Ok(ExecutionHandle {
+                    execution_id: request.execution_id.clone(),
+                    native_id: Some(thread_id),
+                })
+            }
+            Err(e) => {
+                self.lock().executions.remove(&request.execution_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Send one turn over an app-server thread, shared by LAUNCH's turn 1
+    /// and SEND's later turns. Sets `AppServerTurnState::InFlight` **before**
+    /// `turn/start` is even written (see the variant's own doc comment for
+    /// why), so no notification racing ahead of the response can be dropped.
+    fn appserver_send_turn(
+        &self,
+        runtime: &AppServerRuntime,
+        thread_id: &str,
+        prompt: &str,
+        turn_start_budget: Duration,
+    ) -> Result<(), BackendError> {
+        {
+            let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
+            if let AppServerTurnState::InFlight { .. } = &*turn_state {
+                return Err(self.err_failed(
+                    "a turn is already in flight on this app-server thread; a codex thread runs \
+                     one turn at a time",
+                ));
+            }
+            *turn_state = AppServerTurnState::InFlight {
+                turn_id: String::new(),
+                acc: TurnAccumulator::new(),
+                interrupt_requested: false,
+            };
+        }
+        let handle = runtime.child.lock().expect("appserver child lock").handle();
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        });
+        if let Some(schema) = &self.config.output_schema {
+            params["outputSchema"] = schema.clone();
+        }
+        let result = match handle.call("turn/start", params, turn_start_budget) {
+            Ok(v) => v,
+            Err(e) => {
+                *runtime.turn.lock().expect("appserver turn lock") = AppServerTurnState::Idle;
+                return Err(self.err_failed(format!("turn/start failed: {e}")));
+            }
+        };
+        let turn_id = result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let AppServerTurnState::InFlight { turn_id: slot, .. } =
+            &mut *runtime.turn.lock().expect("appserver turn lock")
+        {
+            *slot = turn_id;
+        }
+        Ok(())
+    }
+
+    /// The app-server half of INTERRUPT (spec §2.2): `turn/interrupt`, and
+    /// on any failure the honest downgrade — kill the child's process group
+    /// and journal `phase:"interrupt_downgraded"` (§2.2's own rule: "a
+    /// downgrade that nobody can see is the dishonesty this wave exists to
+    /// avoid").
+    fn interrupt_appserver(
+        &self,
+        execution_id: &str,
+        runtime: &AppServerRuntime,
+        thread_id: &str,
+        interrupt_budget: Duration,
+    ) -> Completion {
+        let turn_id = {
+            let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
+            match &mut *turn_state {
+                AppServerTurnState::InFlight {
+                    turn_id,
+                    interrupt_requested,
+                    ..
+                } => {
+                    *interrupt_requested = true;
+                    Some(turn_id.clone())
+                }
+                AppServerTurnState::Idle | AppServerTurnState::Finished { .. } => None,
+            }
+        };
+        let Some(turn_id) = turn_id else {
+            return Completion::immediate();
+        };
+        let handle = runtime.child.lock().expect("appserver child lock").handle();
+        let work_id = {
+            let state = self.lock();
+            state
+                .executions
+                .get(execution_id)
+                .map(|e| e.work_id.clone())
+                .unwrap_or_default()
+        };
+        let result = handle.call(
+            "turn/interrupt",
+            json!({"threadId": thread_id, "turnId": turn_id}),
+            interrupt_budget,
+        );
+        if let Err(e) = result {
+            let pgid = runtime.child.lock().expect("appserver child lock").pgid();
+            kill_process_group(Some(pgid));
+            self.emit(
+                execution_id,
+                &work_id,
+                KIND_TURN_HARNESS_ERROR,
+                json!({"phase": "interrupt_downgraded", "detail": e}),
+            );
+        }
+        Completion::immediate()
+    }
 }
 
 /// Kill a turn's whole process group (§5.5): `SIGKILL` to the negated group
@@ -2488,6 +2976,7 @@ impl TurnReader {
     }
 }
 
+
 impl Backend for CodexBackend {
     fn name(&self) -> &str {
         CODEX_BACKEND_NAME
@@ -2581,54 +3070,20 @@ impl Backend for CodexBackend {
         })
     }
 
-    /// LAUNCH (§3.1): register the execution, spawn turn 1, and wait bounded
-    /// for `thread.started` before returning a handle at all. A failed
-    /// launch leaves no phantom: adapter state is removed on every error
-    /// path.
+    /// LAUNCH (§3.1/W3 §5): dispatches to whichever transport this
+    /// registration resolved to. Resolution happens once, at PROBE, and is
+    /// never revisited per execution (§5.3) — this is the only place that
+    /// reads it to make a launch decision.
     fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
-        let request = &prepared.request;
-        let LaunchConfig {
-            executable,
-            env,
-            codex_home,
-        } = self.launch_config(request.profile.as_ref())?;
-        {
-            let mut state = self.lock();
-            state.executions.insert(
-                request.execution_id.clone(),
-                CodexExecution {
-                    thread_id: None,
-                    work_id: request.work_id.clone(),
-                    cwd: request.cwd.clone(),
-                    model: request.model.clone(),
-                    executable,
-                    env,
-                    codex_home,
-                    bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
-                    sandbox: self.config.sandbox,
-                    turns: 0,
-                    turn: TurnState::Unlaunched,
-                    turn_pgid: None,
-                    stopped: false,
-                    interrupt_requested: false,
-                    reader: None,
-                },
-            );
-        }
-        match self.spawn_first_turn(&request.execution_id, compose_launch_prompt(request)) {
-            Ok(thread_id) => Ok(ExecutionHandle {
-                execution_id: request.execution_id.clone(),
-                native_id: Some(thread_id),
-            }),
-            Err(e) => {
-                self.lock().executions.remove(&request.execution_id);
-                Err(e)
-            }
+        match self.transport_resolution().transport {
+            Transport::Exec => self.launch_exec(prepared),
+            Transport::AppServer => self.launch_appserver(prepared),
         }
     }
 
+
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
-        {
+        let appserver = {
             let state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
@@ -2638,15 +3093,42 @@ impl Backend for CodexBackend {
                     handle.execution_id
                 )));
             }
-            if let TurnState::InFlight(_) = execution.turn {
-                return Err(self.err_failed(format!(
-                    "execution {} already has a turn in flight; a codex exec conversation runs \
-                     one turn at a time",
-                    handle.execution_id
-                )));
+            match &execution.transport_state {
+                CodexTransportState::Exec => {
+                    if let TurnState::InFlight(_) = execution.turn {
+                        return Err(self.err_failed(format!(
+                            "execution {} already has a turn in flight; a codex exec \
+                             conversation runs one turn at a time",
+                            handle.execution_id
+                        )));
+                    }
+                    None
+                }
+                CodexTransportState::AppServer(runtime) => Some(Arc::clone(runtime)),
+            }
+        };
+        match appserver {
+            None => self.spawn_turn(&handle.execution_id, input.to_string(), None),
+            Some(runtime) => {
+                let thread_id = handle
+                    .native_id
+                    .clone()
+                    .ok_or_else(|| self.err_unknown(&handle.execution_id))?;
+                let turn_start_budget = self
+                    .config
+                    .appserver_budgets
+                    .map(|b| b.2)
+                    .unwrap_or_else(|| codex_appserver::Budgets::default().turn_start);
+                self.appserver_send_turn(&runtime, &thread_id, input, turn_start_budget)?;
+                self.emit(
+                    &handle.execution_id,
+                    &self.lock().executions[&handle.execution_id].work_id.clone(),
+                    KIND_CONVERSATION_USER,
+                    json!({"text": input, "thread_id": thread_id}),
+                );
+                Ok(())
             }
         }
-        self.spawn_turn(&handle.execution_id, input.to_string(), None)
     }
 
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError> {
@@ -2654,6 +3136,9 @@ impl Backend for CodexBackend {
         if state.executions.contains_key(&handle.execution_id) {
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
+            if let CodexTransportState::AppServer(runtime) = &execution.transport_state {
+                return Ok(observe_appserver(execution, runtime));
+            }
             if matches!(execution.turn, TurnState::Adopted) {
                 let thread_id = execution.thread_id.clone().unwrap_or_default();
                 let cwd = execution.cwd.clone();
@@ -2673,9 +3158,31 @@ impl Backend for CodexBackend {
             .ok_or_else(|| self.err_unknown(&handle.execution_id))
     }
 
-    /// §5.5: kill the turn's whole process group. The durable thread
-    /// survives; the turn's evidence is STOP's promise, not this one.
+    /// §5.5 (exec) / W3 §2.2 (app-server): stop the current turn without
+    /// retiring the execution.
     fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
+        let appserver = {
+            let state = self.lock();
+            self.check_identity(&state, handle)?;
+            let execution = &state.executions[&handle.execution_id];
+            match &execution.transport_state {
+                CodexTransportState::AppServer(runtime) => Some(Arc::clone(runtime)),
+                CodexTransportState::Exec => None,
+            }
+        };
+        if let Some(runtime) = appserver {
+            let interrupt_budget = self
+                .config
+                .appserver_budgets
+                .map(|b| b.3)
+                .unwrap_or_else(|| codex_appserver::Budgets::default().interrupt);
+            return Ok(self.interrupt_appserver(
+                &handle.execution_id,
+                &runtime,
+                handle.native_id.as_deref().unwrap_or_default(),
+                interrupt_budget,
+            ));
+        }
         let (pgid, child) = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
@@ -2702,6 +3209,7 @@ impl Backend for CodexBackend {
         kill_turn(pgid, child.as_ref());
         Ok(Completion::immediate())
     }
+
 
     /// RESUME (§5.6): mirrors `claude.rs::resume`'s shape with codex's own
     /// evidence — liveness plus rollout existence, never the durable
@@ -2773,7 +3281,7 @@ impl Backend for CodexBackend {
         state.executions.insert(
             handle.execution_id.clone(),
             CodexExecution {
-                thread_id: Some(thread_id),
+                thread_id: Some(thread_id.clone()),
                 work_id: request.work_id.clone(),
                 cwd: request.cwd.clone(),
                 model: request.model.clone(),
@@ -2791,8 +3299,35 @@ impl Backend for CodexBackend {
                 stopped: false,
                 interrupt_requested: false,
                 reader: None,
+                // W3 §5.4: a restarted daemon has no live app-server child to
+                // re-adopt — the previous one died with the previous daemon
+                // — so re-adoption always continues on the exec transport,
+                // whatever the execution originally launched on. This is a
+                // transport change for a re-adopted execution whose original
+                // transport is provably gone, happening at re-adoption
+                // rather than mid-flight, and it is journaled below as a
+                // capability withdrawal exactly when this backend's own
+                // resolved transport is app-server (the only case where a
+                // reader could otherwise be surprised the row changed).
+                transport_state: CodexTransportState::Exec,
             },
         );
+        drop(state);
+        if self.transport_resolution().transport == Transport::AppServer {
+            self.emit(
+                &handle.execution_id,
+                &request.work_id,
+                KIND_TURN_HARNESS_ERROR,
+                json!({
+                    "phase": "transport_withdrawn_on_readopt",
+                    "thread_id": thread_id,
+                    "detail": "re-adopted after a daemon restart; this execution continues on \
+                               the exec transport (no live app-server child survives a restart), \
+                               losing NativeTurnInterrupt tier and any admitted ask capability \
+                               for its remaining turns",
+                }),
+            );
+        }
         Ok(())
     }
 
@@ -2819,10 +3354,13 @@ impl Backend for CodexBackend {
     }
 
     /// STOP (§5.7): kill any in-flight turn, refuse further input, hand back
-    /// the reader's join as the completion's tail (issue #14/B3's rule).
+    /// the reader's join as the completion's tail (issue #14/B3's rule). On
+    /// app-server, the "turn" and "execution" processes are the same thing
+    /// (§1.4: one child for the whole execution) — STOP is what actually
+    /// ends the child's life; INTERRUPT never does.
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         self.interrupt(handle)?.wait();
-        let reader = {
+        let (reader, appserver) = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = state
@@ -2830,14 +3368,114 @@ impl Backend for CodexBackend {
                 .get_mut(&handle.execution_id)
                 .expect("presence checked above");
             execution.stopped = true;
-            execution.reader.take()
+            let appserver = match &execution.transport_state {
+                CodexTransportState::AppServer(runtime) => Some(Arc::clone(runtime)),
+                CodexTransportState::Exec => None,
+            };
+            (execution.reader.take(), appserver)
         };
+        if let Some(runtime) = appserver {
+            let stderr_drain = codex_appserver::Budgets::default().stderr_drain;
+            return Ok(Completion::deferred(move || {
+                runtime
+                    .child
+                    .lock()
+                    .expect("appserver child lock")
+                    .kill(stderr_drain);
+            }));
+        }
         match reader {
             None => Ok(Completion::immediate()),
             Some(reader) => Ok(Completion::deferred(move || {
                 let _ = reader.join();
             })),
         }
+    }
+}
+
+/// Map an app-server execution's runtime to an Observation (W3 spec §1.4/
+/// §2.2/§2.8). `native` answers "is my child alive" — a property of the
+/// long-lived child, decoupled from whether a turn has finished (unlike
+/// exec, where the per-turn process exiting *is* what "native: Exited"
+/// means). `signal` comes from the current-or-last turn.
+fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> Observation {
+    let thread_ref = execution.thread_id.as_deref().unwrap_or("<unminted>");
+    let native = if runtime.child.lock().expect("appserver child lock").alive() {
+        NativeState::Running
+    } else {
+        NativeState::Exited
+    };
+    let turn_state = runtime.turn.lock().expect("appserver turn lock");
+    match &*turn_state {
+        AppServerTurnState::Idle => Observation {
+            native,
+            signal: BackendSignal::Running,
+            evidence: Some(format!(
+                "app-server child for thread {thread_ref} has not run a turn yet"
+            )),
+        },
+        AppServerTurnState::InFlight { turn_id, .. } => Observation {
+            native,
+            signal: BackendSignal::Running,
+            evidence: Some(format!("turn {turn_id} in flight on thread {thread_ref}")),
+        },
+        AppServerTurnState::Finished {
+            outcome,
+            last_agent_message,
+            message_items,
+            tool_items,
+            unknown_items,
+            unknown_methods,
+            last_codex_error_info,
+        } => match outcome {
+            TerminalOutcome::Completed => Observation {
+                native,
+                signal: BackendSignal::StageCompleted {
+                    summary: last_agent_message.clone(),
+                },
+                evidence: Some(format!(
+                    "thread_id={thread_ref}; message_items={message_items}, \
+                     tool_items={tool_items}, unknown_items={unknown_items:?}, \
+                     unknown_methods={unknown_methods:?}"
+                )),
+            },
+            TerminalOutcome::Failed { message } => {
+                // §2.8: a typed `unauthorized` arm names auth explicitly —
+                // exec could only ever produce an opaque failure string.
+                let auth_note = if last_codex_error_info.as_deref() == Some("unauthorized") {
+                    " (auth)"
+                } else {
+                    ""
+                };
+                Observation {
+                    native,
+                    signal: BackendSignal::Failed {
+                        reason: format!("turn failed{auth_note}: {}", truncate(message, 400)),
+                    },
+                    evidence: Some(format!(
+                        "thread_id={thread_ref}; codex_error_info={last_codex_error_info:?}"
+                    )),
+                }
+            }
+            // §2.2: a first-class, harness-confirmed terminal — the
+            // conversation stays resumable, exactly as exec's inferred
+            // `InterruptedRunning` reports, but never inferred here.
+            TerminalOutcome::Interrupted | TerminalOutcome::InterruptedRunning => Observation {
+                native,
+                signal: BackendSignal::Running,
+                evidence: Some(format!(
+                    "turn interrupted; thread {thread_ref} resumable (app-server: \
+                     harness-confirmed)"
+                )),
+            },
+            TerminalOutcome::AmbiguousUnknown => Observation {
+                native: NativeState::Unknown,
+                signal: BackendSignal::Running,
+                evidence: Some(format!(
+                    "no turn/completed observed for thread {thread_ref}"
+                )),
+            },
+        },
     }
 }
 

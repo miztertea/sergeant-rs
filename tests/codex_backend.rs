@@ -138,6 +138,15 @@ struct StubCodex {
     grandchild: PathBuf,
     grandchild_pid: PathBuf,
     detach: PathBuf,
+    /// W3: a marker file whose presence turns on this stub's `app-server`
+    /// subcommand emulation (`--help` offering `stdio://`, a minimal
+    /// `generate-json-schema` dump, and a bare `initialize`-only responder
+    /// on `--listen stdio://`). Absent by default, so every W1/W2 exec-only
+    /// test's stub fails G1 fast and Auto resolves to exec with no spawn of
+    /// anything that could hang or pollute this stub's shared launches
+    /// record — `supports_appserver()` is the opt-in for the tests that
+    /// need the opposite.
+    appserver_supported: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -173,12 +182,54 @@ impl StubCodex {
         let grandchild = dir.join("codex-grandchild");
         let grandchild_pid = dir.join("codex-grandchild-pid");
         let detach = dir.join("codex-grandchild-detach");
+        let appserver_supported = dir.join("codex-appserver-supported");
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
              if [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo \"{auth_line}\"; exit 0; fi\n\
              if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then printf '%s\\n' \"{exec_help}\"; exit 0; fi\n\
              if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"resume\" ] && [ \"$3\" = \"--help\" ]; then printf '%s\\n' \"{resume_help}\"; exit 0; fi\n\
+             \
+             if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then\n  \
+               if [ -f \"{appserver_supported}\" ]; then\n    \
+                 printf 'Usage: codex app-server\\n      --listen <URL>\\n          Supported: stdio:// (default)\\n'\n  \
+               else\n    \
+                 printf 'Usage: codex app-server\\n      --listen <URL>\\n          Supported: ws://IP:PORT only on this stub build\\n'\n  \
+               fi\n  \
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"generate-json-schema\" ]; then\n  \
+               if [ -f \"{appserver_supported}\" ]; then\n    \
+                 outdir=\"$4\"\n    \
+                 mkdir -p \"$outdir/v1\" \"$outdir/v2\"\n    \
+                 for f in v1/InitializeParams.json v1/InitializeResponse.json \
+                 v2/ThreadStartParams.json v2/ThreadStartResponse.json v2/TurnStartParams.json \
+                 v2/TurnStartResponse.json v2/TurnInterruptParams.json \
+                 v2/TurnCompletedNotification.json v2/TurnStartedNotification.json \
+                 v2/ItemStartedNotification.json v2/ItemCompletedNotification.json \
+                 v2/ThreadTokenUsageUpdatedNotification.json ToolRequestUserInputParams.json \
+                 ServerRequest.json; do\n      \
+                   echo '{{\"stub\":true}}' > \"$outdir/$f\"\n    \
+                 done\n    \
+                 exit 0\n  \
+               else\n    \
+                 exit 1\n  \
+               fi\n\
+             fi\n\
+             if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--listen\" ]; then\n  \
+               if [ -f \"{appserver_supported}\" ]; then\n    \
+                 while IFS= read -r line; do\n      \
+                   case \"$line\" in\n        \
+                     *'\"method\":\"initialize\"'*) printf '%s\\n' \
+                     '{{\"id\":1,\"result\":{{\"userAgent\":\"stub/0.0.0\",\"codexHome\":\"/stub\",\
+\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}}}' ;;\n      \
+                   esac\n    \
+                 done\n    \
+                 exit 0\n  \
+               else\n    \
+                 exit 1\n  \
+               fi\n\
+             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n\
              printf 'env CODEX_HOME=%s\\n' \"${{CODEX_HOME:-<unset>}}\";\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
@@ -217,6 +268,7 @@ impl StubCodex {
             detach = detach.display(),
             hang = hang.display(),
             exit_code = exit_code.display(),
+            appserver_supported = appserver_supported.display(),
         );
         std::fs::write(&path, script).expect("write stub");
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
@@ -235,6 +287,7 @@ impl StubCodex {
             grandchild,
             grandchild_pid,
             detach,
+            appserver_supported,
         }
     }
 
@@ -275,6 +328,19 @@ impl StubCodex {
 
     fn exits_with(&self, code: i32) -> &Self {
         std::fs::write(&self.exit_code, code.to_string()).expect("write exit code");
+        self
+    }
+
+    /// Turn on this stub's `app-server` subcommand emulation (W3 §6.2's
+    /// fourth `StubCodex` mode): `app-server --help` offers `stdio://`,
+    /// `generate-json-schema` writes the 14 pinned files (stub content —
+    /// this is what makes G2's file-presence check pass, never a claim the
+    /// bytes are real schemas), and `--listen stdio://` answers a bare
+    /// `initialize` request. Nothing else on this transport is emulated —
+    /// `thread/start`/`turn/start`/`turn/interrupt` are out of this stub's
+    /// scope; the live suite is this wave's proof for those.
+    fn supports_appserver(&self) -> &Self {
+        std::fs::write(&self.appserver_supported, b"go\n").expect("write appserver marker");
         self
     }
 
@@ -1629,6 +1695,10 @@ fn live_codex_probe_reports_the_installed_version_and_auth() {
     let detail = report.detail.expect("detail");
     assert!(detail.contains("codex-cli"));
     assert!(detail.contains("auth:"));
+    // W3: the resolved transport is now part of this same detail string
+    // (§5.5's journaling requirement) — on this host, Auto resolves to
+    // app-server with a fresh (non-stale) protocol fingerprint.
+    assert!(detail.contains("transport:"));
 }
 
 #[test]

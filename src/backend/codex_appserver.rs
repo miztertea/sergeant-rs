@@ -27,10 +27,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use super::{
-    ItemKind, ItemView, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_TURN_HARNESS_ERROR,
-    NativeEvent, Terminal, TurnAccumulator,
-};
+use super::{ItemKind, ItemView, KIND_TURN_HARNESS_ERROR, NativeEvent, Terminal, TurnAccumulator};
 
 // -------------------------------------------------------------- fingerprint
 
@@ -506,7 +503,7 @@ type PendingMap = Arc<Mutex<BTreeMap<u64, SyncSender<Result<Value, JsonRpcErrorI
 /// whoever owns the write side. [`AppServerChild`] (below) is this plus the
 /// process lifecycle (spawn/kill/pgid); nothing here talks to the process
 /// directly.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub(super) struct AppServerHandle {
     stdin: Arc<Mutex<std::process::ChildStdin>>,
     next_id: Arc<AtomicU64>,
@@ -574,6 +571,7 @@ impl AppServerHandle {
 /// caller (`codex.rs`) drives `thread/start`/`turn/start`/`turn/interrupt`
 /// through it and owns everything transport-specific (sandbox composition,
 /// prompts, the event sink).
+#[derive(Debug)]
 pub(super) struct AppServerChild {
     handle: AppServerHandle,
     child: Arc<Mutex<Child>>,
@@ -587,7 +585,17 @@ pub(super) struct AppServerChild {
 #[derive(Debug, Clone)]
 pub(super) enum InboundLine {
     Notification { method: String, params: Value },
-    ServerRequest { id: Value, method: String, params: Value },
+    /// `params` is carried but not yet read by `appserver_on_line` (only
+    /// `id`/`method` decide the answer) — kept rather than dropped because
+    /// it is exactly what an admitted `ask` path would need
+    /// (`params.questions`) and dropping real protocol data here would be
+    /// throwing away the one piece of evidence that decision needs.
+    #[allow(dead_code)]
+    ServerRequest {
+        id: Value,
+        method: String,
+        params: Value,
+    },
     /// A line that did not parse as JSON at all (§4.6's policy, unchanged).
     Unparsed,
 }
@@ -889,7 +897,7 @@ mod tests {
         assert!(matches!(acc.terminal, Terminal::Completed));
         let assistant: Vec<_> = events
             .iter()
-            .filter(|e| e.kind == KIND_CONVERSATION_ASSISTANT_COMPLETED)
+            .filter(|e| e.kind == crate::runtime::graph::KIND_CONVERSATION_ASSISTANT_COMPLETED)
             .collect();
         assert_eq!(assistant.len(), 1, "one assistant-completed event, no more");
         assert_eq!(assistant[0].payload["text"], "ok");
