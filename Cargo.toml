@@ -69,6 +69,11 @@ ulid = "3.0.0"
 debug = false
 
 [dev-dependencies]
+# Synchronously decoding an axum `Response` body in `tests/i9_floor_pinning.rs`
+# (spec §6.3 compensating assertion (c): calling the real `below_floor_refusal`
+# and inspecting its wire shape) — the version already pinned transitively by
+# axum 0.8's own `http-body-util` dependency.
+http-body-util = "0.1"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
 tempfile = "3"
 

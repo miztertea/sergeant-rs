@@ -228,9 +228,17 @@ impl Journal {
 
     /// Open with an explicit segment rotation threshold (bytes).
     ///
-    /// Open recovers a crashed tail, then fully replays the journal to
-    /// validate seq continuity and learn the next seq — a corrupt or gapped
-    /// journal refuses to open rather than silently accepting new writes.
+    /// Open recovers a crashed tail, then learns the next seq by replaying
+    /// **only the last non-empty segment** ([`tail_next_seq`]) — validating
+    /// seq contiguity for that segment alone, not the whole chain (W2, §1.5
+    /// of the wave spec). What this gives up, and what covers it: the
+    /// startup shared pass validates everything it reads (the whole surviving
+    /// chain on a cache miss), and the startup cache's per-segment BLAKE3
+    /// binding validates everything below the pass's start — any mutation of
+    /// any byte in a summarized segment invalidates the cache and forces a
+    /// full floor-aware replay, which then validates it the old way. A BLAKE3
+    /// over the bytes is *stronger* than a seq scan (which only catches a
+    /// missing or duplicated line), not weaker.
     pub fn open_with(
         data_dir: impl AsRef<Path>,
         segment_max_bytes: u64,
@@ -262,10 +270,7 @@ impl Journal {
             recover_tail(&journal_dir, *index, path)?;
         }
 
-        let mut next_seq = 1u64;
-        for event in Replay::new(segments.clone()) {
-            next_seq = event?.seq + 1;
-        }
+        let next_seq = tail_next_seq(&segments)?;
 
         let (segment_index, segment_path) = match segments.pop() {
             Some(last) => last,
@@ -476,6 +481,80 @@ impl Journal {
         )?))
     }
 
+    /// Extents of every segment that holds at least one event, oldest first.
+    ///
+    /// One line read per segment ([`first_seq`]) plus one `metadata()` — the
+    /// same cost [`Replay::after`] already pays to find its start. Segments
+    /// created by rotation but never appended to are skipped: they have no
+    /// first seq and cannot bound anything. `last_seq` of the newest bound
+    /// segment is `self.next_seq() - 1` (the last event this writer knows
+    /// about); every other segment's `last_seq` is the following segment's
+    /// `first_seq - 1`.
+    pub fn segment_bounds(&self) -> Result<Vec<SegmentBound>, JournalError> {
+        let segments = list_segments(&self.journal_dir)?;
+        let mut bounds: Vec<SegmentBound> = Vec::new();
+        for (index, path) in segments {
+            let Some(first) = first_seq(&path)? else {
+                continue;
+            };
+            let bytes = fs::metadata(&path)?.len();
+            bounds.push(SegmentBound {
+                index,
+                path,
+                first_seq: first,
+                last_seq: 0,
+                bytes,
+            });
+        }
+        let len = bounds.len();
+        for i in 0..len {
+            bounds[i].last_seq = if i + 1 < len {
+                bounds[i + 1].first_seq - 1
+            } else {
+                self.next_seq.saturating_sub(1)
+            };
+        }
+        Ok(bounds)
+    }
+
+    /// The lowest seq any surviving segment holds — the replay floor.
+    /// `None` for an empty journal.
+    pub fn floor_seq(&self) -> Result<Option<u64>, JournalError> {
+        Ok(self.segment_bounds()?.first().map(|b| b.first_seq))
+    }
+
+    /// **A1's redefinition of "full replay":** every event from the oldest
+    /// surviving segment's `first_seq` to the tail.
+    ///
+    /// Identical to [`Journal::replay`] while the oldest segment is segment 1
+    /// starting at seq 1 — which is every journal in production until W3
+    /// exists. After a prune it is the only correct spelling: [`Replay::new`]
+    /// hardcodes `expected = 1` and would report ruled retention as
+    /// [`JournalError::SeqDiscontinuity`]. Implemented as
+    /// `self.replay_after(floor - 1)`, so [`Journal::replay_after`]'s existing
+    /// floor-skip does the work.
+    pub fn replay_from_floor(&self) -> Result<Replay, JournalError> {
+        let after = self.floor_seq()?.map_or(0, |f| f - 1);
+        self.replay_after(after)
+    }
+
+    /// Read-only, lock-free counterpart to [`Journal::replay_from_floor`] for
+    /// out-of-process readers — mirrors [`Journal::replay_data_dir`]'s
+    /// relationship to [`Journal::replay`].
+    pub fn replay_data_dir_from_floor(data_dir: impl AsRef<Path>) -> Result<Replay, JournalError> {
+        let journal_dir = data_dir.as_ref().join("journal");
+        let segments = list_segments(&journal_dir)?;
+        let mut floor = None;
+        for (_, path) in &segments {
+            if let Some(first) = first_seq(path)? {
+                floor = Some(first);
+                break;
+            }
+        }
+        let after = floor.map_or(0, |f| f - 1);
+        Replay::after(segments, after)
+    }
+
     fn rotate_if_needed(&mut self) -> Result<(), JournalError> {
         if self.segment_len < self.segment_max_bytes || self.segment_len == 0 {
             return Ok(());
@@ -516,6 +595,47 @@ impl Drop for Journal {
             let _ = self.segment_file.sync_data();
         }
     }
+}
+
+/// One segment's extent, as the startup pass and the cache binding need it
+/// (W2, `runtime::startup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentBound {
+    /// Rotation-order index (the segment file's `NNNNNNNN` stem).
+    pub index: u64,
+    /// Path to the segment file.
+    pub path: PathBuf,
+    /// First seq in this segment.
+    pub first_seq: u64,
+    /// Last seq in this segment: the next segment's `first_seq - 1`, or
+    /// `next_seq - 1` for the newest.
+    pub last_seq: u64,
+    /// Segment file length in bytes.
+    pub bytes: u64,
+}
+
+/// The seq the next append will receive: one past the last event in the last
+/// segment that has one.
+///
+/// Walks segments newest-first to the first non-empty one (rotation can leave
+/// an empty newest segment) and replays *only* that segment, with `expected`
+/// starting at its own `first_seq` — so seq contiguity is still validated for
+/// everything it reads, and the writer can still never assign a colliding
+/// seq, because the maximum seq is always in the last non-empty segment
+/// (appends are ordered, and rotation creates the new segment before writing
+/// to it).
+fn tail_next_seq(segments: &[(u64, PathBuf)]) -> Result<u64, JournalError> {
+    for (index, path) in segments.iter().rev() {
+        let Some(first) = first_seq(path)? else {
+            continue;
+        };
+        let mut next = first;
+        for event in Replay::after(vec![(*index, path.clone())], first - 1)? {
+            next = event?.seq + 1;
+        }
+        return Ok(next);
+    }
+    Ok(1)
 }
 
 /// Iterator over committed events across segments, validating seq order.
@@ -1307,5 +1427,153 @@ pub(crate) mod tests {
             }
             other => panic!("expected a Malformed error at line 2, got {other:?}"),
         }
+    }
+
+    /// W2 §9.1 step 1: `segment_bounds` over a multi-segment journal reports
+    /// each segment's real extent, with the newest bound by the writer's own
+    /// `next_seq` and every other bound by the following segment's start.
+    #[test]
+    fn segment_bounds_reports_each_segments_real_extent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        // Rotate after every event, so three appends make three segments.
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=3 {
+            journal.append(draft(n)).expect("append");
+        }
+        let bounds = journal.segment_bounds().expect("segment_bounds");
+        assert_eq!(bounds.len(), 3);
+        assert_eq!(bounds[0].index, 1);
+        assert_eq!(bounds[0].first_seq, 1);
+        assert_eq!(bounds[0].last_seq, 1);
+        assert_eq!(bounds[1].index, 2);
+        assert_eq!(bounds[1].first_seq, 2);
+        assert_eq!(bounds[1].last_seq, 2);
+        assert_eq!(bounds[2].index, 3);
+        assert_eq!(bounds[2].first_seq, 3);
+        assert_eq!(
+            bounds[2].last_seq, 3,
+            "the newest segment's last_seq comes from next_seq() - 1"
+        );
+        for b in &bounds {
+            assert!(b.bytes > 0);
+        }
+    }
+
+    /// A segment created by rotation but never appended to has no first seq
+    /// and must be skipped rather than bounding anything.
+    #[test]
+    fn segment_bounds_skips_an_empty_newest_segment() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        journal.append(draft(1)).expect("append 1 — segment 1");
+        journal
+            .append(draft(2))
+            .expect("append 2 — rotates to segment 2");
+        // Segment 2's length is already over the 1-byte threshold from the
+        // append above, so this rotates once more — creating segment 3 with
+        // nothing ever written to it, exactly rotation's own empty-tail case.
+        journal
+            .rotate_if_needed()
+            .expect("rotate past the threshold with nothing to write");
+        let bounds = journal.segment_bounds().expect("segment_bounds");
+        // The empty segment 3 has no first_seq, so it must not appear.
+        assert_eq!(
+            bounds.iter().map(|b| b.first_seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn floor_seq_is_none_for_an_empty_journal() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let journal = Journal::open(dir.path()).expect("open");
+        assert_eq!(journal.floor_seq().expect("floor_seq"), None);
+    }
+
+    #[test]
+    fn floor_seq_is_the_oldest_survivors_first_seq() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=3 {
+            journal.append(draft(n)).expect("append");
+        }
+        assert_eq!(journal.floor_seq().expect("floor_seq"), Some(1));
+    }
+
+    /// A1's proof: with the leading segment deleted (never a production
+    /// path — floor stays 1 until W3 — but the fallback must already work in
+    /// a test `TempDir`), `replay_from_floor` replays from the survivor's own
+    /// `first_seq` instead of failing `SeqDiscontinuity`, and plain `replay()`
+    /// does fail `SeqDiscontinuity` over the same journal.
+    #[test]
+    fn replay_from_floor_survives_a_deleted_leading_segment_where_replay_does_not() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let journal_dir;
+        {
+            let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+            for n in 1..=3 {
+                journal.append(draft(n)).expect("append");
+            }
+            journal_dir = dir.path().join("journal");
+        }
+        // Delete segment 1 (seq 1) — a floor > 1, test-only.
+        fs::remove_file(journal_dir.join(segment_file_name(1))).expect("remove segment 1");
+
+        let journal = Journal::open(dir.path()).expect("reopen over the survivors");
+        assert_eq!(journal.floor_seq().expect("floor_seq"), Some(2));
+
+        let replayed: Vec<u64> = journal
+            .replay_from_floor()
+            .expect("replay_from_floor")
+            .map(|e| e.expect("event").seq)
+            .collect();
+        assert_eq!(replayed, vec![2, 3]);
+
+        let err = journal
+            .replay()
+            .expect("replay")
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("plain replay() must fail closed over a gapped chain");
+        assert!(
+            matches!(
+                err,
+                JournalError::SeqDiscontinuity {
+                    expected: 1,
+                    found: 2,
+                    ..
+                }
+            ),
+            "expected a SeqDiscontinuity at the gap replay() cannot skip, got {err:?}"
+        );
+    }
+
+    /// `tail_next_seq` agrees with a full scan on several segments, including
+    /// when the newest segment is empty (created by rotation but never
+    /// appended to).
+    #[test]
+    fn tail_next_seq_agrees_with_a_full_scan() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut journal = Journal::open_with(dir.path(), 1).expect("open");
+        for n in 1..=4 {
+            journal.append(draft(n)).expect("append");
+        }
+        drop(journal);
+
+        let segments = list_segments(&dir.path().join("journal")).expect("list_segments");
+        let full_scan_next = {
+            let mut next = 1u64;
+            for event in Replay::new(segments.clone()) {
+                next = event.expect("event").seq + 1;
+            }
+            next
+        };
+        let tail_next = tail_next_seq(&segments).expect("tail_next_seq");
+        assert_eq!(tail_next, full_scan_next);
+        assert_eq!(tail_next, 5);
+
+        // Re-open (recovers nothing — no torn tail) and confirm the writer's
+        // own next_seq agrees too.
+        let journal = Journal::open(dir.path()).expect("reopen");
+        assert_eq!(journal.next_seq(), 5);
     }
 }

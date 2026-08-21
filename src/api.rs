@@ -11,6 +11,7 @@
 //! `/healthz` is unauthenticated. Errors are structured JSON:
 //! `{"error": {"code": "...", "message": "..."}}`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +68,7 @@ use crate::runtime::projection::{
     Projection, ProjectionError, WorkIndexRow, WorkRegistry, WorkRun, is_absorbing, rederive_run,
     rederive_work,
 };
+use crate::runtime::startup::{FloorCommandClass, FloorCommandRow};
 use crate::runtime::surface::{
     BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
     KIND_SURFACE_TORN_DOWN, reap, retained_bindings,
@@ -91,6 +93,13 @@ pub struct Core {
     pub registry: Projection<WorkRegistry>,
     /// Live event fan-out for SSE subscribers.
     pub events_tx: broadcast::Sender<Event>,
+    /// W2 §26 keys for commands recorded below this process's replay window
+    /// (Q8). Loaded once from the startup cache and never mutated: every
+    /// command this process records lands in `registry.commands`, which
+    /// [`replay_command`] consults first. Empty on a full-replay start,
+    /// because then the registry already holds every command the journal
+    /// knows.
+    pub floor_ledger: Arc<BTreeMap<String, FloorCommandRow>>,
     /// The **open group**: events written and folded during the current lock
     /// hold, awaiting the hold's single fsync (#44).
     ///
@@ -127,8 +136,22 @@ impl Core {
             journal,
             registry,
             events_tx,
+            floor_ledger: Arc::new(std::collections::BTreeMap::new()),
             open_group: Vec::new(),
         }
+    }
+
+    /// W2: attach the startup cache's below-window command ledger. A
+    /// separate builder rather than a `Core::new` parameter so the three
+    /// existing test constructors stay untouched — an empty ledger (the
+    /// `Core::new` default) is exactly right for them, since none replays a
+    /// cache.
+    pub fn with_floor_ledger(
+        mut self,
+        floor_ledger: Arc<BTreeMap<String, FloorCommandRow>>,
+    ) -> Self {
+        self.floor_ledger = floor_ledger;
+        self
     }
 
     /// Append one event to the journal, fold it into the registry, and add it
@@ -1024,13 +1047,73 @@ fn parse_command_id(raw: &str) -> Result<(), Box<Response>> {
 }
 
 /// Replay a recorded command outcome, if this `command_id` was seen before.
-/// The stored `Value` serializes to the same bytes every time, so duplicates
-/// are byte-identical to the original response.
+///
+/// Two arms, in order:
+///
+/// 1. **In-window** — `registry.commands` has the recorded `CommandOutcome`.
+///    The stored `Value` serializes to the same bytes every time, so the
+///    duplicate is byte-identical to the original response. Unchanged.
+/// 2. **Below the window (W2, Q8)** — the startup cache's ledger has the key
+///    but not the body. The command is *refused by name*, never re-executed
+///    and never byte-replayed: the cache deliberately carries keys only
+///    (full outcome bodies were measured at 250-500 MB and rejected), so the
+///    honest answer is "this already happened, here is what it did", not a
+///    second execution under the same id. For a submit the refusal names the
+///    Work the command created; for anything else it names the outcome
+///    class.
 fn replay_command(core: &Core, command_id: &str) -> Option<Response> {
-    core.registry.state().commands.get(command_id).map(|o| {
-        let status = StatusCode::from_u16(o.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, Json(o.result.clone())).into_response()
-    })
+    if let Some(outcome) = core.registry.state().commands.get(command_id) {
+        let status =
+            StatusCode::from_u16(outcome.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return Some((status, Json(outcome.result.clone())).into_response());
+    }
+    core.floor_ledger.get(command_id).map(below_floor_refusal)
+}
+
+/// The §26 refusal for a command whose recorded outcome is below this
+/// process's replay window: 409 Conflict, never 410 Gone (the Work is not
+/// gone — it is retained and readable by name; only the recorded *response
+/// body* is not), never 200 with a synthesized body (that would be a
+/// fabricated byte-identical replay, which is exactly what Q8 refused), and
+/// never 400 (the request is well-formed).
+///
+/// Not journaled as a `command.rejected`: `record_and_respond` exists to
+/// make an outcome replayable, and journaling one here would append a new
+/// `commands` entry for an id whose real outcome is older and different —
+/// turning a refusal into a fabricated record. The response is returned
+/// directly.
+///
+/// `pub` (rather than the module-private default every other handler
+/// helper here uses) solely so spec §6.3's compensating assertion (c) — "for
+/// every such key, `below_floor_refusal` produces a 409 naming the right
+/// Work" — can call the real function from `tests/i9_floor_pinning.rs`
+/// instead of re-deriving the wire shape there.
+pub fn below_floor_refusal(row: &FloorCommandRow) -> Response {
+    let message = match (&row.class, row.work_id.as_deref()) {
+        (FloorCommandClass::Accepted | FloorCommandClass::Submitted, Some(work_id)) => format!(
+            "command_id {} was already applied before this daemon's replay window; \
+             it created work {work_id}. It is refused rather than re-executed — \
+             re-running it would create a second Work.",
+            row.command_id
+        ),
+        (FloorCommandClass::Rejected, _) => format!(
+            "command_id {} was already applied before this daemon's replay window; \
+             it was rejected. It is refused rather than re-executed, and the \
+             original response body is no longer retained.",
+            row.command_id
+        ),
+        (_, None) => format!(
+            "command_id {} was already applied before this daemon's replay window; \
+             it was accepted. It is refused rather than re-executed, and the \
+             original response body is no longer retained.",
+            row.command_id
+        ),
+    };
+    let mut body = error_body("command_below_replay_window", message);
+    body["error"]["command_id"] = json!(row.command_id);
+    body["error"]["outcome"] = json!(row.class);
+    body["error"]["work_id"] = json!(row.work_id);
+    (StatusCode::CONFLICT, Json(body)).into_response()
 }
 
 /// Journal a command outcome (`command.accepted` / `command.rejected`) and
@@ -4342,6 +4425,120 @@ mod tests {
     use crate::backend::BackendRegistry;
     use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
+
+    // ------------------------------------------------------------------
+    // §26 refuse-by-name (Q8) — `below_floor_refusal`'s own wire shape
+    // (spec §4.3). Finding: no test anywhere in the diff constructed a
+    // `FloorCommandRow` and called this function before this wave's fixer
+    // pass — the entire 409/`command_below_replay_window` contract shipped
+    // unverified. Four cases, one per `below_floor_refusal` match arm.
+    // ------------------------------------------------------------------
+
+    /// A submit's accepted outcome, below the window: 409, naming the Work
+    /// it created — spec §4.3's own worked JSON example.
+    #[tokio::test]
+    async fn below_floor_refusal_names_the_work_for_an_accepted_submit() {
+        let row = FloorCommandRow {
+            command_id: "01JZTESTCOMMAND0000000000".to_string(),
+            class: FloorCommandClass::Accepted,
+            work_id: Some("01JWTESTWORK000000000000".to_string()),
+        };
+        let response = below_floor_refusal(&row);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"]["code"], "command_below_replay_window");
+        assert_eq!(body["error"]["command_id"], row.command_id);
+        assert_eq!(body["error"]["outcome"], "accepted");
+        assert_eq!(body["error"]["work_id"], json!(row.work_id));
+        let message = body["error"]["message"].as_str().expect("message string");
+        assert!(
+            message.contains(&row.command_id) && message.contains(row.work_id.as_ref().unwrap()),
+            "message must name both the command and the Work it created: {message}"
+        );
+    }
+
+    /// The crash-window `Submitted` class (`work.submitted` with no
+    /// following `command.accepted`) hits the same "names the Work" arm as
+    /// `Accepted` — the message and `work_id` must not depend on whether the
+    /// accepting event ever actually landed.
+    #[tokio::test]
+    async fn below_floor_refusal_names_the_work_for_a_crash_window_submit() {
+        let row = FloorCommandRow {
+            command_id: "cmd-submitted".to_string(),
+            class: FloorCommandClass::Submitted,
+            work_id: Some("work-submitted".to_string()),
+        };
+        let response = below_floor_refusal(&row);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"]["code"], "command_below_replay_window");
+        assert_eq!(body["error"]["outcome"], "submitted");
+        assert_eq!(body["error"]["work_id"], json!("work-submitted"));
+    }
+
+    /// A rejected command: 409, `work_id` present-but-null (never omitted —
+    /// spec §4.3), and a message that says it was rejected rather than
+    /// naming a Work.
+    #[tokio::test]
+    async fn below_floor_refusal_reports_a_rejected_command_with_null_work_id() {
+        let row = FloorCommandRow {
+            command_id: "cmd-rejected".to_string(),
+            class: FloorCommandClass::Rejected,
+            work_id: None,
+        };
+        let response = below_floor_refusal(&row);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"]["code"], "command_below_replay_window");
+        assert_eq!(body["error"]["outcome"], "rejected");
+        assert_eq!(
+            body["error"]["work_id"],
+            Value::Null,
+            "work_id must be present-but-null, never omitted, for a non-submit"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message string")
+                .contains("rejected")
+        );
+    }
+
+    /// An accepted command with no Work at all (an admin-scoped command,
+    /// e.g. `admission.pause`): 409, `work_id` present-but-null, message says
+    /// it was accepted without naming a Work.
+    #[tokio::test]
+    async fn below_floor_refusal_reports_an_accepted_admin_command_with_null_work_id() {
+        let row = FloorCommandRow {
+            command_id: "cmd-admin".to_string(),
+            class: FloorCommandClass::Accepted,
+            work_id: None,
+        };
+        let response = below_floor_refusal(&row);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(body["error"]["code"], "command_below_replay_window");
+        assert_eq!(body["error"]["outcome"], "accepted");
+        assert_eq!(body["error"]["work_id"], Value::Null);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .expect("message string")
+                .contains("accepted")
+        );
+    }
 
     /// The `-`-for-missing rule, where it is defined. It used to be tested
     /// beside the dashboard's renderers in `src/web.rs` (deleted, ADR 0011);

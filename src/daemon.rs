@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -45,9 +45,10 @@ use crate::platform::fs_locking::{self, Reliability};
 use crate::runtime::analytics::{Analytics, AnalyticsError};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
-use crate::runtime::journal::{Journal, JournalError};
-use crate::runtime::projection::{ProjectionError, work_registry_projection};
+use crate::runtime::journal::{DEFAULT_SEGMENT_MAX_BYTES, Journal, JournalError};
+use crate::runtime::projection::ProjectionError;
 use crate::runtime::recovery;
+use crate::runtime::startup::{self, StartupError};
 use crate::telemetry::{Telemetry, TelemetryConfig, TelemetryError};
 
 /// Runtime descriptor file name inside the data dir.
@@ -229,6 +230,9 @@ pub enum DaemonError {
     /// The disposable analytical projection could not be rebuilt.
     #[error(transparent)]
     Analytics(#[from] AnalyticsError),
+    /// W2: the shared startup replay or its cache failed.
+    #[error(transparent)]
+    Startup(#[from] StartupError),
     /// The §28 export pipeline could not be built from its configuration.
     #[error(transparent)]
     Telemetry(#[from] TelemetryError),
@@ -356,6 +360,21 @@ pub struct DaemonConfig {
     /// `Engine::extend_turn_envelope` is the per-Work door beneath this
     /// daemon-wide default.
     pub turn_cap: Option<u32>,
+    /// W2 (`sgt daemon --rebuild-cache`): ignore any existing
+    /// `projections/floor-state.json`, rebuild from a full floor-aware
+    /// replay, and write a fresh one. `false` — the default and every
+    /// auto-spawn — uses the cache when it verifies.
+    pub rebuild_cache: bool,
+    /// Segment rotation threshold for this daemon's journal. `None` is
+    /// [`DEFAULT_SEGMENT_MAX_BYTES`] (8 MiB) — production, always.
+    ///
+    /// Configurable for the same reason `completion_poll` and `turn_ceiling`
+    /// are: W2's I9 and floor-fallback tests need a journal with more than
+    /// [`crate::runtime::startup::STARTUP_WINDOW_SEGMENTS`] segments, which
+    /// at the production threshold is far outside a test budget. The
+    /// alternative — shrinking the window instead — would mean the tests
+    /// prove a window nothing ships.
+    pub segment_max_bytes: Option<u64>,
     /// §5.1: the estate root this daemon is bound to, for its whole life.
     ///
     /// [`start_with`] admits it (§4.1's exact-root check —
@@ -384,6 +403,8 @@ impl Default for DaemonConfig {
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
             surfaces_root: None,
             turn_cap: None,
+            rebuild_cache: false,
+            segment_max_bytes: None,
             estate_root: None,
         }
     }
@@ -454,21 +475,20 @@ pub async fn start_with(
         return Err(DaemonError::Locked);
     }
 
-    // 2. Own the journal and rebuild current state by full replay (§24;
-    // snapshots are an optimization the M2 daemon does not need yet).
-    let mut journal = Journal::open(data_dir)?;
-    let mut registry = work_registry_projection();
-    registry.catch_up(journal.replay()?)?;
+    // 2. Own the journal (§24). Recovers a crashed tail and learns the next
+    // seq from the last non-empty segment alone (`Journal::open_with`'s own
+    // doc explains why that is still fully seq-validated).
+    let rebuild_started = Instant::now();
+    let mut journal = Journal::open_with(
+        data_dir,
+        config
+            .segment_max_bytes
+            .unwrap_or(DEFAULT_SEGMENT_MAX_BYTES),
+    )?;
 
-    // 2b. The disposable projections (§21–§23, §40). The DuckDB file is
-    // rebuilt from the journal on **every** start, so deleting it and
-    // restarting is indistinguishable from restarting: no code path can come
-    // to depend on state that only lives in there.
-    let analytics = Analytics::rebuild(data_dir, journal.replay()?)?;
-
-    // 2c. §28 export, when it is switched on. The journal's append timing is
-    // the one metric whose input exists nowhere else, so the observer is
-    // installed here — and only here, when export is on.
+    // §28 export, when it is switched on. The journal's append timing is the
+    // one metric whose input exists nowhere else, so the observer is
+    // installed here — before anything below can append through this handle.
     if let Some(telemetry) = &config.telemetry {
         let telemetry = telemetry.clone();
         journal.set_append_observer(Arc::new(move |elapsed| {
@@ -476,8 +496,73 @@ pub async fn start_with(
         }));
     }
 
+    // 2a-2b. W2's one shared startup pass: collapses what used to be four
+    // separate full replays (`next_seq`'s own scan above, the Work registry,
+    // the analytical projection, the claude capability watermark) into one
+    // `startup::drive` over one `Replay` iterator, windowed by a persisted,
+    // purely-derived cache of everything older than the window
+    // (`runtime::startup` owns the whole mechanism; see its module doc).
+    let plan = startup::Plan::resolve(data_dir, &journal, config.rebuild_cache)?;
+    let mut registry = plan.seed_registry();
+    // The disposable analytical projection (§21–§23, §40): rebuilt from the
+    // journal on every start (windowed exactly like every other sink), so
+    // deleting it and restarting is indistinguishable from restarting.
+    let mut analytics = Analytics::begin_rebuild(data_dir)?;
+    let mut capability_sink = startup::CapabilitySink::seeded(plan.capability_seed());
+    // Loaded once, never mutated by the pass (§26 Q8's below-window ledger) —
+    // a separate seed from the one `LedgerSink` folds forward, so `Core`'s
+    // copy always names exactly the below-window keys the cache carried in,
+    // never anything the pass itself re-derived.
+    let floor_ledger = plan.ledger_seed();
+    let mut ledger_sink = startup::LedgerSink::seeded(floor_ledger.clone());
+    let mut horizon_sink = startup::HorizonSink::default();
+    let mut report = {
+        let mut analytics_sink = startup::AnalyticsSink::new(analytics.fold()?, plan.window_seq());
+        let report = startup::drive(
+            plan.replay(&journal)?,
+            &mut [
+                &mut startup::RegistrySink(&mut registry),
+                &mut analytics_sink,
+                &mut capability_sink,
+                &mut ledger_sink,
+                &mut horizon_sink,
+            ],
+        )?;
+        // `analytics_sink`'s `finish()` already ran inside `drive` above;
+        // dropping it here ends its borrow of `analytics` before the cache
+        // write below (and `analytics`'s later move into `ApiState`) need
+        // one of their own.
+        drop(analytics_sink);
+        report
+    };
+    // `PassReport::from_seq`'s own doc explains why `drive` cannot recover
+    // this when it sees zero events (a cache-hit restart with nothing
+    // appended since the cache was written): the plan itself always knows.
+    report.from_seq = plan.from_seq();
+
+    // 2c. §2.6: the cache this start should leave behind — hit or miss,
+    // extending it is always sound, since everything a new cache needs is
+    // already in hand from the pass just run. Written under the daemon lock,
+    // before the listener binds and before any event is appended, so it
+    // always describes a prefix of the journal as it stood before this
+    // process's first append.
+    let floor_state = plan.next_cache(
+        &journal,
+        registry.state(),
+        &ledger_sink,
+        &capability_sink,
+        &horizon_sink,
+    )?;
+    startup::persist_or_remove(floor_state.as_ref(), data_dir)?;
+    let rebuild_ms = u64::try_from(rebuild_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let startup_cache = plan.startup_cache_tag();
+    // The oldest surviving seq (1 on every W2 production path — the floor
+    // only moves above 1 once W3's prune lands).
+    let replay_floor_seq = journal.floor_seq()?.unwrap_or(1);
+
     let (events_tx, _) = broadcast::channel(1024);
-    let mut core = Core::new(journal, registry, events_tx);
+    let mut core =
+        Core::new(journal, registry, events_tx).with_floor_ledger(Arc::new(floor_ledger));
 
     // 3. Bind loopback on an ephemeral port before publishing anything.
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -487,7 +572,19 @@ pub async fn start_with(
     core.commit(EventDraft::new(
         EventSource::new("daemon", "sergeant"),
         KIND_DAEMON_STARTED,
-        json!({"pid": std::process::id(), "version": env!("CARGO_PKG_VERSION"), "endpoint": endpoint}),
+        json!({
+            "pid": std::process::id(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "endpoint": endpoint,
+            // W2 (Q1/Q4): what the one shared startup pass cost, so
+            // `sgt doctor` can re-argue the fixed window from evidence
+            // rather than adapting it silently.
+            "rebuild_duration_ms": rebuild_ms,
+            "replayed_events": report.replayed_events,
+            "startup_cache": startup_cache,
+            "replay_floor_seq": replay_floor_seq,
+            "replay_from_seq": report.from_seq,
+        }),
     ))?;
     // `core` is bare here — no `CoreGuard`, because nothing else can see it
     // yet — so nothing makes this durable but an explicit flush (invariants
@@ -520,11 +617,11 @@ pub async fn start_with(
         // the registration probe two steps below, first of all — so a
         // capability this exact CLI version already proved absent stays
         // withdrawn across a restart instead of re-defaulting to optimistic
-        // on every fresh process. A separate `replay_data_dir` read (rather
-        // than reusing `journal` above, already moved into `core`) is the
-        // same pattern step 2b's `Analytics::rebuild` already uses for a
-        // second, independent replay of the same validated chain.
-        adapter.seed_capability_provenance(Journal::replay_data_dir(data_dir)?)?;
+        // on every fresh process. W2 replaces this walk's own separate
+        // journal replay with the shared pass's own `CapabilitySink`: the
+        // *fold* moved to step 2b, above; the *application* stays here,
+        // still before the registration probe reads `capabilities()`.
+        adapter.seed_capability_provenance_from(capability_sink.latest.as_ref());
         backends = backends.with(adapter.clone());
         Some(adapter)
     } else {
@@ -914,6 +1011,7 @@ async fn export_events(
 pub async fn run_until_signal(
     data_dir: &Path,
     estate_root: Option<&Path>,
+    rebuild_cache: bool,
 ) -> Result<(), DaemonError> {
     // **Handlers first, before anything makes this daemon reachable.**
     //
@@ -984,6 +1082,7 @@ pub async fn run_until_signal(
             // handed down from the invocation that already admitted it
             // (`sgt -C <root> daemon`, or `sgt daemon` from the root).
             estate_root: estate_root.map(Path::to_path_buf),
+            rebuild_cache,
             ..DaemonConfig::default()
         },
     )
@@ -1265,7 +1364,7 @@ mod tests {
     /// actually touch.
     fn test_core(data_dir: &Path) -> Core {
         let journal = Journal::open(data_dir).expect("open journal");
-        let mut registry = work_registry_projection();
+        let mut registry = crate::runtime::projection::work_registry_projection();
         registry
             .catch_up(journal.replay().expect("replay"))
             .expect("catch up");

@@ -85,6 +85,16 @@ enum Command {
     /// Run the daemon in the foreground until SIGINT/SIGTERM, or (with a
     /// subcommand) manage one already running.
     Daemon {
+        /// Ignore any existing startup cache, rebuild state from a full
+        /// journal replay, and write a fresh cache before serving.
+        ///
+        /// The cache is a pure optimization — a corrupt or stale one is
+        /// already detected and discarded automatically — so this exists for
+        /// the case where an operator wants the rebuild to happen *now* and
+        /// wants the timing on `daemon.started` to describe a full replay.
+        /// Foreground start only; `sgt daemon stop` starts nothing.
+        #[arg(long)]
+        rebuild_cache: bool,
         #[command(subcommand)]
         command: Option<DaemonCommand>,
     },
@@ -742,14 +752,35 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         estate.as_ref().map(|e| e.path.as_path()).unwrap_or(&root),
     )?;
     match command {
-        Command::Daemon { command: None } => {
+        Command::Daemon {
+            command: None,
+            rebuild_cache,
+        } => {
             tracing_subscriber::fmt().init();
-            daemon::run_until_signal(&data_dir, estate.as_ref().map(|e| e.path.as_path())).await?;
+            daemon::run_until_signal(
+                &data_dir,
+                estate.as_ref().map(|e| e.path.as_path()),
+                rebuild_cache,
+            )
+            .await?;
             Ok(())
         }
         Command::Daemon {
             command: Some(DaemonCommand::Stop),
-        } => daemon_stop(&data_dir, &estate_root(&estate), sgt.json).await,
+            rebuild_cache,
+        } => {
+            // Fail closed rather than silently ignoring a flag that cannot
+            // apply: `stop` starts no daemon, so there is no startup for a
+            // rebuild to happen in, and an operator who typed this meant
+            // something the command cannot do.
+            if rebuild_cache {
+                return Err(CliError::new(
+                    "--rebuild-cache applies only to `sgt daemon` (foreground start); \
+                     `sgt daemon stop` does not start a daemon",
+                ));
+            }
+            daemon_stop(&data_dir, &estate_root(&estate), sgt.json).await
+        }
         Command::Status => {
             let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
             let system = client.get("/v1/system").await?;

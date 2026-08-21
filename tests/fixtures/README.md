@@ -68,3 +68,24 @@ scenario taken from the spike. It does not pin a measurement of print mode's
 substitution surface, and the test says so in its own doc comment. Keeping
 the derivation on disk, rather than as a `json!` literal inside the test,
 is what makes the difference between "recorded" and "derived" reviewable.
+
+## `docker-stage-completed.payload.json` — recorded, from a real docker run
+
+W2's A4 pinning suite (`tests/a4_blob_ref_pinning.rs`) needs a `stage.completed`
+event payload shaped exactly as the real Docker executor produces it —
+`detail` a *stringified* JSON object, not a nested object — to prove
+`blob::refs_in_payload`'s recursive walk recovers the two blob refs inside it
+while a flat top-level scan recovers none (A4's whole claim).
+
+Captured 2026-08-21 on this container, real Docker Engine, via
+`DockerBackend::observe` over a container running
+`sh -c "echo hello-stdout-a4-fixture; echo hello-stderr-a4-fixture 1>&2; exit 0"`
+— the exact `BackendSignal::StageCompleted { summary }` string the adapter
+produced, wrapped in the `{"stage_id", "index", "detail"}` shape
+`Engine::settle_launch` (`engine.rs`) journals it under. Every field —
+`image_id`, the two timestamps, the two BLAKE3 refs, the two tails — is the
+real captured value; nothing here is authored. The one-off capture test used
+to produce it is not kept in the tree (it duplicates `m7_docker_executor.rs`'s
+own `exit_zero_completes_and_nonzero_fails_with_captured_evidence` harness
+almost exactly); reproduce it by running that shape against any command and
+copying the resulting `summary` string.
