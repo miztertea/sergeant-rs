@@ -339,6 +339,148 @@ async fn a_start_on_an_over_cap_journal_prunes_before_serving() {
     );
 }
 
+/// The seam W4 found while building a doctor fixture: the **ordinary next
+/// start after any prune**.
+///
+/// W3's own prune completion deletes the startup cache (`prune::run`'s step
+/// 6 — "the next clean start's own write point rebuilds a fresh v2 cache"),
+/// and `complete_interrupted` does the same. So the life *after* a pruning
+/// life always resolves to `Plan::Full` / `CacheMiss::Absent` over a journal
+/// whose floor is no longer 1. That is not a recovery path anyone has to go
+/// looking for — it is the third life of every estate that has ever pruned,
+/// and the one W3 deliberately routed through "one safe full replay".
+///
+/// It was not safe: `Plan::seed_registry`'s `Full` arm handed back a
+/// seq-1-expecting `Projection::new` while `Plan::replay`'s `Full` arm fed
+/// it `Journal::replay_from_floor()`'s floor-seeded events, so the first
+/// event of the pass failed `ProjectionError::SeqMismatch { expected: 1,
+/// found: <floor> }` and the daemon refused to come up at all.
+///
+/// Three lives over one `DataDir`, which is the whole point — life 3 is the
+/// one that used to crash.
+#[tokio::test]
+async fn a_start_after_a_prune_with_no_cache_still_serves() {
+    let data = DataDir::new();
+    let root = TempDir::new().expect("tempdir");
+    let (_mount, _head) = support::scaffold_solo_estate(root.path(), "solo");
+    write_one_stage_workflow(root.path());
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .expect("client");
+
+    const RETENTION: u32 = 4;
+    const TOTAL_WORKS: usize = 12;
+
+    let mut work_ids = Vec::new();
+
+    // Life 1: fill the journal past the cap, with retention high enough that
+    // the rotation-triggered tick (§10.4) never fires mid-life.
+    {
+        let script: Vec<FakeStep> = (0..TOTAL_WORKS).map(|_| FakeStep::complete()).collect();
+        let (handle, _fake) =
+            start_with_retention(data.path(), root.path(), 1_000_000, script).await;
+        for n in 0..TOTAL_WORKS {
+            let body = submit(
+                &http,
+                &handle.endpoint,
+                &handle.token,
+                root.path(),
+                &ulid(),
+                &format!("post-prune restart fixture work {n}"),
+            )
+            .await;
+            work_ids.push(body["work"]["id"].as_str().expect("work id").to_string());
+        }
+        wait_until_all_settled(&http, &handle.endpoint, &handle.token).await;
+        handle.shutdown().await;
+    }
+
+    // Life 2: the startup-triggered prune (§10.3) runs and, on completion,
+    // removes the startup cache.
+    {
+        let (handle, _fake) =
+            start_with_retention(data.path(), root.path(), RETENTION, Vec::<FakeStep>::new()).await;
+        handle.shutdown().await;
+    }
+
+    let cache = data.path().join("projections").join("floor-state.json");
+    assert!(
+        !cache.exists(),
+        "the prune's own completion must have removed the startup cache — \
+         without that, life 3 below is not the cache-miss path this test is about"
+    );
+    let floor_after_prune = {
+        let journal = Journal::open(data.path()).expect("reopen journal after the prune");
+        journal.floor_seq().expect("floor_seq")
+    };
+    assert!(
+        floor_after_prune.unwrap_or(1) > 1,
+        "a real prune must have moved the floor above 1, got {floor_after_prune:?} — \
+         without that, life 3 below never exercises the seam"
+    );
+
+    // Life 3: no cache, floor > 1 — `Plan::Full` over `replay_from_floor()`.
+    // This is the start that used to fail closed with `SeqMismatch`.
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, Vec::<FakeStep>::new());
+    let registry = BackendRegistry::new().with(std::sync::Arc::new(fake));
+    let handle3 = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: std::sync::Arc::new(registry),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            estate_root: Some(root.path().to_path_buf()),
+            segment_max_bytes: Some(256),
+            retention: Some(RETENTION),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!(
+            "a start on an already-pruned journal with no cache must come up \
+             (floor {floor_after_prune:?}): {e}"
+        )
+    });
+
+    // ... and must actually *serve*, folded from the floor with no cache to
+    // lean on: the retained Works are all there, and the pruned ones still
+    // answer by name from residue the pass re-folded out of the surviving
+    // `prune.completed`.
+    let system: serde_json::Value = http
+        .get(format!("{}/v1/work", handle3.endpoint))
+        .bearer_auth(&handle3.token)
+        .send()
+        .await
+        .expect("list works")
+        .json()
+        .await
+        .expect("json");
+    let listed = system["works"].as_array().expect("works array");
+    assert_eq!(
+        listed.len(),
+        RETENTION as usize,
+        "life 3 must serve exactly the retained Works: {system}"
+    );
+
+    let pruned_work_id = &work_ids[0];
+    let resp = http
+        .get(format!("{}/v1/work/{}", handle3.endpoint, pruned_work_id))
+        .bearer_auth(&handle3.token)
+        .send()
+        .await
+        .expect("show a pruned work in life 3");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(
+        body["state"], "pruned",
+        "a cache-less full replay must still re-fold the prune residue: {body}"
+    );
+
+    handle3.shutdown().await;
+}
+
 /// §10.4's own path, distinct from the sibling test above (which is
 /// deliberately built to avoid it, per its own comment, so it can observe
 /// the "before" state undisturbed): a daemon that is never restarted still
