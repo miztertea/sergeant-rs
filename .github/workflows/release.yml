@@ -701,13 +701,13 @@ jobs:
       # for that platform, and a direct contradiction of the SBOM job's own
       # point (target-scoped documents, not one generator for everything).
       - name: GitHub artifact attestations — SBOM (x86_64-unknown-linux-gnu)
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: "release-assets/sergeant-rs-x86_64-unknown-linux-gnu.tar.xz"
           sbom-path: "release-assets/sgt_bin_x86_64-unknown-linux-gnu.cdx.json"
 
       - name: GitHub artifact attestations — SBOM (aarch64-apple-darwin)
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: "release-assets/sergeant-rs-aarch64-apple-darwin.tar.xz"
           sbom-path: "release-assets/sgt_bin_aarch64-apple-darwin.cdx.json"
