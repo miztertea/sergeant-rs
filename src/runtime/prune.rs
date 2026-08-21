@@ -1705,6 +1705,63 @@ mod tests {
         crate::api::Core::new(journal, registry, events_tx)
     }
 
+    /// Re-open `dir`'s journal and fold it from its **current floor** into a
+    /// fresh registry — the daemon's own full-replay start, in miniature.
+    ///
+    /// This is how the crash-window tests get a `Core` whose `pending_prune`
+    /// reflects the journal *as it is on disk right now*, rather than the
+    /// in-memory state of a process that has already folded its own
+    /// completion. `Projection::resumed(.., floor - 1, ..)` rather than
+    /// `work_registry_projection()` because a journal a prune has already
+    /// cut no longer starts at seq 1 (A1).
+    fn refold_core(dir: &std::path::Path) -> crate::api::Core {
+        let journal = crate::runtime::journal::Journal::open_with(dir, 1).expect("re-open journal");
+        let floor = journal.floor_seq().expect("floor_seq").unwrap_or(1);
+        let mut registry = crate::runtime::projection::Projection::resumed(
+            crate::runtime::projection::WorkRegistry::default(),
+            floor - 1,
+            crate::runtime::projection::work_registry_reducer,
+        );
+        registry
+            .catch_up(journal.replay_from_floor().expect("replay_from_floor"))
+            .expect("fold the journal from its floor");
+        let (events_tx, _rx) = tokio::sync::broadcast::channel(16);
+        crate::api::Core::new(journal, registry, events_tx)
+    }
+
+    /// Un-write the newest segment — which, in a `tiny_core` journal (one
+    /// event per segment), holds exactly one event.
+    ///
+    /// Used to model "the completion's own event never landed": the crash
+    /// window that sits *after* every physical effect of a completion
+    /// (quarantine, deferred delete, unlink) and *before* the
+    /// `prune.completed` append that acknowledges them. Asserts the kind it
+    /// is removing, so a fixture that drifts fails loudly here instead of
+    /// quietly testing something else.
+    fn unwrite_newest_event(dir: &std::path::Path, expect_kind: &str) {
+        let journal_dir = dir.join("journal");
+        let mut segments: Vec<std::path::PathBuf> = std::fs::read_dir(&journal_dir)
+            .expect("read journal dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|ext| ext == "ndjson"))
+            .collect();
+        segments.sort();
+        let newest = segments.last().expect("at least one segment");
+        let text = std::fs::read_to_string(newest).expect("read the newest segment");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "this helper assumes a one-event-per-segment fixture"
+        );
+        let event: Event = serde_json::from_str(lines[0]).expect("parse the newest event");
+        assert_eq!(
+            event.kind, expect_kind,
+            "the newest event must be the one this crash window un-writes"
+        );
+        std::fs::remove_file(newest).expect("un-write the newest event");
+    }
+
     fn commit(
         core: &mut crate::api::Core,
         source: crate::domain::event::EventSource,
@@ -2017,13 +2074,6 @@ mod tests {
             "every planned segment must still be gone"
         );
 
-        // Idempotency: completing an already-finished cycle again touches
-        // nothing further and never fails re-quarantining what is already
-        // quarantined.
-        complete_interrupted(&mut core, dir.path()).expect("second complete_interrupted");
-
-        // Exactly one copy of the content exists, in quarantine — never a
-        // live copy alongside it.
         let quarantine_path = dir
             .path()
             .join("blobs")
@@ -2034,6 +2084,45 @@ mod tests {
         assert!(
             quarantine_path.exists(),
             "the blob must still be quarantined"
+        );
+        assert!(!live_path.exists(), "the blob must never also exist live");
+
+        // Idempotency, exercised for real: crash the *completion itself*,
+        // after every physical effect it had and before its own
+        // `prune.completed` landed. Re-folding from that journal gives a
+        // `Core` whose `pending_prune` is still the same unpaired intent —
+        // so this second `complete_interrupted` genuinely re-walks the
+        // whole cycle over work the first pass already finished, rather
+        // than exiting at the `pending_prune == None` guard on its first
+        // statement (which is all a plain second call can ever do, and is
+        // what `crash_window_f1_...`'s own no-op assertion covers).
+        drop(core);
+        unwrite_newest_event(dir.path(), KIND_PRUNE_COMPLETED);
+        let mut core = refold_core(dir.path());
+        assert!(
+            core.registry.state().pending_prune.is_some(),
+            "the re-folded journal must still hold the intent unpaired — otherwise the second \
+             pass below tests nothing"
+        );
+        let next_seq_before_retry = core.journal.next_seq();
+
+        complete_interrupted(&mut core, dir.path()).expect(
+            "re-quarantining an already-quarantined blob and re-unlinking already-gone \
+             segments must both be tolerated",
+        );
+        assert!(core.registry.state().pending_prune.is_none());
+        assert!(core.registry.state().pruned_works.contains_key("w1"));
+        assert_eq!(
+            core.journal.next_seq(),
+            next_seq_before_retry + 1,
+            "the re-run must append exactly its own completion, nothing else"
+        );
+
+        // Still exactly one copy of the content, still in quarantine —
+        // never a live copy alongside it, never lost.
+        assert_eq!(
+            std::fs::read(&quarantine_path).expect("the quarantined copy must have survived"),
+            b"crash window fixture blob"
         );
         assert!(!live_path.exists(), "the blob must never also exist live");
     }
@@ -2164,11 +2253,43 @@ mod tests {
             "the deferred delete must actually have run"
         );
 
-        // Idempotency: completing an already-finished cycle again is a
-        // true no-op, including `drop_quarantined`'s own tolerated
-        // already-gone case.
-        complete_interrupted(&mut core, dir.path()).expect("second complete_interrupted");
-        assert!(!quarantine_path.exists());
+        // Idempotency, exercised for real (see F2's own note): crash the
+        // completion itself — the deferred delete has already run, its
+        // `prune.completed` never landed — and complete again from a
+        // re-fold of that journal, so `drop_quarantined`'s tolerated
+        // already-gone case is actually walked into rather than skipped by
+        // an early return.
+        drop(core);
+        unwrite_newest_event(dir.path(), KIND_PRUNE_COMPLETED);
+        let mut core = refold_core(dir.path());
+        let pending = core
+            .registry
+            .state()
+            .pending_prune
+            .clone()
+            .expect("the re-folded journal must still hold cycle 2's intent unpaired");
+        assert_eq!(
+            pending.delete_quarantined,
+            vec![blob_ref.hex().to_string()],
+            "the re-run must be re-walking the very deferred delete that already happened"
+        );
+
+        complete_interrupted(&mut core, dir.path())
+            .expect("re-deleting an already-deleted quarantined blob must be tolerated");
+        assert!(core.registry.state().pending_prune.is_none());
+        assert!(core.registry.state().pruned_works.contains_key("w_mid"));
+        assert!(
+            !quarantine_path.exists(),
+            "the re-run must leave the deferred delete done, not undone"
+        );
+        assert!(
+            !dir.path()
+                .join("blobs")
+                .join("b3")
+                .join(blob_ref.hex())
+                .exists(),
+            "and must never resurrect a live copy of what it deleted"
+        );
     }
 
     /// N9 / F4: a crash mid-unlink (only the first of the two target

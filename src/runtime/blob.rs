@@ -799,6 +799,81 @@ mod tests {
         );
     }
 
+    /// F2's idempotency half, stated directly on the primitive rather than
+    /// only through the crash-window tests that depend on it: quarantining a
+    /// blob that is *already* quarantined is tolerated, reports `Ok(false)`,
+    /// and leaves the quarantined content byte-for-byte intact — the
+    /// property that lets `prune::complete_interrupted` re-walk an intent's
+    /// whole `condemn` list without knowing how far the crashed cycle got.
+    #[test]
+    fn quarantine_tolerates_an_already_quarantined_blob_and_keeps_its_content() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"already condemned").expect("put");
+        let quarantined = store.root.join(QUARANTINE_DIR).join(blob_ref.hex());
+
+        assert!(store.quarantine(&blob_ref).expect("first quarantine"));
+
+        for attempt in 0..3 {
+            assert!(
+                !store
+                    .quarantine(&blob_ref)
+                    .unwrap_or_else(|e| panic!("re-quarantine {attempt} must not error: {e}")),
+                "a blob already in .pruned/ has no live path to move; this must be Ok(false)"
+            );
+            assert_eq!(
+                std::fs::read(&quarantined).expect("the quarantined copy must still be there"),
+                b"already condemned",
+                "re-quarantining must never disturb the content it already moved"
+            );
+            assert!(
+                !store.root.join(blob_ref.hex()).exists(),
+                "re-quarantining must never resurrect a live copy alongside the quarantined one"
+            );
+        }
+    }
+
+    /// F3's idempotency half, likewise stated on the primitive: deleting a
+    /// quarantined blob that is *already gone* — because the crashed cycle
+    /// got to it before dying, not because anything rescued it — is
+    /// tolerated and reports `Ok(false)`, as is a hex this store has never
+    /// seen at all. `drop_quarantined_is_ok_false_for_a_rescued_blob` covers
+    /// the rescued shape; this one covers the already-deleted and
+    /// never-existed shapes, which are what a re-run of a completion walks
+    /// into.
+    #[test]
+    fn drop_quarantined_tolerates_an_already_deleted_and_an_unknown_hex() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).expect("open store");
+        let blob_ref = store.put(b"deleted once, asked for twice").expect("put");
+        assert!(store.quarantine(&blob_ref).expect("condemn"));
+
+        assert!(
+            store.drop_quarantined(blob_ref.hex()).expect("first drop"),
+            "the first deferred delete actually removes it"
+        );
+        for attempt in 0..3 {
+            assert!(
+                !store
+                    .drop_quarantined(blob_ref.hex())
+                    .unwrap_or_else(|e| panic!("re-drop {attempt} must not error: {e}")),
+                "deleting what is already deleted must be Ok(false), never an error"
+            );
+        }
+        assert!(
+            !store.root.join(blob_ref.hex()).exists(),
+            "a repeated delete must never resurrect the live copy either"
+        );
+
+        let unknown = "b".repeat(64);
+        assert!(
+            !store
+                .drop_quarantined(&unknown)
+                .expect("an unknown hex must not error"),
+            "a hex this store has never held is Ok(false) too"
+        );
+    }
+
     /// `refs_in_event` is the event-level entry point A4's pinning tests use.
     #[test]
     fn refs_in_event_reads_the_payload() {
