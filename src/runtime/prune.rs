@@ -93,16 +93,25 @@ pub const KIND_PRUNE_INTENT: &str = "prune.intent";
 pub const KIND_PRUNE_COMPLETED: &str = "prune.completed";
 
 /// Q5's allowlist, as a **mechanism**: an event with no `work_id` whose kind
-/// is not here pins its segment, and a kind enters this list only with a
-/// replay-equivalence proof (`tests/w3_allowlist_equivalence.rs`).
+/// is not here pins its segment (proved directly by
+/// `an_unknown_non_work_scoped_kind_pins_its_segment`, below). A kind is
+/// meant to enter this list only with its own replay-equivalence proof, one
+/// test per kind (the wave spec's own `tests/w3_allowlist_equivalence.rs`
+/// suite) — this landing does not add that dedicated file; the nine kinds
+/// already here are the ones §2 itself argues are safe, each with the
+/// one-line equivalence claim in its own comment below, but not yet each
+/// pinned by its own named test the way the spec's §13.1 step 6 asks for.
 pub const NON_WORK_ALLOWLIST: &[&str] = &[
-    crate::daemon::KIND_DAEMON_STARTED,
-    crate::daemon::KIND_DAEMON_STOPPED,
-    crate::daemon::KIND_BACKEND_PROBED,
+    crate::daemon::KIND_DAEMON_STARTED, // no registry effect at all
+    crate::daemon::KIND_DAEMON_STOPPED, // no registry effect at all
+    crate::daemon::KIND_BACKEND_PROBED, // no registry effect at all
+    // sets `admission_paused`, force-cleared unconditionally at every
+    // startup before the descriptor is published, so the replayed value is
+    // never load-bearing.
     crate::daemon::KIND_ADMISSION_PAUSED,
-    crate::daemon::KIND_ADMISSION_RESUMED,
-    KIND_COMMAND_ACCEPTED,
-    KIND_COMMAND_REJECTED,
+    crate::daemon::KIND_ADMISSION_RESUMED, // same
+    KIND_COMMAND_ACCEPTED,                 // ledger key survives in `pruned_commands` (Q8)
+    KIND_COMMAND_REJECTED,                 // same
     KIND_PRUNE_INTENT,
     KIND_PRUNE_COMPLETED,
 ];
