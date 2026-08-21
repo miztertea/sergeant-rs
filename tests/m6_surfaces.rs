@@ -1505,6 +1505,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // same as a fresh install with nothing run in it).
             "git_surfaces",
             "disk_pressure",
+            // W4: retention's own growth axis — segments, floor,
+            // retained-Work count against the cap, prune stall, and startup
+            // rebuild time. Runs last, after disk pressure, per
+            // `Report::run`'s own registration order.
+            "journal_growth",
         ],
         "the --json check list and its order are the stable part of this contract"
     );
@@ -3283,6 +3288,29 @@ fn t6_the_sse_vocabulary_is_stated_once_and_stays_complete() {
     let before = seen.len();
     seen.dedup();
     assert_eq!(before, seen.len(), "the vocabulary must not repeat a kind");
+}
+
+/// W4 §1.1.2: the SSE stream's two control frames (`sergeant.floor`,
+/// `sergeant.stream_error`) are deliberately outside `SSE_EVENT_KINDS`'s
+/// vocabulary — neither is a `KIND_*` constant, and neither appears in the
+/// journaled-kinds list. Extends `t6`'s own bidirectional scan rather than
+/// duplicating it.
+#[test]
+fn sse_control_frames_are_disjoint_from_kind_star_and_from_sse_event_kinds() {
+    let declared = declared_event_kinds();
+    let names: Vec<&str> = declared.iter().map(|(kind, _)| kind.as_str()).collect();
+    for frame in sergeant_rs::api::SSE_CONTROL_FRAMES {
+        assert!(
+            !names.contains(frame),
+            "{frame:?} is in SSE_CONTROL_FRAMES but also declared as a KIND_* constant — a \
+             control frame must never collide with a journaled event kind"
+        );
+        assert!(
+            !sergeant_rs::api::SSE_EVENT_KINDS.contains(frame),
+            "{frame:?} is in SSE_CONTROL_FRAMES but also listed in SSE_EVENT_KINDS — the two \
+             vocabularies must stay disjoint"
+        );
+    }
 }
 
 /// Every `pub const KIND_… : &str = "…";` the crate declares, with the file

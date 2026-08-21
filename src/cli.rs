@@ -2423,10 +2423,12 @@ pub(crate) mod doctor {
     };
     use crate::backend::docker::{self, DockerBackend, DockerConfig};
     use crate::daemon;
-    use crate::domain::estate::MANIFEST_FILE;
+    use crate::domain::estate::{DEFAULT_RETENTION, Estate, MANIFEST_FILE};
     use crate::domain::event::Event;
     use crate::runtime::analytics::Analytics;
     use crate::runtime::journal::Journal;
+    use crate::runtime::projection::{Projection, WorkRegistry, work_registry_reducer};
+    use crate::runtime::prune::{FirstSeqIndex, PolicySource, PrunePolicy};
 
     /// A check's verdict.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2656,6 +2658,18 @@ pub(crate) mod doctor {
         // this installation about to run out of disk" does not depend on the
         // daemon, the journal, or Docker being reachable.
         checks.push(disk_pressure_check(data_dir, data_dir_ok));
+        // W4: retention's own growth axis — segments, floor, retained-Work
+        // count against the cap, prune stall, and startup rebuild time.
+        // Shares `journal_events` with `journal_check`/`projection_check`/
+        // `git_surfaces_check` above (#12's one-replay-per-doctor-run
+        // discipline; this is the fourth consumer of the same `Vec<Event>`,
+        // not a second replay).
+        checks.push(journal_growth_check(
+            data_dir,
+            admitted.as_deref(),
+            journal_ok,
+            journal_events.as_deref(),
+        ));
         Report {
             data_dir: data_dir.to_path_buf(),
             checks,
@@ -3472,9 +3486,10 @@ pub(crate) mod doctor {
                 "disk_pressure",
                 detail,
                 format!(
-                    "free {} disk space urgently — the data dir has {} of headroom left; the \
-                     blob store never deletes on its own (no blob GC this milestone), so freeing \
-                     space elsewhere on the same filesystem is the only lever today",
+                    "free {} disk space urgently — the data dir has {} of headroom left; blobs \
+                     are deleted only when their Work is pruned under [estate] retention (sgt \
+                     doctor's journal_growth row reports that policy) — freeing space elsewhere \
+                     on the same filesystem, or lowering retention, are the levers today",
                     human_bytes(WARN_BELOW),
                     human_bytes(free)
                 ),
@@ -3515,6 +3530,19 @@ pub(crate) mod doctor {
             format!("{bytes} {}", UNITS[unit])
         } else {
             format!("{value:.1} {}", UNITS[unit])
+        }
+    }
+
+    /// Render a duration in seconds the way an operator reading a terminal
+    /// wants it, not the raw integer — `journal_growth_check`'s own age and
+    /// rebuild-time detail.
+    fn human_duration(secs: u64) -> String {
+        if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m{}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
         }
     }
 
@@ -3763,6 +3791,175 @@ pub(crate) mod doctor {
             true,
             Some(events),
         )
+    }
+
+    /// Fold doctor's already-replayed events into a `WorkRegistry` — the same
+    /// reducer the daemon itself uses (`work_registry_reducer`), seeded to
+    /// expect the replay's own floor rather than seq 1. `I-W3-7` is exactly
+    /// why this works with no cache at all: a floor replay reconstructs every
+    /// pruned Work's row and every command-ledger key, so `journal_growth`'s
+    /// retained-count and stall report are honest even on an estate whose
+    /// cache file was deleted five minutes ago.
+    fn rebuild_registry(events: &[Event]) -> WorkRegistry {
+        let floor_seq = events.first().map(|e| e.seq).unwrap_or(1);
+        let mut projection = Projection::resumed(
+            WorkRegistry::default(),
+            floor_seq.saturating_sub(1),
+            work_registry_reducer,
+        );
+        // `catch_up` never fails on a replay `journal_check` already validated
+        // contiguous; a doctor row is not the place to re-litigate that.
+        let _ = projection.catch_up(events.iter().cloned().map(Ok));
+        projection.state().clone()
+    }
+
+    /// N4/#23's disk-pressure sibling for retention: whether the journal is
+    /// growing the way `[estate] retention` says it should, and whether the
+    /// engine that keeps it that way is actually running.
+    ///
+    /// Reports, in one row: live segment count and bytes, the replay floor,
+    /// retained-Work count against the declared cap, a stalled prune's
+    /// blocking Work and age (Q7: reported, never overridden — there is no
+    /// remedy here that lowers the predicate), and the most recent startup's
+    /// rebuild duration against the Q4 thresholds. All five read from data
+    /// `journal_check`/`estate_check` already produced or from one lock-free
+    /// directory listing — no new journal I/O beyond that.
+    fn journal_growth_check(
+        data_dir: &Path,
+        admitted: Option<&Path>,
+        journal_ok: bool,
+        journal_events: Option<&[Event]>,
+    ) -> Check {
+        if !journal_ok {
+            return Check::warn(
+                "journal_growth",
+                "not attempted: the journal did not replay",
+                "fix the journal check above first",
+            );
+        }
+        let Some(events) = journal_events else {
+            // No journal yet, or an empty one — nothing has grown, and
+            // nothing to report, same shape `journal_check`'s own
+            // fresh-install arm uses.
+            return Check::ok("journal_growth", "no journal yet — nothing has grown");
+        };
+
+        let bounds = match crate::runtime::journal::segment_bounds_for_dir(
+            &journal_dir(data_dir),
+            events.last().map(|e| e.seq).unwrap_or(0),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                return Check::fail(
+                    "journal_growth",
+                    format!("could not list journal segments: {e}"),
+                    "the journal directory changed mid-check — re-run sgt doctor",
+                );
+            }
+        };
+        let segment_count = bounds.len();
+        let segment_bytes: u64 = bounds.iter().map(|b| b.bytes).sum();
+        let floor_seq = events.first().map(|e| e.seq).unwrap_or(1);
+
+        let registry = rebuild_registry(events);
+        let mut first_seq_index: FirstSeqIndex = FirstSeqIndex::new();
+        for event in events {
+            if let Some(id) = &event.work_id {
+                first_seq_index.entry(id.clone()).or_insert(event.seq);
+            }
+        }
+
+        // Deviation from the spec's own snippet: reads the manifest with
+        // `Estate::from_config_structural`, not `Estate::from_config`. The
+        // strict loader resolves every declared `[[repo]]` against git on
+        // disk and fails closed at the first one not yet cloned — exactly
+        // the shape `daemon::start_with`'s own retention re-read (`src/
+        // daemon.rs:620`) already avoids for this identical purpose, and for
+        // the identical reason (`Estate::from_config_structural`'s own doc
+        // comment): a freshly cloned estate legitimately has manifest-
+        // declared repos with nothing under `repos/` yet. Using the strict
+        // loader here would silently misreport a declared `[estate]
+        // retention` as "using the default" whenever any unrelated
+        // repository is not on disk — a false answer this diagnostic must
+        // not give.
+        let (retention, source) = admitted
+            .and_then(|root| Estate::from_config_structural(&root.join(MANIFEST_FILE)).ok())
+            .and_then(|e| e.retention)
+            .map(|n| (n, PolicySource::Manifest))
+            .unwrap_or((DEFAULT_RETENTION, PolicySource::Default));
+        let policy = PrunePolicy { retention, source };
+
+        let stall = crate::runtime::prune::stall_report(
+            &bounds,
+            &registry,
+            &first_seq_index,
+            &policy,
+            std::time::SystemTime::now(),
+        );
+
+        let rebuild_ms = events
+            .iter()
+            .rev()
+            .find(|e| e.kind == crate::daemon::KIND_DAEMON_STARTED)
+            .and_then(|e| e.payload["rebuild_duration_ms"].as_u64());
+
+        let detail = format!(
+            "{segment_count} segments ({}), floor seq {floor_seq}, {}/{retention} works retained\
+             {}{}",
+            human_bytes(segment_bytes),
+            registry.work_index.len(),
+            match &stall.blocking_work_id {
+                Some(id) => format!(
+                    ", prune stalled on work {id} ({}, {})",
+                    stall.blocking_state.map(|s| s.as_str()).unwrap_or("?"),
+                    stall
+                        .blocking_age_secs
+                        .map(human_duration)
+                        .unwrap_or_else(|| "age unknown".to_string()),
+                ),
+                None => ", no prune stall".to_string(),
+            },
+            match rebuild_ms {
+                Some(ms) => format!(", last rebuild {:.2}s", ms as f64 / 1000.0),
+                None => String::new(),
+            },
+        );
+
+        const REBUILD_WARN_MS: u64 = 10_000;
+        const REBUILD_FAIL_MS: u64 = 30_000; // Q4's owner-ruled trigger, made mechanical
+
+        match rebuild_ms {
+            Some(ms) if ms >= REBUILD_FAIL_MS => Check::fail(
+                "journal_growth",
+                detail,
+                format!(
+                    "the last startup rebuild took {:.1}s — at or past the {:.0}s trigger this \
+                     estate's own retention basis is argued against (issue #17's rulings \
+                     record): lower [estate] retention in sergeant.toml so fewer Works stay in \
+                     the live window, or investigate the filesystem underneath the data dir for \
+                     latency",
+                    ms as f64 / 1000.0,
+                    REBUILD_FAIL_MS as f64 / 1000.0
+                ),
+            ),
+            Some(ms) if ms >= REBUILD_WARN_MS => Check::warn(
+                "journal_growth",
+                detail,
+                format!(
+                    "the last startup rebuild took {:.1}s, above the {:.0}s watch line; if this \
+                     keeps climbing, lower [estate] retention",
+                    ms as f64 / 1000.0,
+                    REBUILD_WARN_MS as f64 / 1000.0
+                ),
+            ),
+            _ if stall.blocking_work_id.is_some() => Check::warn(
+                "journal_growth",
+                detail,
+                "no override exists (Q7) — retire the blocking work (let it complete, fail, or \
+                 be canceled: sgt work show <id>) to let the retention horizon advance past it",
+            ),
+            _ => Check::ok("journal_growth", detail),
+        }
     }
 
     /// §31: the disposable projection can be rebuilt from the journal.

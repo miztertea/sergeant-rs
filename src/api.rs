@@ -2360,22 +2360,65 @@ async fn list_workflows(
     Json(json!({"workflows": workflows})).into_response()
 }
 
-/// `GET /v1/work/{id}` — one work record, with its stage, surface and
-/// execution state (the M3 contract's `work show` surface).
+/// `GET /v1/work/{id}` (§16.3) — one work record, or (W4, Q10) the named
+/// pruned answer, or 404 for an id this estate has never journaled at all.
+/// The three cases are mutually exclusive by construction (`pruned_works`
+/// and `work_index` are disjoint, W3 §6.2) and this handler is the only
+/// place that has to know all three exist.
 async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
     // #4: existence is answered from the always-retained slim index, not
     // the (now bounded) `works` map — an evicted-beyond-cache Work still
     // has a row there, and `work_view`'s own `resolve_work` re-derives it.
-    if core.registry.state().work_index.contains_key(&id) {
-        Json(work_view(&core, &state.engine, &id)).into_response()
-    } else {
-        error_response(
-            StatusCode::NOT_FOUND,
-            "work_not_found",
-            format!("no work with id {id}"),
-        )
+    let registry = core.registry.state();
+    if registry.work_index.contains_key(&id) {
+        return Json(work_view(&core, &state.engine, &id)).into_response();
     }
+    if let Some(row) = registry.pruned_works.get(&id) {
+        return Json(pruned_work_view(row, &state.prune_policy)).into_response();
+    }
+    error_response(
+        StatusCode::NOT_FOUND,
+        "work_not_found",
+        format!("no work with id {id}"),
+    )
+}
+
+/// The named answer for a pruned Work (Q10: "pruned on `<date>` under
+/// policy", never a blank 404). `work: null` keeps the top-level shape a
+/// client already parsing `work_view`'s `{"work": {...}, "stage": ..., ...}`
+/// envelope from breaking outright; `state: "pruned"` is the discriminator
+/// no real `WorkState` variant can ever produce (`WorkState`'s own variants
+/// are `pending`/`active`/`needs_input`/`blocked`/`waiting`/`completed`/
+/// `failed`/`canceled` — never `pruned`), so a client can `match` on it
+/// unambiguously rather than infer "gone" from `work == null` alone (which
+/// would still be indistinguishable from never-existed).
+///
+/// `policy` is this estate's **current** declared retention — not
+/// necessarily the exact policy in force at the instant this Work was
+/// pruned, if an operator has since edited `[estate] retention`. The
+/// historically-exact record of what actually authorized this deletion is
+/// the `prune.intent`/`prune.completed` pair at the seq the residue came
+/// from, discoverable via `GET /v1/events` if ever needed forensically —
+/// `PrunedWorkRow` does not carry a per-row policy snapshot (§2.3 of
+/// `w3-spec.md` did not put one there), and inventing one here would assert
+/// state the journal does not actually hold.
+fn pruned_work_view(
+    row: &crate::runtime::prune::PrunedWorkRow,
+    policy: &crate::runtime::prune::PrunePolicy,
+) -> Value {
+    json!({
+        "work": null,
+        "state": "pruned",
+        "id": row.id,
+        "intent": row.intent,
+        "last_known_state": row.state,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "last_seq": row.last_seq,
+        "pruned_at": row.pruned_at,
+        "policy": {"retention": policy.retention, "source": policy.source},
+    })
 }
 
 /// `GET /v1/work/{id}/transcript` — MVP-3's `sgt work transcript`: the
@@ -2399,30 +2442,55 @@ async fn show_work(State(state): State<ApiState>, Path(id): Path<String>) -> Res
 /// text blocks streamed before the cut. It deliberately does not replay tool
 /// calls or system/vendor plumbing — that stays raw-archive-only.
 ///
-/// §22.6 tradeoff, disclosed rather than hidden: `events_after(0)` below
-/// runs a full from-seq-0 journal replay while `core` — the exclusive
-/// `CoreGuard` — is still held. `blocking_sync` only keeps the tokio
-/// scheduler's other, guard-independent tasks off this worker thread; it
-/// does not release the guard itself, so every call here still queues
-/// every other Core-guarded request (submit, cancel, retry, input,
-/// `/v1/system`) for the full replay duration, exactly as `events_after`'s
-/// own doc comment says every caller must expect. `resolve_run`'s
-/// `terminal_runs` cache accepts the identical shape only as a rare,
-/// capacity-bounded cache-miss fallback; there is no equivalent bound
-/// here, because a work's conversation history is unbounded and not
-/// capped by any terminal-state cache. Closing this for good needs a
-/// journal reader the core does not own — the same named follow-up
-/// `resolve_run` already defers, not this build's.
+/// §22.6 tradeoff, narrowed by W4, not eliminated: `events_after(from)`
+/// below still runs while `core` — the exclusive `CoreGuard` — is held, so
+/// every call here still queues every other Core-guarded request for the
+/// read's duration, exactly as `events_after`'s own doc comment says every
+/// caller must expect. What changed is the *lower bound*: W3's
+/// `first_seq_by_work` (§2.5) already tracks exactly where each retained
+/// Work's own history begins, so this reads from there instead of from the
+/// floor — free on any Work whose first event is not itself near the
+/// floor, and no worse than before on one that is. `resolve_run`'s
+/// `terminal_runs` cache accepts the identical guard-held-replay shape only
+/// as a rare, capacity-bounded cache-miss fallback; there is still no
+/// equivalent bound *within* one Work's own transcript, because a Work's
+/// conversation history is unbounded and not capped by any terminal-state
+/// cache. Closing this for good needs a journal reader the core does not
+/// own — the same named follow-up `resolve_run` already defers, not this
+/// build's.
 async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let core = CoreGuard::acquire(&state.core).await;
-    if !core.registry.state().work_index.contains_key(&id) {
+    let registry = core.registry.state();
+    // W4 §1.2's pruned answer, restated here: a pruned Work's transcript is
+    // exactly its slim row and prune date, same as `work show` — not a 404
+    // and not an attempted replay of events that no longer exist (§3 of
+    // `w3-spec.md`'s Approved Tradeoffs already names this as the intended
+    // shape; this wave is what actually renders it).
+    if let Some(row) = registry.pruned_works.get(&id) {
+        let mut body = pruned_work_view(row, &state.prune_policy);
+        body["work_id"] = json!(id);
+        body["turns"] = json!([]);
+        return Json(body).into_response();
+    }
+    if !registry.work_index.contains_key(&id) {
         return error_response(
             StatusCode::NOT_FOUND,
             "work_not_found",
             format!("no work with id {id}"),
         );
     }
-    let events = match blocking_sync(|| core.events_after(0)) {
+    // W4 §1.3: bounded to this Work's own segment range, not the floor. On
+    // a Work created long after this journal's floor, this skips whole
+    // segments below it (`Replay::after`'s existing segment-skip
+    // optimization, unchanged) instead of walking every retained event of
+    // every other Work first. On a Work as old as the floor itself, this is
+    // exactly today's cost — never worse, sometimes much better.
+    let from = core
+        .first_seq_by_work
+        .get(&id)
+        .map(|seq| seq.saturating_sub(1))
+        .unwrap_or(0);
+    let events = match blocking_sync(|| core.events_after(from)) {
         Ok(events) => events,
         Err(e) => return internal_error(e),
     };
@@ -3752,8 +3820,17 @@ struct EventsQuery {
     limit: Option<usize>,
 }
 
-/// The `GET /v1/events` body for a already-fetched slice.
-fn events_body(events: Vec<Event>, query: &EventsQuery) -> Value {
+/// The `GET /v1/events` body for an already-fetched slice.
+///
+/// `floor_seq` (Q10, W4): the oldest seq this journal can still answer for.
+/// Always present, never inferred by the client — `1` on a journal this
+/// build has never pruned, the oldest surviving segment's `first_seq`
+/// otherwise. A `from=` below this number is not an error (`Replay::after`'s
+/// A1 clamp already serves from the floor, W3 §11.1); this field is what
+/// lets a client tell "you are caught up" apart from "some of what you
+/// asked for is gone under retention policy" — without it those two cases
+/// are wire-identical.
+fn events_body(events: Vec<Event>, query: &EventsQuery, floor_seq: u64) -> Value {
     let mut events: Vec<Event> = match &query.work_id {
         Some(work_id) => events
             .into_iter()
@@ -3766,7 +3843,7 @@ fn events_body(events: Vec<Event>, query: &EventsQuery) -> Value {
     {
         events.drain(..events.len() - limit);
     }
-    json!({"events": events})
+    json!({"events": events, "floor_seq": floor_seq})
 }
 
 /// `GET /v1/events?from=N&work_id=X&limit=K` — journaled history after seq N.
@@ -3784,8 +3861,12 @@ async fn event_history(
         Err(resp) => return *resp,
     };
     let core = CoreGuard::acquire(&state.core).await;
+    let floor_seq = match core.journal.floor_seq() {
+        Ok(f) => f.unwrap_or(1), // `None` = empty journal; `1` is the honest floor of nothing
+        Err(e) => return internal_error(e),
+    };
     match core.events_after(query.from) {
-        Ok(events) => Json(events_body(events, &query)).into_response(),
+        Ok(events) => Json(events_body(events, &query, floor_seq)).into_response(),
         Err(e) => internal_error(e),
     }
 }
@@ -3870,10 +3951,14 @@ async fn forward_events(
         core.events_tx.subscribe()
     };
     let mut last_sent = from;
-    let history = {
+    let (floor_seq, history) = {
         let core = CoreGuard::acquire(&state.core).await;
-        core.events_after(last_sent)
+        let floor_seq = core.journal.floor_seq().ok().flatten().unwrap_or(1);
+        (floor_seq, core.events_after(last_sent))
     };
+    if send_sse_floor(&tx, floor_seq).await.is_err() {
+        return;
+    }
     match history {
         Ok(events) => {
             for event in events {
@@ -3885,6 +3970,7 @@ async fn forward_events(
         }
         Err(e) => {
             tracing::warn!(error = %e, "sse history replay failed; closing stream");
+            let _ = send_sse_error(&tx, &e).await;
             return;
         }
     }
@@ -3917,6 +4003,7 @@ async fn forward_events(
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "sse lag refill failed; closing stream");
+                        let _ = send_sse_error(&tx, &e).await;
                         return;
                     }
                 }
@@ -3926,8 +4013,8 @@ async fn forward_events(
     }
 }
 
-/// Every event kind [`send_sse`] can name a frame with — the SSE stream's
-/// published vocabulary.
+/// Every **journaled** event kind [`send_sse`] can name a frame with — the
+/// SSE stream's published vocabulary of `KIND_*` frames.
 ///
 /// `EventSource` has no way to subscribe to "every named frame": a client that
 /// wants all of them must name each one. Rather than let each client keep its
@@ -3937,6 +4024,16 @@ async fn forward_events(
 /// constants so it cannot say a kind the journal does not have. `t6` in the M6
 /// suite is the other half: it fails if a `KIND_*` constant is added to the
 /// crate and not to this list.
+///
+/// This list is deliberately not the *complete* set of frame names this
+/// stream can ever send: W4 adds one control frame outside it (the floor
+/// marker, [`SSE_FLOOR_FRAME`]) precisely because it is not a journaled event
+/// and forcing it into this list would either misname it as a `KIND_*` that
+/// nothing journals, or weaken `tests/m6_surfaces.rs`'s bidirectional check
+/// into a "some of these" assertion instead of "all of these." A client
+/// that wants "every journaled kind" still gets exactly this list; a client
+/// that wants "everything this stream can ever frame" also has to handle
+/// the two names in [`SSE_CONTROL_FRAMES`] below.
 pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_WORK_SUBMITTED,
     KIND_WORK_STARTED,
@@ -3985,6 +4082,26 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     crate::runtime::prune::KIND_PRUNE_COMPLETED,
 ];
 
+/// Frame names this stream sends that are **not** journaled `KIND_*` events
+/// — deliberately outside [`SSE_EVENT_KINDS`]'s contract (see its doc
+/// comment). Both are sent with no `id:` field (SSE spec: an event with no
+/// `id` does not update the client's last-event-id state), so neither can
+/// ever poison a client's `Last-Event-ID` reconnect header with a
+/// non-numeric value — `event_stream`'s `Last-Event-ID` parse
+/// (`v.parse::<u64>()`) would 400 on anything else, which is exactly the
+/// bug this constraint avoids.
+pub const SSE_CONTROL_FRAMES: &[&str] = &[SSE_FLOOR_FRAME, SSE_STREAM_ERROR_FRAME];
+
+/// Sent once per connection, immediately before history replay, naming the
+/// floor at that moment — Q10's "no client may infer a floor of 1," carried
+/// onto the one surface where there is no per-response JSON envelope to
+/// carry it in.
+pub const SSE_FLOOR_FRAME: &str = "sergeant.floor";
+
+/// Sent once, only on the (pre-existing, W4 §1.1.3) journal-error close
+/// path, naming why the stream is about to end rather than closing silently.
+pub const SSE_STREAM_ERROR_FRAME: &str = "sergeant.stream_error";
+
 /// Encode one journal event as an SSE frame (`id` = seq for resume).
 async fn send_sse(
     tx: &mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
@@ -3995,6 +4112,30 @@ async fn send_sse(
         .id(event.seq.to_string())
         .event(event.kind.clone())
         .data(data);
+    tx.send(Ok(frame)).await.map_err(|_| ())
+}
+
+/// The floor control frame ([`SSE_FLOOR_FRAME`]). No `id:` — see
+/// [`SSE_CONTROL_FRAMES`]'s doc comment for why that is load-bearing, not
+/// incidental.
+async fn send_sse_floor(
+    tx: &mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
+    floor_seq: u64,
+) -> Result<(), ()> {
+    let data = serde_json::to_string(&json!({"floor_seq": floor_seq})).map_err(|_| ())?;
+    let frame = SseEvent::default().event(SSE_FLOOR_FRAME).data(data);
+    tx.send(Ok(frame)).await.map_err(|_| ())
+}
+
+/// The one error control frame this stream ever sends. Best-effort: if the
+/// channel is already gone, sending fails the same way `send_sse` already
+/// tolerates (the receiver dropped, nothing to report to).
+async fn send_sse_error(
+    tx: &mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
+    error: &JournalError,
+) -> Result<(), ()> {
+    let data = serde_json::to_string(&json!({"error": error.to_string()})).map_err(|_| ())?;
+    let frame = SseEvent::default().event(SSE_STREAM_ERROR_FRAME).data(data);
     tx.send(Ok(frame)).await.map_err(|_| ())
 }
 
@@ -4546,15 +4687,32 @@ enum FrameDecode {
 }
 
 /// Decode one SSE frame's `data:` lines into a [`FrameDecode`].
+///
+/// W4 §1.1.2: a frame named for one of [`SSE_CONTROL_FRAMES`] (`sergeant.floor`,
+/// `sergeant.stream_error`) is not a journaled event at all — checked by
+/// name, before the parse, so this client treats it exactly like axum's own
+/// keep-alive comment (silently skipped) rather than a decode failure. This
+/// is what keeps the two control frames additive to the wire contract: an
+/// older client (or one that has not yet been taught to *use* either frame)
+/// still reads the rest of the stream correctly instead of erroring on the
+/// first connection. A genuinely malformed journaled-event frame — the case
+/// [`MalformedFrame`] exists for — is unaffected: it is still whatever
+/// `event:` name a real `KIND_*` carries, never one of these two.
 fn decode_frame(frame: &str) -> FrameDecode {
     let mut data = String::new();
+    let mut event_name: Option<&str> = None;
     for line in frame.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_name = Some(rest.trim());
+        } else if let Some(rest) = line.strip_prefix("data:") {
             if !data.is_empty() {
                 data.push('\n');
             }
             data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
         }
+    }
+    if event_name.is_some_and(|name| SSE_CONTROL_FRAMES.contains(&name)) {
+        return FrameDecode::KeepAlive;
     }
     if data.is_empty() {
         return FrameDecode::KeepAlive;
@@ -5143,6 +5301,22 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
 
+        // W4 §1.1.2: the very first frame on any connection is the floor
+        // control frame, sent before history — consumed here, separately,
+        // so it does not throw off this test's exact history/live frame
+        // count below (it is not one of `send_sse`'s per-event frames).
+        // `sse::Event` exposes no field getters; its `Debug` renders the
+        // already-encoded wire bytes, which is enough to pin the frame name.
+        let floor = rx
+            .recv()
+            .await
+            .expect("the floor frame")
+            .expect("not an error");
+        assert!(
+            format!("{floor:?}").contains(&format!("event: {SSE_FLOOR_FRAME}")),
+            "the first frame must be the floor control frame: {floor:?}"
+        );
+
         // One frame out: the pump is past `subscribe` and inside the history
         // loop. It cannot reach `live.recv()` from here — three history
         // frames remain and the sink holds one — so everything committed
@@ -5175,6 +5349,129 @@ mod tests {
         );
 
         pump.abort();
+    }
+
+    /// w4-spec.md §1.1.3 (A6) names two tests for the SSE error-frame fix:
+    /// one for the initial history-replay `Err` arm
+    /// (`sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure`,
+    /// `tests/w4_read_surfaces.rs`) and one for the `Lagged` refill arm —
+    /// this one. Both arms call the same `send_sse_error`, but only the
+    /// first had a dedicated test; the refill arm shipped with no coverage
+    /// anywhere in the suite (a revert of its `send_sse_error` call would
+    /// have passed every test that existed at the time).
+    ///
+    /// Lag cannot be provoked deterministically through the real HTTP
+    /// surface without pushing past the daemon's 1024-slot broadcast, so
+    /// this drives `forward_events` directly — the same wedge
+    /// `a_lag_refill_resumes_from_the_last_history_frame_the_pump_actually_sent`
+    /// above uses to force the subscriber's first `recv()` to be `Lagged` by
+    /// the channel's own overwrite contract. The journal corruption is the
+    /// same fault-injection seam
+    /// `sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure`
+    /// uses (a malformed line appended straight to the segment file),
+    /// applied here *after* the initial history fetch has already happened
+    /// (it happens synchronously, before the floor frame is even sent, so
+    /// receiving the floor frame proves it is already in memory) — so it
+    /// cannot affect history replay, only the later refill.
+    #[tokio::test]
+    async fn sse_lag_refill_failure_also_sends_the_error_frame() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        const HISTORY: u32 = 5;
+        const LIVE: u32 = 20; // > the 16-slot broadcast `test_state` builds
+        {
+            let mut core = CoreGuard::acquire(&state.core).await;
+            for n in 1..=HISTORY {
+                core.commit(seeded(n)).expect("commit history");
+            }
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+
+        let floor = rx
+            .recv()
+            .await
+            .expect("the floor frame")
+            .expect("not an error");
+        assert!(
+            format!("{floor:?}").contains(&format!("event: {SSE_FLOOR_FRAME}")),
+            "the first frame must be the floor control frame: {floor:?}"
+        );
+
+        let first = rx.recv().await.expect("the first history frame");
+        assert!(
+            first.is_ok(),
+            "history replay itself must not error before any corruption"
+        );
+
+        // From here on the on-disk journal is corrupted. The `history` Vec
+        // the pump is still draining was already fetched (before the floor
+        // frame above was sent), so this cannot touch it — only the later
+        // refill, which reads the journal fresh, sees the damage.
+        let journal_dir = dir.path().join("journal");
+        let mut segments: Vec<_> = std::fs::read_dir(&journal_dir)
+            .expect("journal dir")
+            .filter_map(|entry| {
+                let path = entry.expect("entry").path();
+                (path.extension().is_some_and(|ext| ext == "ndjson")).then_some(path)
+            })
+            .collect();
+        segments.sort();
+        let segment = segments.last().expect("a segment exists").clone();
+        let mut text = std::fs::read_to_string(&segment).expect("read segment");
+        text.push_str("{ \"not\": \"an event\" }\n");
+        std::fs::write(&segment, text).expect("append malformed line");
+
+        // Commit past the broadcast's 16-slot capacity while the sink still
+        // holds only one frame's room — everything committed here piles up
+        // unread in the broadcast ring, exactly as in
+        // `a_lag_refill_resumes_...` above.
+        {
+            let mut core = CoreGuard::acquire(&state.core).await;
+            for n in HISTORY + 1..=HISTORY + LIVE {
+                core.commit(seeded(n)).expect("commit live");
+            }
+        }
+
+        // Drain the remaining history frames — none of them error, since
+        // they were already fetched before the corruption above.
+        for _ in 0..(HISTORY - 1) {
+            let frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("history frame")
+                .expect("channel still open");
+            assert!(
+                frame.is_ok(),
+                "history replay itself must not error: {frame:?}"
+            );
+        }
+
+        // The live loop now makes its first `recv()` — which lags, by the
+        // broadcast's own overwrite contract, since nothing drained it while
+        // 20 events piled up. The refill that follows hits the corrupted
+        // journal: the stream must end with the named error frame, not hang
+        // or close silently.
+        let error_frame = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an error frame must arrive, not hang")
+            .expect("channel still open")
+            .expect("SseEvent frames are never Err — the channel item type is Infallible");
+        assert!(
+            format!("{error_frame:?}").contains(&format!("event: {SSE_STREAM_ERROR_FRAME}")),
+            "a lag refill's journal failure must be named, not silent: {error_frame:?}"
+        );
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the channel must close promptly after the error frame, not hang");
+        assert!(
+            closed.is_none(),
+            "the stream must end after the error frame, not keep sending"
+        );
+
+        pump.await.expect("the pump task must not panic");
     }
 
     /// The TOCTOU this test provokes: `with_analytics` reads `last_seq`,

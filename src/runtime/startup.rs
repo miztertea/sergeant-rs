@@ -13,11 +13,20 @@
 //!
 //! The cache is a cache in the strict sense: absent, stale, or
 //! hash-mismatched, it is discarded and a full replay happens instead, never
-//! an error. Nothing is deleted, no floor moves above segment 1 in any
-//! production path — the floor-awareness and the cache format exist here so
-//! that W3's first deletion code path lands into a repo whose build already
-//! fails when the cache misses registry state or the blob mark scan misses a
-//! ref.
+//! an error. As W2 shipped, nothing was deleted and no floor moved above
+//! segment 1 in any production path — the floor-awareness and the cache
+//! format existed here so that W3's first deletion code path would land into
+//! a repo whose build already fails when the cache misses registry state or
+//! the blob mark scan misses a ref.
+//!
+//! **W3 landed, and that premise expired.** A prune moves the floor *and*
+//! removes the cache on completion (`prune::run` step 6,
+//! `complete_interrupted` likewise), so "no cache, floor above 1" is not an
+//! exotic recovery shape: it is the ordinary next start of every estate that
+//! has ever pruned. Every full-replay path in this module is therefore
+//! floor-seeded, not seq-1-seeded — see [`Plan::seed_registry`], which owns
+//! the pairing between the seed a plan hands back and the [`Replay`] the
+//! same plan hands back.
 //!
 //! ## Forward compatibility (`sergeant.floor-state.v1`)
 //!
@@ -53,8 +62,7 @@ use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError, Replay, SegmentBound};
 use crate::runtime::projection::{
-    Projection, ProjectionError, WorkIndexRow, WorkRegistry, work_registry_projection,
-    work_registry_reducer,
+    Projection, ProjectionError, WorkIndexRow, WorkRegistry, work_registry_reducer,
 };
 
 /// File name of the startup cache inside `projections/`.
@@ -698,9 +706,14 @@ pub enum Plan {
         /// The current window boundary.
         window_seq: u64,
     },
-    /// No usable cache. Full floor-aware replay; the registry starts empty.
+    /// No usable cache. Full floor-aware replay; the registry starts empty
+    /// but **not** at seq 0 — it is resumed from `floor_seq - 1`, so the
+    /// fold agrees with `replay_from_floor()` (see [`Plan::seed_registry`]).
     Full {
-        /// The live journal's floor (1 in every W2 production path).
+        /// The live journal's floor. 1 until this estate first prunes; after
+        /// that, the first seq of the oldest surviving segment, on every
+        /// ordinary start (a prune removes the cache, so the next start is
+        /// always a miss and always lands here).
         floor_seq: u64,
         /// The current window boundary.
         window_seq: u64,
@@ -854,6 +867,32 @@ impl Plan {
 
     /// The registry a start with this plan should begin folding into: seeded
     /// from the cache's `work_index` rows on a hit, empty on a miss.
+    ///
+    /// **Both arms are seq-seeded, and both must agree with the `Replay`
+    /// [`Plan::replay`] hands back for the same plan** — that pairing is the
+    /// whole contract of this method, and breaking it is not a wrong answer
+    /// but a daemon that refuses to start:
+    ///
+    /// | plan | replay starts at | seed `last_seq` |
+    /// |---|---|---|
+    /// | `Windowed` | `H + 1` (`replay_after(H)`) | `H` |
+    /// | `Full` | the floor (`replay_from_floor()`) | `floor_seq - 1` |
+    ///
+    /// The `Full` arm is *not* `work_registry_projection()`. That spelling
+    /// resumes from seq 0 — i.e. it expects the first folded event to be seq
+    /// 1 — which is only true while the journal has never been pruned. Once
+    /// W3's prune has moved the floor, `replay_from_floor()`'s first event is
+    /// the floor, and a seq-0 seed fails the very first `apply` with
+    /// [`ProjectionError::SeqMismatch`]. `Plan::from_seq()` has always
+    /// reported the floor on this arm; this is the same fact, spelled where
+    /// the fold actually happens (and the same seeding
+    /// `cli::doctor`'s `rebuild_registry` and `prune`'s `refold_core`
+    /// already do).
+    ///
+    /// This matters for *every* [`CacheMiss`], not just [`CacheMiss::Absent`]:
+    /// a prune deletes the cache on completion, so the ordinary next start of
+    /// a pruned estate is a miss, and a cache that instead fails its BLAKE3
+    /// or its bounds check on a pruned journal lands on this identical arm.
     pub fn seed_registry(&self) -> Projection<WorkRegistry> {
         match self {
             Plan::Windowed { cache, .. } => {
@@ -891,7 +930,15 @@ impl Plan {
                     work_registry_reducer,
                 )
             }
-            Plan::Full { .. } => work_registry_projection(),
+            // A1: floor-aware, matching `replay()`'s own `Full` arm. On an
+            // unpruned journal `floor_seq` is 1 and this is exactly
+            // `work_registry_projection()`; `saturating_sub` also covers the
+            // empty-journal default (`floor_seq` 1, nothing to fold).
+            Plan::Full { floor_seq, .. } => Projection::resumed(
+                WorkRegistry::default(),
+                floor_seq.saturating_sub(1),
+                work_registry_reducer,
+            ),
         }
     }
 
@@ -1330,6 +1377,15 @@ mod tests {
                 ))
                 .expect("append");
         }
+        let cache = cache_for(&journal);
+        (journal, cache)
+    }
+
+    /// The cache half of [`build_journal_and_cache`], on its own, so a test
+    /// can build an *honest* cache for a journal whose shape it has already
+    /// changed (e.g. one whose leading segment is gone, so the floor is no
+    /// longer 1) instead of only for a pristine one.
+    fn cache_for(journal: &Journal) -> FloorState {
         let bounds = journal.segment_bounds().expect("segment_bounds");
         let w_seq = window_seq(&bounds);
         let summarized: Vec<FloorSegment> = bounds
@@ -1344,7 +1400,7 @@ mod tests {
             })
             .collect();
         let summarized_through_seq = summarized.last().map(|s| s.last_seq).unwrap_or(0);
-        let cache = FloorState {
+        FloorState {
             schema: FLOOR_STATE_SCHEMA.to_string(),
             binding: FloorBinding {
                 floor_seq: bounds[0].first_seq,
@@ -1358,8 +1414,7 @@ mod tests {
             pruned_commands: Vec::new(),
             pending_prune: None,
             quarantined_blobs: Vec::new(),
-        };
-        (journal, cache)
+        }
     }
 
     fn write_cache(data_dir: &Path, cache: &FloorState) {
@@ -1624,6 +1679,124 @@ mod tests {
             ),
             "deleting a middle segment must report the *specific* SegmentSetChanged variant, \
              not merely rebuild and not FloorMoved: {plan:?}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // seed_registry ↔ replay: the seam itself
+    // -------------------------------------------------------------
+
+    /// Drive one plan's own replay into its own seed, the way
+    /// `daemon::start_with` does, and return the seq the seed was resumed
+    /// from. Asserts the pairing `seed_registry`'s doc states: the seed must
+    /// stand exactly one seq below the first event the plan's replay yields.
+    fn assert_seed_folds_its_own_replay(plan: &Plan, journal: &Journal) -> u64 {
+        let mut registry = plan.seed_registry();
+        let resumed_from = registry.last_seq();
+        assert_eq!(
+            resumed_from + 1,
+            plan.from_seq(),
+            "seed_registry must resume exactly one seq below plan.from_seq(): {plan:?}"
+        );
+        let report = drive(
+            plan.replay(journal).expect("replay"),
+            &mut [&mut RegistrySink(&mut registry)],
+        )
+        .expect("the plan's own seed must fold the plan's own replay");
+        if report.replayed_events > 0 {
+            assert_eq!(
+                report.from_seq,
+                plan.from_seq(),
+                "the replay's first event must be the seq the plan predicted: {plan:?}"
+            );
+        }
+        resumed_from
+    }
+
+    /// The W4 seam, at the unit level: **every** plan must seed a registry
+    /// that agrees with the replay that same plan hands back.
+    ///
+    /// `Plan::Full`'s arm used to be `work_registry_projection()` — resumed
+    /// from seq 0, i.e. expecting seq 1 — while its replay arm is
+    /// `replay_from_floor()`. On a journal that has ever been pruned those
+    /// two disagree by the whole width of the pruned prefix, and the first
+    /// `apply` of the start fails `SeqMismatch { expected: 1, found: floor }`.
+    /// Both a *missing* cache (what a prune's own completion leaves behind —
+    /// `prune::run` step 6) and a cache that fails verification reach that
+    /// identical arm, so both are exercised here over the same floor > 1
+    /// journal.
+    #[test]
+    fn every_plan_seeds_a_registry_that_folds_its_own_replay() {
+        let dir = TempDir::new().expect("tempdir");
+        let (journal, cache) = build_journal_and_cache(dir.path());
+
+        // 1. Cache hit, floor 1: the arm that was always right.
+        write_cache(dir.path(), &cache);
+        let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");
+        assert!(matches!(plan, Plan::Windowed { .. }), "{plan:?}");
+        assert_seed_folds_its_own_replay(&plan, &journal);
+
+        // 2. Forced rebuild, floor still 1: `Plan::Full` where `floor_seq`
+        //    is 1 and the corrected seeding is *identical* to the old one —
+        //    the case that let the bug hide for two waves.
+        let plan = Plan::resolve(dir.path(), &journal, true).expect("resolve");
+        assert!(matches!(plan, Plan::Full { floor_seq: 1, .. }), "{plan:?}");
+        assert_eq!(
+            assert_seed_folds_its_own_replay(&plan, &journal),
+            0,
+            "on an unpruned journal the corrected seeding must still be seq 0"
+        );
+
+        // Now move the floor, the only way this module can: unlink the
+        // leading segment (§2.4 step 6's own note). Everything below is the
+        // post-prune shape.
+        let leading = journal.segment_bounds().expect("bounds")[0].path.clone();
+        std::fs::remove_file(&leading).expect("remove the leading segment");
+        let floor = journal.floor_seq().expect("floor_seq").expect("a floor");
+        assert!(floor > 1, "the fixture must really have moved the floor");
+
+        // 3. No cache at all over a moved floor — the ordinary next start of
+        //    any estate that has ever pruned, and the exact crash W4 found.
+        std::fs::remove_file(floor_state_path(dir.path())).expect("remove the cache");
+        let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");
+        assert!(
+            matches!(
+                plan,
+                Plan::Full {
+                    miss: CacheMiss::Absent,
+                    ..
+                }
+            ),
+            "{plan:?}"
+        );
+        assert_eq!(
+            assert_seed_folds_its_own_replay(&plan, &journal),
+            floor - 1,
+            "a cache-less start over a moved floor must resume from floor - 1"
+        );
+
+        // 4. A cache that is honest about the moved floor but fails its
+        //    BLAKE3 — a verification failure post-prune takes the same
+        //    corrected arm, not a differently-broken one.
+        let mut corrupt = cache_for(&journal);
+        assert_eq!(corrupt.binding.floor_seq, floor);
+        corrupt.binding.segments[0].blake3 = "0".repeat(64);
+        write_cache(dir.path(), &corrupt);
+        let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");
+        assert!(
+            matches!(
+                plan,
+                Plan::Full {
+                    miss: CacheMiss::SegmentHashChanged { .. },
+                    ..
+                }
+            ),
+            "{plan:?}"
+        );
+        assert_eq!(
+            assert_seed_folds_its_own_replay(&plan, &journal),
+            floor - 1,
+            "a checksum-failed cache over a moved floor must take the same corrected arm"
         );
     }
 
