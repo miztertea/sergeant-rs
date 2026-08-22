@@ -97,6 +97,41 @@ Four amendments are folded into the text above:
    "isolated" alone; prevention or OS-level sandboxing remains a
    non-goal.
 
+   > **Amended again 2026-08-21** (owner ruling R4 of the *Sergeant speaks
+   > Codex* sprint; `[[repo-is-a-snapshot]]` — this paragraph records what was
+   > known at this commit, and a later measurement may amend it again).
+   >
+   > *"Non-goal" here scopes core, not adapters.* Sergeant's core still runs no
+   > OS sandbox and blocks no write: the mutation surface is declared and
+   > observed, and integrity findings plus estate-drift observations remain
+   > the only things sergeant will assert about what a Work actually changed.
+   > What this amendment adds is that **an adapter MAY use its harness's
+   > native enforcement** where the harness has it, and that doing so does not
+   > make core an enforcement layer. The Codex adapter does exactly this: it
+   > scopes `codex`'s own sandbox (`workspace-write`, with the Work's declared
+   > binding surfaces as the writable roots) to the surface core already
+   > declares, and `backend/docker.rs` has done the same thing with
+   > bind-mounts and `--network=none` since before this was written down.
+   >
+   > Three consequences, stated rather than implied:
+   >
+   > 1. **Observation stays the source of truth.** An adapter's enforcement is
+   >    a belt over core's braces. Sergeant charges dirty evidence from what it
+   >    observed, never from what an adapter claims to have prevented — because
+   >    an enforced surface and an observed surface produce different
+   >    retirement stories, and only the observed one is designed.
+   > 2. **Enforcement is a capability, so it is admitted by measurement like
+   >    every other.** As of this date the Codex adapter's row reads
+   >    *enforcement-claimed, not locally proven*: the harness accepts and
+   >    echoes back the requested policy, and whether the OS sandbox denies an
+   >    out-of-surface write could not be verified on the development host,
+   >    whose nested-container environment cannot initialize bubblewrap. An
+   >    unverifiable claim is recorded as unverified, not promoted.
+   > 3. **A shared mount two Works touch at once remains accepted risk** under
+   >    this contract, exactly as the 2026-08-20 amendment says, on every
+   >    backend — an adapter's sandbox scopes one Work's writes, not another
+   >    Work's.
+
 Original text, historical (adjudicated 2026-08-11):
 
 > *Sergeant is an AgentOS distro — a cloned directory of instructions,
