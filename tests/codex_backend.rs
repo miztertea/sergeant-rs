@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use sergeant_rs::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig, TransportChoice};
+use sergeant_rs::backend::codex::{
+    Budgets, CODEX_BACKEND_NAME, CodexBackend, CodexConfig, TransportChoice,
+};
 use sergeant_rs::backend::{
     Backend, BackendError, BindingSummary, ExecutionHandle, NativeState, ProbeReport,
     ResumeRequest, StartRequest,
@@ -240,6 +242,7 @@ impl StubCodex {
              fi\n\
              if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--listen\" ]; then\n  \
                if [ -f \"{appserver_supported}\" ]; then\n    \
+                 if [ -f \"{stderr}\" ]; then cat \"{stderr}\" >&2; fi\n    \
                  while IFS= read -r line; do\n      \
                    printf '%s\\n' \"$line\" >> \"{appserver_requests}\"\n      \
                    method=$(printf '%s' \"$line\" | sed -n 's/.*\"method\":\"\\([^\"]*\\)\".*/\\1/p')\n      \
@@ -257,6 +260,8 @@ impl StubCodex {
                        done < \"$script_file\"\n        \
                      fi\n        \
                      if [ -f \"$script_file.exit_after\" ]; then\n          \
+                       if [ -f \"$script_file.exit_code\" ]; then \
+exit \"$(cat \"$script_file.exit_code\")\"; fi\n          \
                        exit 0\n        \
                      fi\n      \
                    fi\n    \
@@ -417,6 +422,19 @@ impl StubCodex {
             appserver_script_stem(method)
         ));
         std::fs::write(&marker, b"go\n").expect("write exit-after marker");
+        self
+    }
+
+    /// [`Self::appserver_exits_after`], with a chosen exit status rather than
+    /// a clean `0` — the evidence an ambiguous terminal must be able to name
+    /// (a child that died *with* a status, not merely "a child that is
+    /// gone").
+    fn appserver_exits_after_with_code(&self, method: &str, code: i32) -> &Self {
+        self.appserver_exits_after(method);
+        let marker = self
+            .appserver_scripts_dir
+            .join(format!("{}.jsonl.exit_code", appserver_script_stem(method)));
+        std::fs::write(&marker, code.to_string()).expect("write exit-code marker");
         self
     }
 
@@ -1772,6 +1790,48 @@ fn script_appserver_launch(stub: &StubCodex) {
     );
 }
 
+/// An app-server backend on `stub`, with budgets short enough that a test
+/// which *must* out-wait one of them does not out-wait the reader itself.
+/// Every fix below turns a budget expiry into an immediate, evidenced
+/// failure, so a passing run never spends these; a regressed one spends
+/// `turn_start` exactly once.
+fn appserver_backend(stub: &StubCodex, dir: &Path) -> CodexBackend {
+    let mut config = config_for(stub, dir, &dir.join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    config.appserver_budgets = Some(Budgets {
+        handshake: Duration::from_secs(10),
+        thread_start: Duration::from_secs(10),
+        turn_start: Duration::from_secs(5),
+        interrupt: Duration::from_secs(5),
+        stderr_drain: Duration::from_secs(2),
+    });
+    CodexBackend::new(config)
+}
+
+/// Poll OBSERVE until `ready` accepts what it sees, then return it.
+fn wait_for_observation(
+    backend: &CodexBackend,
+    handle: &ExecutionHandle,
+    what: &str,
+    ready: impl Fn(&sergeant_rs::backend::Observation) -> bool,
+) -> sergeant_rs::backend::Observation {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let observation = backend.observe(handle).expect("observe");
+        if ready(&observation) {
+            return observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: never observed; last evidence was {:?} (native {:?}, signal {:?})",
+            observation.evidence,
+            observation.native,
+            observation.signal,
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// §3.6 test 4: the captured `thread/start` params carry exactly `cwd`,
 /// `sandbox`, `approvalPolicy`, and `runtimeWorkspaceRoots` naming cwd plus
 /// the one binding outside it — never the inside-cwd binding (already
@@ -1838,6 +1898,11 @@ fn appserver_thread_start_names_exactly_the_works_surfaces() {
 /// `turn/completed` ever sent) must resolve to a terminal, fail-closed
 /// `AmbiguousUnknown` observation — never leave the turn `InFlight` forever
 /// (§3.4 point 3 / §15's invariant).
+///
+/// `native` is `Exited`, not `Unknown`: this observation reaped the child and
+/// holds its status, and `NativeState::Unknown`'s own definition is "the
+/// backend cannot tell". What fails closed here is the *signal* — `Running`,
+/// never a stage verdict — which is the guarantee §5.2 actually asks for.
 #[test]
 fn appserver_child_death_mid_turn_is_ambiguous_not_completed() {
     let dir = TempDir::new().expect("tempdir");
@@ -1845,34 +1910,87 @@ fn appserver_child_death_mid_turn_is_ambiguous_not_completed() {
     stub.supports_appserver();
     script_appserver_launch(&stub);
     stub.appserver_exits_after("turn/start");
-    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
-    config.transport = TransportChoice::AppServerOnly;
-    let backend = CodexBackend::new(config);
+    let backend = appserver_backend(&stub, dir.path());
     let prepared = backend
         .prepare(&start_request(dir.path()))
         .expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let observation = loop {
-        let observation = backend.observe(&handle).expect("observe");
-        if observation.native == NativeState::Unknown {
-            break observation;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the turn never resolved out of InFlight after the child's stdout closed"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn never resolved out of InFlight after the child's stdout closed",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("no turn/completed observed"))
+        },
+    );
     match observation.signal {
         sergeant_rs::backend::BackendSignal::Running => {}
         other => panic!("expected Running (fail-closed, no stage verdict), got {other:?}"),
     }
+    assert_eq!(
+        observation.native,
+        NativeState::Exited,
+        "the child was reaped by this very observation; reporting Unknown over the top of \
+         that proof is the adapter lying about what it can see"
+    );
+}
+
+/// Finding 4: the ambiguous terminal is the one outcome with no stream
+/// evidence of its own, so it must carry every scrap of process evidence the
+/// adapter holds — exit status, the last stream `error`, and the child's own
+/// stderr tail. Mirrors exec's own ambiguous arm, which has carried all three
+/// since W1.
+#[test]
+fn appserver_the_ambiguous_terminal_carries_exit_status_stderr_and_last_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.writes_stderr("codex: bwrap: No such file or directory\n");
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"error","params":{"message":"sandbox helper exited before the turn began"}}"#,
+        ],
+    );
+    stub.appserver_exits_after_with_code("turn/start", 7);
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    // The stderr drain is a second thread; poll until its tail has arrived
+    // rather than assuming it beat the reader to the finish line.
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the ambiguous terminal never carried the child's stderr",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("bwrap"))
+        },
+    );
     let evidence = observation.evidence.unwrap_or_default();
     assert!(
-        evidence.contains("no turn/completed observed"),
-        "expected the ambiguous-terminal evidence, got: {evidence}"
+        evidence.contains("code=Some(7)"),
+        "the child's own exit status is the first thing to ask for and used to be \
+         discarded by the liveness peek; got: {evidence}"
+    );
+    assert!(
+        evidence.contains("sandbox helper exited before the turn began"),
+        "the last stream error is often the only statement of *why* no terminal came; \
+         got: {evidence}"
     );
 }
 

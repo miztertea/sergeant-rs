@@ -1620,6 +1620,7 @@ fn fail_closed_appserver_turn(turn_cell: &Mutex<AppServerTurnState>) -> Option<T
         unknown_items: acc.unknown_items.clone(),
         unknown_methods: acc.unknown_methods.clone(),
         last_codex_error_info: acc.last_codex_error_info.clone(),
+        last_error: acc.last_error.clone(),
     };
     Some(outcome)
 }
@@ -1844,6 +1845,10 @@ enum AppServerTurnState {
         unknown_items: Vec<String>,
         unknown_methods: Vec<String>,
         last_codex_error_info: Option<String>,
+        /// The last stream `error`/warning message this turn carried (§4.4),
+        /// kept for the ambiguous terminal's evidence: it is often the only
+        /// thing that says *why* the turn never reached one.
+        last_error: Option<String>,
     },
 }
 
@@ -1919,6 +1924,7 @@ fn appserver_on_line(
                     unknown_items: acc.unknown_items.clone(),
                     unknown_methods: acc.unknown_methods.clone(),
                     last_codex_error_info: acc.last_codex_error_info.clone(),
+                    last_error: acc.last_error.clone(),
                 };
                 drop(state);
                 ctx.emit(
@@ -3986,10 +3992,22 @@ impl Backend for CodexBackend {
 /// means). `signal` comes from the current-or-last turn.
 fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> Observation {
     let thread_ref = execution.thread_id.as_deref().unwrap_or("<unminted>");
-    let native = if runtime.child.lock().expect("appserver child lock").alive() {
-        NativeState::Running
-    } else {
-        NativeState::Exited
+    let (child_status, stderr_tail) = {
+        let child = runtime.child.lock().expect("appserver child lock");
+        (child.status(), child.stderr_tail())
+    };
+    let (native, child_note) = match &child_status {
+        codex_appserver::ChildStatus::Running => (NativeState::Running, "child alive".to_string()),
+        codex_appserver::ChildStatus::Exited { detail, code } => (
+            NativeState::Exited,
+            format!("child exited ({detail}, code={code:?})"),
+        ),
+        // The one honest `Unknown`: the peek itself failed, so this really
+        // is a state the adapter cannot tell.
+        codex_appserver::ChildStatus::Unknown(e) => (
+            NativeState::Unknown,
+            format!("child state could not be read: {e}"),
+        ),
     };
     let turn_state = runtime.turn.lock().expect("appserver turn lock");
     match &*turn_state {
@@ -4013,6 +4031,7 @@ fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> 
             unknown_items,
             unknown_methods,
             last_codex_error_info,
+            last_error,
         } => match outcome {
             TerminalOutcome::Completed => Observation {
                 native,
@@ -4070,11 +4089,37 @@ fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> 
                      not harness-confirmed -- turn/interrupt's own RPC never confirmed it)"
                 )),
             },
+            // §5.2's ambiguity, and the one terminal with no stream evidence
+            // of its own: everything the adapter holds about the process goes
+            // here, exactly as exec's own ambiguous arm has carried exit
+            // status and a stderr tail since W1.
+            //
+            // `native` is whatever the child actually proved one lock ago — a
+            // child this observation just reaped is `Exited`, and reporting
+            // `Unknown` over the top of that proof would be the adapter lying
+            // about what it can see (the enum's own definition: "the backend
+            // cannot tell"). The fail-closed guarantee this arm owes is that
+            // it never reports a *stage verdict*, and it does not: `signal`
+            // stays `Running`.
+            //
+            // Worth naming, because it is a real consequence rather than a
+            // free improvement: the engine blocks a Work outright on
+            // `native: Unknown` (§25), so this arm used to fail closed *at
+            // the engine* by mislabelling a proven exit as ignorance. It now
+            // parks like any other `Running` observation, and the per-turn
+            // ceiling sweep (`Engine::due_interrupts`) is what bounds it —
+            // later than an immediate block, and honest. Exec's own
+            // ambiguous arm still reports `Unknown`; aligning it is a
+            // separate change to a separate transport's contract, not
+            // something to smuggle in here.
             TerminalOutcome::AmbiguousUnknown => Observation {
-                native: NativeState::Unknown,
+                native,
                 signal: BackendSignal::Running,
                 evidence: Some(format!(
-                    "no turn/completed observed for thread {thread_ref}"
+                    "no turn/completed observed for thread {thread_ref}; {child_note}; \
+                     last_error={last_error:?}; codex_error_info={last_codex_error_info:?}; \
+                     stderr tail: {}",
+                    truncate(&stderr_tail, 400)
                 )),
             },
         },

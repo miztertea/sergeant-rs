@@ -584,8 +584,36 @@ impl AppServerHandle {
 pub(super) struct AppServerChild {
     handle: AppServerHandle,
     child: Arc<Mutex<Child>>,
+    /// The child's own exit status, once anything has reaped it. Kept
+    /// because `try_wait`/`wait` hand a status back exactly once per
+    /// underlying reap and OBSERVE may ask many times — discarding it (what
+    /// the first cut of `alive()` did) throws away the only proof this
+    /// adapter will ever hold that the child *did* exit, and with what.
+    exit_status: Arc<Mutex<Option<std::process::ExitStatus>>>,
+    /// The last [`STDERR_TAIL_BYTES`] this child wrote to stderr. Bounded,
+    /// so a chatty child cannot grow this without limit, and retained rather
+    /// than dropped: on a child that died mid-turn, stderr is the same
+    /// evidence exec's own per-turn stderr is for a pre-turn refusal.
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
     pgid: u32,
     reader: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How much of the child's stderr is retained for evidence (a ring: the tail
+/// is what a failure's last words live in; the head is startup chatter).
+const STDERR_TAIL_BYTES: usize = 4096;
+
+/// What a non-blocking peek at the child can prove.
+#[derive(Debug, Clone)]
+pub(super) enum ChildStatus {
+    /// Not exited when asked.
+    Running,
+    /// Reaped: the OS's own rendering of the status (`exit status: 7`,
+    /// `signal: 9 (SIGKILL)`) plus its exit code when it has one (a
+    /// signal-killed child has none).
+    Exited { detail: String, code: Option<i32> },
+    /// The peek itself failed — the one case where "cannot tell" is true.
+    Unknown(String),
 }
 
 /// One line the reader thread hands to whatever is consuming this child's
@@ -668,16 +696,29 @@ impl AppServerChild {
             .stdout
             .take()
             .ok_or_else(|| "child stdout was not piped".to_string())?;
-        // Stderr is drained on its own thread and dropped: nothing this
-        // client does today reads it back out, unlike exec's per-turn
-        // process where stderr is the whole evidence for a pre-turn
-        // refusal. A long-lived app-server child's stderr is diagnostic
-        // only (`tracing` lines), so this mirrors exec's own drain-and-keep
-        // shape without a reader needing to consume it.
+        // Stderr is drained on its own thread into a bounded ring. Draining
+        // is what keeps the pipe from filling and blocking the child;
+        // *retaining* the tail is what makes a child that died mid-turn
+        // explicable — the ambiguous terminal it leaves behind has no stream
+        // evidence at all, and this is the only place its last words exist.
+        let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::new()));
         if let Some(mut stderr) = child.stderr.take() {
+            let sink = Arc::clone(&stderr_tail);
             std::thread::spawn(move || {
-                let mut sink = String::new();
-                let _ = stderr.read_to_string(&mut sink);
+                let mut buffer = [0u8; 1024];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            let mut held = sink.lock().expect("stderr tail lock");
+                            held.extend_from_slice(&buffer[..read]);
+                            let overflow = held.len().saturating_sub(STDERR_TAIL_BYTES);
+                            if overflow > 0 {
+                                held.drain(..overflow);
+                            }
+                        }
+                    }
+                }
             });
         }
 
@@ -737,6 +778,8 @@ impl AppServerChild {
         Ok(Self {
             handle,
             child: Arc::new(Mutex::new(child)),
+            exit_status: Arc::new(Mutex::new(None)),
+            stderr_tail,
             pgid,
             reader: Some(reader),
         })
@@ -755,16 +798,37 @@ impl AppServerChild {
         self.pgid
     }
 
-    /// Whether the child is still alive, without consuming its exit status —
-    /// a non-blocking peek exec's own liveness checks do not need since its
-    /// child is per-turn and always waited on by the reader; this transport's
-    /// child lives for the whole execution, so OBSERVE needs to ask without
-    /// waiting.
-    pub(super) fn alive(&self) -> bool {
-        match self.child.lock().expect("child lock").try_wait() {
-            Ok(None) => true,
-            Ok(Some(_)) | Err(_) => false,
+    /// Whether the child is still alive, and — when it is not — what it
+    /// exited with. A non-blocking peek exec's own liveness checks do not
+    /// need since its child is per-turn and always waited on by the reader;
+    /// this transport's child lives for the whole execution, so OBSERVE needs
+    /// to ask without waiting. The status is remembered on the way past, so
+    /// the second and every later caller gets the same answer as the first
+    /// instead of an empty `Ok(Some(_))` the reap already consumed.
+    pub(super) fn status(&self) -> ChildStatus {
+        if let Some(status) = *self.exit_status.lock().expect("exit status lock") {
+            return ChildStatus::Exited {
+                detail: status.to_string(),
+                code: status.code(),
+            };
         }
+        match self.child.lock().expect("child lock").try_wait() {
+            Ok(None) => ChildStatus::Running,
+            Ok(Some(status)) => {
+                *self.exit_status.lock().expect("exit status lock") = Some(status);
+                ChildStatus::Exited {
+                    detail: status.to_string(),
+                    code: status.code(),
+                }
+            }
+            Err(e) => ChildStatus::Unknown(e.to_string()),
+        }
+    }
+
+    /// The last [`STDERR_TAIL_BYTES`] this child wrote to stderr, lossily
+    /// decoded (a tail can start mid-codepoint by construction).
+    pub(super) fn stderr_tail(&self) -> String {
+        String::from_utf8_lossy(&self.stderr_tail.lock().expect("stderr tail lock")).into_owned()
     }
 
     /// Kill this child's whole process group (§1.5.5) and join its reader.
@@ -773,6 +837,12 @@ impl AppServerChild {
         let _ = stderr_drain_budget; // stderr is drained continuously above
         super::kill_process_group(Some(self.pgid));
         let _ = self.child.lock().expect("child lock").kill();
+        // Reap and record: after the group kill the child is already gone or
+        // about to be, and this is the call that turns "we killed it" into a
+        // status OBSERVE can name.
+        if let Ok(status) = self.child.lock().expect("child lock").wait() {
+            *self.exit_status.lock().expect("exit status lock") = Some(status);
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
