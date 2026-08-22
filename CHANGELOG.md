@@ -44,11 +44,15 @@ an old CLI.
   wants it configures their own `~/.codex/config.toml` and opts out of
   sergeant's default via a launch profile.
 - **Capabilities, reported honestly, negatives included.** `ask` is
-  `false` on both transports: exec has no ask channel at all, and a live,
-  gated admission test against the app-server's `request_user_input`
-  method — the one place Codex's protocol could have exceeded Claude's —
-  did not get a reliably attributable actor question out of the pinned
-  dev-tier model under either of two tried prompts. `history` stays
+  `false` on both transports: exec has no ask channel at all, and
+  app-server has no `NeedsInput` mapping or answering path yet, so the
+  capability cannot be admitted regardless of model behavior. A live,
+  `#[ignore]`d admission test against the app-server's
+  `request_user_input` method — the one place Codex's protocol could
+  have exceeded Claude's — stays in the suite, opt-in via
+  `SERGEANT_CODEX_TESTS=1`, for whoever next re-runs it; this release
+  does not report a completed run of it against the pinned dev-tier
+  model. `history` stays
   `false`: the durable transcript exists (a rollout file, a thread index)
   but reading it would be a private-format read this release does not
   attempt, and the capability's own whole-or-refuse rule forbids claiming

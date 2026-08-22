@@ -167,24 +167,31 @@ asked for; this ADR records that it has not been done, so a later reader
 does not assume the ladder is fully typed when it partly still lives in
 `note` strings.
 
-### `ask` — the recorded negative, not a gap left open
+### `ask` — an open admission test, not a claimed negative
 
 `Capabilities::ask` is `false` on **both** transports
 (`codex.rs:769-798`). On exec this is structural and unconditional (no
 ask channel exists on the transport at all — `[measured-negative]`). On
-app-server, W3 specced a five-assertion live admission test
+app-server, `ask` is `false` for a narrower reason: no `NeedsInput`
+mapping or answering path exists in this build, so the capability cannot
+be admitted regardless of model behavior (§2.4's "only if admitted"
+scope). W3 specced a five-assertion live admission test
 (`live_appserver_actor_authored_question_is_typed`) precisely because the
 protocol's `item/tool/requestUserInput` method is a genuinely clean,
 schema-distinguishable "the actor asked" record — the one place Codex's
-own protocol could have exceeded Claude's `ask` capability. **The measured
-outcome is a negative**: `gpt-5.6-luna` — the pinned, cheap dev tier, the
-same tier the narration hazard below was measured on — did not reliably
-invoke `request_user_input` under either of two tried prompt
-formulations, and the row records exactly that, not a placeholder. This is
-stated as a wave outcome, not a shortfall: §2.4 of the W3 spec named this
-in advance as "a likely and perfectly good outcome," and it is exactly
-what a promotion discipline that refuses to move a row on schema evidence
-alone is supposed to produce sometimes.
+own protocol could have exceeded Claude's `ask` capability. **That test
+has not produced a measured negative**: it is `#[ignore]`d and gated on
+`SERGEANT_CODEX_TESTS=1`, and nothing in this repo records a completed
+run against `gpt-5.6-luna` under either of its two prompt formulations.
+The row's evidence is `Evidence::Unmeasured`, and its own note says so
+plainly: "absence of a probe result under this launch grammar is not a
+measured negative of the tool's existence." Recording this honestly
+rather than resurrecting the unbacked prose an earlier version of this
+row carried (specific prompt formulations, an exact quoted model refusal,
+never backed by a committed test) is itself a wave outcome: §2.4 named
+"a likely and perfectly good outcome" as one possible result of *running*
+the probe, but that is a claim about what re-running the test might show,
+not a substitute for having run it.
 
 Regardless of `ask`'s outcome, the adapter answers or refuses **every**
 server-to-client request the app-server protocol can send
