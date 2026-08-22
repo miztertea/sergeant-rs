@@ -1,0 +1,36 @@
+codex app-server generate-json-schema --out DIR --experimental
+codex-cli 0.149.0, Cerberus, 2026-08-21. 401 files, 52ms, byte-identical
+across two runs (re-measured while authoring W3: 47ms, 401 files, same
+digest as below).
+
+Whole-tree SHA-256 (informational only, not pinned -- flaps on any of the
+401 files, most of which this adapter never reads):
+  6840dbefc5f914635d09cf5ec640ca54675b0d83cdf7e533ca3185eb3891b946
+
+Scoped digest rule (W3 spec section 2.5): for each path below, in the
+order given, feed the path's UTF-8 bytes, then one NUL byte, then the
+file's bytes verbatim, then one NUL byte; hash the concatenation.
+
+  v1/InitializeParams.json
+  v1/InitializeResponse.json
+  v2/ThreadStartParams.json
+  v2/ThreadStartResponse.json
+  v2/TurnStartParams.json
+  v2/TurnStartResponse.json
+  v2/TurnInterruptParams.json
+  v2/TurnCompletedNotification.json
+  v2/TurnStartedNotification.json
+  v2/ItemStartedNotification.json
+  v2/ItemCompletedNotification.json
+  v2/ThreadTokenUsageUpdatedNotification.json
+  ToolRequestUserInputParams.json
+  ServerRequest.json
+
+Scoped SHA-256 (the spec's own pinned value, re-measured identical while
+authoring W3):
+  91d5ac12da62b6a73f3ebf6a7003421c607497cf7bc37c175d78806f2d396310
+
+Scoped BLAKE3 (this is the value MEASURED_PROTOCOL_FINGERPRINT pins --
+blake3 is already an in-tree dependency; sha256 above is provenance that
+the input bytes are stable, not a value this codebase computes):
+  d0fbf8dec13704250254d40fea2c0892928966ba6caa7a6a5af6aa6611abf879

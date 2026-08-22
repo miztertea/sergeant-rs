@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -39,7 +39,7 @@ use tempfile::TempDir;
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::backend::{
     Backend, BackendError, BackendRegistry, BackendSignal, Capabilities, ExecutionHandle,
-    NativeState, Observation, ProbeReport, StartRequest,
+    NativeEvent, NativeState, Observation, ProbeReport, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::estate::InstructionPolicy;
@@ -50,9 +50,9 @@ use sergeant_rs::domain::work::{
 };
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
-    KIND_WORKFLOW_BOUND, WorkflowDefinition,
+    KIND_STAGE_INPUT_RECEIVED, KIND_WORKFLOW_BOUND, WorkflowDefinition,
 };
-use sergeant_rs::runtime::engine::{Engine, SubmitContext};
+use sergeant_rs::runtime::engine::{Engine, KIND_TURN_CEILING_INTERRUPTED, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
@@ -278,6 +278,25 @@ fn events_of(data_dir: &Path, work_id: &str, kind: &str) -> Vec<Event> {
         .into_iter()
         .filter(|e| e.work_id.as_deref() == Some(work_id) && e.kind == kind)
         .collect()
+}
+
+/// R-MVP1-7's own tight interrupt budget (`tests/m4_backends.rs`'s
+/// `interrupt_budget`, same precedent), duplicated here rather than shared:
+/// ceiling plus ten driver intervals of jitter on the measured dev
+/// container, widened with a loud, named allowance on hosted CI's
+/// two-environments split — the *functional* pin (the ceiling fires at all)
+/// holds everywhere; the *latency* pin holds only where it was measured.
+fn interrupt_budget(ceiling: Duration, poll: Duration) -> Duration {
+    let tight = ceiling + poll * 10;
+    if std::env::var_os("CI").is_some() {
+        eprintln!(
+            "WIDENED-ENV: hosted CI runner — interrupt budget {tight:?} + 5s scheduler-jitter \
+             allowance (the tight ceiling-latency pin is asserted on the measured dev container)"
+        );
+        tight + Duration::from_secs(5)
+    } else {
+        tight
+    }
 }
 
 /// Make each of `paths` writable or not, for tests that need a git write to
@@ -1263,6 +1282,175 @@ async fn t4_needs_input_parks_the_run_and_input_resumes_it() {
     handle.shutdown().await;
 }
 
+/// R-H0-7 shape 1 (deferred turn finish), engine-level: `FakeStep::settle`
+/// already models "a turn that is `Running` for some number of polls after
+/// LAUNCH returns, then resolves to its real outcome" — the shape the codex
+/// research measured directly on both transports (JSONL turns resolving over
+/// real seconds; the app-server's own `item/started` arriving strictly
+/// before `item/completed`). No new mechanism exists for this test to drive;
+/// it exists to pin that the *engine* — not just the fake — actually
+/// respects the window: submit's own synchronous answer must not observe the
+/// conclusion before the settle window is spent, only the real completion
+/// driver, ticking on its own schedule, gets to see it.
+#[tokio::test]
+async fn deferred_finish_does_not_let_the_engine_observe_a_conclusion_before_launch_settles() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete_with("ran the migration").settle(3),
+        FakeStep::complete(),
+    ]);
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(registry),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            completion_poll: Duration::from_millis(20),
+            estate_root: Some(estate.clone()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "resolves over real polls",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(
+        body["work"]["state"], "active",
+        "the settle window must still be open when submit's own synchronous \
+         answer is formed — the engine must not have observed a conclusion \
+         that has not settled yet: {body}"
+    );
+    assert_eq!(body["stage"]["status"], "active");
+    let execution_id = fake.starts()[0].execution_id.clone();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+        if shown["work"]["state"] == "completed" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the settled outcome never surfaced: {shown}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let completed = events_of(data.path(), &work_id, KIND_STAGE_COMPLETED);
+    assert_eq!(completed[0].payload["detail"], "ran the migration");
+    assert!(
+        fake.observations()
+            .iter()
+            .filter(|id| **id == execution_id)
+            .count()
+            >= 4,
+        "the settle window (3 interim OBSERVEs) plus the settled one must \
+         actually have been asked, not skipped past: {:?}",
+        fake.observations()
+    );
+
+    handle.shutdown().await;
+}
+
+/// R-H0-7 shape 4 (queued input), engine-level: `queue_input()` against an
+/// execution parked in `needs_input`, followed by the ordinary API `input`
+/// response that actually resumes the stage, must answer both in the one
+/// turn the live response drove — not a turn `queue_input` spent of its own.
+/// Read back through `Backend::history()` itself (not `FakeBackend::inputs`,
+/// a test-only accessor that bypasses the trait) so what is proven is what
+/// the real trait surface would report, the shape a real transcript read
+/// would eventually see.
+#[tokio::test]
+async fn a_resumed_stage_journals_a_queued_item_and_the_live_send_as_one_turn() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
+
+    let (registry, fake) = one_fake([
+        FakeStep::needs_input("which database?"),
+        FakeStep::complete(),
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "queue then answer live",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "needs_input");
+    let execution_id = fake.starts()[0].execution_id.clone();
+
+    // Enqueued out of band, before any live SEND — the fake's stand-in for
+    // `codex queue --thread <id> --message <text>` against an idle thread.
+    fake.queue_input(&execution_id, "also answer this");
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "postgres"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    assert_eq!(body["work"]["state"], "completed");
+
+    // The journal's own record of the resume names exactly the live send —
+    // what the operator actually typed, not what the queue held.
+    let received = events_of(data.path(), &work_id, KIND_STAGE_INPUT_RECEIVED);
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].payload["input"], "postgres");
+
+    // The backend's own trait-level history shows both, in enqueue order,
+    // proving the queued item and the live send both landed in the one
+    // resumed turn rather than the queued item spending a turn of its own.
+    let execution_handle = ExecutionHandle {
+        execution_id: execution_id.clone(),
+        native_id: Some(format!("fake-session-{execution_id}")),
+    };
+    let history = fake.history(&execution_handle).expect("history");
+    assert_eq!(
+        history,
+        vec![
+            NativeEvent {
+                kind: "conversation.user".to_string(),
+                payload: json!({"text": "also answer this", "queued": true}),
+            },
+            NativeEvent {
+                kind: "conversation.user".to_string(),
+                payload: json!({"text": "postgres"}),
+            },
+        ],
+        "the queued item and the live send land in the same resumed turn"
+    );
+
+    handle.shutdown().await;
+}
+
 /// 5. A failed stage fails the work with the reason recorded, and the retry
 ///    verb re-enters that same stage — succeeding on the scripted second
 ///    attempt.
@@ -1630,12 +1818,12 @@ async fn t7_routing_precedence_and_structured_failure() {
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
     // The scripted fake occupies the "claude" slot, so the daemon adds
-    // nothing there — but it still adds the real docker adapter (N4, nothing
-    // here is named "docker"). Codex is descoped (D6) and never registered,
-    // and a backend that is not registered is not offered.
+    // nothing there — but it still adds the real docker and codex adapters
+    // (N4/W2, nothing here is named "docker" or "codex"): codex is now the
+    // third real adapter the daemon registers by default, same as docker.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "docker"])
+        json!(["claude", "codex", "docker"])
     );
     assert!(
         body["error"]["message"]
@@ -1842,13 +2030,19 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     );
     handle.shutdown().await;
 
-    // Row 4, second shape: a harness no daemon here registers.
+    // Row 4, second shape: a harness no daemon here registers. Since W2 the
+    // daemon registers a real Codex adapter by default, so naming "codex"
+    // here would no longer demonstrate an unregistered harness (it would be
+    // host-dependent: `backend_unavailable` with no codex on `PATH`, or an
+    // actual routing success on a host with a real logged-in one) — use
+    // "opencode" instead, the name already used elsewhere in this file for
+    // exactly this meaning (an unregistered backend/harness name).
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
     let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
         &estate,
-        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"codex\"\n",
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"opencode\"\n",
     );
     let (registry, fake) = one_fake([]);
     let handle = start_with(
@@ -1868,12 +2062,13 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     .await;
     assert_eq!(status, 422, "must be refused: {body}");
     assert_eq!(body["error"]["code"], "backend_not_found");
-    // The daemon registers the real Claude and Docker adapters alongside the
-    // scripted fake, so the options list names all three; Codex is descoped
-    // (D6) and never registered, which is exactly why naming it fails.
+    // The daemon registers the real Claude, Codex, and Docker adapters
+    // alongside the scripted fake, so the options list names all four;
+    // "opencode" is still never registered, which is exactly why naming it
+    // fails.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "docker", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
     );
     assert!(fake.starts().is_empty(), "no silent provider substitution");
     let list = get(&client, &handle, "/v1/work").await;
@@ -2427,6 +2622,116 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
 
 // ------------------------------------------------- beyond the numbered list
 
+/// R-H0-7 shape 2 (a never-arriving terminal), engine-level: a known,
+/// never-forgotten execution whose own signal is permanently `Running` (no
+/// settle window that eventually resolves — see `FakeStep::never_arrives`'s
+/// own doc) is never concluded by observation alone drawing a `completed` or
+/// `failed` verdict from the ambiguity. It parks, and only the per-turn
+/// ceiling sweep (`Engine::due_interrupts`/`settle_interrupt`) concludes it —
+/// landing on `blocked`, the same honest "we asked and nothing else arrived"
+/// this fake already reports for `InterruptedRunning`.
+///
+/// Scoped to `.with_native(NativeState::Exited)` — the app-server variant —
+/// deliberately: the *bare* constructor's `NativeState::Unknown` is a
+/// different, already-covered story. `check_observation`'s own "native
+/// liveness has already had its one and only say" rule (§25) fails an
+/// `Unknown` native closed to `blocked` on its very first OBSERVE,
+/// regardless of what the signal says — a pre-existing invariant this new
+/// shape gets to reuse for free, already pinned by
+/// `an_unknown_native_state_blocks_even_when_the_signal_says_completed`
+/// elsewhere in this suite. Only once native reads `Exited` does "only the
+/// signal decides" apply and the execution genuinely sit `active`/parked
+/// with nothing but the ceiling left to conclude it — the same shape
+/// `native_liveness_never_decides_work_state_in_either_direction`'s first
+/// scenario already proves for `hang().with_native(NativeState::Exited)`,
+/// extended here to a signal that is not a hang at all, just permanently
+/// unresolved. A different ambiguity source than
+/// `t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work`'s: that
+/// test's ambiguity is "the backend has forgotten this execution entirely";
+/// this one's is a *known*, never-forgotten execution whose own signal is
+/// permanently stuck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_known_never_forgotten_execution_whose_signal_never_arrives_parks_rather_than_concluding()
+{
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
+
+    let (registry, fake) = one_fake([FakeStep::never_arrives().with_native(NativeState::Exited)]);
+    let poll = Duration::from_millis(50);
+    let ceiling = Duration::from_millis(150);
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(registry),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            completion_poll: poll,
+            turn_ceiling: ceiling,
+            estate_root: Some(estate.clone()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "never resolves on its own",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "active");
+    let execution_id = fake.starts()[0].execution_id.clone();
+
+    // Well within the ceiling, the ambiguity alone must not have concluded
+    // anything: still active, never completed, never failed.
+    tokio::time::sleep(poll * 2).await;
+    let mid = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        mid["work"]["state"], "active",
+        "a signal that never arrives must never read as a conclusion on its \
+         own — it must still be active this early: {mid}"
+    );
+
+    // Only the ceiling, riding the same completion driver R-MVP1-7 proves it
+    // on, eventually acts — and it lands on blocked, never on completed or
+    // failed, which an inference from the ambiguous shape could have
+    // suggested either way.
+    let budget = interrupt_budget(ceiling, poll);
+    let submitted_at = Instant::now();
+    loop {
+        if !events_of(data.path(), &work_id, KIND_TURN_CEILING_INTERRUPTED).is_empty() {
+            break;
+        }
+        assert!(
+            submitted_at.elapsed() < budget,
+            "the ceiling never fired — the only mechanism this shape can be \
+             concluded by"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        shown["work"]["state"], "blocked",
+        "only the ceiling concludes a never-arriving execution, and it does \
+         so by blocking, never by completing or failing: {shown}"
+    );
+    assert_eq!(
+        fake.native_state(&execution_id),
+        Some(NativeState::Exited),
+        "the ordinary interrupt path leaves native exactly where it already \
+         was for this variant — nothing left to flip"
+    );
+
+    handle.shutdown().await;
+}
+
 /// §25 in both directions, which no single acceptance test covers: a dead
 /// native process that signalled nothing must not fail the work, and a live
 /// native process that signalled completion must complete the stage.
@@ -2485,6 +2790,112 @@ async fn native_liveness_never_decides_work_state_in_either_direction() {
         "an explicit completion completes the work however alive the process is: {body}"
     );
     handle.shutdown().await;
+}
+
+/// R-H0-7 shape 3 (a distinct interrupted terminal), engine-level: the same
+/// invariant as the test above, extended to the *new* native shape §1.3
+/// adds. `Backend::interrupt` is only ever called from one place in this
+/// engine — the per-turn ceiling sweep — so both scenarios below drive it
+/// through that one real path rather than calling it directly: an ordinary
+/// step (INTERRUPT flips native to `Exited`, the process-tree-kill shape)
+/// and a `.interrupts_natively()` step (native stays `Running`, the
+/// harness-confirmed shape) must both park the Work identically —
+/// `blocked`, from the ceiling, never a state that varied with which native
+/// shape followed. `mod.rs`'s own `Observation` doc says it plainly: "the
+/// engine acts only on the signal."
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_liveness_after_interrupt_never_decides_work_state_either_way() {
+    let repos = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow(&estate);
+    let poll = Duration::from_millis(50);
+    let ceiling = Duration::from_millis(150);
+    let budget = interrupt_budget(ceiling, poll);
+
+    async fn run_to_ceiling_block(
+        estate: &Path,
+        poll: Duration,
+        ceiling: Duration,
+        budget: Duration,
+        step: FakeStep,
+    ) -> (FakeBackend, String, String) {
+        let data = TempDir::new().expect("tempdir");
+        let (registry, fake) = one_fake([step]);
+        let handle = daemon::start_with(
+            data.path(),
+            DaemonConfig {
+                backends: Arc::new(registry),
+                default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+                completion_poll: poll,
+                turn_ceiling: ceiling,
+                estate_root: Some(estate.to_path_buf()),
+                ..DaemonConfig::default()
+            },
+        )
+        .await
+        .expect("daemon start");
+        let client = http();
+        let (_, body) = submit(
+            &client,
+            &handle,
+            estate,
+            "overdue by construction",
+            json!({"workflow": "tiny"}),
+        )
+        .await;
+        let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+        let execution_id = fake.starts()[0].execution_id.clone();
+
+        let submitted_at = Instant::now();
+        loop {
+            if !events_of(data.path(), &work_id, KIND_TURN_CEILING_INTERRUPTED).is_empty() {
+                break;
+            }
+            assert!(submitted_at.elapsed() < budget, "the ceiling never fired");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+        assert_eq!(shown["work"]["state"], "blocked", "{shown}");
+        handle.shutdown().await;
+        (fake, work_id, execution_id)
+    }
+
+    // The ordinary path: INTERRUPT flips native to Exited. A huge settle
+    // keeps the step genuinely "still running" — never resolving on its
+    // own — long enough for the ceiling to be what concludes it.
+    let (fake, _work_id, execution_id) = run_to_ceiling_block(
+        &estate,
+        poll,
+        ceiling,
+        budget,
+        FakeStep::complete_with("plain interrupt").settle(1_000),
+    )
+    .await;
+    assert_eq!(
+        fake.native_state(&execution_id),
+        Some(NativeState::Exited),
+        "the ordinary interrupt path kills the native context"
+    );
+
+    // The harness-confirmed path: INTERRUPT leaves native alive — and the
+    // Work still parks exactly the same way.
+    let (fake, _work_id, execution_id) = run_to_ceiling_block(
+        &estate,
+        poll,
+        ceiling,
+        budget,
+        FakeStep::complete_with("confirmed interrupt")
+            .settle(1_000)
+            .interrupts_natively(),
+    )
+    .await;
+    assert_eq!(
+        fake.native_state(&execution_id),
+        Some(NativeState::Running),
+        "interrupts_natively leaves the native context alive by construction, \
+         and the Work still parked identically above"
+    );
 }
 
 /// Waiting and blocked are §12 verbs too, and both are re-enterable through
@@ -4284,12 +4695,12 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     );
     assert_eq!(body["error"]["code"], "backend_not_found");
     // Since M4 the daemon registers the real claude adapter alongside the
-    // scripted fake, and since N4 the docker adapter too (registered names
-    // sort: claude, docker, fake). Codex is descoped (D6): not registered,
-    // not offered.
+    // scripted fake, since N4 the docker adapter too, and since W2 the
+    // codex adapter as well (registered names sort: claude, codex, docker,
+    // fake).
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "docker", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
     );
 
     // Only two works exist: the refusal created none.

@@ -2067,8 +2067,9 @@ async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
 #[tokio::test]
 async fn the_capability_probe_is_journaled_at_registration() {
     let data = TempDir::new().expect("tempdir");
-    // A CLI below the minimum trusted version: the probe's verdict is
-    // "unavailable", and the record must say so with its evidence.
+    // A CLI below the minimum trusted version: the probe's verdict is now
+    // "usable, with unmeasured-provenance detail" (R1), and the record must
+    // say so with its evidence.
     let stub = StubClaude::new(data.path(), "2.1.220 (Claude Code)", ALL_FLAGS);
     let mut claude = ClaudeConfig::new(data.path());
     claude.executable = stub.path.clone();
@@ -2090,23 +2091,26 @@ async fn the_capability_probe_is_journaled_at_registration() {
         .map(|e| e.expect("event"))
         .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
         .collect();
-    // One record per registered backend: claude (this test's subject) and
-    // docker (N4 — `start_with` always registers it alongside claude, same
-    // as claude is added here even though this test's registry started
-    // empty). Located by name rather than trusted-by-index, so this stays
-    // correct regardless of how many backends a future adapter adds the
-    // same way.
-    assert_eq!(probed.len(), 2, "one record per registered backend");
+    // One record per registered backend: claude (this test's subject),
+    // docker, and codex (N4/W2 — `start_with` always registers them
+    // alongside claude, same as claude is added here even though this
+    // test's registry started empty). Located by name rather than
+    // trusted-by-index, so this stays correct regardless of how many
+    // backends a future adapter adds the same way.
+    assert_eq!(probed.len(), 3, "one record per registered backend");
     let claude_probed = probed
         .iter()
         .find(|e| e.payload["backend"] == CLAUDE_BACKEND_NAME)
         .expect("a backend.probed record for claude");
     let payload = &claude_probed.payload;
     assert_eq!(payload["backend"], CLAUDE_BACKEND_NAME);
-    assert_eq!(payload["available"], false);
+    assert_eq!(payload["available"], true);
     let detail = payload["detail"].as_str().expect("probe detail recorded");
     assert!(detail.contains("2.1.220"), "{detail}");
-    assert!(detail.contains("minimum trusted 2.1.226"), "{detail}");
+    assert!(
+        detail.contains("BELOW the measured floor 2.1.226"),
+        "{detail}"
+    );
     assert_eq!(
         payload["capabilities"]["native_subagents"], false,
         "capabilities are recorded as advertised, and nothing unmeasured is advertised"
@@ -4472,26 +4476,37 @@ fn a4_a_turn_that_dies_without_an_envelope_is_ambiguous_not_a_verdict() {
 // ------------------------------------------------------- 7. version gate
 
 /// Acceptance 7: the adapter refuses to launch on a CLI the contract tests
-/// never measured — old version, missing flag, or unparseable version —
-/// and the structured error names the probe evidence each time.
+/// never measured — missing flag or unparseable version — and reports
+/// (never refuses) a version below the measured floor; the structured error
+/// names the probe evidence each time it does refuse.
 #[test]
 fn a7_version_gate_fails_closed_naming_the_probe() {
     let dir = TempDir::new().expect("tempdir");
     let request = start_request("e-gate", dir.path(), "irrelevant", None);
 
-    // Version below the measured minimum.
+    // Version below the measured minimum: R1 (2026-08-21) — this is
+    // provenance, not a gate. The probe reports the CLI usable and names the
+    // floor it fell below; it must NOT refuse to launch.
     let old = StubClaude::new(dir.path(), "2.1.220 (Claude Code)", ALL_FLAGS);
     let mut config = ClaudeConfig::new(dir.path());
     config.executable = old.path.clone();
     let backend = ClaudeBackend::new(config);
-    assert!(!backend.probe().available);
-    match backend.start(&request).expect_err("must refuse") {
-        BackendError::Unavailable { detail, .. } => {
-            assert!(detail.contains("2.1.220"), "{detail}");
-            assert!(detail.contains("minimum trusted 2.1.226"), "{detail}");
-        }
-        other => panic!("expected Unavailable, got {other}"),
-    }
+    let probe = backend.probe();
+    assert!(
+        probe.available,
+        "below the measured floor is honest provenance, never a refusal: {probe:?}"
+    );
+    let detail = probe.detail.clone().unwrap_or_default();
+    assert!(detail.contains("2.1.220"), "{detail}");
+    assert!(
+        detail.contains("BELOW the measured floor 2.1.226"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("unmeasured provenance"),
+        "the detail must say capabilities carry unmeasured provenance, not just \
+         that the version is low: {detail}"
+    );
 
     // A required flag missing from --help.
     let dir2 = TempDir::new().expect("tempdir");
@@ -4561,6 +4576,7 @@ fn r1_worker_reports_done_but_native_session_stays_alive() {
         settle: 0,
         interim_native: NativeState::Running,
         interim_signal: BackendSignal::Running,
+        interrupt_confirmed: false,
     };
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [step]);
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));

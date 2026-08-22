@@ -12,6 +12,81 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.2.0] - 2026-08-22
+
+Sergeant speaks Codex: a second native backend, selectable the same way
+Claude always has been, plus a repo-wide fix to how every adapter reports
+an old CLI.
+
+### Codex backend
+
+- **`sgt run --backend codex` and `sgt codex`** are real now — the codex
+  adapter (`src/backend/codex.rs`, `codex_appserver.rs`) is registered in
+  the `BackendRegistry` alongside Claude and Docker, closing deviation D6
+  (`docs/adr/0020-codex-adapter.md`). Backend and harness selection were
+  already separate, user-composable axes before this release
+  (`sgt claude`/`codex`/`opencode`/`goose`, `--backend <name>`,
+  `sergeant.toml`'s routing profiles); this release is what makes `codex`
+  a real option in that existing chain rather than an unregistered name.
+- Two transports, chosen once per registration and journaled, never mixed
+  mid-execution: `codex exec` (one process per turn, the simple fallback
+  every capability below still works on) and an adapter-owned
+  `codex app-server --listen stdio://` child, one per execution, offering
+  a native turn interrupt (a first-class `interrupted` terminal instead of
+  an inferred process-kill), mid-turn token-usage events, and a typed
+  auth-expiry error taxonomy exec never had.
+- **Sandbox enforcement, on by default.** Codex turns run under
+  `workspace-write`, scoped to the Work's own declared surfaces —
+  enforcement the harness itself provides, on top of (never instead of)
+  sergeant's own observation layer, which remains what sergeant charges
+  dirty evidence from (`NORTH-STAR.md` amendment 4, dated 2026-08-21).
+  `danger-full-access` is not offered by this adapter; an operator who
+  wants it configures their own `~/.codex/config.toml` and opts out of
+  sergeant's default via a launch profile.
+- **Capabilities, reported honestly, negatives included.** `ask` is
+  `false` on both transports: exec has no ask channel at all, and
+  app-server has no `NeedsInput` mapping or answering path yet, so the
+  capability cannot be admitted regardless of model behavior. A live,
+  `#[ignore]`d admission test against the app-server's
+  `request_user_input` method — the one place Codex's protocol could
+  have exceeded Claude's — stays in the suite, opt-in via
+  `SERGEANT_CODEX_TESTS=1`, for whoever next re-runs it; this release
+  does not report a completed run of it against the pinned dev-tier
+  model. `history` stays
+  `false`: the durable transcript exists (a rollout file, a thread index)
+  but reading it would be a private-format read this release does not
+  attempt, and the capability's own whole-or-refuse rule forbids claiming
+  it on anything less than a proven-complete read.
+- **The narration hazard, named and tested.** Codex's cheap dev tier has
+  been measured narrating a command's outcome with no corroborating tool
+  record and no filesystem effect. The adapter's decoder has exactly one
+  code path that can ever produce tool evidence, and both the codex
+  contract suite and the deterministic fake backend now carry a test
+  proving narration text alone never manufactures one.
+
+### Every adapter's version floor is provenance now, not a gate
+
+- **The version-floor refusal is struck.** `sgt`'s adapters used to refuse
+  to launch below their own measured-floor CLI version. That refusal is
+  gone: an old CLI is reported as available, with an honest
+  unmeasured-provenance detail in `sgt doctor` and the probe record,
+  instead of an outage the operator has no lever to fix. This is a
+  usability fix, not a loosened guarantee — the two *other* conditions a
+  version check used to bundle in (a required launch flag missing from
+  `--help`; an unparseable version string) are untouched refusals, because
+  neither is actually a version-policy question.
+
+### Fake backend
+
+- Five more measured-shape scripts, for contract-test authors who need to
+  drive the engine against them without a live harness or a token spend:
+  a deferred turn finish; a turn whose own signal never arrives, distinct
+  from a hang; a harness-confirmed interrupt that kills nothing (distinct
+  from the process-tree kill every earlier interrupt modelled); a turn
+  answering an item queued before it was sent; and narration with no
+  corroborating tool evidence. All five are additive — every existing
+  fake-backend test is unchanged.
+
 ## [0.1.3] - 2026-08-21
 
 Foundation close-out: the release pipeline proven end-to-end via a
