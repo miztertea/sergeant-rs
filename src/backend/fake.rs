@@ -173,6 +173,15 @@ pub struct FakeStep {
     pub interim_native: NativeState,
     /// See [`FakeStep::interim_native`].
     pub interim_signal: BackendSignal,
+    /// R-H0-7 (2026-08-22): whether INTERRUPT on this step is a
+    /// harness-*confirmed* stop (`turn/interrupt` → `turn/completed
+    /// {"status":"interrupted"}`, codex's app-server transport,
+    /// `codex_appserver.rs:1213`) rather than the process-tree kill this
+    /// fake otherwise always reports. A confirmed interrupt kills nothing —
+    /// the measured point (H0 §B `[daemon]`: "the child process is still
+    /// alive") — so `native` is left exactly as it already reads, never
+    /// forced to `Exited`.
+    pub interrupt_confirmed: bool,
 }
 
 impl FakeStep {
@@ -232,7 +241,36 @@ impl FakeStep {
             settle: 0,
             interim_native: NativeState::Running,
             interim_signal: BackendSignal::Running,
+            interrupt_confirmed: false,
         }
+    }
+
+    /// R-H0-7 (2026-08-22): a turn whose own harness never marks it concluded —
+    /// the shape a SIGKILLed codex turn measured: the rollout stays intact, the
+    /// turn's own status stamps `inProgress` **permanently**, and nothing ever
+    /// resolves it; a resume silently starts a *new* turn on the same thread
+    /// (H0 §B, `[sessions]`). Distinct from [`FakeStep::hang`]: a hang models a
+    /// native context that is still alive and refuses to die; this models a
+    /// native context whose own signal was simply never going to arrive, which
+    /// is why — unlike a hang — INTERRUPT/STOP are *not* ignored here: nothing
+    /// is being defied. Calling either on this step behaves exactly as it does
+    /// on any other non-hang step (native flips honestly; the ambiguous signal,
+    /// being `Running` already, has nothing to discard) — which is itself the
+    /// point: the engine's own per-turn ceiling sweep interrupting a
+    /// never-arriving execution must land on `InterruptedRunning`, the same
+    /// honest "we asked and nothing else arrived" this fake already reports
+    /// for that case, and this constructor proves it does so without any
+    /// special-casing.
+    ///
+    /// `.with_native(NativeState::Exited)` scripts the app-server variant: "the
+    /// child is provably dead, but the turn's own status stays unresolved"
+    /// (`observe_appserver`'s `AmbiguousUnknown` arm, `codex.rs:4603-4612`) —
+    /// same signal, different native evidence, the exact axis `with_native`
+    /// already separates. The bare constructor's `NativeState::Unknown` matches
+    /// exec's own arm instead (`observe_in_memory`'s `AmbiguousUnknown` arm,
+    /// `codex.rs:4710-4721`).
+    pub fn never_arrives() -> Self {
+        Self::running(BackendSignal::Running).with_native(NativeState::Unknown)
     }
 
     /// Override the native evidence, leaving the signal alone. This is how a
@@ -250,6 +288,14 @@ impl FakeStep {
     /// method exists so a test can stand between "a turn was spawned" and
     /// "the turn finished" for a turn that *does* finish, the interval the
     /// fake had no way to model before.
+    ///
+    /// R-H0-7 (2026-08-22): this is also the shape the codex research measured
+    /// directly — JSONL turns resolve over real seconds on both transports,
+    /// and the app-server's own `item/started` notification arrives strictly
+    /// before `item/completed` (H0 §B, `[live-probe]` `[daemon]`). No new
+    /// mechanism was needed for this shape; `settle`/`settle_as` already model
+    /// it, which is why this wave's own contribution is the test in
+    /// `tests/m3_execution.rs`, not a new method.
     pub fn settle(mut self, k: u32) -> Self {
         self.settle = k;
         self
@@ -275,6 +321,19 @@ impl FakeStep {
         self
     }
 
+    /// Scripts §1.3's shape: INTERRUPT resolves the pending signal (same
+    /// discard rule as an unconfirmed interrupt — a `StageCompleted`/
+    /// `Failed` not yet reached is still lost, not delivered late) but does
+    /// **not** flip `native` to `Exited`. The distinguishing fact a test
+    /// gets to assert on is exactly the one the real adapter carries only
+    /// in `OBSERVE`'s evidence string (`codex.rs:4543-4550` vs
+    /// `4560-4584`): here it is structural (`native` itself), because the
+    /// fake's whole value is making a prose-only distinction assertable.
+    pub fn interrupts_natively(mut self) -> Self {
+        self.interrupt_confirmed = true;
+        self
+    }
+
     fn running(signal: BackendSignal) -> Self {
         Self {
             native: NativeState::Running,
@@ -283,6 +342,7 @@ impl FakeStep {
             settle: 0,
             interim_native: NativeState::Running,
             interim_signal: BackendSignal::Running,
+            interrupt_confirmed: false,
         }
     }
 }
@@ -354,6 +414,17 @@ impl Gate {
     }
 }
 
+/// R-H0-7 (2026-08-22): one item delivered to an execution, and whether it
+/// arrived through SEND (`queued: false`) or was enqueued out of band
+/// (`queued: true`, see [`FakeBackend::queue_input`]) — the one fact that
+/// actually differs about a queued item, per the codex measurement: it is
+/// answered in the same turn as the next real SEND, not a turn of its own.
+#[derive(Debug, Clone)]
+struct QueuedInput {
+    text: String,
+    queued: bool,
+}
+
 #[derive(Debug)]
 struct FakeExecution {
     /// The backend's own name for the native context. §25's restart sequence
@@ -361,7 +432,7 @@ struct FakeExecution {
     /// name *this* one — see [`FakeBackend::resolve`].
     native_id: String,
     step: FakeStep,
-    inputs: Vec<String>,
+    inputs: Vec<QueuedInput>,
     stopped: bool,
     /// R-MVP1-8: OBSERVEs remaining that must report `Running` before
     /// `step`'s own native/signal become visible. Set from `step.settle`
@@ -369,6 +440,11 @@ struct FakeExecution {
     /// left untouched by the out-of-band restart/ask mutators, which are
     /// not spawn events.
     settle_remaining: u32,
+    /// R-H0-7 (2026-08-22): set by `interrupt()` when the step it interrupted
+    /// was `.interrupts_natively()`-scripted — read only by `observe()`'s
+    /// evidence string, never by `native`/`signal` themselves, which already
+    /// carry the real distinction structurally.
+    confirmed_interrupted: bool,
 }
 
 #[derive(Debug)]
@@ -660,8 +736,27 @@ impl FakeBackend {
         self.lock()
             .executions
             .get(execution_id)
-            .map(|e| e.inputs.clone())
+            .map(|e| e.inputs.iter().map(|qi| qi.text.clone()).collect())
             .unwrap_or_default()
+    }
+
+    /// R-H0-7 (2026-08-22): enqueue `text` against `execution_id` **without**
+    /// driving a turn — the fake's stand-in for `codex queue --thread <id>
+    /// --message <text>` (H0 §B, `[sessions]`): durably attached to an idle
+    /// execution, and answered only once a real SEND actually advances it,
+    /// in the same turn that SEND's own input lands in. A no-op if the
+    /// execution is not known (matching `codex queue`'s own idle-thread
+    /// requirement being the caller's to satisfy, not this method's to
+    /// enforce — nothing here claims to validate turn state the way a real
+    /// harness would).
+    pub fn queue_input(&self, execution_id: &str, text: &str) {
+        let mut state = self.lock();
+        if let Some(execution) = state.executions.get_mut(execution_id) {
+            execution.inputs.push(QueuedInput {
+                text: text.to_string(),
+                queued: true,
+            });
+        }
     }
 
     /// Native evidence this backend would report for an execution, without
@@ -861,6 +956,7 @@ impl Backend for FakeBackend {
                 step,
                 inputs: Vec::new(),
                 stopped: false,
+                confirmed_interrupted: false,
             },
         );
         if let Some((remaining, detail)) = state.unavailable_after_launches.take() {
@@ -891,7 +987,10 @@ impl Backend for FakeBackend {
             .executions
             .get_mut(&handle.execution_id)
             .expect("presence checked above");
-        execution.inputs.push(input.to_string());
+        execution.inputs.push(QueuedInput {
+            text: input.to_string(),
+            queued: false,
+        });
         execution.step = step;
         execution.settle_remaining = execution.step.settle;
         Ok(())
@@ -928,14 +1027,18 @@ impl Backend for FakeBackend {
         } else {
             (execution.step.native, execution.step.signal.clone())
         };
+        let mut evidence = format!(
+            "fake backend: native={}, stopped={}",
+            native.as_str(),
+            execution.stopped
+        );
+        if execution.confirmed_interrupted {
+            evidence.push_str("; interrupt: harness-confirmed (native context alive)");
+        }
         Ok(Observation {
             native,
             signal,
-            evidence: Some(format!(
-                "fake backend: native={}, stopped={}",
-                native.as_str(),
-                execution.stopped
-            )),
+            evidence: Some(evidence),
         })
     }
 
@@ -968,7 +1071,12 @@ impl Backend for FakeBackend {
             .get_mut(&handle.execution_id)
             .expect("presence checked above");
         if !execution.step.ignores_stop {
-            execution.step.native = NativeState::Exited;
+            if execution.step.interrupt_confirmed {
+                // R-H0-7: confirmed — nothing was killed, native stays as-is.
+                execution.confirmed_interrupted = true;
+            } else {
+                execution.step.native = NativeState::Exited;
+            }
             if execution.settle_remaining > 0
                 && matches!(
                     execution.step.signal,
@@ -1022,14 +1130,40 @@ impl Backend for FakeBackend {
     fn history(&self, handle: &ExecutionHandle) -> Result<Vec<NativeEvent>, BackendError> {
         let state = self.lock();
         let execution = self.resolve(&state, handle)?;
-        Ok(execution
+        let mut events: Vec<NativeEvent> = execution
             .inputs
             .iter()
-            .map(|input| NativeEvent {
-                kind: "conversation.user".to_string(),
-                payload: json!({"text": input}),
+            .map(|qi| {
+                let mut payload = json!({"text": qi.text});
+                if qi.queued {
+                    payload["queued"] = json!(true);
+                }
+                NativeEvent {
+                    kind: "conversation.user".to_string(),
+                    payload,
+                }
             })
-            .collect())
+            .collect();
+        // R-H0-7 (2026-08-22): the assistant's own completion text, exactly as
+        // a real adapter's `agent_message`/`agentMessage` narrates it — and,
+        // deliberately, the *only* thing that ever produces a `tool.*`-shaped
+        // event out of this backend is nothing at all: there is no branch here,
+        // or anywhere in this module, that reads narration text as evidence of
+        // a tool having run. A test scripting a narration that *claims* a tool
+        // effect (`complete_with("ran pytest, 42 passed")`) and asserting zero
+        // `tool.*` kinds in the returned Vec is this wave's expression of the
+        // hazard `codex.rs`'s decoder was written to survive — pinned here as
+        // an assertable structural fact instead of an unwritten one.
+        if let BackendSignal::StageCompleted {
+            summary: Some(text),
+        } = &execution.step.signal
+        {
+            events.push(NativeEvent {
+                kind: "conversation.assistant.completed".to_string(),
+                payload: json!({"text": text}),
+            });
+        }
+        Ok(events)
     }
 
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
@@ -1367,6 +1501,176 @@ mod tests {
                 summary: Some("done".to_string())
             },
             "the real outcome becomes visible once the window is spent"
+        );
+    }
+
+    /// R-H0-7 shape 2: a turn whose own harness never marks it concluded
+    /// reports the same ambiguous shape (`Unknown`/`Running`) forever — not
+    /// for a settle window that eventually resolves, but as the step's own
+    /// honest, permanent report — and, unlike [`FakeStep::hang`], does not
+    /// ignore an attempted interrupt: the engine's kill-and-give-up path
+    /// lands on `Exited`/`Running`, `InterruptedRunning`'s own shape, from
+    /// the very next OBSERVE onward.
+    #[test]
+    fn never_arrives_reports_the_ambiguous_shape_forever_and_survives_an_attempted_interrupt() {
+        let fake = FakeBackend::scripted("fake", [FakeStep::never_arrives()]);
+        let handle = fake.start(&request("stuck")).expect("start");
+
+        for tick in 0..10 {
+            let observed = fake.observe(&handle).expect("observe");
+            assert_eq!(
+                observed.native,
+                NativeState::Unknown,
+                "tick {tick}: nothing ever resolves this shape on its own"
+            );
+            assert_eq!(
+                observed.signal,
+                BackendSignal::Running,
+                "tick {tick}: not a settle window — there is no real outcome behind it"
+            );
+        }
+
+        fake.interrupt(&handle).expect("interrupt").wait();
+
+        for tick in 0..3 {
+            let observed = fake.observe(&handle).expect("observe");
+            assert_eq!(
+                observed.native,
+                NativeState::Exited,
+                "tick {tick}: the engine's own kill-and-give-up path lands on the \
+                 same honest arm this fake already has a name for"
+            );
+            assert_eq!(observed.signal, BackendSignal::Running);
+        }
+    }
+
+    /// R-H0-7 shape 3: a harness-confirmed interrupt kills nothing — the
+    /// native context stays alive, distinct in the evidence string from the
+    /// process-tree kill every other interrupt reports — and the
+    /// conversation is still resumable afterward, exactly as the live
+    /// admission test (W3's `live_appserver_interrupt_yields_an_interrupted_
+    /// terminal`) proves for the real adapter.
+    #[test]
+    fn a_confirmed_interrupt_leaves_the_native_context_alive_and_the_conversation_resumable() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [
+                FakeStep::complete_with("draft").interrupts_natively(),
+                FakeStep::complete_with("revised"),
+            ],
+        );
+        let handle = fake.start(&request("confirmed")).expect("start");
+
+        fake.interrupt(&handle).expect("interrupt").wait();
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(
+            observed.native,
+            NativeState::Running,
+            "a harness-confirmed interrupt kills nothing"
+        );
+        assert_eq!(
+            observed.evidence.as_deref(),
+            Some(
+                "fake backend: native=running, stopped=false; interrupt: \
+                 harness-confirmed (native context alive)"
+            ),
+            "the confirmation is named in the evidence, not just implied by native"
+        );
+
+        // The conversation is resumable: a follow-up send succeeds and
+        // produces a fresh completion, the resumability a harness-confirmed
+        // interrupt (nothing killed) is supposed to leave intact.
+        fake.send(&handle, "keep going")
+            .expect("a confirmed interrupt must leave the turn resumable");
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(
+            observed.signal,
+            BackendSignal::StageCompleted {
+                summary: Some("revised".to_string())
+            }
+        );
+    }
+
+    /// R-H0-7 shape 4: an item enqueued out of band before any live SEND is
+    /// answered in the *next* turn the caller actually sends, not a turn of
+    /// its own — `history()` shows both, in enqueue order, with `queued:
+    /// true` only on the out-of-band one — and exactly one step advance
+    /// happens for the one live `send()` call, proven by landing on the
+    /// second scripted step's own signal rather than a third, distinguishing
+    /// step that would only be reached had the queued item spent a FIFO draw
+    /// of its own.
+    #[test]
+    fn a_queued_input_is_answered_in_the_next_turn_the_caller_actually_sent_not_its_own() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [
+                FakeStep::needs_input("first"),
+                FakeStep::fail("exactly one advance"),
+                FakeStep::fail("must never be reached"),
+            ],
+        );
+        let handle = fake.start(&request("q1")).expect("start");
+
+        fake.queue_input("q1", "also answer this");
+        fake.send(&handle, "the live message").expect("send");
+
+        assert_eq!(
+            fake.history(&handle).expect("history"),
+            vec![
+                NativeEvent {
+                    kind: "conversation.user".to_string(),
+                    payload: json!({"text": "also answer this", "queued": true}),
+                },
+                NativeEvent {
+                    kind: "conversation.user".to_string(),
+                    payload: json!({"text": "the live message"}),
+                },
+            ],
+            "the queued item and the live send land in the same resumed turn, \
+             in enqueue order, with the existing unqueued shape unchanged"
+        );
+        assert_eq!(
+            fake.observe(&handle).expect("observe").signal,
+            BackendSignal::Failed {
+                reason: "exactly one advance".to_string()
+            },
+            "the one live send must draw exactly the next scripted step — not \
+             the one after it, which only a second, unearned FIFO advance \
+             could reach"
+        );
+    }
+
+    /// R-H0-7 shape 5: narration text alone — a `StageCompleted` summary with
+    /// no corroborating tool evidence — produces the assistant's own
+    /// completion event and never a `tool.*`-shaped one, because nothing in
+    /// this module reads narration text as evidence of a tool having run.
+    /// The second assertion is trivially true today by construction, not by
+    /// a runtime check that could be gamed; its value is making the
+    /// invariant nameable and re-runnable, matching `codex.rs`'s own
+    /// `narration_produces_no_tool_events` one layer down.
+    #[test]
+    fn uncorroborated_narration_produces_an_assistant_event_and_never_a_tool_event() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [FakeStep::complete_with(
+                "ran the migration and it succeeded",
+            )],
+        );
+        let handle = fake.start(&request("narrates")).expect("start");
+
+        let history = fake.history(&handle).expect("history");
+        assert_eq!(
+            history,
+            vec![NativeEvent {
+                kind: "conversation.assistant.completed".to_string(),
+                payload: json!({"text": "ran the migration and it succeeded"}),
+            }],
+            "the narration surfaces as the assistant's own completion event"
+        );
+        assert!(
+            !history.iter().any(|e| e.kind.starts_with("tool.")),
+            "nothing in this backend can produce a tool.* event from narration \
+             text alone: {history:?}"
         );
     }
 
