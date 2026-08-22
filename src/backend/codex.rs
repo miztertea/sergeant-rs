@@ -843,7 +843,17 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         transport: Transport::AppServer,
         claimed: true,
         tier: "NativeOsSandbox(workspace-write)",
-        evidence: Evidence::LocallyMeasured,
+        // `LiveMeasured`, because what this row's note claims -- that the
+        // harness *accepts and echoes* the requested policy -- is a fact
+        // about the installed binary, and only the `#[ignore]`d,
+        // SERGEANT_CODEX_TESTS-gated test named below can establish it. The
+        // deterministic sibling (`appserver_thread_start_names_exactly_the_
+        // works_surfaces`) proves what this adapter *sends*, which is a
+        // different claim and not the one written here.
+        // `a_claimed_row_naming_a_live_test_is_labelled_live_measured` is the
+        // structural check that keeps the label and the citation from
+        // drifting apart again.
+        evidence: Evidence::LiveMeasured,
         stability: Stability::Experimental,
         admission_test: "live_appserver_thread_start_echoes_the_requested_policy",
         note: "thread-scoped, holds for every turn (unlike exec's turn-1-only lapse) -- the \
@@ -5067,6 +5077,37 @@ mod tests {
                     assert!(!row.admission_test.is_empty());
                 }
             }
+        }
+    }
+
+    /// [`Evidence`]'s own definitions are the contract: `LiveMeasured` means
+    /// "driven against the real, installed harness (a `#[ignore]`d live test,
+    /// gated behind SERGEANT_CODEX_TESTS=1)" and `LocallyMeasured` means
+    /// "without a live run". This suite's naming convention makes that
+    /// checkable: every live test in `tests/codex_backend.rs` is named
+    /// `live_*` and nothing else is. So a `claimed: true` row is only
+    /// internally consistent if the two agree.
+    ///
+    /// Scoped to `claimed: true` deliberately. A `claimed: false` row may
+    /// honestly cite a live test under a *different* tier — `ask` on
+    /// app-server names `live_appserver_actor_authored_question_is_typed`
+    /// while staying `Unmeasured`, because that probe measures model
+    /// behaviour, not the capability, and the row says so.
+    #[test]
+    fn a_claimed_row_naming_a_live_test_is_labelled_live_measured() {
+        for row in ADMISSION_ROWS.iter().filter(|row| row.claimed) {
+            let names_live_test = row.admission_test.starts_with("live_");
+            assert_eq!(
+                names_live_test,
+                row.evidence == Evidence::LiveMeasured,
+                "{} on {:?}: evidence {:?} disagrees with its admission test {:?} -- \
+                 LiveMeasured is exactly the tier a live_* test establishes, and the only \
+                 tier it establishes",
+                row.capability,
+                row.transport,
+                row.evidence,
+                row.admission_test,
+            );
         }
     }
 
