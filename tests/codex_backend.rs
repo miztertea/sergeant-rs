@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use sergeant_rs::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
+use sergeant_rs::backend::codex::{
+    Budgets, CODEX_BACKEND_NAME, CodexBackend, CodexConfig, TransportChoice,
+};
 use sergeant_rs::backend::{
     Backend, BackendError, BindingSummary, ExecutionHandle, NativeState, ProbeReport,
     ResumeRequest, StartRequest,
@@ -138,6 +140,35 @@ struct StubCodex {
     grandchild: PathBuf,
     grandchild_pid: PathBuf,
     detach: PathBuf,
+    /// W3: a marker file whose presence turns on this stub's `app-server`
+    /// subcommand emulation (`--help` offering `stdio://`, a minimal
+    /// `generate-json-schema` dump, and a bare `initialize`-only responder
+    /// on `--listen stdio://`). Absent by default, so every W1/W2 exec-only
+    /// test's stub fails G1 fast and Auto resolves to exec with no spawn of
+    /// anything that could hang or pollute this stub's shared launches
+    /// record — `supports_appserver()` is the opt-in for the tests that
+    /// need the opposite.
+    appserver_supported: PathBuf,
+    /// W3 §6.2's fourth `StubCodex` mode: every request line the `--listen
+    /// stdio://` handler reads is appended here verbatim, so a test can
+    /// assert on exactly what this adapter sent (`appserver_requests`).
+    appserver_requests: PathBuf,
+    /// W3 §6.2's "scripted reply table": a directory of `<method_with_
+    /// underscores>.jsonl` files, one per method a test wants answered
+    /// beyond the built-in bare `initialize` responder. Each line is emitted
+    /// verbatim except `__ID__`, substituted with the incoming request's own
+    /// id (`appserver_scripts_reply`); a sibling `<file>.exit_after` marker
+    /// makes the stub close its stdout right after replying (deterministic
+    /// child death mid-turn, or the aftermath of an RPC-failure fallback —
+    /// `appserver_exits_after`).
+    appserver_scripts_dir: PathBuf,
+}
+
+/// The filename stem the stub's own shell script computes for one JSON-RPC
+/// method (`tr '/' '_'`) — kept as one function so the Rust side that writes
+/// a scripted reply and the shell side that looks it up can never drift.
+fn appserver_script_stem(method: &str) -> String {
+    method.replace('/', "_")
 }
 
 #[derive(Debug, Default)]
@@ -173,12 +204,80 @@ impl StubCodex {
         let grandchild = dir.join("codex-grandchild");
         let grandchild_pid = dir.join("codex-grandchild-pid");
         let detach = dir.join("codex-grandchild-detach");
+        let appserver_supported = dir.join("codex-appserver-supported");
+        let appserver_requests = dir.join("codex-appserver-requests.jsonl");
+        let appserver_scripts_dir = dir.join("codex-appserver-scripts");
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
              if [ \"$1\" = \"login\" ] && [ \"$2\" = \"status\" ]; then echo \"{auth_line}\"; exit 0; fi\n\
              if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then printf '%s\\n' \"{exec_help}\"; exit 0; fi\n\
              if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"resume\" ] && [ \"$3\" = \"--help\" ]; then printf '%s\\n' \"{resume_help}\"; exit 0; fi\n\
+             \
+             if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then\n  \
+               if [ -f \"{appserver_supported}\" ]; then\n    \
+                 printf 'Usage: codex app-server\\n      --listen <URL>\\n          Supported: stdio:// (default)\\n'\n  \
+               else\n    \
+                 printf 'Usage: codex app-server\\n      --listen <URL>\\n          Supported: ws://IP:PORT only on this stub build\\n'\n  \
+               fi\n  \
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"generate-json-schema\" ]; then\n  \
+               if [ -f \"{appserver_supported}\" ]; then\n    \
+                 outdir=\"$4\"\n    \
+                 mkdir -p \"$outdir/v1\" \"$outdir/v2\"\n    \
+                 for f in v1/InitializeParams.json v1/InitializeResponse.json \
+                 v2/ThreadStartParams.json v2/ThreadStartResponse.json v2/TurnStartParams.json \
+                 v2/TurnStartResponse.json v2/TurnInterruptParams.json \
+                 v2/TurnCompletedNotification.json v2/TurnStartedNotification.json \
+                 v2/ItemStartedNotification.json v2/ItemCompletedNotification.json \
+                 v2/ThreadTokenUsageUpdatedNotification.json ToolRequestUserInputParams.json \
+                 ServerRequest.json; do\n      \
+                   echo '{{\"stub\":true}}' > \"$outdir/$f\"\n    \
+                 done\n    \
+                 exit 0\n  \
+               else\n    \
+                 exit 1\n  \
+               fi\n\
+             fi\n\
+             if [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--listen\" ]; then\n  \
+               if [ -f \"{appserver_supported}\" ]; then\n    \
+                 if [ -f \"{stderr}\" ]; then cat \"{stderr}\" >&2; fi\n    \
+                 while IFS= read -r line; do\n      \
+                   printf '%s\\n' \"$line\" >> \"{appserver_requests}\"\n      \
+                   method=$(printf '%s' \"$line\" | sed -n 's/.*\"method\":\"\\([^\"]*\\)\".*/\\1/p')\n      \
+                   id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n      \
+                   if [ \"$method\" = \"initialize\" ]; then\n        \
+                     printf '%s\\n' '{{\"id\":__ID__,\"result\":{{\"userAgent\":\"stub/0.0.0\",\
+\"codexHome\":\"/stub\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}}}' \
+| sed \"s/__ID__/$id/\"\n      \
+                   else\n        \
+                     safe=$(printf '%s' \"$method\" | tr '/' '_')\n        \
+                     script_file=\"{appserver_scripts_dir}/$safe.jsonl\"\n        \
+                     if [ -f \"$script_file.exit_before\" ]; then\n          \
+                       seen=0\n          \
+                       if [ -f \"$script_file.count\" ]; then seen=$(cat \"$script_file.count\"); fi\n          \
+                       seen=$((seen+1))\n          \
+                       echo \"$seen\" > \"$script_file.count\"\n          \
+                       if [ \"$seen\" -ge \"$(cat \"$script_file.exit_before\")\" ]; then exit 0; fi\n        \
+                     fi\n        \
+                     if [ -f \"$script_file\" ]; then\n          \
+                       while IFS= read -r out; do\n            \
+                         printf '%s\\n' \"$out\" | sed \"s/__ID__/$id/g\"\n          \
+                       done < \"$script_file\"\n        \
+                     fi\n        \
+                     if [ -f \"$script_file.exit_after\" ]; then\n          \
+                       if [ -f \"$script_file.exit_code\" ]; then \
+exit \"$(cat \"$script_file.exit_code\")\"; fi\n          \
+                       exit 0\n        \
+                     fi\n      \
+                   fi\n    \
+                 done\n    \
+                 exit 0\n  \
+               else\n    \
+                 exit 1\n  \
+               fi\n\
+             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n\
              printf 'env CODEX_HOME=%s\\n' \"${{CODEX_HOME:-<unset>}}\";\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
@@ -217,6 +316,9 @@ impl StubCodex {
             detach = detach.display(),
             hang = hang.display(),
             exit_code = exit_code.display(),
+            appserver_supported = appserver_supported.display(),
+            appserver_requests = appserver_requests.display(),
+            appserver_scripts_dir = appserver_scripts_dir.display(),
         );
         std::fs::write(&path, script).expect("write stub");
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
@@ -235,6 +337,9 @@ impl StubCodex {
             grandchild,
             grandchild_pid,
             detach,
+            appserver_supported,
+            appserver_requests,
+            appserver_scripts_dir,
         }
     }
 
@@ -276,6 +381,98 @@ impl StubCodex {
     fn exits_with(&self, code: i32) -> &Self {
         std::fs::write(&self.exit_code, code.to_string()).expect("write exit code");
         self
+    }
+
+    /// Turn on this stub's `app-server` subcommand emulation (W3 §6.2's
+    /// fourth `StubCodex` mode): `app-server --help` offers `stdio://`,
+    /// `generate-json-schema` writes the 14 pinned files (stub content —
+    /// this is what makes G2's file-presence check pass, never a claim the
+    /// bytes are real schemas), and `--listen stdio://` answers a bare
+    /// `initialize` request out of the box. Every other method
+    /// (`thread/start`/`turn/start`/`turn/interrupt`/…) is answered only if
+    /// a test scripts a reply for it (`appserver_scripts_reply`) — the
+    /// process-bound half of the protocol suite (§6.2: "spawn, handshake
+    /// timing, budgets, interrupt, process-group kill, stderr drain, child
+    /// death mid-turn") is this stub's scope; the live suite remains this
+    /// wave's proof of the real harness's own behaviour.
+    fn supports_appserver(&self) -> &Self {
+        std::fs::write(&self.appserver_supported, b"go\n").expect("write appserver marker");
+        self
+    }
+
+    /// W3 §6.2's "scripted reply table": write the literal output lines this
+    /// stub's `--listen stdio://` handler emits the moment it reads a
+    /// request whose `"method"` is exactly `method` — one block per method,
+    /// a generic table the dispatch loop consults by filename, never a
+    /// per-method special case hardcoded into the stub itself. `__ID__` in
+    /// any line is replaced with the request's own numeric id at emission
+    /// time, so a canned reply can echo whichever id this run's client
+    /// happened to mint.
+    fn appserver_scripts_reply(&self, method: &str, lines: &[&str]) -> &Self {
+        std::fs::create_dir_all(&self.appserver_scripts_dir).expect("scripts dir");
+        let path = self
+            .appserver_scripts_dir
+            .join(format!("{}.jsonl", appserver_script_stem(method)));
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write scripted reply");
+        self
+    }
+
+    /// Mark this stub to close its stdout (the adapter reader thread's own
+    /// EOF) immediately after it finishes answering one request for
+    /// `method` — deterministic child death mid-turn (test 21) and the
+    /// aftermath of an interrupt-RPC-failure fallback (test 22), neither of
+    /// which should be a race against a real process's own timing.
+    fn appserver_exits_after(&self, method: &str) -> &Self {
+        std::fs::create_dir_all(&self.appserver_scripts_dir).expect("scripts dir");
+        let marker = self.appserver_scripts_dir.join(format!(
+            "{}.jsonl.exit_after",
+            appserver_script_stem(method)
+        ));
+        std::fs::write(&marker, b"go\n").expect("write exit-after marker");
+        self
+    }
+
+    /// [`Self::appserver_exits_after`], with a chosen exit status rather than
+    /// a clean `0` — the evidence an ambiguous terminal must be able to name
+    /// (a child that died *with* a status, not merely "a child that is
+    /// gone").
+    fn appserver_exits_after_with_code(&self, method: &str, code: i32) -> &Self {
+        self.appserver_exits_after(method);
+        let marker = self
+            .appserver_scripts_dir
+            .join(format!("{}.jsonl.exit_code", appserver_script_stem(method)));
+        std::fs::write(&marker, code.to_string()).expect("write exit-code marker");
+        self
+    }
+
+    /// Mark this stub to close its stdout on the `nth` request for `method`
+    /// (1-based, and from then on) **before** emitting that method's scripted
+    /// reply — the sibling of [`Self::appserver_exits_after`] for the case it
+    /// cannot express: a child that dies with a request already in flight, so
+    /// the adapter's own `call` is left waiting for a response nobody will
+    /// ever write. The count is what lets one script serve a turn that must
+    /// succeed and a later turn that must die.
+    fn appserver_exits_before(&self, method: &str, nth: u32) -> &Self {
+        std::fs::create_dir_all(&self.appserver_scripts_dir).expect("scripts dir");
+        let marker = self.appserver_scripts_dir.join(format!(
+            "{}.jsonl.exit_before",
+            appserver_script_stem(method)
+        ));
+        std::fs::write(&marker, nth.to_string()).expect("write exit-before marker");
+        self
+    }
+
+    /// Every request line this stub's `--listen stdio://` handler has read
+    /// so far, parsed as JSON, in arrival order — the captured wire evidence
+    /// a deterministic test asserts on (§3.6 test 4: "the captured
+    /// `thread/start` params").
+    fn appserver_requests(&self) -> Vec<Value> {
+        std::fs::read_to_string(&self.appserver_requests)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("captured request line is valid JSON"))
+            .collect()
     }
 
     /// Marks the stub to fork a background grandchild (a detached loop, not
@@ -617,6 +814,108 @@ fn the_probe_reads_auth_from_stderr_when_stdout_is_empty() {
             .expect("detail")
             .contains("auth: logged in using ChatGPT"),
         "the probe must recover the auth line from stderr"
+    );
+}
+
+// ---------------------------------------------------- W3 §5.2: transport gates
+
+/// A stub with no `.supports_appserver()` marker fails G1 (its `app-server
+/// --help` never offers `stdio://`) — `Auto` must fall back to exec, and
+/// `probe()` must still be `available: true` (a gate failure changes which
+/// transport, never whether the backend works at all).
+#[test]
+fn appserver_gate_failure_falls_back_to_exec_under_auto() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let report = backend.probe();
+    assert!(report.available);
+    let detail = report.detail.expect("detail");
+    assert!(
+        detail.contains("transport: exec"),
+        "Auto must resolve to exec when the app-server gate fails: {detail}"
+    );
+    assert!(
+        detail.contains("app-server gate failed"),
+        "the failed gate must be named, not silently absorbed: {detail}"
+    );
+}
+
+/// `AppServerOnly` + a failed gate is the one place §5.2 refuses outright
+/// (rule 2): the operator asked for exactly this transport, and silently
+/// handing them exec — a different capability row — is the dishonesty the
+/// rule exists to prevent.
+#[test]
+fn appserver_only_refuses_when_a_gate_fails() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(
+        !report.available,
+        "AppServerOnly with a failed gate must refuse, not fall back"
+    );
+    let detail = report.detail.expect("detail");
+    assert!(detail.contains("AppServerOnly"), "{detail}");
+    assert!(
+        detail.contains("G1"),
+        "the failed gate must be named: {detail}"
+    );
+}
+
+/// The opposite: a stub that *does* emulate the app-server subcommands
+/// (`.supports_appserver()`) passes G1/G2/G4, so `Auto` resolves to
+/// app-server — and the resolution is memoized (§5.3: never revisited per
+/// execution), which this proves by calling `probe()` twice and getting the
+/// identical resolved transport both times.
+#[test]
+fn transport_is_resolved_once_and_journaled() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let first = backend.probe();
+    let second = backend.probe();
+    assert!(first.available);
+    assert_eq!(first.detail, second.detail, "resolution must be memoized");
+    let detail = first.detail.expect("detail");
+    assert!(
+        detail.contains("transport: app-server (stdio) (Auto)"),
+        "a stub that passes every gate must resolve Auto to app-server: {detail}"
+    );
+    assert!(
+        detail.contains("protocol: fresh") || detail.contains("protocol: stale"),
+        "{detail}"
+    );
+}
+
+/// `ExecOnly` always resolves to exec, even when a stub would otherwise
+/// pass every app-server gate — the operator's own configured choice wins
+/// unconditionally (§5.2 rule 1).
+#[test]
+fn transport_choice_exec_only_never_touches_the_appserver_gates() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::ExecOnly;
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(report.available);
+    let detail = report.detail.expect("detail");
+    assert!(
+        detail.contains("transport: exec (ExecOnly configured)"),
+        "{detail}"
     );
 }
 
@@ -1499,6 +1798,892 @@ fn codex_never_reports_an_actor_authored_question_end_to_end() {
     );
 }
 
+// ------------------------------------------- W3 §6.2: app-server, stub-driven
+
+/// A `thread/start` + `turn/start` scripted reply pair good enough to make
+/// LAUNCH succeed on the app-server transport with no real `codex` binary —
+/// the shared setup every test below builds on.
+fn script_appserver_launch(stub: &StubCodex) {
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#],
+    );
+}
+
+/// An app-server backend on `stub`, with budgets short enough that a test
+/// which *must* out-wait one of them does not out-wait the reader itself.
+/// Every fix below turns a budget expiry into an immediate, evidenced
+/// failure, so a passing run never spends these; a regressed one spends
+/// `turn_start` exactly once.
+fn appserver_backend(stub: &StubCodex, dir: &Path) -> CodexBackend {
+    let mut config = config_for(stub, dir, &dir.join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    config.appserver_budgets = Some(Budgets {
+        handshake: Duration::from_secs(10),
+        thread_start: Duration::from_secs(10),
+        turn_start: Duration::from_secs(5),
+        interrupt: Duration::from_secs(5),
+        stderr_drain: Duration::from_secs(2),
+    });
+    CodexBackend::new(config)
+}
+
+/// Poll OBSERVE until `ready` accepts what it sees, then return it.
+fn wait_for_observation(
+    backend: &CodexBackend,
+    handle: &ExecutionHandle,
+    what: &str,
+    ready: impl Fn(&sergeant_rs::backend::Observation) -> bool,
+) -> sergeant_rs::backend::Observation {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let observation = backend.observe(handle).expect("observe");
+        if ready(&observation) {
+            return observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: never observed; last evidence was {:?} (native {:?}, signal {:?})",
+            observation.evidence,
+            observation.native,
+            observation.signal,
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Every event of `kind` captured so far.
+fn events_of_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> Vec<EventDraft> {
+    events
+        .lock()
+        .expect("event capture lock")
+        .iter()
+        .filter(|e| e.kind == kind)
+        .cloned()
+        .collect()
+}
+
+/// Wait for one event of `kind` that `matches` accepts.
+fn wait_for_event(
+    events: &Arc<Mutex<Vec<EventDraft>>>,
+    kind: &str,
+    what: &str,
+    matches: impl Fn(&EventDraft) -> bool,
+) -> EventDraft {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = events_of_kind(events, kind).into_iter().find(&matches) {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: no matching {kind} event arrived; saw {:?}",
+            events_of_kind(events, kind)
+                .iter()
+                .map(|e| e.payload.clone())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// §3.6 test 4: the captured `thread/start` params carry exactly `cwd`,
+/// `sandbox`, `approvalPolicy`, and `runtimeWorkspaceRoots` naming cwd plus
+/// the one binding outside it — never the inside-cwd binding (already
+/// covered by cwd), never anything fabricated.
+#[test]
+fn appserver_thread_start_names_exactly_the_works_surfaces() {
+    let dir = TempDir::new().expect("tempdir");
+    let outside = TempDir::new().expect("tempdir outside");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let mut request = start_request(dir.path());
+    request.bindings = vec![
+        BindingSummary {
+            repository: "inside".to_string(),
+            worktree_path: dir.path().join("inside-binding"),
+            work_branch: "b1".to_string(),
+            base_branch: None,
+            base_sha: "0".repeat(40),
+        },
+        BindingSummary {
+            repository: "outside".to_string(),
+            worktree_path: outside.path().to_path_buf(),
+            work_branch: "b2".to_string(),
+            base_branch: None,
+            base_sha: "0".repeat(40),
+        },
+    ];
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let requests = stub.appserver_requests();
+    let thread_start = requests
+        .iter()
+        .find(|r| r["method"] == "thread/start")
+        .expect("thread/start was sent");
+    let params = &thread_start["params"];
+    assert_eq!(params["cwd"], dir.path().to_string_lossy().as_ref());
+    assert_eq!(params["sandbox"], "workspace-write");
+    assert_eq!(params["approvalPolicy"], "never");
+    let roots: Vec<String> = params["runtimeWorkspaceRoots"]
+        .as_array()
+        .expect("runtimeWorkspaceRoots is an array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        roots,
+        vec![
+            dir.path().to_string_lossy().to_string(),
+            outside.path().to_string_lossy().to_string(),
+        ],
+        "exactly cwd + the one outside binding, nothing else -- not the inside binding \
+         (already covered by cwd), not the estate root, not repos/"
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// Test 21: a child that dies mid-turn (closes its stdout with no
+/// `turn/completed` ever sent) must resolve to a terminal, fail-closed
+/// `AmbiguousUnknown` observation — never leave the turn `InFlight` forever
+/// (§3.4 point 3 / §15's invariant).
+///
+/// `native` is `Exited`, not `Unknown`: this observation reaped the child and
+/// holds its status, and `NativeState::Unknown`'s own definition is "the
+/// backend cannot tell". What fails closed here is the *signal* — `Running`,
+/// never a stage verdict — which is the guarantee §5.2 actually asks for.
+#[test]
+fn appserver_child_death_mid_turn_is_ambiguous_not_completed() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_exits_after("turn/start");
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn never resolved out of InFlight after the child's stdout closed",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("no turn/completed observed"))
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (fail-closed, no stage verdict), got {other:?}"),
+    }
+    assert_eq!(
+        observation.native,
+        NativeState::Exited,
+        "the child was reaped by this very observation; reporting Unknown over the top of \
+         that proof is the adapter lying about what it can see"
+    );
+}
+
+/// Finding 2: the fail-closed routes owe the journal the same
+/// `conversation.turn.ended` the happy path emits — exec's own finalizer
+/// states the invariant ("every turn ends with this event, however it
+/// ended"), and a turn that died mid-flight used to end with a bare
+/// `harness_error` and nothing else, throwing away the item tallies the
+/// accumulator was holding at the moment it was settled.
+#[test]
+fn appserver_child_death_mid_turn_still_journals_turn_ended() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // One completed item, then the child dies with no terminal: the tallies
+    // below are exactly what the settlement was holding.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i1","type":"agentMessage","text":"half a thought"}}}"#,
+        ],
+    );
+    stub.appserver_exits_after("turn/start");
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let ended = wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "a turn that died mid-flight must still end with conversation.turn.ended",
+        |_| true,
+    );
+    assert_eq!(
+        ended.payload["outcome"], "ambiguous_unknown",
+        "the ambiguous outcome is the fact this event exists to carry: {:?}",
+        ended.payload
+    );
+    assert_eq!(ended.payload["interrupted"], false);
+    assert_eq!(
+        ended.payload["message_items"], 1,
+        "the item the accumulator had already decoded travels with the settlement, not \
+         into the bin: {:?}",
+        ended.payload
+    );
+    // The harness_error is *additional* evidence, never a substitute.
+    wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the child-death harness_error still lands alongside it",
+        |e| e.payload["phase"] == "child_exited_mid_turn",
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// Finding 1: `turn/start`'s failure path used to be the one writer of the
+/// turn cell that was not guarded on what the cell currently held. A child
+/// that dies with `turn/start` in flight settles the turn from the reader
+/// thread (fail-closed, `AmbiguousUnknown`); the blind `= Idle` rollback then
+/// erased that settlement, and OBSERVE went back to reporting "has not run a
+/// turn yet" about a turn that had run, ended, and been journaled.
+///
+/// Both halves of the fix are pinned here: the failing `turn/start` reports
+/// the closed stream (it was drained on EOF, not left to expire its own
+/// budget), and the settled cell survives the rollback.
+#[test]
+fn appserver_a_failed_turn_start_never_clobbers_a_settled_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // Turn 1 answers and completes normally. Turn 2's `turn/start` is never
+    // answered at all: the child dies with the request in flight.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+        ],
+    );
+    stub.appserver_exits_before("turn/start", 2);
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    wait_for_observation(&backend, &handle, "turn 1 never completed", |observation| {
+        matches!(
+            observation.signal,
+            sergeant_rs::backend::BackendSignal::StageCompleted { .. }
+        )
+    });
+
+    let refusal = backend
+        .send(&handle, "second turn")
+        .expect_err("the child died before answering turn/start");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("the app-server child's output stream closed"),
+        "the pending request is drained the moment the stream ends, so the caller learns \
+         the child is gone instead of outliving its own budget; got: {refusal}"
+    );
+
+    // No polling: the EOF handler settles the turn *before* the pending
+    // senders are drained, so by the time `send` returned, the settlement is
+    // already installed. Anything else here is a clobber.
+    let observation = backend.observe(&handle).expect("observe");
+    let evidence = observation.evidence.clone().unwrap_or_default();
+    assert!(
+        evidence.contains("no turn/completed observed"),
+        "the fail-closed settlement of turn 2 must survive turn/start's rollback; got: \
+         {evidence}"
+    );
+    assert!(
+        !evidence.contains("has not run a turn yet"),
+        "the rollback clobbered a settled turn back to Idle: {evidence}"
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// Finding 4: the ambiguous terminal is the one outcome with no stream
+/// evidence of its own, so it must carry every scrap of process evidence the
+/// adapter holds — exit status, the last stream `error`, and the child's own
+/// stderr tail. Mirrors exec's own ambiguous arm, which has carried all three
+/// since W1.
+#[test]
+fn appserver_the_ambiguous_terminal_carries_exit_status_stderr_and_last_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.writes_stderr("codex: bwrap: No such file or directory\n");
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"error","params":{"message":"sandbox helper exited before the turn began"}}"#,
+        ],
+    );
+    stub.appserver_exits_after_with_code("turn/start", 7);
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    // The stderr drain is a second thread; poll until its tail has arrived
+    // rather than assuming it beat the reader to the finish line.
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the ambiguous terminal never carried the child's stderr",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("bwrap"))
+        },
+    );
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains("code=Some(7)"),
+        "the child's own exit status is the first thing to ask for and used to be \
+         discarded by the liveness peek; got: {evidence}"
+    );
+    assert!(
+        evidence.contains("sandbox helper exited before the turn began"),
+        "the last stream error is often the only statement of *why* no terminal came; \
+         got: {evidence}"
+    );
+}
+
+/// Finding 3, path 2, reached the way production reaches it: STOP. §5.7's own
+/// note — on app-server the turn's process and the execution's process are the
+/// same child, so STOP is `turn/interrupt` followed by sergeant killing that
+/// child itself. The harness accepts the interrupt and is then killed before
+/// it can send `turn/completed`, which is not a failed RPC and must not be
+/// reported as one.
+///
+/// No polling: STOP's completion joins the reader thread, so by the time
+/// `wait()` returns, the EOF that settles this turn has already been handled.
+#[test]
+fn appserver_the_routine_stop_settles_as_an_acknowledged_interrupt_cut_short() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.stop(&handle).expect("stop").wait();
+
+    let observation = backend.observe(&handle).expect("observe");
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
+    }
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt was acknowledged, but the child's stdout closed before \
+             turn/completed carried the harness's own verdict"
+        ),
+        "STOP's own interrupt was accepted by the harness; got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("RPC failed") && !evidence.contains("never answered it"),
+        "nothing about the routine STOP path failed or went unanswered; got: {evidence}"
+    );
+
+    // Finding 2 on this route too: the turn ended, so it ends with the event
+    // that says a turn ended.
+    let ended = wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "the turn STOP settled still ends with conversation.turn.ended",
+        |_| true,
+    );
+    assert_eq!(ended.payload["outcome"], "interrupted_running");
+    assert_eq!(ended.payload["interrupted"], true);
+}
+
+/// Finding 3, path 2 again, by the other route: INTERRUPT alone, with a child
+/// that answers and then dies of its own accord rather than being killed.
+/// `turn/interrupt` returned `Ok` — the harness accepted it — and the child's
+/// stdout then closed before `turn/completed` could carry the harness's own
+/// verdict. Same outcome as path 1, a different fact, and the arm used to
+/// claim path 1's sentence here too ("turn/interrupt's own RPC never confirmed
+/// it"), which is false of an RPC that returned `Ok`.
+#[test]
+fn appserver_an_interrupt_acknowledged_then_cut_off_says_so_and_nothing_more() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    stub.appserver_exits_after("turn/interrupt");
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn stayed InFlight after the acknowledged interrupt's stream closed",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt was acknowledged, but the child's stdout closed before \
+             turn/completed carried the harness's own verdict"
+        ),
+        "an acknowledged interrupt must not be reported as a failed RPC; got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("RPC failed"),
+        "nothing about this path failed; got: {evidence}"
+    );
+}
+
+/// Finding 5: notifications that arrive after a turn is already settled used
+/// to be dropped where they stood — including a genuine `turn/completed`
+/// buffered behind an earlier settlement. The settlement is still final (a
+/// turn is never re-settled), but the late lines are journaled: one immediate
+/// report for the terminal, one end-of-stream summary for the tally.
+#[test]
+fn appserver_a_terminal_arriving_after_settlement_is_journaled_never_resettled() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // One burst, read in order by the one reader thread: the turn settles on
+    // the first `turn/completed`, and everything after it is late. The late
+    // terminal deliberately disagrees with the settled one (`failed` vs
+    // `completed`) so that "never re-settled" is a fact this test can see.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i1","type":"agentMessage","text":"done"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i2","type":"agentMessage","text":"late"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"failed","error":{"message":"too late"}}}}"#,
+        ],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let late_terminal = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "a real terminal arriving after settlement must never be dropped silently",
+        |e| e.payload["phase"] == "post_settlement_terminal",
+    );
+    assert_eq!(late_terminal.payload["method"], "turn/completed");
+    assert_eq!(late_terminal.payload["settled_as"], "completed");
+
+    // STOP ends the child's stream, which is when the tally is final.
+    backend.stop(&handle).expect("stop").wait();
+    let summary = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the post-settlement tally is summarized once, at end of stream",
+        |e| e.payload["phase"] == "post_settlement_lines",
+    );
+    assert_eq!(summary.payload["lines"], 2);
+    assert_eq!(summary.payload["terminal_seen"], true);
+    assert_eq!(
+        summary.payload["methods"],
+        serde_json::json!(["item/completed", "turn/completed"])
+    );
+
+    // Exactly one settlement, and it is the first terminal's.
+    let ended = events_of_kind(&events, "conversation.turn.ended");
+    assert_eq!(
+        ended.len(),
+        1,
+        "a settled turn is never re-settled by a line that arrives after it: {:?}",
+        ended.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(ended[0].payload["outcome"], "completed");
+}
+
+/// Finding 5's other exit. End of stream is not the only way a settled turn's
+/// post-settlement tally leaves the building: the next turn on the same thread
+/// overwrites the cell that tally lives in, and on a thread that runs more
+/// than one turn it gets there first. Reporting it only at EOF would drop it
+/// silently on exactly the flow the transport exists for.
+#[test]
+fn appserver_late_lines_are_summarized_when_the_next_turn_displaces_them() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // The same burst every `turn/start` replays: settle, then two late lines.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i2","type":"agentMessage","text":"late"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"failed","error":{"message":"too late"}}}}"#,
+        ],
+    );
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    // Waiting for the late *terminal* is what makes the tally below exact:
+    // it is the last of turn 1's four lines, so both late lines have landed.
+    wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "turn 1's late terminal",
+        |e| e.payload["phase"] == "post_settlement_terminal",
+    );
+    assert!(
+        events_of_kind(&events, "conversation.turn.harness_error")
+            .iter()
+            .all(|e| e.payload["phase"] != "post_settlement_lines"),
+        "nothing has displaced or ended turn 1 yet, so its tally is not final"
+    );
+
+    backend.send(&handle, "second turn").expect("send");
+    let summary = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the displaced turn's tally must be journaled, not overwritten in silence",
+        |e| e.payload["phase"] == "post_settlement_lines",
+    );
+    assert_eq!(summary.payload["lines"], 2);
+    assert_eq!(summary.payload["terminal_seen"], true);
+
+    // Scripted only so this test's own teardown is not a 5-second wait on the
+    // interrupt budget: turn 2 may still be in flight when STOP asks.
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// A stray notification for a turn that already displaced its own cell must
+/// not be folded into the *new* turn's evidence — not even a `turn/completed`
+/// naming the superseded turn's own id. Without the guard, this stray
+/// `turn/completed{status:"failed"}` for turn 1 would stamp `Terminal::Failed`
+/// onto turn 2's still-live accumulator and settle turn 2 on the spot, before
+/// turn 2's own genuine completion ever arrives.
+#[test]
+fn appserver_a_stray_notification_for_the_displaced_turn_never_taints_the_new_one() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // Turn 1: starts as "turn-1" and settles cleanly, completed.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+        ],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "turn 1 settles before turn 2 is ever sent",
+        |e| e.payload["outcome"] == "completed",
+    );
+
+    // Turn 2: starts as "turn-2", but before its own real completion, a
+    // straggler for turn 1 arrives -- a duplicate `turn/completed` naming
+    // turn 1's own id with a *disagreeing* status, exactly the shape a
+    // buffered late line from the displaced turn would have. Turn 2's own
+    // evidence (an `item/completed` and its own `turn/completed`) follows.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-2"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"failed","error":{"message":"stale turn-1 completion, arrived after turn 2 started"}}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-2","text":"turn 2 done","phase":"final_answer"},"turnId":"turn-2"}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-2","status":"completed"}}}"#,
+        ],
+    );
+    backend.send(&handle, "second turn").expect("send");
+
+    let stray = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the straggler for turn 1 is journaled, not silently merged into turn 2",
+        |e| e.payload["phase"] == "stray_notification_for_superseded_turn",
+    );
+    assert_eq!(stray.payload["method"], "turn/completed");
+
+    // Turn 2 must still reach its own, genuine settlement -- the straggler
+    // must not have already finalized it as `failed` in the meantime.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ended = loop {
+        let ended = events_of_kind(&events, "conversation.turn.ended");
+        if ended.len() >= 2 {
+            break ended;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "turn 2 never reached its own settlement; saw {:?}",
+            ended.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Exactly two turns ever ended, and turn 2's own outcome is `completed`
+    // -- the straggler's `failed` status never touched it.
+    assert_eq!(
+        ended.len(),
+        2,
+        "turn 1 and turn 2 each end exactly once: {:?}",
+        ended.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(ended[1].payload["outcome"], "completed");
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "turn 2's own completion, not the stray failure, is what OBSERVE reports",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::StageCompleted { ref summary } => {
+            assert_eq!(summary.as_deref(), Some("turn 2 done"));
+        }
+        other => panic!("expected turn 2's own completion, got {other:?}"),
+    }
+}
+
+/// A second, redundant `Backend::interrupt` call on the same still-`InFlight`
+/// turn must not clobber a first call the harness genuinely acknowledged.
+/// The engine itself can produce exactly this sequence -- a ceiling-triggered
+/// auto-interrupt, acknowledged, followed by a later human cancel or restart
+/// reconcile hitting the same still-running turn -- and before this fix the
+/// second call's unconditional write turned a turn the harness had honestly
+/// confirmed into one whose evidence says nothing ever answered it.
+#[test]
+fn appserver_a_second_interrupt_call_does_not_clobber_the_first_acknowledgment() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    // The child answers the one `turn/interrupt` it ever receives, then exits
+    // of its own accord -- the same shape as
+    // `appserver_an_interrupt_acknowledged_then_cut_off_says_so_and_nothing_more`,
+    // with a second, redundant call added right after the first.
+    stub.appserver_exits_after("turn/interrupt");
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.interrupt(&handle).expect("first interrupt").wait();
+    // Redundant: the engine can legitimately call interrupt (or stop, which
+    // calls interrupt itself) again on a turn that is still `InFlight` --
+    // a ceiling-triggered auto-interrupt followed by a later human cancel is
+    // one real path. This call must neither re-ask the harness nor clobber
+    // whatever the first call's own honest answer already recorded, whether
+    // it lands while the cell still says `Acknowledged` or after the reader
+    // thread has already settled it on the child's exit.
+    backend.interrupt(&handle).expect("second interrupt").wait();
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn stayed InFlight after the second, redundant interrupt call",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt was acknowledged, but the child's stdout closed before \
+             turn/completed carried the harness's own verdict"
+        ),
+        "the first call's genuine acknowledgment must survive a second, redundant call; \
+         got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("never answered it") && !evidence.contains("RPC failed"),
+        "a second call must not turn an acknowledged interrupt into an unresolved or \
+         failed one; got: {evidence}"
+    );
+
+    let interrupt_requests = stub
+        .appserver_requests()
+        .iter()
+        .filter(|r| r["method"] == "turn/interrupt")
+        .count();
+    assert_eq!(
+        interrupt_requests, 1,
+        "a redundant interrupt call must not re-ask the harness once the first \
+         call already got an honest answer"
+    );
+}
+
+/// Test 22: when `turn/interrupt` itself fails, the adapter's own documented
+/// fallback (§2.2) kills the process group and journals
+/// `phase:"interrupt_downgraded"` — and, per §15/§3.4 point 3, must also
+/// resolve the turn out of `InFlight` rather than leave OBSERVE reporting a
+/// hung turn forever just because the RPC that would have confirmed the
+/// interrupt never came back clean.
+#[test]
+fn appserver_interrupt_kills_the_process_group_when_the_rpc_fails() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply(
+        "turn/interrupt",
+        &[r#"{"id":__ID__,"error":{"code":-32000,"message":"stub-forced interrupt failure"}}"#],
+    );
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let downgraded = loop {
+        if let Some(found) = events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.payload["phase"] == "interrupt_downgraded")
+            .cloned()
+        {
+            break found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "interrupt_downgraded was never journaled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(downgraded.kind, "conversation.turn.harness_error");
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn stayed InFlight forever after the interrupt downgrade",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
+    }
+    // Finding 3, path 1: this outcome is reachable two ways, and the evidence
+    // names the one that happened. Here the RPC really did fail.
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt's own RPC failed and sergeant fell back to the process-group kill"
+        ),
+        "the downgrade path must name itself; got: {evidence}"
+    );
+
+    // The fail-closed settlement journals a turn.ended here too (finding 2).
+    let ended = wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "a turn settled by the interrupt downgrade still ends with conversation.turn.ended",
+        |_| true,
+    );
+    assert_eq!(ended.payload["outcome"], "interrupted_running");
+    assert_eq!(ended.payload["interrupted"], true);
+}
+
 // ---------------------------------------------------------- §7.3 live suite
 
 /// Gate mirroring `tests/m4_backends.rs`'s `LiveGate`/`claude_live_enabled`
@@ -1561,13 +2746,52 @@ fn live_config(data_dir: &Path) -> CodexConfig {
     CodexConfig::new(data_dir)
 }
 
+/// W3: `live_config` with `ExecOnly` forced. Every pre-W3 `live_codex_*`
+/// test below was written against exec's own semantics (its `wait_for_
+/// settled` reads `native`, which only exec's per-turn-process model makes
+/// mean "the turn is over") — `live_config`'s default `TransportChoice::
+/// Auto` now resolves to app-server on any host whose installed codex
+/// passes the gates (this host included, measured live), which would
+/// silently point those tests at the wrong transport and the wrong OBSERVE
+/// shape. Pinning `ExecOnly` here keeps them testing exactly what they
+/// always tested; `Auto`'s new default is `live_appserver_config`'s own
+/// suite's job to prove.
+fn live_exec_config(data_dir: &Path) -> CodexConfig {
+    CodexConfig {
+        transport: TransportChoice::ExecOnly,
+        ..live_config(data_dir)
+    }
+}
+
+/// W3: `live_config` with `AppServerOnly` forced, so these tests exercise
+/// the wired app-server transport itself rather than whatever `Auto` would
+/// have picked on this host (which happens to be app-server too, on
+/// Cerberus — but a live test asserting on that transport should not depend
+/// on Auto's own resolution logic staying that way).
+fn live_appserver_config(data_dir: &Path) -> CodexConfig {
+    CodexConfig {
+        transport: TransportChoice::AppServerOnly,
+        ..live_config(data_dir)
+    }
+}
+
 /// Whether the opt-in live-codex tests may run. Reaching this with the
 /// opt-in variable unset is a misuse of `-- --ignored` and panics, naming
 /// the opt-in — the false green `#[ignore]` exists to prevent. An unusable
 /// harness is a clean skip, written straight to fd 2 (libtest only captures
 /// the print macros).
 fn codex_live_enabled(test: &str, data_dir: &Path) -> bool {
-    let config = live_config(data_dir);
+    codex_live_enabled_with(test, live_config(data_dir))
+}
+
+/// W3: the app-server suite's own gate, `AppServerOnly`-forced so a gate
+/// failure on some future host is an honest `SKIPPED`, never a silent
+/// fallback to exec producing a green test that tested the wrong transport.
+fn codex_appserver_live_enabled(test: &str, data_dir: &Path) -> bool {
+    codex_live_enabled_with(test, live_appserver_config(data_dir))
+}
+
+fn codex_live_enabled_with(test: &str, config: CodexConfig) -> bool {
     let probe = CodexBackend::new(config.clone()).probe();
     let gate = live_gate(
         std::env::var("SERGEANT_CODEX_TESTS").ok().as_deref(),
@@ -1613,6 +2837,43 @@ fn wait_for_settled(
     }
 }
 
+/// W3: the app-server counterpart of [`wait_for_settled`]. Neither `native`
+/// (§1.4: "is my child alive", true for the whole execution) nor `signal`
+/// (an *interrupted* turn also reports `Running` — no stage verdict, exactly
+/// like exec's `InterruptedRunning` — so "signal != Running" cannot tell
+/// "settled" apart from "never even started" either) can drive a polling
+/// loop the way exec's own turn-ends-its-process signal can. What actually
+/// marks a turn as over on this transport is the event
+/// `appserver_on_line` emits exactly once per turn, on `turn/completed`
+/// (`conversation.turn.ended`) — so this waits for that event (the sink
+/// must already be installed) and returns the OBSERVE snapshot taken right
+/// after.
+fn wait_for_appserver_settled(
+    backend: &CodexBackend,
+    handle: &ExecutionHandle,
+    events: &Arc<Mutex<Vec<EventDraft>>>,
+    already_ended: usize,
+) -> sergeant_rs::backend::Observation {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let ended_count = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "conversation.turn.ended")
+            .count();
+        if ended_count > already_ended {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live app-server turn never settled"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    backend.observe(handle).expect("observe")
+}
+
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
 fn live_codex_probe_reports_the_installed_version_and_auth() {
@@ -1629,6 +2890,10 @@ fn live_codex_probe_reports_the_installed_version_and_auth() {
     let detail = report.detail.expect("detail");
     assert!(detail.contains("codex-cli"));
     assert!(detail.contains("auth:"));
+    // W3: the resolved transport is now part of this same detail string
+    // (§5.5's journaling requirement) — on this host, Auto resolves to
+    // app-server with a fresh (non-stale) protocol fingerprint.
+    assert!(detail.contains("transport:"));
 }
 
 #[test]
@@ -1641,7 +2906,7 @@ fn live_codex_turn_streams_events_before_it_ends() {
     ) {
         return;
     }
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let (sink_fn, events) = sink();
     backend.set_event_sink(sink_fn);
     let mut request = start_request(data_dir.path());
@@ -1665,7 +2930,7 @@ fn live_codex_turn_reports_usage() {
     if !codex_live_enabled("live_codex_turn_reports_usage", data_dir.path()) {
         return;
     }
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let (sink_fn, events) = sink();
     backend.set_event_sink(sink_fn);
     let mut request = start_request(data_dir.path());
@@ -1699,7 +2964,7 @@ fn live_codex_bad_model_pin_fails_loud_not_silent() {
     ) {
         return;
     }
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-nonexistent-model".to_string());
     request.intent = "Reply with exactly the word ok and nothing else.".to_string();
@@ -1731,7 +2996,7 @@ fn live_codex_resume_recalls_a_nonce_across_processes() {
         return;
     }
     let nonce = format!("nonce-{}", ulid::Ulid::generate());
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
     request.intent = format!("Remember the word {nonce}. Reply ok.");
@@ -1796,7 +3061,7 @@ fn live_codex_interrupt_leaves_the_conversation_resumable() {
         return;
     }
     let nonce = format!("nonce-{}", ulid::Ulid::generate());
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
     request.intent = format!("Remember the word {nonce}. Reply ok.");
@@ -1847,7 +3112,7 @@ fn live_codex_thread_survives_turns_and_a_restart() {
         return;
     }
     let nonce = format!("nonce-{}", ulid::Ulid::generate());
-    let backend = CodexBackend::new(live_config(data_dir.path()));
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
     request.intent = format!("Remember the word {nonce}. Reply ok.");
@@ -1859,7 +3124,7 @@ fn live_codex_thread_survives_turns_and_a_restart() {
 
     // Drop the adapter (simulating a daemon restart) and build a fresh one.
     drop(backend);
-    let fresh = CodexBackend::new(live_config(data_dir.path()));
+    let fresh = CodexBackend::new(live_exec_config(data_dir.path()));
     let resume_request = ResumeRequest::new("w-codex", data_dir.path());
     fresh
         .resume(&handle, &resume_request)
@@ -1881,6 +3146,406 @@ fn live_codex_thread_survives_turns_and_a_restart() {
     );
     assert_eq!(handle.native_id.as_deref(), Some(thread_id.as_str()));
     fresh.stop(&handle).expect("stop").wait();
+}
+
+// --------------------------------------------------- W3 §6.4: app-server live suite
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_handshake_and_thread_start() {
+    let data_dir = live_workdir("appserver-handshake");
+    if !codex_appserver_live_enabled("live_appserver_handshake_and_thread_start", data_dir.path()) {
+        return;
+    }
+    // Zero tokens (M4): PREPARE/LAUNCH's handshake + thread/start never send
+    // a turn/start, so this is free to run every time.
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    // An intent that would need a real model turn to finish — but we STOP
+    // immediately after LAUNCH's own turn/start returns, well before the
+    // model could plausibly answer, so what this proves is the handshake +
+    // thread/start path, not a completed turn (that is the next test).
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    assert!(
+        handle.native_id.is_some(),
+        "the native id must come from thread/start's own synchronous result"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_thread_start_echoes_the_requested_policy() {
+    let data_dir = live_workdir("appserver-policy");
+    if !codex_appserver_live_enabled(
+        "live_appserver_thread_start_echoes_the_requested_policy",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    // Token-free (§3.6): the probe itself already drove `thread/start`
+    // during PROBE (G4's handshake uses `initialize` only, not
+    // `thread/start` — so this LAUNCH is the first `thread/start` this test
+    // sends).
+    let outside = live_workdir("appserver-policy-outside");
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    // A binding outside cwd, so `sandbox.writableRoots` has something to
+    // discriminate on beyond cwd alone (§3.6's own test 4 shape).
+    request.bindings = vec![BindingSummary {
+        repository: "outside".to_string(),
+        worktree_path: outside.path().to_path_buf(),
+        work_branch: "b".to_string(),
+        base_branch: None,
+        base_sha: "0".repeat(40),
+    }];
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    // §3.6's own five assertions, on the wire itself: a successful LAUNCH
+    // only proves the handshake *accepted* the policy (M6's `-32600` gate
+    // without `experimentalApi`) — it proves nothing about what came back.
+    // `appserver_policy_echo` is `thread/start`'s own result, captured at
+    // LAUNCH and otherwise unreachable from outside this crate.
+    let echo = backend
+        .appserver_policy_echo(&handle)
+        .expect("an app-server execution must have a captured policy echo");
+    assert_eq!(
+        echo["sandbox"]["type"], "workspaceWrite",
+        "thread/start's result: {echo}"
+    );
+    let writable_roots: Vec<&str> = echo["sandbox"]["writableRoots"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sandbox.writableRoots must be an array: {echo}"))
+        .iter()
+        .map(|v| v.as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        writable_roots.contains(&outside.path().to_string_lossy().as_ref()),
+        "sandbox.writableRoots must name the out-of-cwd binding: {writable_roots:?}"
+    );
+    assert_eq!(echo["cwd"], data_dir.path().to_string_lossy().as_ref());
+    assert_eq!(echo["approvalPolicy"], "never");
+    assert_eq!(echo["model"], "gpt-5.6-luna");
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_turn_completes_and_streams() {
+    let data_dir = live_workdir("appserver-stream");
+    if !codex_appserver_live_enabled("live_appserver_turn_completes_and_streams", data_dir.path()) {
+        return;
+    }
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent = "Reply with exactly the word ok and nothing else.".to_string();
+    request.context = String::new();
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let _user = wait_for_kind(&events, "conversation.user");
+    let observation = wait_for_appserver_settled(&backend, &handle, &events, 0);
+    assert_eq!(
+        observation.native,
+        NativeState::Running,
+        "the app-server child persists after a completed turn (§1.4) — unlike exec, native never means the turn's own process exited"
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::StageCompleted { .. } => {}
+        other => panic!("expected StageCompleted, got {other:?}"),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_reports_usage_during_the_turn() {
+    let data_dir = live_workdir("appserver-usage");
+    if !codex_appserver_live_enabled(
+        "live_appserver_reports_usage_during_the_turn",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent = "Reply with exactly the word ok and nothing else.".to_string();
+    request.context = String::new();
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    // §2.3's discriminating assertion: usage must arrive *before* the
+    // terminal, not bundled onto it — `thread/tokenUsage/updated` is a
+    // separate notification on this transport.
+    let usage_event = wait_for_kind(&events, "usage.updated");
+    assert!(usage_event.payload["usage"]["total"]["totalTokens"].is_number());
+    let observation = wait_for_appserver_settled(&backend, &handle, &events, 0);
+    assert_eq!(observation.native, NativeState::Running);
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_interrupt_yields_an_interrupted_terminal() {
+    let data_dir = live_workdir("appserver-interrupt");
+    if !codex_appserver_live_enabled(
+        "live_appserver_interrupt_yields_an_interrupted_terminal",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent =
+        "Count slowly from 1 to 200, one number per line, explaining each in a full sentence."
+            .to_string();
+    request.context = String::new();
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    // Bounded wait for genuine mid-flight proof (item/started or a delta),
+    // never a fixed sleep — §2.2 step 2's own requirement.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "conversation.user")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn never even started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    backend.interrupt(&handle).expect("interrupt").wait();
+    let observation = wait_for_appserver_settled(&backend, &handle, &events, 0);
+    assert_eq!(
+        observation.signal,
+        sergeant_rs::backend::BackendSignal::Running,
+        "an interrupted turn reports Running (no stage verdict), same shape as exec's \
+         InterruptedRunning, but harness-confirmed rather than inferred"
+    );
+    assert_eq!(
+        observation.native,
+        NativeState::Running,
+        "the process was never killed -- that is §2.2's whole point"
+    );
+    // Resumability: a second turn on the same thread must still succeed.
+    send_retrying(&backend, &handle, "Reply with exactly the word ok.");
+    let settled = wait_for_appserver_settled(&backend, &handle, &events, 1);
+    match settled.signal {
+        sergeant_rs::backend::BackendSignal::StageCompleted { .. } => {}
+        other => panic!("expected the conversation to still work after interrupt, got {other:?}"),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// §2.4's five-step admission test — "the highest-value single test in this
+/// wave". `ask` stays `false` in this build (`ADMISSION_ROWS`): the adapter
+/// always declines `item/tool/requestUserInput` (no `NeedsInput` mapping or
+/// answering path exists yet), so steps 4/5 cannot pass here regardless of
+/// what the model does — that is §2.4's own "only if admitted" scope, not
+/// this test's gap. This test's job is steps 1-3, run for real: does the
+/// actor's own `item/tool/requestUserInput` ever arrive, cleanly (no
+/// `*/requestApproval` contamination)? Both outcomes in §2.4's own outcome
+/// table are a pass here — "a negative here is a likely and perfectly good
+/// outcome" — what §2.7 forbids is deleting this test or re-deriving its
+/// measurement from prose instead of re-running it.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_appserver_actor_authored_question_is_typed() {
+    let data_dir = live_workdir("appserver-ask");
+    if !codex_appserver_live_enabled(
+        "live_appserver_actor_authored_question_is_typed",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    // Two prompt formulations, tried in order, each once (§2.4 step 2): a
+    // model-behaviour probe, so one formulation failing is not the same as
+    // the capability being absent. `approvalPolicy: "never"` is already
+    // this adapter's unconditional default (§3.3) on every `thread/start`,
+    // so step 1 needs no extra wiring here.
+    const FORMULATIONS: [&str; 2] = [
+        "I want you to write a short poem for a friend. Before you write it, \
+         ask me one clarifying question about what kind of poem they'd like -- \
+         do not guess or assume, use the request_user_input tool to ask.",
+        "Rename the one file in this directory to a clearer name, but the \
+         correct new name is genuinely ambiguous from what's here -- use the \
+         request_user_input tool to ask me what name I want before you act.",
+    ];
+
+    let mut actor_asked = false;
+    let mut contaminated = false;
+    let mut questions_seen = Value::Null;
+    let mut turn_id_seen = Value::Null;
+
+    for prompt in FORMULATIONS {
+        let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
+        let (sink_fn, events) = sink();
+        backend.set_event_sink(sink_fn);
+        let mut request = start_request(data_dir.path());
+        request.model = Some("gpt-5.6-luna".to_string());
+        request.intent = prompt.to_string();
+        request.context = String::new();
+        let prepared = backend.prepare(&request).expect("prepare");
+        let handle = backend.launch(&prepared).expect("launch");
+        wait_for_appserver_settled(&backend, &handle, &events, 0);
+        backend.stop(&handle).expect("stop").wait();
+
+        let harness_events: Vec<EventDraft> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "conversation.turn.harness_error")
+            .cloned()
+            .collect();
+        let asked = harness_events
+            .iter()
+            .find(|e| e.payload["method"] == "item/tool/requestUserInput");
+        if let Some(asked) = asked {
+            actor_asked = true;
+            // Step 3's own contamination check: a policy gate's own request
+            // firing alongside the actor's means the record caught is not
+            // cleanly attributable to the actor alone.
+            contaminated = harness_events
+                .iter()
+                .any(|e| e.payload["phase"] == "approval_denied_unattended");
+            questions_seen = asked.payload["questions"].clone();
+            turn_id_seen = asked.payload["turn_id"].clone();
+            break;
+        }
+    }
+
+    if !actor_asked {
+        // §2.4's own outcome table, first bullet: "absence of a probe
+        // result is not a measured negative" -- a legitimate, recorded
+        // outcome on this run, not a test failure. Re-run to re-measure.
+        eprintln!(
+            "live_appserver_actor_authored_question_is_typed: the actor never invoked \
+             item/tool/requestUserInput under either formulation on this run (evidence: \
+             Unmeasured) -- consistent with ADMISSION_ROWS' recorded ask/AppServer negative; \
+             this is a model-behaviour probe, not a build regression."
+        );
+        return;
+    }
+
+    assert!(
+        !contaminated,
+        "a */requestApproval also fired alongside item/tool/requestUserInput -- the record is \
+         not cleanly attributable to the actor (§2.4 step 3's contamination check)"
+    );
+    assert!(
+        questions_seen.as_array().is_some_and(|a| !a.is_empty()),
+        "params.questions must be non-empty on the caught request: {questions_seen}"
+    );
+    assert!(
+        !turn_id_seen.is_null(),
+        "params.turnId must be present on the caught request: {turn_id_seen}"
+    );
+    // Steps 4/5 (mapping to `NeedsInput`, answering the request) are §2.4's
+    // "only if admitted" work: `ask` stays `false` in this build (no such
+    // mapping or answer path exists), so they are not attempted here — the
+    // wave's own recorded, honest outcome (§2.6/§2.7), not a gap this test
+    // is responsible for closing.
+}
+
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_codex_output_schema_round_trips_on_both_transports() {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"word": {"type": "string"}},
+        "required": ["word"],
+        "additionalProperties": false
+    });
+    let prompt = "Answer with the word ok.";
+
+    for (label, config_builder) in [
+        (
+            "exec",
+            Box::new(live_exec_config) as Box<dyn Fn(&Path) -> CodexConfig>,
+        ),
+        (
+            "appserver",
+            Box::new(live_appserver_config) as Box<dyn Fn(&Path) -> CodexConfig>,
+        ),
+    ] {
+        let data_dir = live_workdir(&format!("output-schema-{label}"));
+        let test_name = format!("live_codex_output_schema_round_trips_on_both_transports[{label}]");
+        if !codex_live_enabled_with(&test_name, config_builder(data_dir.path())) {
+            continue;
+        }
+
+        // Control run: no schema configured, same prompt. The sink is
+        // installed *before* LAUNCH: both transports snapshot the sink at
+        // spawn time, so installing it after LAUNCH returns would miss
+        // turn 1's events entirely (the same hazard `live_codex_resume_
+        // recalls_a_nonce_across_processes` documents for exec).
+        let control_backend = CodexBackend::new(config_builder(data_dir.path()));
+        let (control_sink, control_events) = sink();
+        control_backend.set_event_sink(control_sink);
+        let mut control_request = start_request(data_dir.path());
+        control_request.model = Some("gpt-5.6-luna".to_string());
+        control_request.intent = prompt.to_string();
+        control_request.context = String::new();
+        let control_prepared = control_backend.prepare(&control_request).expect("prepare");
+        let control_handle = control_backend.launch(&control_prepared).expect("launch");
+        let control_assistant = wait_for_kind(&control_events, "conversation.assistant.completed");
+        let control_text = control_assistant.payload["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let control_is_schema_shaped = serde_json::from_str::<serde_json::Value>(&control_text)
+            .ok()
+            .map(|v| v.get("word").is_some() && v.as_object().map(|o| o.len()) == Some(1))
+            .unwrap_or(false);
+        control_backend.stop(&control_handle).expect("stop").wait();
+
+        // Schema run.
+        let mut config = config_builder(data_dir.path());
+        config.output_schema = Some(schema.clone());
+        let backend = CodexBackend::new(config);
+        let (sink_fn, events) = sink();
+        backend.set_event_sink(sink_fn);
+        let mut request = start_request(data_dir.path());
+        request.model = Some("gpt-5.6-luna".to_string());
+        request.intent = prompt.to_string();
+        request.context = String::new();
+        let prepared = backend.prepare(&request).expect("prepare");
+        let handle = backend.launch(&prepared).expect("launch");
+        let assistant = wait_for_kind(&events, "conversation.assistant.completed");
+        let text = assistant.payload["text"].as_str().unwrap_or("").to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("[{label}] not JSON: {e}: {text:?}"));
+        assert!(
+            parsed.get("word").is_some(),
+            "[{label}] missing word: {text:?}"
+        );
+        assert_eq!(
+            parsed.as_object().map(|o| o.len()),
+            Some(1),
+            "[{label}] additionalProperties:false must hold: {text:?}"
+        );
+        assert!(
+            !control_is_schema_shaped,
+            "[{label}] the discriminating assertion: an unschema'd control run must not \
+             coincidentally produce the same shape, or this test cannot tell native validation \
+             from a model that just likes JSON: {control_text:?}"
+        );
+        backend.stop(&handle).expect("stop").wait();
+    }
 }
 
 // ------------------------------------------------------- W2 §1.4: registration

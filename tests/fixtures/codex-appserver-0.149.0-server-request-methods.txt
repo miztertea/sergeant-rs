@@ -1,0 +1,11 @@
+item/tool/requestUserInput
+item/commandExecution/requestApproval
+item/fileChange/requestApproval
+item/permissions/requestApproval
+mcpServer/elicitation/request
+item/tool/call
+applyPatchApproval
+execCommandApproval
+account/chatgptAuthTokens/refresh
+attestation/generate
+currentTime/read

@@ -112,6 +112,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -131,6 +132,28 @@ use crate::runtime::graph::{
     KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED, KIND_CONVERSATION_USER,
     KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
 };
+
+/// The app-server JSON-RPC client (W3 spec, `knowledge/evidence/resources/
+/// h-series/w3-spec.md` §1.5). `#[path]` because this file is a non-`mod.rs`
+/// module (`codex.rs` itself): the spec names the file
+/// `src/backend/codex_appserver.rs`, a sibling of this one, and this
+/// attribute is what makes `mod codex_appserver;` look there instead of
+/// `src/backend/codex/codex_appserver.rs`. Declared here rather than in
+/// `backend/mod.rs` is the visibility the spec asks for ("pub(crate) to
+/// src/backend/codex.rs"): a private child of *this* module can see every
+/// private item this module defines or imports (`ItemView`, `ItemKind`,
+/// `TurnAccumulator`, the `KIND_*` constants above), which is exactly how it
+/// reuses the one decoder rather than owning a second copy of it (§1.6).
+#[path = "codex_appserver.rs"]
+mod codex_appserver;
+
+/// Re-exported so [`CodexConfig::appserver_budgets`] can name it in a public
+/// field: `codex_appserver` itself stays a private child module (the spec's
+/// own visibility rule, above), but a `pub use` of one item out of a private
+/// module is the standard way to give that one item a public path without
+/// making the whole module public — exactly the seam `docs/DEVELOPMENT.md`'s
+/// "narrowest visibility that works" rule asks for.
+pub use codex_appserver::Budgets;
 
 // ------------------------------------------------------------------ consts
 
@@ -284,6 +307,25 @@ pub struct CodexConfig {
     /// process-global mutable state, no `--test-threads` ordering hazard, no
     /// `unsafe { std::env::set_var }` to serialize.
     pub thread_id_budget: Option<Duration>,
+    /// Which transport this registration resolves to (W3 spec §5.2), default
+    /// [`TransportChoice::Auto`]. Resolved **once**, at probe time, and
+    /// journaled; never re-resolved per execution (§5.3).
+    pub transport: TransportChoice,
+    /// Sandbox policy for sergeant-launched turns (W3 spec §3.3), default
+    /// [`SandboxChoice::WorkspaceWrite`].
+    pub sandbox: SandboxChoice,
+    /// A JSON Schema constraining the final assistant message of every turn
+    /// in executions launched from this config (W3 spec §4.2). Adapter-local
+    /// until a contract revision gives native structured output a home in
+    /// `Capabilities`; unused unless a profile or this field sets it.
+    pub output_schema: Option<Value>,
+    /// Overrides for the app-server child's own budgets (spec §1.5.4). `None`
+    /// in every production path — the same per-instance-not-global posture as
+    /// `thread_id_budget` above, and for the same reason. A named
+    /// [`codex_appserver::Budgets`] rather than a positional tuple: every
+    /// field is a `Duration`, so a tuple would let two same-typed slots swap
+    /// silently and still type-check.
+    pub appserver_budgets: Option<codex_appserver::Budgets>,
 }
 
 impl CodexConfig {
@@ -297,8 +339,560 @@ impl CodexConfig {
             codex_home: None,
             env: BTreeMap::new(),
             thread_id_budget: None,
+            transport: TransportChoice::Auto,
+            sandbox: SandboxChoice::WorkspaceWrite,
+            output_schema: None,
+            appserver_budgets: None,
         }
     }
+}
+
+/// Which transport a `CodexBackend` registration resolves to (W3 spec §5.2).
+/// `CodexConfig`'s own field, default [`TransportChoice::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportChoice {
+    /// App-server if every gate passes (§5.2 rule 3), else exec — the
+    /// honest fallback named in the probe detail.
+    #[default]
+    Auto,
+    /// Always exec, regardless of what the app-server gates would say.
+    ExecOnly,
+    /// App-server or refuse: if the gates fail, `PROBE` reports
+    /// `available: false` naming the failed gate, rather than silently
+    /// giving the operator a different transport with a different
+    /// capability row (§5.2 rule 2).
+    AppServerOnly,
+}
+
+/// The transport actually resolved for one registration (§5.2) — internal;
+/// `TransportChoice` is the operator-facing configuration, this is the
+/// outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Exec,
+    AppServer,
+}
+
+impl Transport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Transport::Exec => "exec",
+            Transport::AppServer => "app-server (stdio)",
+        }
+    }
+}
+
+/// Sandbox policy for sergeant-launched turns (W3 spec §3.3). Layered
+/// exactly as every other §14 axis: this is `CodexConfig`'s own default,
+/// applied uniformly to every execution this backend launches — a
+/// per-execution override is not a surface this wave adds (nothing in
+/// `StartRequest` names one, and R3 forbids inventing a core field for it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxChoice {
+    /// `-s read-only` / `sandbox: "readOnly"`. Never sergeant's own default —
+    /// a Work exists to change its worktree.
+    ReadOnly,
+    /// `-s workspace-write` / `sandbox: "workspaceWrite"`, scoped to the
+    /// Work's declared surfaces. The default: enforcement the owner
+    /// welcomed (R4), never wider than the Work's own bindings.
+    #[default]
+    WorkspaceWrite,
+    /// Send no sandbox parameter at all — the operator's own
+    /// `~/.codex/config.toml` decides. The escape hatch for an operator with
+    /// a considered policy of their own; never the default, because a
+    /// default that silently defers is a default nobody chose.
+    Inherit,
+}
+
+impl SandboxChoice {
+    /// The app-server `thread/start.sandbox` string, or `None` for
+    /// [`SandboxChoice::Inherit`] (send no `sandbox` param at all).
+    fn appserver_value(self) -> Option<&'static str> {
+        match self {
+            // Re-measured while wiring LAUNCH (a live -32600 caught this):
+            // `thread/start.sandbox` takes the same kebab-case request
+            // values as exec's own `-s`/`--sandbox` (`read-only` /
+            // `workspace-write` / `danger-full-access`) — the camelCase
+            // spelling (`workspaceWrite`) is only what the *response*
+            // echoes back in `sandbox.type`, a different field entirely.
+            SandboxChoice::ReadOnly => Some("read-only"),
+            SandboxChoice::WorkspaceWrite => Some("workspace-write"),
+            SandboxChoice::Inherit => None,
+        }
+    }
+
+    /// The exec `-s`/`--sandbox` value, or `None` for
+    /// [`SandboxChoice::Inherit`] (compose no `--sandbox`/`--add-dir` at all
+    /// — §3.2's turn-1-only asymmetry, unchanged by this choice).
+    fn exec_value(self) -> Option<&'static str> {
+        match self {
+            SandboxChoice::ReadOnly => Some("read-only"),
+            SandboxChoice::WorkspaceWrite => Some("workspace-write"),
+            SandboxChoice::Inherit => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------- admission rows
+
+/// How a capability's `true`/`false` was established (W3 spec §0.2/§2.1).
+/// A schema entry is a doc claim; it proves the protocol *names* a thing,
+/// never that it fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evidence {
+    /// Driven against the real, installed harness (a `#[ignore]`d live test,
+    /// gated behind `SERGEANT_CODEX_TESTS=1`).
+    LiveMeasured,
+    /// Proven deterministically (a fixture, a stub) without a live run —
+    /// still a real assertion, just not against the installed binary today.
+    LocallyMeasured,
+    /// Named by `generate-json-schema`'s own dump; never promoted to
+    /// `claimed: true` on this evidence alone (§0.2's promotion rule).
+    SchemaClaimed,
+    /// Looked for and not found — a probe ran, no assertion could be made.
+    Unmeasured,
+}
+
+/// Protocol stability, as the app-server subcommand's own header names it
+/// (`[experimental] Run the app server or related tooling`, M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stability {
+    Stable,
+    Experimental,
+}
+
+/// One row of the wave's own capability ledger (W3 spec §2.1): the v1
+/// boolean `capabilities()` returns is the contract; this is the *evidence*
+/// behind it, adapter-local until a contract revision gives it a home.
+/// Rendered into `ProbeReport::detail` and the wave PR body (§2.7).
+#[derive(Debug, Clone, Copy)]
+struct AdmissionRow {
+    /// The v1 flag name, or a name v1 has no row for at all
+    /// (`structured_output`, `sandbox_enforcement`).
+    capability: &'static str,
+    transport: Transport,
+    /// What `capabilities()` claims for this transport (always the same
+    /// value on both transports today — see the row's own note when that
+    /// is itself the interesting fact).
+    claimed: bool,
+    /// The typed tier this row's evidence actually supports
+    /// (`ProcessTreeTermination`, `NativeTurnInterrupt`, `NativeSchema`,
+    /// `NativeOsSandbox(workspace-write)`, or `"-"` when the flag is a
+    /// plain boolean with no tier of its own).
+    tier: &'static str,
+    evidence: Evidence,
+    stability: Stability,
+    /// The exact test name backing a `claimed: true`, or `""` when
+    /// `claimed` is `false` (the structural reason lives in `note`).
+    admission_test: &'static str,
+    note: &'static str,
+}
+
+/// The wave's own ledger (§2.6's table, plus §4.1/§3.1's two rows with no
+/// v1 boolean). [`admission_rows_agree_with_capabilities`] is the
+/// structural check that keeps this honest: a `claimed: true` with no
+/// `admission_test` fails the build.
+const ADMISSION_ROWS: &[AdmissionRow] = &[
+    AdmissionRow {
+        capability: "persistent_sessions",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        // `launch_binds_the_thread_id_from_thread_started` is a plain
+        // `#[test]` driven by `StubCodex` -- no `#[ignore]`, no
+        // SERGEANT_CODEX_TESTS gate, never touches the installed binary.
+        // `LiveMeasured` here would misstate its provenance (`Evidence`'s own
+        // doc comment reserves that tier for a real, installed-harness run).
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Stable,
+        admission_test: "launch_binds_the_thread_id_from_thread_started",
+        note: "the rollout jsonl under <codex_home>/sessions/**",
+    },
+    AdmissionRow {
+        capability: "persistent_sessions",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_handshake_and_thread_start",
+        note: "thread/start's own result.thread.path names the rollout file directly (M4)",
+    },
+    AdmissionRow {
+        capability: "native_background",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no measured mechanism for a turn to survive client disconnect",
+    },
+    AdmissionRow {
+        capability: "native_background",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "our child dies with the execution by construction (§1.4); not even meaningful \
+               to ask on a per-execution child",
+    },
+    AdmissionRow {
+        capability: "streaming",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_turn_streams_events_before_it_ends",
+        note: "item.started/item.completed",
+    },
+    AdmissionRow {
+        capability: "streaming",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_turn_completes_and_streams",
+        note: "finer-grained: item + delta notifications; deltas counted, never decoded",
+    },
+    AdmissionRow {
+        capability: "history",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "the only complete native record is the rollout jsonl, an unmeasured on-disk \
+               format this milestone never reads for content",
+    },
+    AdmissionRow {
+        capability: "history",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::SchemaClaimed,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "thread/read / thread/items/list / thread/turns/list exist [schema-claimed] and \
+               are never called (§1.5.3) — proving completeness against the rollout is the \
+               largest named gap this wave leaves, handed to a future wave",
+    },
+    AdmissionRow {
+        capability: "resume",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_thread_survives_turns_and_a_restart",
+        note: "codex exec resume <thread_id>, measured across fresh OS processes",
+    },
+    AdmissionRow {
+        capability: "resume",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_codex_thread_survives_turns_and_a_restart",
+        note: "served by the exec transport across a daemon restart (§5.4); thread/resume is \
+               never called — a re-adopted execution journals a transport_withdrawn_on_readopt \
+               capability withdrawal",
+    },
+    AdmissionRow {
+        capability: "interrupt",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "ProcessTreeTermination",
+        // `codex_interrupt_kills_the_process_group` is StubCodex-driven and
+        // deterministic -- its own doc comment names the live half as a
+        // *different* test (`live_codex_interrupt_leaves_the_conversation_
+        // resumable`). Tagging this row `LiveMeasured` would credit the
+        // wrong test with a live run it never performs.
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Stable,
+        admission_test: "codex_interrupt_kills_the_process_group",
+        note: "kills the turn's process group; no terminal — InterruptedRunning is inferred",
+    },
+    AdmissionRow {
+        capability: "interrupt",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "NativeTurnInterrupt",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_interrupt_yields_an_interrupted_terminal",
+        note: "turn/interrupt -> turn/completed{status:\"interrupted\"}, a first-class \
+               harness-confirmed terminal (§2.2) -- measured live end to end, including a \
+               second turn on the same thread proving resumability. On any turn/interrupt \
+               failure the adapter falls back to the process-group kill and journals \
+               phase:\"interrupt_downgraded\"",
+    },
+    AdmissionRow {
+        capability: "model_selection",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_bad_model_pin_fails_loud_not_silent",
+        note: "substitution undetectable: turn.completed.usage carries no model field",
+    },
+    AdmissionRow {
+        capability: "model_selection",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_thread_start_echoes_the_requested_policy",
+        note: "detectable here: thread/start echoes \"model\":\"<pin>\", and model/rerouted is a \
+               live notification method [schema-claimed] -- a verification layer exec never had",
+    },
+    AdmissionRow {
+        capability: "profiles",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Stable,
+        admission_test: "a_profile_config_home_sets_codex_home_on_every_turn",
+        note: "codex-native -p/--profile refused: cannot re-apply on exec resume",
+    },
+    AdmissionRow {
+        capability: "profiles",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Experimental,
+        admission_test: "a_profile_config_home_sets_codex_home_on_every_turn",
+        note: "same axis, same refusal -- thread/start.permissions [schema-claimed] cannot be \
+               combined with sandbox, which §3 needs, so the codex-native layer stays refused",
+    },
+    AdmissionRow {
+        capability: "approval_flow",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "structural: no approval channel exists on this transport at all",
+    },
+    AdmissionRow {
+        capability: "approval_flow",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        // `appserver_answers_every_server_request_including_unknown_ones` is
+        // a pure unit test against `answer_for_request()` -- no process
+        // spawned, no live app-server touched. `LiveMeasured` would overstate
+        // it; this is exactly the deterministic tier the enum defines.
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Experimental,
+        admission_test: "appserver_answers_every_server_request_including_unknown_ones",
+        note: "false by policy, deliberately: approvalPolicy is always \"never\", so no \
+               approval-gate request should ever fire; the five approval methods are answered \
+               denied if one ever does (J5 safety), never advertised as a real flow",
+    },
+    AdmissionRow {
+        capability: "human_attach",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no attach mechanism on print-mode turns",
+    },
+    AdmissionRow {
+        capability: "human_attach",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "a scope decision (§1.4), not an unlooked-for absence: codex --remote / codex \
+               agents attach to the shared daemon, which this wave refuses on ladder grounds \
+               (R1/R5) -- our child is per-execution and adapter-owned",
+    },
+    AdmissionRow {
+        capability: "usage",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_turn_reports_usage",
+        note: "known only at turn.completed",
+    },
+    AdmissionRow {
+        capability: "usage",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_reports_usage_during_the_turn",
+        note: "thread/tokenUsage/updated pushed mid-turn, turn-attributed, and measured live to \
+               arrive before the terminal -- known earlier and more precisely than exec",
+    },
+    AdmissionRow {
+        capability: "native_subagents",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no subagent mechanism on this transport",
+    },
+    AdmissionRow {
+        capability: "native_subagents",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::SchemaClaimed,
+        stability: Stability::Experimental,
+        admission_test: "",
+        note: "collabAgentToolCall / subAgentActivity item types exist [schema-claimed]; no \
+               subagent was ever run -- documented is not supported (§15)",
+    },
+    AdmissionRow {
+        capability: "ask",
+        transport: Transport::Exec,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Stable,
+        admission_test: "",
+        note: "no ask channel on this transport at all [measured-negative]",
+    },
+    AdmissionRow {
+        capability: "ask",
+        transport: Transport::AppServer,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        stability: Stability::Experimental,
+        // §2.7 outcome 2: "the test stays in the suite as an #[ignore]d live
+        // probe so the next person re-runs it instead of re-deriving it."
+        // The prose this row previously carried in place of that test
+        // (specific prompt formulations, an exact quoted model refusal) was
+        // never backed by a committed, re-runnable test -- fixed by adding
+        // one rather than by trusting the prose.
+        admission_test: "live_appserver_actor_authored_question_is_typed",
+        note: "§2.4's five-step admission test: step 1 (approvalPolicy: never) always holds by \
+               construction (§3.3); steps 2-3 are a live, gpt-5.6-luna, two-formulation model- \
+               behaviour probe -- re-run it to see this build's current measurement. Steps 4-5 \
+               are not attempted regardless of what the probe measures: no NeedsInput mapping or \
+               answering path exists in this build, so ask stays false either way (§2.4's \
+               \"only if admitted\" scope). Recorded here rather than promoted: absence of a \
+               probe result under this launch grammar is not a measured negative of the tool's \
+               existence (§2.4's own outcome table, first bullet)",
+    },
+    AdmissionRow {
+        capability: "structured_output",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "NativeSchema",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Stable,
+        admission_test: "live_codex_output_schema_round_trips_on_both_transports",
+        note: "--output-schema <path>; re-measured for W3: DOES re-apply on `exec resume` \
+               (present in --help), correcting W1's own turn-1-only placeholder -- not a v1 \
+               flag; recorded here as adapter evidence only (§4.1)",
+    },
+    AdmissionRow {
+        capability: "structured_output",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "NativeSchema",
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_codex_output_schema_round_trips_on_both_transports",
+        note: "turn/start.outputSchema, every turn -- measured live with the spec's own \
+               discriminating control (an unschema'd run must not coincidentally match)",
+    },
+    AdmissionRow {
+        capability: "sandbox_enforcement",
+        transport: Transport::Exec,
+        claimed: true,
+        tier: "NativeOsSandbox(workspace-write)",
+        evidence: Evidence::LocallyMeasured,
+        stability: Stability::Stable,
+        // Spec §3.6 proposed `exec_first_turn_argv_carries_the_sandbox_and_
+        // extra_dirs` as this test's name; the implementation folded the
+        // same coverage into the pre-existing, extended
+        // `first_turn_argv_carries_the_measured_shape` instead of adding a
+        // second function under the spec's literal name. Naming the real
+        // function here keeps this citation resolvable.
+        admission_test: "first_turn_argv_carries_the_measured_shape",
+        note: "turn-1-only: exec resume has neither -s nor --add-dir on this build -- the \
+               composed-flags handshake is proven, enforcement itself is not (bwrap cannot \
+               initialize a network namespace on Cerberus, H0 §C.3 finding 4)",
+    },
+    AdmissionRow {
+        capability: "sandbox_enforcement",
+        transport: Transport::AppServer,
+        claimed: true,
+        tier: "NativeOsSandbox(workspace-write)",
+        // `LiveMeasured`, because what this row's note claims -- that the
+        // harness *accepts and echoes* the requested policy -- is a fact
+        // about the installed binary, and only the `#[ignore]`d,
+        // SERGEANT_CODEX_TESTS-gated test named below can establish it. The
+        // deterministic sibling (`appserver_thread_start_names_exactly_the_
+        // works_surfaces`) proves what this adapter *sends*, which is a
+        // different claim and not the one written here.
+        // `a_claimed_row_naming_a_live_test_is_labelled_live_measured` is the
+        // structural check that keeps the label and the citation from
+        // drifting apart again.
+        evidence: Evidence::LiveMeasured,
+        stability: Stability::Experimental,
+        admission_test: "live_appserver_thread_start_echoes_the_requested_policy",
+        note: "thread-scoped, holds for every turn (unlike exec's turn-1-only lapse) -- the \
+               harness accepts and echoes the requested policy naming exactly this Work's \
+               surfaces as writable roots; whether the OS sandbox actually denies an \
+               out-of-surface write could not be proven on this host for the same reason exec's \
+               row could not. Enforcement-claimed, not locally proven -- sergeant's own \
+               observation layer remains the source of truth for what a Work actually changed",
+    },
+];
+
+/// Render [`ADMISSION_ROWS`] into the plain-text table the wave PR body
+/// pastes verbatim (§2.7's three-outcome labelling) and the probe's own
+/// journaled detail carries. One line per row: capability, transport,
+/// claimed, tier, evidence, stability, the admission test (or a dash), then
+/// the note.
+fn render_admission_rows() -> String {
+    let mut out = String::from(
+        "capability | transport | claimed | tier | evidence | stability | admission_test | note\n",
+    );
+    for row in ADMISSION_ROWS {
+        out.push_str(&format!(
+            "{} | {} | {} | {} | {:?} | {:?} | {} | {}\n",
+            row.capability,
+            row.transport.as_str(),
+            row.claimed,
+            row.tier,
+            row.evidence,
+            row.stability,
+            if row.admission_test.is_empty() {
+                "-"
+            } else {
+                row.admission_test
+            },
+            row.note,
+        ));
+    }
+    out
 }
 
 // ------------------------------------------------------------------- probe
@@ -349,6 +943,28 @@ struct ProbeOutcome {
     version: Option<String>,
     provenance: Option<VersionProvenance>,
     auth: Option<AuthState>,
+}
+
+/// Outcome of W3's four app-server admission gates (§5.2), memoized
+/// alongside [`ProbeOutcome`].
+#[derive(Debug, Clone)]
+struct AppServerGates {
+    /// `Ok(())` when G1, G2 and G4 all passed. `Err` names the gate and why
+    /// (each message is prefixed `"G1: "`/`"G2: "`/`"G4: "`).
+    result: Result<(), String>,
+    /// G3: whether the installed protocol's scoped fingerprint disagreed
+    /// with [`codex_appserver::MEASURED_PROTOCOL_FINGERPRINT`] — provenance,
+    /// never a gate failure (R1). Only meaningful when `result` reached G3
+    /// (i.e. is not a G1 failure); `false` on a G1 failure, harmlessly.
+    stale: bool,
+}
+
+/// §5.2's resolved outcome for one registration — computed once, journaled,
+/// never revisited per execution (§5.3).
+#[derive(Debug, Clone)]
+struct TransportResolution {
+    transport: Transport,
+    detail: String,
 }
 
 /// Parse `"codex-cli 0.149.0"` into a comparable triple. The vendor token,
@@ -415,10 +1031,24 @@ struct LaunchConfig {
     codex_home: Option<PathBuf>,
 }
 
-/// Turn 1's argv, after `<executable>` (spec §3.2): `exec --json
-/// --skip-git-repo-check -C <cwd> [-m <model>]`. Prompt travels on stdin, no
-/// positional argument — see the module docs for why.
-fn first_turn_argv(cwd: &Path, model: Option<&str>) -> Vec<String> {
+/// Turn 1's argv, after `<executable>` (spec §3.2, updated by W3 §3.2/§3.6):
+/// `exec --json --skip-git-repo-check -C <cwd> [-m <model>] [--sandbox
+/// <value>] [--add-dir <path> ...]`. Prompt travels on stdin, no positional
+/// argument — see the module docs for why.
+///
+/// `sandbox`/`extra_dirs` are **turn-1-only** — `exec resume` has neither
+/// flag on this build (`resume_turn_argv` below), so enforcement lapses on
+/// turn 2 of an exec-transport conversation. That asymmetry is recorded, not
+/// routed around (W3 spec §3.2): a first turn is where a Work does most of
+/// its damage, and it is itself an argument for app-server as the resolved
+/// transport, where the policy is thread-scoped and holds for every turn.
+fn first_turn_argv(
+    cwd: &Path,
+    model: Option<&str>,
+    sandbox: SandboxChoice,
+    extra_dirs: &[PathBuf],
+    output_schema_path: Option<&Path>,
+) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
         "--json".to_string(),
@@ -430,6 +1060,18 @@ fn first_turn_argv(cwd: &Path, model: Option<&str>) -> Vec<String> {
         argv.push("-m".to_string());
         argv.push(model.to_string());
     }
+    if let Some(value) = sandbox.exec_value() {
+        argv.push("--sandbox".to_string());
+        argv.push(value.to_string());
+    }
+    for dir in extra_dirs {
+        argv.push("--add-dir".to_string());
+        argv.push(dir.to_string_lossy().into_owned());
+    }
+    if let Some(path) = output_schema_path {
+        argv.push("--output-schema".to_string());
+        argv.push(path.to_string_lossy().into_owned());
+    }
     argv
 }
 
@@ -440,7 +1082,17 @@ fn first_turn_argv(cwd: &Path, model: Option<&str>) -> Vec<String> {
 /// passed here: `exec resume` has no such flag on this build
 /// [measured-negative]; `Command::current_dir` is the only mechanism left,
 /// and is set on every spawn regardless of turn number.
-fn resume_turn_argv(thread_id: &str, model: Option<&str>) -> Vec<String> {
+///
+/// `output_schema_path` **does** re-apply here, unlike `sandbox`/`extra_dirs`
+/// above: `exec resume --help` on 0.149.0 lists `--output-schema` (and
+/// `-o`/`--output-last-message`) — re-measured while implementing W3, and a
+/// correction to W1's own "verify at implementation time" placeholder
+/// (spec §4.2). So `structured_output`'s exec row is **not** turn-1-only.
+fn resume_turn_argv(
+    thread_id: &str,
+    model: Option<&str>,
+    output_schema_path: Option<&Path>,
+) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
         "resume".to_string(),
@@ -451,6 +1103,10 @@ fn resume_turn_argv(thread_id: &str, model: Option<&str>) -> Vec<String> {
     if let Some(model) = model {
         argv.push("-m".to_string());
         argv.push(model.to_string());
+    }
+    if let Some(path) = output_schema_path {
+        argv.push("--output-schema".to_string());
+        argv.push(path.to_string_lossy().into_owned());
     }
     argv
 }
@@ -569,6 +1225,10 @@ enum Terminal {
         /// `error.message`, verbatim.
         message: String,
     },
+    /// **App-server only** (W3 spec §2.2): `turn/completed` itself carried
+    /// `turn.status == "interrupted"` — never constructed by exec's own
+    /// `ingest_line` (exec's stream has no wire shape that means this).
+    Interrupted,
 }
 
 /// The whole decoder: folds one turn's line-delimited JSON stream into
@@ -594,10 +1254,26 @@ struct TurnAccumulator {
     /// The most recent bare stream `error` line's message (§4.4) — evidence
     /// for the ambiguous-unknown case, never a terminal by itself.
     last_error: Option<String>,
-    /// `turn.completed`'s usage object, verbatim, when seen.
+    /// `turn.completed`'s usage object, verbatim, when seen. On app-server
+    /// this is populated from `thread/tokenUsage/updated` instead (§2.3) —
+    /// same field, two producers, one reader (OBSERVE's evidence string).
     usage: Option<Value>,
     /// This turn's terminal, if any.
     terminal: Terminal,
+    /// **App-server only**: method names archived-but-not-decoded at the
+    /// envelope level (`remoteControl/status/changed`,
+    /// `mcpServer/startupStatus/updated`, and the remaining ~60) — the same
+    /// "counted, never decoded" posture `unknown_items` gives exec's
+    /// unrecognized item types, just keyed by method instead of item type
+    /// since these notifications carry no item at all.
+    unknown_methods: Vec<String>,
+    /// **App-server only**: the most recent `turn.error.codexErrorInfo` (or
+    /// the standalone `error` notification's), when the harness supplied
+    /// one (§2.8). Kept separate from [`Terminal::Failed`]'s `message` field
+    /// rather than added to it, so exec's identical-looking `Failed{message}`
+    /// match arms elsewhere in this module need no change for a fact only
+    /// this transport can ever populate.
+    last_codex_error_info: Option<String>,
 }
 
 impl TurnAccumulator {
@@ -660,59 +1336,66 @@ impl TurnAccumulator {
 
     fn ingest_item(&mut self, item: Option<&Value>, started: bool, out: &mut Vec<NativeEvent>) {
         let Some(item) = item else { return };
-        let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        let item_id = item.get("id").cloned().unwrap_or(Value::Null);
-        match item_type {
-            "agent_message" => {
+        self.ingest_view(&exec_item_view(item), started, out);
+    }
+
+    /// The transport-agnostic half of item decoding (spec §1.6): everything
+    /// below reads only [`ItemView`], never a raw `Value` — so a second
+    /// transport needs nothing but its own `fn view(&Value) -> Option<
+    /// ItemView>` (here, always-`Some`; app-server's sibling in
+    /// `codex_appserver.rs` is the same shape) to reuse every line of this
+    /// function unchanged. This is the seam the W3 spec calls out by name:
+    /// "the event-producing code — which `NativeEvent` kinds, which payload
+    /// fields, the `is_error` rule, the `TOOL_OUTPUT_TAIL` truncation —
+    /// exists once."
+    fn ingest_view(&mut self, view: &ItemView, started: bool, out: &mut Vec<NativeEvent>) {
+        match &view.item_type {
+            ItemKind::AgentMessage => {
                 // No `item.started` for this type was ever observed on exec;
                 // emitting a partial assistant message on an unmeasured shape
-                // would double-count the completed one (§4.2).
+                // would double-count the completed one (§4.2). App-server
+                // *does* emit `item/started`/`item/agentMessage/delta` for
+                // this type, and §1.6 deliberately does not decode either —
+                // the caller (`ingest_appserver_notification`) never routes
+                // a started `agentMessage` or a delta line through this
+                // function at all, so `started` here is always `false` for
+                // this variant on both transports today; the guard stays as
+                // the structural invariant it always was.
                 if started {
                     return;
                 }
                 self.message_items += 1;
-                let text = item
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let text = view.text.clone().unwrap_or_default();
                 self.last_agent_message = Some(text.clone());
                 out.push(NativeEvent {
                     kind: KIND_CONVERSATION_ASSISTANT_COMPLETED.to_string(),
-                    payload: json!({"thread_id": self.thread_id, "text": text, "item_id": item_id}),
+                    payload: json!({"thread_id": self.thread_id, "text": text, "item_id": view.item_id}),
                 });
             }
             // §4.3: the *only* code path that produces `tool.*` events.
             // Nothing anywhere else in this decoder reads `agent_message`
             // text as evidence that a command ran.
-            "command_execution" => {
+            ItemKind::CommandExecution => {
                 if started {
                     out.push(NativeEvent {
                         kind: KIND_TOOL_REQUESTED.to_string(),
                         payload: json!({
-                            "id": item_id,
+                            "id": view.item_id,
                             "name": "command_execution",
-                            "input": {"command": item.get("command").cloned().unwrap_or(Value::Null)},
+                            "input": {"command": view.command.clone().unwrap_or(Value::Null)},
                         }),
                     });
                     return;
                 }
                 self.tool_items += 1;
-                let exit_code = item.get("exit_code").cloned().unwrap_or(Value::Null);
-                let status = item
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let exit_code = view.exit_code.clone().unwrap_or(Value::Null);
+                let status = view.status.clone().unwrap_or_default();
                 let is_error = exit_code.as_i64() != Some(0) || status != "completed";
-                let output = item
-                    .get("aggregated_output")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let output = view.aggregated_output.as_deref().unwrap_or("");
                 out.push(NativeEvent {
                     kind: KIND_TOOL_COMPLETED.to_string(),
                     payload: json!({
-                        "tool_use_id": item_id,
+                        "tool_use_id": view.item_id,
                         "is_error": is_error,
                         "exit_code": exit_code,
                         "status": status,
@@ -720,25 +1403,138 @@ impl TurnAccumulator {
                     }),
                 });
             }
-            "error" => {
+            ItemKind::Error => {
                 // Unobserved on `item.started`; the one measured instance was
                 // a warning on a turn that continued, never a terminal.
+                // App-server has no item-level `error` type at all (M9's 18
+                // variants do not include one) — this arm is exec-only in
+                // practice, kept on the shared type because nothing about it
+                // is exec-specific.
                 if !started {
-                    let message = item
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    let message = view.text.clone().unwrap_or_default();
                     out.push(NativeEvent {
                         kind: KIND_TURN_HARNESS_ERROR.to_string(),
-                        payload: json!({"phase": "item_error", "message": message, "item_id": item_id}),
+                        payload: json!({"phase": "item_error", "message": message, "item_id": view.item_id}),
                     });
                 }
             }
-            other => {
-                self.unknown_items.push(other.to_string());
+            ItemKind::Unknown(other) => {
+                self.unknown_items.push(other.clone());
             }
         }
+    }
+}
+
+/// Which of the decoder's four branches an item belongs to (spec §1.6). Every
+/// one of M9's other 14 app-server variants — `plan`, `reasoning`,
+/// `fileChange`, `mcpToolCall`, ... — lands in `Unknown`, named by its own
+/// wire string, and is counted, never decoded; so does every unrecognized
+/// exec item type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemKind {
+    AgentMessage,
+    CommandExecution,
+    /// Exec-only (§4.4): a bare `{"type":"error", ...}` item. App-server has
+    /// no item-level error variant among M9's 18.
+    Error,
+    /// Carries the item's own wire-level type string, for `unknown_items`.
+    Unknown(String),
+}
+
+/// One item, reduced to exactly the fields the decoder branches on (spec
+/// §1.6) — nothing here is transport-specific; each transport's own `fn
+/// view(&Value) -> ItemView` (`exec_item_view` below, `codex_appserver::
+/// appserver_item_view`) is the only place that ever reads a raw item's key
+/// spellings.
+#[derive(Debug, Clone)]
+struct ItemView {
+    item_type: ItemKind,
+    /// The item's own id, whatever shape it takes on the wire (always a
+    /// string on both transports, but carried as `Value` so a missing id
+    /// serializes as `null` rather than an invented string).
+    item_id: Value,
+    /// `agent_message.text` (exec) / `agentMessage.text` (app-server).
+    text: Option<String>,
+    /// `command_execution.command` (exec) / `commandExecution.command`
+    /// (app-server), carried as `Value` since a future shape could be
+    /// structured rather than a bare string and this decoder never
+    /// interprets it — only the event payload does.
+    command: Option<Value>,
+    /// `exit_code` (exec) / `exitCode` (app-server).
+    exit_code: Option<Value>,
+    /// `status` — same key on both transports.
+    status: Option<String>,
+    /// `aggregated_output` (exec) / `aggregatedOutput` (app-server).
+    aggregated_output: Option<String>,
+}
+
+impl ItemView {
+    fn unknown(kind: impl Into<String>, item_id: Value) -> Self {
+        Self {
+            item_type: ItemKind::Unknown(kind.into()),
+            item_id,
+            text: None,
+            command: None,
+            exit_code: None,
+            status: None,
+            aggregated_output: None,
+        }
+    }
+}
+
+/// Exec's own `fn view` (spec §1.6): `snake_case` keys, and an `"error"` item
+/// variant app-server does not have.
+fn exec_item_view(item: &Value) -> ItemView {
+    let item_id = item.get("id").cloned().unwrap_or(Value::Null);
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "agent_message" => ItemView {
+            item_type: ItemKind::AgentMessage,
+            item_id,
+            text: Some(
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            command: None,
+            exit_code: None,
+            status: None,
+            aggregated_output: None,
+        },
+        "command_execution" => ItemView {
+            item_type: ItemKind::CommandExecution,
+            item_id,
+            text: None,
+            command: Some(item.get("command").cloned().unwrap_or(Value::Null)),
+            exit_code: Some(item.get("exit_code").cloned().unwrap_or(Value::Null)),
+            status: Some(
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            aggregated_output: Some(
+                item.get("aggregated_output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+        },
+        "error" => ItemView {
+            item_type: ItemKind::Error,
+            item_id,
+            text: Some(
+                item.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            command: None,
+            exit_code: None,
+            status: None,
+            aggregated_output: None,
+        },
+        other => ItemView::unknown(other, item_id),
     }
 }
 
@@ -757,22 +1553,246 @@ enum TerminalOutcome {
         message: String,
     },
     /// No terminal arrived, but sergeant requested the kill: no conclusion
-    /// about the stage, the conversation stays resumable.
-    InterruptedRunning,
+    /// about the stage, the conversation stays resumable. Always *inferred*
+    /// from "we asked and nothing else arrived", never harness-confirmed —
+    /// and `via` records which of the three ways that inference was reached,
+    /// because OBSERVE's evidence string must name the one that actually
+    /// happened rather than the one that is easiest to write down.
+    InterruptedRunning { via: InterruptedVia },
+    /// **App-server only** (W3 spec §2.2): `turn/completed` itself carried
+    /// `turn.status == "interrupted"` — the harness *told* sergeant the turn
+    /// was interrupted, a first-class, harness-confirmed terminal, distinct
+    /// from [`TerminalOutcome::InterruptedRunning`]'s inference. Exec's
+    /// decoder never produces this arm: `Terminal` (exec's own accumulator
+    /// field) has no `Interrupted` variant, because exec's stream has no
+    /// wire shape that means it.
+    Interrupted,
     /// No terminal arrived and nobody asked for that: §5.2's ambiguity,
     /// fails closed.
     AmbiguousUnknown,
 }
 
-fn classify_terminal(acc: &TurnAccumulator, interrupted: bool) -> TerminalOutcome {
+/// How an [`TerminalOutcome::InterruptedRunning`] was arrived at. The three
+/// arms are three different *facts*, and the one OBSERVE reports has to be
+/// the one that happened: a single hardcoded sentence covering all three
+/// necessarily lies about two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptedVia {
+    /// Exec transport: there is no interrupt RPC to confirm anything with.
+    /// Sergeant killed the turn's process group and nothing else arrived.
+    ProcessKill,
+    /// App-server: `turn/interrupt` itself failed, and the adapter fell back
+    /// to the process-group kill (§2.2's downgrade).
+    RpcFailed,
+    /// App-server: `turn/interrupt` returned `Ok` — the harness accepted the
+    /// request — but the child's stdout closed before `turn/completed` could
+    /// carry the harness's own verdict. The routine STOP path lands here.
+    ClosedAfterAcknowledgedRpc,
+    /// App-server: the stream ended while `turn/interrupt` was still
+    /// outstanding — no answer to it was ever written — so neither of the two
+    /// above is known to be what happened. The honest third answer, and a
+    /// narrow one: an answer that *did* arrive is recorded on the reader
+    /// thread as it is decoded (`InboundLine::Resolved`), ahead of the EOF
+    /// that settles the turn, so "the child answered and then died" never
+    /// lands here.
+    RpcUnresolved,
+}
+
+/// How far `turn/interrupt` has got for the turn currently in flight. Kept
+/// on the cell (not inferred at settlement) because the settlement can
+/// happen on the reader thread at any moment, including between the RPC
+/// being sent and its answer arriving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum InterruptProgress {
+    /// Nobody has asked for this turn to stop.
+    #[default]
+    NotRequested,
+    /// `turn/interrupt` is in flight under this JSON-RPC id; it has not
+    /// resolved either way. The id is carried so that the *reader* thread can
+    /// recognise the answer when it decodes it and mark the outcome there —
+    /// the only thread whose marks are guaranteed to precede the EOF that
+    /// settles the turn.
+    Requested { id: u64 },
+    /// The harness answered `turn/interrupt` with a result.
+    Acknowledged,
+    /// `turn/interrupt` itself failed; the process-group kill is the
+    /// fallback. **Written before the kill is issued**, never after: the
+    /// kill is what ends the child's stdout, and the EOF that follows is
+    /// what settles the turn, so a mark made afterwards would routinely
+    /// arrive at a cell that had already recorded the wrong path.
+    RpcFailed,
+}
+
+impl InterruptProgress {
+    /// Record what the reader thread just decoded as the answer to request
+    /// `id`, but only if that is the request this cell is actually waiting on.
+    /// Anything else — a different request's answer, a turn whose interrupt
+    /// already resolved, a turn nobody interrupted — leaves the cell alone.
+    fn resolve(&mut self, id: u64, ok: bool) {
+        if matches!(*self, InterruptProgress::Requested { id: mine } if mine == id) {
+            *self = if ok {
+                InterruptProgress::Acknowledged
+            } else {
+                InterruptProgress::RpcFailed
+            };
+        }
+    }
+
+    /// Whether this turn's interrupt is still worth actually asking the
+    /// harness for: only `NotRequested` (nobody has asked) or `RpcFailed`
+    /// (the last ask never got an honest answer, one way or the other) mean
+    /// that. `Requested { .. }` (an ask is already outstanding) and
+    /// `Acknowledged` (an ask already got the honest answer) both mean a
+    /// repeat call has nothing to add -- and, just as importantly, must not
+    /// overwrite either of them with a fresh, untracked `Requested`: doing so
+    /// is how a turn the harness genuinely acknowledged could end up
+    /// settling as if nothing had ever answered it, merely because *this*
+    /// call's own redundant RPC went unanswered.
+    fn worth_asking_again(&self) -> bool {
+        matches!(
+            self,
+            InterruptProgress::NotRequested | InterruptProgress::RpcFailed
+        )
+    }
+}
+
+/// Fold one turn's stream evidence plus the interrupt request, if any, into
+/// its outcome. `interrupt` is `None` when nobody asked for the kill; when
+/// somebody did, it names *how* the asking went, which is the only thing
+/// that separates the two honest sentences for the same outcome.
+fn classify_terminal(acc: &TurnAccumulator, interrupt: Option<InterruptedVia>) -> TerminalOutcome {
     match &acc.terminal {
         Terminal::Completed => TerminalOutcome::Completed,
         Terminal::Failed { message } => TerminalOutcome::Failed {
             message: message.clone(),
         },
-        Terminal::None if interrupted => TerminalOutcome::InterruptedRunning,
-        Terminal::None => TerminalOutcome::AmbiguousUnknown,
+        // App-server only (§2.2): the harness itself said the turn ended
+        // interrupted, whether or not sergeant asked — a first-class
+        // terminal, never inferred the way `InterruptedRunning` below is.
+        Terminal::Interrupted => TerminalOutcome::Interrupted,
+        Terminal::None => match interrupt {
+            Some(via) => TerminalOutcome::InterruptedRunning { via },
+            None => TerminalOutcome::AmbiguousUnknown,
+        },
     }
+}
+
+/// One settled outcome's stable, snake_case name — the string the journal
+/// carries, kept out of `{:?}` so a payload consumer is not reading a
+/// derived Debug rendering that changes shape whenever a field is added.
+fn terminal_outcome_label(outcome: &TerminalOutcome) -> &'static str {
+    match outcome {
+        TerminalOutcome::Completed => "completed",
+        TerminalOutcome::Failed { .. } => "failed",
+        TerminalOutcome::InterruptedRunning { .. } => "interrupted_running",
+        TerminalOutcome::Interrupted => "interrupted",
+        TerminalOutcome::AmbiguousUnknown => "ambiguous_unknown",
+    }
+}
+
+/// Everything one settled app-server turn owes its journal and OBSERVE.
+/// Returned by [`settle_appserver_turn`] so that a caller which settles a
+/// turn cannot end up holding *less* than the `turn/completed` path holds:
+/// the fail-closed routes used to drop the accumulator on the floor and
+/// journal a bare `harness_error`, which is how "every turn ends with
+/// `conversation.turn.ended`, however it ended" became true of one route and
+/// false of the others.
+#[derive(Debug, Clone)]
+struct AppServerSettlement {
+    outcome: TerminalOutcome,
+    thread_id: Option<String>,
+    interrupted: bool,
+    message_items: u32,
+    tool_items: u32,
+    unknown_items: Vec<String>,
+    unknown_methods: Vec<String>,
+    usage: Option<Value>,
+}
+
+impl AppServerSettlement {
+    /// This settlement's `conversation.turn.ended` payload — one shape for
+    /// every route, so the fail-closed ones cannot drift from the happy one.
+    /// No `raw`/`raw_error` keys: unlike exec, this transport archives no
+    /// per-turn blob (there is no per-turn stream to archive — one child
+    /// carries every turn), and inventing a null-valued key would read as
+    /// "the archive failed" rather than "there is no archive here".
+    fn turn_ended_payload(&self) -> Value {
+        json!({
+            "thread_id": self.thread_id,
+            "interrupted": self.interrupted,
+            "outcome": terminal_outcome_label(&self.outcome),
+            "message_items": self.message_items,
+            "tool_items": self.tool_items,
+            "unknown_items": self.unknown_items,
+            "unknown_methods": self.unknown_methods,
+        })
+    }
+}
+
+/// The **one** place an app-server turn ever becomes `Finished`. Takes an
+/// already-locked cell; settles it if (and only if) it is `InFlight`, and
+/// hands back the facts both the journal and OBSERVE read from. `None` means
+/// there was nothing in flight to settle, which is what makes every caller
+/// idempotent and safe to race: the reader thread's own EOF handling, the
+/// `turn/completed` handler, and `interrupt_appserver`'s RPC-failure
+/// fallback all funnel through here, and the first one to arrive decides.
+fn settle_appserver_turn(state: &mut AppServerTurnState) -> Option<AppServerSettlement> {
+    let AppServerTurnState::InFlight { interrupt, .. } = &*state else {
+        return None;
+    };
+    let interrupted = *interrupt != InterruptProgress::NotRequested;
+    let via = match interrupt {
+        InterruptProgress::NotRequested => None,
+        InterruptProgress::Requested { .. } => Some(InterruptedVia::RpcUnresolved),
+        InterruptProgress::Acknowledged => Some(InterruptedVia::ClosedAfterAcknowledgedRpc),
+        InterruptProgress::RpcFailed => Some(InterruptedVia::RpcFailed),
+    };
+    let taken = std::mem::replace(state, AppServerTurnState::Idle);
+    let AppServerTurnState::InFlight { acc, turn_id, .. } = taken else {
+        unreachable!("just matched InFlight above");
+    };
+    let outcome = classify_terminal(&acc, via);
+    *state = AppServerTurnState::Finished {
+        turn_id,
+        outcome: outcome.clone(),
+        last_agent_message: acc.last_agent_message.clone(),
+        message_items: acc.message_items,
+        tool_items: acc.tool_items,
+        unknown_items: acc.unknown_items.clone(),
+        unknown_methods: acc.unknown_methods.clone(),
+        last_codex_error_info: acc.last_codex_error_info.clone(),
+        last_error: acc.last_error.clone(),
+        late: LateEvidence::default(),
+    };
+    Some(AppServerSettlement {
+        outcome,
+        thread_id: acc.thread_id,
+        interrupted,
+        message_items: acc.message_items,
+        tool_items: acc.tool_items,
+        unknown_items: acc.unknown_items,
+        unknown_methods: acc.unknown_methods,
+        usage: acc.usage,
+    })
+}
+
+/// Fail closed (§3.4 point 3 / §15's invariant): if a turn is `InFlight` with
+/// no confirmation it ever reached a terminal, settle it — through the same
+/// [`settle_appserver_turn`] the `turn/completed` handler uses, so a turn
+/// that was interrupted (even by the process-group-kill fallback when
+/// `turn/interrupt` itself failed) still resolves to `InterruptedRunning`
+/// rather than `AmbiguousUnknown`, exactly the distinction exec's own decoder
+/// draws. Returns the settlement, or `None` if there was no in-flight turn to
+/// close — idempotent, so it is safe to call from more than one place without
+/// double-finalizing: the reader thread's own EOF handling and
+/// `interrupt_appserver`'s RPC-failure fallback both call this, because
+/// killing the child's process group ends its stdout on its own accord too,
+/// and the two must not race each other into two different outcomes.
+fn fail_closed_appserver_turn(
+    turn_cell: &Mutex<AppServerTurnState>,
+) -> Option<AppServerSettlement> {
+    let mut state = turn_cell.lock().expect("appserver turn lock");
+    settle_appserver_turn(&mut state)
 }
 
 // ----------------------------------------------------------------- liveness
@@ -935,6 +1955,396 @@ enum TurnState {
     Finished(Box<TurnOutcome>),
 }
 
+/// Which transport one execution runs on, and that transport's own runtime
+/// (W3 spec §1.4/§5). `Exec`-transport executions keep using
+/// [`CodexExecution`]'s own `turn`/`turn_pgid`/`reader` fields exactly as
+/// before this wave; app-server executions carry their entire runtime here
+/// instead, because the two transports' lifecycles do not share a shape
+/// (one process per turn vs. one child for the whole execution).
+#[derive(Debug)]
+enum CodexTransportState {
+    Exec,
+    AppServer(Arc<AppServerRuntime>),
+}
+
+/// One app-server execution's runtime: the long-lived child (§1.4) plus its
+/// current-or-last turn, mutated by the reader thread's own callback
+/// ([`appserver_on_line`]) and read from OBSERVE/SEND/INTERRUPT on any
+/// thread.
+#[derive(Debug)]
+struct AppServerRuntime {
+    child: Mutex<codex_appserver::AppServerChild>,
+    /// `Arc`-wrapped rather than a bare `Mutex` because the reader thread's
+    /// own callback (`appserver_on_line`, `'static`, spawned before this
+    /// struct exists) holds an independent clone of the same cell — the
+    /// callback is what constructs the very first `AppServerTurnState`, one
+    /// step before `AppServerRuntime` itself is assembled.
+    turn: Arc<Mutex<AppServerTurnState>>,
+    /// `thread/start`'s own result, verbatim (§3.1/§3.6) — set once at
+    /// LAUNCH and never mutated again, so no lock is needed to read it.
+    /// Exists so a test can assert the wire evidence a `claimed: true`
+    /// `sandbox_enforcement`/`model_selection` row is credited with, the
+    /// same diagnostic-seam posture as [`CodexBackend::tracked_executions`].
+    policy_echo: Value,
+    /// Mints [`AppServerTurnState::InFlight::epoch`]. Monotonic for this
+    /// runtime's whole life, never reset, so no two `turn/start` attempts
+    /// can ever mistake each other's cell for their own.
+    turn_epochs: AtomicU64,
+}
+
+/// One execution's current-or-last turn on the app-server transport.
+#[derive(Debug)]
+enum AppServerTurnState {
+    /// No turn has ever been sent. Transient in practice — LAUNCH always
+    /// sends turn 1 as part of the same call that registers the execution —
+    /// kept as a real variant rather than assumed away, the same posture
+    /// `TurnState::Unlaunched` takes on the exec side.
+    Idle,
+    /// A turn is in flight. `turn_id` is briefly empty (spec's own ordering
+    /// caveat, §1.5.1: a notification may race ahead of `turn/start`'s own
+    /// response) — the accumulator exists and accepts notifications from the
+    /// moment this variant is set, *before* `turn/start` is even written, so
+    /// nothing racing ahead of the id is ever silently dropped.
+    InFlight {
+        turn_id: String,
+        acc: TurnAccumulator,
+        /// How far this turn's `turn/interrupt` has got — the request bit
+        /// and the RPC's fate in one field, recorded as each step happens so
+        /// the settlement can name the path rather than guess at it.
+        interrupt: InterruptProgress,
+        /// Which `turn/start` attempt owns this cell. `appserver_send_turn`
+        /// stamps it before writing the request and compares it before
+        /// touching the cell again: by the time a failed `turn/start`
+        /// returns, the cell may already have been settled by the reader
+        /// thread (a dead child) or replaced by a later turn, and a blind
+        /// write-back would erase a terminal the adapter had already
+        /// journaled. Never reused: a monotonic counter per runtime.
+        epoch: u64,
+        /// The turn id [`AppServerRuntime::turn`] held just before this one
+        /// replaced it, if that turn ever got one (`""` when the previous
+        /// state was [`AppServerTurnState::Idle`], or a settled turn whose
+        /// `turn/start` never got far enough to learn its id). Lets a
+        /// notification that names this id, arriving after this cell already
+        /// moved on, be recognised as a straggler from the turn *this one
+        /// displaced* rather than folded into `acc` as if it were this turn's
+        /// own evidence -- the failure mode the "displacement" tests only
+        /// cover for a straggler that arrives *before* the displacement,
+        /// never one that arrives during the new turn's own `InFlight`
+        /// window.
+        superseded_turn_id: String,
+    },
+    /// The last turn's terminal, plus the evidence OBSERVE reports.
+    Finished {
+        /// This turn's own id, carried forward so a later `InFlight` that
+        /// displaces this `Finished` can name it as `superseded_turn_id` and
+        /// keep recognising its stragglers even after the cell moves on.
+        turn_id: String,
+        outcome: TerminalOutcome,
+        last_agent_message: Option<String>,
+        message_items: u32,
+        tool_items: u32,
+        unknown_items: Vec<String>,
+        unknown_methods: Vec<String>,
+        last_codex_error_info: Option<String>,
+        /// The last stream `error`/warning message this turn carried (§4.4),
+        /// kept for the ambiguous terminal's evidence: it is often the only
+        /// thing that says *why* the turn never reached one.
+        last_error: Option<String>,
+        /// What arrived on this thread after the turn was already settled.
+        late: LateEvidence,
+    },
+}
+
+/// Notifications that arrived for a turn that was already settled (§3.4's
+/// ordering caveat, from the other end): the settlement is final — nothing
+/// here ever re-decides an outcome — but a line that arrives late is still
+/// evidence, and dropping it silently is how a genuine `turn/completed`
+/// buffered behind a fail-closed settlement used to vanish without trace.
+#[derive(Debug, Clone, Default)]
+struct LateEvidence {
+    /// How many post-settlement notifications arrived.
+    lines: u32,
+    /// Which methods, deduplicated and capped — a summary, not a second
+    /// unbounded journal.
+    methods: Vec<String>,
+    /// Whether a real terminal (`turn/completed`) was among them.
+    terminal_seen: bool,
+    /// Whether that terminal has already been journaled on arrival, so the
+    /// immediate report fires once rather than once per late terminal.
+    terminal_reported: bool,
+}
+
+/// How many distinct late method names are kept before the summary stops
+/// growing (`lines` keeps counting either way).
+const LATE_EVIDENCE_METHOD_CAP: usize = 8;
+
+impl LateEvidence {
+    /// Record one post-settlement notification. Returns the payload of the
+    /// report that must be journaled *now* rather than at end of stream —
+    /// only for the first real terminal, the one line whose silent loss
+    /// would mean the journal disagrees with what the harness actually said.
+    fn record(&mut self, method: &str, settled_as: &TerminalOutcome) -> Option<Value> {
+        self.lines = self.lines.saturating_add(1);
+        if self.methods.len() < LATE_EVIDENCE_METHOD_CAP
+            && !self.methods.iter().any(|seen| seen == method)
+        {
+            self.methods.push(method.to_string());
+        }
+        if method != "turn/completed" {
+            return None;
+        }
+        self.terminal_seen = true;
+        if self.terminal_reported {
+            return None;
+        }
+        self.terminal_reported = true;
+        Some(json!({
+            "phase": "post_settlement_terminal",
+            "method": method,
+            "settled_as": terminal_outcome_label(settled_as),
+            "detail": "a real terminal arrived after this turn was already settled; \
+                       the settled outcome stands (a turn is never re-settled) and the \
+                       terminal is recorded here rather than dropped",
+        }))
+    }
+
+    /// The end-of-stream summary, or `None` when nothing arrived late.
+    fn summary(&self) -> Option<Value> {
+        (self.lines > 0).then(|| {
+            json!({
+                "phase": "post_settlement_lines",
+                "lines": self.lines,
+                "methods": self.methods,
+                "terminal_seen": self.terminal_seen,
+                "capped": self.methods.len() >= LATE_EVIDENCE_METHOD_CAP,
+            })
+        })
+    }
+}
+
+/// Owned context for the app-server reader-thread callback (spec §1.4):
+/// exactly what `TurnReader` owns for the exec transport, minus everything
+/// that lives on `AppServerRuntime` instead (the callback is `'static` and
+/// cannot borrow `&CodexBackend`).
+struct AppServerLineContext {
+    sink: Option<EventSink>,
+    execution_id: String,
+    work_id: String,
+    model: Option<String>,
+}
+
+impl AppServerLineContext {
+    fn emit(&self, kind: &str, payload: Value) {
+        if let Some(sink) = &self.sink {
+            sink(EventDraft {
+                source: EventSource::new("backend", CODEX_BACKEND_NAME),
+                workspace_id: None,
+                work_id: Some(self.work_id.clone()),
+                execution_id: Some(self.execution_id.clone()),
+                correlation_id: Some(self.execution_id.clone()),
+                causation_id: None,
+                kind: kind.to_string(),
+                payload,
+            });
+        }
+    }
+}
+
+/// The turn identity one app-server notification's envelope carries, when it
+/// carries one at all (spec §1.6's wire table). `turn/completed` nests it
+/// under `turn.id`; every other per-turn notification (`item/started`,
+/// `item/completed`, `thread/tokenUsage/updated`, the standalone `error`,
+/// ...) carries a flat `turnId` alongside its `threadId`. `thread/started`
+/// and the connection-level warning methods carry neither, and `None` here
+/// is read as "cannot be identified as a straggler" rather than "definitely
+/// belongs to the current turn" — the existing accept-when-unsure posture
+/// [`AppServerTurnState::InFlight`]'s own doc describes for the empty-
+/// `turn_id` window is left exactly as permissive as it was.
+fn notification_turn_id<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    if method == "turn/completed" {
+        params.pointer("/turn/id").and_then(Value::as_str)
+    } else {
+        params.get("turnId").and_then(Value::as_str)
+    }
+}
+
+/// The reader-thread callback every app-server child runs (spec §1.4/§3.4):
+/// decodes notifications through the shared [`TurnAccumulator`], emits their
+/// events immediately, finalizes the turn on `turn/completed`, and answers
+/// every server request — the non-hang guarantee, kept alive on the same
+/// thread that saw the request, never deferred to a second round trip.
+fn appserver_on_line(
+    ctx: &AppServerLineContext,
+    turn_cell: &Mutex<AppServerTurnState>,
+    handle: &codex_appserver::AppServerHandle,
+    line: codex_appserver::InboundLine,
+) {
+    match line {
+        codex_appserver::InboundLine::Notification { method, params } => {
+            let mut state = turn_cell.lock().expect("appserver turn lock");
+            let mut late_report = None;
+            let mut stray = false;
+            let events = match &mut *state {
+                AppServerTurnState::InFlight {
+                    acc,
+                    turn_id,
+                    superseded_turn_id,
+                    ..
+                } => {
+                    // A notification that names the turn this cell's own
+                    // `turn/start` *displaced* — never this cell's own turn,
+                    // and only when that displaced id is actually known — is
+                    // a straggler from the previous turn arriving inside the
+                    // new one's `InFlight` window, not evidence about the new
+                    // turn. Folding it into `acc` used to be how a stray
+                    // `turn/completed{status:"failed"}` for the old turn
+                    // could stamp `Terminal::Failed` onto a turn that never
+                    // failed; recognising it here instead of unconditionally
+                    // ingesting keeps this turn's own accumulator honest.
+                    stray = !superseded_turn_id.is_empty()
+                        && notification_turn_id(&method, &params)
+                            .is_some_and(|id| id == superseded_turn_id && id != turn_id.as_str());
+                    if stray {
+                        Vec::new()
+                    } else {
+                        acc.ingest_appserver_notification(&method, &params)
+                    }
+                }
+                // §3.4, from the far end: this turn is already settled, and
+                // nothing that arrives now re-decides it. What it must not do
+                // is disappear — a buffered `turn/completed` behind a
+                // fail-closed settlement is exactly the line whose silent
+                // loss makes the journal disagree with the harness.
+                AppServerTurnState::Finished { late, outcome, .. } => {
+                    late_report = late.record(&method, outcome);
+                    Vec::new()
+                }
+                // No turn has ever been started on this thread, or the last
+                // `turn/start` failed before the harness acknowledged one.
+                // There is no turn for these lines to be evidence *about*,
+                // which is why they are not tallied the way a settled turn's
+                // late lines are.
+                AppServerTurnState::Idle => Vec::new(),
+            };
+            for event in &events {
+                ctx.emit(&event.kind, event.payload.clone());
+            }
+            // A stray `turn/completed` for the displaced turn must not
+            // settle *this* one — that would be the ceiling case above, one
+            // step further: the new turn's evidence has already been kept
+            // clean of it, and letting it trigger settlement anyway would
+            // finalize a turn that is still genuinely running.
+            let settlement = (method == "turn/completed" && !stray)
+                .then(|| settle_appserver_turn(&mut state))
+                .flatten();
+            drop(state);
+            if stray {
+                ctx.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({
+                        "phase": "stray_notification_for_superseded_turn",
+                        "method": method,
+                    }),
+                );
+            }
+            if let Some(payload) = late_report {
+                ctx.emit(KIND_TURN_HARNESS_ERROR, payload);
+            }
+            if let Some(settlement) = settlement {
+                ctx.emit(
+                    KIND_CONVERSATION_TURN_ENDED,
+                    settlement.turn_ended_payload(),
+                );
+                if let Some(usage) = &settlement.usage {
+                    ctx.emit(
+                        KIND_USAGE_UPDATED,
+                        json!({
+                            "thread_id": settlement.thread_id,
+                            "usage": usage,
+                            "model_pin": model_pin_evidence(ctx.model.as_deref()),
+                        }),
+                    );
+                }
+            }
+        }
+        codex_appserver::InboundLine::ServerRequest { id, method, params } => {
+            // §3.4: every server request is answered, without exception —
+            // `ask` stays structurally `false` (see `ADMISSION_ROWS`), so
+            // this is always the "otherwise" branch of §2.4's conditional.
+            let answered = codex_appserver::answer_for_request(&method, false);
+            let _ = handle.answer(&id, answered.answer);
+            if let Some(phase) = answered.journal_phase {
+                let mut payload = json!({"phase": phase, "method": method});
+                if method == "item/tool/requestUserInput" {
+                    // §2.4 step 3's own wire evidence, carried into the
+                    // journal even though `ask` stays declined here: the
+                    // live admission probe (`live_appserver_actor_authored_
+                    // question_is_typed`) reads these back to prove the
+                    // request it caught actually named a non-empty question
+                    // set for the in-flight turn, not just that *a* request
+                    // arrived.
+                    payload["questions"] = params.get("questions").cloned().unwrap_or(Value::Null);
+                    payload["turn_id"] = params.get("turnId").cloned().unwrap_or(Value::Null);
+                }
+                ctx.emit(KIND_TURN_HARNESS_ERROR, payload);
+            }
+        }
+        // One of this client's own requests has been answered. The only one
+        // whose fate the turn cell tracks is `turn/interrupt`, and it is
+        // tracked *here* rather than where the answer is awaited because the
+        // awaiting thread is woken by a channel and then has to race this one
+        // for the cell — a race it loses on exactly the child this matters
+        // for, one that answers the interrupt and dies in the same breath.
+        codex_appserver::InboundLine::Resolved { id, ok } => {
+            if let AppServerTurnState::InFlight { interrupt, .. } =
+                &mut *turn_cell.lock().expect("appserver turn lock")
+            {
+                interrupt.resolve(id, ok);
+            }
+        }
+        codex_appserver::InboundLine::Unparsed => {}
+        codex_appserver::InboundLine::Eof => {
+            if let Some(settlement) = fail_closed_appserver_turn(turn_cell) {
+                ctx.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({
+                        "phase": "child_exited_mid_turn",
+                        "outcome": terminal_outcome_label(&settlement.outcome),
+                    }),
+                );
+                // §3.5's invariant, which exec's own finalizer states in
+                // one line ("every turn ends with this event, however it
+                // ended") and which this route used to be the exception to.
+                ctx.emit(
+                    KIND_CONVERSATION_TURN_ENDED,
+                    settlement.turn_ended_payload(),
+                );
+                if let Some(usage) = &settlement.usage {
+                    ctx.emit(
+                        KIND_USAGE_UPDATED,
+                        json!({
+                            "thread_id": settlement.thread_id,
+                            "usage": usage,
+                            "model_pin": model_pin_evidence(ctx.model.as_deref()),
+                        }),
+                    );
+                }
+            }
+            // End of stream is when the last settled turn's post-settlement
+            // tally is final, so it is where that turn's summary goes. The
+            // other exit is `appserver_send_turn`, for a turn whose cell a
+            // later turn overwrites before the stream ever ends.
+            let summary = match &*turn_cell.lock().expect("appserver turn lock") {
+                AppServerTurnState::Finished { late, .. } => late.summary(),
+                AppServerTurnState::Idle | AppServerTurnState::InFlight { .. } => None,
+            };
+            if let Some(summary) = summary {
+                ctx.emit(KIND_TURN_HARNESS_ERROR, summary);
+            }
+        }
+    }
+}
+
 /// Adapter-side record of one execution (one durable codex thread).
 #[derive(Debug)]
 struct CodexExecution {
@@ -954,6 +2364,12 @@ struct CodexExecution {
     /// since `--add-dir` is never composed and this is the signal a future
     /// enforcement mapping (W3) would need.
     bindings_outside_cwd: Vec<PathBuf>,
+    /// W3 §3.3: the sandbox policy this execution's turns compose. Resolved
+    /// once at LAUNCH/RESUME from `CodexConfig.sandbox` and carried here so
+    /// SEND's later turns compose the same policy the first one did (never
+    /// re-read from a config that might have changed under a long-lived
+    /// daemon).
+    sandbox: SandboxChoice,
     turns: u32,
     turn: TurnState,
     /// The process group id of the most recent turn, recorded at **spawn**
@@ -974,6 +2390,12 @@ struct CodexExecution {
     stopped: bool,
     interrupt_requested: bool,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Which transport this execution runs on (W3 §5). `Exec` for every
+    /// execution this wave's predecessor could produce; `AppServer` only
+    /// when this registration resolved to that transport (§5.2/§5.3) — a
+    /// re-adopted execution (RESUME) is always `Exec`, even if it was
+    /// originally launched on app-server (§5.4).
+    transport_state: CodexTransportState,
 }
 
 #[derive(Debug, Default)]
@@ -1010,6 +2432,18 @@ enum FirstTurnSignal {
 pub struct CodexBackend {
     config: CodexConfig,
     probe_outcome: OnceLock<ProbeOutcome>,
+    /// The four app-server admission gates (W3 spec §5.2), memoized exactly
+    /// as `probe_outcome` is: G4 spawns a real (bounded, token-free) process,
+    /// so this happens once per daemon lifetime, not once per PROBE call.
+    appserver_gates: OnceLock<AppServerGates>,
+    /// Which transport this registration resolved to (§5.2/§5.3) — computed
+    /// once, journaled, and never revisited per execution.
+    transport_resolution: OnceLock<TransportResolution>,
+    /// `CodexConfig.output_schema`, materialized to a file under `data_dir`
+    /// once (§4.2) — every execution this backend launches on the exec
+    /// transport shares the one file, since the schema is backend-config-
+    /// level, not per-execution.
+    output_schema_path: OnceLock<Option<PathBuf>>,
     state: Arc<Mutex<AdapterState>>,
     sink: Mutex<Option<EventSink>>,
 }
@@ -1029,6 +2463,9 @@ impl CodexBackend {
         Self {
             config,
             probe_outcome: OnceLock::new(),
+            appserver_gates: OnceLock::new(),
+            transport_resolution: OnceLock::new(),
+            output_schema_path: OnceLock::new(),
             state: Arc::new(Mutex::new(AdapterState::default())),
             sink: Mutex::new(None),
         }
@@ -1045,6 +2482,25 @@ impl CodexBackend {
         self.lock().executions.keys().cloned().collect()
     }
 
+    /// `thread/start`'s own result, verbatim, for an execution running (or
+    /// that ran) on the app-server transport — `None` on exec, where no such
+    /// echo exists, and `None` for an execution id this adapter does not
+    /// hold. The diagnostic seam spec §3.6's live admission test needs: the
+    /// wire evidence a `sandbox_enforcement`/`model_selection` row is
+    /// credited with (`result.sandbox.type`, `.writableRoots`, `.cwd`,
+    /// `.approvalPolicy`, `.model`) is otherwise unreachable from outside
+    /// this module, since `codex_appserver::AppServerChild` stays
+    /// `pub(super)` (§1.5's own visibility rule) rather than being widened
+    /// just so a test could hold one directly.
+    pub fn appserver_policy_echo(&self, handle: &ExecutionHandle) -> Option<Value> {
+        let state = self.lock();
+        let execution = state.executions.get(&handle.execution_id)?;
+        match &execution.transport_state {
+            CodexTransportState::AppServer(runtime) => Some(runtime.policy_echo.clone()),
+            CodexTransportState::Exec => None,
+        }
+    }
+
     /// `$CODEX_HOME`: config override, else the environment variable, else
     /// `~/.codex`.
     fn codex_home(&self) -> PathBuf {
@@ -1056,6 +2512,25 @@ impl CodexBackend {
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
         PathBuf::from(home).join(".codex")
+    }
+
+    /// The exec transport's own materialization of `CodexConfig.output_
+    /// schema` (spec §4.2): written once to `<data_dir>/codex-output-schema.
+    /// json`, `None` when no schema is configured. A write failure is
+    /// treated as "no schema" rather than a launch failure — this feature is
+    /// adapter-local evidence with no contract row (§4.1), so a filesystem
+    /// problem here must not turn into a refused Work.
+    fn output_schema_path(&self) -> Option<&Path> {
+        self.output_schema_path
+            .get_or_init(|| {
+                let schema = self.config.output_schema.as_ref()?;
+                let path = self.config.data_dir.join("codex-output-schema.json");
+                match serde_json::to_vec(schema).map(|bytes| std::fs::write(&path, bytes)) {
+                    Ok(Ok(())) => Some(path),
+                    _ => None,
+                }
+            })
+            .as_deref()
     }
 
     /// A bounded, depth-capped walk of `<codex_home>/sessions/**` for a file
@@ -1297,6 +2772,196 @@ impl CodexBackend {
         }
     }
 
+    // ---------------------------------------------- W3 §5.2: transport gates
+
+    /// The four app-server admission gates, run once and cached.
+    fn appserver_gates(&self) -> &AppServerGates {
+        self.appserver_gates
+            .get_or_init(|| self.run_appserver_gates())
+    }
+
+    fn run_appserver_gates(&self) -> AppServerGates {
+        if let Err(reason) = self.gate_g1_help() {
+            return AppServerGates {
+                result: Err(reason),
+                stale: false,
+            };
+        }
+        let stale = match self.gate_g2_g3_fingerprint() {
+            Ok(stale) => stale,
+            Err(reason) => {
+                return AppServerGates {
+                    result: Err(reason),
+                    stale: false,
+                };
+            }
+        };
+        if let Err(reason) = self.gate_g4_handshake() {
+            return AppServerGates {
+                result: Err(reason),
+                stale,
+            };
+        }
+        AppServerGates {
+            result: Ok(()),
+            stale,
+        }
+    }
+
+    /// G1: `codex app-server --help` exits 0 and its `--listen` line offers
+    /// `stdio://`. Token-free.
+    fn gate_g1_help(&self) -> Result<(), String> {
+        let exe = &self.config.executable;
+        let out = Command::new(exe)
+            .args(["app-server", "--help"])
+            .output()
+            .map_err(|e| format!("G1: cannot run {exe:?} app-server --help: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "G1: {exe:?} app-server --help exited {:?}",
+                out.status.code()
+            ));
+        }
+        let help = String::from_utf8_lossy(&out.stdout);
+        if !help.contains("stdio://") {
+            return Err("G1: app-server --help does not offer a stdio:// transport".to_string());
+        }
+        Ok(())
+    }
+
+    /// G2/G3: `generate-json-schema` succeeds, every pinned file exists, and
+    /// the scoped fingerprint is computed. Returns whether it is *stale*
+    /// (mismatched against [`codex_appserver::MEASURED_PROTOCOL_FINGERPRINT`])
+    /// — never a gate failure by itself (R1): staleness is provenance,
+    /// folded into the probe detail, not a refusal. Token-free, ~50ms
+    /// (M7/re-measured while authoring this wave).
+    fn gate_g2_g3_fingerprint(&self) -> Result<bool, String> {
+        let exe = &self.config.executable;
+        let scratch = self.config.data_dir.join(".codex-appserver-schema-probe");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let out = Command::new(exe)
+            .args(["app-server", "generate-json-schema", "--out"])
+            .arg(&scratch)
+            .arg("--experimental")
+            .output()
+            .map_err(|e| format!("G2: cannot run {exe:?} app-server generate-json-schema: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "G2: generate-json-schema exited {:?}",
+                out.status.code()
+            ));
+        }
+        for file in codex_appserver::PINNED_SCHEMA_FILES {
+            if !scratch.join(file).exists() {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Err(format!(
+                    "G2: pinned schema file {file} is missing from the generated dump"
+                ));
+            }
+        }
+        let fingerprint = codex_appserver::compute_fingerprint(&scratch).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&scratch);
+            format!("G2: {e}")
+        })?;
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(fingerprint != codex_appserver::MEASURED_PROTOCOL_FINGERPRINT)
+    }
+
+    /// G4: spawn `--listen stdio://`, round-trip `initialize` within budget,
+    /// kill the child. Token-free — no `turn/start` is ever sent.
+    fn gate_g4_handshake(&self) -> Result<(), String> {
+        let budget = self
+            .config
+            .appserver_budgets
+            .map(|b| b.handshake)
+            .unwrap_or_else(|| codex_appserver::Budgets::default().handshake);
+        let mut child = codex_appserver::AppServerChild::spawn(
+            &self.config.executable,
+            &self.config.data_dir,
+            &self.config.env,
+            self.config.codex_home.as_deref(),
+            |_handle, _line| {},
+        )
+        .map_err(|e| format!("G4: {e}"))?;
+        let result = child.handle().call(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "sergeant", "title": "sergeant",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {"experimentalApi": true},
+            }),
+            budget,
+        );
+        child.kill(Duration::from_secs(1));
+        result.map(|_| ()).map_err(|e| format!("G4: {e}"))
+    }
+
+    /// §5.2's resolution rule, memoized.
+    fn transport_resolution(&self) -> &TransportResolution {
+        self.transport_resolution
+            .get_or_init(|| self.resolve_transport())
+    }
+
+    fn resolve_transport(&self) -> TransportResolution {
+        match self.config.transport {
+            TransportChoice::ExecOnly => TransportResolution {
+                transport: Transport::Exec,
+                detail: format!(
+                    "transport: {} (ExecOnly configured)",
+                    Transport::Exec.as_str()
+                ),
+            },
+            TransportChoice::AppServerOnly => match &self.appserver_gates().result {
+                Ok(()) => TransportResolution {
+                    transport: Transport::AppServer,
+                    detail: self.appserver_detail("AppServerOnly configured"),
+                },
+                Err(reason) => TransportResolution {
+                    // Irrelevant: `probe()` reports `available: false` for
+                    // this exact case (§5.2 rule 2) before this value is
+                    // ever read for a launch decision.
+                    transport: Transport::Exec,
+                    detail: format!(
+                        "transport: app-server requested (AppServerOnly) but refused: {reason}"
+                    ),
+                },
+            },
+            TransportChoice::Auto => match &self.appserver_gates().result {
+                Ok(()) => TransportResolution {
+                    transport: Transport::AppServer,
+                    detail: self.appserver_detail("Auto"),
+                },
+                Err(reason) => TransportResolution {
+                    transport: Transport::Exec,
+                    detail: format!(
+                        "transport: {} (Auto: app-server gate failed: {reason})",
+                        Transport::Exec.as_str()
+                    ),
+                },
+            },
+        }
+    }
+
+    fn appserver_detail(&self, why: &str) -> String {
+        let gates = self.appserver_gates();
+        let mut detail = format!("transport: {} ({why})", Transport::AppServer.as_str());
+        if gates.stale {
+            detail.push_str(&format!(
+                "; protocol: stale (fingerprint [{}] != measured {})",
+                codex_appserver::FINGERPRINT_ALGORITHM,
+                codex_appserver::MEASURED_PROTOCOL_FINGERPRINT
+            ));
+        } else {
+            detail.push_str(&format!(
+                "; protocol: fresh (fingerprint [{}] matches measured)",
+                codex_appserver::FINGERPRINT_ALGORITHM
+            ));
+        }
+        detail
+    }
+
     /// Resolve one execution's launch configuration from adapter config plus
     /// the profile (§14, §3.5). One function, used by PREPARE, LAUNCH and
     /// RESUME alike — the same rule `claude.rs::launch_config` follows.
@@ -1511,6 +3176,7 @@ impl CodexBackend {
             first_turn,
             work_id,
             bindings_outside_cwd,
+            sandbox,
         ) = {
             let state = self.lock();
             let execution = state
@@ -1527,17 +3193,29 @@ impl CodexBackend {
                 execution.turns == 0,
                 execution.work_id.clone(),
                 execution.bindings_outside_cwd.clone(),
+                execution.sandbox,
             )
         };
 
+        let output_schema_path = self.output_schema_path();
         let mut command = Command::new(&executable);
         if first_turn {
-            command.args(first_turn_argv(&cwd, model.as_deref()));
+            command.args(first_turn_argv(
+                &cwd,
+                model.as_deref(),
+                sandbox,
+                &bindings_outside_cwd,
+                output_schema_path,
+            ));
         } else {
             let thread_id = thread_id.clone().ok_or_else(|| {
                 self.err_failed("cannot send: no thread id recorded for this execution")
             })?;
-            command.args(resume_turn_argv(&thread_id, model.as_deref()));
+            command.args(resume_turn_argv(
+                &thread_id,
+                model.as_deref(),
+                output_schema_path,
+            ));
         }
         command
             .current_dir(&cwd)
@@ -1681,6 +3359,433 @@ impl CodexBackend {
             _ => None,
         };
         (execution.turn_pgid, child)
+    }
+
+    /// LAUNCH over `codex exec` (§3.1): register the execution, spawn turn
+    /// 1, and wait bounded for `thread.started` before returning a handle at
+    /// all. A failed launch leaves no phantom: adapter state is removed on
+    /// every error path.
+    fn launch_exec(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let LaunchConfig {
+            executable,
+            env,
+            codex_home,
+        } = self.launch_config(request.profile.as_ref())?;
+        {
+            let mut state = self.lock();
+            state.executions.insert(
+                request.execution_id.clone(),
+                CodexExecution {
+                    thread_id: None,
+                    work_id: request.work_id.clone(),
+                    cwd: request.cwd.clone(),
+                    model: request.model.clone(),
+                    executable,
+                    env,
+                    codex_home,
+                    bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
+                    sandbox: self.config.sandbox,
+                    turns: 0,
+                    turn: TurnState::Unlaunched,
+                    turn_pgid: None,
+                    stopped: false,
+                    interrupt_requested: false,
+                    reader: None,
+                    transport_state: CodexTransportState::Exec,
+                },
+            );
+        }
+        match self.spawn_first_turn(&request.execution_id, compose_launch_prompt(request)) {
+            Ok(thread_id) => Ok(ExecutionHandle {
+                execution_id: request.execution_id.clone(),
+                native_id: Some(thread_id),
+            }),
+            Err(e) => {
+                self.lock().executions.remove(&request.execution_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// LAUNCH over `codex app-server --listen stdio://` (W3 spec §1.4/§3.2):
+    /// spawn the child, handshake, `thread/start` (identity + policy, token-
+    /// free — M4/M5), register the execution, then `turn/start` for turn 1.
+    /// Unlike exec, the native id (`thread.id`) comes back from a
+    /// **synchronous RPC response**, before any turn exists — the crash
+    /// window exec's own module docs name is closed on this transport by
+    /// construction.
+    fn launch_appserver(
+        &self,
+        prepared: &PreparedExecution,
+    ) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let LaunchConfig {
+            executable,
+            env,
+            codex_home,
+        } = self.launch_config(request.profile.as_ref())?;
+        let budgets = self.config.appserver_budgets.unwrap_or_default();
+        let (handshake_budget, thread_start_budget, turn_start_budget) =
+            (budgets.handshake, budgets.thread_start, budgets.turn_start);
+
+        let turn_cell: Arc<Mutex<AppServerTurnState>> =
+            Arc::new(Mutex::new(AppServerTurnState::Idle));
+        let ctx = AppServerLineContext {
+            sink: self.sink.lock().expect("codex sink lock").clone(),
+            execution_id: request.execution_id.clone(),
+            work_id: request.work_id.clone(),
+            model: request.model.clone(),
+        };
+        let cb_cell = Arc::clone(&turn_cell);
+        let mut child = codex_appserver::AppServerChild::spawn(
+            &executable,
+            &request.cwd,
+            &env,
+            codex_home.as_deref(),
+            move |handle, line| appserver_on_line(&ctx, &cb_cell, handle, line),
+        )
+        .map_err(|e| self.err_failed(format!("cannot spawn app-server child: {e}")))?;
+
+        let handshake = child.handle().call(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "sergeant", "title": "sergeant",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {"experimentalApi": true},
+            }),
+            handshake_budget,
+        );
+        if let Err(e) = handshake {
+            child.kill(Duration::from_secs(5));
+            return Err(self.err_failed(format!("app-server handshake failed: {e}")));
+        }
+        if let Err(e) = child.handle().notify("initialized", json!({})) {
+            child.kill(Duration::from_secs(5));
+            return Err(self.err_failed(format!("app-server handshake failed: {e}")));
+        }
+
+        let extra_roots = bindings_outside_cwd(&request.cwd, &request.bindings);
+        let mut roots = vec![request.cwd.to_string_lossy().into_owned()];
+        roots.extend(extra_roots.iter().map(|p| p.to_string_lossy().into_owned()));
+        let mut thread_start_params = json!({
+            "model": request.model,
+            "cwd": request.cwd.to_string_lossy(),
+            "approvalPolicy": "never",
+            "runtimeWorkspaceRoots": roots,
+            "ephemeral": false,
+        });
+        if let Some(value) = self.config.sandbox.appserver_value() {
+            thread_start_params["sandbox"] = json!(value);
+        }
+        let thread_start_result =
+            match child
+                .handle()
+                .call("thread/start", thread_start_params, thread_start_budget)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    child.kill(Duration::from_secs(5));
+                    return Err(self.err_failed(format!("thread/start failed: {e}")));
+                }
+            };
+        let Some(thread_id) = thread_start_result
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            child.kill(Duration::from_secs(5));
+            return Err(self.err_failed(
+                "thread/start's result carried no thread.id (spec §1.5.2 expects one)",
+            ));
+        };
+
+        let runtime = Arc::new(AppServerRuntime {
+            child: Mutex::new(child),
+            turn: turn_cell,
+            policy_echo: thread_start_result.clone(),
+            turn_epochs: AtomicU64::new(1),
+        });
+        {
+            let mut state = self.lock();
+            state.executions.insert(
+                request.execution_id.clone(),
+                CodexExecution {
+                    thread_id: Some(thread_id.clone()),
+                    work_id: request.work_id.clone(),
+                    cwd: request.cwd.clone(),
+                    model: request.model.clone(),
+                    executable,
+                    env,
+                    codex_home,
+                    bindings_outside_cwd: extra_roots,
+                    sandbox: self.config.sandbox,
+                    turns: 0,
+                    turn: TurnState::Unlaunched,
+                    turn_pgid: None,
+                    stopped: false,
+                    interrupt_requested: false,
+                    reader: None,
+                    transport_state: CodexTransportState::AppServer(Arc::clone(&runtime)),
+                },
+            );
+        }
+
+        let prompt = compose_launch_prompt(request);
+        match self.appserver_send_turn(
+            &request.execution_id,
+            &request.work_id,
+            &runtime,
+            &thread_id,
+            &prompt,
+            turn_start_budget,
+        ) {
+            Ok(()) => {
+                self.emit(
+                    &request.execution_id,
+                    &request.work_id,
+                    KIND_CONVERSATION_USER,
+                    json!({
+                        "text": prompt,
+                        "thread_id": thread_id,
+                        "bindings_outside_cwd": bindings_outside_cwd(&request.cwd, &request.bindings),
+                    }),
+                );
+                Ok(ExecutionHandle {
+                    execution_id: request.execution_id.clone(),
+                    native_id: Some(thread_id),
+                })
+            }
+            Err(e) => {
+                self.lock().executions.remove(&request.execution_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// Send one turn over an app-server thread, shared by LAUNCH's turn 1
+    /// and SEND's later turns. Sets `AppServerTurnState::InFlight` **before**
+    /// `turn/start` is even written (see the variant's own doc comment for
+    /// why), so no notification racing ahead of the response can be dropped.
+    fn appserver_send_turn(
+        &self,
+        execution_id: &str,
+        work_id: &str,
+        runtime: &AppServerRuntime,
+        thread_id: &str,
+        prompt: &str,
+        turn_start_budget: Duration,
+    ) -> Result<(), BackendError> {
+        let epoch = runtime.turn_epochs.fetch_add(1, Ordering::SeqCst);
+        let displaced_late = {
+            let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
+            if let AppServerTurnState::InFlight { .. } = &*turn_state {
+                return Err(self.err_failed(
+                    "already has a turn in flight; a codex thread runs one turn at a time",
+                ));
+            }
+            // The outgoing turn's post-settlement tally dies with the cell
+            // this line overwrites, so it is reported here rather than lost.
+            // End of stream is the *other* place this summary is emitted, and
+            // on a thread that runs more than one turn it is not the first:
+            // "never silently drop" has to hold at both exits, not the one
+            // that is easier to remember.
+            let displaced = match &*turn_state {
+                AppServerTurnState::Finished { late, .. } => late.summary(),
+                AppServerTurnState::Idle | AppServerTurnState::InFlight { .. } => None,
+            };
+            // The outgoing turn's own id, if it ever got one, so a straggler
+            // that names it after this line overwrites the cell is still
+            // recognisable as *that* turn's evidence rather than this new
+            // one's (see `superseded_turn_id`'s own doc).
+            let superseded_turn_id = match &*turn_state {
+                AppServerTurnState::Finished { turn_id, .. } => turn_id.clone(),
+                AppServerTurnState::Idle | AppServerTurnState::InFlight { .. } => String::new(),
+            };
+            *turn_state = AppServerTurnState::InFlight {
+                turn_id: String::new(),
+                acc: TurnAccumulator::new(),
+                interrupt: InterruptProgress::NotRequested,
+                epoch,
+                superseded_turn_id,
+            };
+            displaced
+        };
+        if let Some(summary) = displaced_late {
+            self.emit(execution_id, work_id, KIND_TURN_HARNESS_ERROR, summary);
+        }
+        let handle = runtime.child.lock().expect("appserver child lock").handle();
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        });
+        if let Some(schema) = &self.config.output_schema {
+            params["outputSchema"] = schema.clone();
+        }
+        let result = match handle.call("turn/start", params, turn_start_budget) {
+            Ok(v) => v,
+            Err(e) => {
+                // Roll back only what this call actually owns. Every other
+                // writer of this cell is state-guarded; this one used to be
+                // a blind `= Idle`, which meant a `turn/start` that failed
+                // *because the child died* would overwrite the fail-closed
+                // `Finished` the reader thread had already installed for the
+                // very same turn — leaving OBSERVE to report "has not run a
+                // turn yet" about a turn that had run, ended, and been
+                // journaled. A settled cell is never rolled back, and
+                // neither is a later turn's.
+                let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
+                if matches!(
+                    &*turn_state,
+                    AppServerTurnState::InFlight { epoch: mine, .. } if *mine == epoch
+                ) {
+                    *turn_state = AppServerTurnState::Idle;
+                }
+                drop(turn_state);
+                return Err(self.err_failed(format!("turn/start failed: {e}")));
+            }
+        };
+        let turn_id = result
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let AppServerTurnState::InFlight {
+            turn_id: slot,
+            epoch: mine,
+            ..
+        } = &mut *runtime.turn.lock().expect("appserver turn lock")
+            && *mine == epoch
+        {
+            *slot = turn_id;
+        }
+        Ok(())
+    }
+
+    /// The app-server half of INTERRUPT (spec §2.2): `turn/interrupt`, and
+    /// on any failure the honest downgrade — kill the child's process group
+    /// and journal `phase:"interrupt_downgraded"` (§2.2's own rule: "a
+    /// downgrade that nobody can see is the dishonesty this wave exists to
+    /// avoid").
+    fn interrupt_appserver(
+        &self,
+        execution_id: &str,
+        runtime: &AppServerRuntime,
+        thread_id: &str,
+        interrupt_budget: Duration,
+    ) -> Completion {
+        let handle = runtime.child.lock().expect("appserver child lock").handle();
+        // Mint the id before the cell is marked, and mark the cell before the
+        // request goes out: the reader thread resolves this id the instant it
+        // decodes the answer, and it can only do that if the cell already
+        // names the id it is waiting on.
+        //
+        // Only fires the RPC (and stamps `Requested`) from `NotRequested` or
+        // `RpcFailed` -- the two states in which nobody has ever gotten an
+        // honest answer for this turn yet. `Backend::interrupt`/`stop` are
+        // expected to be called more than once on the same still-`InFlight`
+        // turn (the engine's own ceiling-triggered auto-interrupt followed by
+        // a later human cancel is one real path), and a repeat call landing
+        // on `Requested { .. }` (already outstanding) or `Acknowledged`
+        // (already confirmed) must not clobber that state: doing so is
+        // exactly how a turn the harness genuinely acknowledged could settle
+        // as `RpcUnresolved` because *this* call's redundant RPC went
+        // unanswered. A second ask has nothing to add in either case -- the
+        // outstanding request will still resolve on the reader thread, and
+        // an acknowledged one already got the honest answer -- so it is a
+        // no-op rather than a fresh, tracked attempt.
+        let attempt = {
+            let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
+            match &mut *turn_state {
+                AppServerTurnState::InFlight {
+                    turn_id, interrupt, ..
+                } if interrupt.worth_asking_again() => {
+                    let id = handle.reserve_id();
+                    *interrupt = InterruptProgress::Requested { id };
+                    Some((turn_id.clone(), id))
+                }
+                AppServerTurnState::InFlight { .. }
+                | AppServerTurnState::Idle
+                | AppServerTurnState::Finished { .. } => None,
+            }
+        };
+        let Some((turn_id, interrupt_id)) = attempt else {
+            return Completion::immediate();
+        };
+        let work_id = {
+            let state = self.lock();
+            state
+                .executions
+                .get(execution_id)
+                .map(|e| e.work_id.clone())
+                .unwrap_or_default()
+        };
+        let result = handle.call_reserved(
+            interrupt_id,
+            "turn/interrupt",
+            json!({"threadId": thread_id, "turnId": turn_id}),
+            interrupt_budget,
+        );
+        // An answer that arrived has already been recorded, on the reader
+        // thread, in stream order. What is left for this thread is the case
+        // the reader never saw: no answer was written at all — the budget
+        // expired, or the request could not even be sent. That is an RPC
+        // failure, and it is marked here *before* the process-group kill
+        // below, because the kill is what ends the child's stdout and the EOF
+        // that follows is what settles the turn.
+        //
+        // `resolve` is what keeps this from overwriting the reader's own
+        // verdict: it only fires while the cell still names this request as
+        // outstanding.
+        if result.is_err()
+            && let AppServerTurnState::InFlight { interrupt, .. } =
+                &mut *runtime.turn.lock().expect("appserver turn lock")
+        {
+            interrupt.resolve(interrupt_id, false);
+        }
+        if let Err(e) = result {
+            let pgid = runtime.child.lock().expect("appserver child lock").pgid();
+            kill_process_group(Some(pgid));
+            self.emit(
+                execution_id,
+                &work_id,
+                KIND_TURN_HARNESS_ERROR,
+                json!({"phase": "interrupt_downgraded", "detail": e}),
+            );
+            // §15 / §3.4 point 3: a downgrade that nobody can see is the
+            // dishonesty this wave exists to avoid, and a downgrade OBSERVE
+            // can never resolve is the same dishonesty one step further —
+            // `interrupt` was already stamped `Requested` above (this branch
+            // is only reached for a call that actually sent the RPC; a
+            // repeat call landing on an already-`Acknowledged` or already-
+            // `Requested` cell returns before ever getting here), so this
+            // resolves through the same `classify_terminal` the reader
+            // thread's own EOF handling uses, landing on
+            // `InterruptedRunning` (never `AmbiguousUnknown`): sergeant did
+            // ask for the kill, even though the RPC that would have
+            // confirmed it failed. Without this, the turn stays `InFlight`
+            // forever and OBSERVE reports `Running` with no way to learn the
+            // stage ended.
+            if let Some(settlement) = fail_closed_appserver_turn(&runtime.turn) {
+                self.emit(
+                    execution_id,
+                    &work_id,
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": "turn_closed_after_interrupt_downgrade"}),
+                );
+                // Same invariant as the EOF route: a turn that ends here
+                // ends with `conversation.turn.ended` too.
+                self.emit(
+                    execution_id,
+                    &work_id,
+                    KIND_CONVERSATION_TURN_ENDED,
+                    settlement.turn_ended_payload(),
+                );
+            }
+        }
+        Completion::immediate()
     }
 }
 
@@ -1856,7 +3961,10 @@ impl TurnReader {
                 .as_deref()
                 .and_then(|seen| thread_pin_mismatch(expected, seen))
         });
-        let terminal = classify_terminal(&acc, interrupted);
+        // Exec has no interrupt RPC at all: the kill *is* the request, so a
+        // turn that ends with no terminal after one can only ever be
+        // `ProcessKill`.
+        let terminal = classify_terminal(&acc, interrupted.then_some(InterruptedVia::ProcessKill));
         let thread_id_for_event = execution.thread_id.clone();
         let outcome = TurnOutcome {
             terminal,
@@ -1959,9 +4067,38 @@ impl Backend for CodexBackend {
 
     fn probe(&self) -> ProbeReport {
         let outcome = self.probe_outcome();
+        if !outcome.available {
+            return ProbeReport {
+                available: false,
+                detail: Some(outcome.detail.clone()),
+            };
+        }
+        // §5.2 rule 2: `AppServerOnly` + a failed gate is the one place a
+        // refusal is right — the operator asked for exactly this transport,
+        // and silently giving them exec (a different capability row) is the
+        // dishonesty this rule exists to prevent. Not an R1 violation: this
+        // refuses a *configuration* that cannot be satisfied here, not a
+        // version.
+        if self.config.transport == TransportChoice::AppServerOnly
+            && let Err(reason) = &self.appserver_gates().result
+        {
+            return ProbeReport {
+                available: false,
+                detail: Some(format!(
+                    "{}; app-server requested (AppServerOnly) but refused: {reason}",
+                    outcome.detail
+                )),
+            };
+        }
+        let resolution = self.transport_resolution();
         ProbeReport {
-            available: outcome.available,
-            detail: Some(outcome.detail.clone()),
+            available: true,
+            detail: Some(format!(
+                "{}; {}\nadmission rows:\n{}",
+                outcome.detail,
+                resolution.detail,
+                render_admission_rows()
+            )),
         }
     }
 
@@ -1992,53 +4129,19 @@ impl Backend for CodexBackend {
         })
     }
 
-    /// LAUNCH (§3.1): register the execution, spawn turn 1, and wait bounded
-    /// for `thread.started` before returning a handle at all. A failed
-    /// launch leaves no phantom: adapter state is removed on every error
-    /// path.
+    /// LAUNCH (§3.1/W3 §5): dispatches to whichever transport this
+    /// registration resolved to. Resolution happens once, at PROBE, and is
+    /// never revisited per execution (§5.3) — this is the only place that
+    /// reads it to make a launch decision.
     fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
-        let request = &prepared.request;
-        let LaunchConfig {
-            executable,
-            env,
-            codex_home,
-        } = self.launch_config(request.profile.as_ref())?;
-        {
-            let mut state = self.lock();
-            state.executions.insert(
-                request.execution_id.clone(),
-                CodexExecution {
-                    thread_id: None,
-                    work_id: request.work_id.clone(),
-                    cwd: request.cwd.clone(),
-                    model: request.model.clone(),
-                    executable,
-                    env,
-                    codex_home,
-                    bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
-                    turns: 0,
-                    turn: TurnState::Unlaunched,
-                    turn_pgid: None,
-                    stopped: false,
-                    interrupt_requested: false,
-                    reader: None,
-                },
-            );
-        }
-        match self.spawn_first_turn(&request.execution_id, compose_launch_prompt(request)) {
-            Ok(thread_id) => Ok(ExecutionHandle {
-                execution_id: request.execution_id.clone(),
-                native_id: Some(thread_id),
-            }),
-            Err(e) => {
-                self.lock().executions.remove(&request.execution_id);
-                Err(e)
-            }
+        match self.transport_resolution().transport {
+            Transport::Exec => self.launch_exec(prepared),
+            Transport::AppServer => self.launch_appserver(prepared),
         }
     }
 
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
-        {
+        let appserver = {
             let state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
@@ -2048,15 +4151,50 @@ impl Backend for CodexBackend {
                     handle.execution_id
                 )));
             }
-            if let TurnState::InFlight(_) = execution.turn {
-                return Err(self.err_failed(format!(
-                    "execution {} already has a turn in flight; a codex exec conversation runs \
-                     one turn at a time",
-                    handle.execution_id
-                )));
+            match &execution.transport_state {
+                CodexTransportState::Exec => {
+                    if let TurnState::InFlight(_) = execution.turn {
+                        return Err(self.err_failed(format!(
+                            "execution {} already has a turn in flight; a codex exec \
+                             conversation runs one turn at a time",
+                            handle.execution_id
+                        )));
+                    }
+                    None
+                }
+                CodexTransportState::AppServer(runtime) => Some(Arc::clone(runtime)),
+            }
+        };
+        match appserver {
+            None => self.spawn_turn(&handle.execution_id, input.to_string(), None),
+            Some(runtime) => {
+                let thread_id = handle
+                    .native_id
+                    .clone()
+                    .ok_or_else(|| self.err_unknown(&handle.execution_id))?;
+                let turn_start_budget = self
+                    .config
+                    .appserver_budgets
+                    .map(|b| b.turn_start)
+                    .unwrap_or_else(|| codex_appserver::Budgets::default().turn_start);
+                let work_id = self.lock().executions[&handle.execution_id].work_id.clone();
+                self.appserver_send_turn(
+                    &handle.execution_id,
+                    &work_id,
+                    &runtime,
+                    &thread_id,
+                    input,
+                    turn_start_budget,
+                )?;
+                self.emit(
+                    &handle.execution_id,
+                    &work_id,
+                    KIND_CONVERSATION_USER,
+                    json!({"text": input, "thread_id": thread_id}),
+                );
+                Ok(())
             }
         }
-        self.spawn_turn(&handle.execution_id, input.to_string(), None)
     }
 
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError> {
@@ -2064,6 +4202,9 @@ impl Backend for CodexBackend {
         if state.executions.contains_key(&handle.execution_id) {
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
+            if let CodexTransportState::AppServer(runtime) = &execution.transport_state {
+                return Ok(observe_appserver(execution, runtime));
+            }
             if matches!(execution.turn, TurnState::Adopted) {
                 let thread_id = execution.thread_id.clone().unwrap_or_default();
                 let cwd = execution.cwd.clone();
@@ -2083,9 +4224,31 @@ impl Backend for CodexBackend {
             .ok_or_else(|| self.err_unknown(&handle.execution_id))
     }
 
-    /// §5.5: kill the turn's whole process group. The durable thread
-    /// survives; the turn's evidence is STOP's promise, not this one.
+    /// §5.5 (exec) / W3 §2.2 (app-server): stop the current turn without
+    /// retiring the execution.
     fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
+        let appserver = {
+            let state = self.lock();
+            self.check_identity(&state, handle)?;
+            let execution = &state.executions[&handle.execution_id];
+            match &execution.transport_state {
+                CodexTransportState::AppServer(runtime) => Some(Arc::clone(runtime)),
+                CodexTransportState::Exec => None,
+            }
+        };
+        if let Some(runtime) = appserver {
+            let interrupt_budget = self
+                .config
+                .appserver_budgets
+                .map(|b| b.interrupt)
+                .unwrap_or_else(|| codex_appserver::Budgets::default().interrupt);
+            return Ok(self.interrupt_appserver(
+                &handle.execution_id,
+                &runtime,
+                handle.native_id.as_deref().unwrap_or_default(),
+                interrupt_budget,
+            ));
+        }
         let (pgid, child) = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
@@ -2183,7 +4346,7 @@ impl Backend for CodexBackend {
         state.executions.insert(
             handle.execution_id.clone(),
             CodexExecution {
-                thread_id: Some(thread_id),
+                thread_id: Some(thread_id.clone()),
                 work_id: request.work_id.clone(),
                 cwd: request.cwd.clone(),
                 model: request.model.clone(),
@@ -2191,6 +4354,7 @@ impl Backend for CodexBackend {
                 env,
                 codex_home,
                 bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
+                sandbox: self.config.sandbox,
                 turns: 1,
                 turn: TurnState::Adopted,
                 // A re-adopted thread's turn was spawned by a previous
@@ -2200,8 +4364,35 @@ impl Backend for CodexBackend {
                 stopped: false,
                 interrupt_requested: false,
                 reader: None,
+                // W3 §5.4: a restarted daemon has no live app-server child to
+                // re-adopt — the previous one died with the previous daemon
+                // — so re-adoption always continues on the exec transport,
+                // whatever the execution originally launched on. This is a
+                // transport change for a re-adopted execution whose original
+                // transport is provably gone, happening at re-adoption
+                // rather than mid-flight, and it is journaled below as a
+                // capability withdrawal exactly when this backend's own
+                // resolved transport is app-server (the only case where a
+                // reader could otherwise be surprised the row changed).
+                transport_state: CodexTransportState::Exec,
             },
         );
+        drop(state);
+        if self.transport_resolution().transport == Transport::AppServer {
+            self.emit(
+                &handle.execution_id,
+                &request.work_id,
+                KIND_TURN_HARNESS_ERROR,
+                json!({
+                    "phase": "transport_withdrawn_on_readopt",
+                    "thread_id": thread_id,
+                    "detail": "re-adopted after a daemon restart; this execution continues on \
+                               the exec transport (no live app-server child survives a restart), \
+                               losing NativeTurnInterrupt tier and any admitted ask capability \
+                               for its remaining turns",
+                }),
+            );
+        }
         Ok(())
     }
 
@@ -2228,10 +4419,13 @@ impl Backend for CodexBackend {
     }
 
     /// STOP (§5.7): kill any in-flight turn, refuse further input, hand back
-    /// the reader's join as the completion's tail (issue #14/B3's rule).
+    /// the reader's join as the completion's tail (issue #14/B3's rule). On
+    /// app-server, the "turn" and "execution" processes are the same thing
+    /// (§1.4: one child for the whole execution) — STOP is what actually
+    /// ends the child's life; INTERRUPT never does.
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         self.interrupt(handle)?.wait();
-        let reader = {
+        let (reader, appserver) = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = state
@@ -2239,14 +4433,184 @@ impl Backend for CodexBackend {
                 .get_mut(&handle.execution_id)
                 .expect("presence checked above");
             execution.stopped = true;
-            execution.reader.take()
+            let appserver = match &execution.transport_state {
+                CodexTransportState::AppServer(runtime) => Some(Arc::clone(runtime)),
+                CodexTransportState::Exec => None,
+            };
+            (execution.reader.take(), appserver)
         };
+        if let Some(runtime) = appserver {
+            let stderr_drain = codex_appserver::Budgets::default().stderr_drain;
+            return Ok(Completion::deferred(move || {
+                runtime
+                    .child
+                    .lock()
+                    .expect("appserver child lock")
+                    .kill(stderr_drain);
+            }));
+        }
         match reader {
             None => Ok(Completion::immediate()),
             Some(reader) => Ok(Completion::deferred(move || {
                 let _ = reader.join();
             })),
         }
+    }
+}
+
+/// Map an app-server execution's runtime to an Observation (W3 spec §1.4/
+/// §2.2/§2.8). `native` answers "is my child alive" — a property of the
+/// long-lived child, decoupled from whether a turn has finished (unlike
+/// exec, where the per-turn process exiting *is* what "native: Exited"
+/// means). `signal` comes from the current-or-last turn.
+fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> Observation {
+    let thread_ref = execution.thread_id.as_deref().unwrap_or("<unminted>");
+    let (child_status, stderr_tail) = {
+        let child = runtime.child.lock().expect("appserver child lock");
+        (child.status(), child.stderr_tail())
+    };
+    let (native, child_note) = match &child_status {
+        codex_appserver::ChildStatus::Running => (NativeState::Running, "child alive".to_string()),
+        codex_appserver::ChildStatus::Exited { detail, code } => (
+            NativeState::Exited,
+            format!("child exited ({detail}, code={code:?})"),
+        ),
+        // The one honest `Unknown`: the peek itself failed, so this really
+        // is a state the adapter cannot tell.
+        codex_appserver::ChildStatus::Unknown(e) => (
+            NativeState::Unknown,
+            format!("child state could not be read: {e}"),
+        ),
+    };
+    let turn_state = runtime.turn.lock().expect("appserver turn lock");
+    match &*turn_state {
+        AppServerTurnState::Idle => Observation {
+            native,
+            signal: BackendSignal::Running,
+            evidence: Some(format!(
+                "app-server child for thread {thread_ref} has not run a turn yet"
+            )),
+        },
+        AppServerTurnState::InFlight { turn_id, .. } => Observation {
+            native,
+            signal: BackendSignal::Running,
+            evidence: Some(format!("turn {turn_id} in flight on thread {thread_ref}")),
+        },
+        AppServerTurnState::Finished {
+            turn_id: _,
+            outcome,
+            last_agent_message,
+            message_items,
+            tool_items,
+            unknown_items,
+            unknown_methods,
+            last_codex_error_info,
+            last_error,
+            late: _,
+        } => match outcome {
+            TerminalOutcome::Completed => Observation {
+                native,
+                signal: BackendSignal::StageCompleted {
+                    summary: last_agent_message.clone(),
+                },
+                evidence: Some(format!(
+                    "thread_id={thread_ref}; message_items={message_items}, \
+                     tool_items={tool_items}, unknown_items={unknown_items:?}, \
+                     unknown_methods={unknown_methods:?}"
+                )),
+            },
+            TerminalOutcome::Failed { message } => {
+                // §2.8: a typed `unauthorized` arm names auth explicitly —
+                // exec could only ever produce an opaque failure string.
+                let auth_note = if last_codex_error_info.as_deref() == Some("unauthorized") {
+                    " (auth)"
+                } else {
+                    ""
+                };
+                Observation {
+                    native,
+                    signal: BackendSignal::Failed {
+                        reason: format!("turn failed{auth_note}: {}", truncate(message, 400)),
+                    },
+                    evidence: Some(format!(
+                        "thread_id={thread_ref}; codex_error_info={last_codex_error_info:?}"
+                    )),
+                }
+            }
+            // §2.2: a first-class, harness-confirmed terminal — the
+            // conversation stays resumable, exactly as exec's inferred
+            // `InterruptedRunning` reports, but never inferred here.
+            TerminalOutcome::Interrupted => Observation {
+                native,
+                signal: BackendSignal::Running,
+                evidence: Some(format!(
+                    "turn interrupted; thread {thread_ref} resumable (app-server: \
+                     harness-confirmed)"
+                )),
+            },
+            // Reached only via `fail_closed_appserver_turn`'s own use of
+            // `classify_terminal` (§15/§3.4 point 3). Sergeant did ask for
+            // the kill, but nothing confirmed it the way a real
+            // `turn/completed{status:"interrupted"}` would — never claim
+            // `harness-confirmed` for this arm. *Which* unconfirmed path it
+            // was is recorded at settlement time and reported verbatim here:
+            // the two app-server paths are different facts, and the routine
+            // STOP path (an interrupt the harness accepted, then a closed
+            // stream) is not the RPC failure this arm used to assert it was.
+            TerminalOutcome::InterruptedRunning { via } => Observation {
+                native,
+                signal: BackendSignal::Running,
+                evidence: Some(format!(
+                    "turn interrupted; thread {thread_ref} resumable (app-server: inferred, \
+                     not harness-confirmed -- {})",
+                    match via {
+                        InterruptedVia::RpcFailed =>
+                            "turn/interrupt's own RPC failed and sergeant fell back to the \
+                             process-group kill",
+                        InterruptedVia::ClosedAfterAcknowledgedRpc =>
+                            "turn/interrupt was acknowledged, but the child's stdout closed \
+                             before turn/completed carried the harness's own verdict",
+                        InterruptedVia::RpcUnresolved =>
+                            "the child's stdout closed while turn/interrupt was still \
+                             outstanding, so nothing ever answered it either way",
+                        // Unreachable on this transport (`ProcessKill` is
+                        // exec's own arm, minted only by `TurnReader`), and
+                        // named rather than collapsed into one of the three
+                        // above, which is how this arm went wrong before.
+                        InterruptedVia::ProcessKill =>
+                            "the turn's process group was killed with no interrupt RPC involved",
+                    }
+                )),
+            },
+            // §5.2's ambiguity. `native` is whatever the child actually
+            // proved one lock ago — a child this observation just reaped is
+            // `Exited`, and reporting `Unknown` over the top of that proof
+            // would be the adapter lying about what it can see (the enum's
+            // own definition: "the backend cannot tell"). The fail-closed
+            // guarantee this arm owes is that it never reports a *stage
+            // verdict*, and it does not: `signal` stays `Running`.
+            //
+            // Worth naming, because it is a real consequence rather than a
+            // free improvement: the engine blocks a Work outright on
+            // `native: Unknown` (§25), so this arm used to fail closed *at
+            // the engine* by mislabelling a proven exit as ignorance. It now
+            // parks like any other `Running` observation, and the per-turn
+            // ceiling sweep (`Engine::due_interrupts`) is what bounds it —
+            // later than an immediate block, and honest. Exec's own
+            // ambiguous arm still reports `Unknown`; aligning it is a
+            // separate change to a separate transport's contract, not
+            // something to smuggle in here.
+            TerminalOutcome::AmbiguousUnknown => Observation {
+                native,
+                signal: BackendSignal::Running,
+                evidence: Some(format!(
+                    "no turn/completed observed for thread {thread_ref}; {child_note}; \
+                     last_error={last_error:?}; codex_error_info={last_codex_error_info:?}; \
+                     stderr tail: {}",
+                    truncate(&stderr_tail, 400)
+                )),
+            },
+        },
     }
 }
 
@@ -2316,11 +4680,30 @@ fn observe_in_memory(execution: &CodexExecution) -> Observation {
                         outcome.raw_evidence()
                     )),
                 },
-                TerminalOutcome::InterruptedRunning => Observation {
+                TerminalOutcome::InterruptedRunning { .. } => Observation {
                     native: NativeState::Exited,
                     signal: BackendSignal::Running,
                     evidence: Some(format!(
                         "turn interrupted by request; conversation {thread_ref} resumable; raw={}",
+                        outcome.raw_evidence()
+                    )),
+                },
+                // Exec's own `TurnOutcome` never actually carries this arm
+                // (its `classify_terminal` only ever builds `Completed`,
+                // `Failed`, `InterruptedRunning` or `AmbiguousUnknown` from
+                // exec's own `Terminal` type) — kept here so the shared
+                // `TerminalOutcome` enum stays exhaustively matched, and
+                // because the *meaning* is identical to `InterruptedRunning`
+                // from OBSERVE's point of view: no stage verdict, the
+                // conversation stays resumable. The app-server path
+                // (`codex_appserver.rs`) reports this distinctly in its own
+                // evidence rather than through this exec-only function.
+                TerminalOutcome::Interrupted => Observation {
+                    native: NativeState::Exited,
+                    signal: BackendSignal::Running,
+                    evidence: Some(format!(
+                        "turn interrupted (harness-confirmed); conversation {thread_ref} \
+                         resumable; raw={}",
                         outcome.raw_evidence()
                     )),
                 },
@@ -2417,8 +4800,12 @@ mod tests {
 
     #[test]
     fn first_turn_argv_carries_the_measured_shape() {
+        // W3 §3.2/§3.6, deliberately inverted from W1's own tripwire: turn 1
+        // now composes `--sandbox`/`--add-dir` by default. `Inherit` +
+        // `sandbox_choice_inherit_sends_no_sandbox_param` below is what
+        // proves the *absence* path still works.
         let cwd = PathBuf::from("/work/surface");
-        let argv = first_turn_argv(&cwd, None);
+        let argv = first_turn_argv(&cwd, None, SandboxChoice::WorkspaceWrite, &[], None);
         assert_eq!(
             argv,
             vec![
@@ -2426,24 +4813,64 @@ mod tests {
                 "--json",
                 "--skip-git-repo-check",
                 "-C",
-                "/work/surface"
+                "/work/surface",
+                "--sandbox",
+                "workspace-write",
             ]
         );
         assert!(!argv.contains(&"-m".to_string()), "no model, no -m flag");
 
-        let pinned = first_turn_argv(&cwd, Some("gpt-5.6-luna"));
-        assert_eq!(pinned.last().unwrap(), "gpt-5.6-luna");
-        assert_eq!(pinned[pinned.len() - 2], "-m");
+        let pinned = first_turn_argv(
+            &cwd,
+            Some("gpt-5.6-luna"),
+            SandboxChoice::WorkspaceWrite,
+            &[],
+            None,
+        );
+        assert!(pinned.contains(&"-m".to_string()));
+        let m_idx = pinned.iter().position(|a| a == "-m").unwrap();
+        assert_eq!(pinned[m_idx + 1], "gpt-5.6-luna");
 
-        for absent in [
-            "--add-dir",
-            "-s",
-            "--sandbox",
-            "-p",
-            "--profile",
-            "--ignore-user-config",
-            "--ephemeral",
-        ] {
+        let with_extra_dir = first_turn_argv(
+            &cwd,
+            None,
+            SandboxChoice::WorkspaceWrite,
+            &[PathBuf::from("/other/repo")],
+            None,
+        );
+        assert_eq!(with_extra_dir.last().unwrap(), "/other/repo");
+        assert_eq!(with_extra_dir[with_extra_dir.len() - 2], "--add-dir");
+
+        let with_schema = first_turn_argv(
+            &cwd,
+            None,
+            SandboxChoice::WorkspaceWrite,
+            &[],
+            Some(Path::new("/data/codex-output-schema.json")),
+        );
+        assert_eq!(
+            with_schema.last().unwrap(),
+            "/data/codex-output-schema.json"
+        );
+        assert_eq!(with_schema[with_schema.len() - 2], "--output-schema");
+
+        // §4.2's own correction to W1's placeholder: --output-schema DOES
+        // re-apply on resume, unlike --sandbox/--add-dir.
+        let resume_with_schema = resume_turn_argv(
+            "thread-y",
+            None,
+            Some(Path::new("/data/codex-output-schema.json")),
+        );
+        assert_eq!(
+            resume_with_schema.last().unwrap(),
+            "/data/codex-output-schema.json"
+        );
+        assert_eq!(
+            resume_with_schema[resume_with_schema.len() - 2],
+            "--output-schema"
+        );
+
+        for absent in ["-p", "--profile", "--ignore-user-config", "--ephemeral"] {
             assert!(
                 !argv.contains(&absent.to_string()),
                 "{absent} must never appear on turn 1"
@@ -2455,8 +4882,19 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_choice_inherit_sends_no_sandbox_param() {
+        let cwd = PathBuf::from("/work/surface");
+        let argv = first_turn_argv(&cwd, None, SandboxChoice::Inherit, &[], None);
+        assert!(!argv.contains(&"--sandbox".to_string()));
+        assert!(!argv.contains(&"-s".to_string()));
+        assert_eq!(SandboxChoice::Inherit.appserver_value(), None);
+        assert_eq!(SandboxChoice::ReadOnly.exec_value(), Some("read-only"));
+        assert_eq!(SandboxChoice::ReadOnly.appserver_value(), Some("read-only"));
+    }
+
+    #[test]
     fn resume_turn_argv_omits_cd_and_places_the_thread_id_right_after_resume() {
-        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None);
+        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None, None);
         assert_eq!(
             argv,
             vec![
@@ -2474,7 +4912,7 @@ mod tests {
         let resume_idx = argv.iter().position(|a| a == "resume").unwrap();
         assert_eq!(argv[resume_idx + 1], "01a02508-5880-7980-95b7-1d8bc22d5139");
 
-        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"));
+        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"), None);
         assert!(pinned.contains(&"-m".to_string()));
         assert_eq!(pinned.last().unwrap(), "gpt-5.6-luna");
 
@@ -2891,7 +5329,7 @@ mod tests {
         let fixture = include_str!("../../tests/fixtures/codex-0.149.0-turn-failed.jsonl");
         let (acc, events) = replay(fixture);
         assert!(matches!(acc.terminal, Terminal::Failed { .. }));
-        let terminal_outcome = classify_terminal(&acc, false);
+        let terminal_outcome = classify_terminal(&acc, None);
         match terminal_outcome {
             TerminalOutcome::Failed { message } => {
                 assert!(message.contains("gpt-5.6-nonexistent-model"));
@@ -2912,7 +5350,7 @@ mod tests {
         acc.ingest_line(&json!({"type": "turn.completed", "usage": {"input_tokens": 1}}));
         assert_eq!(acc.last_agent_message.as_deref(), Some("last"));
         assert!(matches!(
-            classify_terminal(&acc, false),
+            classify_terminal(&acc, None),
             TerminalOutcome::Completed
         ));
     }
@@ -2962,13 +5400,124 @@ mod tests {
         let mut acc = TurnAccumulator::new();
         acc.ingest_line(&json!({"type": "thread.started", "thread_id": "t1"}));
         assert!(matches!(
-            classify_terminal(&acc, false),
+            classify_terminal(&acc, None),
             TerminalOutcome::AmbiguousUnknown
         ));
         assert!(matches!(
-            classify_terminal(&acc, true),
-            TerminalOutcome::InterruptedRunning
+            classify_terminal(&acc, Some(InterruptedVia::ProcessKill)),
+            TerminalOutcome::InterruptedRunning {
+                via: InterruptedVia::ProcessKill
+            }
         ));
+    }
+
+    /// One in-flight app-server turn whose interrupt is outstanding under a
+    /// known request id.
+    fn interrupted_turn(id: u64) -> AppServerTurnState {
+        AppServerTurnState::InFlight {
+            turn_id: "turn-1".to_string(),
+            acc: TurnAccumulator::new(),
+            interrupt: InterruptProgress::Requested { id },
+            epoch: 1,
+            superseded_turn_id: String::new(),
+        }
+    }
+
+    /// What `via` the settlement lands on for `state`.
+    fn settled_via(mut state: AppServerTurnState) -> Option<InterruptedVia> {
+        match settle_appserver_turn(&mut state)?.outcome {
+            TerminalOutcome::InterruptedRunning { via } => Some(via),
+            other => panic!("expected an inferred interrupt, got {other:?}"),
+        }
+    }
+
+    /// The truthfulness rule `InterruptedVia` exists for, at the one seam
+    /// where it is decided. `turn/interrupt`'s fate is recorded against its
+    /// own request id, by the reader thread, as the answer is decoded — so
+    /// whether the blocked caller or the reader-thread settlement runs next
+    /// changes nothing about which sentence OBSERVE prints. Recording it from
+    /// the woken caller instead leaves a schedule in which the adapter says
+    /// "nothing ever answered it either way" about an RPC the harness had
+    /// already answered, which is exactly the lie this type forbids.
+    #[test]
+    fn an_answered_interrupt_settles_as_acknowledged_whoever_wakes_first() {
+        // Some other request's answer is not this request's answer.
+        let mut state = interrupted_turn(7);
+        if let AppServerTurnState::InFlight { interrupt, .. } = &mut state {
+            interrupt.resolve(6, true);
+        }
+        assert_eq!(
+            settled_via(state),
+            Some(InterruptedVia::RpcUnresolved),
+            "id 6's answer must not settle the request sent under id 7"
+        );
+
+        let mut state = interrupted_turn(7);
+        if let AppServerTurnState::InFlight { interrupt, .. } = &mut state {
+            interrupt.resolve(7, true);
+        }
+        assert_eq!(
+            settled_via(state),
+            Some(InterruptedVia::ClosedAfterAcknowledgedRpc),
+            "the harness answered: the stream closing afterwards does not un-answer it"
+        );
+
+        let mut state = interrupted_turn(7);
+        if let AppServerTurnState::InFlight { interrupt, .. } = &mut state {
+            interrupt.resolve(7, false);
+        }
+        assert_eq!(settled_via(state), Some(InterruptedVia::RpcFailed));
+
+        // And nothing arrived at all: the honest third answer, reachable only
+        // when the id really was never answered.
+        assert_eq!(
+            settled_via(interrupted_turn(7)),
+            Some(InterruptedVia::RpcUnresolved)
+        );
+    }
+
+    /// `turn/completed` nests its turn id under `turn.id`; every other
+    /// per-turn notification carries a flat `turnId`. A notification neither
+    /// shape recognizes (`thread/started`, a connection-level warning) names
+    /// no turn at all -- `None`, not a guess.
+    #[test]
+    fn notification_turn_id_reads_the_shape_each_method_actually_carries() {
+        assert_eq!(
+            notification_turn_id(
+                "turn/completed",
+                &json!({"turn": {"id": "turn-9", "status": "completed"}})
+            ),
+            Some("turn-9")
+        );
+        assert_eq!(
+            notification_turn_id(
+                "item/completed",
+                &json!({"turnId": "turn-9", "item": {"id": "i1"}})
+            ),
+            Some("turn-9")
+        );
+        assert_eq!(
+            notification_turn_id("thread/started", &json!({"thread": {"id": "t1"}})),
+            None
+        );
+        assert_eq!(
+            notification_turn_id("configWarning", &json!({"message": "no bubblewrap"})),
+            None
+        );
+    }
+
+    /// A repeat `Backend::interrupt`/`stop` call on a turn that is still
+    /// `InFlight` -- the engine's own ceiling-triggered auto-interrupt
+    /// followed by a later human cancel is one real path -- must never
+    /// re-ask the harness once an ask has already gotten (or is already
+    /// getting) an honest answer. Only `NotRequested` and `RpcFailed` are
+    /// worth a fresh, tracked attempt.
+    #[test]
+    fn only_not_requested_and_rpc_failed_are_worth_asking_again() {
+        assert!(InterruptProgress::NotRequested.worth_asking_again());
+        assert!(InterruptProgress::RpcFailed.worth_asking_again());
+        assert!(!InterruptProgress::Requested { id: 1 }.worth_asking_again());
+        assert!(!InterruptProgress::Acknowledged.worth_asking_again());
     }
 
     #[test]
@@ -3095,5 +5644,129 @@ mod tests {
         let backend = CodexBackend::new(config);
         assert_eq!(backend.runtime_scope(), RuntimeScope::PerExecution);
         assert_eq!(backend.name(), CODEX_BACKEND_NAME);
+    }
+
+    // ------------------------------------------------------- W3 admission rows
+
+    /// L8, made structural (spec §2.1): every `claimed: true` names a real
+    /// (non-empty) admission test, and every v1 flag `capabilities()`
+    /// reports `true` has a matching, claimed row on *both* transports —
+    /// `capabilities()` takes no transport argument (§5.3), so the two
+    /// transports must agree on every boolean or the contract itself would
+    /// be a lie for whichever transport a registration resolves to.
+    #[test]
+    fn admission_rows_agree_with_capabilities() {
+        let config = CodexConfig::new(Path::new("/nonexistent"));
+        let backend = CodexBackend::new(config);
+        let caps = backend.capabilities();
+
+        let flags: &[(&str, bool)] = &[
+            ("persistent_sessions", caps.persistent_sessions),
+            ("native_background", caps.native_background),
+            ("streaming", caps.streaming),
+            ("history", caps.history),
+            ("resume", caps.resume),
+            ("interrupt", caps.interrupt),
+            ("model_selection", caps.model_selection),
+            ("profiles", caps.profiles),
+            ("approval_flow", caps.approval_flow),
+            ("human_attach", caps.human_attach),
+            ("usage", caps.usage),
+            ("native_subagents", caps.native_subagents),
+            ("ask", caps.ask),
+        ];
+
+        for &(flag, claimed_by_contract) in flags {
+            for transport in [Transport::Exec, Transport::AppServer] {
+                let row = ADMISSION_ROWS
+                    .iter()
+                    .find(|r| r.capability == flag && r.transport == transport)
+                    .unwrap_or_else(|| {
+                        panic!("no ADMISSION_ROWS entry for {flag} on {transport:?}")
+                    });
+                assert_eq!(
+                    row.claimed, claimed_by_contract,
+                    "{flag} on {transport:?}: capabilities() says {claimed_by_contract}, the row \
+                     says {}",
+                    row.claimed
+                );
+                // §2.1's structural rule is one-directional: a `claimed:
+                // true` MUST name a real test (L8, made structural). A
+                // `claimed: false` row MAY still name one — a deterministic
+                // test proving a negative deliberately (e.g. `approval_flow`
+                // on app-server: "every server request answered, the five
+                // approval methods always denied") is real evidence too,
+                // just not evidence *for* the flag.
+                if row.claimed {
+                    assert!(
+                        !row.admission_test.is_empty(),
+                        "{flag} on {transport:?}: claimed true with no admission_test named"
+                    );
+                }
+            }
+        }
+
+        // The two non-v1-flag rows (§4.1's structured_output, §3.1's
+        // sandbox_enforcement) hold the same invariant even though no
+        // `Capabilities` field checks them.
+        for capability in ["structured_output", "sandbox_enforcement"] {
+            for transport in [Transport::Exec, Transport::AppServer] {
+                let row = ADMISSION_ROWS
+                    .iter()
+                    .find(|r| r.capability == capability && r.transport == transport)
+                    .unwrap_or_else(|| {
+                        panic!("no ADMISSION_ROWS entry for {capability} on {transport:?}")
+                    });
+                if row.claimed {
+                    assert!(!row.admission_test.is_empty());
+                }
+            }
+        }
+    }
+
+    /// [`Evidence`]'s own definitions are the contract: `LiveMeasured` means
+    /// "driven against the real, installed harness (a `#[ignore]`d live test,
+    /// gated behind SERGEANT_CODEX_TESTS=1)" and `LocallyMeasured` means
+    /// "without a live run". This suite's naming convention makes that
+    /// checkable: every live test in `tests/codex_backend.rs` is named
+    /// `live_*` and nothing else is. So a `claimed: true` row is only
+    /// internally consistent if the two agree.
+    ///
+    /// Scoped to `claimed: true` deliberately. A `claimed: false` row may
+    /// honestly cite a live test under a *different* tier — `ask` on
+    /// app-server names `live_appserver_actor_authored_question_is_typed`
+    /// while staying `Unmeasured`, because that probe measures model
+    /// behaviour, not the capability, and the row says so.
+    #[test]
+    fn a_claimed_row_naming_a_live_test_is_labelled_live_measured() {
+        for row in ADMISSION_ROWS.iter().filter(|row| row.claimed) {
+            let names_live_test = row.admission_test.starts_with("live_");
+            assert_eq!(
+                names_live_test,
+                row.evidence == Evidence::LiveMeasured,
+                "{} on {:?}: evidence {:?} disagrees with its admission test {:?} -- \
+                 LiveMeasured is exactly the tier a live_* test establishes, and the only \
+                 tier it establishes",
+                row.capability,
+                row.transport,
+                row.evidence,
+                row.admission_test,
+            );
+        }
+    }
+
+    #[test]
+    fn render_admission_rows_names_every_row_and_every_test() {
+        let rendered = render_admission_rows();
+        for row in ADMISSION_ROWS {
+            assert!(rendered.contains(row.capability));
+            if row.claimed {
+                assert!(
+                    rendered.contains(row.admission_test),
+                    "rendered table must name {}'s admission test",
+                    row.capability
+                );
+            }
+        }
     }
 }
