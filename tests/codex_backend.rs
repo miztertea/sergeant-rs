@@ -247,30 +247,28 @@ impl StubCodex {
                    printf '%s\\n' \"$line\" >> \"{appserver_requests}\"\n      \
                    method=$(printf '%s' \"$line\" | sed -n 's/.*\"method\":\"\\([^\"]*\\)\".*/\\1/p')\n      \
                    id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n      \
-                   if [ \"$method\" = \"initialize\" ]; then\n        \
+                   safe=$(printf '%s' \"$method\" | tr '/' '_')\n      \
+                   script_file=\"{appserver_scripts_dir}/$safe.jsonl\"\n      \
+                   if [ -f \"$script_file.exit_before\" ]; then\n        \
+                     seen=0\n        \
+                     if [ -f \"$script_file.count\" ]; then seen=$(cat \"$script_file.count\"); fi\n        \
+                     seen=$((seen+1))\n        \
+                     echo \"$seen\" > \"$script_file.count\"\n        \
+                     if [ \"$seen\" -ge \"$(cat \"$script_file.exit_before\")\" ]; then exit 0; fi\n      \
+                   fi\n      \
+                   if [ \"$method\" = \"initialize\" ] && [ ! -f \"$script_file\" ]; then\n        \
                      printf '%s\\n' '{{\"id\":__ID__,\"result\":{{\"userAgent\":\"stub/0.0.0\",\
 \"codexHome\":\"/stub\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}}}' \
 | sed \"s/__ID__/$id/\"\n      \
-                   else\n        \
-                     safe=$(printf '%s' \"$method\" | tr '/' '_')\n        \
-                     script_file=\"{appserver_scripts_dir}/$safe.jsonl\"\n        \
-                     if [ -f \"$script_file.exit_before\" ]; then\n          \
-                       seen=0\n          \
-                       if [ -f \"$script_file.count\" ]; then seen=$(cat \"$script_file.count\"); fi\n          \
-                       seen=$((seen+1))\n          \
-                       echo \"$seen\" > \"$script_file.count\"\n          \
-                       if [ \"$seen\" -ge \"$(cat \"$script_file.exit_before\")\" ]; then exit 0; fi\n        \
-                     fi\n        \
-                     if [ -f \"$script_file\" ]; then\n          \
-                       while IFS= read -r out; do\n            \
-                         printf '%s\\n' \"$out\" | sed \"s/__ID__/$id/g\"\n          \
-                       done < \"$script_file\"\n        \
-                     fi\n        \
-                     if [ -f \"$script_file.exit_after\" ]; then\n          \
-                       if [ -f \"$script_file.exit_code\" ]; then \
-exit \"$(cat \"$script_file.exit_code\")\"; fi\n          \
-                       exit 0\n        \
-                     fi\n      \
+                   elif [ -f \"$script_file\" ]; then\n        \
+                     while IFS= read -r out; do\n          \
+                       printf '%s\\n' \"$out\" | sed \"s/__ID__/$id/g\"\n        \
+                     done < \"$script_file\"\n      \
+                   fi\n      \
+                   if [ -f \"$script_file.exit_after\" ]; then\n        \
+                     if [ -f \"$script_file.exit_code\" ]; then \
+exit \"$(cat \"$script_file.exit_code\")\"; fi\n        \
+                     exit 0\n      \
                    fi\n    \
                  done\n    \
                  exit 0\n  \
@@ -2682,6 +2680,805 @@ fn appserver_interrupt_kills_the_process_group_when_the_rpc_fails() {
     );
     assert_eq!(ended.payload["outcome"], "interrupted_running");
     assert_eq!(ended.payload["interrupted"], true);
+}
+
+// ------------------------------------------------- §2 residual-gap coverage
+//
+// coverage-spec.md §2's stub-driven wave, closing the residual gap left
+// after §1's accounting fix (StubCodex/StubCodex-adjacent infrastructure
+// only — no live codex, no new coverage-exclusion attributes, no gate
+// change). Grouped exactly as the spec's own subsections.
+
+// --------------------------------------------------------- §2a helpers
+
+/// Write a durable rollout file `thread_rollout`/`find_rollout` will locate
+/// for `thread_id`, nested a few directories deep under
+/// `codex_home/sessions` — the same `YYYY/MM/DD` shape a real `~/.codex`
+/// layout uses, and along the way `find_rollout`'s recursive-directory arm
+/// (never reachable from a rollout dropped flat in `sessions/`).
+fn write_rollout(codex_home: &Path, thread_id: &str) {
+    let dir = codex_home
+        .join("sessions")
+        .join("2026")
+        .join("08")
+        .join("22");
+    std::fs::create_dir_all(&dir).expect("mkdir rollout dir");
+    std::fs::write(
+        dir.join(format!("rollout-2026-08-22T00-00-00-{thread_id}.jsonl")),
+        "{}\n",
+    )
+    .expect("write rollout fixture");
+}
+
+/// Spawn a decoy process whose own argv is exactly `sh -c "read line"`
+/// followed by `extra_args` — the same no-fork, blocked-on-a-builtin shape
+/// `tests/m4_backends.rs::spawn_turn_stand_in` uses, and for the identical
+/// reason: a forked external command transiently duplicates the matching
+/// argv (the parent's, mid-`fork`) and turns a liveness assertion into a
+/// coin flip under load. This is what makes `turn_liveness`'s *real*
+/// wrapper — the one that calls
+/// `crate::platform::process::running_processes()` against the actual
+/// process table, as opposed to `turn_liveness_among`'s own unit tests
+/// (which inject a synthetic `ProcessArgv` list) — honestly testable at
+/// all: `argv_names_thread`/`argv_names_surface` match on argv content
+/// only, never on the executable being `codex`, so a harmless decoy
+/// process satisfies them exactly as a real turn's argv would.
+///
+/// `zombie_processes` is silenced deliberately: every caller kills and
+/// reaps the returned child via [`kill_decoy`], but clippy cannot see across
+/// that function boundary, and the deadline `assert!` below is a path where
+/// a failing *test* — not this helper — drops the child without waiting,
+/// an acceptable leak on an already-failing test run, not the steady-state
+/// zombie the lint exists to catch.
+#[allow(clippy::zombie_processes)]
+fn spawn_decoy_process(extra_args: &[&str]) -> std::process::Child {
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg("read line");
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    let child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn decoy process");
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let execd = sergeant_rs::platform::process::running_processes()
+            .into_iter()
+            .flatten()
+            .any(|process| {
+                process.pid == pid
+                    && extra_args
+                        .iter()
+                        .all(|needle| process.argv.iter().any(|arg| arg == needle))
+            });
+        if execd {
+            return child;
+        }
+        assert!(Instant::now() < deadline, "decoy process never exec'd");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Kill and reap a decoy spawned by [`spawn_decoy_process`]. Blocked on its
+/// own `read` builtin with no forked children, so a single `kill()` ends it
+/// outright — no leaked grandchild the way a `sleep`-based decoy would risk.
+fn kill_decoy(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// coverage-spec.md §2a: `classify_restart`/`turn_liveness`'s live-wrapper
+// methods have zero integration coverage today — only the pure decision
+// function `turn_liveness_among` is unit tested. These five drive the real
+// wrapper (`turn_liveness`, `classify_restart`, `observe`'s `Adopted`
+// branch, `resume`'s `Liveness` match) through a real process scan.
+
+#[test]
+fn restart_observation_reports_a_live_owned_turn_via_a_decoy_process() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let codex_home = dir.path().join("codex-home");
+    let backend = CodexBackend::new(config_for(&stub, dir.path(), &codex_home));
+    let thread_id = fresh_thread_id();
+    write_rollout(&codex_home, &thread_id);
+    let decoy = spawn_decoy_process(&["exec", "resume", &thread_id]);
+    let pid = decoy.id();
+    let handle = ExecutionHandle {
+        execution_id: "e-unowned-live".to_string(),
+        native_id: Some(thread_id.clone()),
+    };
+    let observation = backend
+        .observe(&handle)
+        .expect("observe a live, unowned turn");
+    kill_decoy(decoy);
+    assert_eq!(observation.native, NativeState::Running);
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Blocked { reason } => {
+            assert!(
+                reason.contains(&pid.to_string()),
+                "must name the pid: {reason}"
+            );
+            assert!(reason.contains("unowned"), "must say unowned: {reason}");
+        }
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+}
+
+#[test]
+fn restart_observation_reports_surface_ambiguous_for_a_first_turn_decoy() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let codex_home = dir.path().join("codex-home");
+    let backend = CodexBackend::new(config_for(&stub, dir.path(), &codex_home));
+    let thread_id = fresh_thread_id();
+    write_rollout(&codex_home, &thread_id);
+    let handle = ExecutionHandle {
+        execution_id: "e-surface-ambiguous".to_string(),
+        native_id: Some(thread_id.clone()),
+    };
+    // Re-adopt with nothing live yet, so RESUME's own liveness check passes
+    // and OBSERVE afterward goes through the `Adopted` branch — the only
+    // path that calls `classify_restart` with `Some(cwd)`, since an
+    // un-adopted OBSERVE (the previous test) never has a surface to check
+    // a first-turn decoy against.
+    let request = ResumeRequest::new("w-surface-ambiguous", dir.path());
+    backend
+        .resume(&handle, &request)
+        .expect("re-adopt with no live process");
+    let cwd_str = dir.path().to_string_lossy().into_owned();
+    let decoy = spawn_decoy_process(&["exec", "-C", &cwd_str]);
+    let pid = decoy.id();
+    let observation = backend.observe(&handle).expect("observe");
+    kill_decoy(decoy);
+    assert_eq!(observation.native, NativeState::Unknown);
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Blocked { reason } => {
+            assert!(
+                reason.contains(&pid.to_string()),
+                "must name the pid: {reason}"
+            );
+            assert!(
+                reason.contains("cannot be established from its argv"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+}
+
+#[test]
+fn restart_observation_reports_dead_with_durable_rollout() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let codex_home = dir.path().join("codex-home");
+    let backend = CodexBackend::new(config_for(&stub, dir.path(), &codex_home));
+
+    // Unowned wording: never registered with this daemon at all.
+    let thread_unowned = fresh_thread_id();
+    write_rollout(&codex_home, &thread_unowned);
+    let handle_unowned = ExecutionHandle {
+        execution_id: "e-dead-unowned".to_string(),
+        native_id: Some(thread_unowned),
+    };
+    let observation = backend
+        .observe(&handle_unowned)
+        .expect("observe a dead, unowned thread");
+    assert_eq!(observation.native, NativeState::Exited);
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Blocked { reason } => {
+            assert!(
+                reason.contains("in-flight turn's outcome is unknown"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+
+    // Adopted wording: re-adopted, then observed with nothing live.
+    let thread_adopted = fresh_thread_id();
+    write_rollout(&codex_home, &thread_adopted);
+    let handle_adopted = ExecutionHandle {
+        execution_id: "e-dead-adopted".to_string(),
+        native_id: Some(thread_adopted),
+    };
+    let request = ResumeRequest::new("w-dead-adopted", dir.path());
+    backend.resume(&handle_adopted, &request).expect("re-adopt");
+    let observation = backend
+        .observe(&handle_adopted)
+        .expect("observe a dead, adopted thread");
+    assert_eq!(observation.native, NativeState::Exited);
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Blocked { reason } => {
+            assert!(
+                reason.contains("left no outcome this daemon can read"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected Blocked, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_refuses_to_readopt_a_thread_whose_turn_is_still_running() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let codex_home = dir.path().join("codex-home");
+    let backend = CodexBackend::new(config_for(&stub, dir.path(), &codex_home));
+    let thread_id = fresh_thread_id();
+    write_rollout(&codex_home, &thread_id);
+    let decoy = spawn_decoy_process(&["exec", "resume", &thread_id]);
+    let pid = decoy.id();
+    let handle = ExecutionHandle {
+        execution_id: "e-refuse-running".to_string(),
+        native_id: Some(thread_id),
+    };
+    let request = ResumeRequest::new("w-refuse-running", dir.path());
+    let err = backend
+        .resume(&handle, &request)
+        .expect_err("must refuse while a turn of this thread is still running");
+    kill_decoy(decoy);
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(
+                detail.contains(&pid.to_string()),
+                "must name the pid: {detail}"
+            );
+            assert!(detail.contains("still running"), "{detail}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[test]
+fn resume_refuses_to_readopt_when_surface_is_ambiguous() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let codex_home = dir.path().join("codex-home");
+    let backend = CodexBackend::new(config_for(&stub, dir.path(), &codex_home));
+    let thread_id = fresh_thread_id();
+    write_rollout(&codex_home, &thread_id);
+    let cwd_str = dir.path().to_string_lossy().into_owned();
+    let decoy = spawn_decoy_process(&["exec", "-C", &cwd_str]);
+    let pid = decoy.id();
+    let handle = ExecutionHandle {
+        execution_id: "e-refuse-ambiguous".to_string(),
+        native_id: Some(thread_id),
+    };
+    let request = ResumeRequest::new("w-refuse-ambiguous", dir.path());
+    let err = backend
+        .resume(&handle, &request)
+        .expect_err("must refuse when the surface is ambiguously occupied");
+    kill_decoy(decoy);
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(
+                detail.contains(&pid.to_string()),
+                "must name the pid: {detail}"
+            );
+            assert!(
+                detail.contains("cannot say whether it is this thread's turn"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------- §2b: vanishing
+// probes — the `Command::new(exe).output()` spawn-failure arms, never
+// reachable against `StubCodex::passing` (which always exists and is
+// executable).
+
+/// Write a minimal `codex` stand-in for §2b at `dir.join(name)`, running
+/// `body` as its `#!/bin/sh` script. Deliberately bypasses `StubCodex`'s own
+/// giant launch-recording template: these tests need nothing past the
+/// capability probe's own three sequential spawns, and a stub whose whole
+/// point is to stop existing partway through has no use for launch
+/// recording, replay, or any of `StubCodex`'s other machinery.
+fn write_vanishing_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).expect("write vanishing stub");
+    let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod stub");
+    // Not `support::wait_until_executable`: that helper proves runnability
+    // by actually running `--version`, which for a stub whose whole point
+    // is "answers `--version` exactly once" would spend the one real
+    // invocation these tests need for the probe itself. This warms the
+    // executable up with an arg neither vanishing script recognizes (falls
+    // through to their trailing `exit 1`, consuming nothing), retrying only
+    // on `ETXTBSY` (os error 26) — the same transient "still has the file
+    // open for writing" window `wait_until_executable` itself retries on.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::process::Command::new(&path)
+            .arg("--warm-up-only-matches-no-branch")
+            .output()
+        {
+            Ok(_) => break,
+            Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the vanishing stub at {path:?} is not runnable: {e}"),
+        }
+    }
+    path
+}
+
+/// Answers `--version` for real, once, then deletes its own script file —
+/// every later invocation (starting with `exec --help`) gets `ENOENT`.
+fn vanishes_after_version(dir: &Path) -> PathBuf {
+    write_vanishing_stub(
+        dir,
+        "codex-vanishes-after-version",
+        &format!(
+            "if [ \"$1\" = \"--version\" ]; then echo \"{v}\"; rm -f \"$0\"; exit 0; fi\nexit 1\n",
+            v = PASSING_VERSION,
+        ),
+    )
+}
+
+/// Answers `--version` and `exec --help` for real, then deletes its own
+/// script file — the next invocation (`exec resume --help`) gets `ENOENT`.
+fn vanishes_after_exec_help(dir: &Path) -> PathBuf {
+    write_vanishing_stub(
+        dir,
+        "codex-vanishes-after-exec-help",
+        &format!(
+            "if [ \"$1\" = \"--version\" ]; then echo \"{v}\"; exit 0; fi\n\
+             if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"--help\" ]; then printf '%s\\n' \"{h}\"; \
+             rm -f \"$0\"; exit 0; fi\nexit 1\n",
+            v = PASSING_VERSION,
+            h = ALL_EXEC_HELP,
+        ),
+    )
+}
+
+#[test]
+fn probe_refuses_when_the_executable_itself_cannot_be_run() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut config = CodexConfig::new(dir.path());
+    config.executable = dir.path().join("does-not-exist-at-all");
+    config.codex_home = Some(dir.path().join("codex-home"));
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(!report.available);
+    let detail = report.detail.expect("detail");
+    assert!(detail.contains("cannot run"), "{detail}");
+    assert!(detail.contains("--version"), "{detail}");
+    assert!(detail.contains("NotFound"), "{detail}");
+}
+
+#[test]
+fn probe_refuses_when_exec_help_cannot_even_be_run() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut config = CodexConfig::new(dir.path());
+    config.executable = vanishes_after_version(dir.path());
+    config.codex_home = Some(dir.path().join("codex-home"));
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(!report.available);
+    let detail = report.detail.expect("detail");
+    assert!(detail.contains("cannot run"), "{detail}");
+    assert!(detail.contains("exec --help"), "{detail}");
+    assert!(detail.contains("NotFound"), "{detail}");
+}
+
+#[test]
+fn probe_refuses_when_exec_resume_help_cannot_even_be_run() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut config = CodexConfig::new(dir.path());
+    config.executable = vanishes_after_exec_help(dir.path());
+    config.codex_home = Some(dir.path().join("codex-home"));
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(!report.available);
+    let detail = report.detail.expect("detail");
+    assert!(detail.contains("cannot run"), "{detail}");
+    assert!(detail.contains("exec resume --help"), "{detail}");
+    assert!(detail.contains("NotFound"), "{detail}");
+}
+
+// --------------------------------------------------------- §2c: app-server
+// handshake failure arms.
+
+#[test]
+fn launch_appserver_refuses_a_thread_start_reply_with_no_thread_id() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply("thread/start", &[r#"{"id":__ID__,"result":{}}"#]);
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let err = backend
+        .launch(&prepared)
+        .expect_err("a thread/start reply with no thread.id must be refused");
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(detail.contains("carried no thread.id"), "{detail}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+/// Extends the existing `exit_before` mechanism (previously special-cased
+/// away from `initialize`, per the stub's own dispatch loop fix) to the one
+/// method that was exempt from it: `initialize` never answering is what G4
+/// and LAUNCH's own handshake both need to be able to force.
+#[test]
+fn gate_g4_handshake_fails_closed_when_initialize_never_answers() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_exits_before("initialize", 1);
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    let backend = CodexBackend::new(config);
+    let report = backend.probe();
+    assert!(
+        !report.available,
+        "G4 must refuse under AppServerOnly when initialize never answers"
+    );
+    let detail = report.detail.expect("detail");
+    assert!(
+        detail.contains("G4"),
+        "the failed gate must be named: {detail}"
+    );
+}
+
+#[test]
+fn launch_appserver_reports_a_handshake_failure_when_initialize_never_answers() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    let backend = appserver_backend(&stub, dir.path());
+    // Let the gates pass for real first (a normal spawn, initialize
+    // answered) — only *then* arm the marker, so this pins LAUNCH's own
+    // handshake call, not a resolution that fell back to exec already.
+    let report = backend.probe();
+    assert!(
+        report.available,
+        "gates must pass before the marker is armed: {:?}",
+        report.detail
+    );
+    stub.appserver_exits_before("initialize", 1);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let err = backend
+        .launch(&prepared)
+        .expect_err("initialize never answered on this launch's own child");
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(detail.contains("app-server handshake failed"), "{detail}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------- §2d:
+// `appserver_send_turn`'s in-flight refusal and its `turn/start` rollback.
+
+#[test]
+fn appserver_send_refuses_a_second_turn_while_the_first_is_in_flight() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub); // turn/start acks, never completes
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let err = backend
+        .send(&handle, "second turn")
+        .expect_err("must be refused while turn 1 is still in flight");
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(detail.contains("already has a turn in flight"), "{detail}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+fn appserver_a_failed_turn_start_rolls_back_to_idle_and_a_later_turn_still_succeeds() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // Turn 1: acks and completes immediately, so the cell is settled
+    // (Finished, not InFlight) before turn 2 is even attempted.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+        ],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "turn 1 settles before turn 2 is attempted",
+        |_| true,
+    );
+
+    // Turn 2: the RPC itself fails.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[r#"{"id":__ID__,"error":{"code":-1,"message":"boom"}}"#],
+    );
+    let err = backend
+        .send(&handle, "second turn")
+        .expect_err("turn/start's own RPC failure must surface");
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(detail.contains("turn/start failed"), "{detail}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    // Turn 3: re-scripted to succeed. A test that stopped at "the failing
+    // call returned Err" would not distinguish the fixed rollback from the
+    // bug it replaced (a blind `= Idle` that could clobber a reader-thread
+    // `Finished`) — only a *subsequent* send succeeding proves the cell
+    // really returned to `Idle` rather than staying wedged.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-3"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-3","status":"completed"}}}"#,
+        ],
+    );
+    backend
+        .send(&handle, "third turn")
+        .expect("the cell must have rolled back to Idle, not stayed wedged");
+    backend.stop(&handle).expect("stop").wait();
+}
+
+// --------------------------------------------------------- §2e:
+// `observe_appserver` terminal arms with no coverage through `observe()`
+// itself (as opposed to `classify_terminal`'s own unit tests, which pin the
+// classification but never call `observe_appserver` over the result).
+
+#[test]
+fn appserver_observe_reports_failed_without_the_auth_note_for_an_ordinary_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"failed","error":{"message":"boom, ordinary"}}}}"#,
+        ],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let observation = wait_for_observation(&backend, &handle, "an ordinary failed turn", |o| {
+        matches!(o.signal, sergeant_rs::backend::BackendSignal::Failed { .. })
+    });
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Failed { reason } => {
+            assert!(reason.contains("boom, ordinary"), "{reason}");
+            assert!(
+                !reason.contains("(auth)"),
+                "an ordinary error must not be tagged auth: {reason}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+fn appserver_observe_reports_a_harness_confirmed_interrupt() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"interrupted"}}}"#,
+        ],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "a harness-confirmed interrupt (turn/completed{status:interrupted})",
+        |o| {
+            o.evidence
+                .as_deref()
+                .unwrap_or("")
+                .contains("harness-confirmed")
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("an interrupted-but-resumable turn stays Running, got {other:?}"),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+fn appserver_observe_reads_the_childs_own_exit_after_a_turn_completes() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+        ],
+    );
+    stub.appserver_exits_after("turn/start");
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "a completed turn whose child has since exited",
+        |o| {
+            matches!(
+                o.signal,
+                sergeant_rs::backend::BackendSignal::StageCompleted { .. }
+            ) && o.native == NativeState::Exited
+        },
+    );
+    assert_eq!(observation.native, NativeState::Exited);
+}
+
+// --------------------------------------------------------- §2f: small
+// residuals, one existing-infrastructure test each.
+
+#[test]
+fn a_malformed_replay_line_counts_as_unparsed_but_the_turn_still_settles() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let transcript = format!(
+        "{{\"type\":\"thread.started\",\"thread_id\":\"{tid}\"}}\n\
+         {{\"type\":\"turn.started\"}}\n\
+         not valid json at all\n\
+         {{\"type\":\"item.completed\",\"item\":{{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"ok\"}}}}\n\
+         {{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\
+         \"cache_write_input_tokens\":0,\"output_tokens\":1,\"reasoning_output_tokens\":0}}}}\n",
+        tid = fresh_thread_id(),
+    );
+    stub.replays(&transcript);
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let ended = wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "a malformed line must not stop the turn from reaching a terminal",
+        |_| true,
+    );
+    assert_eq!(ended.payload["unparsed_lines"], 1, "{:?}", ended.payload);
+    assert_eq!(
+        ended.payload["message_items"], 1,
+        "the real item either side of the malformed line still decoded: {:?}",
+        ended.payload
+    );
+    // Exec's `conversation.turn.ended` carries no `outcome` field of its own
+    // (that key is app-server-only) — OBSERVE is the terminal's real
+    // evidence, and it must be a stage verdict, not the ambiguous arm a
+    // reader thread that gave up on the malformed line would produce.
+    let observation = backend.observe(&handle).expect("observe");
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::StageCompleted { .. } => {}
+        other => panic!(
+            "a malformed line must not turn a completed turn into anything less than a stage \
+             verdict: {other:?}"
+        ),
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+fn appserver_policy_echo_returns_the_thread_start_result_verbatim() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let echo = backend
+        .appserver_policy_echo(&handle)
+        .expect("an app-server execution must echo its thread/start result");
+    assert_eq!(
+        echo.pointer("/thread/id").and_then(Value::as_str),
+        Some("01a02508-5880-7980-95b7-1d8bc22d5139")
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+fn appserver_policy_echo_is_none_for_an_exec_transport_execution() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN);
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    assert!(
+        backend.appserver_policy_echo(&handle).is_none(),
+        "exec-transport executions have no app-server policy echo"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+#[test]
+fn prepare_refuses_when_the_probe_itself_is_unavailable() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut config = CodexConfig::new(dir.path());
+    config.executable = dir.path().join("does-not-exist-at-all");
+    config.codex_home = Some(dir.path().join("codex-home"));
+    let backend = CodexBackend::new(config);
+    let err = backend
+        .prepare(&start_request(dir.path()))
+        .expect_err("an unavailable probe must refuse at PREPARE, before any spawn");
+    assert!(matches!(err, BackendError::Unavailable { .. }));
 }
 
 // ---------------------------------------------------------- §7.3 live suite
