@@ -156,7 +156,7 @@ sgt run "add retry handling to the settlement worker"
 sgt run "add retry handling" --backend claude --workflow software-change --repo billing-service
 ```
 
-`run` takes an intent plus optional `--workflow <name>`, `--backend <claude|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), `--group <name>` (a declared estate group, expanded into the same repo selection), `--all` (every declared repository, explicit and journaled), `--turns <n>`/`--ceiling-secs <n>` (override this one work item's turn envelope instead of the daemon-wide default), and `--override-git-preflight` (waives a dirty-or-detached mount for this one submission, never anything else — `sgt run --help` is the authority on the full current list).
+`run` takes an intent plus optional `--workflow <name>`, `--backend <claude|codex|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), `--group <name>` (a declared estate group, expanded into the same repo selection), `--all` (every declared repository, explicit and journaled), `--turns <n>`/`--ceiling-secs <n>` (override this one work item's turn envelope instead of the daemon-wide default), and `--override-git-preflight` (waives a dirty-or-detached mount for this one submission, never anything else — `sgt run --help` is the authority on the full current list).
 
 **Watch it** — CLI or TUI, same daemon state through the same API, pick whichever fits:
 
@@ -279,7 +279,7 @@ A workflow is a directory, not code: a `workflow.toml` naming ordered stages, an
 └── ...
 ```
 
-Route to it explicitly (`sgt run "..." --workflow <name>`), or leave `--workflow` off and `sgt` uses the estate's own `software-change` workflow if it has declared one under `.sergeant/workflows/`, falling back to the built-in default otherwise. Backends are selected per work item (`--backend claude|fake`) or by named routing profiles in `sergeant.toml`. A profile can also pin the permission mode Claude turns launch with (`permission_mode = "acceptEdits"` in the profile's `options` table, using the CLI's own `--permission-mode` vocabulary); with no mode set, `sgt` passes no permission flag at all — never a silent bypass — and `sgt doctor` reports each profile's effective mode.
+Route to it explicitly (`sgt run "..." --workflow <name>`), or leave `--workflow` off and `sgt` uses the estate's own `software-change` workflow if it has declared one under `.sergeant/workflows/`, falling back to the built-in default otherwise. Backends are selected per work item (`--backend claude|codex|fake`) or by named routing profiles in `sergeant.toml`. A profile can also pin the permission mode Claude turns launch with (`permission_mode = "acceptEdits"` in the profile's `options` table, using the CLI's own `--permission-mode` vocabulary); with no mode set, `sgt` passes no permission flag at all — never a silent bypass — and `sgt doctor` reports each profile's effective mode.
 
 This repository dogfoods its own convention under `.sergeant/`: `.sergeant/index.md` catalogs every published workflow (23 at last count — code review, TDD, diagnosing a bug, resolving a merge conflict, breaking a plan into tickets, and more), and [`repo-to-icm`](.sergeant/workflows/repo-to-icm/) — a ten-stage workflow that converts a repository's scattered procedural knowledge (skills, agent instructions, scripts, docs) into reviewable draft workflow packages — is the worked example. Read its [`index.md`](.sergeant/workflows/repo-to-icm/index.md) and [`CONTEXT.md`](.sergeant/workflows/repo-to-icm/CONTEXT.md) for how a real multi-stage workflow is laid out, and see [`AGENTS.md`](AGENTS.md) for how an agent operating in this repo is expected to discover and route to one. Alongside it, `skills/<name>/SKILL.md` is the operator-skills layer — instructions the harness loads directly for judgment/dialogue work that never needs a dispatched Work item (`sergeant-help`, `grilling`, `grill-with-docs`, `estate-navigation`).
 
@@ -288,14 +288,14 @@ Full authoring rules — the four-layer context model (workflow orientation, sta
 ## How it works
 
 ```
-   sgt CLI ──┐            ┌────────────────────────── daemon (one per user) ──┐
-   sgt TUI ──┴─ HTTP/SSE ─┤  engine → workflows → routing → Backend trait     │
-                          │      │                    ├── claude (headless    │
-                          │  append-only journal      │     print-mode turns) │
-                          │  + blob store             └── fake (deterministic)│
-                          │      │                                            │
-                          │  projections: in-memory · DuckDB · graph          │
-                          └──── work surfaces: git worktrees, one per work ───┘
+   sgt CLI ──┐            ┌────────────────────────── daemon (one per user) ─────────────┐
+   sgt TUI ──┴─ HTTP/SSE ─┤  engine → workflows → routing → Backend trait                │
+                          │      │                    ├── claude (headless               │
+                          │  append-only journal      │     print-mode turns)            │
+                          │  + blob store             ├── codex (exec + app-server turns)│
+                          │      │                    └── fake (deterministic)           │
+                          │  projections: in-memory · DuckDB · graph                     │
+                          └──── work surfaces: git worktrees, one per work ──────────────┘
 ```
 
 Every state change — submit, worktree binding, stage entry, each model turn's raw output, the question the agent asked, your answer — is an event in a crash-tolerant journal (large payloads in a BLAKE3 content-addressed blob store). Everything else — the in-memory work state, the DuckDB analytics tables, the graph projection, every client screen — is a disposable projection rebuilt from it; there is no snapshot loading. The daemon exclusively owns the data directory and every process handle; clients (CLI, TUI) hold no state of their own and reach it only through the same loopback HTTP/SSE API — a structural test fails if one gets a private shortcut. A Claude "session" is a durable conversation identity, not a process: the OS process exists per turn, so killing the daemon mid-execution and restarting it resumes on unambiguous evidence, or fails closed into `blocked` with a stated reason — never a guess. Each work item gets its own git worktree on its own branch (`sergeant/<work-id>`), outside your checkout, so agents never fight over a working tree. A third `Backend` — `docker` — runs `kind = "execute"` workflow stages (pinned, offline containers) rather than agent turns; it isn't user-selectable via `--backend`, since a workflow's own stages declare their kind.
@@ -306,7 +306,7 @@ This is a clean-room Rust successor to [callmeradical/sergeant](https://github.c
 
 ## Status
 
-The core engine and CLI (journal, projections, the Backend boundary — Claude, fake, and Docker execute stages — the estate manifest, and every verb in "Using sgt day-to-day" above) are built and gated on `cargo test`; the workflow catalog and this file are the OS layer built on top of it, both converging toward the ship gate in [`NORTH-STAR.md`](NORTH-STAR.md)'s MVP plan. The complete development record — every milestone, every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md); the method that produced it is in [sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md](sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md).
+The core engine and CLI (journal, projections, the Backend boundary — Claude, Codex, fake, and Docker execute stages — the estate manifest, and every verb in "Using sgt day-to-day" above) are built and gated on `cargo test`; the workflow catalog and this file are the OS layer built on top of it, both converging toward the ship gate in [`NORTH-STAR.md`](NORTH-STAR.md)'s MVP plan. The complete development record — every milestone, every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md); the method that produced it is in [sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md](sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md).
 
 ## Contributors
 

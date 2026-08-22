@@ -787,6 +787,83 @@ async fn t3_every_graph_edge_resolves_to_an_event_that_justifies_it() {
     }
 }
 
+/// R-H0-7 shape 5 (uncorroborated narration), engine-level: a stage whose
+/// only signal is a `StageCompleted` summary — the shape a real Codex/Claude
+/// dev-tier turn can narrate a tool effect through with no corroborating
+/// `tool.*` event at all (H0 §C.3 finding 2) — must never manufacture a
+/// tool-call graph edge or a `tool_calls` analytics row. The fake is the one
+/// backend where this is provable without a live model call: its
+/// `StageCompleted { summary }` lands in `stage.completed`'s own `detail`
+/// field (`Engine::drive`'s `StageCompleted` arm), a kind neither
+/// `GraphContext::derive` nor the `tool_calls` fold ever reads narration
+/// text out of — so the graph-provenance rule this suite's acceptance 3
+/// exists for (every edge's `source_seq` resolves to a real event whose
+/// *content* justifies it) cannot be satisfied by narration alone.
+#[tokio::test]
+async fn narration_alone_never_produces_a_tool_call_graph_edge() {
+    let data = TempDir::new().expect("tempdir");
+    let (estate, _mount, _head) = estate();
+
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [
+            FakeStep::complete_with("ran pytest, 42 passed"),
+            FakeStep::complete(),
+        ],
+    )
+    .await;
+    let created = submit(
+        &handle,
+        estate.path(),
+        "narrate a tool effect that never happened",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = created["work"]["id"].as_str().expect("work id").to_string();
+    let shown = get(&handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(shown["work"]["state"], "completed", "run: {shown}");
+
+    let graph = get(&handle, &format!("/v1/graph/work/{work_id}")).await;
+    handle.shutdown().await;
+
+    let relations: BTreeSet<&str> = graph["edges"]
+        .as_array()
+        .expect("edges")
+        .iter()
+        .filter_map(|e| e["relation"].as_str())
+        .collect();
+    assert!(
+        !relations.contains("requested") && !relations.contains("caused"),
+        "narration text in a StageCompleted summary must never manufacture a \
+         tool-call edge: {relations:?}"
+    );
+
+    let events = journal_events(data.path());
+    assert!(
+        events.iter().any(|e| e.kind == "stage.completed"
+            && e.payload["detail"] == json!("ran pytest, 42 passed")),
+        "the narration must actually be present, in stage.completed's own \
+         detail field, not silently dropped: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.kind.starts_with("tool.")),
+        "no tool.* event exists anywhere in the journal — nothing here can \
+         even attempt to fold narration into a tool call: {events:?}"
+    );
+
+    let mut analytics = Analytics::in_memory(events.into_iter().map(Ok)).expect("projection");
+    let counts: BTreeMap<String, i64> = analytics
+        .table_counts()
+        .expect("counts")
+        .into_iter()
+        .collect();
+    assert_eq!(
+        counts["tool_calls"], 0,
+        "narration alone must never populate a tool_calls row: {counts:?}"
+    );
+}
+
 /// The journal, indexed the two ways provenance checking needs it: by seq, to
 /// resolve an edge's `source_seq`, and by event id, to resolve a `causation_id`
 /// to the message node the journal itself says caused a tool call.
