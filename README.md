@@ -1,327 +1,305 @@
-# sergeant-rs
+# Sergeant
 
-![sergeant-rs](docs/img/logo.png)
+<p align="center">
+  <img src="docs/img/logo.png" alt="Sergeant" width="760">
+</p>
 
-**Sergeant is an AgentOS distro: instructions, skills, and conventions that turn a general-purpose coding harness into an operator of your estate, carried by `sgt` — a durable intent-execution engine that runs to completion whether or not anyone is watching.**
+<p align="center">
+  <strong>Define intent with Captain. Execute it with Sergeant.</strong>
+</p>
 
-[![CI](https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<p align="center">
+  Sergeant turns your coding harness into <strong>Captain</strong> using <code>AGENTS.md</code> and skills. Captain helps you understand the work, define what you want, and delegate it. Sergeant executes that intent through durable workflows across one repository or an entire software estate.
+</p>
 
-Clone it, put `sgt` on `PATH`, point it at your repos, and open your coding
-harness there. `AGENTS.md` teaches the harness how to talk to Sergeant —
-what to route where, and the loop it drives. When you say *"add retry
-handling to the settlement worker,"* the harness shapes that into an
-intent and hands it to the engine: `sgt` cuts a git worktree, drives a
-staged agent workflow on Claude (or a deterministic fake backend for
-testing), and records every state change in an append-only journal. Close
-the terminal — the daemon keeps running the work. Come back later and `sgt
-work show <id>` or `sgt tui` show exactly where it got to; if it stopped to
-ask you something, `sgt respond` answers it.
+<p align="center">
+  <a href="https://github.com/miztertea/sergeant-rs/releases"><img alt="Release" src="https://img.shields.io/github/v/release/miztertea/sergeant-rs"></a>
+  <a href="https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/miztertea/sergeant-rs/actions/workflows/ci.yml/badge.svg?event=pull_request"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL-blue">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
 
-## Get it
+Sergeant is local-first, designed for one developer per installation, and currently pre-1.0. It runs on Linux, macOS, and Windows through WSL2.
 
-Requires Rust (edition 2024) and `git`. For real agent execution you also
-need an installed [`claude` CLI](https://claude.com/claude-code) —
-everything else here works without it, via the deterministic fake backend.
+## Get started
 
-```sh
-gh repo clone miztertea/sergeant-rs
-cd sergeant-rs
-cargo install --path . --bin sgt   # first build compiles bundled DuckDB from scratch — that ~10 min figure was measured on an ephemeral cloud container (2026-08-09); on a persistent dev host it's markedly faster
-```
+You need:
 
-That puts `sgt` on `$CARGO_HOME/bin` (usually `~/.cargo/bin`, already on
-`PATH` for most Rust installs). Sergeant is clone-is-distro: this checkout
-*is* the estate — the exact directory `sergeant.toml` lives in once you
-`sgt init` it below. `AGENTS.md`, `skills/`, and `.sergeant/workflows/`
-only exist here — stay in it. Sergeant does not search parent directories
-for an estate and does not fall back to a plain Git checkout, so every
-estate-scoped command run from a bare directory elsewhere refuses outright
-rather than quietly finding nothing to read:
+- **Git**
+- **[Claude Code](https://claude.com/claude-code) or [Codex](https://developers.openai.com/codex/cli)** — agent workflow stages execute on either; everything else works without them via a deterministic test backend
+- **Docker**, if your workflows include deterministic container stages — optional otherwise, and `sgt doctor` will tell you either way
 
-```sh
-sgt init                              # scaffold the estate: sergeant.toml [estate], repos/, .gitignore
-sgt repo add settlement-service --origin git@github.com:you/settlement-service.git
-```
-
-(`sgt init` never touches sergeant-rs's own source — it only adds
-`sergeant.toml`, `repos/`, and a couple of `.gitignore` entries alongside
-it. Your added repos live under `repos/`, gitignored, separate from this
-checkout's own tracked files.)
-
-Then open your harness (Claude Code or another agent CLI) in this same
-directory and just say what you want. It reads `AGENTS.md`, shapes an
-intent, and drives `sgt run` on your behalf — see [`AGENTS.md`](AGENTS.md)
-for exactly how it routes and the loop it follows, and the [workflow
-catalog](#workflows) below for what a workflow actually is.
-
-### Installing a released binary instead of building from source
-
-`dist` (cargo-dist) publishes a prebuilt `sgt` for each [release](https://github.com/miztertea/sergeant-rs/releases), plus a `curl | sh` convenience installer:
+Install the latest release:
 
 ```sh
 curl -fsSL https://github.com/miztertea/sergeant-rs/releases/latest/download/sergeant-rs-installer.sh | sh
 ```
 
-**As of v0.1.2 this one-liner verifies the archive it downloads.** The
-generated installer carries the SHA-256 of every published archive and checks
-the download against it before extracting anything; a substituted or corrupted
-archive aborts the install with `checksum mismatch` and installs nothing. Every
-release run proves this on itself — the release workflow installs from a local
-origin and then re-runs the install against a deliberately substituted archive,
-and fails the release if that one is not rejected.
+Prebuilt binaries cover x86_64 Linux and Apple Silicon macOS; other platforms build from source with Rust (see [CONTRIBUTING.md](CONTRIBUTING.md)). The installer verifies its download against published checksums (v0.1.2 and later); to verify provenance independently, run `gh attestation verify` against the [release](https://github.com/miztertea/sergeant-rs/releases) assets.
 
-Releases before v0.1.2 did **not** verify: `dist` fills those values in only
-when its global build can see the per-target build manifests, and this
-project's release workflow did not pass them forward until 0.1.2. Installing
-v0.1.1 or older with this one-liner prints `no checksums to verify` and installs
-unverified — for those, the manual steps below are the only evidence you get.
-
-Two things the one-liner still does not give you, at any version: it does not
-check **provenance** — that the archive came from *this* repository's release
-workflow rather than from anyone able to produce a matching hash — and its
-checksum arrives inside the very script that consumes it, from the same origin
-as the archive. To verify independently of the script, do it by hand — a few
-extra commands, run once per release:
+Create an estate and launch your coding harness:
 
 ```sh
-# 1. Download the archive for your platform, its checksum file, and the installer.
-mkdir -p /tmp/sgt-install && cd /tmp/sgt-install
-gh release download --repo miztertea/sergeant-rs \
-  -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz' \
-  -p 'sergeant-rs-x86_64-unknown-linux-gnu.tar.xz.sha256'
-
-# 2. Check the archive's contents match what was published.
-sha256sum -c sergeant-rs-x86_64-unknown-linux-gnu.tar.xz.sha256
-
-# 3. Check the archive was actually built by this repo's release workflow,
-#    not just that some file with a matching hash was uploaded somewhere.
-gh attestation verify sergeant-rs-x86_64-unknown-linux-gnu.tar.xz --owner miztertea
-
-# 4. Only after both checks pass, extract and install by hand.
-tar xf sergeant-rs-x86_64-unknown-linux-gnu.tar.xz
-install -m 755 sergeant-rs-x86_64-unknown-linux-gnu/sgt ~/.local/bin/sgt
-sgt --version
+mkdir -p ~/estates/my-product
+cd ~/estates/my-product
+sgt init
+sgt claude
+# or: sgt codex / sgt opencode / sgt goose
 ```
 
-Step 2 confirms the bytes weren't corrupted or swapped in transit — the same
-property the installer now checks for itself, but against a checksum you fetched
-as its own release asset rather than one embedded in the script; step 3 confirms
-they came from a GitHub Actions run of *this* repository's `release.yml`, via
-Sigstore/GitHub's build-provenance attestation — which the convenience one-liner
-still does not check. Swap the target triple (`aarch64-apple-darwin`) and
-`~/.local/bin` for your platform and preferred install location as needed.
+Then talk to Captain:
 
-Want to see the whole loop first, with no tokens spent and no estate to
-set up? `scripts/demo.sh` builds the debug binary itself and drives it end
-to end in a throwaway repo — submit → worktree → stage runs and *stops to
-ask a question* → you answer → independent review stage → completed →
-retired — deterministically, on the fake backend, printing where the
-evidence lives at every step. It exits 0 or the walkthrough is broken:
+> This estate contains our payments API, auth service, customer web app, and engineering knowledge repo. I can give you the local locations or Git remotes for each one.
 
-```sh
-scripts/demo.sh
-```
+Captain will help register the repositories, organize them into groups when useful, and verify the estate. Then describe the work:
 
-Already built a release binary above with `cargo install`? Point the
-script at it instead of paying for a second (debug) DuckDB build:
-`SGT_BIN=$(command -v sgt) scripts/demo.sh`.
+> Add account lockout after five failed login attempts. Update the web UI to explain why the account is locked, and record the new behavior in our engineering knowledge.
 
-With no `claude` CLI installed, add `--backend fake` to any `sgt run` to
-try the loop without spending tokens.
+Captain shapes that conversation into intent, selects the appropriate workflow and repository scope, and hands the work to Sergeant.
 
-## See it
+You do not need to learn Sergeant's CLI before using Sergeant. Captain is an expert in operating it on your behalf.
 
-The images below are from the M6-era minimal Fleet/Detail TUI, superseded
-by the T-series `Home / Fleet / Workflows / Estate` cockpit
-(`sergeant-rs-workspace/knowledge/evidence/reference/proposal-tui-t-series.md`) — real terminal PNG captures of the
-current TUI are a pending follow-up (no real-terminal session was
-available to capture them from). `docs/tui-screenshots/*.txt` has honest,
-current renders in the meantime — actual `ratatui::TestBackend` output
-flattened to plain text, not mockups; regenerate with `cargo test --lib --
---ignored generate_t4_wide_screenshots`.
+## Captain defines. Sergeant executes.
 
-| TUI — work detail with live journal tail (M6, superseded) | TUI — fleet (M6, superseded) |
+Coding harnesses are excellent at conversation and judgment. Terminal sessions, model processes, and context windows are poor places to keep durable execution state. Sergeant separates those responsibilities:
+
+| Captain | Sergeant |
 |---|---|
-| ![TUI work detail](docs/img/tui-detail.png) | ![TUI fleet](docs/img/tui-fleet.png) |
+| Your coding harness + `AGENTS.md` + skills | The `sgt` binary + its estate-bound daemon |
+| Talks with you | Executes accepted intent |
+| Explores, interviews, and clarifies | Runs durable, ordered workflows |
+| Decides what should become Work | Owns Work state and lifecycle |
+| Chooses scope and workflow | Creates Git surfaces and drives stages |
+| Brings decisions back to you | Journals what happened and why |
 
-## Using sgt day-to-day
-
-Every command below is copy-pasteable, run from the estate root; every command takes `--json` for scripting, `--data-dir <dir>` to point at a non-default data directory, and `-C <estate-root>` to name the estate explicitly instead of `cd`-ing there first. Default precedence: `--data-dir` → `$SGT_DATA_DIR` → this estate's own `.sergeant/data` (only when the current directory — or `-C`'s target — *is* the estate root exactly; sergeant never searches parent directories for one, this is the path `sgt init`'s `.gitignore` entry covers, and what keeps sergeant's state out of `~`) → `$XDG_DATA_HOME/sergeant` → `~/.local/share/sergeant`. One wrinkle: the very first `sgt init` in a fresh directory reports its health check against the pre-estate fallback (`$XDG_DATA_HOME`/`~/.local/share/sergeant`), since the estate doesn't exist yet at the instant that check runs — every command after that first one resolves to `<estate>/.sergeant/data` as expected.
-
-**Submit work**, from the exact estate root — a multi-repository estate must name a scope explicitly (`--repo`/`--group`/`--all`); a one-repository estate infers its only repository:
-
-```sh
-sgt run "add retry handling to the settlement worker"
-sgt run "add retry handling" --backend claude --workflow software-change --repo billing-service
-```
-
-`run` takes an intent plus optional `--workflow <name>`, `--backend <claude|codex|fake>`, `--profile <name>` (a launch profile), `--repo <name>` (repeatable, for multi-repo work), `--group <name>` (a declared estate group, expanded into the same repo selection), `--all` (every declared repository, explicit and journaled), `--turns <n>`/`--ceiling-secs <n>` (override this one work item's turn envelope instead of the daemon-wide default), and `--override-git-preflight` (waives a dirty-or-detached mount for this one submission, never anything else — `sgt run --help` is the authority on the full current list).
-
-**Watch it** — CLI or TUI, same daemon state through the same API, pick whichever fits:
-
-```sh
-sgt status              # daemon health + work counts, by state
-sgt work list            # the fleet: id, state, intent
-sgt work show <id>       # one item: stage, execution, surface, output pointer, recent events
-sgt work show <id> --graph   # the work's provenance graph instead of its record
-sgt work transcript <id> # decode the work's conversation from the journal, in causal order
-sgt tui                   # Home/Fleet/Workflows/Estate cockpit, live over SSE
-sgt                       # no subcommand: a homepage — logo, quickstart, no daemon contact
-```
-
-**Wait for it, instead of polling** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/WATCH.md`):
-
-```sh
-sgt watch <id>                # block until this Work needs attention or ends, then print it
-sgt --json watch <id>         # same, one sergeant.watch/v1 JSON object
-sgt --json watch <id> --follow  # stay attached across every nonterminal match too
-sgt --json watch --follow     # future attention/result transitions across the whole estate
-```
-
-`sgt watch` replaces a `sgt work show <id>` polling loop with one blocking
-call: it is silent while nothing has changed, and default mode emits
-exactly one notice and exits — `--json` makes that notice one compact
-JSON object per line (JSONL; no wrapping array, ever). No output means no
-matching transition has happened yet. Watched states are `needs_input`,
-`blocked`, `waiting`, `failed`, `completed`, `canceled`; `pending` and
-`active` never produce a notice. A scoped `--follow` watcher exits once
-the Work reaches `completed`/`canceled`, but stays attached through
-`needs_input`/`blocked`/`waiting`/`failed` — including `failed`: a Work
-that fails and is never retried or canceled leaves a `--follow` watcher
-attached indefinitely after it has already reported the failure, since
-nothing auto-resumes it. `sgt watch` does not wake or launch a harness —
-it is a quiet process contract a harness's own tool-call or
-background-command facility drives — and, unlike every other client verb
-here, it never auto-spawns a daemon: point it at a data dir with nothing
-running and it refuses with the remedy rather than starting one, because
-observing must not materialize the thing being observed.
-
-For an estate-wide watch (no Work id), attach the watcher *before* running
-`sgt status`/`sgt work list`, not after: an estate-wide watch is
-edge-triggered from the moment it attaches, so anything that lands after
-reconciliation but before an after-the-fact watch would otherwise fall in
-an unwatched gap. Stated honestly: a bare one-shot estate watch invoked
-*after* reconciliation still carries that gap — there is no `--from <seq>`
-replay in this version to close it after the fact.
-
-**Respond when a stage is waiting on you** (state `needs_input`):
-
-```sh
-sgt respond <id> "yes, 3 attempts with exponential backoff"
-```
-
-**Retry, extend, or cancel:**
-
-```sh
-sgt retry <id>                  # retry the current stage of a failed, blocked, or waiting work item
-sgt extend <id> <extra-turns>   # work blocked on an exhausted turn envelope: grant more turns, then `sgt retry`
-sgt cancel <id>
-```
-
-**Ask questions of your own history:**
-
-```sh
-sgt analytics                        # list the canned questions, and how populated the projection is
-sgt analytics blocked_time_per_work  # answer one of them
-```
-
-**Diagnose a broken install:**
-
-```sh
-sgt doctor
-```
-
-Checks git, the `claude` CLI (presence and version gate), whether the toolchain directories `sgt claude` (and its siblings) would add to `PATH` are already on it, the data directory, Docker (capability probe), the journal (full validating replay), the analytics projection, the daemon, whether the current directory is an exact estate root, the effective permission mode each declared profile launches with, (inside an estate) the estate manifest's own health, the declared workflow catalog, a cheap Git-surface summary (active/retained worktrees and patches, retained bytes, journaled Work branches, terminal-dirty Works — from the journal and retained-artifact filesystem metadata only, never a per-branch `git` walk), disk pressure inside the data directory, and the journal's growth against its retention policy (live segment count and bytes, the replay floor, retained-Work count against the declared cap, a stalled prune's blocking Work, and the last startup rebuild's duration) — in that order, so a fault is reported under the right name; an unwritable data directory makes Docker and disk pressure decline with a pointer back to the `data_dir` row instead of re-diagnosing the same fault under their own name. Every failing check names its remedy; `sgt doctor` does **not** auto-spawn a daemon, because it's diagnosing the installation, not priming it — it joins `status`, `work`, `analytics`, `watch`, `tui`, and `daemon stop` in never materializing a daemon just to observe it (only `run`/`respond`/`retry`/`extend`/`cancel` do that).
-
-**Launch a harness bound to this estate:**
-
-```sh
-sgt claude                     # or codex / opencode / goose
-sgt claude -- --model opus     # everything after `--` passes through verbatim
-```
-
-Composes an environment (enriches `PATH` with `~/.cargo/bin` and `~/.local/bin` when they exist, binds `SGT_DATA_DIR` to this invocation's resolved data dir) and **exec**s into the harness — replacing the `sgt` process, never forking and supervising it (`docs/adr/0006-harness-passthrough.md`).
-
-**Manage the estate** — the directory declaring the repositories and groups a work item can target with `--repo`/`--group`:
-
-```sh
-sgt init                              # scaffold [estate] in sergeant.toml, repos/, .gitignore entries
-sgt repo add <name> --origin <url>    # clone repos/<name> and declare it (origin optional if it's already there)
-sgt repo add <name> --upstream <url>  # also declare an upstream and set it as the mount's `upstream` remote (forge-neutral)
-sgt repo remove <name>                # undeclare it (refuses while a group still lists it; never deletes repos/<name>)
-sgt repo list                         # declared repositories
-sgt group add <name> <repo>...        # declare or extend a group (mkdir-p semantics)
-sgt group remove <name> [<repo>...]   # drop members, or the whole group with none given
-sgt group list                        # declared groups and their members
-```
-
-`sergeant.toml`'s `[estate]` table also takes `retention = N` — how many terminal Works of history this estate keeps (default 1000, minimum 64); older Works, and the blobs only they referenced, are pruned automatically and journaled — never silently. `sgt init` scaffolds the key commented, with its default spelled out in the comment; uncomment it to declare a different cap. `sgt doctor`'s `journal_growth` row reports what this estate is actually retaining against that number.
-
-**Stop the daemon cleanly** — pauses admission, waits for in-flight work to drain, then shuts down (idempotent):
-
-```sh
-sgt daemon stop
-```
-
-## Workflows
-
-A workflow is a directory, not code: a `workflow.toml` naming ordered stages, and one `CONTEXT.md` per stage directory. Drop one in your own repository and `sgt run` picks it up automatically:
+The split carries into how each side is extended. A Captain *skill* is an interactive way of working inside your current conversation — building an estate, grilling an incomplete idea, turning a discussion into a specification. A Sergeant *workflow* begins after intent has been accepted: a self-contained execution procedure with explicit stages, context, inputs, and outputs.
 
 ```text
-.sergeant/workflows/<name>/
-├── workflow.toml            # [workflow] name, version, stages = ["00-...", "10-...", ...]
-├── CONTEXT.md                # workflow orientation (optional)
-├── 00-<stage>/
-│   └── CONTEXT.md            # the stage's contract — the only thing the engine reads per stage
-├── 10-<stage>/
+You
+ │
+ ▼
+Captain — coding harness + AGENTS.md + skills
+ │
+ │  accepted intent
+ ▼
+Sergeant — durable execution engine
+ │
+ ▼
+Workflow
+ ├── stage → fresh agent execution
+ ├── stage → deterministic container execution
+ ├── stage → fresh agent execution
+ └── stage → review or close-out
+ │
+ ▼
+Your estate — one repository or many
+```
+
+## Work across an estate
+
+An estate is any directory initialized by Sergeant: the exact directory containing `sergeant.toml`.
+
+```text
+my-product/
+├── sergeant.toml
+├── AGENTS.md
+├── skills/
+├── .sergeant/
+└── repos/
+    ├── payments-api/
+    ├── auth-service/
+    ├── customer-web/
+    └── engineering-knowledge/
+```
+
+An estate can contain one repository or hundreds. It gives Sergeant a light-monorepo view of repositories that belong together, without requiring you to combine them into a monorepo. A single Work might touch an API, an authentication service, a frontend, and documentation: Sergeant binds all selected repositories to the same Work, gives each one a Work-owned Git surface, and carries the intent and workflow across the complete scope.
+
+There is no prescribed estate size. Keep one broad estate divided into groups, or several purpose-built estates (`~/estates/client-a`, `~/estates/homelab`, …). Each estate has its own manifest, runtime state, journal, retention policy, and daemon binding, and multiple estates can be active simultaneously. `sergeant.toml` declares the estate's repositories, Git origins, groups, routing profiles, and retention policy; Captain handles the normal setup conversation, and the manifest remains available when you want direct control.
+
+## Bring your knowledge with the work
+
+The `engineering-knowledge` repository in the example estate above is not decoration. When a Work should update your architecture notes, runbooks, or decision records, Captain includes the knowledge repository in the Work scope — and it receives the same branch, workflow context, review, and evidence trail as the source repositories. Documentation stops drifting from the systems it describes, because it ships in the same Work.
+
+Sergeant does not impose a memory system of its own: the estate carries durable knowledge as ordinary repositories, and Captain keeps whatever working memory your harness already uses.
+
+## Make good work repeatable
+
+A workflow is a standard way of working expressed as a directory:
+
+```text
+.sergeant/workflows/software-change/
+├── workflow.toml
+├── CONTEXT.md
+├── 00-prepare/
 │   └── CONTEXT.md
-└── ...
+├── 10-implement/
+│   └── CONTEXT.md
+├── 20-review/
+│   └── CONTEXT.md
+└── 30-close/
+    └── CONTEXT.md
 ```
 
-Route to it explicitly (`sgt run "..." --workflow <name>`), or leave `--workflow` off and `sgt` uses the estate's own `software-change` workflow if it has declared one under `.sergeant/workflows/`, falling back to the built-in default otherwise. Backends are selected per work item (`--backend claude|codex|fake`) or by named routing profiles in `sergeant.toml`. A profile can also pin the permission mode Claude turns launch with (`permission_mode = "acceptEdits"` in the profile's `options` table, using the CLI's own `--permission-mode` vocabulary); with no mode set, `sgt` passes no permission flag at all — never a silent bypass — and `sgt doctor` reports each profile's effective mode.
+Every stage is its own execution with its own contract. A stage declares the context and inputs it needs, produces explicit outputs, and ends before the next stage begins — context moves between stages through declared artifacts, not through one enormous agent conversation that must remain alive forever. A stage can be a fresh agent execution when judgment is needed, a Docker execution for deterministic work, repository-native scripts and tests, or a human decision when authority runs out. Agents where reasoning helps. Containers where determinism helps.
 
-This repository dogfoods its own convention under `.sergeant/`: `.sergeant/index.md` catalogs every published workflow (23 at last count — code review, TDD, diagnosing a bug, resolving a merge conflict, breaking a plan into tickets, and more), and [`repo-to-icm`](.sergeant/workflows/repo-to-icm/) — a ten-stage workflow that converts a repository's scattered procedural knowledge (skills, agent instructions, scripts, docs) into reviewable draft workflow packages — is the worked example. Read its [`index.md`](.sergeant/workflows/repo-to-icm/index.md) and [`CONTEXT.md`](.sergeant/workflows/repo-to-icm/CONTEXT.md) for how a real multi-stage workflow is laid out, and see [`AGENTS.md`](AGENTS.md) for how an agent operating in this repo is expected to discover and route to one. Alongside it, `skills/<name>/SKILL.md` is the operator-skills layer — instructions the harness loads directly for judgment/dialogue work that never needs a dispatched Work item (`sergeant-help`, `grilling`, `grill-with-docs`, `estate-navigation`).
+Sergeant ships with workflows for software changes, code review, research, diagnosing bugs, prototyping, cross-repository work, intent validation, decision recording, validation and shipping, and more — the [workflow catalog](.sergeant/index.md) lists them all. Captain discovers them through the catalog and selects one based on the accepted intent.
 
-Full authoring rules — the four-layer context model (workflow orientation, stage contract, stable references, per-run artifacts), directory shapes, and what's a convention violation — are in [`docs/icm/convention.md`](docs/icm/convention.md).
+### Write your own workflows
 
-## How it works
+Custom workflows are encouraged. Tell Captain how your team works and ask it to create one. New candidates land under `.sergeant/drafts/workflows/<name>/`, where they are reviewable but not runnable; after review, they are promoted into `.sergeant/workflows/<name>/`. That publication boundary is deliberate: generated procedure never becomes runnable merely because an agent wrote it. The complete authoring model is the [ICM filesystem convention](docs/icm/convention.md).
 
-```
-   sgt CLI ──┐            ┌────────────────────────── daemon (one per user) ─────────────┐
-   sgt TUI ──┴─ HTTP/SSE ─┤  engine → workflows → routing → Backend trait                │
-                          │      │                    ├── claude (headless               │
-                          │  append-only journal      │     print-mode turns)            │
-                          │  + blob store             ├── codex (exec + app-server turns)│
-                          │      │                    └── fake (deterministic)           │
-                          │  projections: in-memory · DuckDB · graph                     │
-                          └──── work surfaces: git worktrees, one per work ──────────────┘
-```
+## Work survives the session
 
-Every state change — submit, worktree binding, stage entry, each model turn's raw output, the question the agent asked, your answer — is an event in a crash-tolerant journal (large payloads in a BLAKE3 content-addressed blob store). Everything else — the in-memory work state, the DuckDB analytics tables, the graph projection, every client screen — is a disposable projection rebuilt from it; there is no snapshot loading. The daemon exclusively owns the data directory and every process handle; clients (CLI, TUI) hold no state of their own and reach it only through the same loopback HTTP/SSE API — a structural test fails if one gets a private shortcut. A Claude "session" is a durable conversation identity, not a process: the OS process exists per turn, so killing the daemon mid-execution and restarting it resumes on unambiguous evidence, or fails closed into `blocked` with a stated reason — never a guess. Each work item gets its own git worktree on its own branch (`sergeant/<work-id>`), outside your checkout, so agents never fight over a working tree. A third `Backend` — `docker` — runs `kind = "execute"` workflow stages (pinned, offline containers) rather than agent turns; it isn't user-selectable via `--backend`, since a workflow's own stages declare their kind.
+A Sergeant Work is not a terminal, a model process, or a chat session — it is durable state. You can:
 
-This — the engine described above — is the core `sgt` carries; everything under `.sergeant/`, `AGENTS.md`, and this repo's own skills is the OS layered on top of it. The full destination for both halves, and the rulings that shape them, is [`NORTH-STAR.md`](NORTH-STAR.md).
+- close the terminal
+- lose your network connection
+- put the laptop to sleep
+- accidentally kill the daemon
+- hit a model usage window
+- restart the machine
 
-This is a clean-room Rust successor to [callmeradical/sergeant](https://github.com/callmeradical/sergeant) — the Bash/tmux original whose failure modes became this project's regression-test catalog. The architecture is specified in [a full proposal](sergeant-rs-workspace/knowledge/evidence/reference/proposal-depot-rust-execution-surface.md) committed to this repo; the ICM workflow model layered on top of it is specified in [its successor](sergeant-rs-workspace/knowledge/evidence/reference/proposal-next-iteration-icm-workflows.md); every deviation from either is registered with rationale in [GAUNTLET.md](GAUNTLET.md).
+Sergeant records meaningful state transitions in a crash-tolerant journal. When the estate comes back, Sergeant reconstructs Work from that evidence: if recovery is unambiguous, execution continues; if the evidence is not sufficient, Sergeant blocks with a stated reason rather than guessing.
 
-## Status
+That makes resuming conversational:
 
-The core engine and CLI (journal, projections, the Backend boundary — Claude, Codex, fake, and Docker execute stages — the estate manifest, and every verb in "Using sgt day-to-day" above) are built and gated on `cargo test`; the workflow catalog and this file are the OS layer built on top of it, both converging toward the ship gate in [`NORTH-STAR.md`](NORTH-STAR.md)'s MVP plan. The complete development record — every milestone, every wrong turn — is in [GAUNTLET.md](GAUNTLET.md) and [LESSONS.md](LESSONS.md); the method that produced it is in [sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md](sergeant-rs-workspace/knowledge/evidence/reference/notes/gauntlet-pattern.md).
+> My usage window reset. Resume the account-lockout Work.
 
-## Contributors
+Captain inspects the recorded state and uses Sergeant's retry, extension, response, and recovery surfaces as appropriate. It does not have to reconstruct the run from memory.
 
-Working on sergeant-rs itself (not just using `sgt` against your own repos)? The dev rulebook — build commands, architecture invariants, testing rules, the shipping gate, per-host environment facts — is [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md); `AGENTS.md` points there too under "Working on sergeant-rs itself."
+The durability promise is not that a process survives every interruption. The promise is that retained Work is faithfully resumable after the process does not.
+
+## A lot happens after you say "go"
+
+| Sergeant handles | What that gives you |
+|---|---|
+| Durable Work identity | Work outlives terminals, processes, and individual model turns |
+| Append-only journal and replay | State is reconstructed from recorded evidence, never guessed |
+| One Git surface per Work and repository | Parallel work never shares an ordinary working tree |
+| Explicit `needs_input` state | Agents ask instead of inventing an answer |
+| Turn and time envelopes | An execution cannot consume unbounded agent turns by accident |
+| Retry, extension, cancellation, and recovery | A failed stage does not restart the entire effort |
+| Dirty-state accounting | Uncommitted, misplaced, or unaccounted-for Git results stay visible |
+| Transcripts and provenance graphs | You can inspect the conversation and causal history of any Work |
+
+Sergeant treats a Work's Git worktrees as its declared mutation surface. It records integrity problems and estate drift, but it is not an operating-system security boundary. For stronger isolation, run Sergeant and your harness inside a VM, container, restricted account, or sandbox of your choice.
+
+## Stay informed without babysitting
+
+Humans, Captain, scripts, and observability systems all see the same engine through different surfaces.
+
+**For you: the TUI.**
 
 ```sh
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test   # the gates
-cargo test --test m4_backends              # one suite
-SERGEANT_CLAUDE_TESTS=1 cargo test --test m4_backends -- --ignored   # opt-in: real claude CLI, bills tokens
+sgt tui
 ```
 
-The record that governs how this project decides things: [`NORTH-STAR.md`](NORTH-STAR.md) (the destination and the rulings), [`GAUNTLET.md`](GAUNTLET.md) (the append-only ledger — deviation register, backlog, per-milestone scorecards), [`LESSONS.md`](LESSONS.md) (binding lessons from what went wrong), `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/` (what each milestone actually promised), and [`docs/adr/`](docs/adr/README.md) (architecture decisions that fix a shape once, with [`docs/glossary.md`](docs/glossary.md) for the vocabulary they fix).
+The TUI exposes the estate, workflows, active and historical Work, current stages, attention states, and journal activity.
 
-## Lineage & License
+![Sergeant TUI — fleet view](docs/img/tui-fleet.png)
+*(capture from an earlier build; the current cockpit adds Home, Workflows, and Estate views)*
 
-This is a clean-room Rust successor to [callmeradical/sergeant](https://github.com/callmeradical/sergeant), which was itself inspired by [kunchenguid/firstmate](https://github.com/kunchenguid/firstmate).
+**For Captain: `sgt watch`.**
 
-[MIT](LICENSE).
+```sh
+sgt --json watch <work-id> --follow
+```
+
+`sgt watch` blocks quietly until Work completes, fails, blocks, or needs input — one blocking call instead of a polling loop. Captain can delegate the Work, keep talking with you or go idle, and react when Sergeant has something meaningful to report. Omit the id for an estate-wide watch.
+
+**For automation: CLI, JSON, and API.** Every major CLI surface supports structured output via a global `--json`. The CLI and TUI are both plain clients of the daemon's loopback HTTP/SSE API — neither holds private state.
+
+**For operations: OpenTelemetry.** OTLP/HTTP export is optional and off by default:
+
+```sh
+SGT_OTEL=1 SGT_OTLP_ENDPOINT=http://localhost:4318 sgt daemon
+```
+
+Sergeant exports the Work → stage → execution → tool hierarchy with execution, wait, journal, failure, and token metrics. Telemetry is a disposable projection; the journal remains the source of truth.
+
+## Bring your environment
+
+Sergeant runs as your user and inherits the environment, tools, credentials, and permissions available to your coding harness. It does not prescribe how your estate builds, tests, deploys, or publishes software, and its Git URLs are opaque and forge-neutral — GitHub, GitLab, Gitea, or a bare remote all look the same to it.
+
+Whatever toolchains your repositories use, Sergeant itself needs only Git (repositories and Work surfaces are its execution language), a supported coding harness to act as Captain, and Docker when workflows include container stages. Rust is required only to build Sergeant from source.
+
+## Current targets
+
+| Surface | Current state |
+|---|---|
+| Platforms | Linux, macOS, and Windows through WSL2 |
+| Harness launchers | `sgt claude`, `sgt codex`, `sgt opencode`, `sgt goose` |
+| Primary Captain harnesses | Claude Code and Codex |
+| Agent workflow execution | Claude and Codex (`--backend claude\|codex`); stages that stop to ask a question are Claude-only for now |
+| Deterministic workflow execution | Docker |
+| Planned | OpenCode, Goose, and Antigravity as full Captain and backend targets |
+
+Sergeant is pre-1.0. Configuration and interfaces may change between releases while the product model settles.
+
+## The CLI is still yours
+
+Captain normally operates Sergeant for you, but nothing is hidden behind an agent-only interface.
+
+```sh
+sgt                              # product homepage
+sgt doctor                       # installation and estate health, every fault named with a remedy
+sgt status                       # daemon health and Work counts
+sgt tui                          # interactive estate cockpit
+sgt work list                    # active and historical Work
+sgt work show <id>               # state, stage, surface, output, recent events
+sgt work show <id> --graph       # provenance graph
+sgt work transcript <id>         # reconstructed conversation
+sgt watch [<id>] [--follow]      # wait for attention or a terminal result
+sgt respond <id> "<answer>"      # answer a waiting stage
+sgt retry <id>                   # retry failed, blocked, or waiting Work
+sgt extend <id> <turns>          # grant more turns to an exhausted envelope, then retry
+sgt cancel <id>                  # cancel Work
+sgt analytics                    # ask operational questions of your execution history
+```
+
+You can also submit directly:
+
+```sh
+sgt run "add retry handling to the settlement worker" \
+  --workflow software-change \
+  --group payments
+```
+
+Agent stages run on the backend you route to (`--backend claude|codex`, or a routing profile in `sergeant.toml`). Add `--backend fake` to any `sgt run` to try the whole loop deterministically without spending tokens, or run `scripts/demo.sh` from a source checkout for a guided end-to-end walkthrough. `sgt --help` and each subcommand's `--help` are the authority on the current command surface.
+
+## Bounded history, never silent deletion
+
+Each estate declares how much terminal Work history it retains — 1,000 terminal Works by default, with a configurable minimum of 64. Past that policy, Sergeant prunes eligible old Work and blobs automatically: Work-aware, crash-recoverable, visible through the journal, and reported by `sgt doctor`. A request for a pruned Work is answered by name and policy rather than being made indistinguishable from a Work that never existed. And every Work's output branch (`sergeant/<work-id>`) is retained after every terminal outcome — nothing deletes it automatically.
+
+## Where Sergeant came from
+
+The name sergeant-rs is intentional.
+
+[kunchenguid/firstmate](https://github.com/kunchenguid/firstmate) demonstrated that a coding harness can be specialized by a portable collection of instructions, skills, tools, and operating conventions. [callmeradical/sergeant](https://github.com/callmeradical/sergeant) built on that idea and made multi-repository project topology central: give an agent an understanding of the repositories that belong together, then let it coordinate work across them.
+
+Sergeant-rs is a clean-room Rust reimagining of that lineage. It keeps the agent-distro and multi-repository ideas, but changes the execution substrate: the distro is embedded in the released binary and written by `sgt init`; Work is owned by a purpose-built durable runtime; workflows are explicit staged execution packages; state is journaled rather than inferred from terminal sessions; and tmux-based process orchestration is not part of the runtime. The original ideas — and the problems they exposed — shaped many of Sergeant-rs's contracts and regression tests.
+
+## Documentation
+
+- [AGENTS.md](AGENTS.md) — Captain's operating doctrine and routing model
+- [Workflow catalog](.sergeant/index.md) — published Sergeant workflows
+- [ICM workflow convention](docs/icm/convention.md) — workflow and stage authoring
+- [Glossary](docs/glossary.md) — precise definitions of Sergeant concepts
+- [NORTH-STAR.md](NORTH-STAR.md) — product direction and governing decisions
+- [CHANGELOG.md](CHANGELOG.md) — release history
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contributing and development setup
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — architecture invariants, tests, and development rules
+
+## Contributing
+
+Sergeant is written in Rust and dogfoods its own execution model. See [CONTRIBUTING.md](CONTRIBUTING.md) before changing the project. The core local gates are:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+## License
+
+Sergeant is available under the [MIT License](LICENSE).

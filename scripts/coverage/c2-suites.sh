@@ -61,3 +61,24 @@ cov_stage_end 1 "the estate_routes test binary must write its own profile"
 cov_stage_begin c2-t2_workflow_catalog
 cov_run cargo llvm-cov --no-report --test t2_workflow_catalog --locked || cov_fail "t2_workflow_catalog failed under instrumentation"
 cov_stage_end 1 "the t2_workflow_catalog test binary must write its own profile"
+
+# Added 2026-08-22, closing the identical accounting gap the 2026-08-19 block
+# above closed for m8/m9/m10/estate_routes/t2_workflow_catalog: these two
+# suites existed in tests/ but were invoked by no stage script, so
+# backend/codex.rs's and backend/codex_appserver.rs's real coverage never
+# reached the report (measured: 40.80%/69.46% lines with them excluded vs.
+# 84.74%/94.36% with them included, identical commit, identical binaries).
+#
+# Both sit in C2, not C3: codex_backend.rs's StubCodex is a shell script
+# (uninstrumented, no profile expected of it) — the same shape as m4's own
+# sh/git stand-ins, not a real `sgt` subprocess — and its two daemon-level
+# registration tests use in-process `daemon::start_with` with no subprocess
+# at all, exactly m3_execution's/estate_routes's rig. codex_routing.rs is
+# in-process-only throughout (no StubCodex, no subprocess). Floor 1 for both.
+cov_stage_begin c2-codex_backend
+cov_run cargo llvm-cov --no-report --test codex_backend --locked || cov_fail "codex_backend failed under instrumentation"
+cov_stage_end 1 "the codex_backend test binary must write its own profile (StubCodex's children are shell-script stand-ins, uninstrumented and no loss, per m4's own precedent)"
+
+cov_stage_begin c2-codex_routing
+cov_run cargo llvm-cov --no-report --test codex_routing --locked || cov_fail "codex_routing failed under instrumentation"
+cov_stage_end 1 "the codex_routing test binary must write its own profile"

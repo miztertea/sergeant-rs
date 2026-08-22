@@ -5582,6 +5582,98 @@ mod tests {
         }
     }
 
+    /// coverage-spec.md §2f: `codex_home`'s three-tier fallback (config
+    /// override, then `$CODEX_HOME`, then `~/.codex`) had no test for its
+    /// middle tier. No config override is set here, so a `CODEX_HOME` the
+    /// process actually carries must win over the `~/.codex` default.
+    #[test]
+    fn codex_home_falls_back_to_the_codex_home_env_var_with_no_config_override() {
+        // SAFETY: mirrors codex_config_new_reads_the_bin_env_override's own
+        // save/restore discipline immediately above -- this test does not
+        // run concurrently with another that reads CODEX_HOME, and the
+        // previous value (if any) is restored before returning.
+        let previous = std::env::var_os("CODEX_HOME");
+        unsafe { std::env::set_var("CODEX_HOME", "/env-codex-home") };
+        let config = CodexConfig::new(Path::new("/data")); // codex_home: None
+        let backend = CodexBackend::new(config);
+        let home = backend.codex_home();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        assert_eq!(
+            home,
+            PathBuf::from("/env-codex-home"),
+            "no config override was set; the env var must be honored over ~/.codex"
+        );
+    }
+
+    /// coverage-spec.md §2f: a write failure while materializing `--output-
+    /// schema`'s file is treated as "no schema" (§4.1: this feature is
+    /// adapter-local evidence with no contract row, so a filesystem problem
+    /// here must never turn into a refused Work) -- never surfaced as an
+    /// error and never panics. `data_dir` itself is made read-only so the
+    /// write the method attempts fails outright.
+    #[test]
+    fn output_schema_path_returns_none_when_the_write_itself_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod data_dir read-only");
+        struct RestorePerms(PathBuf);
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = RestorePerms(dir.path().to_path_buf());
+
+        // Environment probe (docs/DEVELOPMENT.md's testing rules): a root
+        // dev container silently ignores permission-bit restrictions, so
+        // this fixture cannot be armed there -- skip loudly rather than
+        // assert something that cannot hold in that environment.
+        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+            eprintln!(
+                "SKIPPED-ENV: permission bits are not enforced on this host (root container \
+                 shape) -- the unwritable-data_dir fault cannot be armed here"
+            );
+            return;
+        }
+
+        let mut config = CodexConfig::new(dir.path());
+        config.output_schema = Some(json!({"type": "object"}));
+        let backend = CodexBackend::new(config);
+        assert_eq!(
+            backend.output_schema_path(),
+            None,
+            "a write failure must be treated as 'no schema', not surfaced as an error"
+        );
+    }
+
+    /// coverage-spec.md §2f: `TurnOutcome::raw_evidence`'s `unarchived
+    /// (error)` arm -- named separately from the "streamed nothing" arm
+    /// because a real archive failure should read differently from a turn
+    /// that legitimately produced no bytes to archive.
+    #[test]
+    fn raw_evidence_names_the_archive_error_when_the_blob_never_landed() {
+        let outcome = TurnOutcome {
+            terminal: TerminalOutcome::Completed,
+            pin_mismatch: None,
+            message_items: 0,
+            tool_items: 0,
+            unknown_items: Vec::new(),
+            unparsed_lines: 0,
+            last_agent_message: None,
+            last_error: None,
+            exit_code: None,
+            raw_blob: None,
+            raw_error: Some("blob store unwritable".to_string()),
+            stderr: String::new(),
+        };
+        assert_eq!(outcome.raw_evidence(), "unarchived (blob store unwritable)");
+    }
+
     #[test]
     fn launch_config_refuses_a_codex_native_profile() {
         let config = CodexConfig::new(Path::new("/nonexistent"));
