@@ -550,6 +550,69 @@ async fn show_work_on_a_never_existing_id_still_404s() {
     handle.shutdown().await;
 }
 
+// ------------------------------------------------------- #221: graph pruned
+
+/// #221: the graph surface is a named read surface too. Once pruning has
+/// removed the Work's graph events, it must still answer from the same
+/// residue row as `work show`, rather than silently treating the id as one
+/// that never existed.
+#[tokio::test]
+async fn work_graph_on_a_pruned_id_answers_pruned_with_its_date_and_policy() {
+    let data = TempDir::new().expect("tempdir");
+    let root = TempDir::new().expect("tempdir");
+    let (handle, pruned, _retained, retention) = pruned_fixture(&data, &root).await;
+    let http = client();
+
+    let resp = http
+        .get(format!("{}/v1/graph/work/{pruned}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("graph pruned work");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "a pruned graph id is never indistinguishable from a 404"
+    );
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["state"], "pruned");
+    assert!(body["work"].is_null());
+    assert_eq!(body["id"], pruned);
+    assert!(
+        body["pruned_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "pruned_at must be a real timestamp: {body}"
+    );
+    assert_eq!(
+        body["policy"]["retention"], retention,
+        "the reported policy must match this daemon's configured cap: {body}"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn work_graph_on_a_never_existing_id_still_404s() {
+    let data = TempDir::new().expect("tempdir");
+    let root = TempDir::new().expect("tempdir");
+    let (handle, _pruned, _retained, _retention) = pruned_fixture(&data, &root).await;
+    let http = client();
+
+    let never_existed = ulid();
+    let resp = http
+        .get(format!("{}/v1/graph/work/{never_existed}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("graph unknown work");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "an id in neither work_index nor pruned_works must remain a graph 404"
+    );
+
+    handle.shutdown().await;
+}
+
 // -------------------------------------------- §1.3: `work transcript` pruned
 
 #[tokio::test]

@@ -3757,7 +3757,14 @@ fn projection_unavailable(e: impl std::fmt::Display) -> Response {
 async fn work_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     {
         let core = CoreGuard::acquire(&state.core).await;
-        if !core.registry.state().work_index.contains_key(&id) {
+        let registry = core.registry.state();
+        // #221: graph is a named read surface too. Its source events have
+        // gone after pruning, but the retained residue gives the same honest
+        // named answer as `work show` and `work transcript`.
+        if let Some(row) = registry.pruned_works.get(&id) {
+            return Json(pruned_work_view(row, &state.prune_policy)).into_response();
+        }
+        if !registry.work_index.contains_key(&id) {
             return error_response(
                 StatusCode::NOT_FOUND,
                 "work_not_found",
