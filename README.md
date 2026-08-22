@@ -230,7 +230,7 @@ Whatever toolchains your repositories use, Sergeant itself needs only Git (repos
 | Platforms | Linux, macOS, and Windows through WSL2 |
 | Harness launchers | `sgt claude`, `sgt codex`, `sgt opencode`, `sgt goose` |
 | Primary Captain harnesses | Claude Code and Codex |
-| Agent workflow execution | Claude and Codex (`--backend claude\|codex`) |
+| Agent workflow execution | Claude and Codex (`--backend claude\|codex`); stages that stop to ask a question are Claude-only for now |
 | Deterministic workflow execution | Docker |
 | Planned | OpenCode, Goose, and Antigravity as full Captain and backend targets |
 
