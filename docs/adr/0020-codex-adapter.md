@@ -227,6 +227,28 @@ this ADR asks a future wave to close by trying harder on the same host —
 it is a fact about Cerberus, recorded so a reader on a different host
 knows what would actually need re-measuring there.
 
+**Amended 2026-08-22, per this document's own rule that a superseded
+claim stays legible.** The paragraph above mis-attributed the failure.
+Two corrections, both measured: (1) the `uid_map` EPERM reproduced above
+was measured from inside an agent-harness sandbox — the measurement
+environment, not the host, blocks nested namespace setup there; (2) on
+the host proper, the real cause was Ubuntu's
+`kernel.apparmor_restrict_unprivileged_userns = 1` denying codex's
+*bundled* (unprofiled) sandbox binary. Installing the distro `bubblewrap`
+package (0.11.1-1ubuntu0.1, 2026-08-22) — whose binary attaches to the
+shipped `bwrap-userns-restrict` AppArmor profile, and which codex's own
+documentation recommends — resolved it: a live `codex exec -s
+workspace-write` turn from the owner's shell created a file inside the
+workspace with a structured `file_change` item and no bubblewrap error
+(thread 01a02782-9ac8-7d50-957c-7be9d6b1ab1c). Sandbox *setup* is
+therefore now locally measured working on Cerberus. What remains
+unproven is unchanged in kind: *enforcement* — that an out-of-surface
+write is actually denied — still needs its negative probe, and the
+`sandbox_enforcement` row's "enforcement-claimed, not locally proven"
+wording continues to hold until that probe runs. (The observed
+`file_change` item type is itself new to the measured catalog — tracked
+as #229.)
+
 **This is the NORTH-STAR tension H0 §E5 flagged in advance, and the
 amendment below is where it is resolved rather than left implicit.**
 
